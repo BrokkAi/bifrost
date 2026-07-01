@@ -1,4 +1,6 @@
-use brokk_bifrost::{CodeUnitType, IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::{
+    CodeUnitType, IAnalyzer, JavaAnalyzer, Language, ProjectFile, Range, TestProject,
+};
 
 fn analyzer_for(files: &[(&str, &str)]) -> JavaAnalyzer {
     let temp = tempfile::tempdir().unwrap();
@@ -54,6 +56,42 @@ fn merges_package_module_children_once_in_canonical_order() {
         vec!["p1.A".to_string(), "p1.C".to_string(), "p1.B".to_string()],
         children
     );
+}
+
+#[test]
+fn file_scope_encloses_imports_without_stealing_class_references() {
+    let source = "package app;\n\nimport app.Target;\n\nclass UseTarget { Target value; }\n";
+    let analyzer = analyzer_for(&[
+        ("Target.java", "package app; class Target {}\n"),
+        ("UseTarget.java", source),
+    ]);
+    let file = analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .find(|file| file.rel_path().ends_with("UseTarget.java"))
+        .unwrap();
+
+    let import_start = source.find("Target;").unwrap();
+    let import_range = Range {
+        start_byte: import_start,
+        end_byte: import_start + "Target".len(),
+        start_line: 2,
+        end_line: 2,
+    };
+    let import_owner = analyzer.enclosing_code_unit(&file, &import_range).unwrap();
+    assert_eq!(CodeUnitType::FileScope, import_owner.kind());
+    assert!(import_owner.is_synthetic());
+
+    let field_start = source.rfind("Target value").unwrap();
+    let field_range = Range {
+        start_byte: field_start,
+        end_byte: field_start + "Target".len(),
+        start_line: 4,
+        end_line: 4,
+    };
+    let field_owner = analyzer.enclosing_code_unit(&file, &field_range).unwrap();
+    assert_eq!("app.UseTarget.value", field_owner.fq_name());
+    assert_ne!(CodeUnitType::FileScope, field_owner.kind());
 }
 
 #[test]

@@ -56,6 +56,46 @@ fn run() {
 }
 
 #[test]
+fn rust_import_hits_ignore_unrelated_aliased_use_path() {
+    let consumer = r#"
+use crate::target::Target;
+use crate::other::Target as OtherTarget;
+
+fn run(value: Target, other: OtherTarget) {}
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub mod target;\npub mod other;\npub mod consumer;\n",
+        ),
+        ("src/target.rs", "pub struct Target;\n"),
+        ("src/other.rs", "pub struct Target;\n"),
+        ("src/consumer.rs", consumer),
+    ]);
+
+    let target = definition(&analyzer, "target.Target");
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+    let editor_hits = result.all_hits_including_imports();
+    let target_import_line = consumer[..consumer.find("use crate::target::Target").unwrap()]
+        .matches('\n')
+        .count()
+        + 1;
+    let other_import_line = consumer[..consumer.find("use crate::other::Target").unwrap()]
+        .matches('\n')
+        .count()
+        + 1;
+
+    assert!(
+        editor_hits.iter().any(|hit| hit.line == target_import_line),
+        "expected target import hit: {editor_hits:#?}"
+    );
+    assert!(
+        editor_hits.iter().all(|hit| hit.line != other_import_line),
+        "unrelated aliased import must not be reported as target hit: {editor_hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_same_file_private_function_calls() {
     let (_project, analyzer) = rust_analyzer_with_files(&[(
         "src/searchtools.rs",

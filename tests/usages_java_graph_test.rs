@@ -134,6 +134,38 @@ public class Consumer {
 }
 
 #[test]
+fn java_import_hits_are_editor_visible_but_external_usage_free() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Target.java",
+            "package app;\n\npublic class Target {}\n",
+        ),
+        (
+            "app/UseTarget.java",
+            "package app;\n\nimport app.Target;\n\npublic class UseTarget { Target value; }\n",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "app.Target");
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+    let external_hits = result.all_hits();
+    let editor_hits = result.all_hits_including_imports();
+
+    assert!(
+        external_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("import app.Target")),
+        "external usage surface must exclude import hits: {external_hits:#?}"
+    );
+    assert!(
+        editor_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("import app.Target")),
+        "editor surface should include import hit: {editor_hits:#?}"
+    );
+}
+
+#[test]
 fn java_graph_strategy_finds_method_constructor_field_and_type_usages() {
     let (project, analyzer) = java_analyzer_with_files(&[
         (

@@ -5,8 +5,8 @@ use brokk_bifrost::analyzer::{
     persistence::{AnalyzerStorage, PersistenceError, SymbolQueryMode, default_db_path},
 };
 use brokk_bifrost::{
-    AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, ProjectFile, PythonAnalyzer,
-    RubyAnalyzer, TestProject, WorkspaceAnalyzer,
+    AnalyzerConfig, CodeUnitType, IAnalyzer, JavaAnalyzer, Language, OverlayProject, Project,
+    ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, TestProject, WorkspaceAnalyzer,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -50,6 +50,23 @@ fn fresh_ruby_workspace() -> (TempDir, Arc<TestProject>) {
     );
     let canon = fs::canonicalize(tmp.path()).unwrap();
     let project = Arc::new(TestProject::new(canon, Language::Ruby));
+    (tmp, project)
+}
+
+fn fresh_java_workspace() -> (TempDir, Arc<TestProject>) {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        tmp.path(),
+        "app/UseTarget.java",
+        "package app;\n\nimport app.Target;\n\nclass UseTarget { Target value; }\n",
+    );
+    write_file(
+        tmp.path(),
+        "app/Target.java",
+        "package app; class Target {}\n",
+    );
+    let canon = fs::canonicalize(tmp.path()).unwrap();
+    let project = Arc::new(TestProject::new(canon, Language::Java));
     (tmp, project)
 }
 
@@ -703,6 +720,82 @@ fn search_definitions_persisted_returns_reconstructable_code_units() {
     assert!(
         cu.source().rel_path().ends_with("alpha.py"),
         "source rebuilt with rel_path: {cu:?}"
+    );
+}
+
+#[test]
+fn file_scope_units_round_trip_through_persistence_without_search_exposure() {
+    let (_tmp, project) = fresh_java_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+
+    let analyzer = JavaAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+    let file = analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .find(|file| file.rel_path().ends_with("UseTarget.java"))
+        .unwrap();
+    assert!(
+        analyzer
+            .get_declarations(&file)
+            .into_iter()
+            .all(|unit| unit.kind() != CodeUnitType::FileScope),
+        "public declaration surface must not expose file scopes"
+    );
+    let source = file.read_to_string().unwrap();
+    let import_start = source.find("Target;").unwrap();
+    let import_range = Range {
+        start_byte: import_start,
+        end_byte: import_start + "Target".len(),
+        start_line: 2,
+        end_line: 2,
+    };
+    let file_scope = analyzer
+        .enclosing_code_unit(&file, &import_range)
+        .expect("import token should have a structural owner");
+    assert_eq!(CodeUnitType::FileScope, file_scope.kind());
+    assert!(file_scope.is_synthetic());
+
+    let reloaded = JavaAnalyzer::new_with_config_and_storage(
+        project,
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+    let reloaded_file_scope = reloaded
+        .enclosing_code_unit(&file, &import_range)
+        .expect("file scope should hydrate from persistence");
+    assert_eq!(file_scope.fq_name(), reloaded_file_scope.fq_name());
+    assert!(reloaded_file_scope.is_synthetic());
+
+    let in_memory_hits = reloaded.search_definitions("UseTarget.java", true);
+    assert!(
+        in_memory_hits
+            .iter()
+            .all(|unit| unit.kind() != CodeUnitType::FileScope),
+        "in-memory definition search must not expose file scopes: {in_memory_hits:?}"
+    );
+
+    let persisted_hits = reloaded.search_definitions_persisted("UseTarget.java");
+    assert!(
+        persisted_hits
+            .iter()
+            .all(|unit| unit.kind() != CodeUnitType::FileScope),
+        "persisted definition search must not expose file scopes: {persisted_hits:?}"
+    );
+
+    let symbol_rows = storage
+        .search_symbols(Language::Java, "UseTarget.java", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        symbol_rows
+            .iter()
+            .any(|hit| hit.symbol.kind == "FileScope" && hit.symbol.synthetic),
+        "storage should contain a synthetic FileScope symbol row: {symbol_rows:?}"
     );
 }
 

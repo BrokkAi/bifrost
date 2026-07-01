@@ -33,7 +33,11 @@ fn reference_sites(files: &[(&str, &str)], caret_file: &str) -> (TempDir, Vec<(S
         } else {
             src.to_string()
         };
-        std::fs::write(root.join(name), clean).expect("write fixture");
+        let path = root.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        std::fs::write(path, clean).expect("write fixture");
     }
     let caret_path: PathBuf = root.join(caret_file);
     let mut server = LspServer::start(&root);
@@ -114,5 +118,72 @@ fn typescript_reports_aliased_import_binding() {
         ],
         "a.ts",
         ("b.ts", 0),
+    );
+}
+
+#[test]
+fn java_reports_import_binding() {
+    assert_import_line_reported(
+        &[
+            (
+                "Target.java",
+                "package app;\n\npublic class <caret>Target {}\n",
+            ),
+            (
+                "UseTarget.java",
+                "package app;\n\nimport app.Target;\n\npublic class UseTarget { Target value; }\n",
+            ),
+        ],
+        "Target.java",
+        ("UseTarget.java", 2),
+    );
+}
+
+#[test]
+fn rust_reports_use_binding() {
+    assert_import_line_reported(
+        &[
+            ("src/lib.rs", "pub mod target;\npub mod consumer;\n"),
+            ("src/target.rs", "pub struct <caret>Target;\n"),
+            (
+                "src/consumer.rs",
+                "use crate::target::Target;\n\nfn run(value: Target) {}\n",
+            ),
+        ],
+        "src/target.rs",
+        ("consumer.rs", 0),
+    );
+}
+
+#[test]
+fn php_reports_use_binding() {
+    assert_import_line_reported(
+        &[
+            (
+                "Target.php",
+                "<?php\nnamespace App;\n\nclass <caret>Target {}\n",
+            ),
+            (
+                "UseTarget.php",
+                "<?php\nnamespace App\\Feature;\n\nuse App\\Target;\n\nclass UseTarget { public Target $value; }\n",
+            ),
+        ],
+        "Target.php",
+        ("UseTarget.php", 3),
+    );
+}
+
+#[test]
+fn scala_reports_import_binding() {
+    assert_import_line_reported(
+        &[
+            ("Target.scala", "package app\n\nclass <caret>Target\n"),
+            (
+                "UseTarget.scala",
+                "package app.feature\n\nimport app.Target\n\nclass UseTarget(value: Target)\n",
+            ),
+        ],
+        "Target.scala",
+        ("UseTarget.scala", 2),
     );
 }

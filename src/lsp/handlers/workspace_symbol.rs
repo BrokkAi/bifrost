@@ -38,14 +38,12 @@ pub fn handle(
     } else {
         analyzer.autocomplete_definitions(&params.query)
     };
+    matches.retain(|code_unit| !code_unit.is_anonymous() && !code_unit.is_synthetic());
     matches.truncate(MAX_RESULTS);
 
     let mut content_cache = FileContentCache::default();
     let mut results = Vec::with_capacity(matches.len());
     for code_unit in matches {
-        if code_unit.is_anonymous() || code_unit.is_synthetic() {
-            continue;
-        }
         if let Some(symbol) = build_symbol(analyzer, &code_unit, &mut content_cache) {
             results.push(symbol);
         }
@@ -108,5 +106,6 @@ fn map_kind(kind: CodeUnitType) -> SymbolKind {
         CodeUnitType::Field => SymbolKind::FIELD,
         CodeUnitType::Module => SymbolKind::MODULE,
         CodeUnitType::Macro => SymbolKind::CONSTANT,
+        CodeUnitType::FileScope => SymbolKind::FILE,
     }
 }

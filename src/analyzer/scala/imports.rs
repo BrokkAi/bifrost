@@ -123,7 +123,7 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
     }
 }
 
-pub(super) fn parse_scala_import_infos(raw: &str) -> Vec<ImportInfo> {
+pub(crate) fn parse_scala_import_infos(raw: &str) -> Vec<ImportInfo> {
     let trimmed = raw
         .trim()
         .strip_prefix("import ")

@@ -314,6 +314,24 @@ impl ParsedFile {
         }
     }
 
+    pub fn add_file_scope(&mut self, file: &ProjectFile, source: &str) {
+        let code_unit = CodeUnit::file_scope(file.clone());
+        if self.declarations.contains(&code_unit) {
+            return;
+        }
+
+        self.top_level_declarations.push(code_unit.clone());
+        self.declarations.insert(code_unit.clone());
+        let line_starts = compute_line_starts(source);
+        let end_line = line_starts.len().saturating_sub(1);
+        self.ranges.entry(code_unit).or_default().push(Range {
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 0,
+            end_line,
+        });
+    }
+
     pub fn replace_code_unit(
         &mut self,
         code_unit: CodeUnit,
@@ -603,7 +621,8 @@ where
             return None;
         }
         let tree = parser.parse(source.as_str(), None)?;
-        let parsed = adapter.parse_file(file, &source, &tree);
+        let mut parsed = adapter.parse_file(file, &source, &tree);
+        parsed.add_file_scope(file, &source);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
         let mut parse_errors = Vec::new();
         collect_parse_errors(tree.root_node(), &mut parse_errors);
@@ -859,11 +878,13 @@ where
 
         for state in files.values() {
             for declaration in &state.declarations {
-                definition_lookup_index.insert(declaration);
-                definitions
-                    .entry(adapter.normalize_full_name(&declaration.fq_name()))
-                    .or_default()
-                    .push(declaration.clone());
+                if !declaration.is_file_scope() {
+                    definition_lookup_index.insert(declaration);
+                    definitions
+                        .entry(adapter.normalize_full_name(&declaration.fq_name()))
+                        .or_default()
+                        .push(declaration.clone());
+                }
                 if declaration.is_class() {
                     classes_by_package
                         .entry(declaration.package_name().to_string())
@@ -1176,7 +1197,12 @@ where
         file: &ProjectFile,
     ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
         match self.file_state(file) {
-            Some(state) => Box::new(state.top_level_declarations.iter()),
+            Some(state) => Box::new(
+                state
+                    .top_level_declarations
+                    .iter()
+                    .filter(|code_unit| !code_unit.is_file_scope()),
+            ),
             None => Box::new(std::iter::empty()),
         }
     }
@@ -1286,7 +1312,8 @@ where
             self.state
                 .files
                 .values()
-                .flat_map(|state| state.declarations.iter()),
+                .flat_map(|state| state.declarations.iter())
+                .filter(|unit| !unit.is_file_scope()),
         )
     }
 
@@ -1295,7 +1322,12 @@ where
         file: &ProjectFile,
     ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
         match self.file_state(file) {
-            Some(state) => Box::new(state.declarations.iter()),
+            Some(state) => Box::new(
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope()),
+            ),
             None => Box::new(std::iter::empty()),
         }
     }
@@ -1366,7 +1398,9 @@ where
             return None;
         }
 
-        self.declarations(file)
+        self.file_state(file)?
+            .declarations
+            .iter()
             .filter_map(|code_unit| {
                 let best_range = self
                     .ranges(code_unit)
@@ -1632,7 +1666,13 @@ where
             self.state
                 .files
                 .values()
-                .map(|state| state.declarations.len())
+                .map(|state| {
+                    state
+                        .declarations
+                        .iter()
+                        .filter(|unit| !unit.is_file_scope())
+                        .count()
+                })
                 .sum(),
         )
     }

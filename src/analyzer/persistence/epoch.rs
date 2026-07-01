@@ -277,24 +277,74 @@ macro_rules! lang_epoch {
     };
 }
 
-lang_epoch!(Java, "java", "treesitter/java/");
+lang_epoch!(
+    Java,
+    "java",
+    "treesitter/java/",
+    "synthetic-file-scope-code-units-2026-07"
+);
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
 lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07"
 );
-lang_epoch!(Cpp, "cpp", "treesitter/cpp/");
-lang_epoch!(JavaScript, "javascript", "treesitter/javascript/");
-lang_epoch!(TypeScript, "typescript", "treesitter/typescript/");
-lang_epoch!(Python, "python", "treesitter/python/");
-lang_epoch!(Rust, "rust", "treesitter/rust/");
-lang_epoch!(Php, "php", "treesitter/php/");
-lang_epoch!(Scala, "scala", "treesitter/scala/");
-lang_epoch!(CSharp, "csharp", "treesitter/c_sharp/");
-lang_epoch!(Ruby, "ruby", "treesitter/ruby/");
+lang_epoch!(
+    Cpp,
+    "cpp",
+    "treesitter/cpp/",
+    "synthetic-file-scope-code-units-2026-07"
+);
+lang_epoch!(
+    JavaScript,
+    "javascript",
+    "treesitter/javascript/",
+    "synthetic-file-scope-code-units-2026-07"
+);
+lang_epoch!(
+    TypeScript,
+    "typescript",
+    "treesitter/typescript/",
+    "synthetic-file-scope-code-units-2026-07"
+);
+lang_epoch!(
+    Python,
+    "python",
+    "treesitter/python/",
+    "synthetic-file-scope-code-units-2026-07"
+);
+lang_epoch!(
+    Rust,
+    "rust",
+    "treesitter/rust/",
+    "synthetic-file-scope-code-units-2026-07"
+);
+lang_epoch!(
+    Php,
+    "php",
+    "treesitter/php/",
+    "synthetic-file-scope-code-units-2026-07"
+);
+lang_epoch!(
+    Scala,
+    "scala",
+    "treesitter/scala/",
+    "synthetic-file-scope-code-units-2026-07"
+);
+lang_epoch!(
+    CSharp,
+    "csharp",
+    "treesitter/c_sharp/",
+    "synthetic-file-scope-code-units-2026-07"
+);
+lang_epoch!(
+    Ruby,
+    "ruby",
+    "treesitter/ruby/",
+    "synthetic-file-scope-code-units-2026-07"
+);
 
 #[cfg(test)]
 mod tests {

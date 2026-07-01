@@ -1,6 +1,8 @@
+use crate::analyzer::scala::imports::parse_scala_import_infos;
+use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::usages::scala_graph::hits::add_hit;
+use crate::analyzer::usages::scala_graph::hits::{add_hit, add_import_hit};
 use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec, Visibility};
 use crate::analyzer::usages::scala_graph::syntax::{
     call_arity_for_reference, has_ancestor_kind, has_member_qualifier, is_assignment_lhs,
@@ -8,7 +10,7 @@ use crate::analyzer::usages::scala_graph::syntax::{
     is_type_like_reference, member_qualifier, member_qualifier_node, node_text,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
@@ -45,7 +47,6 @@ pub(super) fn scan_file(
     let visibility = Visibility::for_file(scala, file, spec);
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let mut ctx = ScanCtx {
-        scala,
         analyzer,
         file,
         source: &source,
@@ -62,7 +63,6 @@ pub(super) fn scan_file(
 }
 
 pub(super) struct ScanCtx<'a> {
-    pub(super) scala: &'a ScalaAnalyzer,
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
@@ -92,7 +92,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "call_expression" {
         scan_call_expression(node, ctx);
     }
-    if is_identifier_node(node) {
+    if node.kind() == "import_declaration" {
+        scan_import_declaration(node, ctx);
+    } else if is_identifier_node(node) {
         scan_identifier(node, ctx);
     }
     let mut cursor = node.walk();
@@ -106,6 +108,52 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if enters_scope {
         ctx.bindings.exit_scope();
     }
+}
+
+fn scan_import_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !matches!(ctx.spec.kind, TargetKind::Type | TargetKind::Constructor) {
+        return;
+    }
+    let matching_names = matching_names_for_import_declaration(node, ctx);
+    if matching_names.is_empty() {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        scan_import_declaration_identifier(child, ctx, &matching_names);
+    }
+}
+
+fn scan_import_declaration_identifier(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    matching_names: &HashSet<String>,
+) {
+    walk_tree_iterative(
+        node,
+        ctx,
+        |current, ctx| {
+            if is_identifier_node(current) {
+                let text = node_text(current, ctx.source).trim();
+                if !text.is_empty() && matching_names.contains(text) {
+                    add_import_hit(current, ctx);
+                }
+            }
+            TreeWalkAction::Descend
+        },
+        |_| {},
+    );
+}
+
+fn matching_names_for_import_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> HashSet<String> {
+    let import_text = node_text(node, ctx.source);
+    let mut names = HashSet::default();
+    for import in parse_scala_import_infos(import_text) {
+        let matched = Visibility::matching_import_names(&import, ctx.spec);
+        names.extend(matched.type_names);
+        names.extend(matched.owner_names);
+    }
+    names
 }
 
 fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

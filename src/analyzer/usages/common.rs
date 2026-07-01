@@ -1,6 +1,7 @@
 use crate::analyzer::common as analyzer_common;
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use std::collections::BTreeSet;
 use tree_sitter::Node;
 
 /// Graph-strategy hits land at maximum confidence.
@@ -44,6 +45,22 @@ pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .get(node.start_byte()..node.end_byte())
         .unwrap_or_default()
         .trim()
+}
+
+pub(super) fn reclassify_import_hit_at(
+    hits: &mut BTreeSet<UsageHit>,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+) {
+    if let Some(hit) = hits
+        .iter()
+        .find(|hit| hit.file == *file && hit.start_offset == start && hit.end_offset == end)
+        .cloned()
+    {
+        hits.remove(&hit);
+        hits.insert(hit.into_import());
+    }
 }
 
 pub(super) enum TreeWalkAction {

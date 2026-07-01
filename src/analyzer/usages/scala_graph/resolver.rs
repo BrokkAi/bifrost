@@ -148,9 +148,17 @@ impl Visibility {
     }
 
     fn apply_import(&mut self, import: &ImportInfo, spec: &TargetSpec) {
+        let names = Self::matching_import_names(import, spec);
+        self.type_names.extend(names.type_names);
+        self.owner_names.extend(names.owner_names);
+        self.direct_member_names.extend(names.direct_member_names);
+    }
+
+    pub(super) fn matching_import_names(import: &ImportInfo, spec: &TargetSpec) -> ImportNames {
         let Some(path) = scala_import_path(import) else {
-            return;
+            return ImportNames::default();
         };
+        let mut names = ImportNames::default();
         let local_name = import
             .identifier
             .as_deref()
@@ -158,9 +166,9 @@ impl Visibility {
             .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()).to_string());
         if import.is_wildcard {
             if path == spec.target.package_name() {
-                self.type_names.insert(spec.member_name.clone());
+                names.type_names.insert(spec.member_name.clone());
                 if spec.owner.is_none() {
-                    self.direct_member_names.insert(spec.member_name.clone());
+                    names.direct_member_names.insert(spec.member_name.clone());
                 }
             }
             if spec
@@ -169,36 +177,44 @@ impl Visibility {
                 .is_some_and(|owner| path == owner.package_name())
                 && let Some(owner_name) = spec.owner_name.as_ref()
             {
-                self.owner_names.insert(owner_name.clone());
+                names.owner_names.insert(owner_name.clone());
             }
             if spec
                 .owner_fq_name
                 .as_ref()
                 .is_some_and(|owner_fq| path == *owner_fq)
             {
-                self.direct_member_names.insert(spec.member_name.clone());
+                names.direct_member_names.insert(spec.member_name.clone());
             }
-            return;
+            return names;
         }
 
         let normalized = scala_normalized_fq_name(&path);
         if normalized == spec.target_fq_name {
-            self.type_names.insert(local_name.clone());
+            names.type_names.insert(local_name.clone());
         }
         if spec
             .owner_fq_name
             .as_ref()
             .is_some_and(|owner_fq| normalized == *owner_fq)
         {
-            self.owner_names.insert(local_name.clone());
+            names.owner_names.insert(local_name.clone());
             if spec.kind == TargetKind::Constructor {
-                self.type_names.insert(local_name.clone());
+                names.type_names.insert(local_name.clone());
             }
         }
         if normalized == spec.target_fq_name && spec.kind != TargetKind::Type {
-            self.direct_member_names.insert(local_name);
+            names.direct_member_names.insert(local_name);
         }
+        names
     }
+}
+
+#[derive(Default)]
+pub(super) struct ImportNames {
+    pub(super) type_names: HashSet<String>,
+    pub(super) owner_names: HashSet<String>,
+    pub(super) direct_member_names: HashSet<String>,
 }
 
 fn ambiguous_wildcard_members(
@@ -256,7 +272,7 @@ pub(in crate::analyzer::usages) fn package_name_of(
 ) -> Option<String> {
     scala
         .declarations(file)
-        .next()
+        .find(|unit| !unit.is_file_scope())
         .map(|unit| unit.package_name().to_string())
 }
 

@@ -1,3 +1,4 @@
+use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::java_graph::hits;
 use crate::analyzer::usages::java_graph::resolver::{
     TargetKind, TargetSpec, argument_list_arity, has_proven_static_import, infer_type_from_value,
@@ -108,7 +109,11 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         seed_inline_declarations(node, ctx);
     }
 
-    maybe_record_hit(node, ctx);
+    if node.kind() == "import_declaration" {
+        maybe_record_import_hit(node, ctx);
+    } else {
+        maybe_record_hit(node, ctx);
+    }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -245,6 +250,29 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     hits::push_hit(node, ctx);
+}
+
+fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.spec.kind != TargetKind::Type {
+        return;
+    }
+    walk_tree_iterative(
+        node,
+        ctx,
+        |current, ctx| {
+            if matches!(
+                current.kind(),
+                "type_identifier" | "scoped_type_identifier" | "scoped_identifier" | "identifier"
+            ) && resolve_type_from_node(current, ctx)
+                .is_some_and(|resolved| resolved == ctx.spec.owner)
+            {
+                hits::push_import_hit(current, ctx);
+                return TreeWalkAction::Skip;
+            }
+            TreeWalkAction::Descend
+        },
+        |_| {},
+    );
 }
 
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

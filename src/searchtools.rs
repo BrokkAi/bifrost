@@ -4450,6 +4450,7 @@ fn display_signatures(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Str
             .signature()
             .map(str::to_string)
             .unwrap_or_else(|| display_identifier_for_target(code_unit).to_string()),
+        CodeUnitType::FileScope => display_identifier_for_target(code_unit).to_string(),
     };
     vec![fallback]
 }
@@ -4528,6 +4529,7 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
         CodeUnitType::Field => "field",
         CodeUnitType::Module => "module",
         CodeUnitType::Macro => "macro",
+        CodeUnitType::FileScope => "file scope",
     }
 }
 

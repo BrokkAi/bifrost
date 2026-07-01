@@ -35,6 +35,42 @@ fn hit_snippets(result: FuzzyResult) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn scala_import_hits_ignore_unrelated_aliased_import_path() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("Target.scala", "package app\n\nclass Target\n"),
+        ("OtherTarget.scala", "package other\n\nclass Target\n"),
+        (
+            "Consumer.scala",
+            r#"
+package app.feature
+
+import app.Target
+import other.Target as OtherTarget
+
+class Consumer(value: Target, other: OtherTarget)
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "app.Target");
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+    let editor_hits = result.all_hits_including_imports();
+
+    assert!(
+        editor_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("import app.Target")),
+        "expected target import hit: {editor_hits:#?}"
+    );
+    assert!(
+        editor_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("import other.Target as OtherTarget")),
+        "unrelated aliased import must not be reported as target hit: {editor_hits:#?}"
+    );
+}
+
 fn hits(result: FuzzyResult) -> Vec<UsageHit> {
     result
         .into_either()

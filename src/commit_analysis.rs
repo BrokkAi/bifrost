@@ -700,6 +700,7 @@ fn kind_name(kind: CodeUnitType) -> &'static str {
         CodeUnitType::Field => "field",
         CodeUnitType::Module => "module",
         CodeUnitType::Macro => "macro",
+        CodeUnitType::FileScope => "file scope",
     }
 }
 

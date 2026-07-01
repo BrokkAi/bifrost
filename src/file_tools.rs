@@ -578,6 +578,7 @@ fn code_unit_kind_label(code_unit: &crate::analyzer::CodeUnit) -> String {
         CodeUnitType::Field => "field".to_string(),
         CodeUnitType::Module => "module".to_string(),
         CodeUnitType::Macro => "macro".to_string(),
+        CodeUnitType::FileScope => "file scope".to_string(),
     }
 }
 

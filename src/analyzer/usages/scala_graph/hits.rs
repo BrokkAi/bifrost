@@ -1,6 +1,6 @@
-use crate::analyzer::usages::common::usage_hit;
+use crate::analyzer::Range;
+use crate::analyzer::usages::common::{reclassify_import_hit_at, usage_hit};
 use crate::analyzer::usages::scala_graph::extractor::ScanCtx;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
 use crate::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
 
@@ -20,10 +20,7 @@ pub(super) fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let enclosing = if let Some(cached) = ctx.enclosing_cache.get(&cache_key) {
         cached.clone()
     } else {
-        let resolved = ctx
-            .analyzer
-            .enclosing_code_unit(ctx.file, &range)
-            .or_else(|| nearest_declaration(ctx.scala, ctx.file));
+        let resolved = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
         ctx.enclosing_cache.insert(cache_key, resolved.clone());
         resolved
     };
@@ -49,14 +46,15 @@ pub(super) fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+pub(super) fn add_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    add_hit(node, ctx);
+    reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+}
+
 fn range_within_any(ranges: &[Range], needle: &Range) -> bool {
     ranges
         .iter()
         .any(|range| range.start_byte <= needle.start_byte && needle.end_byte <= range.end_byte)
-}
-
-fn nearest_declaration(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<CodeUnit> {
-    scala.declarations(file).next().cloned()
 }
 
 fn snippet_around(source: &str, line_starts: &[usize], one_based_line: usize) -> String {
