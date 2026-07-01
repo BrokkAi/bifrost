@@ -133,7 +133,6 @@ fn self_attribute_reference() {
 // construction receiver `Foo()` to `def bar` (line 1). Analogous to the Java
 // method-call-receiver case.
 #[test]
-#[ignore = "bifrost gap: member access on a construction receiver (Foo().bar) is not resolved"]
 fn method_on_construction_receiver() {
     assert_resolves_to_line(
         "QualifiedFunc.py",

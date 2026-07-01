@@ -320,20 +320,33 @@ fn python_receiver_type_unit(
     root: Node<'_>,
     object: Node<'_>,
 ) -> Option<CodeUnit> {
-    if object.kind() != "identifier" {
-        return None;
+    match object.kind() {
+        "identifier" => {
+            let receiver = python_slice(object, source);
+            if let Some(unit) =
+                python_self_receiver_type(analyzer, py, file, root, object, receiver)
+            {
+                return Some(unit);
+            }
+            let facts_by_scope = collect_scope_facts(analyzer, file, &[], "", true);
+            let facts = enclosing_scope_facts(analyzer, file, &facts_by_scope, object)?;
+            let raw_type = facts
+                .resolution_for(receiver)
+                .as_precise()
+                .and_then(|targets| targets.iter().next().cloned())?;
+            resolve_python_receiver_type(analyzer, file, &raw_type, false)
+        }
+        // A construction receiver `Foo().bar` is typed by the class being called.
+        "call" => {
+            let function = object.child_by_field_name("function")?;
+            if function.kind() != "identifier" {
+                return None;
+            }
+            let name = python_slice(function, source);
+            resolve_python_receiver_type(analyzer, file, name, false)
+        }
+        _ => None,
     }
-    let receiver = python_slice(object, source);
-    if let Some(unit) = python_self_receiver_type(analyzer, py, file, root, object, receiver) {
-        return Some(unit);
-    }
-    let facts_by_scope = collect_scope_facts(analyzer, file, &[], "", true);
-    let facts = enclosing_scope_facts(analyzer, file, &facts_by_scope, object)?;
-    let raw_type = facts
-        .resolution_for(receiver)
-        .as_precise()
-        .and_then(|targets| targets.iter().next().cloned())?;
-    resolve_python_receiver_type(analyzer, file, &raw_type, false)
 }
 
 fn python_self_receiver_type(
