@@ -1107,6 +1107,101 @@ end
 }
 
 #[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app.rb",
+        r#"class Service
+  def self.build
+    Service.new
+  end
+
+  def run
+  end
+end
+
+class Other
+  def run
+  end
+end
+
+class App
+  def via_factory
+    service = Service.build
+    service.run
+  end
+end
+"#,
+    )]);
+
+    let service_run = definition(&analyzer, "Service.run");
+    let service_hits = analyzer
+        .find_usages(&[service_run])
+        .into_either()
+        .expect("Service.run lookup should succeed");
+    let service_lines = hit_source_lines(&service_hits);
+    assert!(
+        service_lines.iter().any(|line| line == "service.run"),
+        "{service_lines:?}"
+    );
+
+    let other_run = definition(&analyzer, "Other.run");
+    let other_query = UsageFinder::new().query(&analyzer, &[other_run], 100, 100);
+    if let Ok(other_hits) = other_query.result.into_either() {
+        let other_lines = hit_source_lines(&other_hits);
+        assert!(
+            !other_lines.iter().any(|line| line == "service.run"),
+            "factory receiver must not fall back to same-name Other.run: {other_lines:?}"
+        );
+    }
+}
+
+#[test]
+fn ambiguous_factory_receiver_emits_no_partial_edge() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app.rb",
+        r#"class Service
+  def run
+  end
+end
+
+class Other
+  def run
+  end
+end
+
+class Factory
+  def self.build(flag)
+    if flag
+      Service.new
+    else
+      Other.new
+    end
+  end
+end
+
+class App
+  def run(flag)
+    service = Factory.build(flag)
+    service.run
+  end
+end
+"#,
+    )]);
+
+    for target_fqn in ["Service.run", "Other.run"] {
+        let target = definition(&analyzer, target_fqn);
+        let query = UsageFinder::new().query(&analyzer, &[target], 100, 100);
+        if let Ok(hits) = query.result.into_either() {
+            let lines = hit_source_lines(&hits);
+            assert!(
+                !lines.iter().any(|line| line == "service.run"),
+                "ambiguous factory receiver must not emit partial {target_fqn} hit: {lines:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn resolves_multi_argument_mixin_usage_precedence() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app.rb",
