@@ -108,19 +108,12 @@ enum RubyReferenceNode<'tree> {
     Variable(Node<'tree>),
 }
 
-fn ruby_reference_node(mut node: Node<'_>) -> Option<RubyReferenceNode<'_>> {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == "scope_resolution" {
-            if is_assignment_lhs_owner_scope(node, parent) {
-                break;
-            }
-            node = parent;
-        } else {
-            break;
-        }
-    }
+fn ruby_reference_node(node: Node<'_>) -> Option<RubyReferenceNode<'_>> {
     match node.kind() {
-        "constant" | "scope_resolution" => Some(RubyReferenceNode::Constant(node)),
+        "constant" => Some(RubyReferenceNode::Constant(ruby_focused_constant_path(
+            node,
+        ))),
+        "scope_resolution" => Some(RubyReferenceNode::Constant(node)),
         "instance_variable" | "class_variable" => Some(RubyReferenceNode::Variable(node)),
         "identifier" => {
             if ruby_is_call_method_identifier(node) {
@@ -152,22 +145,22 @@ fn ruby_reference_node(mut node: Node<'_>) -> Option<RubyReferenceNode<'_>> {
     }
 }
 
-fn is_assignment_lhs_owner_scope(child: Node<'_>, parent: Node<'_>) -> bool {
-    parent.child_by_field_name("scope") == Some(child)
-        && scope_resolution_chain_is_assignment_left(parent)
-}
-
-fn scope_resolution_chain_is_assignment_left(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == "assignment" {
-            return parent.child_by_field_name("left") == Some(node);
-        }
-        if parent.kind() != "scope_resolution" {
-            return false;
-        }
-        node = parent;
+/// Resolve a constant path *up to and including* the focused segment: clicking
+/// `Foo` in `Foo::Bar::Baz` targets `Foo`, `Bar` targets `Foo::Bar`, and `Baz`
+/// targets the whole path. tree-sitter nests `scope_resolution` to the left, so a
+/// segment's enclosing path is its parent `scope_resolution` exactly when the
+/// segment is that node's terminal `name` (a left `scope` segment resolves to just
+/// the constant). This also covers assignment-LHS chains, whose leftmost scope
+/// segment naturally resolves to itself.
+fn ruby_focused_constant_path(node: Node<'_>) -> Node<'_> {
+    if let Some(parent) = node.parent()
+        && parent.kind() == "scope_resolution"
+        && parent.child_by_field_name("name") == Some(node)
+    {
+        parent
+    } else {
+        node
     }
-    false
 }
 
 fn ruby_constant_outcome(
