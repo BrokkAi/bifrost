@@ -121,3 +121,62 @@ fn type_reference_resolves_to_class() {
         0,
     );
 }
+
+// IntelliJ method/Simple: `a.method("blah")` where `a` is a `Simple` resolves to
+// `method(String)` (line 1).
+#[test]
+fn method_call_on_typed_local() {
+    assert_resolves_to_line(
+        "Simple.java",
+        "public class Simple {\n    public void method(String s) {\n    }\n\n    static {\n        Simple a = new Simple();\n        a.<caret>method(\"blah\");\n    }\n}\n",
+        1,
+    );
+}
+
+// IntelliJ method/Super1: `super.askdh()` in `Super1 extends A` resolves to
+// `A.askdh` (line 1).
+#[test]
+fn super_method_call_resolves_to_superclass() {
+    assert_resolves_to_line(
+        "Super1.java",
+        "class A{\n public void askdh(){\n }\n}\n\nclass Super1 extends A{\n {\n  super.<caret>askdh();\n }\n}\n",
+        1,
+    );
+}
+
+// IntelliJ method/Inherit1: `super.askdh()` in `Super1 extends B` (B extends A,
+// B overrides askdh) resolves to the nearest override `B.askdh` (line 7).
+#[test]
+fn super_method_call_resolves_to_nearest_override() {
+    assert_resolves_to_line(
+        "Inherit1.java",
+        "class A{\n public int askdh(){\n  return 1;\n }\n}\n\nclass B extends A{\n public void askdh(){\n  return 2;\n }\n}\n\nclass Super1 extends B{\n {\n  super.<caret>askdh();\n }\n}\n",
+        7,
+    );
+}
+
+// IntelliJ class/ClassExtendsItsInner1: `class A extends B.Foo` resolves the
+// qualified nested class `B.Foo` (the `static class Foo`, line 4).
+#[test]
+#[ignore = "bifrost gap: a qualified nested-class reference (B.Foo) in an extends clause is not resolved"]
+fn qualified_nested_class_reference() {
+    assert_resolves_to_line(
+        "ClassExtendsItsInner1.java",
+        "class A extends B.<caret>Foo implements B{\n}\n\ninterface B{\n  static class Foo{\n  }\n}\n",
+        4,
+    );
+}
+
+// IntelliJ var/InheritedOuter: a bare `string` reference inside `Inner extends
+// Outer` resolves to the outer class field `Outer.string` (line 1). bifrost
+// resolves qualified field access (`this.f`, `x.f`) but not a bare, unqualified
+// field name that binds to an enclosing/inherited class field.
+#[test]
+#[ignore = "bifrost gap: bare (unqualified) field references are not resolved (only qualified field access)"]
+fn bare_inherited_outer_field() {
+    assert_resolves_to_line(
+        "InheritedOuter.java",
+        "class Outer {\n  private String string;\n\n  class Inner extends Outer {\n    void test() {\n      System.out.println(<caret>string);\n    }\n  }\n}\n",
+        1,
+    );
+}

@@ -93,3 +93,35 @@ fn inherited_method_usage() {
         &[6],
     );
 }
+
+// Cross-class method usage: a method called on an instance of another class,
+// via a typed local receiver.
+#[test]
+fn cross_class_method_usage() {
+    assert_reference_lines(
+        "CrossClassMethod.java",
+        "class Service {\n  void <caret>handle() {}\n}\n\nclass Caller {\n  void run() {\n    Service s = new Service();\n    s.handle();\n  }\n}\n",
+        &[7],
+    );
+}
+
+// Static field usage: a static field read from another class via the class name.
+#[test]
+fn static_field_usage() {
+    assert_reference_lines(
+        "StaticFieldUsage.java",
+        "class Config {\n  static int <caret>LIMIT = 10;\n}\n\nclass User {\n  int read() {\n    return Config.LIMIT;\n  }\n}\n",
+        &[6],
+    );
+}
+
+// Constructor / class usage across classes: `new Widget()` and a `Widget` type
+// reference from another class.
+#[test]
+fn cross_class_construction_usage() {
+    assert_reference_lines(
+        "CrossClassCtor.java",
+        "class <caret>Widget {}\n\nclass Factory {\n  Widget make() {\n    return new Widget();\n  }\n}\n",
+        &[3, 4],
+    );
+}
