@@ -1099,21 +1099,32 @@ fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
 
     let body = function.child_by_field_name("body")?;
     let mut candidates = HashSet::default();
+    let mut saw_return = false;
+    let mut saw_unknown_return = false;
     let mut stack = vec![body];
     while let Some(node) = stack.pop() {
         if node != body && matches!(node.kind(), "function_definition" | "class_definition") {
             continue;
         }
-        if node.kind() == "return_statement"
-            && let Some(value) = node.named_child(0)
-            && let Some(returned_type) = returned_receiver_type(value, source)
-        {
-            candidates.insert(returned_type);
+        if node.kind() == "return_statement" {
+            saw_return = true;
+            match node
+                .named_child(0)
+                .and_then(|value| returned_receiver_type(value, source))
+            {
+                Some(returned_type) => {
+                    candidates.insert(returned_type);
+                }
+                None => saw_unknown_return = true,
+            }
         }
         let mut cursor = node.walk();
         let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         children.reverse();
         stack.extend(children);
+    }
+    if !saw_return || saw_unknown_return {
+        return None;
     }
     (candidates.len() == 1)
         .then(|| candidates.into_iter().next())

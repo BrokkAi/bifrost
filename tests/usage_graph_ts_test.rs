@@ -273,3 +273,31 @@ export function caller(flag: boolean) {
         graph["edges"]
     );
 }
+
+#[test]
+fn ts_hidden_factory_declaration_does_not_type_unrelated_call() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service { run() {} }
+export class Other { run() {} }
+function hidden() {
+  function make() { return new Service(); }
+  return make;
+}
+export function caller() {
+  const service = make();
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&graph, "caller", "Service.run") && !has_edge(&graph, "caller", "Other.run"),
+        "hidden non-visible factory must not type caller's receiver: {}",
+        graph["edges"]
+    );
+}

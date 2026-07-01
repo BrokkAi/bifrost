@@ -27,6 +27,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T12:01Z) Add budget, ambiguity, and performance instrumentation tests.
 - [x] (2026-07-01T12:10Z) Run final focused validation, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
 - [x] (2026-07-01T12:22Z) Address guided-review findings for JS/TS lexical scoping, Java summary safety, Rust source-order scoping, and receiver outcome merge duplication.
+- [x] (2026-07-01T12:55Z) Address second guided-review findings for JS/TS factory visibility, Python partial returns, C# overload arity, Scala overload maps, and receiver cache keys.
 
 ## Surprises & Discoveries
 
@@ -87,6 +88,21 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: Guided review found that Rust receiver facts were collected function-wide before traversal reached each `let`.
   Evidence: `src/analyzer/usages/rust_graph/inverted.rs` previously populated one `receiver_types` map for every `let` in a function body before any method call was handled.
 
+- Observation: The second guided review found that JS/TS factory summaries indexed same-name functions/classes without checking whether the declaration was visible at the call site.
+  Evidence: `src/analyzer/usages/js_ts_graph/receiver_analysis.rs` now filters function and class declarations through lexical scope ancestry and includes the `program` root as the file scope.
+
+- Observation: The second guided review found that Python factory summaries could treat a known return branch as precise even when another branch returned an unsupported value.
+  Evidence: `src/analyzer/usages/python_graph/extractor.rs` now records whether any return was unknown and refuses the factory summary unless every return is structurally typed.
+
+- Observation: The second guided review found that C# factory-return typing did not account for overload arity and could reuse return facts across incompatible file contexts.
+  Evidence: `src/analyzer/usages/csharp_graph/resolver.rs` now exposes `method_return_type_fq_name_for_arity`, and `src/analyzer/usages/csharp_graph/inverted.rs` caches by file, owner, method, and arity.
+
+- Observation: The second guided review found that Scala factory returns were stored in a single-value map keyed only by owner and method name.
+  Evidence: `src/analyzer/usages/scala_graph/inverted.rs` now stores a set of return owners for each factory key and only seeds a receiver when the set has exactly one value.
+
+- Observation: The second guided review found that receiver cache keys did not include the full budget identity.
+  Evidence: `src/analyzer/usages/receiver_analysis.rs` now includes `max_summary_expansions` and `max_scope_nodes` in `ReceiverAnalysisCacheKey`.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -136,6 +152,8 @@ Final validation complete. Focused suites passed: `cargo test --lib receiver_ana
 All target usage-graph languages now have #394-shaped object-sensitive receiver coverage: JS/TS, Java, C#, C++, Go, PHP, Python, Ruby, Rust, and Scala. JS/TS is the shared-provider proof point across both usage graph and `get_definition`; the remaining backends gained equivalent bounded graph-facing receiver facts through their existing language graph layers. Budget behavior is explicit in shared and JS/TS provider tests: tiny scope budgets return `ExceededBudget`, fanout above the default target cap becomes `Ambiguous`, and graph tests prove those exits do not produce partial same-name edges. Deferred follow-up work includes migrating every backend fully behind the shared provider trait, adding deeper interprocedural summaries, and exploring CFG/path-sensitive or pushdown-style analysis only if monitoring shows the bounded model is insufficient.
 
 Guided-review follow-up complete. JS/TS receiver lookup now resolves identifier bindings through visible lexical scope ancestry, pre-indexes file-local functions/classes when the provider is constructed, and shares the branch-outcome merge policy from `receiver_analysis.rs`. Java receiver summaries now use declared return types and cache method return lookups instead of interpreting callee bodies with caller-local bindings. Rust receiver facts are seeded incrementally by traversal scope, so later or inner-block `let` bindings cannot type earlier or outer receiver calls. Added regressions for TS block-local receiver shadowing, Java caller-binding leakage and recursive factory safety, and Rust block-local receiver shadowing. Validation after review fixes: `cargo test --lib receiver_analysis`, `cargo test --test usage_graph_ts_test`, `cargo test --test usage_graph_java_test`, `cargo test --test usage_graph_rust_test`, `cargo test --test usages_js_ts_graph_test`, `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition`, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check` all passed.
+
+Second guided-review follow-up complete. JS/TS factory and class summaries now require declaration visibility at the call site, Python factory bodies fail closed when any return branch is unknown, C# method-return inference is arity-aware and avoids cross-file cache reuse, Scala factory summaries preserve overloaded return ambiguity, and receiver cache keys include all budget dimensions. Added regressions for hidden JS/TS factories, partially unknown Python returns, C# overloaded factories, and Scala overloaded factories. Focused validation after these fixes passed: `cargo test --lib receiver_analysis`, `cargo test --test usage_graph_ts_test`, `cargo test --test usage_graph_test`, `cargo test --test usage_graph_csharp_test`, `cargo test --test usage_graph_scala_test`, `cargo test --test usage_graph_java_test`, `cargo test --test usage_graph_php_test`, `cargo test --test usages_js_ts_graph_test`, and `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition`. Final gates after the second review also passed: `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
 
 ## Context and Orientation
 

@@ -233,6 +233,8 @@ pub(crate) struct ReceiverAnalysisCacheKey {
     pub(crate) member_name: Option<String>,
     pub(crate) context_depth: usize,
     pub(crate) max_targets: usize,
+    pub(crate) max_summary_expansions: usize,
+    pub(crate) max_scope_nodes: usize,
 }
 
 impl ReceiverAnalysisCacheKey {
@@ -250,6 +252,8 @@ impl ReceiverAnalysisCacheKey {
             member_name: query.member_name.map(str::to_string),
             context_depth: query.context.context_depth,
             max_targets: query.budget.max_targets,
+            max_summary_expansions: query.budget.max_summary_expansions,
+            max_scope_nodes: query.budget.max_scope_nodes,
         }
     }
 }
@@ -505,6 +509,11 @@ mod tests {
         assert_eq!(key.member_name.as_deref(), Some("run"));
         assert_eq!(key.context_depth, DEFAULT_RECEIVER_CONTEXT_DEPTH);
         assert_eq!(key.max_targets, DEFAULT_RECEIVER_MAX_TARGETS);
+        assert_eq!(
+            key.max_summary_expansions,
+            DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS
+        );
+        assert_eq!(key.max_scope_nodes, DEFAULT_RECEIVER_MAX_SCOPE_NODES);
     }
 
     #[test]

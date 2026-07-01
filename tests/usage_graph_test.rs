@@ -295,3 +295,39 @@ class Consumer:
         value["edges"]
     );
 }
+
+#[test]
+fn partially_unknown_factory_return_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    def run(self):
+        pass
+
+class Other:
+    def run(self):
+        pass
+
+def make(flag):
+    if flag:
+        return Service()
+    return None
+
+class Consumer:
+    def partial(self, flag):
+        svc = make(flag)
+        svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "app.Consumer.partial", "app.Service.run")
+            && !has_edge(&value, "app.Consumer.partial", "app.Other.run"),
+        "partially unknown factory receiver must not emit partial name-only edges: {}",
+        value["edges"]
+    );
+}

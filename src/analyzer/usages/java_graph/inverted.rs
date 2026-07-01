@@ -27,7 +27,7 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
-use std::cell::RefCell;
+use std::sync::Mutex;
 use tree_sitter::{Node, Parser};
 
 pub(super) fn build_java_edges<F>(
@@ -41,6 +41,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_java::LANGUAGE.into();
+    let return_type_cache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = JavaScan {
@@ -49,7 +50,7 @@ where
                 source: parsed.source.as_str(),
                 root: parsed.tree.root_node(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
-                return_type_cache: RefCell::new(HashMap::default()),
+                return_type_cache: &return_type_cache,
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -64,7 +65,7 @@ struct JavaScan<'a, 'b> {
     source: &'a str,
     root: Node<'a>,
     class_ranges: ClassRangeIndex,
-    return_type_cache: RefCell<HashMap<(ProjectFile, String), ReceiverAnalysisOutcome<String>>>,
+    return_type_cache: &'a Mutex<HashMap<(ProjectFile, String), ReceiverAnalysisOutcome<String>>>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -421,12 +422,19 @@ fn method_unit_declared_return_type(
     ctx: &JavaScan<'_, '_>,
 ) -> ReceiverAnalysisOutcome<String> {
     let cache_key = (method.source().clone(), method.fq_name());
-    if let Some(cached) = ctx.return_type_cache.borrow().get(&cache_key).cloned() {
+    if let Some(cached) = ctx
+        .return_type_cache
+        .lock()
+        .expect("java return type cache poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
         return cached;
     }
     let outcome = method_unit_declared_return_type_uncached(method, ctx);
     ctx.return_type_cache
-        .borrow_mut()
+        .lock()
+        .expect("java return type cache poisoned")
         .insert(cache_key, outcome.clone());
     outcome
 }

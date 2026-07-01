@@ -166,7 +166,7 @@ where
 struct ScalaScan<'a, 'b> {
     source: &'a str,
     resolver: &'a NameResolver,
-    factory_returns: HashMap<String, String>,
+    factory_returns: HashMap<String, HashSet<String>>,
     class_ranges: ClassRangeIndex,
     collector: &'a mut EdgeCollector<'b>,
 }
@@ -421,25 +421,31 @@ fn call_result_type(
             let method = node_text(field, ctx.source);
             ctx.factory_returns
                 .get(&format!("{owner}.{method}"))
-                .cloned()
+                .and_then(single_factory_return)
         }
         "identifier" => {
             let method = node_text(function, ctx.source);
             let owner = ctx.enclosing_class(function.start_byte())?;
             ctx.factory_returns
                 .get(&format!("{owner}.{method}"))
-                .cloned()
+                .and_then(single_factory_return)
         }
         _ => None,
     }
+}
+
+fn single_factory_return(returns: &HashSet<String>) -> Option<String> {
+    let mut iter = returns.iter();
+    let first = iter.next()?;
+    iter.next().is_none().then(|| first.clone())
 }
 
 fn collect_factory_return_types(
     root: Node<'_>,
     source: &str,
     resolver: &NameResolver,
-) -> HashMap<String, String> {
-    let mut returns = HashMap::default();
+) -> HashMap<String, HashSet<String>> {
+    let mut returns: HashMap<String, HashSet<String>> = HashMap::default();
     let mut stack = vec![(root, None::<String>)];
     while let Some((node, owner)) = stack.pop() {
         match node.kind() {
@@ -455,7 +461,10 @@ fn collect_factory_return_types(
                     && let Some(return_type) = node.child_by_field_name("return_type")
                     && let Some(return_fqn) = resolver.resolve(node_text(return_type, source))
                 {
-                    returns.insert(format!("{owner}.{}", node_text(name, source)), return_fqn);
+                    returns
+                        .entry(format!("{owner}.{}", node_text(name, source)))
+                        .or_default()
+                        .insert(return_fqn);
                 }
             }
             _ => push_children_with_owner(node, owner, &mut stack),

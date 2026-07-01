@@ -43,6 +43,7 @@ use crate::analyzer::{
     resolve_php_function, resolve_php_type,
 };
 use crate::hash::{HashMap, HashSet};
+use std::sync::Mutex;
 use tree_sitter::Node;
 
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
@@ -58,6 +59,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_php::LANGUAGE_PHP.into();
+    let return_type_cache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let ctx = php.file_context_from_source(file, parsed.source.as_str());
@@ -66,7 +68,7 @@ where
                 ctx,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
-                return_type_cache: HashMap::default(),
+                return_type_cache: &return_type_cache,
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -80,7 +82,7 @@ struct PhpScan<'a, 'b> {
     ctx: PhpFileContext,
     source: &'a str,
     class_ranges: ClassRangeIndex,
-    return_type_cache: HashMap<String, Option<String>>,
+    return_type_cache: &'a Mutex<HashMap<String, Option<String>>>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -302,7 +304,12 @@ fn declared_callable_return_type_fqn(
     scan: &mut PhpScan<'_, '_>,
     callable_fqn: &str,
 ) -> Option<String> {
-    if let Some(cached) = scan.return_type_cache.get(callable_fqn) {
+    if let Some(cached) = scan
+        .return_type_cache
+        .lock()
+        .expect("php return type cache poisoned")
+        .get(callable_fqn)
+    {
         return cached.clone();
     }
 
@@ -317,6 +324,8 @@ fn declared_callable_return_type_fqn(
         declared_return_type_fqn(scan.php, callable)
     });
     scan.return_type_cache
+        .lock()
+        .expect("php return type cache poisoned")
         .insert(callable_fqn.to_string(), resolved.clone());
     resolved
 }

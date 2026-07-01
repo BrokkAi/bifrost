@@ -320,3 +320,42 @@ class Consumer {
         value["edges"]
     );
 }
+
+#[test]
+fn overloaded_factory_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/App.scala",
+            r#"package example
+
+class Service {
+  def run(): Int = 1
+}
+
+class Other {
+  def run(): Int = 2
+}
+
+object Factory {
+  def make(value: Int): Service = new Service()
+  def make(value: String): Other = new Other()
+}
+
+class Consumer {
+  def caller(): Int = {
+    val service = Factory.make(1)
+    service.run()
+  }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "example.Consumer.caller", "example.Service.run")
+            && !has_edge(&value, "example.Consumer.caller", "example.Other.run"),
+        "overloaded factory receiver must not choose a same-arity return type by traversal order: {}",
+        value["edges"]
+    );
+}

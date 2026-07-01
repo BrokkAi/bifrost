@@ -336,6 +336,51 @@ public class Consumer {
 }
 
 #[test]
+fn overloaded_factory_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Service.cs",
+            "namespace Example;\npublic class Service { public void Run() {} }\n",
+        )
+        .file(
+            "Other.cs",
+            "namespace Example;\npublic class Other { public void Run() {} }\n",
+        )
+        .file(
+            "Consumer.cs",
+            r#"
+namespace Example;
+
+public class Factory {
+    public Service Make(int value) {
+        return new Service();
+    }
+
+    public Other Make(string value) {
+        return new Other();
+    }
+}
+
+public class Consumer {
+    public void Caller(Factory factory) {
+        var service = factory.Make(1);
+        service.Run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "Example.Consumer.Caller", "Example.Service.Run")
+            && !has_edge(&value, "Example.Consumer.Caller", "Example.Other.Run"),
+        "overloaded factory receiver must not choose a same-arity return type by declaration order: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scoped_usage_graph_skips_unrelated_invalid_csharp_callers() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

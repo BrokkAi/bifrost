@@ -19,16 +19,20 @@
 
 use super::extractor::{is_declaration_name, member_access_name, member_access_receiver};
 use super::resolver::{
-    first_type_child, is_type_reference_node, method_return_type_fq_name, node_text,
-    normalize_type_text, reference_type_text,
+    argument_count, first_type_child, is_type_reference_node, method_return_type_fq_name_for_arity,
+    node_text, normalize_type_text, reference_type_text,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{CSharpAnalyzer, IAnalyzer, ProjectFile};
-use crate::hash::HashSet;
+use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile};
+use crate::hash::{HashMap, HashSet};
+use std::sync::Mutex;
 use tree_sitter::Node;
+
+type MethodReturnCacheKey = (ProjectFile, String, String, usize);
+type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, Option<String>>>;
 
 pub(super) fn build_csharp_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -41,6 +45,13 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_c_sharp::LANGUAGE.into();
+    let class_units: HashMap<String, CodeUnit> = csharp
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.is_class())
+        .map(|unit| (unit.fq_name(), unit))
+        .collect();
+    let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = CsScan {
@@ -48,6 +59,8 @@ where
                 file,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
+                class_units: &class_units,
+                method_return_cache: &method_return_cache,
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -61,6 +74,8 @@ struct CsScan<'a, 'b> {
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
+    class_units: &'a HashMap<String, CodeUnit>,
+    method_return_cache: &'a MethodReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -340,22 +355,54 @@ fn invocation_return_type_fqn(
             let name = node_text(function, ctx.source);
             let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
             let owner = class_unit_for_fqn(ctx, owner_fqn)?;
-            method_return_type_fq_name(ctx.csharp, ctx.file, &owner, name)
+            method_return_type_for_call(ctx, &owner, name, argument_count(invocation, ctx.source))
         }
         "member_access_expression" => {
             let receiver = member_access_receiver(function)?;
             let name = member_access_name(function)?;
             let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
             let owner = class_unit_for_fqn(ctx, &owner_fqn)?;
-            method_return_type_fq_name(ctx.csharp, ctx.file, &owner, node_text(name, ctx.source))
+            method_return_type_for_call(
+                ctx,
+                &owner,
+                node_text(name, ctx.source),
+                argument_count(invocation, ctx.source),
+            )
         }
         _ => None,
     }
 }
 
-fn class_unit_for_fqn(ctx: &CsScan<'_, '_>, fqn: &str) -> Option<crate::analyzer::CodeUnit> {
-    ctx.csharp
-        .get_all_declarations()
-        .into_iter()
-        .find(|unit| unit.is_class() && unit.fq_name() == fqn)
+fn method_return_type_for_call(
+    ctx: &CsScan<'_, '_>,
+    owner: &CodeUnit,
+    method_name: &str,
+    arity: usize,
+) -> Option<String> {
+    let cache_key = (
+        ctx.file.clone(),
+        owner.fq_name(),
+        method_name.to_string(),
+        arity,
+    );
+    if let Some(cached) = ctx
+        .method_return_cache
+        .lock()
+        .expect("csharp return type cache poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return cached;
+    }
+    let resolved =
+        method_return_type_fq_name_for_arity(ctx.csharp, ctx.file, owner, method_name, Some(arity));
+    ctx.method_return_cache
+        .lock()
+        .expect("csharp return type cache poisoned")
+        .insert(cache_key, resolved.clone());
+    resolved
+}
+
+fn class_unit_for_fqn(ctx: &CsScan<'_, '_>, fqn: &str) -> Option<CodeUnit> {
+    ctx.class_units.get(fqn).cloned()
 }
