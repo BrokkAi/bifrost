@@ -87,6 +87,9 @@ pub(super) fn resolve_scala(
             resolve_scala_constructor(ctx, &resolver, constructor)
         }
         Some(ScalaReferenceNode::Call(call)) => resolve_scala_call(ctx, &resolver, root, call),
+        Some(ScalaReferenceNode::NamedArgument { call, name }) => {
+            resolve_scala_named_argument(ctx, &resolver, call, name)
+        }
         Some(ScalaReferenceNode::InfixCall(call)) => {
             resolve_scala_infix_call(ctx, &resolver, root, call)
         }
@@ -272,9 +275,43 @@ enum ScalaReferenceNode<'tree> {
     Field(Node<'tree>),
     StableIdentifier(Node<'tree>),
     Identifier(Node<'tree>),
+    /// A named argument `name = value` in a call `Callee(name = ..)`: `name`
+    /// resolves to the callee type's member/parameter, not a name in scope.
+    NamedArgument {
+        call: Node<'tree>,
+        name: Node<'tree>,
+    },
+}
+
+/// A named-argument identifier (`a` in `Foo(a = 3)`): the LHS of an
+/// `assignment_expression` directly inside a call's `arguments`.
+fn scala_named_argument(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let assignment = node
+        .parent()
+        .filter(|parent| parent.kind() == "assignment_expression")?;
+    let is_lhs = assignment
+        .child_by_field_name("left")
+        .or_else(|| assignment.named_child(0))
+        == Some(node);
+    if !is_lhs {
+        return None;
+    }
+    let arguments = assignment
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")?;
+    let call = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")?;
+    Some(ScalaReferenceNode::NamedArgument { call, name: node })
 }
 
 fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
+    if let Some(named) = scala_named_argument(node) {
+        return Some(named);
+    }
     let mut current = node;
     while let Some(parent) = current.parent() {
         if parent.kind() == "field_expression"
@@ -406,6 +443,40 @@ fn resolve_scala_type(
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed Scala type"),
     )
+}
+
+/// Resolve a named argument (`Foo(a = 3)`, caret on `a`) to the callee type's
+/// member `a` — case-class parameters are members (`Foo.a`).
+fn resolve_scala_named_argument(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    call: Node<'_>,
+    name_node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let arg_name = scala_node_text(name_node, ctx.source).trim();
+    if arg_name.is_empty() {
+        return no_definition("no_reference_text", "Scala named argument is blank");
+    }
+    let owner_fqn = call
+        .child_by_field_name("function")
+        .filter(|function| matches!(function.kind(), "identifier" | "type_identifier"))
+        .map(|function| scala_node_text(function, ctx.source).trim())
+        .filter(|callee| !callee.is_empty())
+        .and_then(|callee| resolver.resolve(callee));
+    let Some(owner_fqn) = owner_fqn else {
+        return no_definition(
+            "no_indexed_definition",
+            format!("named argument `{arg_name}` receiver could not be typed"),
+        );
+    };
+    let candidates = scala_member_candidate_units(ctx, &owner_fqn, arg_name, false);
+    if candidates.is_empty() {
+        return no_definition(
+            "no_indexed_definition",
+            format!("named argument `{arg_name}` is not a member of `{owner_fqn}`"),
+        );
+    }
+    candidates_outcome(candidates)
 }
 
 fn resolve_scala_call(

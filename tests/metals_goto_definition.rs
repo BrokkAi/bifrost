@@ -107,17 +107,10 @@ fn metals_def_case_class_apply() {
 }
 
 // Metals PcDefinitionSuite "case-class-apply": a named argument `a` resolves to
-// the case class parameter `a` (line 0).
-//
-// DEFERRED: a named-argument identifier (`a` in `Foo(a = 3)`) sits as the LHS of
-// an assignment inside the call's `arguments`, so `scala_reference_node` treats it
-// as a bare identifier with no local/member/type binding in scope. Resolving it
-// needs a named-argument arm: detect the enclosing call, resolve its callee to the
-// case-class type, and look the arg name up among that type's constructor params
-// (which are members, `Foo.a`). A real feature on the Scala call-resolution path,
-// not a wiring tweak; lower generalization value than receiver/scope work.
+// the case class parameter `a` (line 0). A named-argument identifier is the LHS of
+// an assignment inside a call's `arguments`; `scala_reference_node` now routes it
+// to the callee type's member lookup (case-class params are members `Foo.a`).
 #[test]
-#[ignore = "deferred: Scala named-argument resolution (Foo(a = 3) -> case-class param) not supported"]
 fn metals_def_case_class_named_arg() {
     assert_resolves_to_line(
         "a.scala",
