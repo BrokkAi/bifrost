@@ -36,7 +36,7 @@ pub(super) fn resolve_php(
             format!("`{}` is not a PHP reference site", site.text),
         );
     }
-    if php_is_variable_reference(node) {
+    if php_is_variable_reference(node) && !php_is_static_property_name(node) {
         return no_definition(
             "local_variable_reference",
             format!(
@@ -108,6 +108,10 @@ enum PhpReferenceNode<'tree> {
 
 fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree>> {
     let node = php_qualified_reference_node(node);
+    if let Some(access) = php_static_property_access_for_name(node) {
+        let (scope, name) = php_static_member_parts(access)?;
+        return Some(PhpReferenceNode::StaticMember { scope, name });
+    }
     match node.kind() {
         "object_creation_expression" => php_object_creation_type(node).map(PhpReferenceNode::Type),
         "named_type" => (!php_is_in_object_creation(node)).then_some(PhpReferenceNode::Type(node)),
@@ -115,7 +119,9 @@ fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree
             .child_by_field_name("function")
             .filter(|name| matches!(name.kind(), "name" | "qualified_name"))
             .map(PhpReferenceNode::Function),
-        "scoped_call_expression" | "class_constant_access_expression" => {
+        "scoped_call_expression"
+        | "class_constant_access_expression"
+        | "scoped_property_access_expression" => {
             let (scope, name) = php_static_member_parts(node)?;
             Some(PhpReferenceNode::StaticMember { scope, name })
         }
@@ -133,7 +139,9 @@ fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree
                 {
                     Some(PhpReferenceNode::Function(node))
                 }
-                "scoped_call_expression" | "class_constant_access_expression"
+                "scoped_call_expression"
+                | "class_constant_access_expression"
+                | "scoped_property_access_expression"
                     if php_static_member_name(parent) == Some(node) =>
                 {
                     let (scope, _) = php_static_member_parts(parent)?;
@@ -175,6 +183,25 @@ fn php_is_instanceof_type_name(node: Node<'_>) -> bool {
 
 fn php_static_member_name(node: Node<'_>) -> Option<Node<'_>> {
     php_static_member_parts(node).map(|(_, name)| name)
+}
+
+fn php_is_static_property_name(node: Node<'_>) -> bool {
+    php_static_property_access_for_name(node).is_some()
+}
+
+fn php_static_property_access_for_name(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "scoped_property_access_expression" {
+            return php_static_member_name(ancestor)
+                .is_some_and(|name| {
+                    name.start_byte() <= node.start_byte() && node.end_byte() <= name.end_byte()
+                })
+                .then_some(ancestor);
+        }
+        current = ancestor.parent();
+    }
+    None
 }
 
 fn php_qualified_reference_node(mut node: Node<'_>) -> Node<'_> {

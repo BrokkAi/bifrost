@@ -8065,6 +8065,44 @@ fn php_self_class_constant_resolves_to_definition() {
 }
 
 #[test]
+fn php_aliased_static_property_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .file(
+            "src/Service/EmailNotifier.php",
+            "<?php\nnamespace App\\Service;\nclass EmailNotifier {\n    public static int $sent = 0;\n    public static function create(): self { return new self(); }\n}\n",
+        )
+        .file(
+            "src/Consumer.php",
+            "<?php\nnamespace App;\nuse App\\Service\\EmailNotifier as Mailer;\n$mailer = Mailer::create();\n$count = Mailer::$sent;\n",
+        )
+        .build();
+
+    let line = "$count = Mailer::$sent;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Consumer.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "sent")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Service.EmailNotifier.sent",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Service/EmailNotifier.php",
+        "{value}"
+    );
+}
+
+#[test]
 fn php_enum_cases_resolve_as_static_members() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(
