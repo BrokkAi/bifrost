@@ -178,3 +178,58 @@ fn bare_inherited_outer_field() {
         1,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deepening: more Java resolution shapes
+// ---------------------------------------------------------------------------
+
+// A static method call `Util.help()` resolves to the static method (line 1).
+#[test]
+fn static_method_call() {
+    assert_resolves_to_line(
+        "StaticCall.java",
+        "class Util {\n  static void help() {}\n}\n\nclass Caller {\n  void run() {\n    Util.<caret>help();\n  }\n}\n",
+        1,
+    );
+}
+
+// An enum constant reference `Color.RED` resolves to the constant (line 1).
+#[test]
+fn enum_constant_reference() {
+    assert_resolves_to_line(
+        "EnumConst.java",
+        "enum Color {\n  RED, GREEN\n}\n\nclass User {\n  Color c = Color.<caret>RED;\n}\n",
+        1,
+    );
+}
+
+// A `this.field` access resolves to the field declaration (line 1).
+#[test]
+fn this_field_access() {
+    assert_resolves_to_line(
+        "ThisField.java",
+        "class Box {\n  int value;\n  int read() {\n    return this.<caret>value;\n  }\n}\n",
+        1,
+    );
+}
+
+// A method called on a concrete implementor resolves to the implementation
+// (`Impl.go`, line 5), not the interface declaration.
+#[test]
+fn interface_method_on_implementor() {
+    assert_resolves_to_line(
+        "InterfaceMethod.java",
+        "interface Runnable2 {\n  void go();\n}\n\nclass Impl implements Runnable2 {\n  public void go() {}\n  void call(Impl i) {\n    i.<caret>go();\n  }\n}\n",
+        5,
+    );
+}
+
+// `new Foo()` resolves the type `Foo` to its class declaration (line 0).
+#[test]
+fn constructor_new_type() {
+    assert_resolves_to_line(
+        "NewType.java",
+        "class Foo {}\n\nclass Maker {\n  Foo make() {\n    return new <caret>Foo();\n  }\n}\n",
+        0,
+    );
+}
