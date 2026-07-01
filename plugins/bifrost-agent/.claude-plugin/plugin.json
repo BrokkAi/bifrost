@@ -1,0 +1,19 @@
+{
+  "name": "bifrost",
+  "version": "0.7.2",
+  "description": "Bifrost analyzer-backed code intelligence over MCP.",
+  "author": {
+    "name": "Brokk",
+    "url": "https://brokk.ai"
+  },
+  "homepage": "https://github.com/BrokkAi/bifrost",
+  "repository": "https://github.com/BrokkAi/bifrost",
+  "license": "LGPL-3.0-or-later",
+  "keywords": [
+    "bifrost",
+    "mcp",
+    "code-intelligence",
+    "tree-sitter"
+  ],
+  "mcpServers": "./.mcp.json"
+}
