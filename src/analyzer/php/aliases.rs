@@ -141,6 +141,9 @@ pub fn php_namespace_to_fq(name: &str) -> String {
 
 pub fn resolve_php_type(raw: &str, ctx: &PhpFileContext) -> Option<String> {
     let first = raw.split('|').next().unwrap_or(raw).trim();
+    // A nullable type `?Foo` is `Foo | null`; strip the marker so member access on a
+    // nullable-typed receiver resolves against `Foo` (mirrors the union split above).
+    let first = first.strip_prefix('?').map(str::trim).unwrap_or(first);
     if first.is_empty() || matches!(first, "self" | "static" | "parent") {
         return None;
     }
