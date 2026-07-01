@@ -106,25 +106,43 @@ porting exercise, not a research one.
 Each pattern has a cross-language suite that both proves the fix and pins the
 remaining gaps.
 
-- **1. Call/construction-receiver type inference — DONE (all languages).**
-  `tests/cross_language_receiver_definition.rs`. Added construction-receiver
-  member resolution to C#, PHP, Scala, C++, and JS/TS `get_definition` (Java and
-  Python already had it). All seven green.
+- **1. Call/construction-receiver type inference.**
+  - *Construction leg — DONE (all languages).*
+    `tests/cross_language_receiver_definition.rs`. Added construction-receiver
+    member resolution to C#, PHP, Scala, C++, and JS/TS `get_definition` (Java
+    and Python already had it). All seven green.
+  - *Return-type leg (`getFoo().member`) — DONE for the C#/Ruby cliffs.*
+    `tests/cross_language_return_type_definition.rs`. These had **zero**
+    return-type/call-receiver handling. C#: an `invocation_expression`
+    receiver arm typed by the callee's declared return type
+    (`method_return_type_fq_name`, read from the full signature). Ruby: a bare
+    implicit-`self` call receiver (`get_foo.v`) typed by the method's inferred
+    return instance (reusing `ruby_infer_method_return_instance_owner`). Scala,
+    PHP, and Rust have *thin* (non-zero) handling — lower marginal value, not
+    yet extended.
 
-- **2. `self`/`this` receiver in find-usages — surfaced.**
+- **2. `self`/`this` receiver in find-usages — surfaced (issue #387).**
   `tests/cross_language_self_usages.rs`. C#, PHP, Scala, Go, Ruby already count a
   `this`/`self` same-class call as a usage. C++, Rust, JS, TS do not; those four
   are `#[ignore]`d (the fix lives in each `<lang>_graph` receiver-typing, a
-  heavier change than the `get_definition` work).
+  heavier change than the `get_definition` work). Fraught by a surface split:
+  self-receiver hits are noise for MCP `scan_usages` but wanted by LSP
+  references — likely a new hit kind, like `Import`.
 
-- **3. `Import`-kind hit emission — DONE for JS/TS (was Python-only).**
+- **3. `Import`-kind hit emission — DONE where architecturally clean; rest
+  blocked (issue #388).**
   `tests/cross_language_import_hits.rs`. The JS/TS graph now emits an `Import`
-  hit for the specifier that binds the target (ESM named + aliased + default), so
-  LSP find-references reports the import line while call-graph surfaces still
-  filter it (`js_ts_graph::extractor::handle_import_statement`). CommonJS
-  `require` destructuring and the remaining languages are the follow-up.
+  hit for the specifier that binds the target (ESM named + aliased + default),
+  joining Python (`js_ts_graph::extractor::handle_import_statement`). This is
+  clean *only* where the language emits a file/module CodeUnit spanning the
+  import region (Python `m`, JS `m.js`). Java, Rust, PHP, Scala emit **no** such
+  unit — an import token's `enclosing_code_unit` is `None`, and `UsageHit`
+  requires a non-optional enclosing, so `push_hit` drops it. Extending to those
+  languages is a **core hit-model change** (make `enclosing` optional for import
+  hits, or synthesize a file-scope owner), not a per-graph port. Go/C# import at
+  package/namespace granularity (no per-symbol binding). Filed as #388.
 
-- **4. Attribute/subscript-target over-declaration — audited.**
+- **4. Attribute/subscript-target over-declaration — audited (issue #386).**
   `tests/cross_language_attribute_target_declarations.rs`. Ruby, PHP, Go are
   already correct (regression-guarded). JS/TS over-declare `obj.x` from a
   plain-local `obj.x = 1`; unlike Python this is not a blanket skip (the same
