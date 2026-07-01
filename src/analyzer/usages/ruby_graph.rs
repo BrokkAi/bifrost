@@ -994,10 +994,21 @@ pub(crate) fn ruby_receiver_type(
             })
         }
         "identifier" => {
-            first_precise(locals, node_text(node, source)).map(|owner_fq_name| ReceiverType {
-                owner_fq_name,
-                mode: ReceiverMode::Instance,
-            })
+            let name = node_text(node, source);
+            if let Some(owner_fq_name) = first_precise(locals, name) {
+                return Some(ReceiverType {
+                    owner_fq_name,
+                    mode: ReceiverMode::Instance,
+                });
+            }
+            // A known local whose type we can't pin is not a method call.
+            if locals.is_shadowed(name) {
+                return None;
+            }
+            // Otherwise a bare implicit-`self` method used as a receiver
+            // (`get_foo.v`): type it by `get_foo`'s inferred return instance.
+            let enclosing = ruby_enclosing_receiver(lexical_stack, method_stack)?;
+            ruby_method_return_receiver_type(semantic, visible_files, &enclosing, name)
         }
         "self" => ruby_enclosing_receiver(lexical_stack, method_stack),
         "call" => ruby_constructed_receiver_type(
@@ -1091,12 +1102,24 @@ fn ruby_factory_return_receiver_type(
     if class.mode != ReceiverMode::Class {
         return None;
     }
+    ruby_method_return_receiver_type(semantic, visible_files, class, method_name)
+}
 
+/// Type a call whose receiver is `receiver` and whose method is `method_name` by
+/// the method's inferred return instance (e.g. a factory method returning
+/// `Foo.new`). Works for both class receivers (`Klass.make.x`) and the enclosing
+/// instance receiver of a bare call (`get_foo.x`).
+fn ruby_method_return_receiver_type(
+    semantic: &RubySemanticIndex<'_>,
+    visible_files: &HashSet<ProjectFile>,
+    receiver: &ReceiverType,
+    method_name: &str,
+) -> Option<ReceiverType> {
     semantic
         .resolve_method_candidates(
             semantic.analyzer.definition_lookup_index(),
             visible_files,
-            class,
+            receiver,
             method_name,
         )
         .into_iter()
@@ -1104,7 +1127,7 @@ fn ruby_factory_return_receiver_type(
             ruby_infer_method_return_instance_owner(
                 semantic,
                 candidate,
-                class.owner_fq_name.clone(),
+                receiver.owner_fq_name.clone(),
             )
             .map(|owner_fq_name| ReceiverType {
                 owner_fq_name,

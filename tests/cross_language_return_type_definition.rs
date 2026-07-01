@@ -80,3 +80,14 @@ fn csharp_return_type_qualified_receiver() {
         1,
     );
 }
+
+// Ruby: a bare implicit-`self` call used as a receiver (`get_foo.v`) is typed by
+// `get_foo`'s inferred return instance (`Foo.new`), resolving `v` to line 1.
+#[test]
+fn ruby_return_type_receiver() {
+    assert_resolves_to_line(
+        "r.rb",
+        "class Foo\n  def v\n  end\nend\n\nclass Bar\n  def get_foo\n    Foo.new\n  end\n\n  def use\n    get_foo.<caret>v\n  end\nend\n",
+        1,
+    );
+}
