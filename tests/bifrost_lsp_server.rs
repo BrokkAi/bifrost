@@ -18,6 +18,26 @@ fn write_completor_fixture(temp_root: &Path) -> std::path::PathBuf {
     file
 }
 
+fn completion_client_capabilities() -> Value {
+    json!({
+        "textDocument": {
+            "completion": {
+                "completionItem": {
+                    "snippetSupport": true
+                }
+            }
+        }
+    })
+}
+
+fn completion_initialize_params(root_uri: String) -> Value {
+    json!({
+        "processId": null,
+        "rootUri": root_uri,
+        "capabilities": completion_client_capabilities()
+    })
+}
+
 struct JvmTypeContextFixtures {
     java_path: PathBuf,
     java_source: &'static str,
@@ -75,6 +95,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["textDocumentSync"].is_object(),
         "textDocumentSync should be advertised: {initialize}"
     );
+    assert!(
+        initialize["result"]["capabilities"]["completionProvider"].is_null(),
+        "completionProvider should be omitted when the client advertises no completion sub-capabilities: {initialize}"
+    );
     assert_eq!(
         initialize["result"]["capabilities"]["typeHierarchyProvider"], true,
         "typeHierarchyProvider should be advertised: {initialize}"
@@ -116,6 +140,74 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
     assert!(shutdown["error"].is_null(), "unexpected error: {shutdown}");
 
     server.exit();
+}
+
+#[test]
+fn bifrost_lsp_server_advertises_completion_when_client_supports_completion_items() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut server = LspServer::spawn(&fixture_root);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": completion_initialize_params(uri_for(&fixture_root))
+    }));
+    let initialize = server.read_message();
+    assert_eq!(initialize["id"], 1);
+    assert!(
+        initialize["result"]["capabilities"]["completionProvider"].is_object(),
+        "completionProvider should be advertised when the client exposes completion sub-capabilities: {initialize}"
+    );
+    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    server.notify_value(json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}));
+    let shutdown = server.read_message();
+    assert_eq!(shutdown["id"], 2);
+    assert!(shutdown["error"].is_null(), "unexpected error: {shutdown}");
+
+    server.exit();
+}
+
+#[test]
+fn bifrost_lsp_server_malformed_initialize_returns_error_response() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut server = LspServer::spawn(&fixture_root);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": null,
+            "rootUri": null,
+            "capabilities": null
+        }
+    }));
+    let initialize = server.read_message();
+    assert_eq!(initialize["id"], 1);
+    assert!(
+        initialize["result"].is_null(),
+        "malformed initialize should not return a success result: {initialize}"
+    );
+    assert_eq!(
+        initialize["error"]["code"], -32602,
+        "malformed initialize should return InvalidParams: {initialize}"
+    );
+    assert!(
+        initialize["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Failed to decode InitializeParams")),
+        "malformed initialize should explain the decode failure: {initialize}"
+    );
 }
 
 #[test]
@@ -475,7 +567,7 @@ fn bifrost_lsp_server_removes_workspace_folder_dynamically() {
                 {"uri": uri_for(&root_a), "name": "service-a"},
                 {"uri": uri_for(&root_b), "name": "service-b"}
             ],
-            "capabilities": {}
+            "capabilities": completion_client_capabilities()
         }),
     );
 
@@ -1427,7 +1519,7 @@ fn bifrost_lsp_server_completion_finds_symbol_by_prefix() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        "params": completion_initialize_params(root_uri)
     }));
     let init = server.read_message();
     assert!(
@@ -1495,7 +1587,7 @@ fn bifrost_lsp_server_completion_truncates_at_max_results_and_sets_is_incomplete
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        "params": completion_initialize_params(root_uri)
     }));
     let _ = server.read_message();
     server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
@@ -1562,7 +1654,7 @@ fn bifrost_lsp_server_completion_empty_prefix_returns_null() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        "params": completion_initialize_params(root_uri)
     }));
     let _ = server.read_message();
     server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
@@ -6648,7 +6740,8 @@ fn bifrost_lsp_server_did_change_completion_finds_overlay_only_symbol() {
     let file_path = root.join("lib.rs");
     fs::write(&file_path, "fn placeholder() {}\n").expect("write disk");
 
-    let mut server = LspServer::start(&root);
+    let mut server =
+        LspServer::start_with_params(&root, completion_initialize_params(uri_for(&root)));
     let file_uri = uri_for(&file_path);
 
     server.notify_value(json!({
