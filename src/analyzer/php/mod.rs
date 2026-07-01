@@ -3,6 +3,7 @@ mod aliases;
 mod clones;
 mod composer;
 mod declarations;
+mod diagnostics;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
@@ -12,8 +13,9 @@ use crate::analyzer::js_ts::{
 };
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider, build_direct_descendant_index,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -424,6 +426,13 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        diagnostics::collect_php_semantic_diagnostics(self, file, source)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
