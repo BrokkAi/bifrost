@@ -25,7 +25,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T11:42Z) Implement and test the Rust milestone.
 - [x] (2026-07-01T11:51Z) Implement and test the Scala milestone.
 - [x] (2026-07-01T12:01Z) Add budget, ambiguity, and performance instrumentation tests.
-- [ ] Run final focused validation, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
+- [x] (2026-07-01T12:10Z) Run final focused validation, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
 
 ## Surprises & Discoveries
 
@@ -121,7 +121,9 @@ Scala milestone complete. Extended `src/analyzer/usages/scala_graph/inverted.rs`
 
 Budget/performance milestone complete. Added a shared assertion that `ExceededBudget` is terminal for graph use, JS/TS provider tests proving a tiny scope-node budget returns `ExceededBudget`, and fanout coverage proving more than four receiver targets becomes `Ambiguous`. Added a TS usage graph regression proving fanout-over-cap emits no partial caller edges. Existing JS/TS provider profiling labels were already present, so no new user-visible diagnostics were added. Validation: `cargo test --lib receiver_analysis` passed 12 tests, and `cargo test --test usage_graph_ts_test` passed 8 tests. Optional ignored memory measurement tests were not run.
 
-At completion, summarize which languages gained object-sensitive receiver tests, which consumers query the provider, any budget behavior observed, and any language-specific receiver semantics deferred to follow-up issues.
+Final validation complete. Focused suites passed: `cargo test --lib receiver_analysis` (12 tests), `cargo test --test usages_js_ts_graph_test` (48 passed, 2 ignored), `cargo test --test usage_graph_ts_test` (8 tests), `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition` (1 focused test), `cargo test --test usage_graph_java_test` (11 tests), `cargo test --test usage_graph_csharp_test` (10 tests), `cargo test --test usage_graph_cpp_test` (11 tests), `cargo test --test usage_graph_go_test` (10 tests), `cargo test --test usage_graph_php_test` (11 tests), `cargo test --test usage_graph_test` (9 tests), `cargo test --test usages_ruby_test` (34 tests), `cargo test --test usage_graph_rust_test` (10 tests), and `cargo test --test usage_graph_scala_test` (10 tests). `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check` also passed. Optional `usagebench` and ignored memory measurement tests were not run.
+
+All target usage-graph languages now have #394-shaped object-sensitive receiver coverage: JS/TS, Java, C#, C++, Go, PHP, Python, Ruby, Rust, and Scala. JS/TS is the shared-provider proof point across both usage graph and `get_definition`; the remaining backends gained equivalent bounded graph-facing receiver facts through their existing language graph layers. Budget behavior is explicit in shared and JS/TS provider tests: tiny scope budgets return `ExceededBudget`, fanout above the default target cap becomes `Ambiguous`, and graph tests prove those exits do not produce partial same-name edges. Deferred follow-up work includes migrating every backend fully behind the shared provider trait, adding deeper interprocedural summaries, and exploring CFG/path-sensitive or pushdown-style analysis only if monitoring shows the bounded model is insufficient.
 
 ## Context and Orientation
 
