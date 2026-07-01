@@ -4,6 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const Module = require("node:module");
+const { pathToFileURL } = require("node:url");
 const tar = require("tar");
 
 const originalLoad = Module._load;
@@ -30,6 +31,29 @@ test("maps VS Code runtime platforms to release targets", () => {
   assert.equal(provisioning.releaseTargetFor("win32", "x64"), "x86_64-pc-windows-msvc");
   assert.equal(provisioning.releaseTargetFor("win32", "arm64"), "aarch64-pc-windows-msvc");
   assert.throws(() => provisioning.releaseTargetFor("freebsd", "x64"), /Unsupported platform/);
+});
+
+test("keeps VS Code and agent plugin release targets aligned", async () => {
+  const launcher = await import(
+    pathToFileURL(path.resolve(__dirname, "../../../plugins/bifrost-agent/bin/bifrost-launcher.mjs")).href
+  );
+  const cases = [
+    ["darwin", "arm64"],
+    ["darwin", "x64"],
+    ["linux", "x64"],
+    ["linux", "arm64"],
+    ["win32", "x64"],
+    ["win32", "arm64"]
+  ];
+
+  assert.deepEqual(
+    cases.map(([platform, arch]) => provisioning.releaseTargetFor(platform, arch)),
+    cases.map(([platform, arch]) => launcher.releaseTargetFor(platform, arch))
+  );
+  assert.deepEqual(
+    new Set(cases.map(([platform, arch]) => provisioning.releaseTargetFor(platform, arch))),
+    new Set(launcher.SUPPORTED_TARGETS)
+  );
 });
 
 test("constructs release archive names and URLs", () => {

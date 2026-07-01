@@ -1,30 +1,38 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { SUPPORTED_TARGETS } from "../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
 
-const SUPPORTED_TARGETS = new Set([
-  "aarch64-pc-windows-msvc",
-  "aarch64-unknown-linux-gnu",
-  "universal-apple-darwin",
-  "x86_64-pc-windows-msvc",
-  "x86_64-unknown-linux-gnu"
-]);
+const supportedTargetSet = new Set(SUPPORTED_TARGETS);
 
 const options = parseArgs(process.argv.slice(2));
 const version = required(options.version, "version");
-const manifestPath = path.resolve(required(options.manifest, "manifest"));
 const distDir = path.resolve(required(options.dist, "dist"));
 const archiveSha256 = readArchiveHashes(distDir, version);
 
-const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-manifest.version = version;
-manifest.bifrost = {
-  ...manifest.bifrost,
-  binaryVersion: version,
-  archiveSha256
-};
+if (options.manifest) {
+  const manifestPath = path.resolve(options.manifest);
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  manifest.version = version;
+  manifest.bifrost = {
+    ...manifest.bifrost,
+    binaryVersion: version,
+    archiveSha256
+  };
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
 
-fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+if (options.pluginRelease) {
+  const pluginReleasePath = path.resolve(options.pluginRelease);
+  const pluginRelease = JSON.parse(fs.readFileSync(pluginReleasePath, "utf8"));
+  pluginRelease.binaryVersion = version;
+  pluginRelease.archiveSha256 = archiveSha256;
+  fs.writeFileSync(pluginReleasePath, `${JSON.stringify(pluginRelease, null, 2)}\n`);
+}
+
+if (!options.manifest && !options.pluginRelease) {
+  throw new Error("Provide --manifest, --plugin-release, or both.");
+}
 
 function readArchiveHashes(distDir, version) {
   const hashes = {};
@@ -37,7 +45,7 @@ function readArchiveHashes(distDir, version) {
     let target = entry.slice(0, -".sha256".length);
     target = target.replace(new RegExp(`^bifrost-v${escapeRegExp(version)}-`), "");
     target = target.replace(/\.tar\.gz$|\.zip$/, "");
-    if (!SUPPORTED_TARGETS.has(target)) {
+    if (!supportedTargetSet.has(target)) {
       continue;
     }
 
@@ -64,11 +72,15 @@ function parseArgs(args) {
     const key = args[index];
     const value = args[index + 1];
     if (!key?.startsWith("--") || value === undefined) {
-      throw new Error("Usage: prepare-vscode-extension-manifest.mjs --version <version> --manifest <package.json> --dist <dist-dir>");
+      throw new Error("Usage: prepare-vscode-extension-manifest.mjs --version <version> --dist <dist-dir> [--manifest <package.json>] [--plugin-release <bifrost-release.json>]");
     }
-    options[key.slice(2)] = value;
+    options[toCamelCase(key.slice(2))] = value;
   }
   return options;
+}
+
+function toCamelCase(value) {
+  return value.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
 }
 
 function required(value, name) {

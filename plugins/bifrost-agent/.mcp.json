@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "bifrost": {
-      "command": "bifrost",
+      "command": "./bin/bifrost-launcher.mjs",
       "args": [
         "--mcp",
         "symbol|extended"

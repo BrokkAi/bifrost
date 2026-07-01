@@ -224,7 +224,11 @@ jobs:
           node scripts/prepare-vscode-extension-manifest.mjs
           --version "${{ steps.tag.outputs.version }}"
           --manifest editors/vscode/package.json
+          --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
+
+      - name: Validate agent plugin manifests
+        run: node scripts/check-codex-plugin-manifest.mjs
 
       - name: Test extension
         run: npm test
@@ -234,11 +238,16 @@ jobs:
         run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
         working-directory: editors/vscode
 
-      - name: Upload VSIX to GitHub Release
+      - name: Package agent plugin
+        run: tar -C plugins -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
+
+      - name: Upload editor and agent plugin artifacts to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          files: dist/*.vsix
+          files: |
+            dist/*.vsix
+            dist/bifrost-agent-*.tar.gz
 
       - name: Publish extension to Visual Studio Marketplace
         run: >
