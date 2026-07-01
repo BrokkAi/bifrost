@@ -372,6 +372,107 @@ class Controller {
 }
 
 #[test]
+fn factory_body_identifier_does_not_use_caller_bindings() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Service.java",
+            "package com.example;\nclass Service { void run() {} }\n",
+        )
+        .file(
+            "com/example/Other.java",
+            "package com.example;\nclass Other { void run() {} }\n",
+        )
+        .file(
+            "com/example/Factory.java",
+            r#"
+package com.example;
+
+class Factory {
+    Other create() {
+        return value;
+    }
+}
+"#,
+        )
+        .file(
+            "com/example/Controller.java",
+            r#"
+package com.example;
+
+class Controller {
+    void caller(Factory factory) {
+        Service value = new Service();
+        var receiver = factory.create();
+        receiver.run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(
+            &value,
+            "com.example.Controller.caller",
+            "com.example.Other.run"
+        )
+        .is_some(),
+        "declared factory return type should resolve receiver to Other.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(
+            &value,
+            "com.example.Controller.caller",
+            "com.example.Service.run"
+        )
+        .is_none(),
+        "callee return identifiers must not resolve through caller locals: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn recursive_factory_summary_uses_declared_return_without_body_recursion() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Service.java",
+            "package com.example;\nclass Service { void run() {} }\n",
+        )
+        .file(
+            "com/example/Controller.java",
+            r#"
+package com.example;
+
+class Controller {
+    Service create() {
+        return create();
+    }
+
+    void caller() {
+        var receiver = create();
+        receiver.run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(
+            &value,
+            "com.example.Controller.caller",
+            "com.example.Service.run"
+        )
+        .is_some(),
+        "recursive factory should use declared return type without recursing through the body: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scoped_usage_graph_skips_unrelated_invalid_java_callers() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

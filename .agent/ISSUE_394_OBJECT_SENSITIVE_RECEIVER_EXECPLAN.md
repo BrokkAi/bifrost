@@ -26,6 +26,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T11:51Z) Implement and test the Scala milestone.
 - [x] (2026-07-01T12:01Z) Add budget, ambiguity, and performance instrumentation tests.
 - [x] (2026-07-01T12:10Z) Run final focused validation, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
+- [x] (2026-07-01T12:22Z) Address guided-review findings for JS/TS lexical scoping, Java summary safety, Rust source-order scoping, and receiver outcome merge duplication.
 
 ## Surprises & Discoveries
 
@@ -77,6 +78,15 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: JS/TS provider queries already have profiling scopes around member resolution, receiver resolution, and call summaries.
   Evidence: `src/analyzer/usages/js_ts_graph/receiver_analysis.rs` uses `profiling::scope` labels `jsts.receiver_analysis.resolve_member_targets`, `resolve_receiver`, and `summarize_call_result`.
 
+- Observation: Guided review found that JS/TS receiver facts treated block-local bindings as visible outside the block.
+  Evidence: `src/analyzer/usages/js_ts_graph/receiver_analysis.rs` previously scanned the enclosing function/program for the latest same-name `variable_declarator` and did not treat `statement_block` as a lexical binding boundary.
+
+- Observation: Guided review found that Java method-body return summaries could interpret callee return identifiers with caller-local bindings and could recurse through factory bodies.
+  Evidence: `src/analyzer/usages/java_graph/inverted.rs` previously passed the caller `LocalInferenceEngine` into `method_return_type_outcome` while recursively visiting return expressions.
+
+- Observation: Guided review found that Rust receiver facts were collected function-wide before traversal reached each `let`.
+  Evidence: `src/analyzer/usages/rust_graph/inverted.rs` previously populated one `receiver_types` map for every `let` in a function body before any method call was handled.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -124,6 +134,8 @@ Budget/performance milestone complete. Added a shared assertion that `ExceededBu
 Final validation complete. Focused suites passed: `cargo test --lib receiver_analysis` (12 tests), `cargo test --test usages_js_ts_graph_test` (48 passed, 2 ignored), `cargo test --test usage_graph_ts_test` (8 tests), `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition` (1 focused test), `cargo test --test usage_graph_java_test` (11 tests), `cargo test --test usage_graph_csharp_test` (10 tests), `cargo test --test usage_graph_cpp_test` (11 tests), `cargo test --test usage_graph_go_test` (10 tests), `cargo test --test usage_graph_php_test` (11 tests), `cargo test --test usage_graph_test` (9 tests), `cargo test --test usages_ruby_test` (34 tests), `cargo test --test usage_graph_rust_test` (10 tests), and `cargo test --test usage_graph_scala_test` (10 tests). `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check` also passed. Optional `usagebench` and ignored memory measurement tests were not run.
 
 All target usage-graph languages now have #394-shaped object-sensitive receiver coverage: JS/TS, Java, C#, C++, Go, PHP, Python, Ruby, Rust, and Scala. JS/TS is the shared-provider proof point across both usage graph and `get_definition`; the remaining backends gained equivalent bounded graph-facing receiver facts through their existing language graph layers. Budget behavior is explicit in shared and JS/TS provider tests: tiny scope budgets return `ExceededBudget`, fanout above the default target cap becomes `Ambiguous`, and graph tests prove those exits do not produce partial same-name edges. Deferred follow-up work includes migrating every backend fully behind the shared provider trait, adding deeper interprocedural summaries, and exploring CFG/path-sensitive or pushdown-style analysis only if monitoring shows the bounded model is insufficient.
+
+Guided-review follow-up complete. JS/TS receiver lookup now resolves identifier bindings through visible lexical scope ancestry, pre-indexes file-local functions/classes when the provider is constructed, and shares the branch-outcome merge policy from `receiver_analysis.rs`. Java receiver summaries now use declared return types and cache method return lookups instead of interpreting callee bodies with caller-local bindings. Rust receiver facts are seeded incrementally by traversal scope, so later or inner-block `let` bindings cannot type earlier or outer receiver calls. Added regressions for TS block-local receiver shadowing, Java caller-binding leakage and recursive factory safety, and Rust block-local receiver shadowing. Validation after review fixes: `cargo test --lib receiver_analysis`, `cargo test --test usage_graph_ts_test`, `cargo test --test usage_graph_java_test`, `cargo test --test usage_graph_rust_test`, `cargo test --test usages_js_ts_graph_test`, `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition`, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check` all passed.
 
 ## Context and Orientation
 

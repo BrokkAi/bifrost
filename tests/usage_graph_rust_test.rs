@@ -266,6 +266,50 @@ pub fn ambiguous(receiver: &dyn Runner) {
 }
 
 #[test]
+fn block_local_receiver_shadow_does_not_leak_to_outer_call() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub struct Service;
+pub struct Other;
+
+impl Service {
+    pub fn new() -> Self { Service }
+    pub fn run(&self) {}
+}
+
+impl Other {
+    pub fn new() -> Self { Other }
+    pub fn run(&self) {}
+}
+
+pub fn caller(flag: bool) {
+    let service = Other::new();
+    if flag {
+        let service = Service::new();
+        let _ = service;
+    }
+    service.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "caller", "Other.run").is_some(),
+        "outer receiver should resolve to Other.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "caller", "Service.run").is_none(),
+        "block-local receiver shadow must not leak to the outer call: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn every_edge_endpoint_is_a_node() {
     assert_every_edge_endpoint_is_a_node(&usage_graph());
 }

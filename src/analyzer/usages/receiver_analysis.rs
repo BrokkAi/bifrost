@@ -90,6 +90,38 @@ where
             _ => Self::Ambiguous(unique),
         }
     }
+
+    pub(crate) fn merge_branch_outcomes(
+        outcomes: impl IntoIterator<Item = Self>,
+        budget: ReceiverAnalysisBudget,
+    ) -> Self {
+        let mut values = Vec::new();
+        let mut saw_non_precise = false;
+        for outcome in outcomes {
+            match outcome {
+                Self::Precise(mut precise) => values.append(&mut precise),
+                Self::Ambiguous(mut ambiguous) => {
+                    saw_non_precise = true;
+                    values.append(&mut ambiguous);
+                }
+                Self::Unknown => saw_non_precise = true,
+                Self::Unsupported { reason } => return Self::Unsupported { reason },
+                Self::ExceededBudget { limit } => return Self::ExceededBudget { limit },
+            }
+        }
+        if values.is_empty() {
+            return Self::Unknown;
+        }
+        let merged = Self::single_precise_or_ambiguous(values, budget);
+        if saw_non_precise {
+            match merged {
+                Self::Precise(values) | Self::Ambiguous(values) => Self::Ambiguous(values),
+                other => other,
+            }
+        } else {
+            merged
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

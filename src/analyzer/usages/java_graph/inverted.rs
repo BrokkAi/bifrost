@@ -26,7 +26,8 @@ use crate::analyzer::usages::inverted_edges::{
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile, Range};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
+use std::cell::RefCell;
 use tree_sitter::{Node, Parser};
 
 pub(super) fn build_java_edges<F>(
@@ -48,6 +49,7 @@ where
                 source: parsed.source.as_str(),
                 root: parsed.tree.root_node(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
+                return_type_cache: RefCell::new(HashMap::default()),
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -62,6 +64,7 @@ struct JavaScan<'a, 'b> {
     source: &'a str,
     root: Node<'a>,
     class_ranges: ClassRangeIndex,
+    return_type_cache: RefCell<HashMap<(ProjectFile, String), ReceiverAnalysisOutcome<String>>>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -393,66 +396,7 @@ fn method_invocation_return_type_outcome(
     let Some(owner) = method_owner_fqn(invocation, ctx, bindings) else {
         return ReceiverAnalysisOutcome::Unknown;
     };
-    let methods = method_declarations_named(ctx.root, ctx.source, name)
-        .into_iter()
-        .filter(|method| {
-            ctx.class_ranges
-                .enclosing(method.start_byte())
-                .is_some_and(|class| class == owner)
-        })
-        .collect::<Vec<_>>();
-    if methods.is_empty() {
-        return method_unit_declared_return_type_outcome(&owner, name, ctx);
-    }
-    merge_receiver_type_outcomes(
-        methods
-            .into_iter()
-            .map(|method| method_return_type_outcome(method, ctx, bindings)),
-    )
-}
-
-fn method_return_type_outcome(
-    method: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<String>,
-) -> ReceiverAnalysisOutcome<String> {
-    let mut returns = Vec::new();
-    let mut stack = vec![method];
-    while let Some(node) = stack.pop() {
-        if node.id() != method.id()
-            && matches!(
-                node.kind(),
-                "method_declaration"
-                    | "constructor_declaration"
-                    | "lambda_expression"
-                    | "class_declaration"
-                    | "interface_declaration"
-            )
-        {
-            continue;
-        }
-        if node.kind() == "return_statement" {
-            let mut cursor = node.walk();
-            if let Some(value) = node.named_children(&mut cursor).next() {
-                returns.push(receiver_type_outcome(value, ctx, bindings));
-            }
-            continue;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    let merged = merge_receiver_type_outcomes(returns);
-    if !matches!(merged, ReceiverAnalysisOutcome::Unknown) {
-        return merged;
-    }
-    method
-        .child_by_field_name("type")
-        .and_then(|type_node| ctx.resolve_type_fqn(type_node))
-        .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
-        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+    method_unit_declared_return_type_outcome(&owner, name, ctx)
 }
 
 fn method_unit_declared_return_type_outcome(
@@ -473,6 +417,21 @@ fn method_unit_declared_return_type_outcome(
 }
 
 fn method_unit_declared_return_type(
+    method: &CodeUnit,
+    ctx: &JavaScan<'_, '_>,
+) -> ReceiverAnalysisOutcome<String> {
+    let cache_key = (method.source().clone(), method.fq_name());
+    if let Some(cached) = ctx.return_type_cache.borrow().get(&cache_key).cloned() {
+        return cached;
+    }
+    let outcome = method_unit_declared_return_type_uncached(method, ctx);
+    ctx.return_type_cache
+        .borrow_mut()
+        .insert(cache_key, outcome.clone());
+    outcome
+}
+
+fn method_unit_declared_return_type_uncached(
     method: &CodeUnit,
     ctx: &JavaScan<'_, '_>,
 ) -> ReceiverAnalysisOutcome<String> {
@@ -540,68 +499,8 @@ fn java_return_type_node_covering<'tree>(root: Node<'tree>, range: &Range) -> Op
     result
 }
 
-fn method_declarations_named<'tree>(
-    root: Node<'tree>,
-    source: &str,
-    name: &str,
-) -> Vec<Node<'tree>> {
-    let mut methods = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "method_declaration"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name_node| node_text(name_node, source) == name)
-        {
-            methods.push(node);
-            continue;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    methods
-}
-
 fn merge_receiver_type_outcomes(
     outcomes: impl IntoIterator<Item = ReceiverAnalysisOutcome<String>>,
 ) -> ReceiverAnalysisOutcome<String> {
-    let mut values = Vec::new();
-    let mut saw_ambiguous_or_unknown = false;
-    for outcome in outcomes {
-        match outcome {
-            ReceiverAnalysisOutcome::Precise(mut precise) => values.append(&mut precise),
-            ReceiverAnalysisOutcome::Ambiguous(mut ambiguous) => {
-                saw_ambiguous_or_unknown = true;
-                values.append(&mut ambiguous);
-            }
-            ReceiverAnalysisOutcome::Unknown => saw_ambiguous_or_unknown = true,
-            ReceiverAnalysisOutcome::Unsupported { reason } => {
-                return ReceiverAnalysisOutcome::Unsupported { reason };
-            }
-            ReceiverAnalysisOutcome::ExceededBudget { limit } => {
-                return ReceiverAnalysisOutcome::ExceededBudget { limit };
-            }
-        }
-    }
-    if values.is_empty() {
-        return ReceiverAnalysisOutcome::Unknown;
-    }
-    let merged = ReceiverAnalysisOutcome::single_precise_or_ambiguous(
-        values,
-        ReceiverAnalysisBudget::default(),
-    );
-    if saw_ambiguous_or_unknown {
-        match merged {
-            ReceiverAnalysisOutcome::Precise(values)
-            | ReceiverAnalysisOutcome::Ambiguous(values) => {
-                ReceiverAnalysisOutcome::Ambiguous(values)
-            }
-            other => other,
-        }
-    } else {
-        merged
-    }
+    ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, ReceiverAnalysisBudget::default())
 }

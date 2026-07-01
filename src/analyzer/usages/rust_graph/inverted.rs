@@ -104,11 +104,21 @@ fn walk(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &mut Vec<ScopeFacts>
         match frame {
             WalkFrame::Enter(node) => match node.kind() {
                 "use_declaration" => {}
-                // A function or closure opens a scope; its parameters and `let` bindings
-                // are local to it and shadow same-named imports/items.
+                // A function or closure opens a parameter scope. `let` bindings
+                // are seeded incrementally when traversal reaches them so later
+                // shadowing cannot type earlier receiver calls.
                 "function_item" | "closure_expression" => {
-                    scopes.push(collect_scope_facts(node, ctx));
+                    scopes.push(collect_parameter_scope_facts(node, ctx));
                     stack.push(WalkFrame::ExitScope);
+                    push_children(node, &mut stack);
+                }
+                "block" => {
+                    scopes.push(ScopeFacts::default());
+                    stack.push(WalkFrame::ExitScope);
+                    push_children(node, &mut stack);
+                }
+                "let_declaration" => {
+                    handle_let_declaration(node, ctx, scopes);
                     push_children(node, &mut stack);
                 }
                 "call_expression" => {
@@ -215,17 +225,13 @@ fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[Scop
     }
 }
 
-/// The local names a function/closure binds: its parameters plus every `let`
-/// binding in its body. Nested function/closure scopes are skipped — they get
-/// their own frame.
-fn collect_scope_facts(scope: Node<'_>, ctx: &RustScan<'_, '_>) -> ScopeFacts {
+/// The local names a function/closure binds through its parameters. `let`
+/// bindings are handled incrementally by `handle_let_declaration`.
+fn collect_parameter_scope_facts(scope: Node<'_>, ctx: &RustScan<'_, '_>) -> ScopeFacts {
     let mut facts = ScopeFacts::default();
     if let Some(params) = scope.child_by_field_name("parameters") {
         collect_param_patterns(params, ctx.source, &mut facts.shadows);
         collect_typed_params(params, ctx, &mut facts.receiver_types);
-    }
-    if let Some(body) = scope.child_by_field_name("body") {
-        collect_let_bindings(body, ctx, &mut facts);
     }
     facts
 }
@@ -249,25 +255,13 @@ fn collect_param_patterns(params: Node<'_>, source: &str, out: &mut HashSet<Stri
     }
 }
 
-/// Collect `let`-bound names in a scope, without descending into nested
-/// function/closure scopes.
-fn collect_let_bindings(node: Node<'_>, ctx: &RustScan<'_, '_>, facts: &mut ScopeFacts) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "function_item" | "closure_expression" => continue,
-            "let_declaration" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    collect_pattern_bindings(pattern, ctx.source, &mut facts.shadows);
-                    collect_let_receiver_type(node, ctx, &mut facts.receiver_types);
-                }
-            }
-            _ => {}
-        }
-        let mut cursor = node.walk();
-        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
-        children.reverse();
-        stack.extend(children);
+fn handle_let_declaration(node: Node<'_>, ctx: &RustScan<'_, '_>, scopes: &mut [ScopeFacts]) {
+    let Some(scope) = scopes.last_mut() else {
+        return;
+    };
+    if let Some(pattern) = node.child_by_field_name("pattern") {
+        collect_pattern_bindings(pattern, ctx.source, &mut scope.shadows);
+        collect_let_receiver_type(node, ctx, &mut scope.receiver_types);
     }
 }
 

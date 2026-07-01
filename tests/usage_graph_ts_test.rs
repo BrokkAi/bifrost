@@ -239,3 +239,37 @@ export function caller() {
         graph["edges"]
     );
 }
+
+#[test]
+fn ts_block_local_receiver_shadow_does_not_leak_to_outer_call() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service { run() {} }
+export class Other { run() {} }
+export function makeService() { return new Service(); }
+export function makeOther() { return new Other(); }
+export function caller(flag: boolean) {
+  const service = makeService();
+  if (flag) {
+    const service = makeOther();
+  }
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "caller", "Service.run"),
+        "outer receiver should still resolve to Service.run: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "caller", "Other.run"),
+        "block-local shadow must not leak to the outer receiver call: {}",
+        graph["edges"]
+    );
+}
