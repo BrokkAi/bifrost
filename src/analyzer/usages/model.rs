@@ -18,14 +18,17 @@ pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// The call-graph / relevance surfaces (SearchTools, dead-code, rename, call
 /// hierarchy) care only about ordinary external `Reference` hits; the LSP
 /// `textDocument/references` surface (IDE "find references") also wants import
-/// bindings and self-receiver references. Keeping all in one graph with a kind lets
-/// each consumer choose through [`UsageHitSurface`].
+/// bindings, self-receiver references, and override declarations. Keeping all in
+/// one graph with a kind lets each consumer choose through [`UsageHitSurface`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UsageHitKind {
     #[default]
     Reference,
     Import,
     SelfReceiver,
+    /// A declaration that overrides/implements the queried declaration; editor-visible,
+    /// not an external usage.
+    OverrideDeclaration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,6 +93,12 @@ impl UsageHit {
     /// Reclassify this hit as a self/this receiver reference.
     pub fn into_self_receiver(mut self) -> Self {
         self.kind = UsageHitKind::SelfReceiver;
+        self
+    }
+
+    /// Reclassify this hit as an override/implementation declaration.
+    pub fn into_override_declaration(mut self) -> Self {
+        self.kind = UsageHitKind::OverrideDeclaration;
         self
     }
 
@@ -540,11 +549,22 @@ mod tests {
             "this.target()",
         )
         .into_self_receiver();
+        let override_declaration = UsageHit::new(
+            project_file("Foo.java"),
+            16,
+            160,
+            170,
+            unit.clone(),
+            1.0,
+            "override",
+        )
+        .into_override_declaration();
 
         let mut hits = BTreeSet::new();
         hits.insert(reference.clone());
         hits.insert(import.clone());
         hits.insert(self_receiver.clone());
+        hits.insert(override_declaration.clone());
         let result = FuzzyResult::success(unit, hits);
 
         assert_eq!(
@@ -553,7 +573,9 @@ mod tests {
         );
         assert_eq!(
             result.all_hits_for_surface(UsageHitSurface::LspReferences),
-            [reference, import, self_receiver].into_iter().collect()
+            [reference, import, self_receiver, override_declaration]
+                .into_iter()
+                .collect()
         );
     }
 

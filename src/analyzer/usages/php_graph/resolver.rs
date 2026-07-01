@@ -105,6 +105,26 @@ impl PhpHierarchyIndex {
         self.owner_fq_name.as_deref() == Some(owner)
             && self.descendant_fq_names.contains(receiver_fq_name)
     }
+
+    pub(super) fn overriding_methods(
+        &self,
+        php: &PhpAnalyzer,
+        spec: &TargetSpec,
+        files: &HashSet<ProjectFile>,
+    ) -> Vec<CodeUnit> {
+        if !self.owner_is_interface || !matches!(spec.kind, TargetKind::Method) {
+            return Vec::new();
+        }
+
+        files
+            .iter()
+            .flat_map(|file| php.declarations(file))
+            .filter(|unit| unit.is_class())
+            .filter(|unit| self.descendant_fq_names.contains(&unit.fq_name()))
+            .flat_map(|owner| php.get_direct_children(owner))
+            .filter(|child| child.is_function() && child.identifier() == spec.member_name)
+            .collect()
+    }
 }
 
 fn class_is_subtype_of_owner(

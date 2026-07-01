@@ -1,4 +1,5 @@
 use super::extractor::scan_file;
+use super::hits::push_override_declaration_hit;
 use super::inverted;
 use super::resolver::{PhpHierarchyIndex, TargetKind, TargetSpec};
 use crate::analyzer::usages::common::language_for_file;
@@ -51,6 +52,9 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
         let empty_hierarchy = PhpHierarchyIndex::default();
         let hierarchy = hierarchy.as_ref().unwrap_or(&empty_hierarchy);
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
+        for override_declaration in hierarchy.overriding_methods(self.php, &spec, &files) {
+            push_override_declaration_hit(self.php, analyzer, &override_declaration, &mut hits);
+        }
         for file in files {
             scan_file(self.php, analyzer, &file, &spec, hierarchy, &mut hits);
             if hits.len() > max_usages {

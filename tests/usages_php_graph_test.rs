@@ -630,6 +630,59 @@ function consume(): void {
 }
 
 #[test]
+fn php_graph_finds_aliased_static_method_and_property_usages() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        ),
+        (
+            "src/Service/EmailNotifier.php",
+            r#"<?php
+namespace App\Service;
+class EmailNotifier {
+    public static int $sent = 0;
+    public static function create(): self { return new self(); }
+}
+"#,
+        ),
+        (
+            "src/Consumer.php",
+            r#"<?php
+namespace App;
+use App\Service\EmailNotifier as Mailer;
+$mailer = Mailer::create();
+$count = Mailer::$sent;
+"#,
+        ),
+    ]);
+
+    let declarations = analyzer.get_all_declarations();
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.fq_name() == "App.Service.EmailNotifier.sent"),
+        "static property declaration should be indexed without '$': {declarations:#?}"
+    );
+
+    let create_hits = graph_hits(&analyzer, "App.Service.EmailNotifier.create");
+    assert!(
+        create_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Mailer::create()")),
+        "expected aliased static method usage: {create_hits:#?}"
+    );
+
+    let sent_hits = graph_hits(&analyzer, "App.Service.EmailNotifier.sent");
+    assert!(
+        sent_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Mailer::$sent")),
+        "expected aliased static property usage: {sent_hits:#?}"
+    );
+}
+
+#[test]
 fn php_graph_finds_instance_methods_and_properties_with_local_receiver_types() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
@@ -1079,6 +1132,82 @@ function consume(): void {
     ]);
 
     assert_eq!(1, graph_hits(&analyzer, "App.Service.run").len());
+}
+
+#[test]
+fn php_graph_lsp_references_include_php_interface_method_implementations() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        ),
+        (
+            "src/Contracts/Notifier.php",
+            r#"<?php
+namespace App\Contracts;
+interface Notifier {
+    public function notify(string $message): void;
+}
+"#,
+        ),
+        (
+            "src/Service/EmailNotifier.php",
+            r#"<?php
+namespace App\Service;
+use App\Contracts\Notifier;
+class EmailNotifier implements Notifier {
+    public function notify(string $message): void {}
+}
+"#,
+        ),
+        (
+            "src/Consumer.php",
+            r#"<?php
+namespace App;
+use App\Service\EmailNotifier;
+function consume(): void {
+    $mailer = new EmailNotifier();
+    $mailer->notify("hello");
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "App.Contracts.Notifier.notify");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = PhpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let external_hits = result.all_hits();
+    let lsp_hits = result.all_hits_including_imports();
+
+    assert!(
+        external_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$mailer->notify(\"hello\")")),
+        "consumer call should be an external usage: {external_hits:#?}"
+    );
+    assert!(
+        external_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("public function notify")),
+        "override declarations must not appear in external usages: {external_hits:#?}"
+    );
+    assert!(
+        lsp_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("public function notify")),
+        "LSP references should include the implementing method declaration: {lsp_hits:#?}"
+    );
+    assert!(
+        lsp_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$mailer->notify(\"hello\")")),
+        "consumer call should remain in LSP references: {lsp_hits:#?}"
+    );
 }
 
 #[test]
