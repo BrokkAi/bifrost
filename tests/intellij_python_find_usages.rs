@@ -406,3 +406,42 @@ fn imports() {
         references_for("Imports.py", "import r<caret>e\n\nx = re.compile('')\n");
     assert_reference_lines(&locations, &file, &[0, 2]);
 }
+
+// ---------------------------------------------------------------------------
+// Deepening: more Python find-usages shapes
+// ---------------------------------------------------------------------------
+
+// Usages of a module-level function are found in an importing file (the import
+// binding + the call).
+#[test]
+fn cross_file_function_usages() {
+    let (_t, _root, locations) = references_multifile(&[
+        ("mod.py", "def <caret>helper():\n    pass\n"),
+        ("main.py", "from mod import helper\n\nhelper()\n"),
+    ]);
+    // consumer.py: the `from mod import helper` binding (line 0) + the call (line 2).
+    assert_eq!(
+        reference_counts_by_file(&locations, &["mod.py", "main.py"]),
+        vec![0, 2],
+    );
+}
+
+// A method usage via a type-annotated parameter receiver.
+#[test]
+fn typed_parameter_method_usage() {
+    let (_temp, file, locations) = references_for(
+        "TypedParam.py",
+        "class Foo:\n    def <caret>bar(self):\n        pass\n\ndef run(x: Foo):\n    x.bar()\n",
+    );
+    assert_reference_lines(&locations, &file, &[5]);
+}
+
+// A classmethod called on the class resolves the same class member.
+#[test]
+fn classmethod_on_class_usage() {
+    let (_temp, file, locations) = references_for(
+        "ClassMethodUse.py",
+        "class Foo:\n    @classmethod\n    def <caret>make(cls):\n        pass\n\ndef run():\n    Foo.make()\n",
+    );
+    assert_reference_lines(&locations, &file, &[6]);
+}
