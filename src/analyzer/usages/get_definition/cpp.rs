@@ -1288,6 +1288,20 @@ fn cpp_receiver_type_units(
         .map(|cpp_type| cpp_type.unit)
         .into_iter()
         .collect(),
+        // `Foo().member` / `(new Foo())->member` — a temporary-construction or
+        // call receiver is typed by the constructed class or the call's return.
+        "call_expression" | "new_expression" => cpp_expression_type(
+            ctx.analyzer,
+            ctx.support,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            ctx.root,
+            receiver,
+        )
+        .map(|cpp_type| cpp_type.unit)
+        .into_iter()
+        .collect(),
         "parenthesized_expression" | "pointer_expression" => receiver
             .child_by_field_name("argument")
             .or_else(|| receiver.named_child(0))

@@ -112,7 +112,6 @@ fn typescript_construction_receiver() {
 
 // C++: `Foo().bar()` resolves `bar` (line 1).
 #[test]
-#[ignore = "pattern 1 gap: C++ temporary-construction receiver Foo().bar not yet typed"]
 fn cpp_construction_receiver() {
     assert_resolves_to_line(
         "r.cpp",
