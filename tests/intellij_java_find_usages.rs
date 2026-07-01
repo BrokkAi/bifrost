@@ -125,3 +125,47 @@ fn cross_class_construction_usage() {
         &[3, 4],
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deepening: more Java find-usages shapes
+// ---------------------------------------------------------------------------
+
+// Static method usages across classes (two call sites).
+#[test]
+fn static_method_usages() {
+    assert_reference_lines(
+        "StaticMethodUsages.java",
+        "class Util {\n  static void <caret>help() {}\n}\n\nclass A {\n  void run() {\n    Util.help();\n    Util.help();\n  }\n}\n",
+        &[6, 7],
+    );
+}
+
+// Enum constant usages.
+#[test]
+fn enum_constant_usages() {
+    assert_reference_lines(
+        "EnumConstantUsages.java",
+        "enum Color {\n  <caret>RED, GREEN\n}\n\nclass User {\n  Color a = Color.RED;\n  Color b = Color.RED;\n}\n",
+        &[5, 6],
+    );
+}
+
+// Field read and write are both usages.
+#[test]
+fn field_read_and_write_usages() {
+    assert_reference_lines(
+        "FieldReadWrite.java",
+        "class Box {\n  int <caret>value;\n  void set(int v) {\n    this.value = v;\n  }\n  int get() {\n    return this.value;\n  }\n}\n",
+        &[3, 6],
+    );
+}
+
+// Static field usages across classes via the class name.
+#[test]
+fn static_field_cross_class_usages() {
+    assert_reference_lines(
+        "StaticFieldCross.java",
+        "class Config {\n  static int <caret>MAX = 5;\n}\n\nclass A {\n  int a() { return Config.MAX; }\n}\n\nclass B {\n  int b() { return Config.MAX; }\n}\n",
+        &[5, 9],
+    );
+}
