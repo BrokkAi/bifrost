@@ -17,6 +17,14 @@ pub(super) fn resolve_js_ts(
     let imports = compute_jsts_import_binder(source, tree);
     let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
+    // AST path for an inline construction receiver `new Foo().member` — the
+    // text-split path below cannot express `new Foo()` as a qualifier.
+    if let Some(members) =
+        jsts_construction_receiver_members(analyzer, support, file, language, source, tree, site)
+    {
+        return candidates_outcome(members);
+    }
+
     if let Some((qualifier, name)) = reference.split_once('.') {
         if let Some(binding) = imports.bindings.get(qualifier)
             && matches!(
@@ -668,6 +676,53 @@ fn jsts_reference_prefix_for_focus(site: &ResolvedReferenceSite) -> Option<Strin
         segment_start = segment_end + 1;
     }
     None
+}
+
+/// Resolve `new Foo().member` by typing the receiver as the constructed class.
+/// Returns the member candidates when the caret is on the property of a
+/// member-expression whose object is a `new_expression`.
+fn jsts_construction_receiver_members(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<Vec<CodeUnit>> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.range.start_byte, site.range.end_byte)?;
+    // The site may resolve to the property identifier or to the whole
+    // member-expression (`new Foo().bar`).
+    let member_expr = if node.kind() == "member_expression" {
+        node
+    } else if node
+        .parent()
+        .is_some_and(|p| p.kind() == "member_expression")
+    {
+        node.parent()?
+    } else {
+        return None;
+    };
+    let object = member_expr.child_by_field_name("object")?;
+    if object.kind() != "new_expression" {
+        return None;
+    }
+    let constructor = object.child_by_field_name("constructor")?;
+    if constructor.kind() != "identifier" {
+        return None;
+    }
+    let property = member_expr.child_by_field_name("property")?;
+    let class_name = &source[constructor.start_byte()..constructor.end_byte()];
+    let member = &source[property.start_byte()..property.end_byte()];
+    let receiver_candidates =
+        jsts_value_space_candidates(analyzer, support.file_identifier(file, class_name));
+    let members = if language == Language::TypeScript {
+        ts_member_candidates(analyzer, support, receiver_candidates, member, true)
+    } else {
+        jsts_member_candidates(analyzer, support, receiver_candidates, member, true)
+    };
+    (!members.is_empty()).then_some(members)
 }
 
 fn jsts_member_candidates(

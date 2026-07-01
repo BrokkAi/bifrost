@@ -90,7 +90,6 @@ fn ruby_construction_receiver() {
 
 // JavaScript: `new Foo().bar()` resolves `bar` (line 1).
 #[test]
-#[ignore = "pattern 1 gap: js_ts get_definition is text-based (split on '.'); inline construction receiver not typed"]
 fn javascript_construction_receiver() {
     assert_resolves_to_line(
         "r.js",
@@ -101,7 +100,6 @@ fn javascript_construction_receiver() {
 
 // TypeScript: `new Foo().bar()` resolves `bar` (line 1).
 #[test]
-#[ignore = "pattern 1 gap: js_ts get_definition is text-based (split on '.'); inline construction receiver not typed"]
 fn typescript_construction_receiver() {
     assert_resolves_to_line(
         "r.ts",
