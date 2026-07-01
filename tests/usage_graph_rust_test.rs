@@ -172,6 +172,100 @@ impl Service {
 }
 
 #[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub struct Service;
+pub struct Other;
+
+impl Service {
+    pub fn new() -> Self {
+        Service
+    }
+
+    pub fn run(&self) {}
+}
+
+impl Other {
+    pub fn run(&self) {}
+}
+
+pub fn make_service() -> Service {
+    Service::new()
+}
+
+pub fn via_free_factory() {
+    let service = make_service();
+    service.run();
+}
+
+pub fn via_associated_factory() {
+    let service = Service::new();
+    service.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "via_free_factory", "Service.run").is_some(),
+        "free factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "via_associated_factory", "Service.run").is_some(),
+        "associated factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "via_free_factory", "Other.run").is_none()
+            && find_edge(&value, "via_associated_factory", "Other.run").is_none(),
+        "factory receiver must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn unsupported_trait_object_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub trait Runner {
+    fn run(&self);
+}
+
+pub struct Service;
+pub struct Other;
+
+impl Service {
+    pub fn run(&self) {}
+}
+
+impl Other {
+    pub fn run(&self) {}
+}
+
+pub fn ambiguous(receiver: &dyn Runner) {
+    receiver.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "ambiguous", "Service.run").is_none()
+            && find_edge(&value, "ambiguous", "Other.run").is_none(),
+        "unsupported trait-object receiver must not emit partial same-name edges: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn every_edge_endpoint_is_a_node() {
     assert_every_edge_endpoint_is_a_node(&usage_graph());
 }
