@@ -1,0 +1,15 @@
+{
+  "name": "bifrost-marketplace",
+  "description": "Local marketplace for the Bifrost analyzer-backed MCP server plugin.",
+  "owner": {
+    "name": "Brokk",
+    "url": "https://brokk.ai"
+  },
+  "plugins": [
+    {
+      "name": "bifrost",
+      "source": "./plugins/bifrost-agent",
+      "description": "Bifrost analyzer-backed code intelligence over MCP."
+    }
+  ]
+}

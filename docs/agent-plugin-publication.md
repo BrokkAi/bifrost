@@ -1,18 +1,17 @@
 # Bifrost Agent Plugin Publication
 
 This is the Bifrost-owned publication path for making the MCP server
-discoverable as an Agent Plugin. The concrete Codex plugin package lives in
-`plugins/bifrost-agent`, and the repo-local marketplace entry for testing lives
-in `.agents/plugins/marketplace.json`.
+discoverable as an Agent Plugin. The shared package lives in
+`plugins/bifrost-agent`. Codex uses `.agents/plugins/marketplace.json` for the
+repo-local marketplace, while Claude Code uses `.claude-plugin/marketplace.json`.
 
 ## Plugin shape
 
-The plugin manifest lives at
-`plugins/bifrost-agent/.codex-plugin/plugin.json`. Treat that checked-in file
-as the source of truth for marketplace metadata, including the plugin version,
-icon paths, display text, and MCP configuration pointer. Keep the stable plugin
-`name` as `bifrost`; use `Bifrost for Codex` for Codex-facing display text so
-this package root can also host other agent manifests later.
+The Codex plugin manifest lives at
+`plugins/bifrost-agent/.codex-plugin/plugin.json`. The Claude Code manifest
+lives at `plugins/bifrost-agent/.claude-plugin/plugin.json`. Keep both manifest
+versions aligned with `Cargo.toml` and keep the stable plugin `name` as
+`bifrost`. Use `Bifrost for Codex` only for Codex-facing display text.
 
 The companion MCP configuration lives at `plugins/bifrost-agent/.mcp.json`:
 
@@ -32,8 +31,8 @@ The companion MCP configuration lives at `plugins/bifrost-agent/.mcp.json`:
 Use the same Bifrost release as the Rust crate and release tag. The plugin does
 not bundle release archives; it expects `bifrost` to be available on `PATH`.
 When testing a checkout build, prepend this repository's `target/debug`
-directory to `PATH` before starting Codex. The plugin omits `--root` so Bifrost
-uses the Codex session working directory as the analyzed workspace root.
+directory to `PATH` before starting the host. The plugin omits `--root` so
+Bifrost uses the host session working directory as the analyzed workspace root.
 The default plugin toolset is `symbol|extended`, not `searchtools`, so the
 local plugin exposes analyzer navigation and related discovery tools without
 the `activate_workspace` or raw text-file tools.
@@ -52,16 +51,18 @@ Verify the binary before installing the plugin:
 ./target/debug/bifrost --root . --tool get_summaries --args '{"targets":["README.md"]}'
 ```
 
-Add the repo-local marketplace, install the plugin, and start a fresh Codex
+Add the repo-local marketplace, install the plugin, and start a fresh host
 session using the canonical local testing steps in
 `plugins/bifrost-agent/README.md`. Then call a lightweight analyzer tool such
 as `get_summaries` or `search_symbols` from the fresh session.
 
-Validate that the plugin manifest version matches `Cargo.toml` and that all
+Validate that the plugin manifest versions match `Cargo.toml` and that all
 plugin JSON files parse:
 
 ```bash
 node scripts/check-codex-plugin-manifest.mjs
+claude plugin validate plugins/bifrost-agent
+claude plugin validate .
 ```
 
 ## Publishing checklist
@@ -69,8 +70,10 @@ node scripts/check-codex-plugin-manifest.mjs
 - Build and publish the Bifrost release archives for every supported platform.
 - Update the VS Code extension's `bifrost.binaryVersion` and
   `bifrost.archiveSha256` entries to the same release.
-- Package the Agent Plugin from `plugins/bifrost-agent` with
+- Package the Codex Agent Plugin from `plugins/bifrost-agent` with
   `.codex-plugin/plugin.json`, `.mcp.json`, and `assets/icon.png`.
+- Package the Claude Code Agent Plugin from `plugins/bifrost-agent` with
+  `.claude-plugin/plugin.json`, `.mcp.json`, and `assets/icon.png`.
 - Validate that the plugin's MCP server entry launches:
   `bifrost --mcp "symbol|extended"`.
 - Confirm that plugin installation and VS Code LSP setup use separate Bifrost
