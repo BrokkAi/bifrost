@@ -173,7 +173,29 @@ Claude Code plugin install:
 /plugin install brokk@brokk-marketplace
 ```
 
-Codex plugin install:
+Codex plugin install for the Bifrost-owned MCP server plugin:
+
+```bash
+cargo build --bin bifrost
+codex plugin marketplace add /path/to/bifrost
+codex plugin add bifrost@bifrost-local
+PATH="/path/to/bifrost/target/debug:$PATH" codex
+```
+
+The Bifrost plugin package lives in `plugins/bifrost-agent`, and the local
+marketplace entry lives in `.agents/plugins/marketplace.json`. That package
+README is the canonical local testing guide. The plugin installs the Bifrost MCP
+server configuration through Codex's plugin flow instead of registering a
+one-off server with `codex mcp add`. It still expects the `bifrost` binary to be
+on `PATH`; for local development, use the `PATH` override shown above. The
+plugin starts Bifrost without `--root`, so Bifrost analyzes the Codex session
+working directory. Its default toolset is `symbol|extended`, which exposes code
+navigation and related discovery tools without workspace activation or raw text
+file tools.
+
+The Brokk workflow skills, such as `/brokk:guided-review`, are still packaged
+separately by the Brokk host plugin. To install those skills, use the Brokk
+plugin marketplace:
 
 ```bash
 codex plugin marketplace add BrokkAi/brokk

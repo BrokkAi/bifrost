@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "bifrost",
+      "args": [
+        "--mcp",
+        "symbol|extended"
+      ],
+      "startup_timeout_sec": 60,
+      "tool_timeout_sec": 300
+    }
+  }
+}
