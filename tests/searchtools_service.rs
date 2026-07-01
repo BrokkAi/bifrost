@@ -1357,12 +1357,9 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
     assert_eq!(0, array_len(&value, "too_many_callsites"));
 }
 
-#[test]
-fn scan_usages_mcp_call_uses_ruby_receiver_aware_resolution() {
-    let project = InlineTestProject::with_language(Language::Ruby)
-        .file(
-            "app/user.rb",
-            r#"
+fn assert_ruby_user_save_scan_usages_hit(user_call: &str, account_call: &str, expected_hit: &str) {
+    let source = format!(
+        r#"
 class User
   def save
   end
@@ -1376,14 +1373,16 @@ end
 class App
   def run
     user = User.new
-    user.save
+    {user_call}
 
     account = Account.new
-    account.save
+    {account_call}
   end
 end
-"#,
-        )
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("app/user.rb", source)
         .build();
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
@@ -1408,15 +1407,22 @@ end
         hits.iter().any(|hit| hit["snippet"]
             .as_str()
             .unwrap_or_default()
-            .contains("user.save")),
-        "expected user.save hit: {value}"
+            .contains(expected_hit)),
+        "expected {expected_hit} hit: {value}"
     );
-    assert!(
-        hits.iter().all(|hit| !hit["snippet"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("account.save")),
-        "must not report Account#save as User#save usage: {value}"
+}
+
+#[test]
+fn scan_usages_mcp_call_uses_ruby_receiver_aware_resolution() {
+    assert_ruby_user_save_scan_usages_hit("user.save", "account.save", "user.save");
+}
+
+#[test]
+fn scan_usages_mcp_call_resolves_ruby_public_send_symbol_dispatch() {
+    assert_ruby_user_save_scan_usages_hit(
+        "user.public_send(:save)\n    user.public_send(:missing, :save)",
+        "account.public_send(:save)",
+        "user.public_send(:save)",
     );
 }
 
