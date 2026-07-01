@@ -3,7 +3,9 @@ use crate::analyzer::js_ts::imports::{
     parse_commonjs_require_bindings_from_node, require_call_module_specifier,
 };
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
-use crate::analyzer::usages::js_ts_graph::hits::{record_hit, record_import_hit};
+use crate::analyzer::usages::js_ts_graph::hits::{
+    record_hit, record_import_hit, record_self_receiver_hit,
+};
 use crate::analyzer::usages::js_ts_graph::resolver::{
     JsTsUsageIndex, is_static_member, member_name, top_level_identifier,
 };
@@ -12,7 +14,7 @@ use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, UsageHit,
 };
 use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -34,9 +36,8 @@ pub(super) fn scan_files_for_seeds(
     let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
-    let target_owner_source = analyzer
-        .parent_of(target)
-        .map(|owner| owner.source().clone());
+    let target_owner = analyzer.parent_of(target);
+    let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
 
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
 
@@ -95,6 +96,7 @@ pub(super) fn scan_files_for_seeds(
             edges: &edges,
             target_self_file,
             target_is_static_member: is_static_member(target),
+            target_owner: target_owner.as_ref(),
             target_owner_source: target_owner_source.as_ref(),
             scope_stack: vec![HashMap::default()],
             binding_engine,
@@ -131,6 +133,7 @@ pub(super) struct ScanCtx<'a> {
     /// in-file references that don't go through an import binding).
     target_self_file: bool,
     target_is_static_member: bool,
+    target_owner: Option<&'a CodeUnit>,
     target_owner_source: Option<&'a ProjectFile>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
@@ -499,13 +502,20 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    // `BaseClass.staticMethod()` style — object binds to the target's parent class, the
-    // property is the requested member.
+    // `this.method()` inside the target owner class: editor references should see it,
+    // but scan_usages / call-graph surfaces filter it as an internal receiver hit.
     if let Some(member) = ctx.target_member
         && property_text == member
-        && member_object_matches_target(object, object_text, ctx)
     {
-        record_hit(property, ctx);
+        if this_receiver_matches_target(object, ctx) {
+            record_self_receiver_hit(property, ctx);
+            return;
+        }
+        // `BaseClass.staticMethod()` style — object binds to the target's parent class, the
+        // property is the requested member.
+        if member_object_matches_target(object, object_text, ctx) {
+            record_hit(property, ctx);
+        }
     }
 }
 
@@ -588,6 +598,30 @@ fn member_object_matches_target(node: Node<'_>, object_text: &str, ctx: &ScanCtx
     }
 
     false
+}
+
+fn this_receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if node.kind() != "this" || !ctx.target_self_file {
+        return false;
+    }
+    let Some(owner) = ctx.target_owner else {
+        return false;
+    };
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+        return false;
+    };
+    if &enclosing == owner {
+        return true;
+    }
+    ctx.analyzer
+        .parent_of(&enclosing)
+        .is_some_and(|parent| &parent == owner)
 }
 
 pub(super) fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {

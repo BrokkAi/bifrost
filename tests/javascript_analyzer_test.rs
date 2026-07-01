@@ -795,3 +795,58 @@ fn test_commonjs_module_exports_assignment_is_not_indexed_as_member_definition()
             .all(|unit| unit.fq_name() != "common.js.module.exports.run")
     );
 }
+
+#[test]
+fn test_member_assignment_declarations_filter_plain_locals_only() {
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "assignments.js",
+        r#"
+class Foo {}
+Foo.make = function make() {};
+function Bar() {}
+Bar.prototype.run = function run() {};
+const request = {};
+request.accepts = function accepts(type) { return type; };
+exports.accepts = request.accepts;
+var req = exports = module.exports = {};
+req.route = function route(type) { return type; };
+const obj = {};
+obj.spuriousmember = 1;
+obj.helper = function helper() {};
+"#,
+    )]);
+    let file = project.file("assignments.js");
+    let declarations = analyzer.get_declarations(&file);
+    let names = fq_names(declarations.iter().cloned());
+
+    assert!(
+        names.contains(&"Foo.make".to_string()),
+        "class static assignment should remain declared: {names:?}"
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.fq_name() == "Foo.make" && unit.kind() == CodeUnitType::Function),
+        "Foo.make should be a function declaration: {declarations:?}"
+    );
+    assert!(
+        names.contains(&"Bar.prototype.run".to_string()),
+        "prototype assignment should remain declared: {names:?}"
+    );
+    assert!(
+        names.contains(&"request.accepts".to_string()),
+        "CommonJS-exported local object member should remain declared: {names:?}"
+    );
+    assert!(
+        names.contains(&"req.route".to_string()),
+        "CommonJS export assignment-chain local object member should remain declared: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name.contains("spuriousmember")),
+        "plain-local member assignment must not be declared: {names:?}"
+    );
+    assert!(
+        !names.contains(&"obj.helper".to_string()),
+        "function-valued plain-local member assignment must not be declared: {names:?}"
+    );
+}

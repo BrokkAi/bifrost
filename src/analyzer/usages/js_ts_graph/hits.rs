@@ -20,6 +20,14 @@ pub(super) fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+/// Record `node` as a self/this receiver hit. IDE references include these; the
+/// call-graph / relevance surfaces filter them out.
+pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(hit) = build_hit(node, ctx) {
+        ctx.hits.insert(hit.into_self_receiver());
+    }
+}
+
 fn build_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<UsageHit> {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();

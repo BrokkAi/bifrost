@@ -105,13 +105,53 @@ pub(super) fn push_member_hit(
     enclosing: CodeUnit,
     hits: &mut BTreeSet<UsageHit>,
 ) {
+    push_member_hit_with_kind(
+        file,
+        source,
+        line_starts,
+        start,
+        end,
+        enclosing,
+        hits,
+        false,
+    );
+}
+
+pub(super) fn push_self_receiver_member_hit(
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    enclosing: CodeUnit,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    push_member_hit_with_kind(file, source, line_starts, start, end, enclosing, hits, true);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_member_hit_with_kind(
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    enclosing: CodeUnit,
+    hits: &mut BTreeSet<UsageHit>,
+    self_receiver: bool,
+) {
     let start_line = find_line_index_for_offset(line_starts, start);
-    hits.insert(usage_hit(
+    let hit = usage_hit(
         file,
         start_line,
         start,
         end,
         enclosing,
         trimmed_snippet_around_range(source, line_starts, start, end, SNIPPET_CONTEXT_LINES),
-    ));
+    );
+    hits.insert(if self_receiver {
+        hit.into_self_receiver()
+    } else {
+        hit
+    });
 }

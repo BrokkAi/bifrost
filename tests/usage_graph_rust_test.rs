@@ -13,7 +13,8 @@
 
 mod common;
 
-use brokk_bifrost::SearchToolsService;
+use brokk_bifrost::{Language, SearchToolsService};
+use common::InlineTestProject;
 use common::usage_graph::{assert_every_edge_endpoint_is_a_node, find_edge};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -139,6 +140,33 @@ fn self_recursion_and_unused_items_produce_no_edges() {
             .iter()
             .any(|edge| edge["to"].as_str() == Some("util.unused")),
         "unused item must have no incoming edges: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn self_receiver_call_does_not_create_usage_graph_edge() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub struct Service;
+
+impl Service {
+    pub fn target(&self) {}
+
+    pub fn caller(&self) {
+        self.target();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "Service.caller", "Service.target").is_none(),
+        "self-receiver calls must not appear as usage_graph edges: {}",
         value["edges"]
     );
 }

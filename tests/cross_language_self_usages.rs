@@ -25,7 +25,7 @@ fn reference_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
     let file: PathBuf = root.join(name);
-    std::fs::write(&file, source).expect("write fixture");
+    std::fs::write(&file, &source).expect("write fixture");
     let mut server = LspServer::start(&root);
     let locations = server.references(&file, line, character, false);
     server.shutdown();
@@ -65,7 +65,6 @@ fn php_this_method_usage() {
     );
 }
 
-#[ignore = "pattern 2 gap: self/this-receiver method usage not counted in the graph strategy"]
 #[test]
 fn cpp_this_method_usage() {
     assert_usage_on_line(
@@ -75,7 +74,6 @@ fn cpp_this_method_usage() {
     );
 }
 
-#[ignore = "pattern 2 gap: self/this-receiver method usage not counted in the graph strategy"]
 #[test]
 fn javascript_this_method_usage() {
     assert_usage_on_line(
@@ -85,7 +83,6 @@ fn javascript_this_method_usage() {
     );
 }
 
-#[ignore = "pattern 2 gap: self/this-receiver method usage not counted in the graph strategy"]
 #[test]
 fn typescript_this_method_usage() {
     assert_usage_on_line(
@@ -104,7 +101,6 @@ fn scala_this_method_usage() {
     );
 }
 
-#[ignore = "pattern 2 gap: self/this-receiver method usage not counted in the graph strategy"]
 #[test]
 fn rust_self_method_usage() {
     assert_usage_on_line(

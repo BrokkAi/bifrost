@@ -8,12 +8,10 @@
 //! flagged.
 //!
 //! Result of the audit: Ruby, PHP, and Go are already correct (guarded here).
-//! JS/TS over-declare `obj.x` from a *plain-local* member assignment, but the
-//! fix is not the blanket skip that worked for Python — the same
-//! `js_member_assignment_name` path also carries legitimate JS/TS member
-//! declarations (`Foo.prototype.m = …`, `Namespace.foo = …`), so narrowing it
-//! correctly needs scope awareness. Those two are `#[ignore]` documenting the
-//! gap.
+//! JS narrows `obj.x` from a *plain-local* member assignment with scope
+//! awareness because the same member-assignment path also carries legitimate
+//! declarations (`Foo.prototype.m = …`, exported local object members, class
+//! static assignments). TS does not declare these plain-local assignments.
 
 mod common;
 
@@ -72,8 +70,6 @@ fn go_field_assignment_does_not_declare_unknown_member() {
     assert_no_spurious_member(declaration_fqns(&analyzer));
 }
 
-#[ignore = "pattern 4 gap: JS declares `obj.x` from a plain-local member assignment; \
-            needs scope-aware narrowing (the same path carries prototype/namespace decls)"]
 #[test]
 fn javascript_local_member_assignment_does_not_declare() {
     let project = InlineTestProject::with_language(brokk_bifrost::Language::JavaScript)
@@ -83,7 +79,6 @@ fn javascript_local_member_assignment_does_not_declare() {
     assert_no_spurious_member(declaration_fqns(&analyzer));
 }
 
-#[ignore = "pattern 4 gap: TS shares the JS member-assignment declarer; same scope-aware fix"]
 #[test]
 fn typescript_local_member_assignment_does_not_declare() {
     let project = InlineTestProject::with_language(brokk_bifrost::Language::TypeScript)

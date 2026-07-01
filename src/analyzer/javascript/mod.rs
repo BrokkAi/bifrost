@@ -1044,6 +1044,26 @@ fn visit_js_object_literal_properties(
     top_level: &CodeUnit,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
+    visit_js_object_literal_properties_for_surface(
+        file,
+        source,
+        object,
+        parent,
+        top_level,
+        parsed,
+        JsAssignmentSymbolSurface::Declaration,
+    );
+}
+
+fn visit_js_object_literal_properties_for_surface(
+    file: &ProjectFile,
+    source: &str,
+    object: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    surface: JsAssignmentSymbolSurface,
+) {
     for index in 0..object.named_child_count() {
         let Some(child) = object.named_child(index) else {
             continue;
@@ -1057,13 +1077,20 @@ fn visit_js_object_literal_properties(
             "",
             format!("{}.{}", parent.short_name(), name),
         );
-        parsed.add_code_unit(
-            code_unit.clone(),
-            child,
-            source,
-            Some(parent.clone()),
-            Some(top_level.clone()),
-        );
+        match surface {
+            JsAssignmentSymbolSurface::Declaration => {
+                parsed.add_code_unit(
+                    code_unit.clone(),
+                    child,
+                    source,
+                    Some(parent.clone()),
+                    Some(top_level.clone()),
+                );
+            }
+            JsAssignmentSymbolSurface::DefinitionLookupOnly => {
+                parsed.add_definition_lookup_unit(code_unit.clone(), child, source);
+            }
+        }
         parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
     }
 }
@@ -1152,18 +1179,279 @@ fn js_parameter_label_node(parameter: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsAssignmentBindingKind {
+    PlainLocal,
+    DeclarationRoot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsAssignmentScopeKind {
+    Function,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsAssignmentSymbolSurface {
+    Declaration,
+    DefinitionLookupOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JsMemberAssignmentTarget {
+    name: String,
+    surface: JsAssignmentSymbolSurface,
+}
+
+struct JsAssignmentScope {
+    kind: JsAssignmentScopeKind,
+    bindings: HashMap<String, JsAssignmentBindingKind>,
+}
+
+impl JsAssignmentScope {
+    fn new(kind: JsAssignmentScopeKind) -> Self {
+        Self {
+            kind,
+            bindings: HashMap::default(),
+        }
+    }
+}
+
+struct JsAssignmentDeclarationState {
+    scopes: Vec<JsAssignmentScope>,
+    commonjs_exported_roots: HashSet<String>,
+}
+
+impl JsAssignmentDeclarationState {
+    fn new(commonjs_exported_roots: HashSet<String>) -> Self {
+        Self {
+            scopes: vec![JsAssignmentScope::new(JsAssignmentScopeKind::Function)],
+            commonjs_exported_roots,
+        }
+    }
+
+    fn enter_scope(&mut self, kind: JsAssignmentScopeKind) {
+        self.scopes.push(JsAssignmentScope::new(kind));
+    }
+
+    fn exit_scope(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+
+    fn declare_current(&mut self, name: &str, kind: JsAssignmentBindingKind) {
+        if name.is_empty() {
+            return;
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.bindings.insert(name.to_string(), kind);
+        }
+    }
+
+    fn declare_function_scoped(&mut self, name: &str, kind: JsAssignmentBindingKind) {
+        if name.is_empty() {
+            return;
+        }
+        if let Some(scope) = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .find(|scope| scope.kind == JsAssignmentScopeKind::Function)
+        {
+            scope.bindings.insert(name.to_string(), kind);
+        }
+    }
+
+    fn binding_of(&self, name: &str) -> Option<JsAssignmentBindingKind> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.bindings.get(name).copied())
+    }
+
+    fn binding_kind_for_declarator(
+        &self,
+        name: &str,
+        declarator: Node<'_>,
+        source: &str,
+    ) -> JsAssignmentBindingKind {
+        if self.commonjs_exported_roots.contains(name)
+            || declarator
+                .child_by_field_name("value")
+                .is_some_and(|value| {
+                    js_assignment_value_is_declaration_root(value)
+                        || js_assignment_value_exports_commonjs_root(value, source)
+                })
+        {
+            JsAssignmentBindingKind::DeclarationRoot
+        } else {
+            JsAssignmentBindingKind::PlainLocal
+        }
+    }
+}
+
 fn visit_js_assignment_declarations(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
-    walk_named_tree_preorder(root, true, |node| {
-        if node.kind() == "assignment_expression" {
-            visit_js_assignment_expression(file, source, node, parsed);
+    let mut state = JsAssignmentDeclarationState::new(js_commonjs_exported_roots(root, source));
+    let mut stack = vec![JsAssignmentWalkFrame::Enter(root)];
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            JsAssignmentWalkFrame::Enter(node) => {
+                register_js_assignment_declaration_name(node, source, &mut state);
+                let scope = js_assignment_scope_kind(node);
+                if let Some(scope) = scope {
+                    state.enter_scope(scope);
+                    register_js_assignment_parameters(node, source, &mut state);
+                }
+                register_js_assignment_variable(node, source, &mut state);
+                if node.kind() == "assignment_expression" {
+                    visit_js_assignment_expression(file, source, node, parsed, &state);
+                }
+                if scope.is_some() {
+                    stack.push(JsAssignmentWalkFrame::Exit);
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(JsAssignmentWalkFrame::Enter(child));
+                    }
+                }
+            }
+            JsAssignmentWalkFrame::Exit => state.exit_scope(),
         }
-        WalkControl::Continue
-    });
+    }
+}
+
+enum JsAssignmentWalkFrame<'tree> {
+    Enter(Node<'tree>),
+    Exit,
+}
+
+fn js_assignment_scope_kind(node: Node<'_>) -> Option<JsAssignmentScopeKind> {
+    match node.kind() {
+        "function_declaration"
+        | "function_expression"
+        | "generator_function"
+        | "arrow_function"
+        | "method_definition" => Some(JsAssignmentScopeKind::Function),
+        "statement_block" => Some(JsAssignmentScopeKind::Block),
+        _ => None,
+    }
+}
+
+fn register_js_assignment_declaration_name(
+    node: Node<'_>,
+    source: &str,
+    state: &mut JsAssignmentDeclarationState,
+) {
+    if !matches!(node.kind(), "class_declaration" | "function_declaration") {
+        return;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    state.declare_current(
+        node_text(name, source).trim(),
+        JsAssignmentBindingKind::DeclarationRoot,
+    );
+}
+
+fn register_js_assignment_parameters(
+    node: Node<'_>,
+    source: &str,
+    state: &mut JsAssignmentDeclarationState,
+) {
+    let mut names = Vec::new();
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        collect_js_assignment_binding_names(parameters, source, &mut names);
+    }
+    if let Some(parameter) = node.child_by_field_name("parameter") {
+        collect_js_assignment_binding_names(parameter, source, &mut names);
+    }
+    for name in names {
+        state.declare_current(&name, JsAssignmentBindingKind::PlainLocal);
+    }
+}
+
+fn register_js_assignment_variable(
+    node: Node<'_>,
+    source: &str,
+    state: &mut JsAssignmentDeclarationState,
+) {
+    if node.kind() != "variable_declarator" {
+        return;
+    }
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let mut names = Vec::new();
+    collect_js_assignment_binding_names(name_node, source, &mut names);
+    let parent_kind = node.parent().map(|parent| parent.kind());
+    for name in names {
+        let kind = state.binding_kind_for_declarator(&name, node, source);
+        if parent_kind == Some("variable_declaration") {
+            state.declare_function_scoped(&name, kind);
+        } else {
+            state.declare_current(&name, kind);
+        }
+    }
+}
+
+fn collect_js_assignment_binding_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let name = node_text(node, source).trim();
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+            return;
+        }
+        "assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_js_assignment_binding_names(left, source, names);
+            }
+            return;
+        }
+        "rest_pattern" => {
+            if let Some(child) = node.named_child(0) {
+                collect_js_assignment_binding_names(child, source, names);
+            }
+            return;
+        }
+        _ => {}
+    }
+    for index in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(index) {
+            collect_js_assignment_binding_names(child, source, names);
+        }
+    }
+}
+
+fn js_assignment_value_is_declaration_root(value: Node<'_>) -> bool {
+    matches!(
+        value.kind(),
+        "arrow_function" | "function_expression" | "generator_function" | "class"
+    )
+}
+
+fn js_assignment_value_exports_commonjs_root(value: Node<'_>, source: &str) -> bool {
+    if value.kind() != "assignment_expression" {
+        return false;
+    }
+    if value
+        .child_by_field_name("left")
+        .is_some_and(|left| js_is_commonjs_export_assignment_target(left, source))
+    {
+        return true;
+    }
+    value
+        .child_by_field_name("right")
+        .is_some_and(|right| js_assignment_value_exports_commonjs_root(right, source))
 }
 
 fn visit_js_assignment_expression(
@@ -1171,35 +1459,32 @@ fn visit_js_assignment_expression(
     source: &str,
     node: Node<'_>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    state: &JsAssignmentDeclarationState,
 ) {
     let Some(left) = node.child_by_field_name("left") else {
         return;
     };
     let value = node.child_by_field_name("right");
-    let Some(name) = js_commonjs_export_assignment_name(left, value, source)
-        .or_else(|| js_member_assignment_name(left, source))
+    let value_is_function =
+        value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
+    let Some(target) = js_commonjs_export_assignment_name(left, value, source)
+        .map(|name| JsMemberAssignmentTarget {
+            name,
+            surface: JsAssignmentSymbolSurface::Declaration,
+        })
+        .or_else(|| js_member_assignment_target(left, source, state))
     else {
         return;
     };
-    let is_function =
-        value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
-    let kind = if is_function {
+    let kind = if value_is_function {
         crate::analyzer::CodeUnitType::Function
     } else {
         crate::analyzer::CodeUnitType::Field
     };
-    let code_unit = CodeUnit::new(file.clone(), kind, "", name);
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        None,
-        Some(code_unit.clone()),
-    );
+    let code_unit = CodeUnit::new(file.clone(), kind, "", target.name);
+    add_js_assignment_code_unit(parsed, target.surface, code_unit.clone(), node, source);
     let (signature, parameter_text) = js_assignment_signature(node, left, value, source);
-    if let Some(value) =
-        value.filter(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
-    {
+    if let Some(value) = value.filter(|_| value_is_function) {
         parsed.add_signature_with_metadata(
             code_unit.clone(),
             js_signature_metadata(signature, value, source, &parameter_text),
@@ -1207,11 +1492,36 @@ fn visit_js_assignment_expression(
     } else {
         parsed.add_signature(code_unit.clone(), signature);
     }
-    if !is_function
+    if !value_is_function
         && let Some(value) = value
         && value.kind() == "object"
     {
-        visit_js_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
+        visit_js_object_literal_properties_for_surface(
+            file,
+            source,
+            value,
+            &code_unit,
+            &code_unit,
+            parsed,
+            target.surface,
+        );
+    }
+}
+
+fn add_js_assignment_code_unit(
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    surface: JsAssignmentSymbolSurface,
+    code_unit: CodeUnit,
+    node: Node<'_>,
+    source: &str,
+) {
+    match surface {
+        JsAssignmentSymbolSurface::Declaration => {
+            parsed.add_code_unit(code_unit.clone(), node, source, None, Some(code_unit));
+        }
+        JsAssignmentSymbolSurface::DefinitionLookupOnly => {
+            parsed.add_definition_lookup_unit(code_unit, node, source);
+        }
     }
 }
 
@@ -1251,13 +1561,22 @@ fn js_commonjs_export_assignment_property(node: Node<'_>, source: &str) -> Optio
     None
 }
 
-fn js_member_assignment_name(node: Node<'_>, source: &str) -> Option<String> {
+fn js_member_assignment_target(
+    node: Node<'_>,
+    source: &str,
+    state: &JsAssignmentDeclarationState,
+) -> Option<JsMemberAssignmentTarget> {
     if node.kind() != "member_expression" {
         return None;
     }
     if js_is_commonjs_export_assignment_target(node, source) {
         return None;
     }
+    let surface = if js_member_assignment_has_plain_local_root(node, source, state) {
+        JsAssignmentSymbolSurface::DefinitionLookupOnly
+    } else {
+        JsAssignmentSymbolSurface::Declaration
+    };
     let object = node.child_by_field_name("object")?;
     let property = node.child_by_field_name("property")?;
     if property.kind() == "computed_property_name" {
@@ -1265,7 +1584,7 @@ fn js_member_assignment_name(node: Node<'_>, source: &str) -> Option<String> {
     }
     let object_name = match object.kind() {
         "identifier" | "property_identifier" => node_text(object, source).trim().to_string(),
-        "member_expression" => js_member_assignment_name(object, source)?,
+        "member_expression" => js_member_assignment_target(object, source, state)?.name,
         _ => return None,
     };
     let property_name = node_text(property, source)
@@ -1275,7 +1594,50 @@ fn js_member_assignment_name(node: Node<'_>, source: &str) -> Option<String> {
     if object_name.is_empty() || property_name.is_empty() {
         return None;
     }
-    Some(format!("{object_name}.{property_name}"))
+    Some(JsMemberAssignmentTarget {
+        name: format!("{object_name}.{property_name}"),
+        surface,
+    })
+}
+
+fn js_member_assignment_has_plain_local_root(
+    node: Node<'_>,
+    source: &str,
+    state: &JsAssignmentDeclarationState,
+) -> bool {
+    let Some(root) = js_member_expression_root_identifier(node, source) else {
+        return false;
+    };
+    state.binding_of(root) == Some(JsAssignmentBindingKind::PlainLocal)
+}
+
+fn js_member_expression_root_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    match node.kind() {
+        "identifier" | "property_identifier" => {
+            let text = node_text(node, source).trim();
+            (!text.is_empty()).then_some(text)
+        }
+        "member_expression" => node
+            .child_by_field_name("object")
+            .and_then(|object| js_member_expression_root_identifier(object, source)),
+        _ => None,
+    }
+}
+
+fn js_commonjs_exported_roots(root: Node<'_>, source: &str) -> HashSet<String> {
+    let mut roots = HashSet::default();
+    walk_named_tree_preorder(root, true, |node| {
+        if node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+            && js_is_commonjs_export_assignment_target(left, source)
+            && let Some(right) = node.child_by_field_name("right")
+            && let Some(root) = js_member_expression_root_identifier(right, source)
+        {
+            roots.insert(root.to_string());
+        }
+        WalkControl::Continue
+    });
+    roots
 }
 
 fn js_is_commonjs_export_assignment_target(node: Node<'_>, source: &str) -> bool {

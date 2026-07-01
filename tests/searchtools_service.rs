@@ -182,6 +182,57 @@ fn rename_symbol_returns_non_mutating_edit_set() {
 }
 
 #[test]
+fn rename_symbol_includes_self_receiver_references() {
+    let source = r#"
+class Foo {
+  target() {}
+  caller() {
+    this.target();
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("service.ts", source)
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+    let start_byte = source.find("target() {}").expect("target declaration");
+    let args = serde_json::json!({
+        "path": "service.ts",
+        "start_byte": start_byte,
+        "new_name": "renamed"
+    });
+
+    let payload = service
+        .call_tool_json("rename_symbol", &args.to_string())
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("ok", value["status"], "payload: {value}");
+    let service_edits = value["edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "service.ts")
+        .and_then(|file| file["edits"].as_array())
+        .expect("service.ts edits");
+    let target_edits: Vec<_> = service_edits
+        .iter()
+        .filter(|edit| edit["old_text"] == "target" && edit["new_text"] == "renamed")
+        .collect();
+
+    assert_eq!(
+        2,
+        target_edits.len(),
+        "rename should edit the declaration and this.target() reference: {value}"
+    );
+    assert!(
+        target_edits.iter().any(|edit| edit["start_line"] == 5),
+        "rename must include the self-receiver callsite: {value}"
+    );
+}
+
+#[test]
 fn rename_symbol_rejects_oversized_identifier() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let arguments = serde_json::json!({

@@ -75,14 +75,45 @@ pub(super) fn selected_code_unit_declaration_at_cursor(
     cursor_range: &ByteRange,
     predicate: impl Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnit> {
-    let code_unit = analyzer.enclosing_code_unit(file, cursor_range)?;
-    if code_unit.source() != file || !predicate(&code_unit) {
-        return None;
+    if let Some(code_unit) = analyzer.enclosing_code_unit(file, cursor_range)
+        && code_unit.source() == file
+        && predicate(&code_unit)
+        && let Some(selection) =
+            code_unit_declaration_name_range(analyzer, file, content, &code_unit)
+        && cursor_range.start_byte >= selection.start_byte
+        && cursor_range.start_byte < selection.end_byte
+    {
+        return Some(code_unit);
     }
-    let selection = code_unit_declaration_name_range(analyzer, file, content, &code_unit)?;
-    (cursor_range.start_byte >= selection.start_byte
-        && cursor_range.start_byte < selection.end_byte)
-        .then_some(code_unit)
+
+    analyzer
+        .get_declarations(file)
+        .into_iter()
+        .filter(|code_unit| code_unit.source() == file && predicate(code_unit))
+        .filter(|code_unit| {
+            analyzer.ranges(code_unit).iter().any(|range| {
+                cursor_range.start_byte >= range.start_byte
+                    && cursor_range.start_byte < range.end_byte
+            })
+        })
+        .filter_map(|code_unit| {
+            let selection = code_unit_declaration_name_range(analyzer, file, content, &code_unit)?;
+            (cursor_range.start_byte >= selection.start_byte
+                && cursor_range.start_byte < selection.end_byte)
+                .then_some((selection.end_byte - selection.start_byte, code_unit))
+        })
+        .min_by_key(|(name_len, code_unit)| {
+            (
+                *name_len,
+                analyzer
+                    .ranges(code_unit)
+                    .iter()
+                    .map(|range| range.end_byte.saturating_sub(range.start_byte))
+                    .min()
+                    .unwrap_or(usize::MAX),
+            )
+        })
+        .map(|(_, code_unit)| code_unit)
 }
 
 pub(super) fn code_unit_declaration_name_range(
@@ -94,7 +125,8 @@ pub(super) fn code_unit_declaration_name_range(
     let declaration_range = analyzer.ranges(code_unit).iter().min().copied()?;
     let language = language_for_file(file);
     let tree = parse_tree_for_language(file, language, content)?;
-    let declaration_node = node_for_exact_range(tree.root_node(), &declaration_range)?;
+    let declaration_node = node_for_exact_range(tree.root_node(), &declaration_range)
+        .or_else(|| node_for_smallest_containing_range(tree.root_node(), &declaration_range))?;
     let name_node = declaration_name_node(declaration_node, code_unit.identifier(), content)?;
     Some(node_byte_range(name_node))
 }
@@ -127,6 +159,32 @@ fn node_for_exact_range<'tree>(root: Node<'tree>, range: &ByteRange) -> Option<N
     best
 }
 
+fn node_for_smallest_containing_range<'tree>(
+    root: Node<'tree>,
+    range: &ByteRange,
+) -> Option<Node<'tree>> {
+    let mut best: Option<Node<'tree>> = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+            continue;
+        }
+        if best.is_none_or(|current| {
+            node.end_byte().saturating_sub(node.start_byte())
+                < current.end_byte().saturating_sub(current.start_byte())
+        }) {
+            best = Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_byte() <= range.start_byte && child.end_byte() >= range.end_byte {
+                stack.push(child);
+            }
+        }
+    }
+    best
+}
+
 fn declaration_name_node<'tree>(
     declaration_node: Node<'tree>,
     identifier: &str,
@@ -145,7 +203,7 @@ fn declaration_name_node<'tree>(
             }
         }
     }
-    None
+    matching_identifier_node(declaration_node, identifier, content)
 }
 
 fn matching_identifier_node<'tree>(

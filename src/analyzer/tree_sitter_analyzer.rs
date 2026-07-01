@@ -152,6 +152,7 @@ pub(crate) struct FileState {
     pub(crate) package_name: String,
     pub(crate) top_level_declarations: Vec<CodeUnit>,
     pub(crate) declarations: HashSet<CodeUnit>,
+    pub(crate) definition_lookup_units: HashSet<CodeUnit>,
     pub(crate) import_statements: Vec<String>,
     pub(crate) imports: Vec<ImportInfo>,
     pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
@@ -209,6 +210,7 @@ pub struct ParsedFile {
     pub package_name: String,
     pub top_level_declarations: Vec<CodeUnit>,
     pub declarations: HashSet<CodeUnit>,
+    pub definition_lookup_units: HashSet<CodeUnit>,
     pub import_statements: Vec<String>,
     pub imports: Vec<ImportInfo>,
     pub raw_supertypes: HashMap<CodeUnit, Vec<String>>,
@@ -226,6 +228,7 @@ impl ParsedFile {
             package_name,
             top_level_declarations: Vec::new(),
             declarations: HashSet::default(),
+            definition_lookup_units: HashSet::default(),
             import_statements: Vec::new(),
             imports: Vec::new(),
             raw_supertypes: HashMap::default(),
@@ -266,6 +269,21 @@ impl ParsedFile {
         if let Some(top_level) = top_level {
             self.children.entry(top_level).or_default();
         }
+    }
+
+    /// Registers a source-backed lookup fact without exposing it through the
+    /// public declaration surface.
+    pub fn add_definition_lookup_unit(
+        &mut self,
+        code_unit: CodeUnit,
+        node: Node<'_>,
+        _source: &str,
+    ) {
+        self.definition_lookup_units.insert(code_unit.clone());
+        self.ranges
+            .entry(code_unit)
+            .or_default()
+            .push(node_range(node));
     }
 
     /// Registers a declaration-like code unit for analysis without giving it a source range.
@@ -363,6 +381,7 @@ impl ParsedFile {
         self.top_level_declarations
             .retain(|existing| existing != code_unit);
         self.declarations.remove(code_unit);
+        self.definition_lookup_units.remove(code_unit);
         self.raw_supertypes.remove(code_unit);
         self.signatures.remove(code_unit);
         self.signature_metadata.remove(code_unit);
@@ -594,6 +613,7 @@ where
             package_name: parsed.package_name,
             top_level_declarations: parsed.top_level_declarations,
             declarations: parsed.declarations,
+            definition_lookup_units: parsed.definition_lookup_units,
             import_statements: parsed.import_statements,
             imports: parsed.imports,
             raw_supertypes: parsed.raw_supertypes,
@@ -850,6 +870,9 @@ where
                         .or_default()
                         .push(declaration.clone());
                 }
+            }
+            for lookup_unit in &state.definition_lookup_units {
+                definition_lookup_index.insert(lookup_unit);
             }
 
             for (parent, descendants) in &state.children {

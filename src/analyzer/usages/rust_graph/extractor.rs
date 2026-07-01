@@ -2,7 +2,8 @@ use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::hits::{
-    member_hit_enclosing, push_member_hit, record_hit, record_module_qualified_hits,
+    member_hit_enclosing, push_member_hit, push_self_receiver_member_hit, record_hit,
+    record_module_qualified_hits,
 };
 use crate::analyzer::usages::rust_graph::resolver::is_trait_owner;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer};
@@ -483,15 +484,27 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             return;
         }
     }
-    push_member_hit(
-        ctx.file,
-        ctx.source,
-        ctx.line_starts,
-        start,
-        end,
-        enclosing,
-        ctx.hits,
-    );
+    if !ctx.target_is_field && receiver_is_self_rooted(receiver) {
+        push_self_receiver_member_hit(
+            ctx.file,
+            ctx.source,
+            ctx.line_starts,
+            start,
+            end,
+            enclosing,
+            ctx.hits,
+        );
+    } else {
+        push_member_hit(
+            ctx.file,
+            ctx.source,
+            ctx.line_starts,
+            start,
+            end,
+            enclosing,
+            ctx.hits,
+        );
+    }
 }
 
 fn receiver_matches_owner(
@@ -508,6 +521,14 @@ fn receiver_matches_owner(
     match receiver.kind() {
         "self" => enclosing_impl_type_matches_owner(receiver, ctx),
         "field_expression" => self_field_receiver_matches_owner(receiver, enclosing, ctx),
+        _ => false,
+    }
+}
+
+fn receiver_is_self_rooted(receiver: Node<'_>) -> bool {
+    match receiver.kind() {
+        "self" => true,
+        "parenthesized_expression" => receiver.named_child(0).is_some_and(receiver_is_self_rooted),
         _ => false,
     }
 }
