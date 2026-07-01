@@ -1,0 +1,35 @@
+{
+  "name": "bifrost",
+  "version": "0.7.2",
+  "description": "Bifrost analyzer-backed code intelligence over MCP.",
+  "author": {
+    "name": "Brokk",
+    "url": "https://brokk.ai"
+  },
+  "homepage": "https://github.com/BrokkAi/bifrost",
+  "repository": "https://github.com/BrokkAi/bifrost",
+  "license": "LGPL-3.0-or-later",
+  "keywords": [
+    "bifrost",
+    "mcp",
+    "code-intelligence",
+    "tree-sitter"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Bifrost",
+    "shortDescription": "Analyzer-backed code intelligence tools",
+    "longDescription": "Bifrost exposes analyzer-backed search, symbol, workspace, and code-quality tools through a stdio MCP server.",
+    "developerName": "Brokk",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "websiteURL": "https://brokk.ai",
+    "brandColor": "#2563EB",
+    "logo": "./assets/icon.png",
+    "composerIcon": "./assets/icon.png",
+    "screenshots": []
+  }
+}

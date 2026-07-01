@@ -1,0 +1,20 @@
+{
+  "name": "bifrost-local",
+  "interface": {
+    "displayName": "Bifrost Local"
+  },
+  "plugins": [
+    {
+      "name": "bifrost",
+      "source": {
+        "source": "local",
+        "path": "./plugins/bifrost-agent"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
