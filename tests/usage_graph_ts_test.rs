@@ -76,3 +76,130 @@ export class Service {
         graph["edges"]
     );
 }
+
+#[test]
+fn ts_factory_receiver_call_edges_only_to_constructed_type() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service { run() {} }
+export class Other { run() {} }
+export function makeService() { return new Service(); }
+export function caller() {
+  const service = makeService();
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "caller", "Service.run"),
+        "factory-produced receiver should resolve caller -> Service.run: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "caller", "Other.run"),
+        "factory-produced receiver must not resolve by same member name: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn ts_static_factory_receiver_call_edges_only_to_constructed_type() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service {
+  static create() { return new Service(); }
+  run() {}
+}
+export class Other { run() {} }
+export function caller() {
+  const service = Service.create();
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "caller", "Service.run"),
+        "static factory-produced receiver should resolve caller -> Service.run: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "caller", "Other.run"),
+        "static factory-produced receiver must not resolve by same member name: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn ts_ambiguous_factory_receiver_call_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service { run() {} }
+export class Other { run() {} }
+export function make(flag: boolean) {
+  if (flag) {
+    return new Service();
+  }
+  return new Other();
+}
+export function caller(flag: boolean) {
+  const service = make(flag);
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&graph, "caller", "Service.run"),
+        "ambiguous receiver must not pick Service.run by partial name match: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "caller", "Other.run"),
+        "ambiguous receiver must not pick Other.run by partial name match: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn js_factory_receiver_call_edges_only_to_constructed_type() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "service.js",
+            r#"
+export class Service { run() {} }
+export class Other { run() {} }
+export function makeService() { return new Service(); }
+export function caller() {
+  const service = makeService();
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "caller", "Service.run"),
+        "JS factory-produced receiver should resolve caller -> Service.run: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "caller", "Other.run"),
+        "JS factory-produced receiver must not resolve by same member name: {}",
+        graph["edges"]
+    );
+}

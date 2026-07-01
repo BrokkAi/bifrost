@@ -33,10 +33,12 @@
 mod extractor;
 mod hits;
 mod inverted;
+mod receiver_analysis;
 mod resolver;
 
 /// The cacheable JS/TS resolution index and its tree-free builder, exposed so the
 /// TypeScript and JavaScript analyzers can cache one per language.
+pub(in crate::analyzer::usages) use receiver_analysis::JsTsReceiverFactProvider;
 pub(crate) use resolver::{JsTsUsageIndex, build_jsts_usage_index};
 
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;

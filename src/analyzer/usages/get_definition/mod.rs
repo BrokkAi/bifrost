@@ -18,7 +18,9 @@ use crate::analyzer::usages::go_graph::{
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::java_graph::java_signature_arity;
-use crate::analyzer::usages::js_ts_graph::{cached_jsts_index, compute_jsts_import_binder};
+use crate::analyzer::usages::js_ts_graph::{
+    JsTsReceiverFactProvider, cached_jsts_index, compute_jsts_import_binder,
+};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::php_graph::{
@@ -30,6 +32,7 @@ use crate::analyzer::usages::python_graph::{
     is_declaration_identifier as python_is_declaration_identifier, python_slice,
     resolve_receiver_type as resolve_python_receiver_type,
 };
+use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 pub(crate) use crate::analyzer::usages::reference_site::byte_offset_for_character_column;
 pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,

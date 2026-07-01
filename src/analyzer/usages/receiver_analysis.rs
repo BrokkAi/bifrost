@@ -69,6 +69,27 @@ where
             Self::Precise(unique)
         }
     }
+
+    pub(crate) fn single_precise_or_ambiguous(
+        values: impl IntoIterator<Item = T>,
+        budget: ReceiverAnalysisBudget,
+    ) -> Self {
+        let mut unique = Vec::new();
+        for value in values {
+            if unique.contains(&value) {
+                continue;
+            }
+            unique.push(value);
+            if unique.len() > budget.max_targets {
+                return Self::Ambiguous(unique);
+            }
+        }
+        match unique.len() {
+            0 => Self::Unknown,
+            1 => Self::Precise(unique),
+            _ => Self::Ambiguous(unique),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -365,6 +386,22 @@ mod tests {
         );
 
         assert_eq!(outcome, ReceiverAnalysisOutcome::Unknown);
+    }
+
+    #[test]
+    fn single_precise_or_ambiguous_requires_exactly_one_target() {
+        let outcome = ReceiverAnalysisOutcome::single_precise_or_ambiguous(
+            [
+                ReceiverValue::InstanceType(class("Service")),
+                ReceiverValue::InstanceType(class("Other")),
+            ],
+            ReceiverAnalysisBudget::default(),
+        );
+
+        assert!(matches!(
+            outcome,
+            ReceiverAnalysisOutcome::Ambiguous(ref values) if values.len() == 2
+        ));
     }
 
     #[test]

@@ -1501,6 +1501,30 @@ fn ts_type_lookup_resolves_member_receiver_type() {
 }
 
 #[test]
+fn typescript_factory_receiver_member_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            "export class Service { run() {} }\nexport class Other { run() {} }\nexport function makeService() { return new Service(); }\nexport function caller() {\n  const service = makeService();\n  service.run();\n}\n",
+        )
+        .build();
+
+    let line = "  service.run();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"service.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Service.run", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "service.ts", "{value}");
+}
+
+#[test]
 fn ts_function_local_use_does_not_leak_to_sibling_function_type_lookup() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

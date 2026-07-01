@@ -21,6 +21,7 @@ use super::extractor::{
     compute_import_binder, is_declaration_identifier, is_object_in_member_expression,
     is_property_key_in_member, rightmost_jsx_identifier, slice,
 };
+use super::receiver_analysis::JsTsReceiverFactProvider;
 use super::resolver::{JsTsUsageIndex, collect_jsts_files, tree_sitter_language_for};
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -32,6 +33,7 @@ use crate::analyzer::usages::model::{ExportEntry, ImportKind};
 use crate::analyzer::usages::parsed_tree::{
     js_ts_tree_sitter_language_for_file, parse_tree_sitter_file,
 };
+use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,6 +98,13 @@ where
 
                 let mut ctx = TsScan {
                     source,
+                    receiver_provider: JsTsReceiverFactProvider::new(
+                        analyzer,
+                        language,
+                        file,
+                        source,
+                        parsed.tree.root_node(),
+                    ),
                     named_imports,
                     namespace_locals,
                     same_file,
@@ -155,6 +164,13 @@ where
             |collector| {
                 let mut ctx = ScopedTsScan {
                     source: parsed.source.as_str(),
+                    receiver_provider: JsTsReceiverFactProvider::new(
+                        analyzer,
+                        language,
+                        file,
+                        parsed.source.as_str(),
+                        parsed.tree.root_node(),
+                    ),
                     index,
                     declarations: &declarations,
                     imports,
@@ -177,6 +193,7 @@ struct ScopedImportBindings {
 
 struct ScopedTsScan<'a, 'b> {
     source: &'a str,
+    receiver_provider: JsTsReceiverFactProvider<'a, 'a>,
     index: &'a JsTsUsageIndex,
     declarations: &'a HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
     imports: ScopedImportBindings,
@@ -213,6 +230,7 @@ impl<'a> ScopedTsScan<'a, '_> {
 
 struct TsScan<'a, 'b> {
     source: &'a str,
+    receiver_provider: JsTsReceiverFactProvider<'a, 'a>,
     named_imports: HashMap<String, String>,
     namespace_locals: HashSet<String>,
     same_file: HashSet<String>,
@@ -691,12 +709,22 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferen
     ) else {
         return;
     };
+    let object_text = slice(object, ctx.source);
+    let property_text = slice(property, ctx.source);
+    if property_text.is_empty() {
+        return;
+    }
+
+    if (object.kind() != "identifier" || locals.is_shadowed(object_text))
+        && record_receiver_member(node, object, property, property_text, ctx)
+    {
+        return;
+    }
+
     if object.kind() != "identifier" {
         return;
     }
-    let object_text = slice(object, ctx.source);
-    let property_text = slice(property, ctx.source);
-    if object_text.is_empty() || property_text.is_empty() || locals.is_shadowed(object_text) {
+    if object_text.is_empty() || locals.is_shadowed(object_text) {
         return;
     }
 
@@ -728,9 +756,20 @@ fn handle_scoped_member(
         return;
     }
 
+    if object.kind() != "identifier"
+        && record_scoped_receiver_member(node, object, property, property_text, ctx)
+    {
+        return;
+    }
+
     if object.kind() == "identifier" {
         let object_text = slice(object, ctx.source);
-        if object_text.is_empty() || locals.is_shadowed(object_text) {
+        if object_text.is_empty() {
+            return;
+        }
+
+        if locals.is_shadowed(object_text) {
+            record_scoped_receiver_member(node, object, property, property_text, ctx);
             return;
         }
 
@@ -760,6 +799,61 @@ fn handle_scoped_member(
             ),
             property,
         );
+    }
+}
+
+fn record_receiver_member(
+    node: Node<'_>,
+    object: Node<'_>,
+    property: Node<'_>,
+    property_text: &str,
+    ctx: &mut TsScan<'_, '_>,
+) -> bool {
+    match ctx.receiver_provider.resolve_member_targets(
+        object,
+        property_text,
+        node.start_byte(),
+        ReceiverAnalysisBudget::default(),
+    ) {
+        ReceiverAnalysisOutcome::Precise(targets) => {
+            for target in targets {
+                ctx.record(target.fq_name(), property);
+            }
+            true
+        }
+        ReceiverAnalysisOutcome::Ambiguous(_)
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => true,
+        ReceiverAnalysisOutcome::Unknown => false,
+    }
+}
+
+fn record_scoped_receiver_member(
+    node: Node<'_>,
+    object: Node<'_>,
+    property: Node<'_>,
+    property_text: &str,
+    ctx: &mut ScopedTsScan<'_, '_>,
+) -> bool {
+    match ctx.receiver_provider.resolve_member_targets(
+        object,
+        property_text,
+        node.start_byte(),
+        ReceiverAnalysisBudget::default(),
+    ) {
+        ReceiverAnalysisOutcome::Precise(targets) => {
+            for target in targets {
+                ctx.record(
+                    UsageNodeKey::new(target.source().clone(), target.fq_name()),
+                    property,
+                );
+            }
+            true
+        }
+        ReceiverAnalysisOutcome::Ambiguous(_)
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => true,
+        ReceiverAnalysisOutcome::Unknown => false,
     }
 }
 
