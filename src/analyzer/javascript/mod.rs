@@ -1044,6 +1044,26 @@ fn visit_js_object_literal_properties(
     top_level: &CodeUnit,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
+    visit_js_object_literal_properties_for_surface(
+        file,
+        source,
+        object,
+        parent,
+        top_level,
+        parsed,
+        JsAssignmentSymbolSurface::Declaration,
+    );
+}
+
+fn visit_js_object_literal_properties_for_surface(
+    file: &ProjectFile,
+    source: &str,
+    object: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    surface: JsAssignmentSymbolSurface,
+) {
     for index in 0..object.named_child_count() {
         let Some(child) = object.named_child(index) else {
             continue;
@@ -1057,13 +1077,20 @@ fn visit_js_object_literal_properties(
             "",
             format!("{}.{}", parent.short_name(), name),
         );
-        parsed.add_code_unit(
-            code_unit.clone(),
-            child,
-            source,
-            Some(parent.clone()),
-            Some(top_level.clone()),
-        );
+        match surface {
+            JsAssignmentSymbolSurface::Declaration => {
+                parsed.add_code_unit(
+                    code_unit.clone(),
+                    child,
+                    source,
+                    Some(parent.clone()),
+                    Some(top_level.clone()),
+                );
+            }
+            JsAssignmentSymbolSurface::DefinitionLookupOnly => {
+                parsed.add_definition_lookup_unit(code_unit.clone(), child, source);
+            }
+        }
         parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
     }
 }
@@ -1162,6 +1189,18 @@ enum JsAssignmentBindingKind {
 enum JsAssignmentScopeKind {
     Function,
     Block,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsAssignmentSymbolSurface {
+    Declaration,
+    DefinitionLookupOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JsMemberAssignmentTarget {
+    name: String,
+    surface: JsAssignmentSymbolSurface,
 }
 
 struct JsAssignmentScope {
@@ -1428,8 +1467,12 @@ fn visit_js_assignment_expression(
     let value = node.child_by_field_name("right");
     let value_is_function =
         value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
-    let Some(name) = js_commonjs_export_assignment_name(left, value, source)
-        .or_else(|| js_member_assignment_name(left, source, state))
+    let Some(target) = js_commonjs_export_assignment_name(left, value, source)
+        .map(|name| JsMemberAssignmentTarget {
+            name,
+            surface: JsAssignmentSymbolSurface::Declaration,
+        })
+        .or_else(|| js_member_assignment_target(left, source, state))
     else {
         return;
     };
@@ -1438,14 +1481,8 @@ fn visit_js_assignment_expression(
     } else {
         crate::analyzer::CodeUnitType::Field
     };
-    let code_unit = CodeUnit::new(file.clone(), kind, "", name);
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        None,
-        Some(code_unit.clone()),
-    );
+    let code_unit = CodeUnit::new(file.clone(), kind, "", target.name);
+    add_js_assignment_code_unit(parsed, target.surface, code_unit.clone(), node, source);
     let (signature, parameter_text) = js_assignment_signature(node, left, value, source);
     if let Some(value) = value.filter(|_| value_is_function) {
         parsed.add_signature_with_metadata(
@@ -1459,7 +1496,32 @@ fn visit_js_assignment_expression(
         && let Some(value) = value
         && value.kind() == "object"
     {
-        visit_js_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
+        visit_js_object_literal_properties_for_surface(
+            file,
+            source,
+            value,
+            &code_unit,
+            &code_unit,
+            parsed,
+            target.surface,
+        );
+    }
+}
+
+fn add_js_assignment_code_unit(
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    surface: JsAssignmentSymbolSurface,
+    code_unit: CodeUnit,
+    node: Node<'_>,
+    source: &str,
+) {
+    match surface {
+        JsAssignmentSymbolSurface::Declaration => {
+            parsed.add_code_unit(code_unit.clone(), node, source, None, Some(code_unit));
+        }
+        JsAssignmentSymbolSurface::DefinitionLookupOnly => {
+            parsed.add_definition_lookup_unit(code_unit, node, source);
+        }
     }
 }
 
@@ -1499,20 +1561,22 @@ fn js_commonjs_export_assignment_property(node: Node<'_>, source: &str) -> Optio
     None
 }
 
-fn js_member_assignment_name(
+fn js_member_assignment_target(
     node: Node<'_>,
     source: &str,
     state: &JsAssignmentDeclarationState,
-) -> Option<String> {
+) -> Option<JsMemberAssignmentTarget> {
     if node.kind() != "member_expression" {
         return None;
     }
     if js_is_commonjs_export_assignment_target(node, source) {
         return None;
     }
-    if js_member_assignment_has_plain_local_root(node, source, state) {
-        return None;
-    }
+    let surface = if js_member_assignment_has_plain_local_root(node, source, state) {
+        JsAssignmentSymbolSurface::DefinitionLookupOnly
+    } else {
+        JsAssignmentSymbolSurface::Declaration
+    };
     let object = node.child_by_field_name("object")?;
     let property = node.child_by_field_name("property")?;
     if property.kind() == "computed_property_name" {
@@ -1520,7 +1584,7 @@ fn js_member_assignment_name(
     }
     let object_name = match object.kind() {
         "identifier" | "property_identifier" => node_text(object, source).trim().to_string(),
-        "member_expression" => js_member_assignment_name(object, source, state)?,
+        "member_expression" => js_member_assignment_target(object, source, state)?.name,
         _ => return None,
     };
     let property_name = node_text(property, source)
@@ -1530,7 +1594,10 @@ fn js_member_assignment_name(
     if object_name.is_empty() || property_name.is_empty() {
         return None;
     }
-    Some(format!("{object_name}.{property_name}"))
+    Some(JsMemberAssignmentTarget {
+        name: format!("{object_name}.{property_name}"),
+        surface,
+    })
 }
 
 fn js_member_assignment_has_plain_local_root(

@@ -18,7 +18,7 @@ use std::io;
 /// Bincode envelope version. Bumped when the wire format changes in a way
 /// that cannot be deserialized by older readers; persisted rows tagged with
 /// an unknown version are treated as dirty and re-analyzed.
-pub(crate) const PAYLOAD_VERSION: u32 = 2;
+pub(crate) const PAYLOAD_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct PersistedCodeUnit {
@@ -60,6 +60,7 @@ struct PersistedFileState {
     contains_tests: bool,
     top_level_declarations: Vec<PersistedCodeUnit>,
     declarations: Vec<PersistedCodeUnit>,
+    definition_lookup_units: Vec<PersistedCodeUnit>,
     import_statements: Vec<String>,
     imports: Vec<ImportInfo>,
     raw_supertypes: Vec<(PersistedCodeUnit, Vec<String>)>,
@@ -85,6 +86,11 @@ impl PersistedFileState {
                 .collect(),
             declarations: state
                 .declarations
+                .iter()
+                .map(PersistedCodeUnit::from_code_unit)
+                .collect(),
+            definition_lookup_units: state
+                .definition_lookup_units
                 .iter()
                 .map(PersistedCodeUnit::from_code_unit)
                 .collect(),
@@ -144,6 +150,11 @@ impl PersistedFileState {
             declarations.insert(unit.into_code_unit(source));
         }
 
+        let mut definition_lookup_units = set_with_capacity(self.definition_lookup_units.len());
+        for unit in self.definition_lookup_units {
+            definition_lookup_units.insert(unit.into_code_unit(source));
+        }
+
         let mut raw_supertypes = map_with_capacity(self.raw_supertypes.len());
         for (unit, parents) in self.raw_supertypes {
             raw_supertypes.insert(unit.into_code_unit(source), parents);
@@ -189,6 +200,7 @@ impl PersistedFileState {
             package_name: self.package_name,
             top_level_declarations,
             declarations,
+            definition_lookup_units,
             import_statements: self.import_statements,
             imports: self.imports,
             raw_supertypes,
