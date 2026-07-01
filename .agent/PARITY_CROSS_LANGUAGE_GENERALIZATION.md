@@ -99,3 +99,34 @@ These were Java/Python idioms with no cross-language analog:
 The methodology is the real generalization: the caret->LSP harness turns "does
 language X have bug Y" into a handful of fixtures, so cross-language coverage is a
 porting exercise, not a research one.
+
+
+## Outcomes (generalization pass)
+
+Each pattern has a cross-language suite that both proves the fix and pins the
+remaining gaps.
+
+- **1. Call/construction-receiver type inference — DONE (all languages).**
+  `tests/cross_language_receiver_definition.rs`. Added construction-receiver
+  member resolution to C#, PHP, Scala, C++, and JS/TS `get_definition` (Java and
+  Python already had it). All seven green.
+
+- **2. `self`/`this` receiver in find-usages — surfaced.**
+  `tests/cross_language_self_usages.rs`. C#, PHP, Scala, Go, Ruby already count a
+  `this`/`self` same-class call as a usage. C++, Rust, JS, TS do not; those four
+  are `#[ignore]`d (the fix lives in each `<lang>_graph` receiver-typing, a
+  heavier change than the `get_definition` work).
+
+- **3. `Import`-kind hit emission — DONE for JS/TS (was Python-only).**
+  `tests/cross_language_import_hits.rs`. The JS/TS graph now emits an `Import`
+  hit for the specifier that binds the target (ESM named + aliased + default), so
+  LSP find-references reports the import line while call-graph surfaces still
+  filter it (`js_ts_graph::extractor::handle_import_statement`). CommonJS
+  `require` destructuring and the remaining languages are the follow-up.
+
+- **4. Attribute/subscript-target over-declaration — audited.**
+  `tests/cross_language_attribute_target_declarations.rs`. Ruby, PHP, Go are
+  already correct (regression-guarded). JS/TS over-declare `obj.x` from a
+  plain-local `obj.x = 1`; unlike Python this is not a blanket skip (the same
+  `js_member_assignment_name` path carries legitimate `Foo.prototype.m` /
+  namespace declarations), so it needs scope-aware narrowing and is `#[ignore]`d.

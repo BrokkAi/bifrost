@@ -439,11 +439,15 @@ fn find_js_target(
         .expect("target definition not found")
 }
 
+// Models the call-graph hit surface (`all_hits`): `Import`-kind bindings are the
+// tokens that bring a symbol into a file and belong to find-references, not to
+// usage/call-graph counts, so they are filtered here.
 fn flatten_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
     match result {
         FuzzyResult::Success { hits_by_overload } => hits_by_overload
             .into_values()
             .flat_map(BTreeSet::into_iter)
+            .filter(|hit| hit.kind != brokk_bifrost::usages::UsageHitKind::Import)
             .collect(),
         other => panic!("expected Success, got {other:?}"),
     }

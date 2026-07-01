@@ -1,14 +1,30 @@
 use crate::analyzer::Range;
+use crate::analyzer::usages::UsageHit;
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::js_ts_graph::extractor::ScanCtx;
 use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use tree_sitter::Node;
 
 pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(hit) = build_hit(node, ctx) {
+        ctx.hits.insert(hit);
+    }
+}
+
+/// Record `node` as an `Import`-binding hit (the token that brings the symbol
+/// into this file). The IDE find-references surface includes these; the
+/// call-graph / relevance surfaces filter them out.
+pub(super) fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(hit) = build_hit(node, ctx) {
+        ctx.hits.insert(hit.into_import());
+    }
+}
+
+fn build_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<UsageHit> {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
     if start_byte >= end_byte {
-        return;
+        return None;
     }
 
     let line_idx = find_line_index_for_offset(ctx.line_starts, start_byte);
@@ -21,11 +37,9 @@ pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         end_line: line_idx,
     };
 
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
-        return;
-    };
+    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range)?;
 
-    ctx.hits.insert(usage_hit(
+    Some(usage_hit(
         ctx.file, line_idx, start_byte, end_byte, enclosing, snippet,
-    ));
+    ))
 }

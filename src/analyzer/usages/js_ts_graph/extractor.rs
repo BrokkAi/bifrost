@@ -3,7 +3,7 @@ use crate::analyzer::js_ts::imports::{
     parse_commonjs_require_bindings_from_node, require_call_module_specifier,
 };
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
-use crate::analyzer::usages::js_ts_graph::hits::record_hit;
+use crate::analyzer::usages::js_ts_graph::hits::{record_hit, record_import_hit};
 use crate::analyzer::usages::js_ts_graph::resolver::{
     JsTsUsageIndex, is_static_member, member_name, top_level_identifier,
 };
@@ -206,6 +206,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "export_specifier"
     ) || (kind == "expression_statement" && is_commonjs_export_statement(node, ctx.source))
     {
+        if kind == "import_statement" {
+            handle_import_statement(node, ctx);
+        }
         if introduces_scope {
             ctx.scope_stack.pop();
             ctx.binding_engine.exit_scope();
@@ -235,6 +238,58 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if introduces_scope {
         ctx.scope_stack.pop();
         ctx.binding_engine.exit_scope();
+    }
+}
+
+/// Emit an `Import`-binding hit for each ESM `import` specifier whose local
+/// binding resolves to the target (per `ctx.edges`). This makes LSP
+/// find-references report the import line, while the call-graph / relevance
+/// surfaces (which filter `Import` hits) stay import-free. Members are imported
+/// through their owner rather than by their own name, so member targets emit
+/// nothing here — mirroring the Python graph's `handle_import_candidate`.
+fn handle_import_statement(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_member.is_some() {
+        return;
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            // `{ Target }` or `{ Orig as Alias }`: the local binding is the alias
+            // when present, else the imported name; the token that *is* the target
+            // is always the imported-name node.
+            "import_specifier" => {
+                let name = current.child_by_field_name("name");
+                let local = current.child_by_field_name("alias").or(name);
+                if let (Some(name_node), Some(local_node)) = (name, local) {
+                    let local_name = slice(local_node, ctx.source);
+                    if ctx.edges.iter().any(|edge| edge.local_name == local_name) {
+                        record_import_hit(name_node, ctx);
+                    }
+                }
+            }
+            // `import Target from "…"`: the default binding is a bare `identifier`
+            // child of the clause (named/namespace bindings are their own nodes).
+            "import_clause" => {
+                let mut cursor = current.walk();
+                for child in current.named_children(&mut cursor) {
+                    if child.kind() != "identifier" {
+                        continue;
+                    }
+                    let local_name = slice(child, ctx.source);
+                    if ctx.edges.iter().any(|edge| {
+                        edge.local_name == local_name
+                            && matches!(edge.kind, ImportEdgeKind::Default)
+                    }) {
+                        record_import_hit(child, ctx);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            stack.push(child);
+        }
     }
 }
 
