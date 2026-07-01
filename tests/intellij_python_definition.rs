@@ -140,3 +140,125 @@ fn method_on_construction_receiver() {
         1,
     );
 }
+
+// An inherited method called on a subclass construction resolves to the base
+// class definition (line 1).
+#[test]
+fn inherited_method_via_construction() {
+    assert_resolves_to_line(
+        "InheritedMethod.py",
+        "class Base:\n    def run(self):\n        pass\n\nclass Sub(Base):\n    pass\n\nSub().<caret>run()\n",
+        1,
+    );
+}
+
+// A reference to a module-level global inside a function resolves to its
+// top-level assignment (line 0).
+#[test]
+fn module_global_reference() {
+    assert_resolves_to_line(
+        "Global.py",
+        "LIMIT = 10\n\ndef check(v):\n    return v < <caret>LIMIT\n",
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-file (multi-file) resolution
+// ---------------------------------------------------------------------------
+
+/// Write several Python files (exactly one carrying a `<caret>`), drive
+/// `textDocument/definition`, and return the resolved `(file-name-suffix, line)`
+/// pairs across all files.
+fn definition_multifile(files: &[(&str, &str)]) -> (TempDir, Vec<(String, u64)>) {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let mut caret: Option<(PathBuf, u64, u64)> = None;
+    for (name, src) in files {
+        let path = root.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        if src.contains("<caret>") {
+            let (clean, line, character) = split_caret(src);
+            std::fs::write(&path, clean).expect("write caret fixture");
+            caret = Some((path, line, character));
+        } else {
+            std::fs::write(&path, src).expect("write fixture");
+        }
+    }
+    let (caret_path, line, character) = caret.expect("one file must contain <caret>");
+    let mut server = LspServer::start(&root);
+    let response = server.text_document_position_response(
+        "textDocument/definition",
+        &uri_for(&caret_path),
+        line,
+        character,
+    );
+    server.shutdown();
+
+    let locations = match &response["result"] {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|loc| {
+                let uri = loc["uri"].as_str()?;
+                let line = loc["range"]["start"]["line"].as_u64()?;
+                let name = uri.rsplit('/').next().unwrap_or(uri).to_string();
+                Some((name, line))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    (temp, locations)
+}
+
+fn assert_resolves_in_file(files: &[(&str, &str)], target_file: &str, expected_line: u64) {
+    let (_temp, locations) = definition_multifile(files);
+    assert!(
+        locations
+            .iter()
+            .any(|(name, line)| name == target_file && *line == expected_line),
+        "expected {target_file}:{expected_line}, got {locations:?}"
+    );
+}
+
+// A `from mod import func; func()` use resolves to `def func` in mod.py (line 0).
+#[test]
+fn cross_file_from_import_use() {
+    assert_resolves_in_file(
+        &[
+            ("mod.py", "def func():\n    pass\n"),
+            ("main.py", "from mod import func\n\n<caret>func()\n"),
+        ],
+        "mod.py",
+        0,
+    );
+}
+
+// An aliased import `from mod import func as f; f()` resolves through the alias
+// to `def func` in mod.py (line 0).
+#[test]
+fn cross_file_aliased_import_use() {
+    assert_resolves_in_file(
+        &[
+            ("mod.py", "def func():\n    pass\n"),
+            ("main.py", "from mod import func as f\n\n<caret>f()\n"),
+        ],
+        "mod.py",
+        0,
+    );
+}
+
+// A qualified `import mod; mod.func()` resolves `func` to `def func` in mod.py
+// (line 0).
+#[test]
+fn cross_file_qualified_module_member() {
+    assert_resolves_in_file(
+        &[
+            ("mod.py", "def func():\n    pass\n"),
+            ("main.py", "import mod\n\nmod.<caret>func()\n"),
+        ],
+        "mod.py",
+        0,
+    );
+}
