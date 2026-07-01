@@ -822,23 +822,25 @@ fn collect_scope_facts_from_source(
 
                     match rhs {
                         AssignmentRhs::Call(callee) => {
-                            if let Some(receiver_type) = factory_return_type_for_callee(
-                                callee,
-                                current_class,
-                                factory_return_types,
-                            ) && engine.resolve_symbol(lhs).is_unknown()
-                            {
-                                engine.seed_symbol(lhs.clone(), receiver_type.clone());
-                                changed = true;
-                                continue;
-                            }
+                            if !engine.is_shadowed(callee) {
+                                if let Some(receiver_type) = factory_return_type_for_callee(
+                                    callee,
+                                    current_class,
+                                    factory_return_types,
+                                ) && engine.resolve_symbol(lhs).is_unknown()
+                                {
+                                    engine.seed_symbol(lhs.clone(), receiver_type.clone());
+                                    changed = true;
+                                    continue;
+                                }
 
-                            if let Some(receiver_type) = normalized_receiver_type(callee)
-                                && engine.resolve_symbol(lhs).is_unknown()
-                            {
-                                engine.seed_symbol(lhs.clone(), receiver_type);
-                                changed = true;
-                                continue;
+                                if let Some(receiver_type) = normalized_receiver_type(callee)
+                                    && engine.resolve_symbol(lhs).is_unknown()
+                                {
+                                    engine.seed_symbol(lhs.clone(), receiver_type);
+                                    changed = true;
+                                    continue;
+                                }
                             }
                         }
                         AssignmentRhs::Symbol(rhs_symbol) => {

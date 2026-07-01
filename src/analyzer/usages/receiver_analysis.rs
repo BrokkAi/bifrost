@@ -347,11 +347,11 @@ impl ReceiverFactProvider for NoopReceiverFactProvider {
 mod tests {
     use super::*;
     use crate::analyzer::CodeUnitType;
-    use std::path::Path;
+    use std::env;
 
     fn file() -> ProjectFile {
         ProjectFile::new(
-            Path::new("/tmp/bifrost-receiver-analysis"),
+            env::temp_dir().join("bifrost-receiver-analysis"),
             "src/service.ts",
         )
     }
