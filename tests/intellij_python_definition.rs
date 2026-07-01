@@ -261,3 +261,51 @@ fn cross_file_qualified_module_member() {
         0,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deepening: more single-file resolution shapes
+// ---------------------------------------------------------------------------
+
+// A decorator reference `@deco` resolves to `def deco` (line 0).
+#[test]
+fn decorator_reference() {
+    assert_resolves_to_line(
+        "Decorator.py",
+        "def deco(f):\n    return f\n\n@<caret>deco\ndef g():\n    pass\n",
+        0,
+    );
+}
+
+// A class-level attribute read via `self.LIMIT` resolves to the class-body
+// assignment (line 1).
+#[test]
+fn class_level_attribute_via_self() {
+    assert_resolves_to_line(
+        "ClassAttr.py",
+        "class C:\n    LIMIT = 10\n\n    def check(self, v):\n        return v < self.<caret>LIMIT\n",
+        1,
+    );
+}
+
+// A qualified nested class `Outer.Inner` resolves to the nested class (line 1).
+#[test]
+fn nested_class_reference() {
+    assert_resolves_to_line(
+        "NestedClass.py",
+        "class Outer:\n    class Inner:\n        pass\n\nOuter.<caret>Inner()\n",
+        1,
+    );
+}
+
+// A chained call `A().make().go()` resolves `go` through `make()`'s return type.
+// bifrost types a construction receiver but not a function's return type, so the
+// second hop is unresolved.
+#[test]
+#[ignore = "bifrost gap: member access on a function-call result (make().go()) needs return-type inference"]
+fn chained_method_return_type() {
+    assert_resolves_to_line(
+        "Chained.py",
+        "class B:\n    def go(self):\n        pass\n\nclass A:\n    def make(self):\n        return B()\n\nA().make().<caret>go()\n",
+        1,
+    );
+}

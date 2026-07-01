@@ -278,12 +278,21 @@ fn python_member_outcome(
     receiver_type: CodeUnit,
     member: &str,
 ) -> DefinitionLookupOutcome {
-    let mut candidates = support.fqn(&format!("{}.{}", receiver_type.fq_name(), member));
+    // Members use a `.` separator; a nested class is indexed with `$`
+    // (`Outer$Inner`), so try both.
+    let member_candidates = |owner: &str| {
+        let mut units = support.fqn(&format!("{owner}.{member}"));
+        if units.is_empty() {
+            units = support.fqn(&format!("{owner}${member}"));
+        }
+        units
+    };
+    let mut candidates = member_candidates(&receiver_type.fq_name());
     if candidates.is_empty()
         && let Some(provider) = analyzer.type_hierarchy_provider()
     {
         for ancestor in provider.get_ancestors(&receiver_type) {
-            candidates.extend(support.fqn(&format!("{}.{}", ancestor.fq_name(), member)));
+            candidates.extend(member_candidates(&ancestor.fq_name()));
         }
         sort_units(&mut candidates);
         candidates.dedup();
@@ -328,13 +337,20 @@ fn python_receiver_type_unit(
             {
                 return Some(unit);
             }
+            // A typed-variable receiver: use the local/parameter's inferred type.
             let facts_by_scope = collect_scope_facts(analyzer, file, &[], "", true);
-            let facts = enclosing_scope_facts(analyzer, file, &facts_by_scope, object)?;
-            let raw_type = facts
-                .resolution_for(receiver)
-                .as_precise()
-                .and_then(|targets| targets.iter().next().cloned())?;
-            resolve_python_receiver_type(analyzer, file, &raw_type, false)
+            if let Some(facts) = enclosing_scope_facts(analyzer, file, &facts_by_scope, object)
+                && let Some(raw_type) = facts
+                    .resolution_for(receiver)
+                    .as_precise()
+                    .and_then(|targets| targets.iter().next().cloned())
+                && let Some(unit) = resolve_python_receiver_type(analyzer, file, &raw_type, false)
+            {
+                return Some(unit);
+            }
+            // A class-name receiver: `ClassName.Nested` / `ClassName.member`
+            // accesses a member on the class itself.
+            resolve_python_receiver_type(analyzer, file, receiver, false)
         }
         // A construction receiver `Foo().bar` is typed by the class being called.
         "call" => {
