@@ -80,14 +80,12 @@ fn gopls_refs_type_as_param_and_return() {
 // gopls references/intrapackage.txt: references to a package-level var `q`
 // (assignment target + read argument). Caret on the var declaration (line 2).
 //
-// DEFERRED: package-level `var` references don't resolve in either direction —
-// go-to-definition from a use returns null and find-references from the decl
-// returns []. Package-level `const`/`func`/`type` references DO resolve, and the
-// var IS extracted (`pkg._module_.q`, kind Field), so the gap is specific to Go
-// module-field *vars* in reference resolution/indexing, not extraction. Exact
-// locus (DefinitionLookupIndex vs the graph resolver) still to be pinned.
+// Was failing: a package-level `var` was seeded as a *local shadow* in both the
+// get-definition reference resolver (`go_name_shadowed_at`) and the find-usages
+// forward scan (`seed_var_spec`), so references to it were treated as shadowed
+// locals and dropped. Fixed by not shadowing top-level (`source_file`-scoped)
+// `var` declarations while still seeding their type for receiver inference.
 #[test]
-#[ignore = "deferred: package-level Go `var` references unresolved (const/func/type resolve)"]
 fn gopls_refs_package_var_assign_and_read() {
     assert_refs(
         &[(

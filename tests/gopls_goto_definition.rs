@@ -88,6 +88,19 @@ fn gopls_def_method_through_var_receiver() {
     );
 }
 
+// Package-level `var` reference resolves to its declaration (line 2). A package
+// var was previously seeded as a local *shadow* in the reference resolver, so a
+// bare use failed to resolve (unlike `const`/`func`/`type`); fixed by not
+// shadowing top-level (`source_file`-scoped) `var` declarations.
+#[test]
+fn gopls_def_package_var_reference() {
+    assert_resolves_to_line(
+        "a.go",
+        "package a\n\nvar q string\n\nfunc use() {\n\t_ = q<caret>\n}\n",
+        2,
+    );
+}
+
 // gopls-style: a method call on an interface-typed parameter resolves to the
 // interface method declaration (line 3).
 #[test]

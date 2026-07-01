@@ -1,5 +1,6 @@
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::go_graph::hits::record_hit;
+use crate::analyzer::usages::go_graph::reference::go_is_top_level_decl;
 use crate::analyzer::usages::go_graph::resolver::{
     GoProjectGraph, ScanBindings, TargetSpec, TypeRef, node_text,
 };
@@ -92,7 +93,12 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
             seed_parameter_declaration(node, ctx, locals);
         }
         "var_declaration" | "short_var_declaration" => {
-            seed_local_bindings(node, ctx, locals);
+            // A package-level `var` is not a local binding: seeding it (as a shadow
+            // or a typed symbol) would hide references to the package variable.
+            // Only function/block-scoped `var`/`:=` are locals.
+            if !go_is_top_level_decl(node) {
+                seed_local_bindings(node, ctx, locals);
+            }
         }
         "assignment_statement" => {
             seed_local_bindings(node, ctx, locals);

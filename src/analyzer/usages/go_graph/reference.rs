@@ -90,6 +90,13 @@ fn resolve_with_namespaces(
     }
 }
 
+/// Whether `node` is a top-level declaration (a direct child of the source file),
+/// i.e. package scope rather than a function/block-local binding.
+pub(super) fn go_is_top_level_decl(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "source_file")
+}
+
 fn go_name_shadowed_at(root: Node<'_>, source: &str, byte: usize, name: &str) -> bool {
     let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let mut shadowed_at_lookup = None;
@@ -162,7 +169,13 @@ fn seed_go_bindings_before(
                 locals.declare_shadow(parameter);
             }
         }
-        "var_declaration" | "short_var_declaration" if node.start_byte() < cutoff_start => {
+        "var_declaration" | "short_var_declaration"
+            if node.start_byte() < cutoff_start && !go_is_top_level_decl(node) =>
+        {
+            // A *package-level* `var` is the declaration a reference resolves TO,
+            // not a local shadow — only function/block-scoped `var`/`:=` bindings
+            // shadow. (Top-level `const`/`func`/`type` were never seeded here, which
+            // is why only package `var` references failed to resolve.)
             for declared in declared_names(node, source) {
                 locals.declare_shadow(declared);
             }
