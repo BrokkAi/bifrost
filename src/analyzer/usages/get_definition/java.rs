@@ -95,7 +95,7 @@ pub(super) fn resolve_java(
                     _ => {}
                 }
             }
-            resolve_java_bare_identifier(analyzer, java, support, file, source, node)
+            resolve_java_bare_identifier(analyzer, java, support, file, source, root, node)
         }
         _ => no_definition(
             "unsupported_java_reference_shape",
@@ -262,6 +262,9 @@ fn resolve_java_type_reference(
     }
     if let Some(unit) = java_nested_type_from_context(analyzer, file, normalized, node.start_byte())
     {
+        return candidates_outcome(vec![unit]);
+    }
+    if let Some(unit) = java_qualified_nested_type(analyzer, java, file, source, node) {
         return candidates_outcome(vec![unit]);
     }
     if java_import_boundary_for_type(java, support, file, normalized) {
@@ -526,6 +529,7 @@ fn resolve_java_bare_identifier(
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
     let name = java_node_text(node, source);
@@ -535,6 +539,19 @@ fn resolve_java_bare_identifier(
     let static_import = java_static_import_candidates(analyzer, support, file, name);
     if static_import.status != DefinitionLookupStatus::NoDefinition {
         return static_import;
+    }
+    // A bare identifier can be an unqualified field access — resolve it to a
+    // field of the enclosing class (or an inherited one), unless the name is
+    // bound locally (a local, parameter, or type variable), in which case it is
+    // not this field.
+    if !java_local_binding_before(source, root, name, node.start_byte()) {
+        let class_ranges = ClassRangeIndex::build(analyzer, file);
+        if let Some(owner_fqn) = class_ranges.enclosing(node.start_byte()) {
+            let outcome = java_member_candidates(analyzer, support, owner_fqn, name, false);
+            if outcome.status == DefinitionLookupStatus::Resolved {
+                return outcome;
+            }
+        }
     }
     if java_import_boundary_for_type(java, support, file, name) {
         return boundary(format!(
@@ -687,6 +704,44 @@ fn java_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
             parent.kind(),
             "method_declaration" | "constructor_declaration"
         )
+}
+
+/// Resolve the name of a `scoped_type_identifier` (`B.Foo`) by resolving the
+/// qualifier (`B`) and finding the nested type `Foo` in it — directly or via a
+/// superclass/interface. Handles cases the from-context nested lookup misses,
+/// like `class A extends B.Foo`.
+fn java_qualified_nested_type(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    let parent = node.parent()?;
+    if parent.kind() != "scoped_type_identifier" {
+        return None;
+    }
+    let mut cursor = parent.walk();
+    let qualifier = parent
+        .named_children(&mut cursor)
+        .find(|child| child.id() != node.id() && child.end_byte() <= node.start_byte())?;
+    let qualifier_type = java_type_from_node_with_context(analyzer, java, file, source, qualifier)?;
+    let name = java_node_text(node, source);
+
+    let nested = |owner: &CodeUnit| {
+        analyzer
+            .definitions(&format!("{}.{}", owner.fq_name(), name))
+            .find(|unit| unit.is_class())
+            .cloned()
+    };
+    if let Some(unit) = nested(&qualifier_type) {
+        return Some(unit);
+    }
+    analyzer
+        .type_hierarchy_provider()?
+        .get_ancestors(&qualifier_type)
+        .into_iter()
+        .find_map(|ancestor| nested(&ancestor))
 }
 
 fn java_type_from_node_with_context(
@@ -1348,7 +1403,16 @@ fn java_identifier_binding_before(
     before_byte: usize,
 ) -> bool {
     let mut found = false;
-    collect_java_identifier_binding_before(source, root, name, before_byte, &mut found);
+    collect_java_identifier_binding_before(source, root, name, before_byte, true, &mut found);
+    found
+}
+
+/// Like [`java_identifier_binding_before`] but counts only local variables and
+/// parameters, not field declarations — used to decide whether a bare name is
+/// shadowed by a local (and so is not a field reference).
+fn java_local_binding_before(source: &str, root: Node<'_>, name: &str, before_byte: usize) -> bool {
+    let mut found = false;
+    collect_java_identifier_binding_before(source, root, name, before_byte, false, &mut found);
     found
 }
 
@@ -1357,6 +1421,7 @@ fn collect_java_identifier_binding_before(
     node: Node<'_>,
     name: &str,
     before_byte: usize,
+    include_fields: bool,
     found: &mut bool,
 ) {
     if *found {
@@ -1368,7 +1433,9 @@ fn collect_java_identifier_binding_before(
             continue;
         }
         match node.kind() {
-            "local_variable_declaration" | "field_declaration" => {
+            "local_variable_declaration" | "field_declaration"
+                if include_fields || node.kind() == "local_variable_declaration" =>
+            {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     if child.kind() == "variable_declarator"

@@ -158,7 +158,6 @@ fn super_method_call_resolves_to_nearest_override() {
 // IntelliJ class/ClassExtendsItsInner1: `class A extends B.Foo` resolves the
 // qualified nested class `B.Foo` (the `static class Foo`, line 4).
 #[test]
-#[ignore = "bifrost gap: a qualified nested-class reference (B.Foo) in an extends clause is not resolved"]
 fn qualified_nested_class_reference() {
     assert_resolves_to_line(
         "ClassExtendsItsInner1.java",
@@ -172,7 +171,6 @@ fn qualified_nested_class_reference() {
 // resolves qualified field access (`this.f`, `x.f`) but not a bare, unqualified
 // field name that binds to an enclosing/inherited class field.
 #[test]
-#[ignore = "bifrost gap: bare (unqualified) field references are not resolved (only qualified field access)"]
 fn bare_inherited_outer_field() {
     assert_resolves_to_line(
         "InheritedOuter.java",
