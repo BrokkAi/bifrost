@@ -19,7 +19,8 @@
 
 use super::extractor::{is_declaration_name, member_access_name, member_access_receiver};
 use super::resolver::{
-    first_type_child, is_type_reference_node, node_text, normalize_type_text, reference_type_text,
+    first_type_child, is_type_reference_node, method_return_type_fq_name, node_text,
+    normalize_type_text, reference_type_text,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
@@ -242,6 +243,7 @@ fn seed_variable_declaration(
         let resolved = if type_text == "var" {
             object_created_type(child)
                 .and_then(|type_node| ctx.resolve_type_fqn(node_text(type_node, ctx.source)))
+                .or_else(|| var_initializer_type(child, ctx, bindings))
         } else {
             ctx.resolve_type_fqn(type_text)
         };
@@ -275,4 +277,85 @@ fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find_map(object_created_type)
+}
+
+fn var_initializer_type(
+    declarator: Node<'_>,
+    ctx: &CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let initializer = variable_declarator_initializer(declarator)?;
+    expression_type_fqn(initializer, ctx, bindings)
+}
+
+fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
+    declarator
+        .child_by_field_name("value")
+        .or_else(|| declarator.child_by_field_name("initializer"))
+        .or_else(|| {
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "equals_value_clause")
+                .and_then(|clause| {
+                    clause
+                        .child_by_field_name("value")
+                        .or_else(|| clause.named_child(0))
+                })
+        })
+        .or_else(|| {
+            let name = declarator.child_by_field_name("name")?;
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| child.start_byte() > name.end_byte())
+        })
+}
+
+fn expression_type_fqn(
+    expression: Node<'_>,
+    ctx: &CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    match expression.kind() {
+        "object_creation_expression" => object_created_type(expression)
+            .and_then(|type_node| ctx.resolve_type_fqn(node_text(type_node, ctx.source))),
+        "invocation_expression" => invocation_return_type_fqn(expression, ctx, bindings),
+        "identifier" => {
+            let name = node_text(expression, ctx.source);
+            first_precise(bindings, name)
+        }
+        _ => None,
+    }
+}
+
+fn invocation_return_type_fqn(
+    invocation: Node<'_>,
+    ctx: &CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let function = invocation.child_by_field_name("function")?;
+    match function.kind() {
+        "identifier" => {
+            let name = node_text(function, ctx.source);
+            let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
+            let owner = class_unit_for_fqn(ctx, owner_fqn)?;
+            method_return_type_fq_name(ctx.csharp, ctx.file, &owner, name)
+        }
+        "member_access_expression" => {
+            let receiver = member_access_receiver(function)?;
+            let name = member_access_name(function)?;
+            let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
+            let owner = class_unit_for_fqn(ctx, &owner_fqn)?;
+            method_return_type_fq_name(ctx.csharp, ctx.file, &owner, node_text(name, ctx.source))
+        }
+        _ => None,
+    }
+}
+
+fn class_unit_for_fqn(ctx: &CsScan<'_, '_>, fqn: &str) -> Option<crate::analyzer::CodeUnit> {
+    ctx.csharp
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.fq_name() == fqn)
 }

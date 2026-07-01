@@ -228,6 +228,114 @@ public class ProdTests {
 }
 
 #[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Service.cs",
+            r#"
+namespace Example;
+
+public class Service {
+    public void Run() {}
+    public static Service Create() {
+        return new Service();
+    }
+}
+
+public class Other {
+    public void Run() {}
+}
+"#,
+        )
+        .file(
+            "Consumer.cs",
+            r#"
+namespace Example;
+
+public class Consumer {
+    Service MakeService() {
+        return new Service();
+    }
+
+    public void ViaFactory() {
+        var service = MakeService();
+        service.Run();
+    }
+
+    public void ViaStaticFactory() {
+        var service = Service.Create();
+        service.Run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in [
+        "Example.Consumer.ViaFactory",
+        "Example.Consumer.ViaStaticFactory",
+    ] {
+        assert!(
+            has_edge(&value, caller, "Example.Service.Run"),
+            "{caller} should edge to Service.Run: {}",
+            value["edges"]
+        );
+        assert!(
+            !has_edge(&value, caller, "Example.Other.Run"),
+            "{caller} must not edge to Other.Run by member name: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
+fn ambiguous_factory_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Service.cs",
+            "namespace Example;\npublic class Service { public void Run() {} }\n",
+        )
+        .file(
+            "Other.cs",
+            "namespace Example;\npublic class Other { public void Run() {} }\n",
+        )
+        .file(
+            "Consumer.cs",
+            r#"
+namespace Example;
+
+public class Consumer {
+    object Choose(bool flag) {
+        if (flag) {
+            return new Service();
+        }
+        return new Other();
+    }
+
+    public void Caller(bool flag) {
+        var service = Choose(flag);
+        service.Run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "Example.Consumer.Caller", "Example.Service.Run"),
+        "ambiguous receiver must not choose Service.Run: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Example.Consumer.Caller", "Example.Other.Run"),
+        "ambiguous receiver must not choose Other.Run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scoped_usage_graph_skips_unrelated_invalid_csharp_callers() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
