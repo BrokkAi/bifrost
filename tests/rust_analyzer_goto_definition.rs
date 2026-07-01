@@ -139,3 +139,28 @@ fn ra_goto_definition_on_self() {
         0,
     );
 }
+
+// Module-qualified associated-fn call: `foo::Foo::new()` from outside an inline
+// `mod foo { .. }` should resolve to `new` (line 4).
+//
+// DEFERRED (resolver architecture). Making this work needs two things: (1) impl
+// methods inside inline modules to be extracted — `visit_rust_module` never
+// dispatches `impl_item`, so `mod foo { impl Foo { fn m } }` yields `foo.Foo` but
+// not `foo.Foo.m`; and (2) scope-sensitive name resolution. (1) is a small fix,
+// but it exposes (2): `RustReferenceContext.same_file` is keyed by short
+// `identifier()`, so same-named declarations in sibling inline modules collide
+// nondeterministically in the HashMap, and `collect_factory_return_types` keys
+// module-level factories via `resolve_bare` — together yielding nondeterministic
+// and spurious cross-module edges in the inverted usage graph (verified: it
+// flakes `usage_graph_rust_test::factory_receiver_uses_resolved_callable_...`).
+// The real fix is a position/scope-aware `resolve_bare`, which ripples through
+// every Rust resolution caller — its own ExecPlan, not a burndown bolt-on.
+#[test]
+#[ignore = "deferred: needs scope-sensitive Rust name resolution (see suite comment)"]
+fn ra_goto_def_module_qualified_assoc_fn() {
+    assert_resolves_to_line(
+        "p.rs",
+        "mod foo {\n    pub struct Foo;\n\n    impl Foo {\n        pub fn new() -> Foo { Foo }\n    }\n}\n\nfn main() {\n    let _f = foo::Foo::new<caret>();\n}\n",
+        4,
+    );
+}

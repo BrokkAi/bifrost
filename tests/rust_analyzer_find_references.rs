@@ -96,14 +96,14 @@ fn ra_field_read_and_write() {
 // rust-analyzer: test_find_struct_function_refs_outside_module — an associated
 // function referenced through its module path (`foo::Foo::new()`).
 //
-// DEFERRED: this is an inline-module path-resolution gap, not a usage-scan gap.
-// `resolve_scoped("foo", "Foo")` does not resolve the type declared inside an
-// inline `mod foo { .. }`, so *both* go-to-definition and find-references return
-// nothing for `foo::Foo::new()` (verified: goto-def on the call site also yields
-// []). The right fix registers inline-module member paths in the Rust reference
-// context; tracked separately from this find-usages work.
+// DEFERRED (resolver architecture) — same root cause as
+// `ra_goto_def_module_qualified_assoc_fn` in the go-to-definition suite: inline
+// `mod foo` impl methods aren't extracted, and the fix exposes that the Rust
+// reference context resolves bare names against a flat, position-blind short-name
+// map, so same-named sibling-module declarations collide nondeterministically.
+// The real fix is scope-sensitive name resolution; tracked for its own ExecPlan.
 #[test]
-#[ignore = "deferred: inline `mod foo` path `foo::Foo` does not resolve (affects goto-def too)"]
+#[ignore = "deferred: needs scope-sensitive Rust name resolution (see ra_goto_def_module_qualified_assoc_fn)"]
 fn ra_find_struct_function_refs_outside_module() {
     assert_refs(
         &[(
