@@ -74,15 +74,13 @@ pub(crate) fn run_with_connection(
         Ok(params) => params,
         Err(err) => {
             let message = format!("Failed to decode InitializeParams: {err}");
-            connection
-                .sender
-                .send(Message::Response(Response::new_err(
-                    init_id,
-                    ErrorCode::InvalidParams as i32,
-                    message.clone(),
-                )))
-                .map_err(|send_err| format!("Failed to send LSP initialize error: {send_err}"))?;
-            return Err(message);
+            return finish_with_initialize_error(
+                connection,
+                io_threads,
+                init_id,
+                ErrorCode::InvalidParams as i32,
+                message,
+            );
         }
     };
     let server_capabilities = server_capabilities_json(&init_params)?;
@@ -136,6 +134,28 @@ pub(crate) fn run_with_connection(
         .join()
         .map_err(|err| format!("LSP IO threads failed: {err}"))?;
     result
+}
+
+fn finish_with_initialize_error(
+    connection: Connection,
+    io_threads: IoThreads,
+    init_id: RequestId,
+    code: i32,
+    message: String,
+) -> Result<(), String> {
+    connection
+        .sender
+        .send(Message::Response(Response::new_err(
+            init_id,
+            code,
+            message.clone(),
+        )))
+        .map_err(|send_err| format!("Failed to send LSP initialize error: {send_err}"))?;
+    drop(connection);
+    io_threads
+        .join()
+        .map_err(|err| format!("LSP IO threads failed after initialize error: {err}"))?;
+    Err(message)
 }
 
 fn server_capabilities_json(params: &InitializeParams) -> Result<serde_json::Value, String> {
