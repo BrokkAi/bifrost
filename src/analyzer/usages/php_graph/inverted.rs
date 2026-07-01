@@ -39,11 +39,15 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
-    IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
+    CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
     resolve_php_function, resolve_php_type,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
+use std::sync::Mutex;
 use tree_sitter::Node;
+
+type CallableReturnCache = Mutex<HashMap<String, Option<String>>>;
+type FileReturnCache = Mutex<HashMap<ProjectFile, HashMap<String, Option<String>>>>;
 
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
 /// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
@@ -58,13 +62,20 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_php::LANGUAGE_PHP.into();
+    let return_type_cache: CallableReturnCache = Mutex::new(HashMap::default());
+    let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let ctx = php.file_context_from_source(file, parsed.source.as_str());
             let mut scan = PhpScan {
+                php,
+                file,
                 ctx,
                 source: parsed.source.as_str(),
+                root: parsed.tree.root_node(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
+                return_type_cache: &return_type_cache,
+                file_return_cache: &file_return_cache,
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -74,9 +85,14 @@ where
 }
 
 struct PhpScan<'a, 'b> {
+    php: &'a PhpAnalyzer,
+    file: &'a ProjectFile,
     ctx: PhpFileContext,
     source: &'a str,
+    root: Node<'a>,
     class_ranges: ClassRangeIndex,
+    return_type_cache: &'a CallableReturnCache,
+    file_return_cache: &'a FileReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -243,11 +259,12 @@ fn seed_parameters(
     });
 }
 
-/// Seed `$x = new Foo()` locals into the binding scope. Other assignments shadow
-/// the name (so an untyped local is not later read as a static type).
+/// Seed `$x = new Foo()` and `$x = factory()` locals into the binding scope when
+/// the RHS has a structurally declared class result. Other assignments shadow the
+/// name (so an untyped local is not later read as a static type).
 fn seed_assignment(
     node: Node<'_>,
-    scan: &PhpScan<'_, '_>,
+    scan: &mut PhpScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let Some((left, right)) = assignment_parts(node) else {
@@ -260,14 +277,174 @@ fn seed_assignment(
     if name.is_empty() {
         return;
     }
-    let resolved = (right.kind() == "object_creation_expression")
-        .then(|| object_creation_type(right))
-        .flatten()
-        .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source)));
+    let resolved = assignment_receiver_type_fqn(right, scan);
     match resolved {
         Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
         None => bindings.declare_shadow(name.to_string()),
     }
+}
+
+fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_, '_>) -> Option<String> {
+    match right.kind() {
+        "object_creation_expression" => object_creation_type(right)
+            .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source))),
+        "function_call_expression" => {
+            let function = right.child_by_field_name("function")?;
+            if !matches!(function.kind(), "name" | "qualified_name") {
+                return None;
+            }
+            let fqn = resolve_php_function(node_text(function, scan.source), &scan.ctx)?;
+            declared_callable_return_type_fqn(scan, &fqn)
+        }
+        "scoped_call_expression" => {
+            let scope = right.child_by_field_name("scope")?;
+            let name = right.child_by_field_name("name")?;
+            let method = node_text(name, scan.source);
+            if method.is_empty() {
+                return None;
+            }
+            let owner = scope_class_fqn(scope, scan)?;
+            declared_callable_return_type_fqn(scan, &format!("{owner}.{method}"))
+        }
+        _ => None,
+    }
+}
+
+fn declared_callable_return_type_fqn(
+    scan: &mut PhpScan<'_, '_>,
+    callable_fqn: &str,
+) -> Option<String> {
+    if let Some(cached) = scan
+        .return_type_cache
+        .lock()
+        .expect("php return type cache poisoned")
+        .get(callable_fqn)
+    {
+        return cached.clone();
+    }
+
+    let mut definitions = scan
+        .php
+        .definitions(callable_fqn)
+        .filter(|unit| unit.is_function());
+    let resolved = definitions.next().and_then(|callable| {
+        if definitions.next().is_some() {
+            return None;
+        }
+        declared_return_type_fqn(scan, callable)
+    });
+    scan.return_type_cache
+        .lock()
+        .expect("php return type cache poisoned")
+        .insert(callable_fqn.to_string(), resolved.clone());
+    resolved
+}
+
+fn declared_return_type_fqn(scan: &PhpScan<'_, '_>, callable: &CodeUnit) -> Option<String> {
+    if callable.source() == scan.file {
+        return declared_return_type_fqn_from_root(scan.php, callable, scan.source, scan.root);
+    }
+    php_file_return_type_index(scan, callable.source())
+        .get(&callable.fq_name())
+        .cloned()
+        .flatten()
+}
+
+fn php_file_return_type_index(
+    scan: &PhpScan<'_, '_>,
+    file: &ProjectFile,
+) -> HashMap<String, Option<String>> {
+    if let Some(cached) = scan
+        .file_return_cache
+        .lock()
+        .expect("php file return cache poisoned")
+        .get(file)
+        .cloned()
+    {
+        return cached;
+    }
+
+    let index = build_php_file_return_type_index(scan.php, file);
+    scan.file_return_cache
+        .lock()
+        .expect("php file return cache poisoned")
+        .insert(file.clone(), index.clone());
+    index
+}
+
+fn build_php_file_return_type_index(
+    php: &PhpAnalyzer,
+    file: &ProjectFile,
+) -> HashMap<String, Option<String>> {
+    let source = php.project().read_source(file).unwrap_or_default();
+    if source.is_empty() {
+        return HashMap::default();
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .is_err()
+    {
+        return HashMap::default();
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return HashMap::default();
+    };
+    php.declarations(file)
+        .filter(|unit| unit.is_function())
+        .map(|unit| {
+            (
+                unit.fq_name(),
+                declared_return_type_fqn_from_root(php, unit, &source, tree.root_node()),
+            )
+        })
+        .collect()
+}
+
+fn declared_return_type_fqn_from_root(
+    php: &PhpAnalyzer,
+    callable: &CodeUnit,
+    source: &str,
+    root: Node<'_>,
+) -> Option<String> {
+    let declaration = callable_declaration_node(php, callable, root)?;
+    let return_type = declaration.child_by_field_name("return_type")?;
+    let raw = node_text(return_type, source).trim();
+    if matches!(raw, "self" | "static") {
+        return php.parent_of(callable).map(|owner| owner.fq_name());
+    }
+    resolve_php_type(
+        raw,
+        &php.file_context_from_source(callable.source(), source),
+    )
+}
+
+fn callable_declaration_node<'tree>(
+    php: &PhpAnalyzer,
+    callable: &CodeUnit,
+    root: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let ranges = php.ranges(callable);
+    let start = ranges.iter().map(|range| range.start_byte).min()?;
+    let end = ranges.iter().map(|range| range.end_byte).max()?;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "function_definition" | "method_declaration")
+            && node.start_byte() >= start
+            && node.end_byte() <= end
+        {
+            return Some(node);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index)
+                && child.end_byte() >= start
+                && child.start_byte() <= end
+            {
+                stack.push(child);
+            }
+        }
+    }
+    None
 }
 
 /// True when `node` is the type name inside a `new X(..)` expression (so the

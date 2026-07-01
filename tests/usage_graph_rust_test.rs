@@ -172,6 +172,236 @@ impl Service {
 }
 
 #[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub struct Service;
+pub struct Other;
+
+impl Service {
+    pub fn new() -> Self {
+        Service
+    }
+
+    pub fn run(&self) {}
+}
+
+impl Other {
+    pub fn run(&self) {}
+}
+
+pub fn make_service() -> Service {
+    Service::new()
+}
+
+pub fn via_free_factory() {
+    let service = make_service();
+    service.run();
+}
+
+pub fn via_associated_factory() {
+    let service = Service::new();
+    service.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "via_free_factory", "Service.run").is_some(),
+        "free factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "via_associated_factory", "Service.run").is_some(),
+        "associated factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "via_free_factory", "Other.run").is_none()
+            && find_edge(&value, "via_associated_factory", "Other.run").is_none(),
+        "factory receiver must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn factory_receiver_uses_resolved_callable_not_simple_name() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+mod hidden {
+    pub struct Service;
+
+    impl Service {
+        pub fn run(&self) {}
+    }
+
+    pub fn make() -> Service {
+        Service
+    }
+}
+
+mod real {
+    pub struct Service;
+
+    impl Service {
+        pub fn run(&self) {}
+    }
+
+    pub fn make() -> Service {
+        Service
+    }
+}
+
+use real::make;
+
+pub fn caller() {
+    let service = make();
+    service.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "caller", "hidden.Service.run").is_none(),
+        "bare factory must not use a hidden same-name factory summary: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn wrapper_self_factory_return_seeds_owner_receiver() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+use std::sync::Arc;
+
+pub struct Service;
+pub struct Other;
+
+impl Service {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Service)
+    }
+
+    pub fn run(&self) {}
+}
+
+impl Other {
+    pub fn run(&self) {}
+}
+
+pub fn caller() {
+    let service = Service::new();
+    service.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "caller", "Service.run").is_some(),
+        "Arc<Self> factory return should seed the owner receiver: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "caller", "Other.run").is_none(),
+        "wrapper self return must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn unsupported_trait_object_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub trait Runner {
+    fn run(&self);
+}
+
+pub struct Service;
+pub struct Other;
+
+impl Service {
+    pub fn run(&self) {}
+}
+
+impl Other {
+    pub fn run(&self) {}
+}
+
+pub fn ambiguous(receiver: &dyn Runner) {
+    receiver.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "ambiguous", "Service.run").is_none()
+            && find_edge(&value, "ambiguous", "Other.run").is_none(),
+        "unsupported trait-object receiver must not emit partial same-name edges: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn block_local_receiver_shadow_does_not_leak_to_outer_call() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub struct Service;
+pub struct Other;
+
+impl Service {
+    pub fn new() -> Self { Service }
+    pub fn run(&self) {}
+}
+
+impl Other {
+    pub fn new() -> Self { Other }
+    pub fn run(&self) {}
+}
+
+pub fn caller(flag: bool) {
+    let service = Other::new();
+    if flag {
+        let service = Service::new();
+        let _ = service;
+    }
+    service.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "caller", "Other.run").is_some(),
+        "outer receiver should resolve to Other.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "caller", "Service.run").is_none(),
+        "block-local receiver shadow must not leak to the outer call: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn every_edge_endpoint_is_a_node() {
     assert_every_edge_endpoint_is_a_node(&usage_graph());
 }

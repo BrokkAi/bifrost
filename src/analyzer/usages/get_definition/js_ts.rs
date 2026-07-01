@@ -78,6 +78,30 @@ pub(super) fn resolve_js_ts(
         if !member_candidates.is_empty() {
             return candidates_outcome(member_candidates);
         }
+        match jsts_receiver_provider_member_candidates(
+            analyzer, file, language, source, tree, site, name,
+        ) {
+            ReceiverAnalysisOutcome::Precise(candidates) if !candidates.is_empty() => {
+                return candidates_outcome(if language == Language::TypeScript {
+                    if value_position {
+                        jsts_value_space_candidates(analyzer, candidates)
+                    } else {
+                        jsts_type_space_candidates(analyzer, candidates)
+                    }
+                } else {
+                    jsts_value_space_candidates(analyzer, candidates)
+                });
+            }
+            ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
+                return no_definition(
+                    "receiver_analysis_not_precise",
+                    format!("`{reference}` did not resolve to a precise JS/TS receiver"),
+                );
+            }
+            ReceiverAnalysisOutcome::Precise(_) | ReceiverAnalysisOutcome::Unknown => {}
+        }
         let new_receiver_candidates = jsts_local_new_receiver_owner_candidates(
             analyzer,
             support,
@@ -723,6 +747,53 @@ fn jsts_construction_receiver_members(
         jsts_member_candidates(analyzer, support, receiver_candidates, member, true)
     };
     (!members.is_empty()).then_some(members)
+}
+
+fn jsts_receiver_provider_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    member: &str,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
+    let Some(node) = node else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    let member_expr = if node.kind() == "member_expression" {
+        node
+    } else if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "member_expression")
+    {
+        node.parent().expect("checked parent")
+    } else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    let Some(property) = member_expr.child_by_field_name("property") else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    if node_text(property, source) != member {
+        return ReceiverAnalysisOutcome::Unknown;
+    }
+    let Some(object) = member_expr.child_by_field_name("object") else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    let provider =
+        JsTsReceiverFactProvider::new(analyzer, language, file, source, tree.root_node());
+    provider.resolve_member_targets(
+        object,
+        member,
+        site.focus_start_byte,
+        ReceiverAnalysisBudget::default(),
+    )
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
 fn jsts_member_candidates(

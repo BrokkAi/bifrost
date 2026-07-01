@@ -186,6 +186,31 @@ impl VisibilityIndex {
             .cloned()
     }
 
+    fn resolve_type_for_declaration(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        let normalized = normalize_reference_name(raw_name)?;
+        let visible = self.visible_by_file.get(visible_from)?;
+        if !normalized.contains("::")
+            && let Some(namespace) = cpp_namespace_for(declaration)
+        {
+            for prefix in namespace_prefixes(&namespace) {
+                let qualified = format!("{prefix}::{normalized}");
+                if let Some(unit) = visible
+                    .iter()
+                    .filter(|unit| unit.kind() == CodeUnitType::Class || is_type_alias(unit))
+                    .find(|unit| reference_matches_unit(&qualified, unit))
+                {
+                    return Some(unit.clone());
+                }
+            }
+        }
+        self.resolve_type(visible_from, raw_name)
+    }
+
     pub(super) fn resolves_to_type(
         &self,
         file: &ProjectFile,
@@ -344,9 +369,9 @@ impl VisibilityIndex {
             }
         }
         let mut resolved_return: Option<CodeUnit> = None;
-        for (_function, signature) in candidates {
+        for (function, signature) in candidates {
             let return_text = cpp_function_return_type_text_from_signature(&signature)?;
-            let return_type = self.resolve_type(file, &return_text)?;
+            let return_type = self.resolve_type_for_declaration(file, function, &return_text)?;
             if let Some(existing) = resolved_return.as_ref()
                 && !same_visible_symbol(existing, &return_type)
             {
@@ -373,7 +398,16 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
         }
         "call_expression" => node.child_by_field_name("function").and_then(|function| {
             let function_text = node_text(function, source);
-            visibility.resolve_type(file, function_text).or_else(|| {
+            resolve_static_method_call_return_type(
+                analyzer,
+                visibility,
+                file,
+                source,
+                function,
+                call_arity(node),
+            )
+            .or_else(|| visibility.resolve_type(file, function_text))
+            .or_else(|| {
                 visibility.resolve_call_return_type(
                     analyzer,
                     file,
@@ -385,6 +419,39 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
         }),
         _ => None,
     }
+}
+
+fn resolve_static_method_call_return_type(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    arity: usize,
+) -> Option<CodeUnit> {
+    if function.kind() != "qualified_identifier" {
+        return None;
+    }
+    let scope = function.child_by_field_name("scope")?;
+    let name = function.child_by_field_name("name")?;
+    let owner = visibility.resolve_type(file, node_text(scope, source))?;
+    let method_fqn = format!("{}.{}", owner.fq_name(), node_text(name, source));
+    let mut resolved_return = None;
+    for method in visibility.visible_units(file).filter(|unit| {
+        unit.is_function()
+            && unit.fq_name() == method_fqn
+            && signature_arity(unit.signature()) == arity
+    }) {
+        let return_text = cpp_function_return_type_text(analyzer, method)?;
+        let return_type = visibility.resolve_type_for_declaration(file, method, &return_text)?;
+        if let Some(existing) = resolved_return.as_ref()
+            && !same_visible_symbol(existing, &return_type)
+        {
+            return None;
+        }
+        resolved_return = Some(return_type);
+    }
+    resolved_return
 }
 
 fn build_alias_index(files: &HashSet<ProjectFile>) -> HashMap<ProjectFile, Vec<CppAlias>> {
@@ -1125,6 +1192,16 @@ pub(super) fn cpp_namespace_for(unit: &CodeUnit) -> Option<String> {
             .unwrap_or(namespace)
             .to_string()
     })
+}
+
+fn namespace_prefixes(namespace: &str) -> Vec<&str> {
+    let mut prefixes = Vec::new();
+    let mut current = Some(namespace);
+    while let Some(prefix) = current {
+        prefixes.push(prefix);
+        current = prefix.rsplit_once("::").map(|(parent, _)| parent);
+    }
+    prefixes
 }
 
 pub(in crate::analyzer::usages) fn enclosing_namespace_context(

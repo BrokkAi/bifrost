@@ -217,12 +217,12 @@ pub(super) fn scan_files_for_seeds(
         let edges = py.usage_matching_edges(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
         let target_self_file = *file == target.source();
-        let scope_facts = collect_scope_facts(
+        let scope_facts = collect_scope_facts_from_parsed_source(
             analyzer,
             file,
-            &edges,
             target_short.as_str(),
-            target_self_file,
+            source_str,
+            tree_ref.root_node(),
         );
 
         let mut local_hits = BTreeSet::new();
@@ -678,12 +678,22 @@ pub(in crate::analyzer::usages) fn collect_assigned_identifiers(
     }
 }
 
-pub(in crate::analyzer::usages) fn collect_scope_facts(
+pub(in crate::analyzer::usages) fn collect_scope_facts_from_parsed_source(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    edges: &[ImportEdge],
     target_short: &str,
-    target_self_file: bool,
+    source: &str,
+    root: Node<'_>,
+) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
+    let factory_return_types = collect_factory_return_types_from_root(root, source);
+    collect_scope_facts_with_factory_returns(analyzer, file, target_short, &factory_return_types)
+}
+
+fn collect_scope_facts_with_factory_returns(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    target_short: &str,
+    factory_return_types: &HashMap<String, String>,
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
     let declarations = analyzer.get_declarations(file);
     let mut class_facts_by_name: HashMap<String, LocalBindingsSnapshot<String>> =
@@ -697,11 +707,11 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         };
         let facts = collect_scope_facts_from_source(
             &source,
-            edges,
             target_short,
-            target_self_file,
             true,
             false,
+            Some(declaration.short_name()),
+            factory_return_types,
         );
         class_facts_by_name.insert(
             declaration.short_name().to_string(),
@@ -717,15 +727,19 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         let Some(source) = analyzer.get_source(declaration, false) else {
             continue;
         };
+        let owner = declaration
+            .short_name()
+            .rsplit_once('.')
+            .map(|(owner, _)| owner);
         let mut facts = collect_scope_facts_from_source(
             &source,
-            edges,
             target_short,
-            target_self_file,
             false,
             false,
+            owner,
+            factory_return_types,
         );
-        if let Some((owner, _)) = declaration.short_name().rsplit_once('.')
+        if let Some(owner) = owner
             && let Some(class_facts) = class_facts_by_name.get(owner)
         {
             facts = facts.merged_with_visible(class_facts);
@@ -743,11 +757,11 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         };
         let facts = collect_scope_facts_from_source(
             &source,
-            edges,
             target_short,
-            target_self_file,
             false,
             true,
+            None,
+            factory_return_types,
         );
         scope_facts.insert(declaration.clone(), facts);
     }
@@ -756,11 +770,11 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
 
 fn collect_scope_facts_from_source(
     source: &str,
-    _edges: &[ImportEdge],
     target_short: &str,
-    _target_self_file: bool,
     allow_self_receivers: bool,
     is_module_scope: bool,
+    current_class: Option<&str>,
+    factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
     let events = collect_scope_fact_events(source);
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -807,6 +821,28 @@ fn collect_scope_facts_from_source(
                     }
 
                     match rhs {
+                        AssignmentRhs::Call(callee) => {
+                            if !engine.is_shadowed(callee) {
+                                if let Some(receiver_type) = factory_return_type_for_callee(
+                                    callee,
+                                    current_class,
+                                    factory_return_types,
+                                ) && engine.resolve_symbol(lhs).is_unknown()
+                                {
+                                    engine.seed_symbol(lhs.clone(), receiver_type.clone());
+                                    changed = true;
+                                    continue;
+                                }
+
+                                if let Some(receiver_type) = normalized_receiver_type(callee)
+                                    && engine.resolve_symbol(lhs).is_unknown()
+                                {
+                                    engine.seed_symbol(lhs.clone(), receiver_type);
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
                         AssignmentRhs::Symbol(rhs_symbol) => {
                             if !engine.is_shadowed(rhs_symbol)
                                 && let Some(receiver_type) = normalized_receiver_type(rhs_symbol)
@@ -837,6 +873,21 @@ fn collect_scope_facts_from_source(
     }
 
     engine.snapshot()
+}
+
+fn factory_return_type_for_callee<'a>(
+    callee: &str,
+    current_class: Option<&str>,
+    factory_return_types: &'a HashMap<String, String>,
+) -> Option<&'a String> {
+    if let Some(receiver_type) = factory_return_types.get(callee) {
+        return Some(receiver_type);
+    }
+    let class_name = current_class?;
+    let method = callee
+        .strip_prefix("self.")
+        .or_else(|| callee.strip_prefix("cls."))?;
+    factory_return_types.get(&format!("{class_name}.{method}"))
 }
 
 fn apply_annotation_event(
@@ -874,6 +925,7 @@ enum ScopeFactEvent {
 
 enum AssignmentRhs {
     Symbol(String),
+    Call(String),
     Unknown,
 }
 
@@ -974,7 +1026,6 @@ fn collect_assignment_events(node: Node<'_>, source: &str, events: &mut Vec<Scop
     let rhs = node
         .child_by_field_name("right")
         .and_then(|right| rhs_symbol(right, source))
-        .map(AssignmentRhs::Symbol)
         .unwrap_or(AssignmentRhs::Unknown);
     events.push(ScopeFactEvent::Assignment { lhs, rhs });
 }
@@ -986,13 +1037,14 @@ fn receiver_symbol(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn rhs_symbol(node: Node<'_>, source: &str) -> Option<String> {
+fn rhs_symbol(node: Node<'_>, source: &str) -> Option<AssignmentRhs> {
     match node.kind() {
-        "identifier" | "attribute" => non_empty_node_text(node, source),
+        "identifier" | "attribute" => non_empty_node_text(node, source).map(AssignmentRhs::Symbol),
         "call" => node
             .child_by_field_name("function")
             .or_else(|| node.named_child(0))
-            .and_then(|callee| receiver_symbol(callee, source)),
+            .and_then(|callee| receiver_symbol(callee, source))
+            .map(AssignmentRhs::Call),
         _ => None,
     }
 }
@@ -1000,4 +1052,103 @@ fn rhs_symbol(node: Node<'_>, source: &str) -> Option<String> {
 fn non_empty_node_text(node: Node<'_>, source: &str) -> Option<String> {
     let text = slice(node, source).trim();
     (!text.is_empty()).then(|| text.to_string())
+}
+
+fn collect_factory_return_types_from_root(root: Node<'_>, source: &str) -> HashMap<String, String> {
+    let mut returns = HashMap::default();
+    let mut stack = vec![(root, None::<String>)];
+    while let Some((node, class_name)) = stack.pop() {
+        match node.kind() {
+            "class_definition" => {
+                let next_class = node
+                    .child_by_field_name("name")
+                    .and_then(|name| non_empty_node_text(name, source))
+                    .or(class_name);
+                push_factory_index_children(node, next_class, &mut stack);
+            }
+            "function_definition" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| non_empty_node_text(name, source))
+                    && let Some(return_type) = factory_return_type(node, source)
+                {
+                    let key = class_name
+                        .as_ref()
+                        .map(|class| format!("{class}.{name}"))
+                        .unwrap_or(name);
+                    returns.insert(key, return_type);
+                }
+            }
+            _ => push_factory_index_children(node, class_name, &mut stack),
+        }
+    }
+    returns
+}
+
+fn push_factory_index_children<'tree>(
+    node: Node<'tree>,
+    class_name: Option<String>,
+    stack: &mut Vec<(Node<'tree>, Option<String>)>,
+) {
+    let mut cursor = node.walk();
+    let mut children: Vec<Node<'tree>> = node.named_children(&mut cursor).collect();
+    children.reverse();
+    stack.extend(
+        children
+            .into_iter()
+            .map(|child| (child, class_name.clone())),
+    );
+}
+
+fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
+    if let Some(return_type) = function.child_by_field_name("return_type") {
+        let raw = slice(return_type, source).trim();
+        return normalized_receiver_type(raw);
+    }
+
+    let body = function.child_by_field_name("body")?;
+    let mut candidates = HashSet::default();
+    let mut saw_return = false;
+    let mut saw_unknown_return = false;
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node != body && matches!(node.kind(), "function_definition" | "class_definition") {
+            continue;
+        }
+        if node.kind() == "return_statement" {
+            saw_return = true;
+            match node
+                .named_child(0)
+                .and_then(|value| returned_receiver_type(value, source))
+            {
+                Some(returned_type) => {
+                    candidates.insert(returned_type);
+                }
+                None => saw_unknown_return = true,
+            }
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    if !saw_return || saw_unknown_return {
+        return None;
+    }
+    (candidates.len() == 1)
+        .then(|| candidates.into_iter().next())
+        .flatten()
+}
+
+fn returned_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
+    let raw = match node.kind() {
+        "identifier" => non_empty_node_text(node, source),
+        "call" => node
+            .child_by_field_name("function")
+            .or_else(|| node.named_child(0))
+            .filter(|callee| callee.kind() == "identifier")
+            .and_then(|callee| non_empty_node_text(callee, source)),
+        _ => None,
+    }?;
+    normalized_receiver_type(&raw)
 }

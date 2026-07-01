@@ -30,6 +30,7 @@ mod outcome;
 mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
+pub(crate) mod receiver_analysis;
 pub(crate) mod receiver_facts;
 mod reexport_seeds;
 pub(crate) mod reference_site;

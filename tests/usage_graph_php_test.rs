@@ -129,6 +129,106 @@ fn receiver_typing_is_type_based_not_name_based() {
 }
 
 #[test]
+fn object_sensitive_factory_receiver_resolves_only_declared_return_type() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "Factory.php",
+            r#"<?php
+namespace App;
+
+class Service {
+    public function run(): void {}
+
+    public static function create(): Service {
+        return new Service();
+    }
+}
+
+class Other {
+    public function run(): void {}
+}
+
+function makeService(): Service {
+    return new Service();
+}
+
+class Consumer {
+    public function viaFreeFactory(): void {
+        $svc = makeService();
+        $svc->run();
+    }
+
+    public function viaStaticFactory(): void {
+        $svc = Service::create();
+        $svc->run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "App.Consumer.viaFreeFactory", "App.Service.run"),
+        "free factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "App.Consumer.viaStaticFactory", "App.Service.run"),
+        "static factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.viaFreeFactory", "App.Other.run")
+            && !has_edge(&value, "App.Consumer.viaStaticFactory", "App.Other.run"),
+        "factory receiver must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn ambiguous_factory_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "Factory.php",
+            r#"<?php
+namespace App;
+
+class Service {
+    public function run(): void {}
+}
+
+class Other {
+    public function run(): void {}
+}
+
+function make($flag) {
+    if ($flag) {
+        return new Service();
+    }
+    return new Other();
+}
+
+class Consumer {
+    public function ambiguous($flag): void {
+        $svc = make($flag);
+        $svc->run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "App.Consumer.ambiguous", "App.Service.run")
+            && !has_edge(&value, "App.Consumer.ambiguous", "App.Other.run"),
+        "untyped ambiguous factory receiver must not emit partial name-only edges: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn closure_locals_do_not_leak_into_the_enclosing_scope() {
     let value = usage_graph();
 

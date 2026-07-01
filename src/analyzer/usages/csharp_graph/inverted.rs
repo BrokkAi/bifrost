@@ -19,15 +19,46 @@
 
 use super::extractor::{is_declaration_name, member_access_name, member_access_receiver};
 use super::resolver::{
-    first_type_child, is_type_reference_node, node_text, normalize_type_text, reference_type_text,
+    argument_count, first_type_child, is_type_reference_node, method_unit_return_type_fq_name,
+    node_text, normalize_type_text, reference_type_text, signature_arity,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{CSharpAnalyzer, IAnalyzer, ProjectFile};
-use crate::hash::HashSet;
+use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile};
+use crate::hash::{HashMap, HashSet};
+use std::sync::Mutex;
 use tree_sitter::Node;
+
+type MethodReturnCacheKey = (String, String, usize);
+type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, Option<String>>>;
+type MethodDeclarationIndex = HashMap<MethodReturnCacheKey, Vec<CodeUnit>>;
+
+fn csharp_method_declaration_index(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+) -> MethodDeclarationIndex {
+    let mut index: MethodDeclarationIndex = HashMap::default();
+    for unit in csharp
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.is_function())
+    {
+        let Some(owner) = analyzer.parent_of(&unit) else {
+            continue;
+        };
+        index
+            .entry((
+                owner.fq_name(),
+                unit.identifier().to_string(),
+                signature_arity(unit.signature()),
+            ))
+            .or_default()
+            .push(unit);
+    }
+    index
+}
 
 pub(super) fn build_csharp_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -40,13 +71,25 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_c_sharp::LANGUAGE.into();
+    let class_units: HashMap<String, CodeUnit> = csharp
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.is_class())
+        .map(|unit| (unit.fq_name(), unit))
+        .collect();
+    let method_declarations = csharp_method_declaration_index(analyzer, csharp);
+    let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = CsScan {
+                analyzer,
                 csharp,
                 file,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
+                class_units: &class_units,
+                method_declarations: &method_declarations,
+                method_return_cache: &method_return_cache,
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -56,10 +99,14 @@ where
 }
 
 struct CsScan<'a, 'b> {
+    analyzer: &'a dyn IAnalyzer,
     csharp: &'a CSharpAnalyzer,
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
+    class_units: &'a HashMap<String, CodeUnit>,
+    method_declarations: &'a MethodDeclarationIndex,
+    method_return_cache: &'a MethodReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -242,6 +289,7 @@ fn seed_variable_declaration(
         let resolved = if type_text == "var" {
             object_created_type(child)
                 .and_then(|type_node| ctx.resolve_type_fqn(node_text(type_node, ctx.source)))
+                .or_else(|| var_initializer_type(child, ctx, bindings))
         } else {
             ctx.resolve_type_fqn(type_text)
         };
@@ -275,4 +323,138 @@ fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find_map(object_created_type)
+}
+
+fn var_initializer_type(
+    declarator: Node<'_>,
+    ctx: &CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let initializer = variable_declarator_initializer(declarator)?;
+    expression_type_fqn(initializer, ctx, bindings)
+}
+
+fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
+    declarator
+        .child_by_field_name("value")
+        .or_else(|| declarator.child_by_field_name("initializer"))
+        .or_else(|| {
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "equals_value_clause")
+                .and_then(|clause| {
+                    clause
+                        .child_by_field_name("value")
+                        .or_else(|| clause.named_child(0))
+                })
+        })
+        .or_else(|| {
+            let name = declarator.child_by_field_name("name")?;
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| child.start_byte() > name.end_byte())
+        })
+}
+
+fn expression_type_fqn(
+    expression: Node<'_>,
+    ctx: &CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    match expression.kind() {
+        "object_creation_expression" => object_created_type(expression)
+            .and_then(|type_node| ctx.resolve_type_fqn(node_text(type_node, ctx.source))),
+        "invocation_expression" => invocation_return_type_fqn(expression, ctx, bindings),
+        "identifier" => {
+            let name = node_text(expression, ctx.source);
+            first_precise(bindings, name)
+        }
+        _ => None,
+    }
+}
+
+fn invocation_return_type_fqn(
+    invocation: Node<'_>,
+    ctx: &CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let function = invocation.child_by_field_name("function")?;
+    match function.kind() {
+        "identifier" => {
+            let name = node_text(function, ctx.source);
+            let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
+            let owner = class_unit_for_fqn(ctx, owner_fqn)?;
+            method_return_type_for_call(ctx, &owner, name, argument_count(invocation, ctx.source))
+        }
+        "member_access_expression" => {
+            let receiver = member_access_receiver(function)?;
+            let name = member_access_name(function)?;
+            let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
+            let owner = class_unit_for_fqn(ctx, &owner_fqn)?;
+            method_return_type_for_call(
+                ctx,
+                &owner,
+                node_text(name, ctx.source),
+                argument_count(invocation, ctx.source),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn method_return_type_for_call(
+    ctx: &CsScan<'_, '_>,
+    owner: &CodeUnit,
+    method_name: &str,
+    arity: usize,
+) -> Option<String> {
+    let cache_key = (owner.fq_name(), method_name.to_string(), arity);
+    if let Some(cached) = ctx
+        .method_return_cache
+        .lock()
+        .expect("csharp return type cache poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return cached;
+    }
+    let mut resolved = csharp_method_return_types_for_owner(ctx, owner, method_name, arity);
+    resolved.sort();
+    resolved.dedup();
+    let resolved = (resolved.len() == 1).then(|| resolved.remove(0));
+    ctx.method_return_cache
+        .lock()
+        .expect("csharp return type cache poisoned")
+        .insert(cache_key, resolved.clone());
+    resolved
+}
+
+fn csharp_method_return_types_for_owner(
+    ctx: &CsScan<'_, '_>,
+    owner: &CodeUnit,
+    method_name: &str,
+    arity: usize,
+) -> Vec<String> {
+    let mut owners = vec![owner.clone()];
+    if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
+        owners.extend(provider.get_ancestors(owner));
+    }
+    let mut returns = Vec::new();
+    for candidate in owners {
+        if let Some(methods) =
+            ctx.method_declarations
+                .get(&(candidate.fq_name(), method_name.to_string(), arity))
+        {
+            returns.extend(methods.iter().filter_map(|method| {
+                method_unit_return_type_fq_name(ctx.csharp, &candidate, method)
+            }));
+        }
+    }
+    returns
+}
+
+fn class_unit_for_fqn(ctx: &CsScan<'_, '_>, fqn: &str) -> Option<CodeUnit> {
+    ctx.class_units.get(fqn).cloned()
 }

@@ -16,7 +16,8 @@
 mod common;
 
 use brokk_bifrost::SearchToolsService;
-use common::usage_graph::has_edge;
+use common::InlineTestProject;
+use common::usage_graph::{has_edge, usage_graph_at};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -95,6 +96,105 @@ fn constructor_returned_receiver_call_resolves_to_an_edge() {
             "example.com/app.Service.Execute"
         ),
         "member call on a constructor-returned receiver should resolve to Service.Execute; edges: {:?}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let project = InlineTestProject::with_language(brokk_bifrost::Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "service.go",
+            r#"
+package app
+
+type Service struct{}
+func (Service) Run() {}
+
+type Other struct{}
+func (Other) Run() {}
+
+func makeService() Service {
+    return Service{}
+}
+
+func caller() {
+    service := makeService()
+    service.Run()
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &graph,
+            "example.com/app.caller",
+            "example.com/app.Service.Run"
+        ),
+        "factory-produced receiver should resolve caller -> Service.Run: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(
+            &graph,
+            "example.com/app.caller",
+            "example.com/app.Other.Run"
+        ),
+        "factory-produced receiver must not resolve by same member name: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn unsupported_interface_factory_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(brokk_bifrost::Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "service.go",
+            r#"
+package app
+
+type Service struct{}
+func (Service) Run() {}
+
+type Other struct{}
+func (Other) Run() {}
+
+func choose(flag bool) any {
+    if flag {
+        return Service{}
+    }
+    return Other{}
+}
+
+func caller(flag bool) {
+    service := choose(flag)
+    service.Run()
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(
+            &graph,
+            "example.com/app.caller",
+            "example.com/app.Service.Run"
+        ),
+        "unsupported interface receiver must not choose Service.Run: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(
+            &graph,
+            "example.com/app.caller",
+            "example.com/app.Other.Run"
+        ),
+        "unsupported interface receiver must not choose Other.Run: {}",
         graph["edges"]
     );
 }

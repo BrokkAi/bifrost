@@ -12,8 +12,11 @@
 
 mod common;
 
-use brokk_bifrost::SearchToolsService;
-use common::usage_graph::{assert_every_edge_endpoint_is_a_node, find_edge, has_edge};
+use brokk_bifrost::{Language, SearchToolsService};
+use common::InlineTestProject;
+use common::usage_graph::{
+    assert_every_edge_endpoint_is_a_node, find_edge, has_edge, usage_graph_at,
+};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -201,6 +204,204 @@ fn locals_shadowing_an_import_do_not_produce_an_edge() {
     assert!(
         find_edge(&value, "shadowed_local", "helper").is_none(),
         "a local shadowing the import must not produce an edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    @classmethod
+    def create(cls) -> Service:
+        return Service()
+
+    def run(self):
+        pass
+
+class Other:
+    def run(self):
+        pass
+
+def make_service() -> Service:
+    return Service()
+
+class Consumer:
+    def via_free_factory(self):
+        svc = make_service()
+        svc.run()
+
+    def via_static_factory(self):
+        svc = Service.create()
+        svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Consumer.via_free_factory", "app.Service.run"),
+        "free factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Consumer.via_static_factory", "app.Service.run"),
+        "static factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Consumer.via_free_factory", "app.Other.run")
+            && !has_edge(&value, "app.Consumer.via_static_factory", "app.Other.run"),
+        "factory receiver must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn self_factory_receiver_resolves_through_current_class() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    def run(self):
+        pass
+
+class Other:
+    def run(self):
+        pass
+
+class Consumer:
+    def make_service(self) -> Service:
+        return Service()
+
+    def caller(self):
+        svc = self.make_service()
+        svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Consumer.caller", "app.Service.run"),
+        "self factory receiver should resolve to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Consumer.caller", "app.Other.run"),
+        "self factory receiver must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn hidden_nested_factory_does_not_type_unrelated_call() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    def run(self):
+        pass
+
+class Other:
+    def run(self):
+        pass
+
+def outer():
+    def make() -> Service:
+        return Service()
+    return make
+
+class Consumer:
+    def caller(self):
+        svc = make()
+        svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "app.Consumer.caller", "app.Service.run")
+            && !has_edge(&value, "app.Consumer.caller", "app.Other.run"),
+        "hidden nested factory must not seed an unrelated receiver: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn ambiguous_factory_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    def run(self):
+        pass
+
+class Other:
+    def run(self):
+        pass
+
+def make(flag):
+    if flag:
+        return Service()
+    return Other()
+
+class Consumer:
+    def ambiguous(self, flag):
+        svc = make(flag)
+        svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "app.Consumer.ambiguous", "app.Service.run")
+            && !has_edge(&value, "app.Consumer.ambiguous", "app.Other.run"),
+        "ambiguous factory receiver must not emit partial name-only edges: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn partially_unknown_factory_return_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    def run(self):
+        pass
+
+class Other:
+    def run(self):
+        pass
+
+def make(flag):
+    if flag:
+        return Service()
+    return None
+
+class Consumer:
+    def partial(self, flag):
+        svc = make(flag)
+        svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "app.Consumer.partial", "app.Service.run")
+            && !has_edge(&value, "app.Consumer.partial", "app.Other.run"),
+        "partially unknown factory receiver must not emit partial name-only edges: {}",
         value["edges"]
     );
 }

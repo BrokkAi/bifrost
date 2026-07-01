@@ -17,7 +17,7 @@
 //! typing ([`collect_scope_facts`] + [`resolve_receiver_type`]).
 
 use super::extractor::{
-    collect_assigned_identifiers, collect_scope_facts, enclosing_scope_facts,
+    collect_assigned_identifiers, collect_scope_facts_from_parsed_source, enclosing_scope_facts,
     is_declaration_identifier, slice,
 };
 use super::resolver::resolve_receiver_type;
@@ -83,7 +83,13 @@ where
             // Per-function receiver-type facts (typed params + `x = Foo()`),
             // computed by the same routine the forward scan uses, so a typed
             // `recv.method` resolves to the receiver's class fqn.
-            let scope_facts = collect_scope_facts(analyzer, file, &[], "", true);
+            let scope_facts = collect_scope_facts_from_parsed_source(
+                analyzer,
+                file,
+                "",
+                source,
+                parsed.tree.root_node(),
+            );
 
             let mut ctx = PyScan {
                 analyzer,
