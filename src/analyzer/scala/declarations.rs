@@ -110,8 +110,10 @@ impl<'a> ScalaVisitor<'a> {
                 | "enum_definition" => {
                     self.visit_type_declaration(child, &current_package, None, stack)
                 }
-                "function_definition" => self.visit_function(child, &current_package, None),
-                "val_definition" | "var_definition" => {
+                "function_definition" | "function_declaration" => {
+                    self.visit_function(child, &current_package, None)
+                }
+                "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, &current_package, None)
                 }
                 _ => {}
@@ -253,10 +255,10 @@ impl<'a> ScalaVisitor<'a> {
         let children = body.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children {
             match child.kind() {
-                "function_definition" => {
+                "function_definition" | "function_declaration" => {
                     self.visit_function(child, package_name, Some(parent.clone()))
                 }
-                "val_definition" | "var_definition" => {
+                "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, package_name, Some(parent.clone()))
                 }
                 "class_definition" | "object_definition" | "trait_definition"
