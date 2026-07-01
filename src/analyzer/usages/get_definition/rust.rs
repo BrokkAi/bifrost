@@ -22,6 +22,31 @@ pub(super) fn resolve_rust(
     {
         return outcome;
     }
+    // `Self` (as a type) denotes the lexically enclosing impl's type — the Rust
+    // form of the `LexicalEnclosingType` receiver origin. Name-based resolution
+    // (`resolve_bare` / `resolve_scoped`) has no notion of `Self`, so resolve it
+    // here where the cursor node is available: bare `Self` / `Self { .. }` goes
+    // to the type declaration, and `Self::assoc` to the associated item.
+    if let Some(tree) = tree
+        && (reference == "Self" || reference.starts_with("Self::"))
+        && let Some(node) = smallest_named_node_covering(
+            tree.root_node(),
+            site.focus_start_byte,
+            site.focus_end_byte,
+        )
+        && let Some(self_type) = rust_enclosing_impl_type_fqn(analyzer, support, file, source, node)
+    {
+        let candidates = match reference.split_once("::") {
+            Some((_, name)) => rust_member_candidates(
+                support.fqn(&format!("{self_type}.{name}")),
+                RustMemberKind::Function,
+            ),
+            None => support.fqn(&self_type),
+        };
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+    }
     let refs = rust.reference_context_of(file);
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {

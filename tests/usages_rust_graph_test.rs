@@ -2877,15 +2877,21 @@ fn rust_graph_strategy_finds_method_call_on_constructor_returned_local() {
 fn rust_graph_strategy_finds_field_read_through_self_field_receiver() {
     let (project, analyzer) = build_233_reexport_project();
     let hits = rust_graph_hits(&analyzer, "service.MemoryRepository.last");
+    // Two references to `MemoryRepository.last`: the `self.repository.last` read
+    // in `Service::execute`, and the `MemoryRepository { last: .. }` struct-literal
+    // field initializer in `build_service` (a struct-literal field read).
+    let lines: std::collections::BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
     assert_eq!(
-        1,
-        hits.len(),
-        "expected the self.repository.last read in Service::execute: {hits:?}",
+        [12usize, 19]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        lines,
+        "expected the self.repository.last read and the struct-literal field init: {hits:?}",
     );
     assert!(
         hits.iter()
             .all(|hit| hit.file == project.file("src/service.rs")),
-        "hit should be the field read in service.rs: {hits:?}",
+        "hits should be in service.rs: {hits:?}",
     );
 }
 

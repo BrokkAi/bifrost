@@ -469,6 +469,7 @@ fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     match node.kind() {
         "field_expression" => record_instance_member_hit(node, ctx),
         "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
+        "struct_expression" if ctx.target_is_field => record_struct_literal_field_hit(node, ctx),
         _ => {}
     }
 
@@ -539,6 +540,52 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             ctx.hits,
         );
     } else {
+        push_member_hit(
+            ctx.file,
+            ctx.source,
+            ctx.line_starts,
+            start,
+            end,
+            enclosing,
+            ctx.hits,
+        );
+    }
+}
+
+/// A struct literal `S { field: value }` (or shorthand `S { field }`) references
+/// the struct's field. Count each initializer as a field read when the literal's
+/// type resolves to the field owner. (rust-analyzer:
+/// `test_basic_highlight_field_read_write`.)
+fn record_struct_literal_field_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let Some(type_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    if !resolved_type_matches_owner(type_node, ctx) {
+        return;
+    }
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        let field = match child.kind() {
+            "field_initializer" => child.child_by_field_name("field"),
+            "shorthand_field_initializer" => child.named_child(0),
+            _ => None,
+        };
+        let Some(field) = field else {
+            continue;
+        };
+        if simple_node_text(field, ctx.source).as_deref() != Some(ctx.member_name) {
+            continue;
+        }
+        let start = field.start_byte();
+        let end = field.end_byte();
+        let Some(enclosing) =
+            member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+        else {
+            continue;
+        };
         push_member_hit(
             ctx.file,
             ctx.source,
