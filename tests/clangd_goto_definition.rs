@@ -13,7 +13,7 @@ mod common;
 
 use common::lsp_client::{LspServer, uri_for};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn split_caret(source: &str) -> (String, u64, u64) {
@@ -56,6 +56,55 @@ fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) 
     (temp, lines)
 }
 
+fn definition_lines_in_files(
+    files: &[(&str, &str)],
+    cursor_file: &str,
+    target_file: &str,
+) -> (TempDir, Vec<u64>) {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let mut cursor_position = None;
+
+    for (name, contents) in files {
+        let path = root.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        let contents = if *name == cursor_file {
+            let (source, line, character) = split_caret(contents);
+            cursor_position = Some((path.clone(), line, character));
+            source
+        } else {
+            contents.to_string()
+        };
+        std::fs::write(&path, contents).expect("write fixture");
+    }
+
+    let (cursor_path, line, character) = cursor_position.expect("cursor file must contain caret");
+    let mut server = LspServer::start(&root);
+    let response = server.text_document_position_response(
+        "textDocument/definition",
+        &uri_for(&cursor_path),
+        line,
+        character,
+    );
+    server.shutdown();
+
+    let target_uri = uri_for(&root.join(Path::new(target_file)));
+    let lines = match &response["result"] {
+        Value::Array(items) => items
+            .iter()
+            .filter(|loc| loc["uri"].as_str() == Some(target_uri.as_str()))
+            .filter_map(|loc| loc["range"]["start"]["line"].as_u64())
+            .collect(),
+        Value::Object(loc) if loc["uri"].as_str() == Some(target_uri.as_str()) => {
+            loc["range"]["start"]["line"].as_u64().into_iter().collect()
+        }
+        _ => Vec::new(),
+    };
+    (temp, lines)
+}
+
 fn assert_resolves_to_line(name: &str, source_with_caret: &str, expected: u64) {
     let (_t, lines) = definition_lines(name, source_with_caret);
     assert!(
@@ -69,6 +118,32 @@ fn assert_does_not_resolve_to_line(name: &str, source_with_caret: &str, forbidde
     assert!(
         !lines.contains(&forbidden),
         "expected {name} NOT to resolve to line {forbidden}, got {lines:?}"
+    );
+}
+
+#[test]
+fn cpp_using_alias_type_usage_resolves_to_target_class() {
+    let (_temp, lines) = definition_lines_in_files(
+        &[
+            (
+                "include/parity.h",
+                "#pragma once\n#include <string>\nnamespace parity {\nstruct Sink {};\nclass ConsoleHandler {\npublic:\n    explicit ConsoleHandler(Sink& s);\n    std::string handle(const std::string& v);\n};\nusing HandlerAlias = ConsoleHandler;\n}\n",
+            ),
+            (
+                "src/main.cpp",
+                "#include \"../include/parity.h\"\nvoid run(parity::Sink& sink) {\n    parity::Handler<caret>Alias handler(sink);\n}\n",
+            ),
+        ],
+        "src/main.cpp",
+        "include/parity.h",
+    );
+    assert!(
+        lines.contains(&4),
+        "expected HandlerAlias usage to resolve to ConsoleHandler class line 4, got {lines:?}"
+    );
+    assert!(
+        !lines.contains(&9),
+        "expected HandlerAlias usage not to resolve to using-alias line 9, got {lines:?}"
     );
 }
 

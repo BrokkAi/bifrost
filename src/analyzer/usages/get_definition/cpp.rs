@@ -281,12 +281,9 @@ fn resolve_cpp_type(
         return candidates_outcome(vec![unit]);
     }
     if let Some(unit) = visibility.resolve_type(file, &text) {
-        let candidates = support.fqn(&unit.fq_name());
-        return if candidates.is_empty() {
-            candidates_outcome(vec![unit])
-        } else {
-            candidates_outcome(candidates)
-        };
+        return candidates_outcome(cpp_type_definition_candidates(
+            analyzer, visibility, file, support, unit,
+        ));
     }
     let namespace = cpp_lexical_namespace(node, source);
     let candidates = cpp_visible_name_candidates(
@@ -299,6 +296,12 @@ fn resolve_cpp_type(
         namespace.as_deref(),
     );
     if !candidates.is_empty() {
+        let candidates = candidates
+            .into_iter()
+            .flat_map(|unit| {
+                cpp_type_definition_candidates(analyzer, visibility, file, support, unit)
+            })
+            .collect();
         return candidates_outcome(candidates);
     }
     if cpp_unresolved_include_boundary(analyzer, file, &text) {
@@ -310,6 +313,24 @@ fn resolve_cpp_type(
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed C++ type"),
     )
+}
+
+fn cpp_type_definition_candidates(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    support: &DefinitionLookupIndex,
+    unit: CodeUnit,
+) -> Vec<CodeUnit> {
+    let mut seen = HashSet::default();
+    let target =
+        cpp_alias_target_unit(analyzer, visibility, file, &unit, &mut seen).unwrap_or(unit);
+    let indexed = support.fqn(&target.fq_name());
+    if indexed.is_empty() {
+        vec![target]
+    } else {
+        indexed
+    }
 }
 
 fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLookupOutcome {

@@ -587,6 +587,94 @@ void call(Sink& sink) {
 }
 
 #[test]
+fn cpp_graph_counts_alias_typed_declarations_and_out_of_line_member_qualifiers_as_type_usages() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/parity.h",
+            r#"
+#pragma once
+#include <string>
+namespace parity {
+struct Sink {};
+class ConsoleHandler {
+public:
+    explicit ConsoleHandler(Sink& s);
+    std::string handle(const std::string& value);
+};
+using HandlerAlias = ConsoleHandler;
+}
+"#,
+        ),
+        (
+            "src/parity.cpp",
+            r#"
+#include "../include/parity.h"
+namespace parity {
+ConsoleHandler::ConsoleHandler(Sink& s) {}
+std::string ConsoleHandler::handle(const std::string& value) { return value; }
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"
+#include "../include/parity.h"
+void run(parity::Sink& sink) {
+    parity::HandlerAlias handler(sink);
+}
+"#,
+        ),
+    ]);
+
+    let target = class_definition(&analyzer, "ConsoleHandler");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = CppUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("cpp graph success");
+    let summaries = hits.iter().cloned().map(hit_summary).collect::<Vec<_>>();
+
+    assert_hit_contains(
+        &summaries,
+        "src/parity.cpp",
+        "ConsoleHandler::ConsoleHandler",
+    );
+    assert_hit_contains(&summaries, "src/parity.cpp", "ConsoleHandler::handle");
+    assert_hit_contains(&summaries, "src/main.cpp", "parity::HandlerAlias handler");
+    assert_no_hit_contains(&summaries, "class ConsoleHandler");
+
+    let selected_texts = hits
+        .iter()
+        .map(|hit| {
+            let source = hit.file.read_to_string().expect("hit source");
+            source[hit.start_offset..hit.end_offset].to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        selected_texts
+            .iter()
+            .filter(|text| text.as_str() == "ConsoleHandler")
+            .count()
+            >= 2,
+        "out-of-line member qualifier hits should select the class qualifier: {selected_texts:?}"
+    );
+    assert!(
+        !selected_texts.iter().any(|text| text == "handle"),
+        "class query must not select the member name itself: {selected_texts:?}"
+    );
+    let main_source = project
+        .file("src/main.cpp")
+        .read_to_string()
+        .expect("main source");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/main.cpp")
+                && main_source[hit.start_offset..hit.end_offset] == *"parity::HandlerAlias"),
+        "alias-typed declaration site should resolve through the alias: {selected_texts:?}"
+    );
+}
+
+#[test]
 fn cpp_graph_does_not_seed_namespace_scope_function_declarations_as_receivers() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (
