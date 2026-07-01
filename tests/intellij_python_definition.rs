@@ -297,15 +297,33 @@ fn nested_class_reference() {
     );
 }
 
-// A chained call `A().make().go()` resolves `go` through `make()`'s return type.
-// bifrost types a construction receiver but not a function's return type, so the
-// second hop is unresolved.
+// A chained call `A().make().go()` resolves `go` through `make()`'s inferred
+// return type (`return B()`).
 #[test]
-#[ignore = "bifrost gap: member access on a function-call result (make().go()) needs return-type inference"]
 fn chained_method_return_type() {
     assert_resolves_to_line(
         "Chained.py",
         "class B:\n    def go(self):\n        pass\n\nclass A:\n    def make(self):\n        return B()\n\nA().make().<caret>go()\n",
+        1,
+    );
+}
+
+// Return type via an explicit `-> B` annotation.
+#[test]
+fn annotated_return_type_receiver() {
+    assert_resolves_to_line(
+        "AnnotatedReturn.py",
+        "class B:\n    def go(self):\n        pass\n\nclass A:\n    def make(self) -> B:\n        return None\n\nA().make().<caret>go()\n",
+        1,
+    );
+}
+
+// Return type inferred from a bare module-level function `def make(): return B()`.
+#[test]
+fn bare_function_return_type_receiver() {
+    assert_resolves_to_line(
+        "BareFuncReturn.py",
+        "class B:\n    def go(self):\n        pass\n\ndef make():\n    return B()\n\nmake().<caret>go()\n",
         1,
     );
 }

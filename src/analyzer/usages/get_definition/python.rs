@@ -352,17 +352,127 @@ fn python_receiver_type_unit(
             // accesses a member on the class itself.
             resolve_python_receiver_type(analyzer, file, receiver, false)
         }
-        // A construction receiver `Foo().bar` is typed by the class being called.
-        "call" => {
-            let function = object.child_by_field_name("function")?;
-            if function.kind() != "identifier" {
-                return None;
-            }
+        // A call receiver: `Foo().bar` (construction) or `make().bar` (the
+        // called function/method's return type).
+        "call" => python_call_result_type(analyzer, py, file, source, root, object),
+        _ => None,
+    }
+}
+
+/// The type produced by a call expression: the class for a construction
+/// (`Foo()`), or the resolved return type of the called function/method
+/// (`make()`, `obj.make()`).
+fn python_call_result_type(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    call: Node<'_>,
+) -> Option<CodeUnit> {
+    let function = call.child_by_field_name("function")?;
+    let callee = python_resolve_callable(analyzer, py, file, source, root, function)?;
+    if callee.is_class() {
+        return Some(callee);
+    }
+    python_callable_return_type(analyzer, &callee)
+}
+
+/// Resolve a call's callee expression to the class or function/method being
+/// called.
+fn python_resolve_callable(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    function: Node<'_>,
+) -> Option<CodeUnit> {
+    match function.kind() {
+        "identifier" => {
             let name = python_slice(function, source);
-            resolve_python_receiver_type(analyzer, file, name, false)
+            if let Some(class) = resolve_python_receiver_type(analyzer, file, name, false) {
+                return Some(class);
+            }
+            analyzer
+                .get_declarations(file)
+                .into_iter()
+                .find(|unit| unit.identifier() == name && unit.is_function())
+        }
+        "attribute" => {
+            let receiver = function.child_by_field_name("object")?;
+            let method = python_slice(function.child_by_field_name("attribute")?, source);
+            let receiver_type =
+                python_receiver_type_unit(analyzer, py, file, source, root, receiver)?;
+            analyzer
+                .definitions(&format!("{}.{}", receiver_type.fq_name(), method))
+                .next()
+                .cloned()
         }
         _ => None,
     }
+}
+
+/// The declared or inferred return type of a Python function/method: read a
+/// `-> T` annotation, else infer from a `return T(...)` / `return T` in the
+/// body. Resolved in the callable's own file.
+fn python_callable_return_type(analyzer: &dyn IAnalyzer, callable: &CodeUnit) -> Option<CodeUnit> {
+    let file = callable.source();
+    let source = analyzer.get_source(callable, false)?;
+    let tree = parse_python_tree(&source)?;
+    let function = python_first_function_definition(tree.root_node())?;
+
+    if let Some(return_type) = function.child_by_field_name("return_type") {
+        let text = python_slice(return_type, &source).trim();
+        if let Some(class) = resolve_python_receiver_type(analyzer, file, text, true) {
+            return Some(class);
+        }
+    }
+
+    let body = function.child_by_field_name("body")?;
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        // Don't descend into nested functions/classes — their returns are theirs.
+        if matches!(node.kind(), "function_definition" | "class_definition") {
+            continue;
+        }
+        if node.kind() == "return_statement"
+            && let Some(value) = node.named_child(0)
+        {
+            let name = match value.kind() {
+                "call" => value
+                    .child_by_field_name("function")
+                    .filter(|f| f.kind() == "identifier")
+                    .map(|f| python_slice(f, &source)),
+                "identifier" => Some(python_slice(value, &source)),
+                _ => None,
+            };
+            if let Some(name) = name
+                && let Some(class) = resolve_python_receiver_type(analyzer, file, name, true)
+            {
+                return Some(class);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+fn python_first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    None
 }
 
 fn python_self_receiver_type(
