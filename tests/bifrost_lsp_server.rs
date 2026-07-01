@@ -5117,6 +5117,99 @@ fn bifrost_lsp_server_python_semantic_diagnostics_malformed_file_reports_parse_n
 }
 
 #[test]
+fn bifrost_lsp_server_php_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::create_dir_all(temp_root.join("src")).expect("create src");
+    fs::write(
+        temp_root.join("src/Service.php"),
+        r#"<?php
+namespace App;
+
+class Anchor {}
+
+class Service {
+    private MissingType $value;
+
+    public function run(): void {
+        \App\missing_function();
+    }
+}
+"#,
+    )
+    .expect("write php fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let php_uri = uri_for(&temp_root.join("src/Service.php"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": php_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-php"
+            && item["code"] == "php_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("MissingType"))),
+        "expected MissingType PHP semantic diagnostic: {response}"
+    );
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-php"
+            && item["code"] == "php_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("missing_function"))),
+        "expected missing_function PHP semantic diagnostic: {response}"
+    );
+
+    server.shutdown_with_id(3);
+}
+
+#[test]
+fn bifrost_lsp_server_php_semantic_diagnostics_malformed_file_reports_parse_not_semantic() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("broken.php"),
+        "<?php\nnamespace App;\nclass Broken { public function run(: void { MissingType; }\n",
+    )
+    .expect("write broken php");
+
+    let mut server = LspServer::start(&temp_root);
+    let php_uri = uri_for(&temp_root.join("broken.php"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": php_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items
+            .iter()
+            .any(|item| item["source"] == "bifrost-tree-sitter"),
+        "expected parse diagnostic for malformed PHP: {response}"
+    );
+    assert!(
+        items.iter().all(|item| item["source"] != "bifrost-php"),
+        "malformed PHP must suppress semantic diagnostics: {response}"
+    );
+
+    server.shutdown_with_id(3);
+}
+
+#[test]
 fn bifrost_lsp_server_did_save_triggers_reindex() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
@@ -5453,6 +5546,46 @@ fn bifrost_lsp_server_did_save_publishes_python_semantic_diagnostics() {
                 .as_str()
                 .is_some_and(|message| message.contains("missing_value"))),
         "expected publishDiagnostics semantic Python item: {publish}"
+    );
+
+    server.shutdown_with_id(99);
+}
+
+#[test]
+fn bifrost_lsp_server_did_save_publishes_php_semantic_diagnostics() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("Service.php"),
+        "<?php\nnamespace App;\nclass Anchor {}\nclass Service { public function run(): void {} }\n",
+    )
+    .expect("write fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let php_uri = uri_for(&temp_root.join("Service.php"));
+
+    fs::write(
+        temp_root.join("Service.php"),
+        "<?php\nnamespace App;\nclass Anchor {}\nclass Service { private MissingType $value; }\n",
+    )
+    .expect("rewrite fixture");
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": php_uri}}
+    }));
+
+    let publish = server.read_notification("textDocument/publishDiagnostics");
+    let items = publish["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-php"
+            && item["code"] == "php_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("MissingType"))),
+        "expected publishDiagnostics semantic PHP item: {publish}"
     );
 
     server.shutdown_with_id(99);
