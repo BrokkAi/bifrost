@@ -175,6 +175,34 @@ export function caller(flag: boolean) {
 }
 
 #[test]
+fn ts_branch_assignment_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service { run() {} }
+export class Other { run() {} }
+export function makeService() { return new Service(); }
+export function makeOther() { return new Other(); }
+export function caller(flag: boolean) {
+  let service;
+  if (flag) service = makeService();
+  else service = makeOther();
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&graph, "caller", "Service.run") && !has_edge(&graph, "caller", "Other.run"),
+        "branch-assigned receiver must not be linearized to a partial edge: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
 fn ts_factory_receiver_fanout_over_cap_emits_no_partial_edge() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

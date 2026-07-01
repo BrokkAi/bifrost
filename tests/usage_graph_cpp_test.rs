@@ -185,6 +185,65 @@ void via_static_factory() {
 }
 
 #[test]
+fn static_factory_return_resolves_in_method_namespace() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            r#"#pragma once
+namespace lib {
+class Service {
+public:
+    void run() {}
+};
+class Factory {
+public:
+    static Service create();
+};
+}
+namespace app {
+class Service {
+public:
+    void run() {}
+};
+void caller();
+}
+"#,
+        )
+        .file(
+            "service.cpp",
+            r#"#include "service.h"
+namespace lib {
+Service Factory::create() { return Service{}; }
+}
+"#,
+        )
+        .file(
+            "main.cpp",
+            r#"#include "service.h"
+namespace app {
+void caller() {
+    auto service = lib::Factory::create();
+    service.run();
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.caller", "lib.Service.run"),
+        "static factory return should resolve in the method namespace: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.caller", "app.Service.run"),
+        "static factory return must not resolve Service in the caller namespace: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn unsupported_conditional_receiver_emits_no_partial_edge() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

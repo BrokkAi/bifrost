@@ -29,6 +29,7 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     class_declarations_by_name: HashMap<String, Vec<Node<'tree>>>,
     member_target_cache:
         RefCell<HashMap<ReceiverAnalysisCacheKey, ReceiverAnalysisOutcome<CodeUnit>>>,
+    scope_nodes_seen: RefCell<usize>,
 }
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
@@ -50,6 +51,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             function_declarations_by_name,
             class_declarations_by_name,
             member_target_cache: RefCell::new(HashMap::default()),
+            scope_nodes_seen: RefCell::new(0),
         }
     }
 
@@ -224,7 +226,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let mut latest = None;
         let mut stack = vec![scope];
         while let Some(node) = stack.pop() {
-            if let Err(limit) = tracker.record_scope_node() {
+            if let Err(limit) = self.record_scope_node(budget, tracker) {
                 return Some(limit.exceeded());
             }
             if node.start_byte() >= before_byte {
@@ -247,11 +249,15 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 && matches!(left.kind(), "identifier" | "type_identifier")
                 && node_text_matches(left, self.source, receiver)
             {
-                latest = Some(
-                    node.child_by_field_name("right")
-                        .map(|right| self.resolve_expression(right, depth + 1, budget, tracker))
-                        .unwrap_or(ReceiverAnalysisOutcome::Unknown),
-                );
+                if assignment_has_nonlinear_control_ancestor(node, scope) {
+                    latest = Some(ReceiverAnalysisOutcome::Ambiguous(Vec::new()));
+                } else {
+                    latest = Some(
+                        node.child_by_field_name("right")
+                            .map(|right| self.resolve_expression(right, depth + 1, budget, tracker))
+                            .unwrap_or(ReceiverAnalysisOutcome::Unknown),
+                    );
+                }
             }
 
             for index in (0..node.named_child_count()).rev() {
@@ -261,6 +267,23 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             }
         }
         latest
+    }
+
+    fn record_scope_node(
+        &self,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> Result<(), crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit> {
+        {
+            let mut seen = self.scope_nodes_seen.borrow_mut();
+            *seen += 1;
+            if *seen > budget.max_scope_nodes {
+                return Err(
+                    crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::ScopeNodes,
+                );
+            }
+        }
+        tracker.record_scope_node()
     }
 
     fn resolve_static_object_expression(
@@ -383,7 +406,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let mut outcomes = Vec::new();
         let mut stack = vec![function];
         while let Some(node) = stack.pop() {
-            if let Err(limit) = tracker.record_scope_node() {
+            if let Err(limit) = self.record_scope_node(budget, tracker) {
                 return limit.exceeded();
             }
             if node.id() != function.id() && is_summary_boundary(node.kind()) {
@@ -570,6 +593,36 @@ fn declaration_scope_id(node: Node<'_>) -> Option<usize> {
         }
         current = current.parent()?;
     }
+}
+
+fn assignment_has_nonlinear_control_ancestor(assignment: Node<'_>, scope: Node<'_>) -> bool {
+    let mut current = assignment.parent();
+    while let Some(node) = current {
+        if node.id() == scope.id() || is_scope_boundary(node.kind()) {
+            return false;
+        }
+        if is_nonlinear_control_boundary(node.kind()) {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn is_nonlinear_control_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_statement"
+            | "else_clause"
+            | "switch_statement"
+            | "switch_case"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_statement"
+            | "do_statement"
+            | "try_statement"
+            | "catch_clause"
+    )
 }
 
 fn smallest_named_node_covering<'tree>(

@@ -290,6 +290,95 @@ public class Consumer {
 }
 
 #[test]
+fn factory_return_resolves_in_callee_namespace() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib.cs",
+            r#"
+namespace Lib;
+
+public class Service {
+    public void Run() {}
+}
+
+public class Factory {
+    public Service Make() {
+        return new Service();
+    }
+}
+"#,
+        )
+        .file(
+            "App.cs",
+            r#"
+using Lib;
+
+namespace App;
+
+public class Service {
+    public void Run() {}
+}
+
+public class Consumer {
+    public void Call(Factory factory) {
+        var service = factory.Make();
+        service.Run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "App.Consumer.Call", "Lib.Service.Run"),
+        "factory return should resolve in the callee namespace: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.Call", "App.Service.Run"),
+        "factory return must not resolve Service in the caller namespace: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn inherited_factory_receiver_resolves_from_base_method() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            r#"
+namespace App;
+
+public class Service {
+    public void Run() {}
+}
+
+public class Base {
+    public Service Make() {
+        return new Service();
+    }
+}
+
+public class Consumer : Base {
+    public void Call() {
+        var service = Make();
+        service.Run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "App.Consumer.Call", "App.Service.Run"),
+        "inherited factory should seed the receiver type: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn ambiguous_factory_receiver_emits_no_partial_edge() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

@@ -18,7 +18,7 @@
 //! typing are not resolved — a recall gap, not a wrong edge. This mirrors the
 //! receiver shapes the forward Java scan proves.
 
-use super::resolver::{is_ignored_type_context, node_text};
+use super::resolver::{is_ignored_type_context, node_text, signature_arity};
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, parse_and_collect,
@@ -29,6 +29,9 @@ use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Mutex;
 use tree_sitter::{Node, Parser};
+
+type MethodReturnCacheKey = (ProjectFile, String, Option<String>);
+type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
 
 pub(super) fn build_java_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -41,7 +44,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_java::LANGUAGE.into();
-    let return_type_cache = Mutex::new(HashMap::default());
+    let return_type_cache: MethodReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = JavaScan {
@@ -65,7 +68,7 @@ struct JavaScan<'a, 'b> {
     source: &'a str,
     root: Node<'a>,
     class_ranges: ClassRangeIndex,
-    return_type_cache: &'a Mutex<HashMap<(ProjectFile, String), ReceiverAnalysisOutcome<String>>>,
+    return_type_cache: &'a MethodReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -397,16 +400,29 @@ fn method_invocation_return_type_outcome(
     let Some(owner) = method_owner_fqn(invocation, ctx, bindings) else {
         return ReceiverAnalysisOutcome::Unknown;
     };
-    method_unit_declared_return_type_outcome(&owner, name, ctx)
+    method_unit_declared_return_type_outcome(&owner, name, argument_count(invocation), ctx)
+}
+
+fn argument_count(invocation: Node<'_>) -> usize {
+    invocation
+        .child_by_field_name("arguments")
+        .map(|arguments| arguments.named_child_count())
+        .unwrap_or(0)
 }
 
 fn method_unit_declared_return_type_outcome(
     owner: &str,
     name: &str,
+    arity: usize,
     ctx: &JavaScan<'_, '_>,
 ) -> ReceiverAnalysisOutcome<String> {
     let fqn = format!("{owner}.{name}");
-    let units = ctx.java.definitions(&fqn).cloned().collect::<Vec<_>>();
+    let units = ctx
+        .java
+        .definitions(&fqn)
+        .filter(|unit| signature_arity(unit.signature()) == arity)
+        .cloned()
+        .collect::<Vec<_>>();
     if units.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
     }
@@ -421,7 +437,11 @@ fn method_unit_declared_return_type(
     method: &CodeUnit,
     ctx: &JavaScan<'_, '_>,
 ) -> ReceiverAnalysisOutcome<String> {
-    let cache_key = (method.source().clone(), method.fq_name());
+    let cache_key = (
+        method.source().clone(),
+        method.fq_name(),
+        method.signature().map(str::to_string),
+    );
     if let Some(cached) = ctx
         .return_type_cache
         .lock()

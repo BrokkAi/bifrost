@@ -261,6 +261,80 @@ class Consumer:
 }
 
 #[test]
+fn self_factory_receiver_resolves_through_current_class() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    def run(self):
+        pass
+
+class Other:
+    def run(self):
+        pass
+
+class Consumer:
+    def make_service(self) -> Service:
+        return Service()
+
+    def caller(self):
+        svc = self.make_service()
+        svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Consumer.caller", "app.Service.run"),
+        "self factory receiver should resolve to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Consumer.caller", "app.Other.run"),
+        "self factory receiver must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn hidden_nested_factory_does_not_type_unrelated_call() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    def run(self):
+        pass
+
+class Other:
+    def run(self):
+        pass
+
+def outer():
+    def make() -> Service:
+        return Service()
+    return make
+
+class Consumer:
+    def caller(self):
+        svc = make()
+        svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "app.Consumer.caller", "app.Service.run")
+            && !has_edge(&value, "app.Consumer.caller", "app.Other.run"),
+        "hidden nested factory must not seed an unrelated receiver: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn ambiguous_factory_receiver_emits_no_partial_edge() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

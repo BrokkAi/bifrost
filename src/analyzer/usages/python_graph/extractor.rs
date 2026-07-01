@@ -217,13 +217,7 @@ pub(super) fn scan_files_for_seeds(
         let edges = py.usage_matching_edges(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
         let target_self_file = *file == target.source();
-        let scope_facts = collect_scope_facts(
-            analyzer,
-            file,
-            &edges,
-            target_short.as_str(),
-            target_self_file,
-        );
+        let scope_facts = collect_scope_facts(analyzer, file, target_short.as_str());
 
         let mut local_hits = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
@@ -681,9 +675,7 @@ pub(in crate::analyzer::usages) fn collect_assigned_identifiers(
 pub(in crate::analyzer::usages) fn collect_scope_facts(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    edges: &[ImportEdge],
     target_short: &str,
-    target_self_file: bool,
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
     let declarations = analyzer.get_declarations(file);
     let factory_return_types = analyzer
@@ -703,11 +695,10 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         };
         let facts = collect_scope_facts_from_source(
             &source,
-            edges,
             target_short,
-            target_self_file,
             true,
             false,
+            Some(declaration.short_name()),
             &factory_return_types,
         );
         class_facts_by_name.insert(
@@ -724,16 +715,19 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         let Some(source) = analyzer.get_source(declaration, false) else {
             continue;
         };
+        let owner = declaration
+            .short_name()
+            .rsplit_once('.')
+            .map(|(owner, _)| owner);
         let mut facts = collect_scope_facts_from_source(
             &source,
-            edges,
             target_short,
-            target_self_file,
             false,
             false,
+            owner,
             &factory_return_types,
         );
-        if let Some((owner, _)) = declaration.short_name().rsplit_once('.')
+        if let Some(owner) = owner
             && let Some(class_facts) = class_facts_by_name.get(owner)
         {
             facts = facts.merged_with_visible(class_facts);
@@ -751,11 +745,10 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         };
         let facts = collect_scope_facts_from_source(
             &source,
-            edges,
             target_short,
-            target_self_file,
             false,
             true,
+            None,
             &factory_return_types,
         );
         scope_facts.insert(declaration.clone(), facts);
@@ -765,11 +758,10 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
 
 fn collect_scope_facts_from_source(
     source: &str,
-    _edges: &[ImportEdge],
     target_short: &str,
-    _target_self_file: bool,
     allow_self_receivers: bool,
     is_module_scope: bool,
+    current_class: Option<&str>,
     factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
     let events = collect_scope_fact_events(source);
@@ -818,8 +810,11 @@ fn collect_scope_facts_from_source(
 
                     match rhs {
                         AssignmentRhs::Call(callee) => {
-                            if let Some(receiver_type) = factory_return_types.get(callee)
-                                && engine.resolve_symbol(lhs).is_unknown()
+                            if let Some(receiver_type) = factory_return_type_for_callee(
+                                callee,
+                                current_class,
+                                factory_return_types,
+                            ) && engine.resolve_symbol(lhs).is_unknown()
                             {
                                 engine.seed_symbol(lhs.clone(), receiver_type.clone());
                                 changed = true;
@@ -864,6 +859,21 @@ fn collect_scope_facts_from_source(
     }
 
     engine.snapshot()
+}
+
+fn factory_return_type_for_callee<'a>(
+    callee: &str,
+    current_class: Option<&str>,
+    factory_return_types: &'a HashMap<String, String>,
+) -> Option<&'a String> {
+    if let Some(receiver_type) = factory_return_types.get(callee) {
+        return Some(receiver_type);
+    }
+    let class_name = current_class?;
+    let method = callee
+        .strip_prefix("self.")
+        .or_else(|| callee.strip_prefix("cls."))?;
+    factory_return_types.get(&format!("{class_name}.{method}"))
 }
 
 fn apply_annotation_event(

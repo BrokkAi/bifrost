@@ -31,7 +31,7 @@ use crate::hash::{HashMap, HashSet};
 use std::sync::Mutex;
 use tree_sitter::Node;
 
-type MethodReturnCacheKey = (ProjectFile, String, String, usize);
+type MethodReturnCacheKey = (String, String, usize);
 type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, Option<String>>>;
 
 pub(super) fn build_csharp_edges<F>(
@@ -55,6 +55,7 @@ where
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = CsScan {
+                analyzer,
                 csharp,
                 file,
                 source: parsed.source.as_str(),
@@ -70,6 +71,7 @@ where
 }
 
 struct CsScan<'a, 'b> {
+    analyzer: &'a dyn IAnalyzer,
     csharp: &'a CSharpAnalyzer,
     file: &'a ProjectFile,
     source: &'a str,
@@ -379,12 +381,7 @@ fn method_return_type_for_call(
     method_name: &str,
     arity: usize,
 ) -> Option<String> {
-    let cache_key = (
-        ctx.file.clone(),
-        owner.fq_name(),
-        method_name.to_string(),
-        arity,
-    );
+    let cache_key = (owner.fq_name(), method_name.to_string(), arity);
     if let Some(cached) = ctx
         .method_return_cache
         .lock()
@@ -394,13 +391,39 @@ fn method_return_type_for_call(
     {
         return cached;
     }
-    let resolved =
-        method_return_type_fq_name_for_arity(ctx.csharp, ctx.file, owner, method_name, Some(arity));
+    let mut resolved = csharp_method_return_types_for_owner(ctx, owner, method_name, arity);
+    resolved.sort();
+    resolved.dedup();
+    let resolved = (resolved.len() == 1).then(|| resolved.remove(0));
     ctx.method_return_cache
         .lock()
         .expect("csharp return type cache poisoned")
         .insert(cache_key, resolved.clone());
     resolved
+}
+
+fn csharp_method_return_types_for_owner(
+    ctx: &CsScan<'_, '_>,
+    owner: &CodeUnit,
+    method_name: &str,
+    arity: usize,
+) -> Vec<String> {
+    let mut owners = vec![owner.clone()];
+    if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
+        owners.extend(provider.get_ancestors(owner));
+    }
+    owners
+        .into_iter()
+        .filter_map(|candidate| {
+            method_return_type_fq_name_for_arity(
+                ctx.csharp,
+                ctx.file,
+                &candidate,
+                method_name,
+                Some(arity),
+            )
+        })
+        .collect()
 }
 
 fn class_unit_for_fqn(ctx: &CsScan<'_, '_>, fqn: &str) -> Option<CodeUnit> {

@@ -822,7 +822,7 @@ fn function_return_type_node(function: Node<'_>) -> Option<Node<'_>> {
         .find(|child| is_rust_type_node(*child))
 }
 
-fn first_generic_type_argument(type_node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn first_generic_type_argument(type_node: Node<'_>) -> Option<Node<'_>> {
     let type_arguments = type_node.child_by_field_name("type_arguments");
     let mut cursor = type_arguments.unwrap_or(type_node).walk();
     type_arguments
@@ -899,7 +899,7 @@ fn constructor_type_node_fqn(
     }
 }
 
-fn type_node_last_segment(type_node: Node<'_>, source: &str) -> Option<String> {
+pub(super) fn type_node_last_segment(type_node: Node<'_>, source: &str) -> Option<String> {
     match type_node.kind() {
         "type_identifier" | "identifier" => simple_node_text(type_node, source),
         "scoped_type_identifier" | "scoped_identifier" => type_node

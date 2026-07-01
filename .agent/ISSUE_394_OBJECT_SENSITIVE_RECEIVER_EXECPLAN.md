@@ -28,6 +28,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T12:10Z) Run final focused validation, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
 - [x] (2026-07-01T12:22Z) Address guided-review findings for JS/TS lexical scoping, Java summary safety, Rust source-order scoping, and receiver outcome merge duplication.
 - [x] (2026-07-01T12:55Z) Address second guided-review findings for JS/TS factory visibility, Python partial returns, C# overload arity, Scala overload maps, and receiver cache keys.
+- [x] (2026-07-01T13:21Z) Address third guided-review findings for declaration-context factory returns, Java overload arity, Python/Rust callable identity, JS/TS branch assignments, and JS/TS cache/resource bounds.
 
 ## Surprises & Discoveries
 
@@ -103,6 +104,18 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: The second guided review found that receiver cache keys did not include the full budget identity.
   Evidence: `src/analyzer/usages/receiver_analysis.rs` now includes `max_summary_expansions` and `max_scope_nodes` in `ReceiverAnalysisCacheKey`.
 
+- Observation: The third guided review found that C# and C++ factory return types could resolve in the caller context instead of the callee declaration context.
+  Evidence: `src/analyzer/usages/csharp_graph/resolver.rs` now resolves method return text using `unit.source()`, and `src/analyzer/usages/cpp_graph/resolver.rs` resolves return text through declaration-file visibility with namespace-prefix preference.
+
+- Observation: The third guided review found that Java factory return inference ignored invocation arity.
+  Evidence: `src/analyzer/usages/java_graph/inverted.rs` now filters candidate methods by `signature_arity` and keys cached return facts by method signature.
+
+- Observation: The third guided review found that Python and Rust factory facts could be applied by raw callable names instead of resolved callable identity/context.
+  Evidence: `src/analyzer/usages/python_graph/extractor.rs` now resolves `self.`/`cls.` factories through the current class key, and `src/analyzer/usages/rust_graph/inverted.rs` now looks up bare-call factory summaries only after `RustReferenceContext::resolve_bare`.
+
+- Observation: The third guided review found that JS/TS assignment scanning could linearize non-linear control-flow writes and could spend repeated scope-walk work per receiver query.
+  Evidence: `src/analyzer/usages/js_ts_graph/receiver_analysis.rs` now marks assignments under non-linear control constructs as ambiguous and tracks aggregate provider scope-node budget use.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -154,6 +167,8 @@ All target usage-graph languages now have #394-shaped object-sensitive receiver 
 Guided-review follow-up complete. JS/TS receiver lookup now resolves identifier bindings through visible lexical scope ancestry, pre-indexes file-local functions/classes when the provider is constructed, and shares the branch-outcome merge policy from `receiver_analysis.rs`. Java receiver summaries now use declared return types and cache method return lookups instead of interpreting callee bodies with caller-local bindings. Rust receiver facts are seeded incrementally by traversal scope, so later or inner-block `let` bindings cannot type earlier or outer receiver calls. Added regressions for TS block-local receiver shadowing, Java caller-binding leakage and recursive factory safety, and Rust block-local receiver shadowing. Validation after review fixes: `cargo test --lib receiver_analysis`, `cargo test --test usage_graph_ts_test`, `cargo test --test usage_graph_java_test`, `cargo test --test usage_graph_rust_test`, `cargo test --test usages_js_ts_graph_test`, `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition`, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check` all passed.
 
 Second guided-review follow-up complete. JS/TS factory and class summaries now require declaration visibility at the call site, Python factory bodies fail closed when any return branch is unknown, C# method-return inference is arity-aware and avoids cross-file cache reuse, Scala factory summaries preserve overloaded return ambiguity, and receiver cache keys include all budget dimensions. Added regressions for hidden JS/TS factories, partially unknown Python returns, C# overloaded factories, and Scala overloaded factories. Focused validation after these fixes passed: `cargo test --lib receiver_analysis`, `cargo test --test usage_graph_ts_test`, `cargo test --test usage_graph_test`, `cargo test --test usage_graph_csharp_test`, `cargo test --test usage_graph_scala_test`, `cargo test --test usage_graph_java_test`, `cargo test --test usage_graph_php_test`, `cargo test --test usages_js_ts_graph_test`, and `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition`. Final gates after the second review also passed: `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
+
+Third guided-review follow-up complete. C# and C++ factory return typing now resolves return text in the declaration context rather than the caller context; C# also walks inherited owners for factory calls. Java factory return typing now filters overloads by invocation arity and caches by method signature. Python factory lookup now handles `self.`/`cls.` calls through the current class, while hidden nested factories remain unseeded. Rust factory summaries no longer use raw simple-name lookup before `RustReferenceContext`, and wrapper `Box`/`Arc`/`Rc<Self>` returns seed the owner receiver. JS/TS branch assignments under non-linear control flow now fail closed as ambiguous, receiver cache keys no longer copy receiver source text, and provider instances track aggregate scope-node budget use. Focused validation passed: `cargo test --lib receiver_analysis`, `cargo test --test usage_graph_csharp_test`, `cargo test --test usage_graph_cpp_test`, `cargo test --test usage_graph_java_test`, `cargo test --test usage_graph_test`, `cargo test --test usage_graph_rust_test`, `cargo test --test usage_graph_ts_test`, `cargo test --test usages_js_ts_graph_test`, `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition`, and `cargo test --test get_definition_test python_`. Final gates passed: `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
 
 ## Context and Orientation
 

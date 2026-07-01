@@ -21,6 +21,7 @@
 //! (`recv.method()`) resolves only when a local receiver fact proves the receiver
 //! type, such as `let recv = Service::new()` or `let recv = make_service()`.
 
+use super::extractor::{first_generic_type_argument, type_node_last_segment};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdges, build_edges, parse_and_collect,
 };
@@ -332,11 +333,9 @@ fn callable_return_type(function: Node<'_>, ctx: &RustScan<'_, '_>) -> Option<St
     match function.kind() {
         "identifier" => {
             let name = slice(function, ctx.source);
-            ctx.factory_returns.get(name).cloned().or_else(|| {
-                ctx.refs
-                    .resolve_bare(name)
-                    .and_then(|fqn| ctx.factory_returns.get(fqn).cloned())
-            })
+            ctx.refs
+                .resolve_bare(name)
+                .and_then(|fqn| ctx.factory_returns.get(fqn).cloned())
         }
         "scoped_identifier" | "scoped_type_identifier" => {
             let path = function.child_by_field_name("path")?;
@@ -382,11 +381,8 @@ fn collect_factory_return_types(
                 };
                 if let Some(owner_fqn) = impl_owner_fqn.as_ref() {
                     returns.insert(format!("{owner_fqn}.{name}"), return_fqn);
-                } else {
-                    returns.insert(name.clone(), return_fqn.clone());
-                    if let Some(fqn) = refs.resolve_bare(&name) {
-                        returns.insert(fqn.to_string(), return_fqn);
-                    }
+                } else if let Some(fqn) = refs.resolve_bare(&name) {
+                    returns.insert(fqn.to_string(), return_fqn);
                 }
             }
             _ => push_children_with_impl(node, impl_owner_fqn, &mut stack),
@@ -455,9 +451,16 @@ fn type_node_fqn_with_impl(
                 .named_children(&mut cursor)
                 .find_map(|child| type_node_fqn_with_impl(child, source, refs, impl_owner_fqn))
         }
-        "generic_type" => type_node
-            .child_by_field_name("type")
-            .and_then(|base| type_node_fqn_with_impl(base, source, refs, impl_owner_fqn)),
+        "generic_type" => {
+            let base = type_node.child_by_field_name("type")?;
+            let base_name = type_node_last_segment(base, source)?;
+            if matches!(base_name.as_str(), "Box" | "Arc" | "Rc") {
+                return first_generic_type_argument(type_node).and_then(|inner| {
+                    type_node_fqn_with_impl(inner, source, refs, impl_owner_fqn)
+                });
+            }
+            type_node_fqn_with_impl(base, source, refs, impl_owner_fqn)
+        }
         _ => None,
     }
 }

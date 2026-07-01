@@ -229,7 +229,6 @@ pub(crate) struct ReceiverAnalysisCacheKey {
     pub(crate) file: ProjectFile,
     pub(crate) start_byte: usize,
     pub(crate) end_byte: usize,
-    pub(crate) expression: String,
     pub(crate) member_name: Option<String>,
     pub(crate) context_depth: usize,
     pub(crate) max_targets: usize,
@@ -248,7 +247,6 @@ impl ReceiverAnalysisCacheKey {
             file: query.file.clone(),
             start_byte,
             end_byte,
-            expression: query.receiver_text.to_string(),
             member_name: query.member_name.map(str::to_string),
             context_depth: query.context.context_depth,
             max_targets: query.budget.max_targets,
@@ -505,7 +503,6 @@ mod tests {
         assert_eq!(key.file, file);
         assert_eq!(key.start_byte, 10);
         assert_eq!(key.end_byte, 17);
-        assert_eq!(key.expression, "service");
         assert_eq!(key.member_name.as_deref(), Some("run"));
         assert_eq!(key.context_depth, DEFAULT_RECEIVER_CONTEXT_DEPTH);
         assert_eq!(key.max_targets, DEFAULT_RECEIVER_MAX_TARGETS);

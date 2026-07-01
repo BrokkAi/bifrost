@@ -414,7 +414,7 @@ pub(in crate::analyzer::usages) fn method_return_type_fq_name(
 
 pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
     csharp: &CSharpAnalyzer,
-    file: &ProjectFile,
+    _file: &ProjectFile,
     owner: &CodeUnit,
     method_name: &str,
     arity: Option<usize>,
@@ -425,8 +425,10 @@ pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
         .into_iter()
         .filter(|unit| unit.is_function() && unit.fq_name() == method_fqn)
         .filter(|unit| arity.is_none_or(|arity| signature_arity(unit.signature()) == arity))
-        .filter_map(|unit| method_return_type(csharp, &unit))
-        .filter_map(|type_text| resolve_member_type_fq_name(csharp, file, owner, &type_text))
+        .filter_map(|unit| {
+            let type_text = method_return_type(csharp, &unit)?;
+            resolve_member_type_fq_name(csharp, unit.source(), owner, &type_text)
+        })
         .collect::<Vec<_>>();
     resolved.sort();
     resolved.dedup();

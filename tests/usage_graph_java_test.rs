@@ -316,6 +316,83 @@ class Controller {
 }
 
 #[test]
+fn overloaded_factory_receiver_uses_call_arity() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Service.java",
+            r#"
+package com.example;
+
+class Service {
+    void run() {}
+}
+"#,
+        )
+        .file(
+            "com/example/Other.java",
+            r#"
+package com.example;
+
+class Other {
+    void run() {}
+}
+"#,
+        )
+        .file(
+            "com/example/Factory.java",
+            r#"
+package com.example;
+
+class Factory {
+    static Service create() {
+        return new Service();
+    }
+
+    static Other create(int code) {
+        return new Other();
+    }
+}
+"#,
+        )
+        .file(
+            "com/example/Controller.java",
+            r#"
+package com.example;
+
+class Controller {
+    void viaOverload() {
+        var service = Factory.create(1);
+        service.run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(
+            &value,
+            "com.example.Controller.viaOverload",
+            "com.example.Other.run"
+        )
+        .is_some(),
+        "factory overload arity should resolve to Other.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(
+            &value,
+            "com.example.Controller.viaOverload",
+            "com.example.Service.run"
+        )
+        .is_none(),
+        "factory overload arity must not use the zero-arg Service return: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn ambiguous_factory_receiver_emits_no_partial_edge() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

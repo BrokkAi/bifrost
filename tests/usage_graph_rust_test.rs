@@ -229,6 +229,98 @@ pub fn via_associated_factory() {
 }
 
 #[test]
+fn factory_receiver_uses_resolved_callable_not_simple_name() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+mod hidden {
+    pub struct Service;
+
+    impl Service {
+        pub fn run(&self) {}
+    }
+
+    pub fn make() -> Service {
+        Service
+    }
+}
+
+mod real {
+    pub struct Service;
+
+    impl Service {
+        pub fn run(&self) {}
+    }
+
+    pub fn make() -> Service {
+        Service
+    }
+}
+
+use real::make;
+
+pub fn caller() {
+    let service = make();
+    service.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "caller", "hidden.Service.run").is_none(),
+        "bare factory must not use a hidden same-name factory summary: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn wrapper_self_factory_return_seeds_owner_receiver() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+use std::sync::Arc;
+
+pub struct Service;
+pub struct Other;
+
+impl Service {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Service)
+    }
+
+    pub fn run(&self) {}
+}
+
+impl Other {
+    pub fn run(&self) {}
+}
+
+pub fn caller() {
+    let service = Service::new();
+    service.run();
+}
+"#,
+        )
+        .build();
+
+    let value = common::usage_graph::usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(&value, "caller", "Service.run").is_some(),
+        "Arc<Self> factory return should seed the owner receiver: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "caller", "Other.run").is_none(),
+        "wrapper self return must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn unsupported_trait_object_receiver_emits_no_partial_edge() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

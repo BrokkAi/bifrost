@@ -83,7 +83,7 @@ where
             // Per-function receiver-type facts (typed params + `x = Foo()`),
             // computed by the same routine the forward scan uses, so a typed
             // `recv.method` resolves to the receiver's class fqn.
-            let scope_facts = collect_scope_facts(analyzer, file, &[], "", true);
+            let scope_facts = collect_scope_facts(analyzer, file, "");
 
             let mut ctx = PyScan {
                 analyzer,
