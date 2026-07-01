@@ -11,7 +11,8 @@ pub(in crate::analyzer::usages) use resolver::{
     argument_count as csharp_argument_count, first_type_child as csharp_first_type_child,
     is_type_reference_node as csharp_is_type_reference_node,
     member_declared_type_fq_name as csharp_member_declared_type_fq_name,
-    node_text as csharp_node_text, reference_type_text as csharp_reference_type_text,
+    method_return_type_fq_name as csharp_method_return_type_fq_name, node_text as csharp_node_text,
+    reference_type_text as csharp_reference_type_text,
     seed_bindings_before as seed_csharp_bindings_before, signature_arity as csharp_signature_arity,
 };
 

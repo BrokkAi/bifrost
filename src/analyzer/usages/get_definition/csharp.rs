@@ -804,8 +804,93 @@ fn csharp_receiver_type_units(
                 csharp_visible_type_candidates(csharp, file, csharp_node_text(type_node, source))
             })
             .unwrap_or_default(),
+        // `GetFoo().Member` / `obj.GetFoo().Member` — the receiver is typed by the
+        // called method's declared return type.
+        "invocation_expression" => csharp_invocation_return_type_units(
+            analyzer, csharp, support, file, source, root, receiver,
+        ),
         _ => Vec::new(),
     }
+}
+
+/// Type an `invocation_expression` receiver by the callee's declared return
+/// type: resolve the invoked method's owner(s), then resolve the return type of
+/// `owner.Method` (walking the type hierarchy) to a type CodeUnit.
+fn csharp_invocation_return_type_units(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    invocation: Node<'_>,
+) -> Vec<CodeUnit> {
+    let Some(function) = invocation.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    let (owners, method): (Vec<CodeUnit>, &str) = match function.kind() {
+        // `obj.Method()` — type the sub-receiver, look up `Method` on it.
+        "member_access_expression" => {
+            let Some(sub_receiver) = csharp_member_access_receiver(function) else {
+                return Vec::new();
+            };
+            let Some(name_node) = function.child_by_field_name("name") else {
+                return Vec::new();
+            };
+            let owners = csharp_receiver_type_units(
+                analyzer,
+                csharp,
+                support,
+                file,
+                source,
+                root,
+                sub_receiver,
+            );
+            (owners, csharp_node_text(name_node, source))
+        }
+        // `Method()` — an unqualified call resolves against the enclosing class.
+        "identifier" => {
+            let owners = csharp_enclosing_class(analyzer, file, function.start_byte())
+                .into_iter()
+                .collect();
+            (owners, csharp_node_text(function, source))
+        }
+        _ => return Vec::new(),
+    };
+    if owners.is_empty() || method.is_empty() {
+        return Vec::new();
+    }
+
+    let mut return_type_units = Vec::new();
+    for owner in csharp_owners_with_ancestors(analyzer, owners) {
+        if let Some(type_fqn) = csharp_method_return_type_fq_name(csharp, file, &owner, method) {
+            return_type_units.extend(support.fqn(&type_fqn));
+        }
+    }
+    sort_units(&mut return_type_units);
+    return_type_units.dedup();
+    return_type_units
+}
+
+/// Expand a set of owner types to include their ancestors (for inherited
+/// methods), preserving order and de-duplicating.
+fn csharp_owners_with_ancestors(analyzer: &dyn IAnalyzer, owners: Vec<CodeUnit>) -> Vec<CodeUnit> {
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return owners;
+    };
+    let mut seen = HashSet::default();
+    let mut expanded = Vec::new();
+    for owner in owners {
+        if seen.insert(owner.clone()) {
+            expanded.push(owner.clone());
+        }
+        for ancestor in provider.get_ancestors(&owner) {
+            if seen.insert(ancestor.clone()) {
+                expanded.push(ancestor);
+            }
+        }
+    }
+    expanded
 }
 
 fn csharp_enclosing_member_type_units(

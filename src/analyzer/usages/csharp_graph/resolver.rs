@@ -399,6 +399,25 @@ pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
         .find_map(|type_text| resolve_member_type_fq_name(csharp, file, owner, &type_text))
 }
 
+/// Resolve the type named by a method's declared return type, so a call
+/// receiver (`GetFoo().Member`) can be typed by the callee. The stored member
+/// `signature()` keeps only the parameter list, so read the return type from the
+/// full signature text (`signatures_of`), which is `Return Name(params) { … }`.
+pub(in crate::analyzer::usages) fn method_return_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    method_name: &str,
+) -> Option<String> {
+    let method_fqn = format!("{}.{}", owner.fq_name(), method_name);
+    csharp
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.is_function() && unit.fq_name() == method_fqn)
+        .filter_map(|unit| method_return_type(csharp, &unit))
+        .find_map(|type_text| resolve_member_type_fq_name(csharp, file, owner, &type_text))
+}
+
 fn resolve_member_type_fq_name(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
@@ -426,10 +445,23 @@ fn member_declared_type(csharp: &CSharpAnalyzer, member: &CodeUnit) -> Option<St
     let signatures = csharp.signatures_of(member);
     let signature = member
         .signature()
-        .or_else(|| signatures.first().map(String::as_str))?
-        .trim();
-    let name = member.identifier();
-    let before_name = signature.rsplit_once(name)?.0.trim();
+        .or_else(|| signatures.first().map(String::as_str))?;
+    type_text_before_name(signature, member.identifier())
+}
+
+/// A method's declared return type, read from the full signature
+/// (`Return Name(params) { … }`); constructors, whose signature starts at the
+/// name, yield `None`.
+fn method_return_type(csharp: &CSharpAnalyzer, method: &CodeUnit) -> Option<String> {
+    let signatures = csharp.signatures_of(method);
+    let signature = signatures.first().map(String::as_str)?;
+    type_text_before_name(signature, method.identifier())
+}
+
+/// Extract the (normalized) type token that precedes `name` in a declaration
+/// signature — the field/parameter type or a method's return type.
+fn type_text_before_name(signature: &str, name: &str) -> Option<String> {
+    let before_name = signature.trim().rsplit_once(name)?.0.trim();
     let before_name = before_name.trim_end_matches(|ch: char| ch == '?' || ch.is_whitespace());
     let type_text = before_name
         .split_whitespace()

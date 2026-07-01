@@ -7,9 +7,9 @@ use crate::analyzer::usages::cpp_graph::{
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,
-    csharp_is_type_reference_node, csharp_member_declared_type_fq_name, csharp_node_text,
-    csharp_reference_type_text, csharp_signature_arity,
-    member_access_name as csharp_member_access_name,
+    csharp_is_type_reference_node, csharp_member_declared_type_fq_name,
+    csharp_method_return_type_fq_name, csharp_node_text, csharp_reference_type_text,
+    csharp_signature_arity, member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
