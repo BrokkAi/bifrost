@@ -20,7 +20,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T10:58Z) Implement and test the C++ milestone.
 - [x] (2026-07-01T11:00Z) Implement and test the Go milestone.
 - [x] (2026-07-01T11:08Z) Implement and test the PHP milestone.
-- [ ] Implement and test the Python milestone.
+- [x] (2026-07-01T11:18Z) Implement and test the Python milestone.
 - [ ] Implement and test the Ruby milestone.
 - [ ] Implement and test the Rust milestone.
 - [ ] Implement and test the Scala milestone.
@@ -62,6 +62,9 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: PHP already seeded local receiver facts from `new Service()`, but not from factory calls.
   Evidence: `src/analyzer/usages/php_graph/inverted.rs` seeded `$x = new Foo()` and shadowed other assignments before the PHP milestone.
 
+- Observation: Python's whole-workspace graph already reused forward scope facts for typed parameters and `x = Class()` locals.
+  Evidence: `src/analyzer/usages/python_graph/inverted.rs` calls `collect_scope_facts`, and `src/analyzer/usages/python_graph/extractor.rs` seeded assignments from normalized call callee names before the Python milestone.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -95,6 +98,8 @@ C++ milestone complete. Added regression coverage for `auto` receivers initializ
 Go milestone complete. Added inline regression coverage proving `service := makeService(); service.Run()` resolves only to `Service.Run`, while an unsupported interface-return factory remains unseeded and emits no partial same-name edge. The existing constructor-return index already provided the implementation. Validation: `cargo test --test usage_graph_go_test` passed 10 tests.
 
 PHP milestone complete. Extended `src/analyzer/usages/php_graph/inverted.rs` so `$x = makeService()` and `$x = Service::create()` seed receiver facts only when the called free function or static method has a single declared class return type. The implementation uses AST declaration lookup and a per-file return-type cache, not text fallback. Untyped ambiguous factories remain unseeded and do not emit partial same-name member edges. Validation: `cargo test --test usage_graph_php_test` passed 11 tests.
+
+Python milestone complete. Extended `src/analyzer/usages/python_graph/extractor.rs` so the shared scope fact collector builds a same-file factory return index for `make_service()` and `Service.create()` calls. The index reads return annotations and single unambiguous `return Service()` bodies from the Python AST, then seeds receiver locals through the existing local inference engine. Multi-return incompatible factories remain unseeded and do not emit partial same-name member edges. Validation: `cargo test --test usage_graph_test` passed 9 tests.
 
 At completion, summarize which languages gained object-sensitive receiver tests, which consumers query the provider, any budget behavior observed, and any language-specific receiver semantics deferred to follow-up issues.
 
