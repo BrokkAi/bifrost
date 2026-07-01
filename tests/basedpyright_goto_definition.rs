@@ -96,16 +96,10 @@ fn basedpyright_def_confirmations() {
 
 // findDefinitions.dataclasses (shape): a keyword argument `a` in a dataclass
 // constructor resolves to the dataclass field `a` — the Python analog of the Scala
-// named-argument case fixed this session.
-//
-// DEFERRED: bifrost does not resolve the keyword-arg identifier to the dataclass
-// field (it resolves to nothing / the call site). The fix mirrors the Scala
-// `NamedArgument` arm — detect the keyword argument in a call, resolve the callee
-// to the dataclass, and member-lookup the arg name (`Foo.a`) — on the Python
-// get_definition path. Left for a focused follow-up (its own test is isolated so
-// the process-global-state flakiness above does not affect the confirmations).
+// named-argument case. Resolved via a `KeywordArgument` reference shape (type the
+// callee, member-lookup the arg name). A single lookup, so unaffected by the
+// multi-lookup harness flakiness that keeps the confirmations test ignored.
 #[test]
-#[ignore = "deferred: Python dataclass keyword-argument resolution (Foo(a=3) -> field a); mirror the Scala named-arg fix"]
 fn basedpyright_def_dataclass_keyword_arg() {
     assert_resolves_to(
         "from dataclasses import dataclass\n\n@dataclass\nclass Foo:\n    a: int\n    b: str\n\nf = Foo(a<caret>=3, b=\"x\")\n",

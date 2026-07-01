@@ -117,6 +117,29 @@ pub(super) fn resolve_python(
                 format!("`{text}` did not resolve to an indexed Python definition"),
             )
         }
+        Some(PythonReferenceNode::KeywordArgument { call, name }) => {
+            let name_text = python_slice(name, source);
+            if name_text.is_empty() {
+                return no_definition("no_reference_text", "Python keyword argument is blank");
+            }
+            let Some(function) = call.child_by_field_name("function") else {
+                return no_definition("no_function_name", "Python call has no callee");
+            };
+            // `Foo(a=..)` -> `a` is a member/parameter of the callee's type (e.g. a
+            // dataclass field `Foo.a`). Type the callee and look the name up as a
+            // member.
+            if let Some(receiver_type) =
+                python_receiver_type_unit(analyzer, py, file, source, tree.root_node(), function)
+            {
+                return python_member_outcome(analyzer, support, receiver_type, name_text);
+            }
+            no_definition(
+                "no_indexed_definition",
+                format!(
+                    "keyword argument `{name_text}` did not resolve to an indexed Python member"
+                ),
+            )
+        }
         None => no_definition(
             "unsupported_python_reference_shape",
             format!(
@@ -218,9 +241,39 @@ enum PythonReferenceNode<'tree> {
         object: Node<'tree>,
         attribute: Node<'tree>,
     },
+    /// A keyword argument `name=value` in a call `Callee(name=..)`: `name` resolves
+    /// to the callee type's member/parameter (e.g. a dataclass field `Foo.a`), not
+    /// a name in scope.
+    KeywordArgument {
+        call: Node<'tree>,
+        name: Node<'tree>,
+    },
+}
+
+/// A keyword-argument identifier (`a` in `Foo(a=3)`): the `name` of a
+/// `keyword_argument` inside a call's `argument_list`.
+fn python_keyword_argument(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let kwarg = node
+        .parent()
+        .filter(|parent| parent.kind() == "keyword_argument")?;
+    if kwarg.child_by_field_name("name") != Some(node) {
+        return None;
+    }
+    let call = kwarg
+        .parent()
+        .filter(|parent| parent.kind() == "argument_list")?
+        .parent()
+        .filter(|parent| parent.kind() == "call")?;
+    Some(PythonReferenceNode::KeywordArgument { call, name: node })
 }
 
 fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
+    if let Some(keyword) = python_keyword_argument(node) {
+        return Some(keyword);
+    }
     let original = node;
     let mut node = node;
     while let Some(parent) = node.parent() {
