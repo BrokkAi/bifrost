@@ -124,6 +124,106 @@ int main() {
 }
 
 #[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            r#"#pragma once
+namespace example {
+class Service {
+public:
+    void run() {}
+    static Service create();
+};
+class Other {
+public:
+    void run() {}
+};
+Service make_service();
+}
+"#,
+        )
+        .file(
+            "service.cpp",
+            r#"#include "service.h"
+namespace example {
+Service make_service() { return Service{}; }
+Service Service::create() { return Service{}; }
+}
+"#,
+        )
+        .file(
+            "main.cpp",
+            r#"#include "service.h"
+namespace example {
+void via_factory() {
+    auto service = make_service();
+    service.run();
+}
+void via_static_factory() {
+    auto service = Service::create();
+    service.run();
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in ["example.via_factory", "example.via_static_factory"] {
+        assert!(
+            has_edge(&value, caller, "example.Service.run"),
+            "{caller} should edge to Service.run: {}",
+            value["edges"]
+        );
+        assert!(
+            !has_edge(&value, caller, "example.Other.run"),
+            "{caller} must not edge to Other.run by member name: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
+fn unsupported_conditional_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            r#"#pragma once
+namespace example {
+class Service { public: void run() {} };
+class Other { public: void run() {} };
+void caller(bool flag);
+}
+"#,
+        )
+        .file(
+            "main.cpp",
+            r#"#include "service.h"
+namespace example {
+void caller(bool flag) {
+    auto service = flag ? Service{} : Other{};
+    service.run();
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "example.caller", "example.Service.run"),
+        "unsupported conditional receiver must not choose Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "example.caller", "example.Other.run"),
+        "unsupported conditional receiver must not choose Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn receiver_typing_is_type_based_not_name_based() {
     let value = usage_graph();
 

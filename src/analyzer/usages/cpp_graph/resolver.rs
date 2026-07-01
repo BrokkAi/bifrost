@@ -373,7 +373,16 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
         }
         "call_expression" => node.child_by_field_name("function").and_then(|function| {
             let function_text = node_text(function, source);
-            visibility.resolve_type(file, function_text).or_else(|| {
+            resolve_static_method_call_return_type(
+                analyzer,
+                visibility,
+                file,
+                source,
+                function,
+                call_arity(node),
+            )
+            .or_else(|| visibility.resolve_type(file, function_text))
+            .or_else(|| {
                 visibility.resolve_call_return_type(
                     analyzer,
                     file,
@@ -385,6 +394,39 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
         }),
         _ => None,
     }
+}
+
+fn resolve_static_method_call_return_type(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    arity: usize,
+) -> Option<CodeUnit> {
+    if function.kind() != "qualified_identifier" {
+        return None;
+    }
+    let scope = function.child_by_field_name("scope")?;
+    let name = function.child_by_field_name("name")?;
+    let owner = visibility.resolve_type(file, node_text(scope, source))?;
+    let method_fqn = format!("{}.{}", owner.fq_name(), node_text(name, source));
+    let mut resolved_return = None;
+    for method in visibility.visible_units(file).filter(|unit| {
+        unit.is_function()
+            && unit.fq_name() == method_fqn
+            && signature_arity(unit.signature()) == arity
+    }) {
+        let return_text = cpp_function_return_type_text(analyzer, method)?;
+        let return_type = visibility.resolve_type(file, &return_text)?;
+        if let Some(existing) = resolved_return.as_ref()
+            && !same_visible_symbol(existing, &return_type)
+        {
+            return None;
+        }
+        resolved_return = Some(return_type);
+    }
+    resolved_return
 }
 
 fn build_alias_index(files: &HashSet<ProjectFile>) -> HashMap<ProjectFile, Vec<CppAlias>> {
