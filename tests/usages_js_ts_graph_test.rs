@@ -1037,6 +1037,97 @@ fn ts_static_member_on_namespace_import_resolves_member_usage() {
 }
 
 #[test]
+fn ts_static_member_on_class_value_resolves_member_usage() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "api.ts",
+            r#"
+export class ApiClient {
+  static create(baseUrl: string): ApiClient {
+    return new ApiClient(baseUrl);
+  }
+  constructor(readonly baseUrl: string) {}
+}
+
+export function boot() {
+  return ApiClient.create("/api");
+}
+"#,
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("api.ts"), |cu| {
+        cu.short_name() == "ApiClient.create$static" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len(), "hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("ApiClient.create")),
+        "static class-value call should be a usage of the static member: {hits:?}"
+    );
+}
+
+#[test]
+fn js_object_literal_method_member_calls_resolve_to_plain_key() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "library.js",
+            r#"
+const helpers = {
+  formatTask(task) {
+    return task.label;
+  },
+  render(task) {
+    return helpers.formatTask(this);
+  },
+};
+export { helpers };
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"
+import { helpers } from './library.js';
+
+export function run(directTask) {
+  return helpers.formatTask(directTask);
+}
+"#,
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("library.js"), |cu| {
+        cu.short_name().ends_with(".helpers.formatTask")
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("library.js")
+                && hit.snippet.contains("helpers.formatTask(this)")
+        }),
+        "same-file object-literal member call should use the plain declaration key: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("consumer.js")
+                && hit.snippet.contains("helpers.formatTask(directTask)")
+        }),
+        "imported object-literal member call should use the plain declaration key: {hits:?}"
+    );
+}
+
+#[test]
 fn js_commonjs_exports_property_resolves_destructured_require() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file("lib.js", "class Foo {}\nexports.Foo = Foo;\n")

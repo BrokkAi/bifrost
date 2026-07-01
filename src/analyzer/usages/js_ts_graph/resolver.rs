@@ -509,15 +509,6 @@ pub(super) fn target_language(target: &CodeUnit) -> Language {
     })
 }
 
-pub(super) fn top_level_identifier(target: &CodeUnit) -> &str {
-    // For nested members like `BaseClass.foo`, the top-level identifier is `BaseClass`.
-    target
-        .short_name()
-        .split('.')
-        .next()
-        .unwrap_or(target.short_name())
-}
-
 pub(super) fn member_name(target: &CodeUnit) -> Option<String> {
     // Anything past the first dot is treated as the member chain. We strip TS-specific
     // `$static` suffix to align with the original syntactic name.

@@ -108,6 +108,7 @@ where
                     named_imports,
                     namespace_locals,
                     same_file,
+                    nodes,
                     collector,
                 };
                 let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -222,6 +223,35 @@ impl<'a> ScopedTsScan<'a, '_> {
         ))
     }
 
+    fn scoped_member_declaration_keys(
+        &self,
+        owner: &UsageNodeKey,
+        member: &str,
+    ) -> Vec<UsageNodeKey> {
+        let static_key = UsageNodeKey::new(
+            owner.file.clone(),
+            format!("{}.{}$static", owner.fqn, member),
+        );
+        if self
+            .declarations
+            .get(&(owner.file.clone(), format!("{member}$static")))
+            .is_some_and(|keys| keys.contains(&static_key))
+        {
+            return vec![static_key];
+        }
+
+        let plain_key = UsageNodeKey::new(owner.file.clone(), format!("{}.{}", owner.fqn, member));
+        if self
+            .declarations
+            .get(&(owner.file.clone(), member.to_string()))
+            .is_some_and(|keys| keys.contains(&plain_key))
+        {
+            return vec![plain_key];
+        }
+
+        Vec::new()
+    }
+
     fn record(&mut self, callee: UsageNodeKey, node: Node<'_>) {
         self.collector
             .record(callee, node.start_byte(), node.end_byte());
@@ -234,7 +264,24 @@ struct TsScan<'a, 'b> {
     named_imports: HashMap<String, String>,
     namespace_locals: HashSet<String>,
     same_file: HashSet<String>,
+    nodes: &'a HashSet<String>,
     collector: &'a mut EdgeCollector<'b>,
+}
+
+impl TsScan<'_, '_> {
+    fn member_declaration_keys(&self, owner: &str, member: &str) -> Vec<String> {
+        let static_key = format!("{owner}.{member}$static");
+        if self.nodes.contains(&static_key) {
+            return vec![static_key];
+        }
+
+        let plain_key = format!("{owner}.{member}");
+        if self.nodes.contains(&plain_key) {
+            return vec![plain_key];
+        }
+
+        Vec::new()
+    }
 }
 
 fn scoped_declarations_by_file_and_name(
@@ -348,11 +395,21 @@ fn scoped_node_status(
     nodes
         .iter()
         .map(|node| {
-            let top = top_level_name(&node.fqn);
-            let keys = canonical_export_keys(index, declarations, &node.file, &top);
+            let seed_names = export_seed_names_for_node(declarations, node);
+            let mut keys = BTreeSet::new();
+            let mut ambiguous = false;
+            for seed_name in &seed_names {
+                keys.extend(canonical_export_keys(
+                    index,
+                    declarations,
+                    &node.file,
+                    seed_name,
+                ));
+                ambiguous |= ambiguous_alias_for_node(index, declarations, node, seed_name);
+            }
             let status = if keys.is_empty() {
                 JsTsScopedNodeStatus::Unseedable
-            } else if ambiguous_alias_for_node(index, declarations, node, &top) {
+            } else if ambiguous {
                 JsTsScopedNodeStatus::Ambiguous
             } else if keys
                 .iter()
@@ -365,6 +422,41 @@ fn scoped_node_status(
             (node.clone(), status)
         })
         .collect()
+}
+
+fn export_seed_names_for_node(
+    declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    node: &UsageNodeKey,
+) -> BTreeSet<String> {
+    let mut best_len = usize::MAX;
+    let mut out = BTreeSet::new();
+    for ((file, identifier), keys) in declarations {
+        if file != &node.file {
+            continue;
+        }
+        if keys
+            .iter()
+            .any(|key| node.fqn == key.fqn || node.fqn.starts_with(&format!("{}.", key.fqn)))
+        {
+            let len = keys
+                .iter()
+                .map(|key| key.fqn.len())
+                .min()
+                .unwrap_or(usize::MAX);
+            if len < best_len {
+                best_len = len;
+                out.clear();
+            }
+            if len == best_len {
+                out.insert(identifier.clone());
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out.insert(top_level_name(&node.fqn));
+    }
+    out
 }
 
 fn ambiguous_alias_for_node(
@@ -736,7 +828,9 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferen
     // `Class.member` — static access on an imported / same-file class resolves to
     // the member's `Owner.member` fqn.
     if let Some(class) = ctx.bare_callee(object_text) {
-        ctx.record(format!("{class}.{property_text}"), property);
+        for member in ctx.member_declaration_keys(&class, property_text) {
+            ctx.record(member, property);
+        }
     }
 }
 
@@ -778,13 +872,9 @@ fn handle_scoped_member(
             return;
         }
         if let Some(class) = ctx.bare_callee(object_text) {
-            ctx.record(
-                UsageNodeKey::new(
-                    class.file,
-                    format!("{}.{}$static", class.fqn, property_text),
-                ),
-                property,
-            );
+            for member in ctx.scoped_member_declaration_keys(&class, property_text) {
+                ctx.record(member, property);
+            }
         }
         return;
     }
@@ -792,13 +882,9 @@ fn handle_scoped_member(
     if object.kind() == "member_expression"
         && let Some(class) = scoped_namespace_member_class(object, ctx, locals)
     {
-        ctx.record(
-            UsageNodeKey::new(
-                class.file,
-                format!("{}.{}$static", class.fqn, property_text),
-            ),
-            property,
-        );
+        for member in ctx.scoped_member_declaration_keys(&class, property_text) {
+            ctx.record(member, property);
+        }
     }
 }
 

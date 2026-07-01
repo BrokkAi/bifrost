@@ -42,9 +42,7 @@ pub(in crate::analyzer::usages) use receiver_analysis::JsTsReceiverFactProvider;
 pub(crate) use resolver::{JsTsUsageIndex, build_jsts_usage_index};
 
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
-use crate::analyzer::usages::js_ts_graph::resolver::{
-    is_static_member, target_language, top_level_identifier,
-};
+use crate::analyzer::usages::js_ts_graph::resolver::{is_static_member, target_language};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
@@ -134,14 +132,13 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 "JsTsExportUsageGraphStrategy",
             );
         };
+        let target_seed = target_seed_identifier(analyzer, target);
         let owner_seed_allowed = is_static_member(target)
             || !target.short_name().contains('.')
-            || analyzer
-                .parent_of(target)
-                .is_some_and(|parent| parent.short_name() == top_level_identifier(target));
+            || analyzer.parent_of(target).is_some();
         let seeds = index.seeds_for_target(
             target.source(),
-            top_level_identifier(target),
+            &target_seed,
             target.short_name(),
             owner_seed_allowed,
         );
@@ -349,6 +346,19 @@ impl JsTsExportUsageGraphStrategy {
         };
         resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
+}
+
+fn target_seed_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String {
+    if let Some(parent) = analyzer.parent_of(target) {
+        return parent.identifier().trim_end_matches("$static").to_string();
+    }
+    if is_static_member(target)
+        && let Some((owner, _)) = target.short_name().rsplit_once('.')
+        && let Some(owner_name) = owner.rsplit('.').next()
+    {
+        return owner_name.to_string();
+    }
+    target.identifier().trim_end_matches("$static").to_string()
 }
 
 impl UsageAnalyzer for JsTsExportUsageGraphStrategy {

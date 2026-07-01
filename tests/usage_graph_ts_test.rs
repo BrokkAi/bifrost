@@ -165,6 +165,34 @@ export function caller() {
 }
 
 #[test]
+fn ts_static_method_call_edges_to_static_member() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "api.ts",
+            r#"
+export class ApiClient {
+  static create(baseUrl: string): ApiClient {
+    return new ApiClient(baseUrl);
+  }
+  constructor(readonly baseUrl: string) {}
+}
+
+export function boot() {
+  return ApiClient.create("/api");
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "boot", "ApiClient.create$static"),
+        "static method call should resolve to the indexed static member key: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
 fn ts_ambiguous_factory_receiver_call_emits_no_partial_edge() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

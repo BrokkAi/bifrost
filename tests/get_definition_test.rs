@@ -1525,6 +1525,44 @@ fn typescript_factory_receiver_member_resolves_to_definition() {
 }
 
 #[test]
+fn typescript_static_method_call_resolves_to_static_definition() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "api.ts",
+            r#"
+export class ApiClient {
+  static create(baseUrl: string): ApiClient {
+    return new ApiClient(baseUrl);
+  }
+  constructor(readonly baseUrl: string) {}
+}
+
+export function boot() {
+  return ApiClient.create("/api");
+}
+"#,
+        )
+        .build();
+
+    let line = "  return ApiClient.create(\"/api\");";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"api.ts","line":10,"column":{}}}]}}"#,
+            column_of(line, "create")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ApiClient.create$static",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "api.ts", "{value}");
+}
+
+#[test]
 fn typescript_parameter_shadow_blocks_outer_factory_receiver_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

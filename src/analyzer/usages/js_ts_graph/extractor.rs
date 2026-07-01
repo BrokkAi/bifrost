@@ -7,7 +7,7 @@ use crate::analyzer::usages::js_ts_graph::hits::{
     record_hit, record_import_hit, record_self_receiver_hit,
 };
 use crate::analyzer::usages::js_ts_graph::resolver::{
-    JsTsUsageIndex, is_static_member, member_name, top_level_identifier,
+    JsTsUsageIndex, is_static_member, member_name,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{
@@ -33,10 +33,10 @@ pub(super) fn scan_files_for_seeds(
     language: Language,
 ) -> BTreeSet<UsageHit> {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
-    let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
-    let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner = analyzer.parent_of(target);
+    let target_short = target_seed_identifier(target, target_owner.as_ref());
+    let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
 
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
@@ -305,7 +305,9 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    ctx.binding_engine.declare_shadow(lhs.to_string());
+    if !is_target_owner_declaration_binding(name_node, lhs, ctx) {
+        ctx.binding_engine.declare_shadow(lhs.to_string());
+    }
 
     let Some(value_node) = node.child_by_field_name("value") else {
         return;
@@ -318,6 +320,37 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     ctx.binding_engine.alias_symbol(lhs.to_string(), rhs);
+}
+
+fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) -> String {
+    if let Some(owner) = target_owner {
+        return owner.identifier().trim_end_matches("$static").to_string();
+    }
+    if is_static_member(target)
+        && let Some((owner, _)) = target.short_name().rsplit_once('.')
+        && let Some(owner_name) = owner.rsplit('.').next()
+    {
+        return owner_name.to_string();
+    }
+    target.identifier().trim_end_matches("$static").to_string()
+}
+
+fn is_target_owner_declaration_binding(name_node: Node<'_>, lhs: &str, ctx: &ScanCtx<'_>) -> bool {
+    if !ctx.target_self_file || lhs != ctx.target_short {
+        return false;
+    }
+    let Some(owner) = ctx.target_owner else {
+        return false;
+    };
+    let range = Range {
+        start_byte: name_node.start_byte(),
+        end_byte: name_node.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    ctx.analyzer
+        .enclosing_code_unit(ctx.file, &range)
+        .is_some_and(|enclosing| &enclosing == owner)
 }
 
 fn register_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
