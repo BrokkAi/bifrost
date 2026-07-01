@@ -65,14 +65,33 @@ pub(crate) fn run_with_connection(
     fallback_root: PathBuf,
 ) -> Result<(), String> {
     install_lsp_panic_hook();
-    let server_capabilities = server_capabilities_json()?;
 
-    let init_params_value = connection
-        .initialize(server_capabilities)
+    let (init_id, init_params_value) = connection
+        .initialize_start()
         .map_err(|err| format!("LSP initialize failed: {err}"))?;
     let supports_work_done_progress = raw_client_supports_work_done_progress(&init_params_value);
-    let init_params: InitializeParams = serde_json::from_value(init_params_value)
-        .map_err(|err| format!("Failed to decode InitializeParams: {err}"))?;
+    let init_params: InitializeParams = match serde_json::from_value(init_params_value) {
+        Ok(params) => params,
+        Err(err) => {
+            let message = format!("Failed to decode InitializeParams: {err}");
+            return finish_with_initialize_error(
+                connection,
+                io_threads,
+                init_id,
+                ErrorCode::InvalidParams as i32,
+                message,
+            );
+        }
+    };
+    let server_capabilities = server_capabilities_json(&init_params)?;
+    connection
+        .initialize_finish(
+            init_id,
+            serde_json::json!({
+                "capabilities": server_capabilities,
+            }),
+        )
+        .map_err(|err| format!("LSP initialize failed: {err}"))?;
 
     let workspace_config = collect_workspace_config(&init_params, fallback_root.as_path())?;
     let mut pending_messages = Vec::new();
@@ -117,8 +136,30 @@ pub(crate) fn run_with_connection(
     result
 }
 
-fn server_capabilities_json() -> Result<serde_json::Value, String> {
-    let mut capabilities = serde_json::to_value(server_capabilities())
+fn finish_with_initialize_error(
+    connection: Connection,
+    io_threads: IoThreads,
+    init_id: RequestId,
+    code: i32,
+    message: String,
+) -> Result<(), String> {
+    connection
+        .sender
+        .send(Message::Response(Response::new_err(
+            init_id,
+            code,
+            message.clone(),
+        )))
+        .map_err(|send_err| format!("Failed to send LSP initialize error: {send_err}"))?;
+    drop(connection);
+    io_threads
+        .join()
+        .map_err(|err| format!("LSP IO threads failed after initialize error: {err}"))?;
+    Err(message)
+}
+
+fn server_capabilities_json(params: &InitializeParams) -> Result<serde_json::Value, String> {
+    let mut capabilities = serde_json::to_value(server_capabilities(&params.capabilities))
         .map_err(|err| format!("Failed to serialize LSP server capabilities: {err}"))?;
     if let Some(object) = capabilities.as_object_mut() {
         // lsp-types 0.97 has the type-hierarchy request/response types but no

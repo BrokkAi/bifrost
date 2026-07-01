@@ -1,12 +1,13 @@
 use lsp_types::{
-    CompletionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentFormattingOptions,
-    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
-    OneOf, RenameOptions, ServerCapabilities, SignatureHelpOptions, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
-    TypeDefinitionProviderCapability, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
+    ClientCapabilities, CompletionClientCapabilities, CompletionOptions, DiagnosticOptions,
+    DiagnosticServerCapabilities, DocumentFormattingOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, OneOf, RenameOptions,
+    ServerCapabilities, SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
+    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
 };
 
-pub fn server_capabilities() -> ServerCapabilities {
+pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCapabilities {
     // Full-document sync: each `didChange` carries the entire buffer, which we
     // store in `OverlayProject` so request-time reads and the analyzer's
     // reparse both see the unsaved content. INCREMENTAL would require applying
@@ -26,14 +27,7 @@ pub fn server_capabilities() -> ServerCapabilities {
 
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(text_document_sync)),
-        completion_provider: Some(CompletionOptions {
-            // v1: client must invoke completion explicitly. We don't expose
-            // trigger characters because identifier-prefix-only completion
-            // isn't meaningful on `.` or `::` (we don't resolve qualified
-            // names yet).
-            resolve_provider: Some(false),
-            ..CompletionOptions::default()
-        }),
+        completion_provider: completion_provider(client_capabilities),
         signature_help_provider: Some(SignatureHelpOptions {
             // Signature help currently reparses overlay source and may perform
             // structured definition lookup, so v1 supports explicit requests
@@ -74,4 +68,31 @@ pub fn server_capabilities() -> ServerCapabilities {
         // Per-feature capabilities are turned on as their handlers land.
         ..ServerCapabilities::default()
     }
+}
+
+fn completion_provider(client_capabilities: &ClientCapabilities) -> Option<CompletionOptions> {
+    let completion = client_capabilities
+        .text_document
+        .as_ref()
+        .and_then(|text_document| text_document.completion.as_ref())?;
+    if !has_completion_sub_capability(completion) {
+        return None;
+    }
+    Some(CompletionOptions {
+        // v1: client must invoke completion explicitly. We don't expose
+        // trigger characters because identifier-prefix-only completion
+        // isn't meaningful on `.` or `::` (we don't resolve qualified
+        // names yet).
+        resolve_provider: Some(false),
+        ..CompletionOptions::default()
+    })
+}
+
+fn has_completion_sub_capability(completion: &CompletionClientCapabilities) -> bool {
+    completion.dynamic_registration.is_some()
+        || completion.completion_item.is_some()
+        || completion.completion_item_kind.is_some()
+        || completion.context_support.is_some()
+        || completion.insert_text_mode.is_some()
+        || completion.completion_list.is_some()
 }
