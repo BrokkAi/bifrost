@@ -25,6 +25,7 @@ The current tree includes analyzers for:
 - C#
 - PHP
 - Scala
+- Ruby
 
 ## Contributing
 
