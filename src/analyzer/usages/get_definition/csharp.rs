@@ -758,15 +758,6 @@ fn csharp_extension_declaring_type_is_visible(
     })
 }
 
-fn csharp_is_extension_method(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
-    analyzer.signatures_of(unit).iter().any(|signature| {
-        signature
-            .split_once('(')
-            .map(|(_, parameters)| parameters.trim_start().starts_with("this "))
-            .unwrap_or(false)
-    })
-}
-
 fn csharp_receiver_type_units(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,

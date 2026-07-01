@@ -9,6 +9,7 @@ pub(in crate::analyzer::usages) use extractor::{
 };
 pub(in crate::analyzer::usages) use resolver::{
     argument_count as csharp_argument_count, first_type_child as csharp_first_type_child,
+    is_extension_method as csharp_is_extension_method,
     is_type_reference_node as csharp_is_type_reference_node,
     member_declared_type_fq_name as csharp_member_declared_type_fq_name,
     method_return_type_fq_name as csharp_method_return_type_fq_name, node_text as csharp_node_text,

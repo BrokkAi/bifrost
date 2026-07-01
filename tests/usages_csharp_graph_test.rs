@@ -599,6 +599,77 @@ namespace App {
 }
 
 #[test]
+fn csharp_graph_finds_extension_method_call_syntax_usages() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Extensions.cs",
+            r#"
+public static class HandlerExtensions {
+    public static string Tag(this string value) {
+        return "[" + value + "]";
+    }
+}
+"#,
+        ),
+        (
+            "src/Handlers.cs",
+            r#"
+public interface IHandler {
+    string Handle(string value);
+}
+
+public class Other {
+    public string Tag() {
+        return "other";
+    }
+}
+"#,
+        ),
+        (
+            "src/Consumers.cs",
+            r#"
+public class Consumers {
+    public void Run(IHandler handler, string name) {
+        var t1 = name.Tag();
+        var t2 = handler.Handle("Ada").Tag();
+        var t3 = HandlerExtensions.Tag(name);
+        var other = new Other();
+        var t4 = other.Tag();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let tag = member_function(&analyzer, "HandlerExtensions", "Tag");
+    let hits = graph_hits(&analyzer, &tag);
+
+    assert_eq!(
+        3,
+        hits.len(),
+        "extension method query should find extension-call and static-call sites only: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains("name.Tag()")),
+        "string local extension call should resolve: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("handler.Handle(\"Ada\").Tag()")),
+        "string-returning call-result extension call should resolve: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("HandlerExtensions.Tag(name)")),
+        "direct static extension method call should still resolve: {hits:#?}"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.snippet.contains("other.Tag()")),
+        "unrelated same-name instance method must not be counted: {hits:#?}"
+    );
+}
+
+#[test]
 fn csharp_graph_receiver_method_calls_skip_precise_nonmatching_owners() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (

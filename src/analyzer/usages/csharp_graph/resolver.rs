@@ -1,7 +1,7 @@
 pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 pub(super) use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
-use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, resolve_analyzer};
 use tree_sitter::Node;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,8 @@ pub(super) struct TargetSpec {
     pub(super) owner: CodeUnit,
     pub(super) member_name: String,
     pub(super) method_arity: Option<usize>,
+    pub(super) is_extension_method: bool,
+    pub(super) extension_receiver_type: Option<String>,
 }
 
 impl TargetSpec {
@@ -29,6 +31,8 @@ impl TargetSpec {
                 owner: target.clone(),
                 member_name: target.identifier().to_string(),
                 method_arity: None,
+                is_extension_method: false,
+                extension_receiver_type: None,
             });
         }
 
@@ -48,7 +52,16 @@ impl TargetSpec {
             member_name: target.identifier().to_string(),
             method_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
                 .then(|| signature_arity(target.signature())),
+            is_extension_method: kind == TargetKind::Method
+                && is_extension_method(analyzer, target),
+            extension_receiver_type: (kind == TargetKind::Method)
+                .then(|| extension_method_receiver_type(analyzer, target))
+                .flatten(),
         })
+    }
+
+    pub(super) fn is_extension_method(&self) -> bool {
+        self.is_extension_method
     }
 }
 
@@ -285,6 +298,47 @@ fn expression_type_fq_name(
             let owners = receiver_type_units(receiver, csharp, file, source, bindings);
             owners.into_iter().find_map(|owner| {
                 member_declared_type_fq_name(csharp, file, &owner, node_text(name, source))
+            })
+        }
+        "invocation_expression" => {
+            invocation_expression_return_type_fq_name(expression, csharp, file, source, bindings)
+        }
+        _ => None,
+    }
+}
+
+fn invocation_expression_return_type_fq_name(
+    invocation: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let function = invocation.child_by_field_name("function")?;
+    let arity = argument_count(invocation, source);
+    match function.kind() {
+        "identifier" => {
+            let owner = enclosing_declared_type(function, csharp, file, source)?;
+            method_return_type_fq_name_for_arity(
+                csharp,
+                file,
+                &owner,
+                node_text(function, source),
+                Some(arity),
+            )
+        }
+        "member_access_expression" => {
+            let receiver = member_access_receiver(function)?;
+            let name = member_access_name(function)?;
+            let owners = receiver_type_units(receiver, csharp, file, source, bindings);
+            owners.into_iter().find_map(|owner| {
+                method_return_type_fq_name_for_arity(
+                    csharp,
+                    file,
+                    &owner,
+                    node_text(name, source),
+                    Some(arity),
+                )
             })
         }
         _ => None,
@@ -565,6 +619,9 @@ fn resolve_type_fq_name(
     reference: &str,
 ) -> Option<String> {
     let normalized = normalize_type_text(reference);
+    if is_csharp_string_type(&normalized) {
+        return Some(normalized);
+    }
     if let Some(target) = csharp.resolve_visible_type(file, &normalized) {
         return Some(target.fq_name());
     }
@@ -573,6 +630,52 @@ fn resolve_type_fq_name(
         .into_iter()
         .find(|unit| unit.is_class() && reference_matches_target_fq_name(&normalized, unit))
         .map(|unit| unit.fq_name())
+}
+
+fn is_csharp_string_type(reference: &str) -> bool {
+    reference == "string"
+}
+
+pub(in crate::analyzer::usages) fn is_extension_method(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> bool {
+    unit.is_function()
+        && analyzer
+            .signatures_of(unit)
+            .iter()
+            .any(|signature| extension_receiver_type_from_signature(signature).is_some())
+}
+
+pub(in crate::analyzer::usages) fn extension_method_receiver_type(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<String> {
+    if !unit.is_function() {
+        return None;
+    }
+    let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
+    let owner = analyzer.parent_of(unit)?;
+    analyzer
+        .signatures_of(unit)
+        .iter()
+        .find_map(|signature| extension_receiver_type_from_signature(signature))
+        .and_then(|type_text| {
+            resolve_member_type_fq_name(csharp, unit.source(), &owner, &type_text)
+        })
+}
+
+fn extension_receiver_type_from_signature(signature: &str) -> Option<String> {
+    let parameters = signature.split_once('(')?.1;
+    let first_parameter = parameters.split(')').next()?.split(',').next()?.trim();
+    let without_this = first_parameter.strip_prefix("this ")?.trim();
+    let parameter_name = without_this.split_whitespace().last()?;
+    let type_text = without_this
+        .strip_suffix(parameter_name)
+        .unwrap_or(without_this)
+        .trim();
+    let normalized = normalize_type_text(type_text);
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn reference_matches_target_fq_name(reference: &str, target: &CodeUnit) -> bool {
@@ -652,6 +755,11 @@ fn receiver_type_fq_names(
             }
         }
         "member_access_expression" => {
+            expression_type_fq_name(receiver_node, csharp, file, source, bindings)
+                .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
+                .unwrap_or(SymbolResolution::Unknown)
+        }
+        "invocation_expression" => {
             expression_type_fq_name(receiver_node, csharp, file, source, bindings)
                 .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
                 .unwrap_or(SymbolResolution::Unknown)

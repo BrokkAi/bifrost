@@ -5,6 +5,7 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     normalize_type_text, receiver_targets_owner, reference_type_text, resolves_to_target,
     same_node, seed_visible_bindings_at, unqualified_member_resolves_to_owner,
 };
+use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile};
@@ -163,12 +164,12 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if is_nameof_argument(node, ctx.source) {
         return;
     }
+    let extension_call_arity_matches = extension_call_arity_matches(node, ctx);
     if ctx.spec.kind == TargetKind::Method
         && let Some(invocation) = enclosing_invocation(node)
-        && ctx
-            .spec
-            .method_arity
-            .is_some_and(|arity| argument_count(invocation, ctx.source) != arity)
+        && let Some(arity) = ctx.spec.method_arity
+        && argument_count(invocation, ctx.source) != arity
+        && !extension_call_arity_matches
     {
         return;
     }
@@ -197,22 +198,83 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.source,
         &mut bindings,
     );
+    if extension_call_arity_matches {
+        match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
+            SymbolResolution::Precise(targets) => {
+                if targets.iter().any(|target| {
+                    extension_receiver_type_matches(
+                        target,
+                        ctx.spec.extension_receiver_type.as_deref(),
+                        ctx,
+                    )
+                }) {
+                    push_hit(name_node, ctx);
+                }
+            }
+            SymbolResolution::Ambiguous | SymbolResolution::Unknown => {
+                *ctx.saw_unproven_match = true;
+            }
+        }
+        return;
+    }
     match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
-        crate::analyzer::usages::local_inference::SymbolResolution::Precise(targets)
+        SymbolResolution::Precise(targets)
             if targets
                 .iter()
                 .any(|target| target == &ctx.spec.owner.fq_name()) =>
         {
             push_hit(name_node, ctx);
         }
-        crate::analyzer::usages::local_inference::SymbolResolution::Ambiguous => {
+        SymbolResolution::Ambiguous => {
             *ctx.saw_unproven_match = true;
         }
-        crate::analyzer::usages::local_inference::SymbolResolution::Unknown => {
+        SymbolResolution::Unknown => {
             *ctx.saw_unproven_match = true;
         }
-        crate::analyzer::usages::local_inference::SymbolResolution::Precise(_) => {}
+        SymbolResolution::Precise(_) => {}
     }
+}
+
+fn extension_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.spec.kind != TargetKind::Method || !ctx.spec.is_extension_method() {
+        return false;
+    }
+    let Some(declared_arity) = ctx.spec.method_arity else {
+        return false;
+    };
+    let Some(extension_arity) = declared_arity.checked_sub(1) else {
+        return false;
+    };
+    enclosing_invocation(node)
+        .is_some_and(|invocation| argument_count(invocation, ctx.source) == extension_arity)
+}
+
+fn extension_receiver_type_matches(
+    receiver_type: &str,
+    extension_receiver_type: Option<&str>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    let Some(extension_receiver_type) = extension_receiver_type else {
+        return false;
+    };
+    if receiver_type == extension_receiver_type {
+        return true;
+    }
+    let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
+        return false;
+    };
+    let Some(receiver_unit) = ctx
+        .csharp
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.fq_name() == receiver_type)
+    else {
+        return false;
+    };
+    provider
+        .get_ancestors(&receiver_unit)
+        .iter()
+        .any(|ancestor| ancestor.fq_name() == extension_receiver_type)
 }
 
 fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
