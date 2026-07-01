@@ -18,7 +18,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T10:54Z) Implement and test the Java milestone.
 - [x] (2026-07-01T10:56Z) Implement and test the C# milestone.
 - [x] (2026-07-01T10:58Z) Implement and test the C++ milestone.
-- [ ] Implement and test the Go milestone.
+- [x] (2026-07-01T11:00Z) Implement and test the Go milestone.
 - [ ] Implement and test the PHP milestone.
 - [ ] Implement and test the Python milestone.
 - [ ] Implement and test the Ruby milestone.
@@ -56,6 +56,9 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: C++ already inferred `auto` receivers from constructors and free-function return types; static factory method return types were the missing factory shape.
   Evidence: `src/analyzer/usages/cpp_graph/resolver.rs` had `infer_cpp_initializer_type` and `resolve_call_return_type` for free functions before this milestone.
 
+- Observation: Go already had a constructor-return index used by the inverted graph.
+  Evidence: `src/analyzer/usages/go_graph/resolver.rs` builds `constructor_return_types`, and `src/analyzer/usages/go_graph/inverted.rs` uses it when seeding short-var receiver bindings.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -85,6 +88,8 @@ Java milestone complete. Extended `src/analyzer/usages/java_graph/inverted.rs` s
 C# milestone complete. Extended `src/analyzer/usages/csharp_graph/inverted.rs` so `var` locals can be seeded from constructor expressions and factory invocation declared return types, including static factories. Unsupported or ambiguous `object` factories remain unseeded and therefore do not emit partial same-name member edges. Validation: `cargo test --test usage_graph_csharp_test` passed 10 tests.
 
 C++ milestone complete. Added regression coverage for `auto` receivers initialized from free factories and static factories, and extended C++ initializer inference to resolve `Service::create()` return types from visible static method declarations. Unsupported conditional receivers remain unseeded and do not emit partial same-name member edges. Validation: `cargo test --test usage_graph_cpp_test` passed 11 tests.
+
+Go milestone complete. Added inline regression coverage proving `service := makeService(); service.Run()` resolves only to `Service.Run`, while an unsupported interface-return factory remains unseeded and emits no partial same-name edge. The existing constructor-return index already provided the implementation. Validation: `cargo test --test usage_graph_go_test` passed 10 tests.
 
 At completion, summarize which languages gained object-sensitive receiver tests, which consumers query the provider, any budget behavior observed, and any language-specific receiver semantics deferred to follow-up issues.
 
