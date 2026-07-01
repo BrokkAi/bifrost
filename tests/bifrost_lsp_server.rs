@@ -5302,6 +5302,92 @@ fn bifrost_lsp_server_php_semantic_diagnostics_malformed_file_reports_parse_not_
 }
 
 #[test]
+fn bifrost_lsp_server_rust_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::create_dir_all(temp_root.join("src")).expect("create src");
+    fs::write(
+        temp_root.join("src/main.rs"),
+        r#"
+fn run(input: MissingType) {
+    missing_value;
+}
+"#,
+    )
+    .expect("write rust fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let rust_uri = uri_for(&temp_root.join("src/main.rs"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": rust_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-rust"
+            && item["code"] == "rust_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("MissingType"))),
+        "expected MissingType Rust semantic diagnostic: {response}"
+    );
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-rust"
+            && item["code"] == "rust_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("missing_value"))),
+        "expected missing_value Rust semantic diagnostic: {response}"
+    );
+
+    server.shutdown_with_id(3);
+}
+
+#[test]
+fn bifrost_lsp_server_rust_semantic_diagnostics_malformed_file_reports_parse_not_semantic() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::create_dir_all(temp_root.join("src")).expect("create src");
+    fs::write(
+        temp_root.join("src/main.rs"),
+        "fn run( {\n    missing_value;\n}\n",
+    )
+    .expect("write broken rust");
+
+    let mut server = LspServer::start(&temp_root);
+    let rust_uri = uri_for(&temp_root.join("src/main.rs"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": rust_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items
+            .iter()
+            .any(|item| item["source"] == "bifrost-tree-sitter"),
+        "expected parse diagnostic for malformed Rust: {response}"
+    );
+    assert!(
+        items.iter().all(|item| item["source"] != "bifrost-rust"),
+        "malformed Rust must suppress semantic diagnostics: {response}"
+    );
+
+    server.shutdown_with_id(3);
+}
+
+#[test]
 fn bifrost_lsp_server_did_save_triggers_reindex() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
@@ -5678,6 +5764,43 @@ fn bifrost_lsp_server_did_save_publishes_php_semantic_diagnostics() {
                 .as_str()
                 .is_some_and(|message| message.contains("MissingType"))),
         "expected publishDiagnostics semantic PHP item: {publish}"
+    );
+
+    server.shutdown_with_id(99);
+}
+
+#[test]
+fn bifrost_lsp_server_did_save_publishes_rust_semantic_diagnostics() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::create_dir_all(temp_root.join("src")).expect("create src");
+    fs::write(temp_root.join("src/main.rs"), "fn run() {}\n").expect("write fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let rust_uri = uri_for(&temp_root.join("src/main.rs"));
+
+    fs::write(
+        temp_root.join("src/main.rs"),
+        "fn run() {\n    missing_value;\n}\n",
+    )
+    .expect("rewrite fixture");
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": rust_uri}}
+    }));
+
+    let publish = server.read_notification("textDocument/publishDiagnostics");
+    let items = publish["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-rust"
+            && item["code"] == "rust_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("missing_value"))),
+        "expected publishDiagnostics semantic Rust item: {publish}"
     );
 
     server.shutdown_with_id(99);

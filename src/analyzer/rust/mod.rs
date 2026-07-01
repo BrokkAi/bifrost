@@ -1,6 +1,7 @@
 mod adapter;
 mod cache;
 mod declarations;
+mod diagnostics;
 mod graph_support;
 mod hierarchy;
 mod imports;
@@ -12,7 +13,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
@@ -280,6 +281,13 @@ impl IAnalyzer for RustAnalyzer {
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        diagnostics::collect_rust_semantic_diagnostics(self, file, source)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
