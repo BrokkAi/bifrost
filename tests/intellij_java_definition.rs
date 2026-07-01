@@ -233,3 +233,14 @@ fn constructor_new_type() {
         0,
     );
 }
+
+// A chained call `a.make().go()` resolves `go` through make()'s declared return
+// type `B`.
+#[test]
+fn chained_method_return_type() {
+    assert_resolves_to_line(
+        "ChainedJava.java",
+        "class B {\n  void go() {}\n}\n\nclass A {\n  B make() {\n    return new B();\n  }\n}\n\nclass Main {\n  void run(A a) {\n    a.make().<caret>go();\n  }\n}\n",
+        1,
+    );
+}
