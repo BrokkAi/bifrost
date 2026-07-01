@@ -1,19 +1,20 @@
-# bifrost
+# Why bifrost
 
-`bifrost` is a Rust port of Brokk's Tree-sitter-backed analyzer suite.
+`bifrost` is Brokk's Rust-based static analysis swiss-army-toolbox for AI coding harnesses.
 
-At the library level, this repository builds the `brokk_bifrost` crate. It provides single-language analyzers, a `MultiAnalyzer`, snapshot-style updates, import analysis, type hierarchy queries, test-file detection, and source/skeleton extraction.
+In a nutshell:
+1. Bifrost can parse unbuilt or partially broken repos, even for compiled languages. It also automatically handles mixed languages in a single repo.
+1. Bifrost is designed for concurrency, with snapshot isolation and fast incremental updates when ground-truth code changes underneath.
+1. Bifrost is **fast** and **lazy**; it avoids doing optional work like import analysis unless you make a request that needs it.
+1. Bifrost is designed to be used (in increasing levels of power / decreasing levels of abstraction) from LSP, MCP, Python, or Rust.
 
-At the tool level, this repository also provides:
+# Toolsets
 
-- `bifrost`, a stdio MCP server that exposes analyzer-backed search tools
-- `bifrost_searchtools`, a Python import package backed by a native Rust extension
-- `most_relevant_files`, a CLI that ranks related project files from one or more seed files
-- `editors/vscode`, a minimal VS Code extension that launches Bifrost's LSP server
+TODO
 
-## Status
+## Languages
 
-The current tree includes analyzers for:
+Bifrost includes analyzers for:
 
 - Java
 - JavaScript
@@ -21,6 +22,7 @@ The current tree includes analyzers for:
 - Rust
 - Go
 - Python
+- C
 - C++
 - C#
 - PHP
