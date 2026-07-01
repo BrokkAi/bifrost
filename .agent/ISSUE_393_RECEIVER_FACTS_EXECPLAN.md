@@ -16,7 +16,7 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 - [x] (2026-07-01T08:03Z) Added the shared receiver/fact vocabulary and usage-hit surface helpers; focused surface and existing JS/TS/Python usage tests passed.
 - [x] (2026-07-01T09:39Z) Implemented and tested self-receiver hit classification for #387 across JS/TS, C++, and Rust.
 - [x] (2026-07-01T10:13Z) Implemented and tested JS/TS member-assignment declaration filtering for #386.
-- [ ] Run focused tests, `cargo fmt`, and `cargo clippy-no-cuda`; commit after each completed milestone.
+- [x] (2026-07-01T10:46+02:00) Ran focused tests, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`; committed after each completed milestone.
 
 ## Surprises & Discoveries
 
@@ -50,6 +50,9 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 - Observation: JavaScript local-object function assignments are intentional declaration seeds even when the receiver object is a plain local.
   Evidence: `cargo test --test usages_js_ts_graph_test` failed `js_commonjs_exports_property_does_not_seed_unrelated_member_by_short_name` until the filter suppressed only non-function plain-local member assignments and preserved function-valued local member declarations.
 
+- Observation: Final validation required only formatter churn plus two small clippy fixes after the behavioral milestones.
+  Evidence: `cargo fmt` reformatted existing edited code, `cargo clippy-no-cuda` flagged one needless C++ return and one intentional Rust helper arity, and the rerun passed.
+
 ## Decision Log
 
 - Decision: Implement #393 as “contract plus fixes,” not contract-only.
@@ -71,6 +74,7 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 - C++ also treats implicit same-owner calls (`target()`) as editor-visible self-receiver hits in the forward usage scan and skips them in the inverted graph.
 - Deferred richer receiver/value analysis remains #394 territory: receiver chains such as object-sensitive local aliases are still only handled where existing structured resolver support proves them.
 - #386 milestone: unignored JS and TS plain-local member-assignment declaration tests. JavaScript now suppresses non-function member assignments rooted at scoped plain locals or parameters, while preserving class/function/prototype roots and function-valued local object member declarations used by CommonJS export graphs. TypeScript remains covered by the cross-language regression and does not emit the plain-local assignment declaration.
+- Final validation passed: the focused #393 test suites, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check` all completed successfully.
 
 ## Context and Orientation
 

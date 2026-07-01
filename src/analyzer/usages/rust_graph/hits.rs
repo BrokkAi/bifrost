@@ -105,7 +105,16 @@ pub(super) fn push_member_hit(
     enclosing: CodeUnit,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    push_member_hit_with_kind(file, source, line_starts, start, end, enclosing, hits, false);
+    push_member_hit_with_kind(
+        file,
+        source,
+        line_starts,
+        start,
+        end,
+        enclosing,
+        hits,
+        false,
+    );
 }
 
 pub(super) fn push_self_receiver_member_hit(
@@ -120,6 +129,7 @@ pub(super) fn push_self_receiver_member_hit(
     push_member_hit_with_kind(file, source, line_starts, start, end, enclosing, hits, true);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_member_hit_with_kind(
     file: &ProjectFile,
     source: &str,

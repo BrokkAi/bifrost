@@ -78,7 +78,8 @@ pub(super) fn selected_code_unit_declaration_at_cursor(
     if let Some(code_unit) = analyzer.enclosing_code_unit(file, cursor_range)
         && code_unit.source() == file
         && predicate(&code_unit)
-        && let Some(selection) = code_unit_declaration_name_range(analyzer, file, content, &code_unit)
+        && let Some(selection) =
+            code_unit_declaration_name_range(analyzer, file, content, &code_unit)
         && cursor_range.start_byte >= selection.start_byte
         && cursor_range.start_byte < selection.end_byte
     {

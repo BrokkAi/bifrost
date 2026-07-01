@@ -213,7 +213,6 @@ fn record_call(
                     return;
                 }
                 ctx.record(unit.fq_name(), function);
-                return;
             }
             // Otherwise this is an unqualified member call (`this`/inherited).
             // That belongs to editor references, not the usage_graph edge surface.

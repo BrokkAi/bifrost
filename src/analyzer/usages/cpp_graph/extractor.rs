@@ -322,7 +322,9 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() != "call_expression" {
         return;
     }
-    let Some(function) = node.child_by_field_name("function").or_else(|| node.named_child(0))
+    let Some(function) = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))
     else {
         return;
     };
@@ -427,7 +429,9 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    let Some(function) = node.child_by_field_name("function").or_else(|| node.named_child(0))
+    let Some(function) = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))
     else {
         return;
     };

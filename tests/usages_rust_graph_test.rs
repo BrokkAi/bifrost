@@ -730,7 +730,11 @@ impl Foo {
     );
     let editor_hits = result.all_hits_including_imports();
     assert_eq!(1, editor_hits.len(), "editor hits: {editor_hits:?}");
-    assert!(editor_hits.iter().all(|hit| hit.snippet.contains("self.target")));
+    assert!(
+        editor_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("self.target"))
+    );
 }
 
 #[test]

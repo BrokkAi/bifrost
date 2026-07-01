@@ -71,7 +71,8 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
         } else if is_member_target(rust, target) {
             let seeds = infer_graph_seeds(rust, target);
             if seeds.is_empty() {
-                let scan_files: HashSet<ProjectFile> = [target.source().clone()].into_iter().collect();
+                let scan_files: HashSet<ProjectFile> =
+                    [target.source().clone()].into_iter().collect();
                 let graph = build_rust_graph_for_files(scan_files.clone());
                 let local_hits = scan_files_for_member_target(
                     analyzer,
