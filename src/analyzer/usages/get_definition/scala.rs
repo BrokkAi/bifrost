@@ -1005,8 +1005,35 @@ fn scala_receiver_type_fqn(
                 })
             })
         }
+        // `new Foo().member` — the receiver is typed by the constructed class.
+        "instance_expression" => {
+            let name = scala_first_type_name(receiver, ctx.source)?;
+            resolver.resolve(name)
+        }
         _ => None,
     }
+}
+
+/// The first `type_identifier` (else `identifier`) in a pre-order walk — the
+/// constructed type of a `new Foo(...)` instance expression.
+fn scala_first_type_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let mut fallback = None;
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "type_identifier" => return Some(scala_node_text(node, source).trim()),
+            "identifier" if fallback.is_none() => {
+                fallback = Some(scala_node_text(node, source).trim());
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    fallback
 }
 
 fn scala_enclosing_class_parameter_type(

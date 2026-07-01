@@ -70,7 +70,6 @@ fn csharp_construction_receiver() {
 
 // PHP: `(new Foo())->x` resolves `x` through the construction receiver (line 2).
 #[test]
-#[ignore = "pattern 1 gap: PHP construction receiver (new Foo())->x not yet typed"]
 fn php_construction_receiver() {
     assert_resolves_to_line(
         "R.php",
@@ -124,7 +123,6 @@ fn cpp_construction_receiver() {
 
 // Scala: `new Foo().bar` resolves `bar` (line 1).
 #[test]
-#[ignore = "pattern 1 gap: Scala construction receiver new Foo().bar not yet typed"]
 fn scala_construction_receiver() {
     assert_resolves_to_line(
         "R.scala",

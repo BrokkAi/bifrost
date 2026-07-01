@@ -70,7 +70,7 @@ pub(super) fn resolve_php(
             let member = php_node_text(name, source).trim_start_matches('$');
             let bindings =
                 php_bindings_before(php, file, source, root, site.range.start_byte, &ctx);
-            let owner = php_instance_receiver_fqn(object, source, &class_ranges, &bindings);
+            let owner = php_instance_receiver_fqn(object, source, &class_ranges, &bindings, &ctx);
             php_member_outcome(php, analyzer, support, owner, member)
         }
         None => no_definition(
@@ -333,6 +333,7 @@ fn php_instance_receiver_fqn(
     source: &str,
     class_ranges: &ClassRangeIndex,
     bindings: &LocalInferenceEngine<String>,
+    ctx: &FileContext,
 ) -> Option<String> {
     match object.kind() {
         "variable_name" => {
@@ -344,6 +345,12 @@ fn php_instance_receiver_fqn(
             }
             first_precise(bindings, name)
         }
+        // `(new Foo())->member` — the receiver is typed by the constructed class.
+        "object_creation_expression" => php_object_creation_type(object)
+            .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
+        "parenthesized_expression" => object.named_child(0).and_then(|inner| {
+            php_instance_receiver_fqn(inner, source, class_ranges, bindings, ctx)
+        }),
         _ => None,
     }
 }
