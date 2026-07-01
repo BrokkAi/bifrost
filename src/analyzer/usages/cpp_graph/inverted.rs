@@ -23,9 +23,9 @@
 //! receiver shapes the forward C++ scan proves.
 
 use super::resolver::{
-    TargetKind, VisibilityIndex, extract_variable_name, first_type_child,
-    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, normalize_type_text,
-    type_owner_of,
+    TargetKind, VisibilityIndex, constructor_style_local_declaration, extract_variable_name,
+    first_type_child, infer_cpp_initializer_type, is_declaration_name, is_declarator_node,
+    normalize_type_text, type_owner_of,
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -365,7 +365,16 @@ fn seed_variable_declaration(
         let Some(declarator) = declarator else {
             continue;
         };
-        if declarator.kind() == "function_declarator" {
+        if declarator.kind() == "function_declarator"
+            && !constructor_style_local_declaration(
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                declarator,
+                type_text.as_deref(),
+                bindings,
+            )
+        {
             continue;
         }
         let Some(name) = extract_variable_name(declarator, ctx.source) else {

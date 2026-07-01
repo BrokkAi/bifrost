@@ -145,7 +145,16 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         let Some(declarator) = declarator else {
             continue;
         };
-        if declarator.kind() == "function_declarator" {
+        if declarator.kind() == "function_declarator"
+            && !constructor_style_local_declaration(
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                declarator,
+                type_text.as_deref(),
+                &ctx.bindings,
+            )
+        {
             continue;
         }
         let Some(name) = extract_variable_name(declarator, ctx.source) else {

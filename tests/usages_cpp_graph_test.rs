@@ -550,6 +550,86 @@ void call(Target* ptr) {
 }
 
 #[test]
+fn cpp_graph_seeds_direct_initialized_receivers_for_method_usages() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "parity.h",
+            r#"
+namespace std { class string {}; }
+struct Sink {};
+class ConsoleHandler {
+public:
+    ConsoleHandler(Sink& sink);
+    std::string handle(const std::string& value);
+};
+"#,
+        ),
+        (
+            "main.cpp",
+            r#"
+#include "parity.h"
+
+void call(Sink& sink) {
+    ConsoleHandler handler(sink);
+    ConsoleHandler braced{sink};
+    handler.handle("Ben");
+    braced.handle("Ada");
+}
+"#,
+        ),
+    ]);
+
+    let handle = member_function_definition(&analyzer, "ConsoleHandler", "handle");
+    let hits = usage_hits(&analyzer, &handle);
+
+    assert_hit_contains(&hits, "main.cpp", "handler.handle(\"Ben\")");
+    assert_hit_contains(&hits, "main.cpp", "braced.handle(\"Ada\")");
+}
+
+#[test]
+fn cpp_graph_does_not_seed_namespace_scope_function_declarations_as_receivers() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "parity.h",
+            r#"
+namespace std { class string {}; }
+struct Sink {};
+class ConsoleHandler {
+public:
+    std::string handle(const std::string& value);
+};
+"#,
+        ),
+        (
+            "main.cpp",
+            r#"
+#include "parity.h"
+
+ConsoleHandler handler(Sink);
+
+void call() {
+    handler.handle("Ben");
+}
+"#,
+        ),
+    ]);
+
+    let handle = member_function_definition(&analyzer, "ConsoleHandler", "handle");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&handle),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        result.all_hits().is_empty(),
+        "namespace-scope prototype must not seed a receiver binding: {result:?}"
+    );
+}
+
+#[test]
 fn cpp_graph_finds_globals_enum_values_and_alias_references() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (

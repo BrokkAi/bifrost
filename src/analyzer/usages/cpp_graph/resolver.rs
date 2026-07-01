@@ -1,5 +1,6 @@
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
+use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
     CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ProjectFile, cpp_include_paths,
     cpp_node_text as node_text, normalize_cpp_whitespace,
@@ -926,6 +927,61 @@ pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<No
                 | "enum_specifier"
         )
     })
+}
+
+pub(in crate::analyzer::usages) fn constructor_style_local_declaration(
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    declarator: Node<'_>,
+    type_text: Option<&str>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) -> bool {
+    if !has_ancestor_kind(declarator, "compound_statement") {
+        return false;
+    }
+    if declarator
+        .child_by_field_name("declarator")
+        .is_none_or(|declarator| declarator.kind() != "identifier")
+    {
+        return false;
+    }
+    if !type_text
+        .and_then(|text| visibility.resolve_type(file, text))
+        .is_some_and(|unit| unit.is_class())
+    {
+        return false;
+    }
+    declarator
+        .child_by_field_name("parameters")
+        .is_some_and(|parameters| {
+            constructor_parameters_look_like_expressions(parameters, source, bindings)
+        })
+}
+
+fn constructor_parameters_look_like_expressions(
+    parameters: Node<'_>,
+    source: &str,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) -> bool {
+    let mut cursor = parameters.walk();
+    parameters.named_children(&mut cursor).any(|parameter| {
+        !matches!(
+            parameter.kind(),
+            "parameter_declaration" | "optional_parameter_declaration"
+        ) || parameter_declaration_is_local_expression(parameter, source, bindings)
+    })
+}
+
+fn parameter_declaration_is_local_expression(
+    parameter: Node<'_>,
+    source: &str,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) -> bool {
+    let text = node_text(parameter, source).trim();
+    text.chars()
+        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && !bindings.resolve_symbol(text).is_unknown()
 }
 
 pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
