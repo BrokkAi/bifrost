@@ -28,7 +28,7 @@ use crate::analyzer::usages::php_graph::{
     resolve_php_function, resolve_php_type,
 };
 use crate::analyzer::usages::python_graph::{
-    collect_assigned_identifiers, collect_scope_facts, enclosing_scope_facts,
+    collect_assigned_identifiers, collect_scope_facts_from_parsed_source, enclosing_scope_facts,
     is_declaration_identifier as python_is_declaration_identifier, python_slice,
     resolve_receiver_type as resolve_python_receiver_type,
 };

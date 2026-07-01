@@ -338,7 +338,8 @@ fn python_receiver_type_unit(
                 return Some(unit);
             }
             // A typed-variable receiver: use the local/parameter's inferred type.
-            let facts_by_scope = collect_scope_facts(analyzer, file, "");
+            let facts_by_scope =
+                collect_scope_facts_from_parsed_source(analyzer, file, "", source, root);
             if let Some(facts) = enclosing_scope_facts(analyzer, file, &facts_by_scope, object)
                 && let Some(raw_type) = facts
                     .resolution_for(receiver)

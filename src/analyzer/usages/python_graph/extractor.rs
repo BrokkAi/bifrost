@@ -217,7 +217,13 @@ pub(super) fn scan_files_for_seeds(
         let edges = py.usage_matching_edges(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
         let target_self_file = *file == target.source();
-        let scope_facts = collect_scope_facts(analyzer, file, target_short.as_str());
+        let scope_facts = collect_scope_facts_from_parsed_source(
+            analyzer,
+            file,
+            target_short.as_str(),
+            source_str,
+            tree_ref.root_node(),
+        );
 
         let mut local_hits = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
@@ -672,18 +678,24 @@ pub(in crate::analyzer::usages) fn collect_assigned_identifiers(
     }
 }
 
-pub(in crate::analyzer::usages) fn collect_scope_facts(
+pub(in crate::analyzer::usages) fn collect_scope_facts_from_parsed_source(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     target_short: &str,
+    source: &str,
+    root: Node<'_>,
+) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
+    let factory_return_types = collect_factory_return_types_from_root(root, source);
+    collect_scope_facts_with_factory_returns(analyzer, file, target_short, &factory_return_types)
+}
+
+fn collect_scope_facts_with_factory_returns(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    target_short: &str,
+    factory_return_types: &HashMap<String, String>,
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
     let declarations = analyzer.get_declarations(file);
-    let factory_return_types = analyzer
-        .project()
-        .read_source(file)
-        .ok()
-        .map(|source| collect_factory_return_types(&source))
-        .unwrap_or_default();
     let mut class_facts_by_name: HashMap<String, LocalBindingsSnapshot<String>> =
         HashMap::default();
     for declaration in declarations
@@ -699,7 +711,7 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
             true,
             false,
             Some(declaration.short_name()),
-            &factory_return_types,
+            factory_return_types,
         );
         class_facts_by_name.insert(
             declaration.short_name().to_string(),
@@ -725,7 +737,7 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
             false,
             false,
             owner,
-            &factory_return_types,
+            factory_return_types,
         );
         if let Some(owner) = owner
             && let Some(class_facts) = class_facts_by_name.get(owner)
@@ -749,7 +761,7 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
             false,
             true,
             None,
-            &factory_return_types,
+            factory_return_types,
         );
         scope_facts.insert(declaration.clone(), facts);
     }
@@ -1040,24 +1052,9 @@ fn non_empty_node_text(node: Node<'_>, source: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-fn collect_factory_return_types(source: &str) -> HashMap<String, String> {
-    if source.trim().is_empty() {
-        return HashMap::default();
-    }
-
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .is_err()
-    {
-        return HashMap::default();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return HashMap::default();
-    };
-
+fn collect_factory_return_types_from_root(root: Node<'_>, source: &str) -> HashMap<String, String> {
     let mut returns = HashMap::default();
-    let mut stack = vec![(tree.root_node(), None::<String>)];
+    let mut stack = vec![(root, None::<String>)];
     while let Some((node, class_name)) = stack.pop() {
         match node.kind() {
             "class_definition" => {

@@ -108,6 +108,31 @@ export function caller() {
 }
 
 #[test]
+fn ts_parameter_shadow_blocks_outer_factory_receiver_edge() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service { run() {} }
+export class Other { run() {} }
+export function makeService() { return new Service(); }
+const service = makeService();
+export function caller(service: Other) {
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&graph, "caller", "Service.run"),
+        "parameter receiver must shadow outer factory-produced local: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
 fn ts_static_factory_receiver_call_edges_only_to_constructed_type() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

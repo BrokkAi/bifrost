@@ -134,7 +134,7 @@ impl VisibilityIndex {
             .map(|file| (file.clone(), analyzer.get_declarations(file)))
             .collect();
         let mut visible_by_file = HashMap::default();
-        for file in &files {
+        for file in roots {
             let mut visited = HashSet::default();
             let mut visible = HashSet::default();
             collect_visible_declarations(
@@ -188,11 +188,12 @@ impl VisibilityIndex {
 
     fn resolve_type_for_declaration(
         &self,
+        visible_from: &ProjectFile,
         declaration: &CodeUnit,
         raw_name: &str,
     ) -> Option<CodeUnit> {
         let normalized = normalize_reference_name(raw_name)?;
-        let visible = self.visible_by_file.get(declaration.source())?;
+        let visible = self.visible_by_file.get(visible_from)?;
         if !normalized.contains("::")
             && let Some(namespace) = cpp_namespace_for(declaration)
         {
@@ -207,7 +208,7 @@ impl VisibilityIndex {
                 }
             }
         }
-        self.resolve_type(declaration.source(), raw_name)
+        self.resolve_type(visible_from, raw_name)
     }
 
     pub(super) fn resolves_to_type(
@@ -370,7 +371,7 @@ impl VisibilityIndex {
         let mut resolved_return: Option<CodeUnit> = None;
         for (function, signature) in candidates {
             let return_text = cpp_function_return_type_text_from_signature(&signature)?;
-            let return_type = self.resolve_type_for_declaration(function, &return_text)?;
+            let return_type = self.resolve_type_for_declaration(file, function, &return_text)?;
             if let Some(existing) = resolved_return.as_ref()
                 && !same_visible_symbol(existing, &return_type)
             {
@@ -442,7 +443,7 @@ fn resolve_static_method_call_return_type(
             && signature_arity(unit.signature()) == arity
     }) {
         let return_text = cpp_function_return_type_text(analyzer, method)?;
-        let return_type = visibility.resolve_type_for_declaration(method, &return_text)?;
+        let return_type = visibility.resolve_type_for_declaration(file, method, &return_text)?;
         if let Some(existing) = resolved_return.as_ref()
             && !same_visible_symbol(existing, &return_type)
         {

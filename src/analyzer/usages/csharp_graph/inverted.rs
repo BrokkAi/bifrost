@@ -19,8 +19,8 @@
 
 use super::extractor::{is_declaration_name, member_access_name, member_access_receiver};
 use super::resolver::{
-    argument_count, first_type_child, is_type_reference_node, method_return_type_fq_name_for_arity,
-    node_text, normalize_type_text, reference_type_text,
+    argument_count, first_type_child, is_type_reference_node, method_unit_return_type_fq_name,
+    node_text, normalize_type_text, reference_type_text, signature_arity,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
@@ -33,6 +33,32 @@ use tree_sitter::Node;
 
 type MethodReturnCacheKey = (String, String, usize);
 type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, Option<String>>>;
+type MethodDeclarationIndex = HashMap<MethodReturnCacheKey, Vec<CodeUnit>>;
+
+fn csharp_method_declaration_index(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+) -> MethodDeclarationIndex {
+    let mut index: MethodDeclarationIndex = HashMap::default();
+    for unit in csharp
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.is_function())
+    {
+        let Some(owner) = analyzer.parent_of(&unit) else {
+            continue;
+        };
+        index
+            .entry((
+                owner.fq_name(),
+                unit.identifier().to_string(),
+                signature_arity(unit.signature()),
+            ))
+            .or_default()
+            .push(unit);
+    }
+    index
+}
 
 pub(super) fn build_csharp_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -51,6 +77,7 @@ where
         .filter(|unit| unit.is_class())
         .map(|unit| (unit.fq_name(), unit))
         .collect();
+    let method_declarations = csharp_method_declaration_index(analyzer, csharp);
     let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
@@ -61,6 +88,7 @@ where
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 class_units: &class_units,
+                method_declarations: &method_declarations,
                 method_return_cache: &method_return_cache,
                 collector,
             };
@@ -77,6 +105,7 @@ struct CsScan<'a, 'b> {
     source: &'a str,
     class_ranges: ClassRangeIndex,
     class_units: &'a HashMap<String, CodeUnit>,
+    method_declarations: &'a MethodDeclarationIndex,
     method_return_cache: &'a MethodReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
@@ -412,18 +441,18 @@ fn csharp_method_return_types_for_owner(
     if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
         owners.extend(provider.get_ancestors(owner));
     }
-    owners
-        .into_iter()
-        .filter_map(|candidate| {
-            method_return_type_fq_name_for_arity(
-                ctx.csharp,
-                ctx.file,
-                &candidate,
-                method_name,
-                Some(arity),
-            )
-        })
-        .collect()
+    let mut returns = Vec::new();
+    for candidate in owners {
+        if let Some(methods) =
+            ctx.method_declarations
+                .get(&(candidate.fq_name(), method_name.to_string(), arity))
+        {
+            returns.extend(methods.iter().filter_map(|method| {
+                method_unit_return_type_fq_name(ctx.csharp, &candidate, method)
+            }));
+        }
+    }
+    returns
 }
 
 fn class_unit_for_fqn(ctx: &CsScan<'_, '_>, fqn: &str) -> Option<CodeUnit> {

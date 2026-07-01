@@ -435,6 +435,15 @@ pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
     (resolved.len() == 1).then(|| resolved.remove(0))
 }
 
+pub(in crate::analyzer::usages) fn method_unit_return_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+    method: &CodeUnit,
+) -> Option<String> {
+    let type_text = method_return_type(csharp, method)?;
+    resolve_member_type_fq_name(csharp, method.source(), owner, &type_text)
+}
+
 fn resolve_member_type_fq_name(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,

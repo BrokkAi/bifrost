@@ -32,6 +32,9 @@ use tree_sitter::{Node, Parser};
 
 type MethodReturnCacheKey = (ProjectFile, String, Option<String>);
 type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
+type FileReturnCacheKey = (String, Option<String>);
+type FileReturnCache =
+    Mutex<HashMap<ProjectFile, HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>>>;
 
 pub(super) fn build_java_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -45,6 +48,7 @@ where
 {
     let language = tree_sitter_java::LANGUAGE.into();
     let return_type_cache: MethodReturnCache = Mutex::new(HashMap::default());
+    let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = JavaScan {
@@ -54,6 +58,7 @@ where
                 root: parsed.tree.root_node(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 return_type_cache: &return_type_cache,
+                file_return_cache: &file_return_cache,
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -69,6 +74,7 @@ struct JavaScan<'a, 'b> {
     root: Node<'a>,
     class_ranges: ClassRangeIndex,
     return_type_cache: &'a MethodReturnCache,
+    file_return_cache: &'a FileReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -472,38 +478,90 @@ fn method_unit_declared_return_type_uncached(
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown);
     }
-    let Ok(source) = method.source().read_to_string() else {
-        return ReceiverAnalysisOutcome::Unknown;
+    java_file_return_type_index(ctx, method.source())
+        .get(&(method.fq_name(), method.signature().map(str::to_string)))
+        .cloned()
+        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+}
+
+fn java_file_return_type_index(
+    ctx: &JavaScan<'_, '_>,
+    file: &ProjectFile,
+) -> HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>> {
+    if let Some(cached) = ctx
+        .file_return_cache
+        .lock()
+        .expect("java file return cache poisoned")
+        .get(file)
+        .cloned()
+    {
+        return cached;
+    }
+
+    let index = build_java_file_return_type_index(ctx, file);
+    ctx.file_return_cache
+        .lock()
+        .expect("java file return cache poisoned")
+        .insert(file.clone(), index.clone());
+    index
+}
+
+fn build_java_file_return_type_index(
+    ctx: &JavaScan<'_, '_>,
+    file: &ProjectFile,
+) -> HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>> {
+    let Ok(source) = file.read_to_string() else {
+        return HashMap::default();
     };
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_java::LANGUAGE.into())
         .is_err()
     {
-        return ReceiverAnalysisOutcome::Unknown;
+        return HashMap::default();
     }
     let Some(tree) = parser.parse(source.as_str(), None) else {
-        return ReceiverAnalysisOutcome::Unknown;
+        return HashMap::default();
     };
-    java_return_type_node_covering(tree.root_node(), &range)
-        .and_then(|type_node| {
-            let raw = node_text(type_node, &source);
-            let normalized = raw
-                .split('<')
-                .next()
-                .unwrap_or(raw)
-                .trim()
-                .trim_end_matches("[]")
-                .trim();
-            (!normalized.is_empty())
-                .then(|| {
-                    ctx.java
-                        .resolve_type_name_in_file(method.source(), normalized)
-                })
-                .flatten()
+    ctx.java
+        .declarations(file)
+        .filter(|unit| unit.is_function())
+        .map(|unit| {
+            let outcome = ctx
+                .java
+                .ranges(unit)
+                .first()
+                .copied()
+                .and_then(|range| java_return_type_node_covering(tree.root_node(), &range))
+                .and_then(|type_node| java_type_fqn_from_node(ctx.java, file, &source, type_node))
+                .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
+                .unwrap_or(ReceiverAnalysisOutcome::Unknown);
+            (
+                (unit.fq_name(), unit.signature().map(str::to_string)),
+                outcome,
+            )
         })
-        .map(|unit| ReceiverAnalysisOutcome::Precise(vec![unit.fq_name()]))
-        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+        .collect()
+}
+
+fn java_type_fqn_from_node(
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+) -> Option<String> {
+    let raw = node_text(type_node, source);
+    let normalized = raw
+        .split('<')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .trim_end_matches("[]")
+        .trim();
+    (!normalized.is_empty())
+        .then(|| java.resolve_type_name_in_file(file, normalized))
+        .flatten()
+        .map(|unit| unit.fq_name())
 }
 
 fn java_return_type_node_covering<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {

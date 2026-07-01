@@ -1525,6 +1525,32 @@ fn typescript_factory_receiver_member_resolves_to_definition() {
 }
 
 #[test]
+fn typescript_parameter_shadow_blocks_outer_factory_receiver_definition() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            "export class Service { run() {} }\nexport class Other { run() {} }\nexport function makeService() { return new Service(); }\nconst service = makeService();\nexport function caller(service: Other) {\n  service.run();\n}\n",
+        )
+        .build();
+
+    let line = "  service.run();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"service.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        value.to_string().find("Service.run").is_none(),
+        "parameter receiver must not resolve through the outer Service factory: {value}"
+    );
+}
+
+#[test]
 fn ts_function_local_use_does_not_leak_to_sibling_function_type_lookup() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

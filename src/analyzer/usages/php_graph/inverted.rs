@@ -46,6 +46,9 @@ use crate::hash::{HashMap, HashSet};
 use std::sync::Mutex;
 use tree_sitter::Node;
 
+type CallableReturnCache = Mutex<HashMap<String, Option<String>>>;
+type FileReturnCache = Mutex<HashMap<ProjectFile, HashMap<String, Option<String>>>>;
+
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
 /// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
 pub(super) fn build_php_edges<F>(
@@ -59,16 +62,20 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_php::LANGUAGE_PHP.into();
-    let return_type_cache = Mutex::new(HashMap::default());
+    let return_type_cache: CallableReturnCache = Mutex::new(HashMap::default());
+    let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let ctx = php.file_context_from_source(file, parsed.source.as_str());
             let mut scan = PhpScan {
                 php,
+                file,
                 ctx,
                 source: parsed.source.as_str(),
+                root: parsed.tree.root_node(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 return_type_cache: &return_type_cache,
+                file_return_cache: &file_return_cache,
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -79,10 +86,13 @@ where
 
 struct PhpScan<'a, 'b> {
     php: &'a PhpAnalyzer,
+    file: &'a ProjectFile,
     ctx: PhpFileContext,
     source: &'a str,
+    root: Node<'a>,
     class_ranges: ClassRangeIndex,
-    return_type_cache: &'a Mutex<HashMap<String, Option<String>>>,
+    return_type_cache: &'a CallableReturnCache,
+    file_return_cache: &'a FileReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -321,7 +331,7 @@ fn declared_callable_return_type_fqn(
         if definitions.next().is_some() {
             return None;
         }
-        declared_return_type_fqn(scan.php, callable)
+        declared_return_type_fqn(scan, callable)
     });
     scan.return_type_cache
         .lock()
@@ -330,22 +340,82 @@ fn declared_callable_return_type_fqn(
     resolved
 }
 
-fn declared_return_type_fqn(php: &PhpAnalyzer, callable: &CodeUnit) -> Option<String> {
-    let source = php.project().read_source(callable.source()).ok()?;
+fn declared_return_type_fqn(scan: &PhpScan<'_, '_>, callable: &CodeUnit) -> Option<String> {
+    if callable.source() == scan.file {
+        return declared_return_type_fqn_from_root(scan.php, callable, scan.source, scan.root);
+    }
+    php_file_return_type_index(scan, callable.source())
+        .get(&callable.fq_name())
+        .cloned()
+        .flatten()
+}
+
+fn php_file_return_type_index(
+    scan: &PhpScan<'_, '_>,
+    file: &ProjectFile,
+) -> HashMap<String, Option<String>> {
+    if let Some(cached) = scan
+        .file_return_cache
+        .lock()
+        .expect("php file return cache poisoned")
+        .get(file)
+        .cloned()
+    {
+        return cached;
+    }
+
+    let index = build_php_file_return_type_index(scan.php, file);
+    scan.file_return_cache
+        .lock()
+        .expect("php file return cache poisoned")
+        .insert(file.clone(), index.clone());
+    index
+}
+
+fn build_php_file_return_type_index(
+    php: &PhpAnalyzer,
+    file: &ProjectFile,
+) -> HashMap<String, Option<String>> {
+    let source = php.project().read_source(file).unwrap_or_default();
+    if source.is_empty() {
+        return HashMap::default();
+    }
     let mut parser = tree_sitter::Parser::new();
-    parser
+    if parser
         .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let declaration = callable_declaration_node(php, callable, tree.root_node())?;
+        .is_err()
+    {
+        return HashMap::default();
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return HashMap::default();
+    };
+    php.declarations(file)
+        .filter(|unit| unit.is_function())
+        .map(|unit| {
+            (
+                unit.fq_name(),
+                declared_return_type_fqn_from_root(php, unit, &source, tree.root_node()),
+            )
+        })
+        .collect()
+}
+
+fn declared_return_type_fqn_from_root(
+    php: &PhpAnalyzer,
+    callable: &CodeUnit,
+    source: &str,
+    root: Node<'_>,
+) -> Option<String> {
+    let declaration = callable_declaration_node(php, callable, root)?;
     let return_type = declaration.child_by_field_name("return_type")?;
-    let raw = node_text(return_type, &source).trim();
+    let raw = node_text(return_type, source).trim();
     if matches!(raw, "self" | "static") {
         return php.parent_of(callable).map(|owner| owner.fq_name());
     }
     resolve_php_type(
         raw,
-        &php.file_context_from_source(callable.source(), source.as_str()),
+        &php.file_context_from_source(callable.source(), source),
     )
 }
 
