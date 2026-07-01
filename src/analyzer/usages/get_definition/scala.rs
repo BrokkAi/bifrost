@@ -518,7 +518,16 @@ fn resolve_scala_call(
                 }
             }
             if let Some(owner_fqn) = resolver.resolve(name) {
-                let apply_candidates = ctx.support.fqn(&format!("{owner_fqn}.apply"));
+                // A call `Foo(..)` resolves to the companion object's `apply` when
+                // one exists. `name` may resolve to the class `Foo` or the companion
+                // object `Foo$` — they share a simple name, so `resolve` picks one
+                // arbitrarily — so reconstruct the companion object fqn (`Foo$`) and
+                // prefer its `apply` deterministically, regardless of which resolved.
+                let companion_base = owner_fqn.trim_end_matches('$');
+                let mut apply_candidates = ctx.support.fqn(&format!("{companion_base}$.apply"));
+                if apply_candidates.is_empty() {
+                    apply_candidates = ctx.support.fqn(&format!("{owner_fqn}.apply"));
+                }
                 if !apply_candidates.is_empty() {
                     return candidates_outcome(apply_candidates);
                 }

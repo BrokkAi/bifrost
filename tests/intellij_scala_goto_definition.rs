@@ -61,14 +61,6 @@ fn assert_resolves_to_line(name: &str, source_with_caret: &str, expected: u64) {
     );
 }
 
-fn assert_resolves_to_one_of(name: &str, source_with_caret: &str, expected: &[u64]) {
-    let (_t, lines) = definition_lines(name, source_with_caret);
-    assert!(
-        lines.iter().any(|line| expected.contains(line)),
-        "expected {name} to resolve to one of {expected:?}, got {lines:?}"
-    );
-}
-
 // Method call on a trait-typed `val` resolves to the trait's method (line 1).
 #[test]
 fn intellij_scala_def_trait_method_via_trait_typed_val() {
@@ -79,18 +71,15 @@ fn intellij_scala_def_trait_method_via_trait_typed_val() {
     );
 }
 
-// Companion-object `apply` call: `Foo(3)` resolves to either the companion's
-// explicit `apply` (line 2, the precise Scala target) or the same-named class
-// `Foo` (line 0). Because a class and its companion object share the name `Foo`,
-// bifrost picks one of the two *nondeterministically* - both are sensible
-// navigation targets, so accept either. (The nondeterministic pick between a
-// class and its same-name companion is a minor finding, distinct from #431's
-// cross-scope collapse.)
+// Companion-object `apply` call: `Foo(3)` resolves to the companion's explicit
+// `apply` (line 2) - the precise Scala target. The class `Foo` and companion
+// object `Foo$` share a simple name (so name resolution picked one arbitrarily);
+// `resolve_scala_call` now reconstructs the companion `apply` deterministically.
 #[test]
 fn intellij_scala_def_companion_apply() {
-    assert_resolves_to_one_of(
+    assert_resolves_to_line(
         "a.scala",
         "class Foo(val a: Int)\nobject Foo {\n  def apply(x: Int): Foo = new Foo(x)\n}\nobject Main {\n  val f = Foo<caret>(3)\n}\n",
-        &[0, 2],
+        2,
     );
 }
