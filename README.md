@@ -177,19 +177,17 @@ Claude Code plugin install:
 Codex plugin install for the Bifrost-owned MCP server plugin:
 
 ```bash
-cargo build --bin bifrost
 codex plugin marketplace add /path/to/bifrost
 codex plugin add bifrost@bifrost-local
-PATH="/path/to/bifrost/target/debug:$PATH" codex
+codex
 ```
 
 Claude Code plugin install for the Bifrost-owned MCP server plugin:
 
 ```bash
-cargo build --bin bifrost
 claude plugin marketplace add /path/to/bifrost
 claude plugin install bifrost@bifrost-marketplace --scope local
-PATH="/path/to/bifrost/target/debug:$PATH" claude
+claude
 ```
 
 The Bifrost plugin package lives in `plugins/bifrost-agent`, and the local
@@ -197,12 +195,20 @@ marketplace entries live in `.agents/plugins/marketplace.json` for Codex and
 `.claude-plugin/marketplace.json` for Claude Code. That package README is the
 canonical local testing guide. The plugin installs the Bifrost MCP server
 configuration through the host's plugin flow instead of registering a one-off
-server with `codex mcp add` or `claude mcp add`. It still expects the `bifrost`
-binary to be on `PATH`; for local development, use the `PATH` override shown
-above. The plugin starts Bifrost without `--root`, so Bifrost analyzes the host
-session working directory. Its default toolset is `symbol|extended`, which
-exposes code navigation and related discovery tools without workspace
-activation or raw text file tools.
+server with `codex mcp add` or `claude mcp add`. The plugin starts a
+package-local launcher that resolves `BIFROST_BINARY_PATH`, a managed cache
+entry, or a checksum-verified GitHub release download. A compatible `bifrost`
+on `PATH` is used only when `BIFROST_LAUNCHER_ALLOW_PATH=1` is set explicitly.
+The launcher resolves the workspace root from `BIFROST_WORKSPACE_ROOT` or the
+host session working directory and always starts Bifrost with explicit `--root
+<resolved-root>`. Its default toolset is `symbol|extended`, which exposes code
+navigation and related discovery tools without workspace activation or raw text
+file tools. For local checkout builds, use:
+
+```bash
+cargo build --bin bifrost
+BIFROST_BINARY_PATH="/path/to/bifrost/target/debug/bifrost" codex
+```
 
 The Brokk workflow skills, such as `/brokk:guided-review`, are still packaged
 separately by the Brokk host plugin. To install those skills, use the Brokk

@@ -19,7 +19,7 @@ The companion MCP configuration lives at `plugins/bifrost-agent/.mcp.json`:
 {
   "mcpServers": {
     "bifrost": {
-      "command": "bifrost",
+      "command": "./bin/bifrost-launcher.mjs",
       "args": ["--mcp", "symbol|extended"],
       "startup_timeout_sec": 60,
       "tool_timeout_sec": 300
@@ -29,13 +29,19 @@ The companion MCP configuration lives at `plugins/bifrost-agent/.mcp.json`:
 ```
 
 Use the same Bifrost release as the Rust crate and release tag. The plugin does
-not bundle release archives; it expects `bifrost` to be available on `PATH`.
-When testing a checkout build, prepend this repository's `target/debug`
-directory to `PATH` before starting the host. The plugin omits `--root` so
-Bifrost uses the host session working directory as the analyzed workspace root.
-The default plugin toolset is `symbol|extended`, not `searchtools`, so the
-local plugin exposes analyzer navigation and related discovery tools without
-the `activate_workspace` or raw text-file tools.
+not bundle release archives; `plugins/bifrost-agent/bifrost-release.json`
+stores the pinned version and per-target archive hashes. The launcher uses
+`BIFROST_BINARY_PATH`, an existing managed cache entry, or a checksum-verified
+GitHub release download. A compatible `bifrost` on `PATH` is used only when
+`BIFROST_LAUNCHER_ALLOW_PATH=1` is set explicitly. Set
+`BIFROST_LAUNCHER_AUTO_INSTALL=0` to disable downloads.
+
+The launcher resolves the workspace root from `BIFROST_WORKSPACE_ROOT`, then a
+host-provided `--root` or `--workspace-root`, then the host session working
+directory. It always starts Bifrost with explicit `--root <resolved-root>`. The
+default plugin toolset is `symbol|extended`, not `searchtools`, so the local
+plugin exposes analyzer navigation and related discovery tools without the
+`activate_workspace` or raw text-file tools.
 
 ## Local testing
 
@@ -53,13 +59,16 @@ Verify the binary before installing the plugin:
 
 Add the repo-local marketplace, install the plugin, and start a fresh host
 session using the canonical local testing steps in
-`plugins/bifrost-agent/README.md`. Then call a lightweight analyzer tool such
-as `get_summaries` or `search_symbols` from the fresh session.
+`plugins/bifrost-agent/README.md`. For checkout builds, set
+`BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost"` before starting the host.
+Then call a lightweight analyzer tool such as `get_summaries` or
+`search_symbols` from the fresh session.
 
 Validate that the plugin manifest versions match `Cargo.toml` and that all
-plugin JSON files parse:
+plugin JSON files and launcher metadata parse:
 
 ```bash
+node --test plugins/bifrost-agent/test/*.test.mjs
 node scripts/check-codex-plugin-manifest.mjs
 claude plugin validate plugins/bifrost-agent
 claude plugin validate .
@@ -69,13 +78,18 @@ claude plugin validate .
 
 - Build and publish the Bifrost release archives for every supported platform.
 - Update the VS Code extension's `bifrost.binaryVersion` and
-  `bifrost.archiveSha256` entries to the same release.
+  `bifrost.archiveSha256` entries to the same release, and update
+  `plugins/bifrost-agent/bifrost-release.json` from the same release sidecars.
+- Confirm the release workflow uploads `bifrost-agent-<tag>.tar.gz` after
+  preparing `plugins/bifrost-agent/bifrost-release.json`.
 - Package the Codex Agent Plugin from `plugins/bifrost-agent` with
-  `.codex-plugin/plugin.json`, `.mcp.json`, and `assets/icon.png`.
+  `.codex-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
+  and `assets/icon.png`.
 - Package the Claude Code Agent Plugin from `plugins/bifrost-agent` with
-  `.claude-plugin/plugin.json`, `.mcp.json`, and `assets/icon.png`.
+  `.claude-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
+  and `assets/icon.png`.
 - Validate that the plugin's MCP server entry launches:
-  `bifrost --mcp "symbol|extended"`.
+  `bifrost --root <resolved-root> --mcp "symbol|extended"`.
 - Confirm that plugin installation and VS Code LSP setup use separate Bifrost
   stdio processes, even when they point at the same binary/release.
 

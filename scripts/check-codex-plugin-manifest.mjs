@@ -2,6 +2,8 @@
 
 import fs from "node:fs";
 import assert from "node:assert/strict";
+import { constants as fsConstants } from "node:fs";
+import { SUPPORTED_TARGETS } from "../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
 
 const cargoToml = fs.readFileSync("Cargo.toml", "utf8");
 const cargoVersion = cargoToml.match(/^version = "([^"]+)"$/m)?.[1];
@@ -44,7 +46,32 @@ for (const field of sharedManifestFields) {
 }
 
 const mcpPath = "plugins/bifrost-agent/.mcp.json";
-JSON.parse(fs.readFileSync(mcpPath, "utf8"));
+const mcpConfig = JSON.parse(fs.readFileSync(mcpPath, "utf8"));
+assert.deepStrictEqual(
+  mcpConfig.mcpServers?.bifrost?.command,
+  "./bin/bifrost-launcher.mjs",
+  `${mcpPath} should launch the package-local Bifrost launcher`,
+);
+assert.deepStrictEqual(
+  mcpConfig.mcpServers?.bifrost?.args?.slice(0, 2),
+  ["--mcp", "symbol|extended"],
+  `${mcpPath} should use the default Bifrost MCP toolset`,
+);
+fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK);
+
+const releaseMetadataPath = "plugins/bifrost-agent/bifrost-release.json";
+const releaseMetadata = JSON.parse(fs.readFileSync(releaseMetadataPath, "utf8"));
+if (releaseMetadata.binaryVersion !== cargoVersion) {
+  throw new Error(
+    `${releaseMetadataPath} binaryVersion ${releaseMetadata.binaryVersion} does not match Cargo.toml version ${cargoVersion}`,
+  );
+}
+for (const target of SUPPORTED_TARGETS) {
+  const hash = releaseMetadata.archiveSha256?.[target];
+  if (!/^[a-f0-9]{64}$/.test(hash ?? "")) {
+    throw new Error(`${releaseMetadataPath} is missing a valid archiveSha256.${target}`);
+  }
+}
 
 const marketplacePath = ".agents/plugins/marketplace.json";
 JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
