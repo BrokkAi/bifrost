@@ -6,11 +6,10 @@
 //! Scala named-argument resolution fixed this session.
 //!
 //! Driven through the in-process `get_definition_by_location` tool (like
-//! `get_definition_test.rs`) rather than the LSP subprocess. Each resolution is
-//! correct when run one-per-process, but *multiple* in-process lookups in one test
-//! process flake nondeterministically via process-global state (see the tests'
-//! `#[ignore]` reasons), so both tests are ignored. Assertions are on the resolved
-//! FQN.
+//! `get_definition_test.rs`). Assertions are on the resolved FQN. An earlier
+//! nondeterministic flake here (#432) turned out to be an `enclosing_code_unit`
+//! hash-order tie between the equal-span synthetic `FileScope` and the Python
+//! module unit, fixed with a deterministic rank in `tree_sitter_analyzer.rs`.
 
 mod common;
 
@@ -71,14 +70,11 @@ fn assert_resolves_to(source_with_caret: &str, suffix: &str) {
     );
 }
 
-// Confirmations (findDefinitions.functions/fields/classes shapes). Each resolution
-// is verified CORRECT in isolation (`cargo test <name>` in a fresh process), but
-// multiple in-process `SearchToolsService` lookups — even serialized and with unique
-// module names — flake nondeterministically, so this cannot run reliably in a shared
-// test process. `#[ignore]`d pending a stable in-process multi-lookup harness (the
-// process-global-state issue is a separate finding, not a resolution bug).
+// Confirmations (findDefinitions.functions/fields/classes shapes). Previously
+// `#[ignore]`d for nondeterministic flakes; those were the #432
+// `enclosing_code_unit` FileScope/module equal-span hash-order tie, now fixed
+// deterministically.
 #[test]
-#[ignore = "resolution verified in isolation; multi-lookup in-process harness flakes (process-global state)"]
 fn basedpyright_def_confirmations() {
     // method call -> method
     assert_resolves_to(
@@ -97,8 +93,7 @@ fn basedpyright_def_confirmations() {
 // findDefinitions.dataclasses (shape): a keyword argument `a` in a dataclass
 // constructor resolves to the dataclass field `a` — the Python analog of the Scala
 // named-argument case. Resolved via a `KeywordArgument` reference shape (type the
-// callee, member-lookup the arg name). A single lookup, so unaffected by the
-// multi-lookup harness flakiness that keeps the confirmations test ignored.
+// callee, member-lookup the arg name).
 #[test]
 fn basedpyright_def_dataclass_keyword_arg() {
     assert_resolves_to(

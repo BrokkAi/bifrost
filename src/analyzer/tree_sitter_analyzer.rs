@@ -1411,7 +1411,16 @@ where
                     code_unit.clone(),
                 ))
             })
-            .min_by_key(|(span, _)| *span)
+            .min_by(|(left_span, left), (right_span, right)| {
+                left_span
+                    .cmp(right_span)
+                    .then_with(|| {
+                        enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right))
+                    })
+                    .then_with(|| left.fq_name().cmp(&right.fq_name()))
+                    .then_with(|| left.kind().cmp(&right.kind()))
+                    .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
+            })
             .map(|(_, code_unit)| code_unit)
     }
 
@@ -1690,6 +1699,10 @@ where
     fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
         self.signature_metadata_of(code_unit)
     }
+}
+
+fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
+    if code_unit.is_file_scope() { 1 } else { 0 }
 }
 
 fn node_range(node: Node<'_>) -> Range {

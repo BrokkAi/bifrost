@@ -3930,6 +3930,39 @@ def imported_static():
 }
 
 #[test]
+fn python_property_getter_resolves_on_module_level_receiver() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "m.py",
+            r#"
+class User:
+    @property
+    def normalized_name(self) -> str:
+        return "guest"
+
+user = User()
+user.normalized_name
+"#,
+        )
+        .build();
+
+    let line = "user.normalized_name";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"m.py","line":8,"column":{}}}]}}"#,
+            column_of(line, "normalized_name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "m.User.normalized_name",
+        "{value}"
+    );
+}
+
+#[test]
 fn python_nested_function_self_assignment_does_not_create_outer_field() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
