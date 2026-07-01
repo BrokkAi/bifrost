@@ -13,7 +13,7 @@ The change improves both recall and precision. Recall improves because calls thr
 ## Progress
 
 - [x] (2026-07-01T10:30Z) Created this ExecPlan at `.agent/ISSUE_394_OBJECT_SENSITIVE_RECEIVER_EXECPLAN.md`.
-- [ ] Add the shared receiver analysis API, budget model, no-op provider, cache key shape, and unit tests.
+- [x] (2026-07-01T10:35Z) Add the shared receiver analysis API, budget model, no-op provider, cache key shape, and unit tests.
 - [ ] Implement and test the JS/TS milestone, including a second consumer through `get_definition` or type lookup.
 - [ ] Implement and test the Java milestone.
 - [ ] Implement and test the C# milestone.
@@ -38,6 +38,9 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: Receiver inference already exists in scattered language-specific graph and get-definition modules.
   Evidence: repository search found constructor/factory receiver handling in `src/analyzer/usages/js_ts_graph`, `src/analyzer/usages/get_definition/js_ts.rs`, `src/analyzer/usages/ruby_graph.rs`, and graph tests for Go, Java, C#, C++, PHP, Rust, and Scala.
 
+- Observation: The shared provider can compile and test independently before any language backend adopts it.
+  Evidence: `cargo test --lib receiver_analysis` passed 8 unit tests covering `Precise`, `Ambiguous`, `Unknown`, `Unsupported`, `ExceededBudget`, cache key identity, and no-op provider behavior.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -58,7 +61,9 @@ The change improves both recall and precision. Recall improves because calls thr
 
 ## Outcomes & Retrospective
 
-Update this section after each milestone. At completion, summarize which languages gained object-sensitive receiver tests, which consumers query the provider, any budget behavior observed, and any language-specific receiver semantics deferred to follow-up issues.
+Shared API milestone complete. Added `src/analyzer/usages/receiver_analysis.rs` and exposed it internally from `src/analyzer/usages/mod.rs`. The module defines bounded receiver outcomes, receiver values, the default budget, query/cache-key shapes, a budget tracker, the provider trait, and a no-op provider for unsupported rollout stages. Validation: `cargo test --lib receiver_analysis` passed 8 tests.
+
+At completion, summarize which languages gained object-sensitive receiver tests, which consumers query the provider, any budget behavior observed, and any language-specific receiver semantics deferred to follow-up issues.
 
 ## Context and Orientation
 
