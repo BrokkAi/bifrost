@@ -13,7 +13,7 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 ## Progress
 
 - [x] (2026-07-01T07:58Z) Created this ExecPlan at `.agent/ISSUE_393_RECEIVER_FACTS_EXECPLAN.md`.
-- [ ] Add the shared receiver/fact vocabulary and usage-hit surface helpers.
+- [x] (2026-07-01T08:03Z) Added the shared receiver/fact vocabulary and usage-hit surface helpers; focused surface and existing JS/TS/Python usage tests passed.
 - [ ] Implement and test self-receiver hit classification for #387.
 - [ ] Implement and test JS/TS scope-aware member-assignment declaration filtering for #386.
 - [ ] Run focused tests, `cargo fmt`, and `cargo clippy-no-cuda`; commit after each completed milestone.
@@ -31,6 +31,9 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 
 - Observation: #386 is already pinned by ignored tests.
   Evidence: `tests/cross_language_attribute_target_declarations.rs` ignores JS and TS plain-local member-assignment cases.
+
+- Observation: The first shared-surface milestone did not change existing JS/TS or Python usage graph behavior.
+  Evidence: `cargo test --lib usage_hit`, `cargo test --test usages_js_ts_graph_test`, and `cargo test --test usages_python_graph_test` all passed after adding `UsageHitSurface`, `UsageHitKind::SelfReceiver`, and `receiver_facts`.
 
 ## Decision Log
 

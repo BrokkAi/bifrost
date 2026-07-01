@@ -8,7 +8,7 @@ use crate::analyzer::symbol_lookup::{
 };
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
-    ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
+    ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitSurface,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
@@ -3384,9 +3384,9 @@ fn filter_and_dedupe_hits(
     let mut rows: BTreeMap<(String, usize, String), UsageHitRow> = BTreeMap::new();
     let mut definition_sites_excluded = 0usize;
     for hit in hits {
-        // Import bindings are for the IDE find-references surface, not the
+        // Import and self-receiver hits are for editor references, not the
         // call-graph/relevance rendering here.
-        if hit.kind == UsageHitKind::Import {
+        if !hit.kind.included_in(UsageHitSurface::ExternalUsages) {
             continue;
         }
         if definition_ranges

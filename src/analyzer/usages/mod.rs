@@ -30,6 +30,7 @@ mod outcome;
 mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
+pub(crate) mod receiver_facts;
 mod reexport_seeds;
 pub(crate) mod reference_site;
 pub(crate) mod ruby_graph;
@@ -56,7 +57,7 @@ pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
     ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceGraphResult,
     ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageAnalysisDiagnostic, UsageHit,
-    UsageHitKind,
+    UsageHitKind, UsageHitSurface,
 };
 pub use php_graph::PhpUsageGraphStrategy;
 pub use python_graph::PythonExportUsageGraphStrategy;

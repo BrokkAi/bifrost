@@ -12,7 +12,7 @@ use crate::analyzer::usages::{
     CSharpUsageGraphStrategy, CandidateFileProvider, FallbackCandidateProvider, FuzzyResult,
     GoUsageGraphStrategy, JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy,
     PhpUsageGraphStrategy, RustExportUsageGraphStrategy, ScalaUsageGraphStrategy,
-    TextSearchCandidateProvider, UsageAnalyzer, UsageHit, UsageHitKind,
+    TextSearchCandidateProvider, UsageAnalyzer, UsageHit, UsageHitSurface,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::HashSet;
@@ -617,7 +617,7 @@ fn analyze_candidate(
         FuzzyResult::Success { hits_by_overload } => hits_by_overload
             .into_values()
             .flat_map(BTreeSet::into_iter)
-            .filter(|hit| hit.kind != UsageHitKind::Import)
+            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
             .collect::<Vec<_>>(),
         FuzzyResult::Ambiguous { .. } => {
             skipped.push(format!(

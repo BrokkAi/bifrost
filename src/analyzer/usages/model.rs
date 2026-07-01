@@ -12,17 +12,39 @@ pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// `confidence` and `snippet` are excluded so duplicate hits coming from different patterns
 /// collapse into one.
 /// Whether a hit is a real reference to the symbol (a call, read, write, type
-/// use, ...) or the *binding* that brings the symbol into a file (an `import`).
+/// use, ...), a binding that brings the symbol into a file (an `import`), or an
+/// internal self/this receiver reference.
 ///
 /// The call-graph / relevance surfaces (SearchTools, dead-code, rename, call
-/// hierarchy) care only about `Reference` hits; the LSP `textDocument/references`
-/// surface (IDE "find references") also wants the `Import` binding. Keeping both
-/// in one graph with a kind lets each consumer choose.
+/// hierarchy) care only about ordinary external `Reference` hits; the LSP
+/// `textDocument/references` surface (IDE "find references") also wants import
+/// bindings and self-receiver references. Keeping all in one graph with a kind lets
+/// each consumer choose through [`UsageHitSurface`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UsageHitKind {
     #[default]
     Reference,
     Import,
+    SelfReceiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UsageHitSurface {
+    /// Agent/search/relevance/call-graph surfaces that should count only external
+    /// references from other semantic contexts.
+    ExternalUsages,
+    /// Editor find-references surface that should show every source occurrence that
+    /// points at the symbol, including import bindings and self/this receiver calls.
+    LspReferences,
+}
+
+impl UsageHitKind {
+    pub fn included_in(self, surface: UsageHitSurface) -> bool {
+        match surface {
+            UsageHitSurface::ExternalUsages => self == UsageHitKind::Reference,
+            UsageHitSurface::LspReferences => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +84,12 @@ impl UsageHit {
     /// Reclassify this hit as an `Import` binding.
     pub fn into_import(mut self) -> Self {
         self.kind = UsageHitKind::Import;
+        self
+    }
+
+    /// Reclassify this hit as a self/this receiver reference.
+    pub fn into_self_receiver(mut self) -> Self {
+        self.kind = UsageHitKind::SelfReceiver;
         self
     }
 
@@ -230,19 +258,28 @@ impl FuzzyResult {
         }
     }
 
-    /// Returns every reference hit, regardless of overload bucket. Excludes
-    /// `Import` bindings — the call-graph/relevance surfaces want real references
-    /// only. Use [`all_hits_including_imports`](Self::all_hits_including_imports)
-    /// for the IDE find-references surface.
+    /// Returns every external-usage hit, regardless of overload bucket. Excludes
+    /// import bindings and self/this receiver hits because call-graph/relevance
+    /// surfaces want externally meaningful references only.
     pub fn all_hits(&self) -> BTreeSet<UsageHit> {
-        self.all_hits_including_imports()
+        self.all_hits_for_surface(UsageHitSurface::ExternalUsages)
+    }
+
+    /// Returns every hit for the requested usage surface.
+    pub fn all_hits_for_surface(&self, surface: UsageHitSurface) -> BTreeSet<UsageHit> {
+        self.all_hits_unfiltered()
             .into_iter()
-            .filter(|hit| hit.kind != UsageHitKind::Import)
+            .filter(|hit| hit.kind.included_in(surface))
             .collect()
     }
 
-    /// Returns every hit, including `Import` bindings.
+    /// Returns every editor-visible hit, including `Import` bindings and
+    /// self/this receiver hits.
     pub fn all_hits_including_imports(&self) -> BTreeSet<UsageHit> {
+        self.all_hits_for_surface(UsageHitSurface::LspReferences)
+    }
+
+    fn all_hits_unfiltered(&self) -> BTreeSet<UsageHit> {
         match self {
             FuzzyResult::Success { hits_by_overload }
             | FuzzyResult::Ambiguous {
@@ -273,7 +310,7 @@ impl FuzzyResult {
             FuzzyResult::Success { hits_by_overload } => Ok(hits_by_overload
                 .into_values()
                 .flat_map(BTreeSet::into_iter)
-                .filter(|hit| hit.kind != UsageHitKind::Import)
+                .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
                 .collect()),
             FuzzyResult::Ambiguous {
                 hits_by_overload, ..
@@ -281,7 +318,8 @@ impl FuzzyResult {
                 .into_values()
                 .flat_map(BTreeSet::into_iter)
                 .filter(|hit| {
-                    hit.kind != UsageHitKind::Import && hit.confidence >= CONFIDENCE_THRESHOLD
+                    hit.kind.included_in(UsageHitSurface::ExternalUsages)
+                        && hit.confidence >= CONFIDENCE_THRESHOLD
                 })
                 .collect()),
         }
@@ -468,6 +506,55 @@ mod tests {
         let either = result.into_either().expect("ambiguous => Ok");
         assert!(either.contains(&high));
         assert_eq!(either.len(), 1);
+    }
+
+    #[test]
+    fn usage_hit_surfaces_filter_internal_and_editor_hits() {
+        let unit = enclosing_unit();
+        let reference = UsageHit::new(
+            project_file("Foo.java"),
+            10,
+            100,
+            110,
+            unit.clone(),
+            1.0,
+            "reference",
+        );
+        let import = UsageHit::new(
+            project_file("Foo.java"),
+            12,
+            120,
+            130,
+            unit.clone(),
+            1.0,
+            "import",
+        )
+        .into_import();
+        let self_receiver = UsageHit::new(
+            project_file("Foo.java"),
+            14,
+            140,
+            150,
+            unit.clone(),
+            1.0,
+            "this.target()",
+        )
+        .into_self_receiver();
+
+        let mut hits = BTreeSet::new();
+        hits.insert(reference.clone());
+        hits.insert(import.clone());
+        hits.insert(self_receiver.clone());
+        let result = FuzzyResult::success(unit, hits);
+
+        assert_eq!(
+            result.all_hits_for_surface(UsageHitSurface::ExternalUsages),
+            [reference.clone()].into_iter().collect()
+        );
+        assert_eq!(
+            result.all_hits_for_surface(UsageHitSurface::LspReferences),
+            [reference, import, self_receiver].into_iter().collect()
+        );
     }
 
     #[test]
