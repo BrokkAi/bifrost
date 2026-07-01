@@ -15,7 +15,7 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 - [x] (2026-07-01T07:58Z) Created this ExecPlan at `.agent/ISSUE_393_RECEIVER_FACTS_EXECPLAN.md`.
 - [x] (2026-07-01T08:03Z) Added the shared receiver/fact vocabulary and usage-hit surface helpers; focused surface and existing JS/TS/Python usage tests passed.
 - [x] (2026-07-01T09:39Z) Implemented and tested self-receiver hit classification for #387 across JS/TS, C++, and Rust.
-- [ ] Implement and test JS/TS scope-aware member-assignment declaration filtering for #386.
+- [x] (2026-07-01T10:13Z) Implemented and tested JS/TS member-assignment declaration filtering for #386.
 - [ ] Run focused tests, `cargo fmt`, and `cargo clippy-no-cuda`; commit after each completed milestone.
 
 ## Surprises & Discoveries
@@ -44,6 +44,12 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 - Observation: Rust `self.field` and direct self field accesses are external receiver evidence, not `SelfReceiver` hits.
   Evidence: `cargo test --test usages_rust_graph_test` initially failed existing field receiver tests until `SelfReceiver` classification was narrowed to non-field targets with direct `self.method()` receivers.
 
+- Observation: TypeScript already did not over-declare the ignored plain-local assignment fixture; the active fix was in JavaScript assignment declaration extraction.
+  Evidence: `cargo test --test cross_language_attribute_target_declarations -- --ignored --nocapture` passed the TS ignored case before the JS fix, while JS produced `obj.spuriousmember`.
+
+- Observation: JavaScript local-object function assignments are intentional declaration seeds even when the receiver object is a plain local.
+  Evidence: `cargo test --test usages_js_ts_graph_test` failed `js_commonjs_exports_property_does_not_seed_unrelated_member_by_short_name` until the filter suppressed only non-function plain-local member assignments and preserved function-valued local member declarations.
+
 ## Decision Log
 
 - Decision: Implement #393 as “contract plus fixes,” not contract-only.
@@ -64,6 +70,7 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 - Added graph regressions proving same-class receiver calls do not create `usage_graph` edges for TypeScript, C++, and Rust.
 - C++ also treats implicit same-owner calls (`target()`) as editor-visible self-receiver hits in the forward usage scan and skips them in the inverted graph.
 - Deferred richer receiver/value analysis remains #394 territory: receiver chains such as object-sensitive local aliases are still only handled where existing structured resolver support proves them.
+- #386 milestone: unignored JS and TS plain-local member-assignment declaration tests. JavaScript now suppresses non-function member assignments rooted at scoped plain locals or parameters, while preserving class/function/prototype roots and function-valued local object member declarations used by CommonJS export graphs. TypeScript remains covered by the cross-language regression and does not emit the plain-local assignment declaration.
 
 ## Context and Orientation
 
