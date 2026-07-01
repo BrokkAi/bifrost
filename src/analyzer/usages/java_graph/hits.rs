@@ -1,4 +1,4 @@
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
 use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::{CodeUnit, Range};
 use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
@@ -35,6 +35,11 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;
     }
+}
+
+pub(super) fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit(node, ctx);
+    reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
 }
 
 pub(super) fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingContext {

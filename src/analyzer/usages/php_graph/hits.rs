@@ -1,4 +1,4 @@
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::php_graph::resolver::TargetSpec;
 use crate::analyzer::{IAnalyzer, ProjectFile, Range};
@@ -25,6 +25,20 @@ pub(super) fn push_hit(
         spec,
         hits,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_import_hit(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    spec: &TargetSpec,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    push_hit(node, analyzer, file, source, line_starts, spec, hits);
+    reclassify_import_hit_at(hits, file, node.start_byte(), node.end_byte());
 }
 
 #[allow(clippy::too_many_arguments)]

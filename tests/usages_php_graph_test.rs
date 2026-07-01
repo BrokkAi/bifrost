@@ -68,6 +68,59 @@ function build(): Target {
 }
 
 #[test]
+fn php_import_hits_ignore_unrelated_aliased_use_path() {
+    let consumer = r#"<?php
+namespace App\Feature;
+
+use App\Target;
+use Other\Target as OtherTarget;
+
+class Consumer {
+    public Target $target;
+    public OtherTarget $other;
+}
+"#;
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {}
+"#,
+        ),
+        (
+            "OtherTarget.php",
+            r#"<?php
+namespace Other;
+class Target {}
+"#,
+        ),
+        ("Consumer.php", consumer),
+    ]);
+
+    let target = definition(&analyzer, "App.Target");
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+    let editor_hits = result.all_hits_including_imports();
+    let target_import_line = consumer[..consumer.find("use App\\Target").unwrap()]
+        .matches('\n')
+        .count()
+        + 1;
+    let other_import_line = consumer[..consumer.find("use Other\\Target").unwrap()]
+        .matches('\n')
+        .count()
+        + 1;
+
+    assert!(
+        editor_hits.iter().any(|hit| hit.line == target_import_line),
+        "expected target import hit: {editor_hits:#?}"
+    );
+    assert!(
+        editor_hits.iter().all(|hit| hit.line != other_import_line),
+        "unrelated aliased import must not be reported as target hit: {editor_hits:#?}"
+    );
+}
+
+#[test]
 fn composer_psr4_autoload_expands_php_usage_candidates_without_text_fallback() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

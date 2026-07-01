@@ -122,6 +122,7 @@ pub enum CodeUnitType {
     Field,
     Module,
     Macro,
+    FileScope,
 }
 
 impl CodeUnitType {
@@ -135,6 +136,7 @@ impl CodeUnitType {
             CodeUnitType::Field => "field",
             CodeUnitType::Module => "module",
             CodeUnitType::Macro => "macro",
+            CodeUnitType::FileScope => "file scope",
         }
     }
 }
@@ -406,6 +408,18 @@ impl CodeUnit {
         }))
     }
 
+    pub fn file_scope(source: ProjectFile) -> Self {
+        let short_name = source.rel_path().display().to_string();
+        Self::with_signature(
+            source,
+            CodeUnitType::FileScope,
+            String::new(),
+            short_name,
+            None,
+            true,
+        )
+    }
+
     pub fn source(&self) -> &ProjectFile {
         &self.0.source
     }
@@ -502,6 +516,10 @@ impl CodeUnit {
 
     pub fn is_macro(&self) -> bool {
         self.0.kind == CodeUnitType::Macro
+    }
+
+    pub fn is_file_scope(&self) -> bool {
+        self.0.kind == CodeUnitType::FileScope
     }
 }
 

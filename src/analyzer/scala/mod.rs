@@ -2,7 +2,7 @@ mod adapter;
 mod clones;
 mod declarations;
 mod hierarchy;
-mod imports;
+pub(crate) mod imports;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};

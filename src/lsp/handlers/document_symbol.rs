@@ -180,6 +180,7 @@ pub(super) fn classify_symbol_kind(
         }
         CodeUnitType::Module => SymbolKind::MODULE,
         CodeUnitType::Macro => SymbolKind::CONSTANT,
+        CodeUnitType::FileScope => SymbolKind::FILE,
     }
 }
 

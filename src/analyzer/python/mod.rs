@@ -496,7 +496,7 @@ impl PythonAnalyzer {
                 rendered.push_str(": ...");
             }
             CodeUnitType::Field | CodeUnitType::Macro => rendered.push_str(header.as_str()),
-            CodeUnitType::Module => return None,
+            CodeUnitType::Module | CodeUnitType::FileScope => return None,
         }
         Some(rendered)
     }

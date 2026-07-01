@@ -1,9 +1,9 @@
-use crate::analyzer::usages::common::same_node;
+use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::hits::{
     member_hit_enclosing, push_member_hit, push_self_receiver_member_hit, record_hit,
-    record_module_qualified_hits,
+    record_import_hit, record_module_qualified_hits,
 };
 use crate::analyzer::usages::rust_graph::resolver::is_trait_owner;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer};
@@ -208,7 +208,10 @@ impl ScanCtx<'_> {
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
-        "use_declaration" => return,
+        "use_declaration" => {
+            record_use_import_hits(node, ctx);
+            return;
+        }
         "identifier" | "type_identifier" => {
             let text = node
                 .utf8_text(ctx.source.as_bytes())
@@ -226,6 +229,47 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     for child in node.named_children(&mut cursor) {
         scan_node(child, ctx);
     }
+}
+
+fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    walk_tree_iterative(
+        node,
+        ctx,
+        |current, ctx| {
+            if matches!(current.kind(), "identifier" | "type_identifier")
+                && is_local_use_binding_node(current)
+            {
+                let text = current
+                    .utf8_text(ctx.source.as_bytes())
+                    .ok()
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if ctx.direct_names.contains(text)
+                    || (ctx.target_self_file && text == ctx.target_short)
+                {
+                    record_import_hit(current, ctx);
+                }
+            }
+            TreeWalkAction::Descend
+        },
+        |_| {},
+    );
+}
+
+fn is_local_use_binding_node(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "use_declaration" {
+            return true;
+        }
+        if parent.kind() == "use_as_clause" {
+            return parent
+                .child_by_field_name("alias")
+                .is_some_and(|alias| same_node(alias, node));
+        }
+        current = parent.parent();
+    }
+    true
 }
 
 fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

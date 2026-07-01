@@ -649,5 +649,6 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
         crate::analyzer::CodeUnitType::Field => 2,
         crate::analyzer::CodeUnitType::Macro => 3,
         crate::analyzer::CodeUnitType::Module => 4,
+        crate::analyzer::CodeUnitType::FileScope => 5,
     }
 }

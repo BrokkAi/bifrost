@@ -1,6 +1,7 @@
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::usages::php_graph::hits::{push_hit, push_hit_range};
+use crate::analyzer::usages::php_graph::hits::{push_hit, push_hit_range, push_import_hit};
 use crate::analyzer::usages::php_graph::resolver::{
     PhpHierarchyIndex, TargetKind, TargetSpec, is_const_declaration_name, is_function_call_name,
     is_function_declaration_name, is_member_or_scoped_access_name, is_object_creation_type_name,
@@ -91,7 +92,11 @@ fn scan_node(
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    if node.kind() == "namespace_use_declaration" || node.kind() == "comment" {
+    if node.kind() == "namespace_use_declaration" {
+        record_namespace_use_import_hit(node, analyzer, file, source, line_starts, ctx, spec, hits);
+        return;
+    }
+    if node.kind() == "comment" {
         return;
     }
 
@@ -108,6 +113,67 @@ fn scan_node(
     for child in node.named_children(&mut cursor) {
         scan_node(child, analyzer, file, source, line_starts, ctx, spec, hits);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_namespace_use_import_hit(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    ctx: &PhpFileContext,
+    spec: &TargetSpec,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    if !matches!(spec.kind, TargetKind::Type) {
+        return;
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "namespace_name" | "qualified_name" | "name")
+            && resolve_php_type(&qualified_candidate_text(current, source), ctx)
+                .is_some_and(|fq| fq == spec.target_fq_name)
+        {
+            push_import_hit(current, analyzer, file, source, line_starts, spec, hits);
+            continue;
+        }
+        if matches!(current.kind(), "name" | "identifier") {
+            let text = node_text(current, source);
+            if is_local_namespace_use_binding_node(current)
+                && ctx
+                    .aliases
+                    .type_aliases
+                    .get(text)
+                    .is_some_and(|fq| fq == &spec.target_fq_name)
+            {
+                push_import_hit(current, analyzer, file, source, line_starts, spec, hits);
+                continue;
+            }
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+}
+
+fn is_local_namespace_use_binding_node(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_use_declaration" {
+            return true;
+        }
+        if parent.kind() == "namespace_use_clause" {
+            return match parent.child_by_field_name("alias") {
+                Some(alias) => same_node(alias, node),
+                None => true,
+            };
+        }
+        current = parent.parent();
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]

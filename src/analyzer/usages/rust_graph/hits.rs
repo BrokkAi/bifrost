@@ -1,4 +1,4 @@
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::extractor::ScanCtx;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
@@ -76,6 +76,25 @@ pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         enclosing,
         ctx.hits,
     );
+}
+
+pub(super) fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+    else {
+        return;
+    };
+    push_member_hit(
+        ctx.file,
+        ctx.source,
+        ctx.line_starts,
+        start,
+        end,
+        enclosing,
+        ctx.hits,
+    );
+    reclassify_import_hit_at(ctx.hits, ctx.file, start, end);
 }
 
 pub(super) fn member_hit_enclosing(
