@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "bincode",
  "chrono",
