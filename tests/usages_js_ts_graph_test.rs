@@ -941,6 +941,80 @@ fn ts_this_receiver_is_editor_only_member_usage() {
 }
 
 #[test]
+fn ts_self_receiver_hits_do_not_trigger_external_usage_cap() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "a.ts",
+            "class Foo {\n  target() {}\n  caller() { this.target(); this.target(); }\n}\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.short_name() == "Foo.target" && cu.is_function()
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = JsTsExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        0,
+    );
+
+    assert!(
+        !matches!(result, FuzzyResult::TooManyCallsites { .. }),
+        "self-receiver hits are editor-visible but must not count against the external usage cap: {result:?}"
+    );
+    assert!(result.all_hits().is_empty(), "result: {result:?}");
+    assert_eq!(2, result.all_hits_including_imports().len());
+}
+
+#[test]
+fn ts_seedless_local_external_hits_still_enforce_usage_cap() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "a.ts",
+            r#"
+class Foo {
+  target() {}
+}
+
+function caller(foo: Foo) {
+  foo.target();
+  foo.target();
+}
+"#,
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.short_name() == "Foo.target" && cu.is_function()
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = JsTsExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1,
+    );
+
+    match result {
+        FuzzyResult::TooManyCallsites {
+            total_callsites,
+            limit,
+            ..
+        } => {
+            assert_eq!(2, total_callsites);
+            assert_eq!(1, limit);
+        }
+        other => panic!("expected seedless local external hits to enforce cap, got {other:?}"),
+    }
+}
+
+#[test]
 fn ts_static_member_on_namespace_import_resolves_member_usage() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file("a.ts", "export class Foo { static make() {} }\n")
@@ -1110,7 +1184,7 @@ fn js_commonjs_reexported_module_object_member_resolves_nested_usage() {
 
 #[test]
 fn js_commonjs_exports_property_does_not_seed_unrelated_member_by_short_name() {
-    let (project, analyzer) = js_inline_analyzer(|p| {
+    let (_project, analyzer) = js_inline_analyzer(|p| {
         p.file(
             "lib/request.js",
             "function accepts(type) { return type; }\nconst request = {};\nrequest.accepts = function acceptsMember(type) { return type; };\nexports.accepts = accepts;\n",
@@ -1122,21 +1196,11 @@ fn js_commonjs_exports_property_does_not_seed_unrelated_member_by_short_name() {
         .build()
     });
 
-    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
-        cu.short_name() == "request.accepts" && cu.is_function()
-    });
-    let candidates = analyzer.get_analyzed_files().into_iter().collect();
-
-    let result = JsTsExportUsageGraphStrategy::new().find_usages(
-        &analyzer,
-        std::slice::from_ref(&target),
-        &candidates,
-        1000,
-    );
-
     assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "member-qualified target must not seed from an unrelated local export with the same property name"
+        analyzer
+            .all_declarations()
+            .all(|cu| cu.short_name() != "request.accepts"),
+        "unexported plain-local member function assignment must not be declared"
     );
 }
 

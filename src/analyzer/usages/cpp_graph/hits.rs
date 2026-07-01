@@ -4,6 +4,7 @@ use crate::analyzer::usages::cpp_graph::extractor::{EnclosingContext, ScanCtx};
 use crate::analyzer::usages::cpp_graph::resolver::{
     TargetKind, precise_parent_of, same_logical_symbol, visible_owner_from_member_name,
 };
+use crate::analyzer::usages::model::UsageHitSurface;
 use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
@@ -55,7 +56,14 @@ fn push_hit_with_options(
     } else {
         hit
     });
-    if ctx.hits.len() > ctx.max_usages {
+    if !self_receiver
+        && ctx
+            .hits
+            .iter()
+            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+            .count()
+            > ctx.max_usages
+    {
         *ctx.limit_exceeded = true;
     }
 }

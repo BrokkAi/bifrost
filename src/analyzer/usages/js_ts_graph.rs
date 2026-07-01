@@ -43,7 +43,7 @@ use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
 use crate::analyzer::usages::js_ts_graph::resolver::{
     is_static_member, target_language, top_level_identifier,
 };
-use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
 use crate::analyzer::{
@@ -143,7 +143,7 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
             target.short_name(),
             owner_seed_allowed,
         );
-        if seeds.is_empty() {
+        let hits = if seeds.is_empty() {
             let mut self_file = HashSet::default();
             self_file.insert(target.source().clone());
             let local_hits = scan_files_for_seeds(
@@ -155,32 +155,34 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 language,
             );
             if !local_hits.is_empty() {
-                return GraphUsageOutcome::Resolved(FuzzyResult::success(
-                    target.clone(),
-                    local_hits,
-                ));
+                local_hits
+            } else {
+                return GraphUsageOutcome::fallback_safe(
+                    target.fq_name(),
+                    GraphFailureReason::NoGraphSeed("no export seed resolved"),
+                    "JsTsExportUsageGraphStrategy",
+                );
             }
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::NoGraphSeed("no export seed resolved"),
-                "JsTsExportUsageGraphStrategy",
-            );
-        }
+        } else {
+            let importers = index.importers_of_seeds(&seeds);
+            let scan_files: HashSet<ProjectFile> =
+                candidate_files.iter().cloned().chain(importers).collect();
 
-        let importers = index.importers_of_seeds(&seeds);
-        let scan_files: HashSet<ProjectFile> =
-            candidate_files.iter().cloned().chain(importers).collect();
-
-        let hits = scan_files_for_seeds(analyzer, index, &scan_files, target, &seeds, language);
+            scan_files_for_seeds(analyzer, index, &scan_files, target, &seeds, language)
+        };
         let hits: BTreeSet<UsageHit> = hits
             .into_iter()
             .filter(|hit| &hit.enclosing != target)
             .collect();
 
-        if hits.len() > max_usages {
+        let external_hit_count = hits
+            .iter()
+            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+            .count();
+        if external_hit_count > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
-                total_callsites: hits.len(),
+                total_callsites: external_hit_count,
                 limit: max_usages,
             });
         }

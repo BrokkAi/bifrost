@@ -5,7 +5,7 @@ mod resolver;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
-use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult};
+use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::rust_graph::extractor::{
     build_rust_graph_for_files, effective_scan_files, scan_files_for_member_target,
@@ -83,26 +83,25 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                     &BTreeSet::new(),
                 );
                 if !local_hits.is_empty() {
+                    local_hits
+                } else {
+                    return GraphUsageOutcome::fallback_safe(
+                        target.fq_name(),
+                        GraphFailureReason::NoGraphSeed("no export seed resolved"),
+                        "RustExportUsageGraphStrategy",
+                    );
+                }
+            } else {
+                if !is_graph_visible_member_target(rust, target) {
                     return GraphUsageOutcome::Resolved(FuzzyResult::success(
                         target.clone(),
-                        local_hits,
+                        BTreeSet::new(),
                     ));
                 }
-                return GraphUsageOutcome::fallback_safe(
-                    target.fq_name(),
-                    GraphFailureReason::NoGraphSeed("no export seed resolved"),
-                    "RustExportUsageGraphStrategy",
-                );
+                let scan_files = effective_scan_files(rust, candidate_files, target, &seeds);
+                let graph = build_rust_graph_for_files(scan_files.clone());
+                scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
             }
-            if !is_graph_visible_member_target(rust, target) {
-                return GraphUsageOutcome::Resolved(FuzzyResult::success(
-                    target.clone(),
-                    BTreeSet::new(),
-                ));
-            }
-            let scan_files = effective_scan_files(rust, candidate_files, target, &seeds);
-            let graph = build_rust_graph_for_files(scan_files.clone());
-            scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
         } else {
             let seeds = infer_graph_seeds(rust, target);
             if seeds.is_empty() {
@@ -122,10 +121,14 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             .filter(|hit| &hit.enclosing != target)
             .collect();
 
-        if hits.len() > max_usages {
+        let external_hit_count = hits
+            .iter()
+            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+            .count();
+        if external_hit_count > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
-                total_callsites: hits.len(),
+                total_callsites: external_hit_count,
                 limit: max_usages,
             });
         }

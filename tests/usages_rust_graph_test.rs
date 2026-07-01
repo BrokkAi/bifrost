@@ -738,6 +738,70 @@ impl Foo {
 }
 
 #[test]
+fn rust_self_receiver_hits_do_not_trigger_external_usage_cap() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Foo;
+impl Foo {
+    pub fn target(&self) {}
+    pub fn caller(&self) {
+        self.target();
+        self.target();
+    }
+}
+"#,
+    )]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "target");
+    let result = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&target), 1000, 0)
+        .result;
+
+    assert!(
+        !matches!(result, FuzzyResult::TooManyCallsites { .. }),
+        "self-receiver hits are editor-visible but must not count against the external usage cap: {result:?}"
+    );
+    assert!(result.all_hits().is_empty(), "result: {result:?}");
+    assert_eq!(2, result.all_hits_including_imports().len());
+}
+
+#[test]
+fn rust_seedless_local_external_hits_still_enforce_usage_cap() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Foo;
+impl Foo {
+    pub fn target(&self) {}
+}
+
+fn caller(foo: Foo) {
+    foo.target();
+    foo.target();
+}
+"#,
+    )]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "target");
+    let result = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&target), 1000, 1)
+        .result;
+
+    match result {
+        FuzzyResult::TooManyCallsites {
+            total_callsites,
+            limit,
+            ..
+        } => {
+            assert_eq!(2, total_callsites);
+            assert_eq!(1, limit);
+        }
+        other => panic!("expected seedless local external hits to enforce cap, got {other:?}"),
+    }
+}
+
+#[test]
 fn usage_finder_routes_rust_member_targets_through_graph() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (

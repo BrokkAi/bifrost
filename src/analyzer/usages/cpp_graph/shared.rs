@@ -3,7 +3,7 @@ use super::inverted;
 use super::resolver::{TargetSpec, VisibilityIndex};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
-use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver};
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
@@ -74,10 +74,14 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             );
         }
 
-        if limit_exceeded || hits.len() > max_usages {
+        let external_hit_count = hits
+            .iter()
+            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+            .count();
+        if limit_exceeded || external_hit_count > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
-                total_callsites: hits.len(),
+                total_callsites: external_hit_count,
                 limit: max_usages,
             });
         }

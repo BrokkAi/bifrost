@@ -178,6 +178,63 @@ struct Foo {
     );
 }
 
+#[test]
+fn cpp_self_receiver_hits_do_not_trigger_external_usage_cap() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "foo.cpp",
+        r#"
+struct Foo {
+  void target() {}
+  void caller() {
+    this->target();
+    target();
+  }
+};
+"#,
+    )]);
+
+    let target = member_function_definition(&analyzer, "Foo", "target");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        0,
+    );
+
+    assert!(
+        !matches!(result, FuzzyResult::TooManyCallsites { .. }),
+        "self-receiver hits are editor-visible but must not count against the external usage cap: {result:?}"
+    );
+    assert!(result.all_hits().is_empty(), "result: {result:?}");
+    assert_eq!(2, result.all_hits_including_imports().len());
+}
+
+#[test]
+fn cpp_explicit_same_owner_receiver_counts_as_external_usage() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "foo.cpp",
+        r#"
+struct Foo {
+  void target() {}
+  void caller(Foo& other) {
+    other.target();
+  }
+};
+"#,
+    )]);
+
+    let target = member_function_definition(&analyzer, "Foo", "target");
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = result.into_either().expect("cpp graph success");
+
+    assert_eq!(1, hits.len(), "external hits: {hits:?}");
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains("other.target")),
+        "explicit object receiver should remain an external usage: {hits:?}"
+    );
+}
+
 fn signature_arity(signature: Option<&str>) -> usize {
     let Some(signature) = signature else {
         return 0;

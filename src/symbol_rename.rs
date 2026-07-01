@@ -137,7 +137,7 @@ pub(crate) fn rename_symbol(
         FuzzyResult::Success { hits_by_overload } => hits_by_overload
             .into_values()
             .flat_map(|hits| hits.into_iter())
-            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+            .filter(|hit| hit.kind.included_in(UsageHitSurface::LspReferences))
             .collect::<Vec<_>>(),
         FuzzyResult::Ambiguous { .. } => {
             return Err(RenameFailure {

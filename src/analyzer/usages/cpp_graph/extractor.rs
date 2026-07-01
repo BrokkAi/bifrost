@@ -445,13 +445,14 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    let self_receiver = receiver_is_self_like(function);
-    if receiver_matches_target(function, ctx) || same_owner_context(function, ctx) {
-        if self_receiver || same_owner_context(function, ctx) {
+    if receiver_matches_target(function, ctx) {
+        if receiver_is_self_like(function) {
             push_self_receiver_hit(function_terminal_node(function), ctx);
         } else {
             push_hit(function_terminal_node(function), ctx);
         }
+    } else if same_owner_context(function, ctx) {
+        push_self_receiver_hit(function_terminal_node(function), ctx);
     } else if !receiver_has_known_non_target(function, ctx)
         && !known_non_target_owner_context(function, ctx)
     {

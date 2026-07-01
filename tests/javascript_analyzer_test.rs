@@ -808,8 +808,11 @@ Bar.prototype.run = function run() {};
 const request = {};
 request.accepts = function accepts(type) { return type; };
 exports.accepts = request.accepts;
+var req = exports = module.exports = {};
+req.route = function route(type) { return type; };
 const obj = {};
 obj.spuriousmember = 1;
+obj.helper = function helper() {};
 "#,
     )]);
     let file = project.file("assignments.js");
@@ -835,7 +838,15 @@ obj.spuriousmember = 1;
         "CommonJS-exported local object member should remain declared: {names:?}"
     );
     assert!(
+        names.contains(&"req.route".to_string()),
+        "CommonJS export assignment-chain local object member should remain declared: {names:?}"
+    );
+    assert!(
         !names.iter().any(|name| name.contains("spuriousmember")),
         "plain-local member assignment must not be declared: {names:?}"
+    );
+    assert!(
+        !names.contains(&"obj.helper".to_string()),
+        "function-valued plain-local member assignment must not be declared: {names:?}"
     );
 }

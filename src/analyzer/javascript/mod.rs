@@ -1235,11 +1235,15 @@ impl JsAssignmentDeclarationState {
         &self,
         name: &str,
         declarator: Node<'_>,
+        source: &str,
     ) -> JsAssignmentBindingKind {
         if self.commonjs_exported_roots.contains(name)
             || declarator
                 .child_by_field_name("value")
-                .is_some_and(js_assignment_value_is_declaration_root)
+                .is_some_and(|value| {
+                    js_assignment_value_is_declaration_root(value)
+                        || js_assignment_value_exports_commonjs_root(value, source)
+                })
         {
             JsAssignmentBindingKind::DeclarationRoot
         } else {
@@ -1350,7 +1354,7 @@ fn register_js_assignment_variable(
     collect_js_assignment_binding_names(name_node, source, &mut names);
     let parent_kind = node.parent().map(|parent| parent.kind());
     for name in names {
-        let kind = state.binding_kind_for_declarator(&name, node);
+        let kind = state.binding_kind_for_declarator(&name, node, source);
         if parent_kind == Some("variable_declaration") {
             state.declare_function_scoped(&name, kind);
         } else {
@@ -1396,6 +1400,21 @@ fn js_assignment_value_is_declaration_root(value: Node<'_>) -> bool {
     )
 }
 
+fn js_assignment_value_exports_commonjs_root(value: Node<'_>, source: &str) -> bool {
+    if value.kind() != "assignment_expression" {
+        return false;
+    }
+    if value
+        .child_by_field_name("left")
+        .is_some_and(|left| js_is_commonjs_export_assignment_target(left, source))
+    {
+        return true;
+    }
+    value
+        .child_by_field_name("right")
+        .is_some_and(|right| js_assignment_value_exports_commonjs_root(right, source))
+}
+
 fn visit_js_assignment_expression(
     file: &ProjectFile,
     source: &str,
@@ -1410,7 +1429,7 @@ fn visit_js_assignment_expression(
     let value_is_function =
         value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
     let Some(name) = js_commonjs_export_assignment_name(left, value, source)
-        .or_else(|| js_member_assignment_name(left, source, state, value_is_function))
+        .or_else(|| js_member_assignment_name(left, source, state))
     else {
         return;
     };
@@ -1484,7 +1503,6 @@ fn js_member_assignment_name(
     node: Node<'_>,
     source: &str,
     state: &JsAssignmentDeclarationState,
-    allow_plain_local_root: bool,
 ) -> Option<String> {
     if node.kind() != "member_expression" {
         return None;
@@ -1492,7 +1510,7 @@ fn js_member_assignment_name(
     if js_is_commonjs_export_assignment_target(node, source) {
         return None;
     }
-    if !allow_plain_local_root && js_member_assignment_has_plain_local_root(node, source, state) {
+    if js_member_assignment_has_plain_local_root(node, source, state) {
         return None;
     }
     let object = node.child_by_field_name("object")?;
@@ -1502,9 +1520,7 @@ fn js_member_assignment_name(
     }
     let object_name = match object.kind() {
         "identifier" | "property_identifier" => node_text(object, source).trim().to_string(),
-        "member_expression" => {
-            js_member_assignment_name(object, source, state, allow_plain_local_root)?
-        }
+        "member_expression" => js_member_assignment_name(object, source, state)?,
         _ => return None,
     };
     let property_name = node_text(property, source)
