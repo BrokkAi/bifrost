@@ -1,9 +1,13 @@
-# Bifrost Codex Plugin
+# Bifrost for Codex Plugin
 
 This package installs Bifrost's MCP server configuration as a Codex plugin. It
 does not bundle the Bifrost binary or the Brokk host workflow skills; it only
 makes a code-intelligence subset of the `bifrost` MCP tools discoverable to
 Codex through the plugin system.
+
+The plugin's stable install name is `bifrost`. The Codex UI-facing display name
+is `Bifrost for Codex` so this package root can also host other agent manifests,
+such as a future Claude plugin, without renaming the shared package.
 
 The plugin expects `bifrost` to be available on `PATH`. For local development,
 build this checkout and prepend `target/debug` while testing:

@@ -1,7 +1,7 @@
 {
   "name": "bifrost-local",
   "interface": {
-    "displayName": "Bifrost Local"
+    "displayName": "Bifrost for Codex Local"
   },
   "plugins": [
     {

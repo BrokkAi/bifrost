@@ -10,7 +10,9 @@ in `.agents/plugins/marketplace.json`.
 The plugin manifest lives at
 `plugins/bifrost-agent/.codex-plugin/plugin.json`. Treat that checked-in file
 as the source of truth for marketplace metadata, including the plugin version,
-icon paths, display text, and MCP configuration pointer.
+icon paths, display text, and MCP configuration pointer. Keep the stable plugin
+`name` as `bifrost`; use `Bifrost for Codex` for Codex-facing display text so
+this package root can also host other agent manifests later.
 
 The companion MCP configuration lives at `plugins/bifrost-agent/.mcp.json`:
 

@@ -17,7 +17,7 @@
   ],
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Bifrost",
+    "displayName": "Bifrost for Codex",
     "shortDescription": "Analyzer-backed code intelligence tools",
     "longDescription": "Bifrost exposes analyzer-backed search, symbol, workspace, and code-quality tools through a stdio MCP server.",
     "developerName": "Brokk",
