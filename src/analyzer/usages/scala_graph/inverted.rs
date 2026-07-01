@@ -145,9 +145,15 @@ where
     build_edges(&graph.files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let resolver = NameResolver::for_file(graph.scala, file, &graph.types);
+            let factory_returns = collect_factory_return_types(
+                parsed.tree.root_node(),
+                parsed.source.as_str(),
+                &resolver,
+            );
             let mut ctx = ScalaScan {
                 source: parsed.source.as_str(),
                 resolver: &resolver,
+                factory_returns,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 collector,
             };
@@ -160,6 +166,7 @@ where
 struct ScalaScan<'a, 'b> {
     source: &'a str,
     resolver: &'a NameResolver,
+    factory_returns: HashMap<String, String>,
     class_ranges: ClassRangeIndex,
     collector: &'a mut EdgeCollector<'b>,
 }
@@ -364,13 +371,18 @@ fn seed_value_definition(
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    // Prefer the declared type; otherwise infer from a `new Foo()` initializer.
+    // Prefer the declared type; otherwise infer from a `new Foo()` initializer
+    // or a call with a declared factory return.
     let resolved = node
         .child_by_field_name("type")
         .and_then(|type_node| ctx.resolver.resolve(node_text(type_node, ctx.source)))
         .or_else(|| {
             node.child_by_field_name("value")
                 .and_then(|value| constructed_type(value, ctx))
+        })
+        .or_else(|| {
+            node.child_by_field_name("value")
+                .and_then(|value| call_result_type(value, ctx, bindings))
         });
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
@@ -390,6 +402,78 @@ fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
             .and_then(|type_node| ctx.resolver.resolve(node_text(type_node, ctx.source)));
     }
     None
+}
+
+fn call_result_type(
+    node: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    match function.kind() {
+        "field_expression" => {
+            let receiver = function.child_by_field_name("value")?;
+            let field = function.child_by_field_name("field")?;
+            let owner = receiver_type_fqn(receiver, ctx, bindings)?;
+            let method = node_text(field, ctx.source);
+            ctx.factory_returns
+                .get(&format!("{owner}.{method}"))
+                .cloned()
+        }
+        "identifier" => {
+            let method = node_text(function, ctx.source);
+            let owner = ctx.enclosing_class(function.start_byte())?;
+            ctx.factory_returns
+                .get(&format!("{owner}.{method}"))
+                .cloned()
+        }
+        _ => None,
+    }
+}
+
+fn collect_factory_return_types(
+    root: Node<'_>,
+    source: &str,
+    resolver: &NameResolver,
+) -> HashMap<String, String> {
+    let mut returns = HashMap::default();
+    let mut stack = vec![(root, None::<String>)];
+    while let Some((node, owner)) = stack.pop() {
+        match node.kind() {
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+                let next_owner = node
+                    .child_by_field_name("name")
+                    .and_then(|name| resolver.resolve(node_text(name, source)));
+                push_children_with_owner(node, next_owner, &mut stack);
+            }
+            "function_definition" => {
+                if let Some(owner) = owner.as_ref()
+                    && let Some(name) = node.child_by_field_name("name")
+                    && let Some(return_type) = node.child_by_field_name("return_type")
+                    && let Some(return_fqn) = resolver.resolve(node_text(return_type, source))
+                {
+                    returns.insert(format!("{owner}.{}", node_text(name, source)), return_fqn);
+                }
+            }
+            _ => push_children_with_owner(node, owner, &mut stack),
+        }
+    }
+    returns
+}
+
+fn push_children_with_owner<'tree>(
+    node: Node<'tree>,
+    owner: Option<String>,
+    stack: &mut Vec<(Node<'tree>, Option<String>)>,
+) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push((child, owner.clone()));
+        }
+    }
 }
 
 fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {

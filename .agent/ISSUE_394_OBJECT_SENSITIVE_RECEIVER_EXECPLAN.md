@@ -23,7 +23,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T11:18Z) Implement and test the Python milestone.
 - [x] (2026-07-01T11:27Z) Implement and test the Ruby milestone.
 - [x] (2026-07-01T11:42Z) Implement and test the Rust milestone.
-- [ ] Implement and test the Scala milestone.
+- [x] (2026-07-01T11:51Z) Implement and test the Scala milestone.
 - [ ] Add budget, ambiguity, and performance instrumentation tests.
 - [ ] Run final focused validation, `cargo fmt`, `cargo clippy-no-cuda`, and `git diff --check`.
 
@@ -71,6 +71,9 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: Rust forward usage scanning had structured receiver inference, but the whole-workspace inverted graph still treated instance-method dispatch as a recall gap.
   Evidence: `src/analyzer/usages/rust_graph/inverted.rs` explicitly said `recv.method()` was not resolved before the Rust milestone, while `src/analyzer/usages/rust_graph/extractor.rs` already had constructor-return and receiver-binding helpers.
 
+- Observation: Scala already seeded receivers from typed parameters and `val x = new Foo()`, but not from factory call return types.
+  Evidence: `src/analyzer/usages/scala_graph/inverted.rs` seeded `val` definitions from declared types or `constructed_type(value, ctx)` before the Scala milestone.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -110,6 +113,8 @@ Python milestone complete. Extended `src/analyzer/usages/python_graph/extractor.
 Ruby milestone complete. The existing receiver-aware Ruby graph already implemented bounded factory-return inference for class factory methods and fail-closed recursive factories. Added the #394-shaped Service/Other regression tests proving `service = Service.build; service.run` resolves only to `Service.run`, while an ambiguous `Factory.build(flag)` receiver emits no partial same-name hit for either `Service.run` or `Other.run`. Validation: `cargo test --test usages_ruby_test` passed 34 tests.
 
 Rust milestone complete. Extended `src/analyzer/usages/rust_graph/inverted.rs` with a per-file factory return index and per-function receiver facts for typed params, typed lets, `Service::new()`/associated factories, struct expressions, and bare same-file factory calls. Instance method calls now record graph edges only when a local receiver fact proves the owner type. Unsupported trait-object receivers remain unseeded and do not emit partial same-name edges. Validation: `cargo test --test usage_graph_rust_test` passed 10 tests.
+
+Scala milestone complete. Extended `src/analyzer/usages/scala_graph/inverted.rs` with per-file declared factory return indexing for methods under classes/objects and used those facts when seeding `val`/`var` receivers from call initializers such as `Factory.make()`. Unsupported trait-typed receivers still resolve to the trait, not unrelated same-name concrete methods. Validation: `cargo test --test usage_graph_scala_test` passed 10 tests.
 
 At completion, summarize which languages gained object-sensitive receiver tests, which consumers query the provider, any budget behavior observed, and any language-specific receiver semantics deferred to follow-up issues.
 

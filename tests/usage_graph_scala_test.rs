@@ -243,3 +243,80 @@ class Broken {
         value["edges"]
     );
 }
+
+#[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/App.scala",
+            r#"package example
+
+class Service {
+  def run(): Int = 1
+}
+
+class Other {
+  def run(): Int = 2
+}
+
+object Factory {
+  def make(): Service = new Service()
+}
+
+class Consumer {
+  def viaFactory(): Int = {
+    val service = Factory.make()
+    service.run()
+  }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "example.Consumer.viaFactory", "example.Service.run"),
+        "factory receiver should edge only to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "example.Consumer.viaFactory", "example.Other.run"),
+        "factory receiver must not fall back to same-name Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn unsupported_trait_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/App.scala",
+            r#"package example
+
+trait Runner {
+  def run(): Int
+}
+
+class Service {
+  def run(): Int = 1
+}
+
+class Other {
+  def run(): Int = 2
+}
+
+class Consumer {
+  def ambiguous(receiver: Runner): Int = receiver.run()
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "example.Consumer.ambiguous", "example.Service.run")
+            && !has_edge(&value, "example.Consumer.ambiguous", "example.Other.run"),
+        "unsupported trait receiver must not emit partial same-name edges: {}",
+        value["edges"]
+    );
+}
