@@ -1,6 +1,6 @@
 use super::declarations::{
-    determine_package_name, is_class_like_declaration_kind, node_text, normalize_java_full_name,
-    parse_tree,
+    class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
+    node_text, normalize_java_full_name, parse_tree,
 };
 use crate::analyzer::{JavaExternalArtifact, JavaExternalDependencies, JavaMavenCoordinate};
 use crate::hash::HashMap;
@@ -82,6 +82,7 @@ impl JavaExternalDeclarationIndex {
             }
             index.index_class_jar(&artifact.artifact_path);
         }
+        index.apply_enclosing_visibility();
         index
     }
 
@@ -149,6 +150,31 @@ impl JavaExternalDeclarationIndex {
         }
         self.types_by_fqn
             .insert(external_type.fqn.clone(), external_type);
+    }
+
+    fn apply_enclosing_visibility(&mut self) {
+        let updates: Vec<_> = self
+            .types_by_fqn
+            .values()
+            .filter_map(|external_type| {
+                let mut effective_visibility = external_type.visibility;
+                for owner_fqn in enclosing_type_fqns(external_type) {
+                    let Some(owner) = self.types_by_fqn.get(&owner_fqn) else {
+                        continue;
+                    };
+                    effective_visibility =
+                        restrict_visibility(effective_visibility, owner.visibility);
+                }
+                (effective_visibility != external_type.visibility)
+                    .then(|| (external_type.fqn.clone(), effective_visibility))
+            })
+            .collect();
+
+        for (fqn, visibility) in updates {
+            if let Some(external_type) = self.types_by_fqn.get_mut(&fqn) {
+                external_type.visibility = visibility;
+            }
+        }
     }
 
     fn index_source_jar(&mut self, artifact_path: &Path) {
@@ -418,11 +444,16 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
             continue;
         };
         if is_class_like_declaration_kind(child.kind()) {
-            stack.push((child, None::<String>, true));
+            stack.push((
+                child,
+                None::<String>,
+                None::<JavaVisibility>,
+                JavaVisibility::PackagePrivate,
+            ));
         }
     }
 
-    while let Some((node, parent_short_name, parent_visible)) = stack.pop() {
+    while let Some((node, parent_short_name, parent_visibility, default_visibility)) = stack.pop() {
         let Some(name_node) = node.child_by_field_name("name") else {
             continue;
         };
@@ -435,8 +466,11 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
             .as_deref()
             .map(|parent| format!("{parent}.{simple_name}"))
             .unwrap_or_else(|| simple_name.to_string());
-        let visibility = source_visibility(node, source);
-        if parent_visible && visibility != JavaVisibility::Private {
+        let declared_visibility = source_visibility(node, source, default_visibility);
+        let visibility = parent_visibility
+            .map(|parent| restrict_visibility(declared_visibility, parent))
+            .unwrap_or(declared_visibility);
+        if visibility != JavaVisibility::Private {
             result.push(JavaExternalType {
                 fqn: qualified_name(&package_name, &short_name),
                 package_name: package_name.clone(),
@@ -450,16 +484,22 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
             });
         }
 
-        let child_parent_visible = parent_visible && visibility != JavaVisibility::Private;
+        let child_default_visibility = if is_interface_like_node(node.kind()) {
+            JavaVisibility::Public
+        } else {
+            JavaVisibility::PackagePrivate
+        };
         let Some(body) = node.child_by_field_name("body") else {
             continue;
         };
-        for index in (0..body.named_child_count()).rev() {
-            let Some(child) = body.named_child(index) else {
-                continue;
-            };
+        for child in class_like_body_children_rev(body) {
             if is_class_like_declaration_kind(child.kind()) {
-                stack.push((child, Some(short_name.clone()), child_parent_visible));
+                stack.push((
+                    child,
+                    Some(short_name.clone()),
+                    Some(visibility),
+                    child_default_visibility,
+                ));
             }
         }
     }
@@ -467,7 +507,11 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
     result
 }
 
-fn source_visibility(node: tree_sitter::Node<'_>, source: &str) -> JavaVisibility {
+fn source_visibility(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    default_visibility: JavaVisibility,
+) -> JavaVisibility {
     for index in 0..node.named_child_count() {
         let Some(child) = node.named_child(index) else {
             continue;
@@ -486,7 +530,7 @@ fn source_visibility(node: tree_sitter::Node<'_>, source: &str) -> JavaVisibilit
             return JavaVisibility::Private;
         }
     }
-    JavaVisibility::PackagePrivate
+    default_visibility
 }
 
 fn modifier_present(modifiers: &str, expected: &str) -> bool {
@@ -574,6 +618,26 @@ fn class_visibility(class_file: &ClassFile, internal_name: &str) -> JavaVisibili
     }
 }
 
+fn restrict_visibility(declared: JavaVisibility, enclosing: JavaVisibility) -> JavaVisibility {
+    match (declared, enclosing) {
+        (JavaVisibility::Private, _) | (_, JavaVisibility::Private) => JavaVisibility::Private,
+        (JavaVisibility::PackagePrivate, _) | (_, JavaVisibility::PackagePrivate) => {
+            JavaVisibility::PackagePrivate
+        }
+        (JavaVisibility::Protected, _) | (_, JavaVisibility::Protected) => {
+            JavaVisibility::Protected
+        }
+        _ => JavaVisibility::Public,
+    }
+}
+
+fn is_interface_like_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "interface_declaration" | "annotation_type_declaration"
+    )
+}
+
 fn nested_class_visibility(flags: &NestedClassFlags) -> JavaVisibility {
     if flags.contains(NestedClassFlags::ACC_PUBLIC) {
         JavaVisibility::Public
@@ -624,6 +688,16 @@ fn qualified_name(package_name: &str, short_name: &str) -> String {
     } else {
         format!("{package_name}.{short_name}")
     }
+}
+
+fn enclosing_type_fqns(external_type: &JavaExternalType) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = external_type.short_name.as_str();
+    while let Some((owner, _)) = current.rsplit_once('.') {
+        result.push(qualified_name(&external_type.package_name, owner));
+        current = owner;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -702,6 +776,18 @@ mod tests {
                 .get("com.example.dep.PackageHelper")
                 .map(JavaExternalType::visibility)
         );
+        assert_eq!(
+            Some(JavaVisibility::PackagePrivate),
+            index
+                .get("com.example.dep.PackageOuter.Nested")
+                .map(JavaExternalType::visibility)
+        );
+        assert_eq!(
+            Some(JavaVisibility::Public),
+            index
+                .get("com.example.dep.PublicApi.Callback")
+                .map(JavaExternalType::visibility)
+        );
         assert!(
             index
                 .resolve_wildcard_import("com.example.dep", "ExternalService", "app")
@@ -744,6 +830,12 @@ mod tests {
         assert_eq!("com.example.dep", package_nested.package_name());
         assert_eq!("ExternalService.PackageNested", package_nested.short_name());
         assert_eq!(JavaVisibility::PackagePrivate, package_nested.visibility());
+        assert_eq!(
+            Some(JavaVisibility::PackagePrivate),
+            index
+                .get("com.example.dep.PackageOuter.Nested")
+                .map(JavaExternalType::visibility)
+        );
         assert!(
             index
                 .get("com.example.dep.ExternalService.Hidden")
@@ -870,7 +962,9 @@ mod tests {
             return;
         };
         let config = AnalyzerConfig {
-            java_external_dependencies: fixture.coordinate_config(),
+            java: crate::analyzer::JavaAnalyzerConfig {
+                external_dependencies: fixture.coordinate_config(),
+            },
             ..AnalyzerConfig::default()
         };
 
@@ -879,7 +973,10 @@ mod tests {
             "package app;\n\
              import com.example.dep.ExternalService;\n\
              import com.example.dep.ExternalHelper;\n\
-             public class App { ExternalService one; ExternalService.Nested two; ExternalHelper helper; ExternalService.ProtectedNested blocked; }\n",
+             import com.example.dep.PublicApi;\n\
+             import com.example.dep.*;\n\
+             import com.example.other.*;\n\
+             public class App { ExternalService one; ExternalService.Nested two; ExternalHelper helper; ExternalService.ProtectedNested blocked; PublicApi.Callback callback; Foo ambiguous; PackageOuter.Nested hidden; }\n",
         )
         .unwrap();
         ProjectFile::new(fixture.project_root().to_path_buf(), "src/LocalType.java")
@@ -915,6 +1012,22 @@ mod tests {
                 .resolve_type_name_with_external(&app, "ExternalService.ProtectedNested")
                 .is_none(),
             "protected nested dependency types should not resolve from unrelated packages"
+        );
+        assert!(matches!(
+            analyzer.resolve_type_name_with_external(&app, "PublicApi.Callback"),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
+        ));
+        assert!(
+            analyzer
+                .resolve_type_name_with_external(&app, "Foo")
+                .is_none(),
+            "ambiguous wildcard external types should not resolve arbitrarily"
+        );
+        assert!(
+            analyzer
+                .resolve_type_name_with_external(&app, "PackageOuter.Nested")
+                .is_none(),
+            "public nested types under package-private outers should not resolve from other packages"
         );
         assert!(matches!(
             analyzer.resolve_type_name_with_external(&same_package_app, "PackageHelper"),
@@ -963,10 +1076,12 @@ mod tests {
             let repo_dir = root.join("m2").join(GROUP_PATH);
             let source_dir = root.join("dep-src");
             let package_dir = source_dir.join("com/example/dep");
+            let other_package_dir = source_dir.join("com/example/other");
             let classes_dir = root.join("dep-classes");
             fs::create_dir_all(&workspace_root).unwrap();
             fs::create_dir_all(&repo_dir).unwrap();
             fs::create_dir_all(&package_dir).unwrap();
+            fs::create_dir_all(&other_package_dir).unwrap();
             fs::create_dir_all(&classes_dir).unwrap();
 
             fs::write(
@@ -995,6 +1110,26 @@ mod tests {
                 "package com.example.dep; class PackageHelper {}\n",
             )
             .unwrap();
+            fs::write(
+                package_dir.join("PackageOuter.java"),
+                "package com.example.dep; class PackageOuter { public static class Nested {} }\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("PublicApi.java"),
+                "package com.example.dep; public interface PublicApi { interface Callback {} }\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("Foo.java"),
+                "package com.example.dep; public class Foo {}\n",
+            )
+            .unwrap();
+            fs::write(
+                other_package_dir.join("Foo.java"),
+                "package com.example.other; public class Foo {}\n",
+            )
+            .unwrap();
 
             run(Command::new("javac")
                 .arg("-d")
@@ -1002,7 +1137,11 @@ mod tests {
                 .arg(package_dir.join("ExternalService.java"))
                 .arg(package_dir.join("ExternalInterface.java"))
                 .arg(package_dir.join("ExternalHelper.java"))
-                .arg(package_dir.join("PackageHelper.java")));
+                .arg(package_dir.join("PackageHelper.java"))
+                .arg(package_dir.join("PackageOuter.java"))
+                .arg(package_dir.join("PublicApi.java"))
+                .arg(package_dir.join("Foo.java"))
+                .arg(other_package_dir.join("Foo.java")));
             run(Command::new("jar")
                 .current_dir(&classes_dir)
                 .arg("cf")

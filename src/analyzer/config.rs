@@ -4,7 +4,12 @@ use std::path::PathBuf;
 pub struct AnalyzerConfig {
     pub parallelism: Option<usize>,
     pub memo_cache_budget_bytes: Option<u64>,
-    pub java_external_dependencies: JavaExternalDependencies,
+    pub java: JavaAnalyzerConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JavaAnalyzerConfig {
+    pub external_dependencies: JavaExternalDependencies,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,7 +66,7 @@ impl Default for AnalyzerConfig {
         Self {
             parallelism: Some(default_parallelism()),
             memo_cache_budget_bytes: Some(256 * 1024 * 1024),
-            java_external_dependencies: JavaExternalDependencies::default(),
+            java: JavaAnalyzerConfig::default(),
         }
     }
 }

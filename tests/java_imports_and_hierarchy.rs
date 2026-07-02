@@ -1,6 +1,7 @@
 use brokk_bifrost::{
-    AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, JavaExternalDependencies,
-    JavaMavenCoordinate, Language, ProjectFile, TestProject, TypeHierarchyProvider,
+    AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, JavaAnalyzerConfig,
+    JavaExternalDependencies, JavaMavenCoordinate, Language, ProjectFile, TestProject,
+    TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -65,14 +66,16 @@ fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_d
     }
 
     let config = AnalyzerConfig {
-        java_external_dependencies: JavaExternalDependencies {
-            coordinates: vec![JavaMavenCoordinate::new(
-                "com.example",
-                "external-lib",
-                "1.2.3",
-            )],
-            repository_roots: vec![root.join("m2")],
-            ..JavaExternalDependencies::default()
+        java: JavaAnalyzerConfig {
+            external_dependencies: JavaExternalDependencies {
+                coordinates: vec![JavaMavenCoordinate::new(
+                    "com.example",
+                    "external-lib",
+                    "1.2.3",
+                )],
+                repository_roots: vec![root.join("m2")],
+                ..JavaExternalDependencies::default()
+            },
         },
         ..AnalyzerConfig::default()
     };

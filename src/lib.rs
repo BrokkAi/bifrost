@@ -43,7 +43,7 @@ pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CloneSmell,
     CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo,
     DeclarationKind, EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavaExternalArtifact,
+    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavaAnalyzerConfig, JavaExternalArtifact,
     JavaExternalDependencies, JavaMavenCoordinate, JavascriptAnalyzer, Language, MultiAnalyzer,
     MultiRootProject, OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, Project,
     ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SourceContent,

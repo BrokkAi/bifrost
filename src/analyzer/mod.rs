@@ -37,7 +37,8 @@ pub use capabilities::{
 };
 pub(crate) use capabilities::{build_direct_descendant_index, build_reverse_import_index};
 pub use config::{
-    AnalyzerConfig, JavaExternalArtifact, JavaExternalDependencies, JavaMavenCoordinate,
+    AnalyzerConfig, JavaAnalyzerConfig, JavaExternalArtifact, JavaExternalDependencies,
+    JavaMavenCoordinate,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{

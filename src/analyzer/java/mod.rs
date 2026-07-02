@@ -50,7 +50,7 @@ impl JavaAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let external_dependencies = config.java_external_dependencies.clone();
+        let external_dependencies = config.java.external_dependencies.clone();
         let inner = TreeSitterAnalyzer::new_with_config(project, JavaAdapter, config);
         Self {
             inner,
@@ -84,7 +84,7 @@ impl JavaAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let external_dependencies = config.java_external_dependencies.clone();
+        let external_dependencies = config.java.external_dependencies.clone();
         let inner = match progress {
             Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
                 project,
@@ -124,7 +124,7 @@ impl JavaAnalyzer {
         F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         let memo_budget = config.memo_cache_budget_bytes();
-        let external_dependencies = config.java_external_dependencies.clone();
+        let external_dependencies = config.java.external_dependencies.clone();
         let inner = TreeSitterAnalyzer::new_with_config_and_progress(
             project,
             JavaAdapter,
@@ -300,7 +300,7 @@ impl IAnalyzer for JavaAnalyzer {
             inner: self.inner.update(_changed_files),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
             external_dependencies: self.external_dependencies.clone(),
-            external_index: Arc::new(std::sync::OnceLock::new()),
+            external_index: self.external_index.clone(),
         }
     }
 
@@ -309,7 +309,7 @@ impl IAnalyzer for JavaAnalyzer {
             inner: self.inner.update_all(),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
             external_dependencies: self.external_dependencies.clone(),
-            external_index: Arc::new(std::sync::OnceLock::new()),
+            external_index: self.external_index.clone(),
         }
     }
 

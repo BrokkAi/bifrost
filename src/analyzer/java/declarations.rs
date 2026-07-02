@@ -258,11 +258,7 @@ pub(super) fn visit_class_like(
 
         let mut has_explicit_constructor = false;
         if let Some(body) = node.child_by_field_name("body") {
-            for index in (0..body.named_child_count()).rev() {
-                let Some(child) = body.named_child(index) else {
-                    continue;
-                };
-
+            for child in class_like_body_children_rev(body) {
                 match child.kind() {
                     kind if is_class_like_declaration_kind(kind) => {
                         stack.push((child, Some(code_unit.clone()), Some(top_level.clone())));
@@ -626,6 +622,17 @@ pub(super) fn is_class_like_declaration_kind(kind: &str) -> bool {
             | "record_declaration"
             | "annotation_type_declaration"
     )
+}
+
+pub(super) fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut children = Vec::new();
+    for index in (0..body.named_child_count()).rev() {
+        let Some(child) = body.named_child(index) else {
+            continue;
+        };
+        children.push(child);
+    }
+    children
 }
 
 pub(super) fn find_nearest_declaration_from_node(

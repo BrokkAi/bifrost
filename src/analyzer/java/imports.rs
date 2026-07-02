@@ -365,27 +365,9 @@ impl JavaAnalyzer {
             return Some(JavaTypeResolution::External(external_type.clone()));
         }
 
-        for import in self.inner.import_info_of(file) {
-            let Some(import_path) = non_static_import_path(import) else {
-                continue;
-            };
-
-            if !import.is_wildcard {
-                if import.identifier.as_deref() == Some(normalized)
-                    && let Some(external_type) =
-                        external.resolve_explicit_import(import_path, access_package)
-                {
-                    return Some(JavaTypeResolution::External(external_type.clone()));
-                }
-                continue;
-            }
-
-            let package_name = import_path.trim_end_matches(".*");
-            if let Some(external_type) =
-                external.resolve_wildcard_import(package_name, normalized, access_package)
-            {
-                return Some(JavaTypeResolution::External(external_type.clone()));
-            }
+        if let Some(external_type) = self.resolve_external_imports(file, normalized, access_package)
+        {
+            return Some(JavaTypeResolution::External(external_type));
         }
 
         if let Some((first, rest)) = normalized.split_once('.')
@@ -434,6 +416,23 @@ impl JavaAnalyzer {
         name: &str,
         access_package: &str,
     ) -> Option<JavaExternalType> {
+        if let Some(external_type) = self.resolve_external_imports(file, name, access_package) {
+            return Some(external_type);
+        }
+
+        let external = self.external_declaration_index();
+        external
+            .resolve_same_package(access_package, name)
+            .or_else(|| external.resolve_java_lang(name))
+            .cloned()
+    }
+
+    fn resolve_external_imports(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        access_package: &str,
+    ) -> Option<JavaExternalType> {
         let external = self.external_declaration_index();
         for import in self.inner.import_info_of(file) {
             let Some(import_path) = non_static_import_path(import) else {
@@ -449,19 +448,31 @@ impl JavaAnalyzer {
                 }
                 continue;
             }
+        }
+
+        let mut wildcard_match: Option<JavaExternalType> = None;
+        for import in self.inner.import_info_of(file) {
+            let Some(import_path) = non_static_import_path(import) else {
+                continue;
+            };
+            if !import.is_wildcard {
+                continue;
+            }
 
             let package_name = import_path.trim_end_matches(".*");
-            if let Some(external_type) =
+            let Some(external_type) =
                 external.resolve_wildcard_import(package_name, name, access_package)
-            {
-                return Some(external_type.clone());
+            else {
+                continue;
+            };
+            match wildcard_match.as_ref() {
+                Some(existing) if existing.fqn() != external_type.fqn() => return None,
+                Some(_) => {}
+                None => wildcard_match = Some(external_type.clone()),
             }
         }
 
-        external
-            .resolve_same_package(access_package, name)
-            .or_else(|| external.resolve_java_lang(name))
-            .cloned()
+        wildcard_match
     }
 
     fn resolve_visible_simple_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
