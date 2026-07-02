@@ -43,6 +43,10 @@ default plugin toolset is `symbol|extended`, not `searchtools`, so the local
 plugin exposes analyzer navigation and related discovery tools without the
 `activate_workspace` or raw text-file tools.
 
+The plugin manifests also point at `plugins/bifrost-agent/skills`. Keep these
+skills limited to guidance for the default Bifrost MCP toolset unless the
+toolset changes in the same release.
+
 ## Local testing
 
 Build the local binary:
@@ -65,7 +69,7 @@ Then call a lightweight analyzer tool such as `get_summaries` or
 `search_symbols` from the fresh session.
 
 Validate that the plugin manifest versions match `Cargo.toml` and that all
-plugin JSON files and launcher metadata parse:
+plugin JSON files, skill files, and launcher metadata parse:
 
 ```bash
 node --test plugins/bifrost-agent/test/*.test.mjs
@@ -84,18 +88,25 @@ claude plugin validate .
   preparing `plugins/bifrost-agent/bifrost-release.json`.
 - Package the Codex Agent Plugin from `plugins/bifrost-agent` with
   `.codex-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
-  and `assets/icon.png`.
+  `skills/`, and `assets/icon.png`.
 - Package the Claude Code Agent Plugin from `plugins/bifrost-agent` with
   `.claude-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
-  and `assets/icon.png`.
+  `skills/`, and `assets/icon.png`.
 - Validate that the plugin's MCP server entry launches:
   `bifrost --root <resolved-root> --mcp "symbol|extended"`.
 - Confirm that plugin installation and VS Code LSP setup use separate Bifrost
   stdio processes, even when they point at the same binary/release.
 
-## Current skill bundle
+## Skill ownership
 
-The Brokk host skills are still packaged from the Brokk plugin source rather
-than this repository. Until that bundle moves here, publish the Bifrost Agent
-Plugin as an MCP-server package only, and keep skill migration as a separate
-tracked change.
+The Bifrost plugin owns code-intelligence skills that describe the MCP tools it
+installs: code navigation, code reading, and codebase search. These skills must
+refer only to tools available through `symbol|extended` or to host-provided
+shell/file-reading tools.
+
+The Brokk `workspace` skill is intentionally excluded because the default
+Bifrost plugin does not expose `activate_workspace`, `get_active_workspace`, or
+`refresh`. Higher-level Brokk workflows such as guided issue resolution, guided
+review, PR review, GitHub issue drafting, today planning, and specialist
+reviewer agents remain Brokk-owned unless a separate tracker issue moves them
+into the Bifrost package.

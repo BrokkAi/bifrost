@@ -1,0 +1,41 @@
+---
+name: bifrost-code-navigation
+description: >-
+  Find symbol definitions, references, call sites, and related files using
+  Bifrost's search_symbols, get_symbol_locations, scan_usages, and
+  most_relevant_files tools.
+---
+
+# Bifrost Code Navigation
+
+Use these Bifrost MCP tools when you need to find where code is defined,
+where it is used, or which source files are related to a starting point.
+
+The Bifrost agent plugin starts the MCP server with an explicit workspace root,
+so do not call workspace lifecycle tools such as `activate_workspace` for the
+default plugin install.
+
+## Tools
+
+| Tool | Purpose |
+|---|---|
+| `search_symbols` | Find classes, methods, fields, functions, modules, and other indexed declarations by name |
+| `get_symbol_locations` | Get project-relative file paths and line ranges for known symbols |
+| `scan_usages` | Find references, call sites, usages, callers, and related tests for known symbols or declaration locations |
+| `most_relevant_files` | Rank project files related to a set of seed files using imports and git history |
+
+## Tips
+
+- Start with `search_symbols` for partial names. It matches indexed symbol
+  names and accepts `include_tests: true` when tests matter.
+- Use `get_symbol_locations` when you need exact definition coordinates before
+  opening or editing a declaration.
+- Use `scan_usages` instead of text search when changing behavior and callers
+  or references matter. Pass fully qualified symbols from `search_symbols`
+  where possible, or use source-location targets when you only know the file
+  and declaration line.
+- Use `most_relevant_files` after finding one useful file to discover adjacent
+  implementation, tests, or related modules.
+- For arbitrary text that is not an indexed code symbol, use the host shell
+  with `rg` or another built-in grep/search tool. The default Bifrost plugin
+  does not expose raw text-search MCP tools.
