@@ -1,6 +1,6 @@
 use crate::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
-    searchtools_render::RenderOptions,
+    scoped_project::create_scoped_service, searchtools_render::RenderOptions,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -14,12 +14,30 @@ pub struct SearchToolsNativeSession {
 #[pymethods]
 impl SearchToolsNativeSession {
     #[new]
-    #[pyo3(signature = (root, manual=false))]
-    fn new(py: Python<'_>, root: &str, manual: bool) -> PyResult<Self> {
+    #[pyo3(signature = (root, manual=false, sources=None, revision=None))]
+    fn new(
+        py: Python<'_>,
+        root: &str,
+        manual: bool,
+        sources: Option<Vec<String>>,
+        revision: Option<String>,
+    ) -> PyResult<Self> {
+        if sources.is_some() && manual {
+            return Err(PyValueError::new_err(
+                "manual=True cannot be combined with sources; scoped sessions are already manual",
+            ));
+        }
+        if revision.is_some() && sources.is_none() {
+            return Err(PyValueError::new_err(
+                "revision requires sources for a scoped session",
+            ));
+        }
         let root = PathBuf::from(root);
         let service = py
-            .allow_threads(|| {
-                if manual {
+            .allow_threads(move || {
+                if let Some(sources) = sources {
+                    create_scoped_service(root, &sources, revision.as_deref())
+                } else if manual {
                     SearchToolsService::new_for_python_manual(root)
                 } else {
                     SearchToolsService::new_for_python(root)

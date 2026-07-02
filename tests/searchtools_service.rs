@@ -1,7 +1,7 @@
 use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, Project, SearchToolsService,
-    SearchToolsServiceErrorCode, WorkspaceAnalyzer, searchtools::SCAN_USAGES_RESPONSE_BUDGET_BYTES,
-    searchtools_render::RenderOptions,
+    SearchToolsServiceErrorCode, WorkspaceAnalyzer, scoped_project::create_scoped_service,
+    searchtools::SCAN_USAGES_RESPONSE_BUDGET_BYTES, searchtools_render::RenderOptions,
 };
 mod common;
 use common::InlineTestProject;
@@ -259,6 +259,51 @@ fn get_file_contents_reads_workspace_git_history() {
     assert_eq!("HEAD~1:file.py", history["files"][0]["path"]);
     assert_eq!("print('v1')\n", history["files"][0]["content"]);
     assert_eq!("print('v2')\n", current["files"][0]["content"]);
+}
+
+#[test]
+fn scoped_service_reads_selected_files_from_revision() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Demo.java"),
+        "class OldDemo {\n  int value() { return 1; }\n}\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join("Other.java"), "class Other {}\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Demo.java", "Other.java"], "v1");
+    fs::write(
+        temp.path().join("Demo.java"),
+        "class NewDemo {\n  int value() { return 2; }\n}\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join("Other.java"), "class ChangedOther {}\n").unwrap();
+    commit_paths(&repo, &["Demo.java", "Other.java"], "v2");
+
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["Demo.java".to_string()],
+        Some("HEAD~1"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json("get_summaries", r#"{"targets":["Demo.java","Other.java"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let text = value["summaries"][0]["elements"][0]["text"]
+        .as_str()
+        .unwrap();
+
+    assert!(text.contains("OldDemo"), "payload: {value}");
+    assert!(!text.contains("NewDemo"), "payload: {value}");
+    assert!(
+        value["not_found"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "Other.java"),
+        "unselected files must not be analyzer-visible: {value}"
+    );
 }
 
 #[test]

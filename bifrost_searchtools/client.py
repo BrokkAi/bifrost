@@ -87,10 +87,20 @@ class SearchToolsClient:
         library_path: Path | str | None = None,
         render_line_numbers: bool = True,
         manual: bool = False,
+        sources: list[str] | None = None,
+        revision: str | None = None,
     ) -> None:
         # manual=True: no file watcher; caller drives incremental updates via
         # update_paths(). For batch consumers reusing one session across revisions.
+        if sources is not None and manual:
+            raise ValueError(
+                "manual=True cannot be combined with sources; scoped sessions are already manual"
+            )
+        if revision is not None and sources is None:
+            raise ValueError("revision requires sources for a scoped session")
         self._manual = manual
+        self._sources = list(sources) if sources is not None else None
+        self._revision = revision
         self.root = Path(root).expanduser().resolve()
         self._library_path = (
             Path(library_path).expanduser().resolve() if library_path is not None else None
@@ -943,7 +953,12 @@ class SearchToolsClient:
                 return self._runtime
 
             try:
-                native = self._native.SearchToolsNativeSession(str(self.root), self._manual)
+                native = self._native.SearchToolsNativeSession(
+                    str(self.root),
+                    self._manual,
+                    self._sources,
+                    self._revision,
+                )
             except Exception as exc:
                 raise SearchToolsError(
                     f"Failed to start the bifrost native session: {exc}"

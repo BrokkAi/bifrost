@@ -187,6 +187,34 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertFalse(result["documented.py"])
         self.assertNotIn("does_not_exist.py", result)
 
+    def test_scoped_revision_client_reads_selected_old_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "Demo.java").write_text(
+                "class OldDemo {\n  int value() { return 1; }\n}\n"
+            )
+            (root / "Other.java").write_text("class Other {}\n")
+            _init_git_repo(root)
+            _git_commit(root, "v1")
+            (root / "Demo.java").write_text(
+                "class NewDemo {\n  int value() { return 2; }\n}\n"
+            )
+            (root / "Other.java").write_text("class ChangedOther {}\n")
+            _git_commit(root, "v2")
+
+            with SearchToolsClient(
+                root=root,
+                sources=["Demo.java"],
+                revision="HEAD~1",
+            ) as client:
+                summaries = client.get_summaries(["Demo.java", "Other.java"])
+
+        self.assertEqual("Demo.java", summaries.summaries[0].path)
+        text = summaries.summaries[0].elements[0].text
+        self.assertIn("OldDemo", text)
+        self.assertNotIn("NewDemo", text)
+        self.assertIn("Other.java", summaries.not_found)
+
     def test_scan_usages_returns_rendered_native_payload(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             usages = client.scan_usages(["A.method2"])

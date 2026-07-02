@@ -1,21 +1,16 @@
-use std::collections::BTreeSet;
 use std::env;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
+use brokk_bifrost::ToolOutput;
 use brokk_bifrost::lsp::run_lsp_stdio_server;
 use brokk_bifrost::mcp_common::{McpRenderOptions, run_stdio_server};
 use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
+use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
-use brokk_bifrost::tool_arguments::{GitHistoryOverlay, normalize_tool_arguments_for_cli};
-use brokk_bifrost::{
-    FileSetProject, OverlayProject, Project, SearchToolsService, ToolOutput,
-    collect_workspace_files,
-};
-use glob::Pattern;
+use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
 use serde_json::{Value, json};
 
 fn main() -> ExitCode {
@@ -156,42 +151,12 @@ fn run_tool(
     tool_sources: &[String],
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    let root = root
+    let canonical_root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
-    let (arguments, overlays) = normalize_tool_arguments_for_cli(tool_name, tool_args, &root)?;
-    let service = if overlays.is_empty() && tool_sources.is_empty() {
-        SearchToolsService::new(root.clone())?
-    } else if overlays.is_empty() {
-        let rel_paths = resolve_tool_sources(&root, tool_sources)?;
-        let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
-        SearchToolsService::new_manual_for_project(project)?
-    } else {
-        let mut rel_paths: BTreeSet<PathBuf> = if tool_sources.is_empty() {
-            collect_workspace_files(&root)
-                .map_err(|err| {
-                    format!(
-                        "Failed to enumerate workspace files under {}: {err}",
-                        root.display()
-                    )
-                })?
-                .into_iter()
-                .map(|file| file.rel_path().to_path_buf())
-                .collect()
-        } else {
-            resolve_tool_sources(&root, tool_sources)?
-                .into_iter()
-                .collect()
-        };
-        for overlay in &overlays {
-            rel_paths.insert(overlay.rel_path.clone());
-        }
-        let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
-        let overlay_project = Arc::new(OverlayProject::new(project));
-        install_git_history_overlays(&root, &overlay_project, overlays)?;
-        let project: Arc<dyn Project> = overlay_project;
-        SearchToolsService::new_manual_for_project(project)?
-    };
+    let (arguments, overlays) =
+        normalize_tool_arguments_for_cli(tool_name, tool_args, &canonical_root)?;
+    let service = create_cli_tool_service(canonical_root, tool_sources, overlays)?;
     let output = service
         .call_tool_output(
             tool_name,
@@ -220,177 +185,6 @@ fn run_tool(
         .map_err(|err| format!("Failed to serialize tool result: {err}"))?;
     println!("{encoded}");
     Ok(())
-}
-
-fn install_git_history_overlays(
-    root: &Path,
-    project: &OverlayProject,
-    overlays: Vec<GitHistoryOverlay>,
-) -> Result<(), String> {
-    for overlay in overlays {
-        let abs_path = root.join(&overlay.rel_path);
-        if !project.set(abs_path.clone(), overlay.content) {
-            return Err(format!(
-                "git history path `{}` is too large for the analyzer overlay",
-                abs_path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn resolve_tool_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, String> {
-    let workspace_files = collect_workspace_files(root).map_err(|err| {
-        format!(
-            "Failed to enumerate workspace files under {}: {err}",
-            root.display()
-        )
-    })?;
-    let workspace_rel_paths: Vec<String> = workspace_files
-        .iter()
-        .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
-        .collect();
-
-    let mut selected = std::collections::BTreeSet::new();
-    for input in inputs {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if contains_glob_syntax(trimmed) {
-            let pattern = normalize_source_pattern(trimmed, root)?;
-            let glob = Pattern::new(&pattern)
-                .map_err(|err| format!("Invalid --sources glob `{trimmed}`: {err}"))?;
-            let mut matched_any = false;
-            for rel in &workspace_rel_paths {
-                if glob.matches(rel) {
-                    matched_any = true;
-                    selected.insert(PathBuf::from(rel));
-                }
-            }
-            if !matched_any {
-                return Err(format!("--sources glob `{trimmed}` matched no files"));
-            }
-            continue;
-        }
-
-        let rel = normalize_literal_source_path(trimmed, root)?;
-        let abs = root.join(&rel);
-        if abs.is_file() {
-            selected.insert(rel);
-            continue;
-        }
-        if abs.is_dir() {
-            let prefix = rel.to_string_lossy().replace('\\', "/");
-            let prefix_slash = format!("{prefix}/");
-            let mut matched_any = false;
-            for workspace_rel in &workspace_rel_paths {
-                if workspace_rel == &prefix || workspace_rel.starts_with(&prefix_slash) {
-                    matched_any = true;
-                    selected.insert(PathBuf::from(workspace_rel));
-                }
-            }
-            if !matched_any {
-                return Err(format!(
-                    "--sources directory `{trimmed}` contains no analyzer-visible files"
-                ));
-            }
-            continue;
-        }
-
-        return Err(format!("--sources path does not exist: {trimmed}"));
-    }
-
-    if selected.is_empty() {
-        return Err("--sources resolved to an empty workspace".to_string());
-    }
-    Ok(selected.into_iter().collect())
-}
-
-fn normalize_source_pattern(raw: &str, root: &Path) -> Result<String, String> {
-    if looks_like_absolute_path(raw) {
-        normalize_relative_path(&normalize_absolute_source_string(raw, root)?)
-            .map(|path| path.to_string_lossy().replace('\\', "/"))
-    } else {
-        normalize_relative_path(raw).map(|path| path.to_string_lossy().replace('\\', "/"))
-    }
-}
-
-fn normalize_literal_source_path(raw: &str, root: &Path) -> Result<PathBuf, String> {
-    if looks_like_absolute_path(raw) {
-        let abs = Path::new(raw);
-        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        if abs.exists() {
-            let normalized_abs = abs
-                .canonicalize()
-                .map_err(|err| format!("Failed to resolve source path {}: {err}", abs.display()))?;
-            let rel = normalized_abs
-                .strip_prefix(&canonical_root)
-                .map_err(|_| absolute_source_outside_workspace_error(raw, root))?;
-            return normalize_relative_path(&rel.to_string_lossy());
-        }
-        return normalize_relative_path(&normalize_absolute_source_string(raw, root)?);
-    }
-
-    normalize_relative_path(raw)
-}
-
-fn normalize_absolute_source_string(raw: &str, root: &Path) -> Result<String, String> {
-    let raw_norm = raw.replace('\\', "/");
-    let root_norm = root.display().to_string().replace('\\', "/");
-    let root_trimmed = root_norm.trim_end_matches('/');
-
-    if raw_norm == root_trimmed {
-        return Ok(String::new());
-    }
-
-    raw_norm
-        .strip_prefix(&format!("{root_trimmed}/"))
-        .map(str::to_string)
-        .ok_or_else(|| absolute_source_outside_workspace_error(raw, root))
-}
-
-fn absolute_source_outside_workspace_error(raw: &str, root: &Path) -> String {
-    format!(
-        "absolute path is outside active workspace: {} (workspace: {})",
-        raw,
-        root.display()
-    )
-}
-
-fn normalize_relative_path(raw: &str) -> Result<PathBuf, String> {
-    let normalized = raw.replace('\\', "/");
-    let mut rel = PathBuf::new();
-    for component in Path::new(&normalized).components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => rel.push(part),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(format!("path escapes active workspace: {raw}"));
-            }
-        }
-    }
-    if rel.as_os_str().is_empty() {
-        return Err(format!("path is empty: {raw}"));
-    }
-    Ok(rel)
-}
-
-fn contains_glob_syntax(raw: &str) -> bool {
-    raw.contains(['*', '?', '['])
-}
-
-fn looks_like_absolute_path(raw: &str) -> bool {
-    Path::new(raw).is_absolute() || is_windows_absolute_path(raw)
-}
-
-fn is_windows_absolute_path(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
 }
 
 fn print_help(topic: Option<&str>) -> Result<(), String> {

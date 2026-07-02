@@ -25,6 +25,7 @@ mod project_watcher;
 #[cfg(feature = "python")]
 mod python_module;
 mod relevance;
+pub mod scoped_project;
 pub mod searchtools;
 pub mod searchtools_render;
 pub mod searchtools_service;
