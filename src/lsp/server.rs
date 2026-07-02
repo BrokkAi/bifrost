@@ -49,6 +49,7 @@ use crate::lsp::handlers::{
     folding_range, formatting, hover, references, rename, signature_help, type_definition,
     type_hierarchy, workspace_symbol,
 };
+use crate::util::throttled_log::ThrottledLog;
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
 /// not advertise usable workspace folders or legacy root params. Returns when
@@ -1177,7 +1178,7 @@ pub(crate) struct ServerState {
     /// to throttle the warning to one line per URI per
     /// [`MALFORMED_DIDCHANGE_LOG_THROTTLE`] — a misbehaving client sending
     /// incremental events per keystroke would otherwise flood stderr.
-    malformed_didchange_log: Mutex<HashMap<String, Instant>>,
+    malformed_didchange_log: ThrottledLog<String>,
     published_diagnostic_uris: Vec<Uri>,
     open_documents: HashMap<String, OpenDocument>,
     document_generations: Arc<Mutex<HashMap<String, u64>>>,
@@ -1327,7 +1328,10 @@ impl ServerState {
             workspace,
             overlay,
             completion_cache: completion::CompletionCache::new(),
-            malformed_didchange_log: Mutex::new(HashMap::new()),
+            malformed_didchange_log: ThrottledLog::new(
+                MALFORMED_DIDCHANGE_LOG_THROTTLE,
+                MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES,
+            ),
             published_diagnostic_uris: Vec::new(),
             open_documents: HashMap::new(),
             document_generations: Arc::new(Mutex::new(HashMap::new())),
@@ -1461,32 +1465,7 @@ impl ServerState {
     /// fills.
     fn maybe_log_malformed_didchange(&self, uri: &Uri, n_changes: usize) {
         let now = Instant::now();
-        let should_log = {
-            let mut log = self
-                .malformed_didchange_log
-                .lock()
-                .expect("malformed didChange log poisoned");
-            let key = uri.as_str();
-            let recent = log
-                .get(key)
-                .map(|last| now.duration_since(*last) < MALFORMED_DIDCHANGE_LOG_THROTTLE)
-                .unwrap_or(false);
-            if recent {
-                false
-            } else {
-                if log.len() >= MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES {
-                    log.retain(|_, last| {
-                        now.duration_since(*last) < MALFORMED_DIDCHANGE_LOG_THROTTLE
-                    });
-                    if log.len() >= MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES {
-                        log.clear();
-                    }
-                }
-                log.insert(key.to_string(), now);
-                true
-            }
-        };
-        if should_log {
+        if self.malformed_didchange_log.should_log(uri.as_str(), now) {
             eprintln!(
                 "[bifrost-lsp] dropping didChange for {}: {n_changes} content_change events but none was a full-document replacement (server advertises TextDocumentSyncKind::FULL)",
                 uri.as_str(),
