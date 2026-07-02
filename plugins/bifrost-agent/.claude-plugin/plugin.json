@@ -1,7 +1,7 @@
 {
   "name": "brokk",
   "version": "0.7.2",
-  "description": "Multi-language code analysis and navigation over MCP.",
+  "description": "Multi-language code intelligence and Brokk/Bifrost engineering workflows.",
   "author": {
     "name": "Brokk",
     "url": "https://brokk.ai"
@@ -16,5 +16,15 @@
     "tree-sitter"
   ],
   "skills": "./skills/",
+  "agents": [
+    "./agents/architect-reviewer.md",
+    "./agents/devops-reviewer.md",
+    "./agents/dry-reviewer.md",
+    "./agents/issue-diagnostician.md",
+    "./agents/issue-enhancer.md",
+    "./agents/issue-planner.md",
+    "./agents/security-reviewer.md",
+    "./agents/senior-dev-reviewer.md"
+  ],
   "mcpServers": "./.mcp.json"
 }

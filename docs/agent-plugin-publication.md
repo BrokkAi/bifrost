@@ -45,9 +45,11 @@ default plugin toolset is `symbol|extended`, not `searchtools`, so the local
 plugin exposes analyzer navigation and related discovery tools without the
 `activate_workspace` or raw text-file tools.
 
-The plugin manifests also point at `plugins/bifrost-agent/skills`. Keep these
-skills limited to guidance for the default Bifrost MCP toolset unless the
-toolset changes in the same release.
+The plugin manifests also point at `plugins/bifrost-agent/skills` and declare
+the specialist agents under `plugins/bifrost-agent/agents`. Keep the
+code-intelligence skills aligned with the default Bifrost MCP toolset, and keep
+the workflow skills and agents in the same plugin so `brokk@bifrost` remains a
+single installable bundle for code intelligence plus GitHub/review workflows.
 
 ## Local testing
 
@@ -99,10 +101,10 @@ claude plugin validate .
   preparing `plugins/bifrost-agent/bifrost-release.json`.
 - Package the Codex Agent Plugin from `plugins/bifrost-agent` with
   `.codex-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
-  `skills/`, and `assets/icon.png`.
+  `skills/`, `agents/`, and `assets/icon.png`.
 - Package the Claude Code Agent Plugin from `plugins/bifrost-agent` with
   `.claude-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
-  `skills/`, and `assets/icon.png`.
+  `skills/`, `agents/`, and `assets/icon.png`.
 - Validate that the plugin's MCP server entry launches:
   `bifrost --root <resolved-root> --mcp "symbol|extended"`.
 - Confirm that plugin installation and VS Code LSP setup use separate Bifrost
@@ -115,9 +117,13 @@ installs: code navigation, code reading, and codebase search. These skills must
 refer only to tools available through `symbol|extended` or to host-provided
 shell/file-reading tools.
 
-The Brokk `workspace` skill is intentionally excluded because the default
-Bifrost plugin does not expose `activate_workspace`, `get_active_workspace`, or
-`refresh`. Higher-level Brokk workflows such as guided issue resolution, guided
-review, PR review, GitHub issue drafting, today planning, and specialist
-reviewer agents remain Brokk-owned unless a separate tracker issue moves them
-into the Bifrost package.
+The same plugin also owns the Brokk/Bifrost workflow skills for git
+exploration, guided issue resolution, guided review, PR review, ordinary code
+review, work-queue triage, and issue drafting. Keep their specialist agents in
+`plugins/bifrost-agent/agents` and list them in both host manifests.
+
+The Brokk `workspace` skill remains excluded because the default Bifrost plugin
+does not expose `activate_workspace`, `get_active_workspace`, or `refresh`.
+Workflow skills should treat explicit workspace activation as optional host
+capability and continue with the plugin's current workspace root when those
+tools are unavailable.
