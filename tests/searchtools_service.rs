@@ -1751,11 +1751,20 @@ function run() {
         )
         .unwrap();
     let dependency: Value = serde_json::from_str(&dependency_payload).unwrap();
-    assert_scan_usages_failure(
-        &dependency,
-        "lib/request.js#request.js.accepts",
-        "JsTsExportUsageGraphStrategy",
-        "no_graph_seed",
+    assert_eq!(0, array_len(&dependency, "ambiguous"), "{dependency}");
+    assert_eq!(0, array_len(&dependency, "failures"), "{dependency}");
+    assert_eq!(
+        "lib/request.js#request.js.accepts", dependency["usages"][0]["symbol"],
+        "{dependency}"
+    );
+    assert_eq!(1, dependency["usages"][0]["total_hits"], "{dependency}");
+    assert_eq!(
+        "lib/request.js", dependency["usages"][0]["files"][0]["path"],
+        "{dependency}"
+    );
+    assert_eq!(
+        "req.accepts", dependency["usages"][0]["files"][0]["hits"][0]["enclosing"],
+        "{dependency}"
     );
 
     let method_payload = service
