@@ -1,6 +1,14 @@
 use crate::git_file::parse_rev_path;
+use crate::git_file::{read_git_file, resolve_git_file_path};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct GitHistoryOverlay {
+    pub rel_path: PathBuf,
+    pub content: String,
+}
 
 pub fn normalize_tool_arguments(
     tool_name: &str,
@@ -46,6 +54,119 @@ pub fn normalize_tool_arguments(
         _ => {}
     }
     Ok(arguments)
+}
+
+pub fn normalize_tool_arguments_for_cli(
+    tool_name: &str,
+    mut arguments: Value,
+    workspace_root: &Path,
+) -> Result<(Value, Vec<GitHistoryOverlay>), String> {
+    let mut overlays = GitHistoryOverlays::default();
+    match tool_name {
+        "get_summaries" => normalize_cli_string_array_field(
+            &mut arguments,
+            "targets",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "get_symbol_sources" => normalize_cli_string_array_field(
+            &mut arguments,
+            "symbols",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "list_symbols" => normalize_cli_string_array_field(
+            &mut arguments,
+            "file_patterns",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "scan_usages" => {
+            normalize_cli_string_array_field(
+                &mut arguments,
+                "paths",
+                workspace_root,
+                &mut overlays,
+            )?;
+            normalize_cli_object_array_string_field(
+                &mut arguments,
+                "targets",
+                "path",
+                workspace_root,
+                &mut overlays,
+            )?;
+        }
+        "usage_graph" => normalize_cli_string_array_field(
+            &mut arguments,
+            "paths",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "most_relevant_files" => normalize_cli_string_array_field(
+            &mut arguments,
+            "seed_file_paths",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "rename_symbol" => normalize_cli_optional_string_field(
+            &mut arguments,
+            "path",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "get_definition_by_location" | "get_type_by_location" => {
+            normalize_cli_object_array_string_field(
+                &mut arguments,
+                "references",
+                "path",
+                workspace_root,
+                &mut overlays,
+            )?
+        }
+        "find_filenames" => normalize_cli_string_array_field(
+            &mut arguments,
+            "patterns",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "search_file_contents" | "jq" | "xml_skim" | "xml_select" => {
+            normalize_cli_optional_string_field(
+                &mut arguments,
+                "file_path",
+                workspace_root,
+                &mut overlays,
+            )?
+        }
+        "list_files" => normalize_cli_optional_string_field(
+            &mut arguments,
+            "directory_path",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "compute_cyclomatic_complexity"
+        | "compute_cognitive_complexity"
+        | "report_comment_density_for_files"
+        | "report_exception_handling_smells"
+        | "report_test_assertion_smells"
+        | "report_structural_clone_smells"
+        | "report_long_method_and_god_object_smells"
+        | "report_dead_code_and_unused_abstraction_smells" => normalize_cli_string_array_field(
+            &mut arguments,
+            "file_paths",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "get_git_log" => normalize_cli_optional_string_field(
+            &mut arguments,
+            "file_path",
+            workspace_root,
+            &mut overlays,
+        )?,
+        _ => {}
+    }
+
+    let arguments = normalize_tool_arguments(tool_name, arguments, workspace_root)?;
+    Ok((arguments, overlays.into_vec()))
 }
 
 fn normalize_get_file_contents_paths(
@@ -95,6 +216,133 @@ fn normalize_rev_path_part(path: &str, workspace_root: &Path) -> Result<String, 
 
     if let Some(rest) = trimmed.strip_prefix("~/") {
         return Ok(format!("~/{rest}"));
+    }
+
+    normalize_relative_path_preserving_escape(trimmed)
+}
+
+#[derive(Default)]
+struct GitHistoryOverlays {
+    by_rel_path: HashMap<PathBuf, (String, String)>,
+}
+
+impl GitHistoryOverlays {
+    fn add(
+        &mut self,
+        raw: &str,
+        rev: &str,
+        rel_path: PathBuf,
+        abs_path: PathBuf,
+    ) -> Result<(), String> {
+        if let Some((existing_rev, _)) = self.by_rel_path.get(&rel_path) {
+            if existing_rev == rev {
+                return Ok(());
+            }
+            return Err(format!(
+                "cannot use multiple git revisions for `{}` in one --tool analyzer workspace: `{existing_rev}` and `{rev}`",
+                path_to_slash_string(&rel_path)
+            ));
+        }
+        let content = read_git_file(rev, &abs_path)
+            .map_err(|err| format!("failed to read git history path `{raw}`: {err}"))?;
+        self.by_rel_path
+            .insert(rel_path, (rev.to_string(), content));
+        Ok(())
+    }
+
+    fn into_vec(self) -> Vec<GitHistoryOverlay> {
+        self.by_rel_path
+            .into_iter()
+            .map(|(rel_path, (_, content))| GitHistoryOverlay { rel_path, content })
+            .collect()
+    }
+}
+
+fn normalize_cli_string_array_field(
+    arguments: &mut Value,
+    field: &str,
+    workspace_root: &Path,
+    overlays: &mut GitHistoryOverlays,
+) -> Result<(), String> {
+    let Some(array) = arguments.get_mut(field).and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    for item in array {
+        let Some(raw) = item.as_str() else {
+            continue;
+        };
+        if let Some(normalized) = normalize_cli_path_argument(raw, workspace_root, overlays)? {
+            *item = Value::String(normalized);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_cli_optional_string_field(
+    arguments: &mut Value,
+    field: &str,
+    workspace_root: &Path,
+    overlays: &mut GitHistoryOverlays,
+) -> Result<(), String> {
+    let Some(value) = arguments.get_mut(field) else {
+        return Ok(());
+    };
+    let Some(raw) = value.as_str() else {
+        return Ok(());
+    };
+    if let Some(normalized) = normalize_cli_path_argument(raw, workspace_root, overlays)? {
+        *value = Value::String(normalized);
+    }
+    Ok(())
+}
+
+fn normalize_cli_object_array_string_field(
+    arguments: &mut Value,
+    array_field: &str,
+    string_field: &str,
+    workspace_root: &Path,
+    overlays: &mut GitHistoryOverlays,
+) -> Result<(), String> {
+    let Some(array) = arguments.get_mut(array_field).and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    for item in array {
+        normalize_cli_optional_string_field(item, string_field, workspace_root, overlays)?;
+    }
+    Ok(())
+}
+
+fn normalize_cli_path_argument(
+    raw: &str,
+    workspace_root: &Path,
+    overlays: &mut GitHistoryOverlays,
+) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    let Some((rev, path)) = parse_rev_path(trimmed) else {
+        return normalize_mcp_path_argument(raw, workspace_root);
+    };
+
+    let normalized_path = normalize_rev_path_part_inside_workspace(path, workspace_root)?;
+    let rel_path = PathBuf::from(&normalized_path);
+    let abs_path = resolve_git_file_path(&normalized_path, workspace_root);
+    overlays.add(trimmed, rev, rel_path, abs_path)?;
+    Ok(Some(normalized_path))
+}
+
+fn normalize_rev_path_part_inside_workspace(
+    path: &str,
+    workspace_root: &Path,
+) -> Result<String, String> {
+    let trimmed = path.trim();
+    if looks_like_absolute_path(trimmed) {
+        return normalize_absolute_literal_path(trimmed, workspace_root);
+    }
+
+    if trimmed.starts_with("~/") {
+        let abs_path = resolve_git_file_path(trimmed, workspace_root);
+        return normalize_absolute_literal_path(&abs_path.display().to_string(), workspace_root);
     }
 
     normalize_relative_path_preserving_escape(trimmed)

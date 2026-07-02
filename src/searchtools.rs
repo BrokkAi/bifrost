@@ -1851,7 +1851,7 @@ pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>)
             Some(SummaryBlock {
                 label: rel_path_string(&file),
                 path: rel_path_string(&file),
-                preamble: file_preamble(&file, &elements),
+                preamble: file_preamble(analyzer, &file, &elements),
                 fallback_reason,
                 elements,
             })
@@ -1883,7 +1883,7 @@ fn summary_fallback_for_file(
         ));
     }
 
-    excerpt_fallback_elements(file).map(|elements| {
+    excerpt_fallback_elements(analyzer, file).map(|elements| {
         (
             elements,
             Some(
@@ -1905,7 +1905,7 @@ fn include_fallback_elements(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Ve
         return Vec::new();
     }
 
-    let Ok(content) = file.read_to_string() else {
+    let Ok(content) = analyzer.project().read_source(file) else {
         return Vec::new();
     };
     let path = rel_path_string(file);
@@ -1948,8 +1948,11 @@ fn include_fallback_elements(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Ve
     elements
 }
 
-fn excerpt_fallback_elements(file: &ProjectFile) -> Option<Vec<SummaryElement>> {
-    let content = file.read_to_string().ok()?;
+fn excerpt_fallback_elements(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<Vec<SummaryElement>> {
+    let content = analyzer.project().read_source(file).ok()?;
     let sampled = model_context::sample(&content);
     if sampled.text.is_empty() {
         return None;
@@ -4392,7 +4395,7 @@ pub(crate) fn summary_block_for_code_unit(
     Some(SummaryBlock {
         label: display_symbol_for_target(code_unit),
         path: rel_path_string(code_unit.source()),
-        preamble: file_preamble(code_unit.source(), &elements),
+        preamble: file_preamble(analyzer, code_unit.source(), &elements),
         fallback_reason: None,
         elements,
     })
@@ -4547,14 +4550,18 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
     }
 }
 
-fn file_preamble(file: &ProjectFile, elements: &[SummaryElement]) -> String {
+fn file_preamble(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    elements: &[SummaryElement],
+) -> String {
     let Some(first_start_line) = elements.iter().map(|element| element.start_line).min() else {
         return String::new();
     };
     if first_start_line <= 1 {
         return String::new();
     }
-    let Ok(content) = file.read_to_string() else {
+    let Ok(content) = analyzer.project().read_source(file) else {
         return String::new();
     };
     content
@@ -4590,7 +4597,7 @@ fn source_blocks_for_code_unit(
     code_unit: &CodeUnit,
     include_comments: bool,
 ) -> Vec<SourceBlock> {
-    let Ok(content) = code_unit.source().read_to_string() else {
+    let Ok(content) = analyzer.project().read_source(code_unit.source()) else {
         return Vec::new();
     };
 
@@ -4656,7 +4663,7 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
                 return Some(block);
             }
 
-            excerpt_fallback_source_block(&file)
+            excerpt_fallback_source_block(analyzer, &file)
         })
         .collect()
 }
@@ -4695,8 +4702,13 @@ fn include_fallback_source_block(
     })
 }
 
-fn excerpt_fallback_source_block(file: &ProjectFile) -> Option<SourceBlock> {
-    let sampled = excerpt_fallback_elements(file)?.into_iter().next()?;
+fn excerpt_fallback_source_block(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<SourceBlock> {
+    let sampled = excerpt_fallback_elements(analyzer, file)?
+        .into_iter()
+        .next()?;
     Some(SourceBlock {
         label: sampled.path.clone(),
         path: sampled.path,

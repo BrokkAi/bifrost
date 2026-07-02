@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
@@ -9,8 +10,11 @@ use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
 use brokk_bifrost::searchtools_render::RenderOptions;
-use brokk_bifrost::tool_arguments::normalize_tool_arguments;
-use brokk_bifrost::{FileSetProject, SearchToolsService, ToolOutput, collect_workspace_files};
+use brokk_bifrost::tool_arguments::{GitHistoryOverlay, normalize_tool_arguments_for_cli};
+use brokk_bifrost::{
+    FileSetProject, OverlayProject, Project, SearchToolsService, ToolOutput,
+    collect_workspace_files,
+};
 use glob::Pattern;
 use serde_json::{Value, json};
 
@@ -155,12 +159,37 @@ fn run_tool(
     let root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
-    let arguments = normalize_tool_arguments(tool_name, tool_args, &root)?;
-    let service = if tool_sources.is_empty() {
+    let (arguments, overlays) = normalize_tool_arguments_for_cli(tool_name, tool_args, &root)?;
+    let service = if overlays.is_empty() && tool_sources.is_empty() {
         SearchToolsService::new(root.clone())?
-    } else {
+    } else if overlays.is_empty() {
         let rel_paths = resolve_tool_sources(&root, tool_sources)?;
         let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
+        SearchToolsService::new_manual_for_project(project)?
+    } else {
+        let mut rel_paths: BTreeSet<PathBuf> = if tool_sources.is_empty() {
+            collect_workspace_files(&root)
+                .map_err(|err| {
+                    format!(
+                        "Failed to enumerate workspace files under {}: {err}",
+                        root.display()
+                    )
+                })?
+                .into_iter()
+                .map(|file| file.rel_path().to_path_buf())
+                .collect()
+        } else {
+            resolve_tool_sources(&root, tool_sources)?
+                .into_iter()
+                .collect()
+        };
+        for overlay in &overlays {
+            rel_paths.insert(overlay.rel_path.clone());
+        }
+        let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
+        let overlay_project = Arc::new(OverlayProject::new(project));
+        install_git_history_overlays(&root, &overlay_project, overlays)?;
+        let project: Arc<dyn Project> = overlay_project;
         SearchToolsService::new_manual_for_project(project)?
     };
     let output = service
@@ -186,6 +215,23 @@ fn run_tool(
     print!("{text}");
     if !text.ends_with('\n') {
         println!();
+    }
+    Ok(())
+}
+
+fn install_git_history_overlays(
+    root: &Path,
+    project: &OverlayProject,
+    overlays: Vec<GitHistoryOverlay>,
+) -> Result<(), String> {
+    for overlay in overlays {
+        let abs_path = root.join(&overlay.rel_path);
+        if !project.set(abs_path.clone(), overlay.content) {
+            return Err(format!(
+                "git history path `{}` is too large for the analyzer overlay",
+                abs_path.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -377,6 +423,7 @@ USAGE:
 OPTIONS:
     --root DIR             Project root to analyze (default: current directory)
     --args JSON            Inline JSON arguments for --tool, e.g. '{"patterns":["MyClass"]}'.
+                           File path arguments may use <commit-ish>:<path> in --tool mode.
                            Required for tools that take arguments; omit for those that don't
                            (defaults to {}, which suits e.g. get_active_workspace).
     --sources PATH         Restrict one-shot --tool workspace construction to selected files,

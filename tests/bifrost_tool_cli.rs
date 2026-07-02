@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git2::{Repository, Signature};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -18,6 +19,32 @@ fn get_file_contents_args(path: &Path) -> String {
 
 fn get_file_contents_many(paths: &[&str]) -> String {
     serde_json::json!({ "file_paths": paths }).to_string()
+}
+
+fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
+    let mut index = repo.index().unwrap();
+    for path in paths {
+        index.add_path(Path::new(path)).unwrap();
+    }
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = Signature::now("Bifrost Test", "bifrost@example.com").unwrap();
+    let parents = if let Ok(head) = repo.head() {
+        vec![head.peel_to_commit().unwrap()]
+    } else {
+        Vec::new()
+    };
+    let parent_refs: Vec<_> = parents.iter().collect();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &parent_refs,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -41,6 +68,83 @@ fn tool_get_summaries_renders_text() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("A.java"), "{stdout}");
     assert!(stdout.contains("3..52: public class A"), "{stdout}");
+}
+
+#[test]
+fn tool_get_summaries_accepts_git_history_path() {
+    let temp = TempDir::new().expect("temp dir");
+    let root = temp.path();
+    fs::write(
+        root.join("Demo.java"),
+        "class OldDemo {\n  int value() { return 1; }\n}\n",
+    )
+    .expect("write v1");
+    let repo = Repository::init(root).expect("init repo");
+    commit_paths(&repo, &["Demo.java"], "v1");
+    fs::write(
+        root.join("Demo.java"),
+        "class NewDemo {\n  int value() { return 2; }\n}\n",
+    )
+    .expect("write v2");
+    commit_paths(&repo, &["Demo.java"], "v2");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--tool")
+        .arg("get_summaries")
+        .arg("--args")
+        .arg(r#"{"targets":["HEAD~1:Demo.java"]}"#)
+        .output()
+        .expect("run bifrost --tool get_summaries with git history path");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("OldDemo"), "{stdout}");
+    assert!(!stdout.contains("NewDemo"), "{stdout}");
+}
+
+#[test]
+fn tool_get_symbol_sources_accepts_git_history_path() {
+    let temp = TempDir::new().expect("temp dir");
+    let root = temp.path();
+    fs::write(
+        root.join("Demo.java"),
+        "class OldDemo {\n  int value() { return 1; }\n}\n",
+    )
+    .expect("write v1");
+    let repo = Repository::init(root).expect("init repo");
+    commit_paths(&repo, &["Demo.java"], "v1");
+    fs::write(
+        root.join("Demo.java"),
+        "class NewDemo {\n  int value() { return 2; }\n}\n",
+    )
+    .expect("write v2");
+    commit_paths(&repo, &["Demo.java"], "v2");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--tool")
+        .arg("get_symbol_sources")
+        .arg("--args")
+        .arg(r#"{"symbols":["HEAD~1:Demo.java","OldDemo"]}"#)
+        .output()
+        .expect("run bifrost --tool get_symbol_sources with git history path");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("OldDemo"), "{stdout}");
+    assert!(stdout.contains("value() { return 1; }"), "{stdout}");
+    assert!(!stdout.contains("NewDemo"), "{stdout}");
 }
 
 #[test]

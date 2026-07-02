@@ -2,8 +2,8 @@ use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::git_file::{parse_rev_path, read_git_file, resolve_git_file_path};
 use crate::model_context;
 use crate::path_utils::{
-    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
-    rel_path_string,
+    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, has_drive_letter_prefix,
+    normalize_pattern, rel_path_string,
 };
 use glob::{MatchOptions, Pattern};
 use rayon::prelude::*;
@@ -207,6 +207,11 @@ pub fn get_file_contents(
                 }
                 Err(_) => not_found.push(trimmed.to_string()),
             }
+            continue;
+        }
+
+        if has_drive_letter_prefix(&normalize_pattern(trimmed)) {
+            not_found.push(trimmed.to_string());
             continue;
         }
 

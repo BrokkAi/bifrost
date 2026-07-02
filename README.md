@@ -230,7 +230,7 @@ For one-shot terminal use, `bifrost` can also invoke a tool directly without sta
 ./target/debug/bifrost --root /path/to/project --tool get_summaries --args '{"targets":["src/main.rs"]}'
 ```
 
-Direct `--tool` mode prints rendered text by default. The `--args` payload is inline JSON matching the existing tool argument objects, and absolute paths inside the selected workspace are normalized the same way they are for MCP calls. Repeat `--sources PATH` to restrict one-shot workspace construction to explicit files, directories, or glob matches when you do not want to index the entire repo for a simple query.
+Direct `--tool` mode prints rendered text by default. The `--args` payload is inline JSON matching the existing tool argument objects, and absolute paths inside the selected workspace are normalized the same way they are for MCP calls. File-bearing CLI tool arguments also accept git history paths in `<commit-ish>:<path>` form, such as `HEAD~2:src/main.rs`; parser-backed tools build their one-shot analyzer workspace with that historical content. Repeat `--sources PATH` to restrict one-shot workspace construction to explicit files, directories, or glob matches when you do not want to index the entire repo for a simple query.
 
 ```bash
 ./target/debug/bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
