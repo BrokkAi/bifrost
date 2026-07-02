@@ -342,6 +342,7 @@ fn get_file_contents_reports_git_history_errors_in_not_found() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn get_file_contents_prefers_literal_file_over_rev_syntax() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("x:y.txt"), "literal wins\n").unwrap();

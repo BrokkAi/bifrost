@@ -6,7 +6,16 @@ pub(crate) fn parse_rev_path(input: &str) -> Option<(&str, &str)> {
     if rev.is_empty() || path.is_empty() {
         return None;
     }
+    if is_windows_absolute_path_split(rev, path) {
+        return None;
+    }
     Some((rev, path))
+}
+
+fn is_windows_absolute_path_split(rev: &str, path: &str) -> bool {
+    rev.len() == 1
+        && rev.as_bytes()[0].is_ascii_alphabetic()
+        && matches!(path.as_bytes().first(), Some(b'/' | b'\\'))
 }
 
 pub(crate) fn resolve_git_file_path(path: &str, workspace_root: &Path) -> PathBuf {

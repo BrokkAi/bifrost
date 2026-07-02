@@ -527,6 +527,7 @@ mod tests {
     use super::normalize_tool_arguments;
     use serde_json::json;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]
@@ -548,6 +549,20 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_windows_absolute_literal_paths_for_tool_fields() {
+        let root = Path::new("C:/work/root");
+
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": ["C:/work/root/src/A.java"] }),
+            root,
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["file_paths"][0], "src/A.java");
+    }
+
+    #[test]
     fn normalizes_get_file_contents_rev_path_part() {
         let root = TempDir::new().expect("temp dir");
         let src = root.path().join("src");
@@ -559,6 +574,20 @@ mod tests {
             "get_file_contents",
             json!({ "file_paths": [format!("HEAD:{}", file.display())] }),
             root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["file_paths"][0], "HEAD:src/relative.py");
+    }
+
+    #[test]
+    fn normalizes_get_file_contents_windows_rev_path_part() {
+        let root = Path::new("C:/work/root");
+
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": ["HEAD:C:/work/root/src/relative.py"] }),
+            root,
         )
         .expect("normalize");
 
@@ -613,6 +642,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_windows_absolute_paths_outside_workspace() {
+        let root = Path::new("C:/work/root");
+
+        let err = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": ["C:/work/outside/secret.txt"] }),
+            root,
+        )
+        .expect_err("outside path should fail");
+
+        assert!(err.contains("outside active workspace"), "{err}");
+        assert!(err.contains("C:/work/outside/secret.txt"), "{err}");
+    }
+
+    #[test]
     fn normalizes_nonexistent_absolute_paths_inside_workspace() {
         let root = TempDir::new().expect("temp dir");
         let missing = root.path().join("src").join("Missing.java");
@@ -628,6 +672,20 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_nonexistent_windows_absolute_paths_inside_workspace() {
+        let root = Path::new("C:/work/root");
+
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": ["C:/work/root/src/Missing.java"] }),
+            root,
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["file_paths"][0], "src/Missing.java");
+    }
+
+    #[test]
     fn rejects_nonexistent_parent_dir_escapes() {
         let root = TempDir::new().expect("temp dir");
         let raw = format!("{}/../outside/Missing.java", root.path().display());
@@ -636,6 +694,20 @@ mod tests {
             "get_file_contents",
             json!({ "file_paths": [raw] }),
             root.path(),
+        )
+        .expect_err("escaping path should fail");
+
+        assert!(err.contains("outside active workspace"), "{err}");
+    }
+
+    #[test]
+    fn rejects_windows_absolute_parent_dir_escapes() {
+        let root = Path::new("C:/work/root");
+
+        let err = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": ["C:/work/root/../outside/Missing.java"] }),
+            root,
         )
         .expect_err("escaping path should fail");
 
