@@ -116,7 +116,7 @@ pub(super) fn selected_code_unit_declaration_at_cursor(
         .map(|(_, code_unit)| code_unit)
 }
 
-pub(super) fn code_unit_declaration_name_range(
+pub(crate) fn code_unit_declaration_name_range(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     content: &str,

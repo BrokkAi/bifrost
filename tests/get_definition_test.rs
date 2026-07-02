@@ -8468,6 +8468,69 @@ fn python_reexported_function_call_resolves_to_original_definition() {
 }
 
 #[test]
+fn python_reexported_class_alias_resolves_static_members_and_name_range() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/shop/models.py",
+            "from dataclasses import dataclass\n@dataclass\nclass User:\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls(\"guest\")\n    @staticmethod\n    def format_name(name: str) -> str:\n        return name.title()\n",
+        )
+        .file("src/shop/__init__.py", "from .models import User as Account\n")
+        .file(
+            "tests/test_models.py",
+            "from shop import Account\nuser = Account.guest()\nAccount.format_name(\"ada\")\n",
+        )
+        .build();
+
+    let guest_line = "user = Account.guest()";
+    let guest = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tests/test_models.py","line":2,"column":{}}}]}}"#,
+            column_of(guest_line, "guest")
+        ),
+    );
+    let guest_result = &guest["results"][0];
+    assert_eq!(guest_result["status"], "resolved", "{guest}");
+    assert_eq!(
+        guest_result["definitions"][0]["fqn"], "shop.models.User.guest",
+        "{guest}"
+    );
+
+    let format_line = "Account.format_name(\"ada\")";
+    let format_name = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tests/test_models.py","line":3,"column":{}}}]}}"#,
+            column_of(format_line, "format_name")
+        ),
+    );
+    let format_result = &format_name["results"][0];
+    assert_eq!(format_result["status"], "resolved", "{format_name}");
+    assert_eq!(
+        format_result["definitions"][0]["fqn"], "shop.models.User.format_name",
+        "{format_name}"
+    );
+
+    let account = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tests/test_models.py","line":2,"column":{}}}]}}"#,
+            column_of(guest_line, "Account")
+        ),
+    );
+    let account_result = &account["results"][0];
+    assert_eq!(account_result["status"], "resolved", "{account}");
+    assert_eq!(
+        account_result["definitions"][0]["fqn"], "shop.models.User",
+        "{account}"
+    );
+    assert_eq!(
+        account_result["definitions"][0]["start_line"], 3,
+        "{account}"
+    );
+}
+
+#[test]
 fn python_namespace_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("pkg/util.py", "def helper():\n    pass\n")

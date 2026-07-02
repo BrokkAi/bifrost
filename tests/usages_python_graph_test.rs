@@ -138,6 +138,43 @@ def run():
 }
 
 #[test]
+fn reexported_class_alias_receiver_resolves_member_usages() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/shop/models.py",
+            "from dataclasses import dataclass\n@dataclass\nclass User:\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls(\"guest\")\n    @staticmethod\n    def format_name(name: str) -> str:\n        return name.title()\n",
+        )
+        .file("src/shop/__init__.py", "from .models import User as Account\n")
+        .file(
+            "tests/test_models.py",
+            "from shop import Account\nuser = Account.guest()\nAccount.format_name(\"ada\")\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    for (fqn, snippet) in [
+        ("shop.models.User.guest", "Account.guest()"),
+        ("shop.models.User.format_name", "Account.format_name"),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let result = PythonExportUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        );
+        let hits = result
+            .into_either()
+            .unwrap_or_else(|_| panic!("graph should resolve usages for {fqn}"));
+        assert_eq!(hits.len(), 1, "{fqn}: {hits:#?}");
+        let hit = hits.iter().next().expect("one hit");
+        assert_eq!(hit.file, project.file("tests/test_models.py"), "{fqn}");
+        assert!(hit.snippet.contains(snippet), "{fqn}: {hit:#?}");
+    }
+}
+
+#[test]
 fn relative_import_resolves_export_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

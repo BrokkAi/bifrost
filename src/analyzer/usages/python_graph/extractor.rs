@@ -324,6 +324,10 @@ impl ScanCtx<'_> {
             return true;
         }
 
+        if self.target_member.is_some() && self.import_edge_visible_for(expr, node) {
+            return true;
+        }
+
         // `self`/`cls` is implicitly typed as the enclosing class, so a same-file
         // `self.member` access is a usage of that class's member even though the
         // receiver is never assigned a type the way a local or parameter is.
@@ -383,6 +387,18 @@ impl ScanCtx<'_> {
             Some(facts) => facts.resolution_for(expr).is_unknown(),
             None => true,
         }
+    }
+
+    fn import_edge_visible_for(&self, ident: &str, node: Node<'_>) -> bool {
+        if let Some(scope_facts) = self.scope_facts_for_node(node)
+            && scope_facts.is_shadowed(ident)
+        {
+            return false;
+        }
+        if !self.target_self_file && self.local_conflicts.contains(ident) {
+            return false;
+        }
+        self.edges.iter().any(|edge| edge.local_name == ident)
     }
 
     /// Whether the class enclosing `node` is the target member's owner (or a

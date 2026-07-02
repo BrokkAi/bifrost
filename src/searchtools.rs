@@ -12,6 +12,7 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
+use crate::lsp::handlers::broad_symbol::code_unit_declaration_name_range;
 use crate::model_context;
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
@@ -1471,7 +1472,7 @@ fn definition_candidates(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Vec<De
 }
 
 fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DefinitionCandidate> {
-    let range = primary_range(analyzer, unit)?;
+    let range = definition_display_range(analyzer, unit)?;
     Some(DefinitionCandidate {
         fqn: unit.fq_name(),
         path: rel_path_string(unit.source()),
@@ -1481,6 +1482,19 @@ fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Def
         signature: unit.signature().map(str::to_string),
         language: language_name(language_for_target(unit)),
     })
+}
+
+fn definition_display_range(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Range> {
+    let primary = primary_range(analyzer, unit)?;
+    if let Ok(content) = analyzer.project().read_source(unit.source())
+        && let Some(mut name_range) =
+            code_unit_declaration_name_range(analyzer, unit.source(), &content, unit)
+    {
+        name_range.start_line += 1;
+        name_range.end_line += 1;
+        return Some(name_range);
+    }
+    Some(primary)
 }
 
 pub fn get_symbol_ancestors(

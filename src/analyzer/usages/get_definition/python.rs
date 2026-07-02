@@ -59,13 +59,19 @@ pub(super) fn resolve_python(
                 );
             }
             if !object_shadowed
-                && let Some(receiver_type) = ctx.receiver_type_for_object(support, object_text)
+                && let Some(receiver_type) = ctx.receiver_type_for_object(py, support, object_text)
             {
                 return python_member_outcome(analyzer, support, receiver_type, attribute_text);
             }
-            if let Some(receiver_type) =
-                python_receiver_type_unit(analyzer, py, file, source, tree.root_node(), object)
-            {
+            if let Some(receiver_type) = python_receiver_type_unit(
+                analyzer,
+                py,
+                support,
+                file,
+                source,
+                tree.root_node(),
+                object,
+            ) {
                 return python_member_outcome(analyzer, support, receiver_type, attribute_text);
             }
             if object_shadowed {
@@ -128,9 +134,15 @@ pub(super) fn resolve_python(
             // `Foo(a=..)` -> `a` is a member/parameter of the callee's type (e.g. a
             // dataclass field `Foo.a`). Type the callee and look the name up as a
             // member.
-            if let Some(receiver_type) =
-                python_receiver_type_unit(analyzer, py, file, source, tree.root_node(), function)
-            {
+            if let Some(receiver_type) = python_receiver_type_unit(
+                analyzer,
+                py,
+                support,
+                file,
+                source,
+                tree.root_node(),
+                function,
+            ) {
                 return python_member_outcome(analyzer, support, receiver_type, name_text);
             }
             no_definition(
@@ -221,11 +233,12 @@ impl PythonDefinitionContext {
 
     fn receiver_type_for_object(
         &self,
+        py: &PythonAnalyzer,
         support: &DefinitionLookupIndex,
         object: &str,
     ) -> Option<CodeUnit> {
         if let Some(fqn) = self.named.get(object) {
-            return support.fqn(fqn).into_iter().find(|unit| unit.is_class());
+            return python_class_for_fqn(py, support, fqn);
         }
         self.same_file
             .get(object)?
@@ -325,6 +338,18 @@ fn python_fqn_outcome(
     )
 }
 
+fn python_class_for_fqn(
+    py: &PythonAnalyzer,
+    support: &DefinitionLookupIndex,
+    fqn: &str,
+) -> Option<CodeUnit> {
+    support
+        .fqn(fqn)
+        .into_iter()
+        .chain(py.resolve_exported_fqn(fqn))
+        .find(|unit| unit.is_class())
+}
+
 fn python_member_outcome(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
@@ -377,6 +402,7 @@ fn python_workspace_module_exists(support: &DefinitionLookupIndex, module: &str)
 fn python_receiver_type_unit(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -404,11 +430,19 @@ fn python_receiver_type_unit(
             }
             // A class-name receiver: `ClassName.Nested` / `ClassName.member`
             // accesses a member on the class itself.
-            resolve_python_receiver_type(analyzer, file, receiver, false)
+            let class = resolve_python_receiver_type(analyzer, file, receiver, false);
+            if class.is_some() {
+                return class;
+            }
+            let binder = py.import_binder_of(file);
+            let binding = binder.bindings.get(receiver)?;
+            let imported = binding.imported_name.as_ref()?;
+            let fqn = format!("{}.{}", binding.module_specifier, imported);
+            python_class_for_fqn(py, support, &fqn)
         }
         // A call receiver: `Foo().bar` (construction) or `make().bar` (the
         // called function/method's return type).
-        "call" => python_call_result_type(analyzer, py, file, source, root, object),
+        "call" => python_call_result_type(analyzer, py, support, file, source, root, object),
         _ => None,
     }
 }
@@ -419,13 +453,14 @@ fn python_receiver_type_unit(
 fn python_call_result_type(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     call: Node<'_>,
 ) -> Option<CodeUnit> {
     let function = call.child_by_field_name("function")?;
-    let callee = python_resolve_callable(analyzer, py, file, source, root, function)?;
+    let callee = python_resolve_callable(analyzer, py, support, file, source, root, function)?;
     if callee.is_class() {
         return Some(callee);
     }
@@ -437,6 +472,7 @@ fn python_call_result_type(
 fn python_resolve_callable(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -457,7 +493,7 @@ fn python_resolve_callable(
             let receiver = function.child_by_field_name("object")?;
             let method = python_slice(function.child_by_field_name("attribute")?, source);
             let receiver_type =
-                python_receiver_type_unit(analyzer, py, file, source, root, receiver)?;
+                python_receiver_type_unit(analyzer, py, support, file, source, root, receiver)?;
             analyzer
                 .definitions(&format!("{}.{}", receiver_type.fq_name(), method))
                 .next()
