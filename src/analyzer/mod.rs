@@ -36,7 +36,9 @@ pub use capabilities::{
     TypeHierarchyProvider,
 };
 pub(crate) use capabilities::{build_direct_descendant_index, build_reverse_import_index};
-pub use config::AnalyzerConfig;
+pub use config::{
+    AnalyzerConfig, JavaExternalArtifact, JavaExternalDependencies, JavaMavenCoordinate,
+};
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
     include_paths as cpp_include_paths, node_text as cpp_node_text, normalize_cpp_whitespace,

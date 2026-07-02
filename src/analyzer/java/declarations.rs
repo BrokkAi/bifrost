@@ -20,14 +20,7 @@ pub(super) fn determine_package_name(root: Node<'_>, source: &str) -> String {
                 .to_string();
         }
 
-        if matches!(
-            child.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "annotation_type_declaration"
-        ) {
+        if is_class_like_declaration_kind(child.kind()) {
             break;
         }
     }
@@ -271,11 +264,7 @@ pub(super) fn visit_class_like(
                 };
 
                 match child.kind() {
-                    "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-                    | "annotation_type_declaration" => {
+                    kind if is_class_like_declaration_kind(kind) => {
                         stack.push((child, Some(code_unit.clone()), Some(top_level.clone())));
                     }
                     "method_declaration" | "constructor_declaration" => {
@@ -625,6 +614,17 @@ pub(super) fn is_declaration_parent(kind: &str) -> bool {
             | "catch_formal_parameter"
             | "enhanced_for_statement"
             | "resource"
+    )
+}
+
+pub(super) fn is_class_like_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
     )
 }
 

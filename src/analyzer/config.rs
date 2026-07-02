@@ -1,7 +1,44 @@
+use std::path::PathBuf;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyzerConfig {
     pub parallelism: Option<usize>,
     pub memo_cache_budget_bytes: Option<u64>,
+    pub java_external_dependencies: JavaExternalDependencies,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JavaExternalDependencies {
+    pub artifact_paths: Vec<JavaExternalArtifact>,
+    pub coordinates: Vec<JavaMavenCoordinate>,
+    pub repository_roots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JavaExternalArtifact {
+    pub artifact_path: PathBuf,
+    pub source_artifact_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JavaMavenCoordinate {
+    pub group_id: String,
+    pub artifact_id: String,
+    pub version: String,
+}
+
+impl JavaMavenCoordinate {
+    pub fn new(
+        group_id: impl Into<String>,
+        artifact_id: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Self {
+        Self {
+            group_id: group_id.into(),
+            artifact_id: artifact_id.into(),
+            version: version.into(),
+        }
+    }
 }
 
 /// Default analyzer thread-pool size. Honors `BIFROST_PARALLELISM` (a positive integer)
@@ -24,6 +61,7 @@ impl Default for AnalyzerConfig {
         Self {
             parallelism: Some(default_parallelism()),
             memo_cache_budget_bytes: Some(256 * 1024 * 1024),
+            java_external_dependencies: JavaExternalDependencies::default(),
         }
     }
 }
