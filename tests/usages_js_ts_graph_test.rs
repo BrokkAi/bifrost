@@ -1211,6 +1211,32 @@ fn js_commonjs_exports_property_resolves_destructured_require() {
 }
 
 #[test]
+fn js_self_file_scan_keeps_selected_local_require_binding_unshadowed() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "var accepts = require('accepts');\nvar req = {};\nmodule.exports = req;\nreq.accepts = function(){ return accepts(this); };\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.identifier() == "accepts" && cu.short_name() == "request.js.accepts"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("lib/request.js") && hit.snippet.contains("accepts(this)")
+        }),
+        "selected local require binding should stay visible during self-file scan: {hits:?}"
+    );
+}
+
+#[test]
 fn js_commonjs_exports_property_resolves_member_declaration() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

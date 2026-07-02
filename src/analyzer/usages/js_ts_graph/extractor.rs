@@ -35,8 +35,12 @@ pub(super) fn scan_files_for_seeds(
     language: Language,
 ) -> BTreeSet<UsageHit> {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
-    let target_member = member_name(target);
     let target_owner = analyzer.parent_of(target);
+    let target_member = target_owner
+        .as_ref()
+        .is_none_or(|owner| !owner.is_module())
+        .then(|| member_name(target))
+        .flatten();
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
@@ -95,6 +99,7 @@ pub(super) fn scan_files_for_seeds(
             source: source_str,
             line_starts: &line_starts,
             analyzer,
+            target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
             edges: &edges,
@@ -129,6 +134,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
+    target: &'a CodeUnit,
     /// Top-level identifier (the class/function/field's own name component).
     target_short: &'a str,
     /// For members, the member name (e.g. `foo` in `BaseClass.foo`); otherwise None.
@@ -314,7 +320,7 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    if !is_target_owner_declaration_binding(name_node, lhs, ctx) {
+    if !is_target_declaration_binding(name_node, lhs, ctx) {
         ctx.binding_engine.declare_shadow(lhs.to_string());
     }
 
@@ -332,7 +338,9 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) -> String {
-    if let Some(owner) = target_owner {
+    if let Some(owner) = target_owner
+        && !owner.is_module()
+    {
         return owner.identifier().trim_end_matches("$static").to_string();
     }
     if is_static_member(target)
@@ -344,22 +352,35 @@ fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) ->
     target.identifier().trim_end_matches("$static").to_string()
 }
 
-fn is_target_owner_declaration_binding(name_node: Node<'_>, lhs: &str, ctx: &ScanCtx<'_>) -> bool {
+fn is_target_declaration_binding(name_node: Node<'_>, lhs: &str, ctx: &ScanCtx<'_>) -> bool {
     if !ctx.target_self_file || lhs != ctx.target_short {
         return false;
     }
-    let Some(owner) = ctx.target_owner else {
-        return false;
-    };
     let range = Range {
         start_byte: name_node.start_byte(),
         end_byte: name_node.end_byte(),
         start_line: 0,
         end_line: 0,
     };
-    ctx.analyzer
-        .enclosing_code_unit(ctx.file, &range)
-        .is_some_and(|enclosing| &enclosing == owner)
+    if ctx
+        .analyzer
+        .ranges(ctx.target)
+        .iter()
+        .any(|target_range| range_within(&range, target_range))
+    {
+        return true;
+    }
+    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+        return false;
+    };
+    if &enclosing == ctx.target {
+        return true;
+    }
+    ctx.target_owner.is_some_and(|owner| &enclosing == owner)
+}
+
+fn range_within(inner: &Range, outer: &Range) -> bool {
+    outer.start_byte <= inner.start_byte && inner.end_byte <= outer.end_byte
 }
 
 fn register_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
