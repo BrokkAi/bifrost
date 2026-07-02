@@ -5,9 +5,9 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    TypeHierarchyProvider, build_reverse_import_index,
+    ImportInfo, Language, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -23,6 +23,7 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::js_ts::clones::{
     build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
 };
+use crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics;
 use crate::analyzer::js_ts::hierarchy::{
     build_direct_descendant_index_by_unit, extract_ts_supertypes, resolve_direct_ancestors,
 };
@@ -590,6 +591,13 @@ impl IAnalyzer for TypescriptAnalyzer {
     }
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        collect_typescript_semantic_diagnostics(self, file, source, &self.alias_resolver)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

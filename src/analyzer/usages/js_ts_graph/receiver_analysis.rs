@@ -5,7 +5,7 @@
 //! factory calls that return constructed values, and class factory methods whose body
 //! returns a constructed value.
 
-use super::extractor::slice;
+use crate::analyzer::js_ts::syntax::slice;
 use crate::analyzer::usages::get_definition::js_ts::{
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
 };

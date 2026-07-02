@@ -1,6 +1,7 @@
-use crate::analyzer::js_ts::imports::{
-    CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
-    parse_commonjs_require_bindings_from_node, require_call_module_specifier,
+use crate::analyzer::js_ts::imports::require_call_module_specifier;
+use crate::analyzer::js_ts::syntax::{
+    is_commonjs_require_declarator, is_declaration_identifier, is_object_in_member_expression,
+    is_property_key_in_member, slice,
 };
 use crate::analyzer::usages::get_definition::js_ts::{
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
@@ -13,9 +14,7 @@ use crate::analyzer::usages::js_ts_graph::resolver::{
     JsTsUsageIndex, is_static_member, member_name,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::{
-    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, UsageHit,
-};
+use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinder, UsageHit};
 use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
 use crate::analyzer::{AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
@@ -853,10 +852,6 @@ fn name_subtree_mentions_target_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool 
         .any(|child| name_subtree_mentions_target_type(child, ctx))
 }
 
-pub(super) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
-}
-
 fn simple_identifier_text_for_source<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     match node.kind() {
         "identifier" | "type_identifier" | "property_identifier" => {
@@ -895,95 +890,6 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)
-}
-
-// ===================================================================================
-// AST predicates
-// ===================================================================================
-
-pub(super) fn is_declaration_identifier(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    let parent_kind = parent.kind();
-    if matches!(
-        parent_kind,
-        "variable_declarator"
-            | "function_declaration"
-            | "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "type_alias_declaration"
-            | "method_definition"
-            | "method_signature"
-            | "abstract_method_signature"
-            | "public_field_definition"
-            | "property_signature"
-            | "field_definition"
-            | "import_specifier"
-            | "namespace_import"
-            | "import_clause"
-            | "labeled_statement"
-            | "function_signature"
-    ) {
-        if let Some(name_node) = parent.child_by_field_name("name")
-            && name_node.id() == node.id()
-        {
-            return true;
-        }
-        // import_specifier has shape `name as alias`; both sides are declarations.
-        if matches!(
-            parent_kind,
-            "import_specifier" | "namespace_import" | "import_clause"
-        ) {
-            return true;
-        }
-    }
-    if matches!(
-        parent_kind,
-        "formal_parameters"
-            | "required_parameter"
-            | "optional_parameter"
-            | "rest_pattern"
-            | "object_pattern"
-            | "array_pattern"
-            | "pair_pattern"
-            | "assignment_pattern"
-            | "shorthand_property_identifier_pattern"
-    ) {
-        return true;
-    }
-    false
-}
-
-pub(super) fn is_property_key_in_member(node: Node<'_>) -> bool {
-    // Avoid double-counting: when scanning a member_expression we report the property
-    // node directly. The recursive walk also visits the property child, so we must
-    // suppress the visit-time report (handled in handle_member_expression by reporting
-    // and short-circuiting in the parent visitor for those patterns).
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if parent.kind() != "member_expression" {
-        return false;
-    }
-    parent
-        .child_by_field_name("property")
-        .map(|p| p.id() == node.id())
-        .unwrap_or(false)
-}
-
-pub(super) fn is_object_in_member_expression(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if parent.kind() != "member_expression" {
-        return false;
-    }
-    parent
-        .child_by_field_name("object")
-        .map(|object| object.id() == node.id())
-        .unwrap_or(false)
 }
 
 // ===================================================================================
@@ -1426,142 +1332,11 @@ fn unquote(text: &str) -> String {
     stripped.unwrap_or(trimmed).to_string()
 }
 
-// ===================================================================================
-// ImportBinder extraction
-// ===================================================================================
-
-pub(in crate::analyzer::usages) fn compute_import_binder(
-    source: &str,
-    tree: &Tree,
-) -> ImportBinder {
-    let mut binder = ImportBinder::empty();
-    let root = tree.root_node();
-
-    for index_id in 0..root.named_child_count() {
-        let Some(child) = root.named_child(index_id) else {
-            continue;
-        };
-        if child.kind() == "import_statement" {
-            visit_import_statement(child, source, &mut binder);
-        } else if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
-            visit_commonjs_require_statement(child, source, &mut binder);
-        }
-    }
-    binder
-}
-
-fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut ImportBinder) {
-    for binding in parse_commonjs_require_bindings_from_node(node, source) {
-        let (kind, imported_name) = match binding.kind {
-            CommonJsRequireBindingKind::ModuleObject => (ImportKind::CommonJsRequire, None),
-            CommonJsRequireBindingKind::Named => (ImportKind::Named, Some(binding.imported_name)),
-        };
-        binder.bindings.insert(
-            binding.local_name,
-            ImportBinding {
-                module_specifier: binding.module_specifier,
-                kind,
-                imported_name,
-            },
-        );
-    }
-}
-
-fn is_commonjs_require_declarator(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "variable_declarator"
-        && commonjs_require_module_specifier_from_declarator(node, source).is_some()
-}
-
-fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinder) {
-    let Some(source_node) = node.child_by_field_name("source") else {
-        return;
-    };
-    let module_specifier = unquote(slice(source_node, source));
-    if module_specifier.is_empty() {
-        return;
-    }
-
-    // import_clause holds default/namespace/named bindings. Side-effect imports
-    // (`import "./x";`) have no clause and therefore no bindings.
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() != "import_clause" {
-            continue;
-        }
-        let mut clause_cursor = child.walk();
-        for clause_child in child.named_children(&mut clause_cursor) {
-            match clause_child.kind() {
-                "identifier" => {
-                    let local = slice(clause_child, source).to_string();
-                    if !local.is_empty() {
-                        binder.bindings.insert(
-                            local,
-                            ImportBinding {
-                                module_specifier: module_specifier.clone(),
-                                kind: ImportKind::Default,
-                                imported_name: None,
-                            },
-                        );
-                    }
-                }
-                "namespace_import" => {
-                    // namespace_import has a single identifier child (no field name).
-                    let mut ns_cursor = clause_child.walk();
-                    let identifier = clause_child
-                        .named_children(&mut ns_cursor)
-                        .find(|n| n.kind() == "identifier")
-                        .map(|n| slice(n, source).to_string());
-                    if let Some(local) = identifier
-                        && !local.is_empty()
-                    {
-                        binder.bindings.insert(
-                            local,
-                            ImportBinding {
-                                module_specifier: module_specifier.clone(),
-                                kind: ImportKind::Namespace,
-                                imported_name: None,
-                            },
-                        );
-                    }
-                }
-                "named_imports" => {
-                    let mut spec_cursor = clause_child.walk();
-                    for spec in clause_child.named_children(&mut spec_cursor) {
-                        if spec.kind() != "import_specifier" {
-                            continue;
-                        }
-                        let imported_name = spec
-                            .child_by_field_name("name")
-                            .map(|n| slice(n, source).to_string());
-                        let alias = spec
-                            .child_by_field_name("alias")
-                            .map(|n| slice(n, source).to_string());
-                        let local_name = alias
-                            .clone()
-                            .or_else(|| imported_name.clone())
-                            .unwrap_or_default();
-                        if local_name.is_empty() {
-                            continue;
-                        }
-                        binder.bindings.insert(
-                            local_name,
-                            ImportBinding {
-                                module_specifier: module_specifier.clone(),
-                                kind: ImportKind::Named,
-                                imported_name,
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::js_ts::syntax::compute_import_binder;
+    use crate::analyzer::usages::ImportKind;
 
     fn parse_js(source: &str) -> Tree {
         let mut parser = Parser::new();

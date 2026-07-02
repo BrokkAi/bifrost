@@ -5388,6 +5388,119 @@ fn bifrost_lsp_server_rust_semantic_diagnostics_malformed_file_reports_parse_not
 }
 
 #[test]
+fn bifrost_lsp_server_js_ts_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("app.js"),
+        "function run(known) {\n  const local = known;\n  missingValue;\n  local;\n}\n",
+    )
+    .expect("write js fixture");
+    fs::write(
+        temp_root.join("types.ts"),
+        "type Present = string;\nfunction run(value: Present): MissingType {\n  return missingValue;\n}\n",
+    )
+    .expect("write ts fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let js_uri = uri_for(&temp_root.join("app.js"));
+    let ts_uri = uri_for(&temp_root.join("types.ts"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": js_uri}}
+    }));
+    let js_response = server.read_message();
+    let js_items = js_response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {js_response}"));
+    assert!(
+        js_items
+            .iter()
+            .any(|item| item["source"] == "bifrost-javascript"
+                && item["code"] == "js_ts_unrecognized_symbol"
+                && item["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("missingValue"))),
+        "expected missingValue JavaScript semantic diagnostic: {js_response}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": ts_uri}}
+    }));
+    let ts_response = server.read_message();
+    let ts_items = ts_response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {ts_response}"));
+    assert!(
+        ts_items
+            .iter()
+            .any(|item| item["source"] == "bifrost-typescript"
+                && item["code"] == "js_ts_unrecognized_symbol"
+                && item["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("MissingType"))),
+        "expected MissingType TypeScript semantic diagnostic: {ts_response}"
+    );
+    assert!(
+        ts_items
+            .iter()
+            .any(|item| item["source"] == "bifrost-typescript"
+                && item["code"] == "js_ts_unrecognized_symbol"
+                && item["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("missingValue"))),
+        "expected missingValue TypeScript semantic diagnostic: {ts_response}"
+    );
+
+    server.shutdown_with_id(4);
+}
+
+#[test]
+fn bifrost_lsp_server_js_ts_malformed_file_reports_parse_not_semantic_diagnostics() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("broken.js"),
+        "function run( {\n  missingValue;\n}\n",
+    )
+    .expect("write broken js");
+
+    let mut server = LspServer::start(&temp_root);
+    let broken_uri = uri_for(&temp_root.join("broken.js"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": broken_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items
+            .iter()
+            .any(|item| item["source"] == "bifrost-tree-sitter"),
+        "expected parse diagnostic for malformed JavaScript: {response}"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item["source"] != "bifrost-javascript"),
+        "malformed JavaScript must suppress semantic diagnostics: {response}"
+    );
+
+    server.shutdown_with_id(3);
+}
+
+#[test]
 fn bifrost_lsp_server_did_save_triggers_reindex() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
@@ -5801,6 +5914,44 @@ fn bifrost_lsp_server_did_save_publishes_rust_semantic_diagnostics() {
                 .as_str()
                 .is_some_and(|message| message.contains("missing_value"))),
         "expected publishDiagnostics semantic Rust item: {publish}"
+    );
+
+    server.shutdown_with_id(99);
+}
+
+#[test]
+fn bifrost_lsp_server_did_save_publishes_js_ts_semantic_diagnostics() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.ts"), "function run() { return 1; }\n").expect("write fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let ts_uri = uri_for(&temp_root.join("app.ts"));
+
+    fs::write(
+        temp_root.join("app.ts"),
+        "function run(): MissingType {\n  return missingValue;\n}\n",
+    )
+    .expect("rewrite fixture");
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": ts_uri}}
+    }));
+
+    let publish = server.read_notification("textDocument/publishDiagnostics");
+    let items = publish["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
+    assert!(
+        items
+            .iter()
+            .any(|item| item["source"] == "bifrost-typescript"
+                && item["code"] == "js_ts_unrecognized_symbol"
+                && item["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("MissingType"))),
+        "expected publishDiagnostics semantic TypeScript item: {publish}"
     );
 
     server.shutdown_with_id(99);

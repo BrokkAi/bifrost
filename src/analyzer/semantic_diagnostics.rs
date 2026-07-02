@@ -18,7 +18,7 @@ impl ScopeStack {
     }
 
     pub(crate) fn declare(&mut self, name: String) {
-        if name == "_" {
+        if name.is_empty() || name == "_" {
             return;
         }
         if self.scopes.is_empty() {
