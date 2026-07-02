@@ -1,7 +1,7 @@
 {
-  "name": "bifrost",
+  "name": "brokk",
   "version": "0.7.2",
-  "description": "Bifrost analyzer-backed code intelligence over MCP.",
+  "description": "Multi-language code analysis and navigation over MCP.",
   "author": {
     "name": "Brokk",
     "url": "https://brokk.ai"
@@ -18,9 +18,9 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Bifrost for Codex",
-    "shortDescription": "Analyzer-backed code intelligence tools",
-    "longDescription": "Bifrost exposes analyzer-backed code navigation, summaries, reference search, and related-file discovery through a stdio MCP server.",
+    "displayName": "Bifrost by Brokk",
+    "shortDescription": "Multi-language code analysis tools",
+    "longDescription": "Bifrost provides multi-language code navigation, summaries, reference search, and related-file discovery through an analyzer-backed stdio MCP server.",
     "developerName": "Brokk",
     "category": "Developer Tools",
     "capabilities": [
