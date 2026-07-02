@@ -105,6 +105,11 @@ impl<'a> RoleSink<'a> {
         self.push(role, None, target, Some(span_of(name_node)));
     }
 
+    /// Attach a role edge whose name is a precise span inside `target`.
+    pub fn role_named_span(&mut self, role: Role, target: Node<'_>, name: Span) {
+        self.push(role, None, target, Some(name));
+    }
+
     /// Attach a keyword-argument edge (`shell=True` → keyword `shell`,
     /// target the value node).
     pub fn kwarg(&mut self, keyword_node: Node<'_>, value: Node<'_>) {

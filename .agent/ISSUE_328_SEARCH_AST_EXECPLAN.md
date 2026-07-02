@@ -29,7 +29,7 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 - [x] (2026-07-02) Milestone 2: Python structural adapter + matcher + captures + containment; `search_ast` wired end-to-end (MCP descriptor in extended toolset, dispatch arm, provider capability on `IAnalyzer` with `MultiAnalyzer` fan-out). New files: `src/analyzer/structural/{facts,spec,extract,matcher,provider,search}.rs`, `src/analyzer/python/structural.rs`, `tests/structural_search_python.rs` (8 tests). CLI verified: `bifrost --tool search_ast --args '{"match":{"kind":"call","callee":{"name":"eval"},"args":[{"capture":"code"}]},"inside":{"kind":"callable","capture":"fn"}}'` returns the match with `$code`/`$fn` captures and `enclosing_symbol`; malformed queries return path-precise errors.
 - [x] (2026-07-02) Query-language revision after review: dropped `kind_exact`; `kind` now accepts a union array and `not_kind` provides subtype-aware exclusion (see Decision Log). IR, matcher, tool schema, plan, and tests updated; `kind_exact` now fails as an unknown field with the standard path-precise error.
 - [x] (2026-07-02) Milestone 3: planner + cache. `src/analyzer/structural/planner.rs` collects positive literal anchors (exact `name` predicates and `kwargs` keywords from conjunctive pattern positions; negation and regex contribute nothing) and prefilters candidates against the in-memory source before any parse; execution is a rayon per-file map with a per-file match cap of `limit+1`; facts are served from a `StructuralFactsCache` (moka, byte-weighted at `memo_cache_budget_bytes()/8`, keyed by file, validated by an FxHash of the in-memory source) that lives on `TreeSitterAnalyzer` and is shared across clones and incremental `update()` generations; enclosing-symbol lookups run only for the ≤limit returned matches. `tests/structural_search_planner.rs` (6 tests) asserts pruning skips anchor-less files, repeated queries do not re-extract, negation never prunes, glob-excluded files never parse, cross-file truncation is deterministic, and unsupported workspace languages surface as diagnostics. Verified on the bifrost repo itself via CLI (`subprocess.run` receiver query over python_tests/ with java/cpp/etc. diagnostics).
-- [ ] Milestone 4: Java and JS/TS structural adapters; kwargs/decorators/annotations; cross-language acceptance tests.
+- [x] (2026-07-02) Milestone 4: Java and JS/TS structural adapters. `src/analyzer/java/structural.rs` maps Java calls, field accesses, methods/constructors/classes, variable declarators/assignments, imports, annotations, and literals; `src/analyzer/js_ts/structural.rs` maps JavaScript and TypeScript calls/new expressions, member expressions, functions/methods/classes, variable declarators/assignments, imports, decorators, and literals. Java/JS/TS analyzers now expose structural providers through their existing wrapper analyzers. `tests/structural_search_cross_language.rs` proves the same JSON query finds `eval(code)` calls, `password = "hunter2"`-style initializers, and Python decorators / Java annotations / JS/TS decorators across one inferred-language workspace. Verified with `cargo fmt`, `cargo test structural --lib`, `cargo test --test structural_search_python --test structural_search_planner`, `cargo test --test structural_search_cross_language`, and `cargo clippy-no-cuda`.
 - [ ] Milestone 5 (deferred): S-expression frontend compiling to the same `AstQuery`, with `--print-json` style canonical echo.
 
 
@@ -39,8 +39,14 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
   Evidence: `FileState { pub(crate) source: String, ... }` at `src/analyzer/tree_sitter_analyzer.rs:150`; on-demand re-parse helper `parse_tree_sitter_file` in `src/analyzer/usages/parsed_tree.rs` reads from disk today.
   Implication: re-parsing on a facts-cache miss costs CPU only (no disk IO if we parse from `FileState.source`), and tree-sitter parses are typically well under a millisecond per average file. The "lots of re-parsing" worry is bounded by prune-then-parse plus a facts cache; we should not cache `tree_sitter::Tree`s (roughly 10x source size in memory).
 
-- Observation: on this macOS machine the `cargo clippy-no-cuda` alias fails with `error: Unrecognized option: 'all-targets'` (the alias leaks `--all-targets` into clippy-driver), while the identical spelled-out command `cargo clippy --all-targets --features nlp,python -- -D warnings` — run with the rustup 1.96.0 toolchain bin first on PATH so homebrew's cargo/clippy-driver do not shadow it — passes cleanly.
-  Evidence: M1 verification runs, 2026-07-02.
+- Observation: the no-CUDA clippy command is environment-sensitive. An earlier M1 run saw `cargo clippy-no-cuda` fail with `error: Unrecognized option: 'all-targets'`, while the spelled-out command passed under a rustup 1.96.0 toolchain path. In this M4 worktree, Homebrew `cargo 1.96.0` ran the repo alias successfully.
+  Evidence: M1 verification runs and M4 `cargo clippy-no-cuda`, 2026-07-02.
+
+- Observation: JavaScript and TypeScript grammar tables include a non-named `function` token, but Bifrost's structural extractor walks named nodes only, so that token cannot produce facts. The named function-expression shapes are `function_expression` and `generator_function_declaration`.
+  Evidence: `cargo test structural` initially failed the JS/TS kind-table tests with `node type "function" ... does not exist in grammar`; replacing that entry with named node kinds made `cargo test structural --lib` pass.
+
+- Observation: TypeScript decorators on class members can appear as `decorator` siblings under `class_body` immediately before the `method_definition`, while JavaScript decorators in the test fixture are direct children of the `method_definition`.
+  Evidence: the cross-language decorator test initially matched Java, JavaScript, and Python only; after collecting immediately preceding class-body decorator siblings, `cargo test --test structural_search_cross_language` found the TypeScript method as well.
 
 
 ## Decision Log
@@ -121,10 +127,18 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
   Rationale: extended is the low-risk home while the tool stabilizes (the `symbol` toolset is the curated core surface); snippet caps keep rendered output within tool budgets — full content is always reachable via the returned line range.
   Date/Author: 2026-07-02 / dave (M2 implementation).
 
+- Decision: Normalize variable-initializer nodes as `assignment` facts in Java and JS/TS (`variable_declarator`) in addition to true assignment expressions.
+  Rationale: the user-level structural query is "left has this name, right is this value"; local/field variable initialization is the cross-language form of that shape, and the role edges still come from parser fields (`name`/`value`) rather than source-text parsing.
+  Date/Author: 2026-07-02 / dave (M4 implementation).
+
+- Decision: JS/TS decorator extraction accepts both direct declaration children and immediately preceding `class_body` decorator siblings.
+  Rationale: the two grammars expose equivalent decorator syntax in both placements. Treating the sibling form as a decorator role on the following member preserves the normalized query contract without changing match spans.
+  Date/Author: 2026-07-02 / dave (M4 implementation).
+
 
 ## Outcomes & Retrospective
 
-(To be filled in as milestones complete.)
+- 2026-07-02: Milestone 4 completed. `search_ast` now has first-pass Java, JavaScript, and TypeScript structural adapters in addition to Python. Cross-language tests demonstrate the same JSON query matching calls, variable initializers, and decorator/annotation roles across Python, Java, JavaScript, and TypeScript. Remaining planned work is Milestone 5's deferred S-expression frontend.
 
 
 ## Context and Orientation
@@ -340,3 +354,4 @@ In `src/analyzer/i_analyzer.rs` (default `None`; implemented by `TreeSitterAnaly
 ## Revision Notes
 
 - 2026-07-02: Replaced the `kind` / `kind_exact` pair with `kind` (string or union array, each entry subtype-aware) plus `not_kind` (string or array, subtype-aware exclusion, verifier-only). Reason: review feedback (dave) showed `kind_exact` only *differs* from `kind` on abstract kinds, where "exactly `literal`" would select nothing but facts from adapters too coarse to classify — a precision property that belongs in capability diagnostics, not query semantics — while union + exclusion directly express queries like "named functions but not constructors or lambdas". Updated: the query-shape section, Decision Log (superseding entry kept), M1 test description, `src/analyzer/structural/{query,matcher,mod}.rs`, the `search_ast` descriptor text, and both test suites. Note the interface sketch's `fn structural_search_provider(&self)` shipped pluralized as `structural_search_providers(&self) -> Vec<...>` (one provider per language, `MultiAnalyzer` fan-out).
+- 2026-07-02: Completed Milestone 4 with Java, JavaScript, and TypeScript structural specs plus `tests/structural_search_cross_language.rs`. Reason: this validates the normalized adapter boundary against three additional grammars before adding any second query syntax. Updated: progress, discoveries, decisions, outcomes, concrete validation evidence, Java/JS/TS adapter wiring, and cross-language tests.

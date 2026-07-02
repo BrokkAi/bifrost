@@ -7,6 +7,7 @@ mod exceptions;
 mod external;
 mod hierarchy;
 mod imports;
+mod structural;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
@@ -327,6 +328,12 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        vec![&self.inner]
     }
 
     fn get_all_declarations(&self) -> Vec<CodeUnit> {

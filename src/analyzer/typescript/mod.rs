@@ -146,6 +146,10 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
 
         parsed
     }
+
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&crate::analyzer::js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC)
+    }
 }
 
 #[derive(Clone)]
@@ -683,6 +687,13 @@ impl IAnalyzer for TypescriptAnalyzer {
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        vec![&self.inner]
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }
