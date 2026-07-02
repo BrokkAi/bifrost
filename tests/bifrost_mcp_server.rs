@@ -200,6 +200,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
+            "contains_tests",
         ];
         #[cfg(feature = "nlp")]
         let expected = vec![
@@ -241,6 +242,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
+            "contains_tests",
         ];
         expected
     });
@@ -779,6 +781,90 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
     );
     #[cfg(feature = "nlp")]
     assert_server_tool_names(&fixture_root, "nlp", &["semantic_search"]);
+}
+
+#[test]
+fn bifrost_cli_toolset_exposes_contains_tests() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(
+        fixture_root.path().join("SampleTest.java"),
+        r#"
+        import org.junit.jupiter.api.Test;
+
+        public class SampleTest {
+            @Test
+            void works() {}
+        }
+        "#,
+    )
+    .expect("write test file");
+    fs::write(
+        fixture_root.path().join("Production.java"),
+        r#"
+        public class Production {
+            void works() {}
+        }
+        "#,
+    )
+    .expect("write production file");
+
+    let mut child = spawn_server(fixture_root.path(), "cli", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let list_tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    let tools = list_tools["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert!(
+        tool_names(tools).contains(&"contains_tests"),
+        "cli toolset should advertise contains_tests: {list_tools}"
+    );
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "contains_tests",
+                "arguments": {
+                    "file_paths": ["SampleTest.java", "Production.java", "Missing.java"]
+                }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(
+        structured["contains_tests"]["SampleTest.java"], true,
+        "{response}"
+    );
+    assert_eq!(
+        structured["contains_tests"]["Production.java"], false,
+        "{response}"
+    );
+    assert_eq!(
+        structured["unresolved"],
+        json!(["Missing.java"]),
+        "{response}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
 /// When the embedding model cannot load, semantic_search must surface a

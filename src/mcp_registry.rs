@@ -5,7 +5,15 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 
-const SEARCHTOOLS_ORDER: &[&str] = &["symbol", "nlp", "workspace", "extended", "text", "slopcop"];
+const SEARCHTOOLS_ORDER: &[&str] = &[
+    "symbol",
+    "nlp",
+    "workspace",
+    "extended",
+    "text",
+    "slopcop",
+    "cli",
+];
 
 /// The individual toolset names that compose `searchtools`, in registry order.
 /// Exposed so the CLI `--help` can enumerate each toolset and its tools without
@@ -95,15 +103,17 @@ fn expand_toolset(
     seen_hidden: &mut HashSet<String>,
 ) -> Result<(), String> {
     match name {
-        "symbol" | "nlp" | "workspace" | "text" | "extended" | "slopcop" => append_named_toolset(
-            name,
-            render_options,
-            git_repo,
-            descriptors,
-            seen,
-            hidden_tool_names,
-            seen_hidden,
-        ),
+        "symbol" | "nlp" | "workspace" | "text" | "extended" | "slopcop" | "cli" => {
+            append_named_toolset(
+                name,
+                render_options,
+                git_repo,
+                descriptors,
+                seen,
+                hidden_tool_names,
+                seen_hidden,
+            )
+        }
         "core" => {
             for alias in ["symbol", "nlp", "workspace"] {
                 expand_toolset(
@@ -173,6 +183,7 @@ fn descriptors_for_toolset(
         "text" => crate::mcp_text::text_tool_descriptors(),
         "extended" => crate::mcp_extended::extended_tool_descriptors(),
         "slopcop" => crate::mcp_slopcop::slopcop_tool_descriptors(),
+        "cli" => crate::mcp_cli::cli_tool_descriptors(),
         other => panic!("unknown toolset requested from registry: {other}"),
     }
 }
@@ -321,6 +332,7 @@ mod tests {
                 "report_long_method_and_god_object_smells",
                 "report_dead_code_and_unused_abstraction_smells",
                 "report_secret_like_code",
+                "contains_tests",
             ]
             .into_iter()
             .map(str::to_string),

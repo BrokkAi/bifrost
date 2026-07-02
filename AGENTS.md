@@ -33,6 +33,11 @@ the test should stay single-language.
 Prefer handwritten fixture directories or bespoke setup only when the test genuinely needs a larger reusable corpus or
 filesystem behavior that is awkward to express inline.
 
+Avoid low-value tests that only mirror implementation-shaped lists, such as asserting every registry or toolset
+expansion by exact name order, unless that order or membership is itself the user-visible contract being changed.
+Prefer behavior-focused coverage that proves the advertised surface works end to end, for example listing a tool and
+successfully calling it, over tests that duplicate registry construction logic.
+
 # Rust CI Checks
 
 Before pushing Rust changes, run the same core checks that CI enforces locally when practical.

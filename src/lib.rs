@@ -8,6 +8,7 @@ mod git_file;
 pub mod git_tools;
 pub mod hash;
 pub mod lsp;
+pub mod mcp_cli;
 pub mod mcp_common;
 pub mod mcp_core;
 pub mod mcp_extended;
