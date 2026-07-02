@@ -25,7 +25,47 @@ pub fn run_extended_stdio_server(
 }
 
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
+    let pattern_schema_description = "A structural pattern object. Fields (all optional): kind (normalized kind, subtype-aware: declaration, callable, function, method, constructor, lambda, class, import, call, assignment, field_access, identifier, literal, string_literal, numeric_literal, boolean_literal, null_literal, return, throw, catch, if, loop, decorator), kind_exact (exact-kind variant), name (string for exact match or {\"regex\": ...}), text ({\"regex\": ...}), capture (label reported with each match), has / not_has (descendant patterns), and role sub-patterns valid for the declared kind: callee, receiver, args (array), kwargs (object keyed by keyword name), left, right, module, decorators (array), object, field.";
     vec![
+        tool_descriptor(
+            "search_ast",
+            "Search code structure across languages using normalized node kinds instead of grammar-specific node names. Finds shapes like calls to a named function, assignments of literals, decorated functions, or imports of a module, with named captures and enclosing symbols. Use scan_usages instead when you already know the exact symbol; use this for structural shapes.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "match": {
+                        "type": "object",
+                        "description": pattern_schema_description
+                    },
+                    "inside": {
+                        "type": "object",
+                        "description": "Optional containment constraint: the match must be lexically inside a node matching this pattern (same shape as match)."
+                    },
+                    "not_inside": {
+                        "type": "object",
+                        "description": "Optional negative containment: the match must NOT be inside a node matching this pattern."
+                    },
+                    "where": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional project-relative path globs limiting which files are searched."
+                    },
+                    "languages": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional language filter (e.g. \"python\"). Languages without structural support are reported in diagnostics."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 100,
+                        "minimum": 1,
+                        "maximum": 1000,
+                        "description": "Maximum number of matches to return."
+                    }
+                },
+                "required": ["match"]
+            }),
+        ),
         tool_descriptor(
             "get_symbol_locations",
             "Get project-relative file paths and line ranges for known symbols after search_symbols; use before opening exact definitions.",

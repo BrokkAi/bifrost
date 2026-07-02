@@ -99,4 +99,8 @@ impl LanguageAdapter for PythonAdapter {
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&PYTHON_COGNITIVE_CONFIG)
     }
+
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::PYTHON_STRUCTURAL_SPEC)
+    }
 }

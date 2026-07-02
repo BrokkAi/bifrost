@@ -106,6 +106,12 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         None
     }
+    /// Optional structural-search spec (issue #328). Languages that return
+    /// `Some` expose `search_ast` support through
+    /// [`crate::analyzer::structural::StructuralSearchProvider`].
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        None
+    }
 }
 
 pub type BuildProgress = Arc<dyn Fn(BuildProgressEvent) + Send + Sync>;
@@ -1007,6 +1013,12 @@ where
 
     fn file_state(&self, file: &ProjectFile) -> Option<&FileState> {
         self.state.files.get(file)
+    }
+
+    /// The retained source text of an analyzed file. Structural search
+    /// re-parses from this instead of touching disk.
+    pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<&str> {
+        self.file_state(file).map(|state| state.source.as_str())
     }
 
     pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {

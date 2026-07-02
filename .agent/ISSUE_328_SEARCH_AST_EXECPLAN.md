@@ -26,7 +26,7 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 
 - [x] (2026-07-02) Read issue #328 thread; surveyed analyzer/tool architecture; wrote this plan.
 - [x] (2026-07-02) Milestone 1: kind vocabulary + query IR + JSON frontend + validation. `src/analyzer/structural/{mod,kinds,query}.rs` landed with 17 unit tests (`cargo test --lib analyzer::structural`); fmt + clippy clean.
-- [ ] Milestone 2: Python structural adapter + single-file matcher + captures + containment; `search_ast` tool wired end-to-end for Python.
+- [x] (2026-07-02) Milestone 2: Python structural adapter + matcher + captures + containment; `search_ast` wired end-to-end (MCP descriptor in extended toolset, dispatch arm, provider capability on `IAnalyzer` with `MultiAnalyzer` fan-out). New files: `src/analyzer/structural/{facts,spec,extract,matcher,provider,search}.rs`, `src/analyzer/python/structural.rs`, `tests/structural_search_python.rs` (8 tests). CLI verified: `bifrost --tool search_ast --args '{"match":{"kind":"call","callee":{"name":"eval"},"args":[{"capture":"code"}]},"inside":{"kind":"callable","capture":"fn"}}'` returns the match with `$code`/`$fn` captures and `enclosing_symbol`; malformed queries return path-precise errors.
 - [ ] Milestone 3: workspace planner — candidate pruning, parallel parse, moka facts cache, limits, enclosing symbols, capability diagnostics.
 - [ ] Milestone 4: Java and JS/TS structural adapters; kwargs/decorators/annotations; cross-language acceptance tests.
 - [ ] Milestone 5 (deferred): S-expression frontend compiling to the same `AstQuery`, with `--print-json` style canonical echo.
@@ -91,6 +91,18 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 - Decision: Role sub-patterns require the pattern to *declare* a kind, and each role is validated against that kind (`callee` requires `call`; `decorators` accepts any callable/class/declaration kind). A role on a kindless pattern is rejected with a message telling the caller to add `kind`.
   Rationale: inferring `kind: call` from the presence of `callee` is tempting sugar but makes error cases ambiguous; explicit is cheaper for agents than clever.
   Date/Author: 2026-07-02 / dave (M1 implementation).
+
+- Decision: Extraction is two-pass per file: pass 1 walks the tree iteratively creating facts with parent links and a tree-node→fact map, pass 2 re-visits each fact's node for role extraction so role edges can resolve to fact ids regardless of source order. Role targets carry `node: Option<u32>` (fact id) plus a raw span and derived name span; sub-pattern evaluation uses full fact semantics when the target is a fact, and degrades to name/text/capture-only against the span otherwise (kind or nested constraints then fail, they never guess).
+  Rationale: keeps the matcher exact without normalizing every expression form; un-normalized targets (e.g. a dotted module path, a subscript callee) still support the predicates that make sense for them.
+  Date/Author: 2026-07-02 / dave (M2 implementation).
+
+- Decision: A call fact's own `name` is its callee's derived name, and Python `def`s directly inside a `class` body are refined from `function` to `method` via the spec's `refine_kind` hook (nearest-enclosing-fact kind, not raw tree parentage).
+  Rationale: `{ "kind": "call", "name": "eval" }` reads naturally as sugar for the callee constraint; method-vs-function is exactly the "context property" the issue thread wanted without a per-language subtype fork.
+  Date/Author: 2026-07-02 / dave (M2 implementation).
+
+- Decision: `search_ast` lives in the `extended` toolset, first descriptor in the list; match/capture snippets in results are first-line-only, capped at 160 chars.
+  Rationale: extended is the low-risk home while the tool stabilizes (the `symbol` toolset is the curated core surface); snippet caps keep rendered output within tool budgets — full content is always reachable via the returned line range.
+  Date/Author: 2026-07-02 / dave (M2 implementation).
 
 
 ## Outcomes & Retrospective

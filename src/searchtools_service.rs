@@ -408,6 +408,21 @@ impl SearchToolsService {
             "usage_graph" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 usage_graph(workspace.analyzer(), params)
             }),
+            "search_ast" => {
+                let query = crate::analyzer::structural::AstQuery::from_json(&arguments)
+                    .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+                let output = crate::analyzer::structural::execute(snapshot.analyzer(), &query);
+                let rendered_text = output.render_text();
+                let structured = serde_json::to_value(&output).map_err(|err| {
+                    SearchToolsServiceError::internal(format!(
+                        "Failed to serialize tool result: {err}"
+                    ))
+                })?;
+                Ok(ToolOutput::Structured {
+                    structured,
+                    rendered_text: Some(rendered_text),
+                })
+            }
             "analyze_commit" => Self::decode_and_try_run(
                 &snapshot,
                 arguments,

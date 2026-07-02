@@ -5,6 +5,7 @@ mod declarations;
 mod diagnostics;
 mod hierarchy;
 mod imports;
+mod structural;
 mod tests;
 mod usage_index;
 
@@ -766,6 +767,12 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        vec![&self.inner]
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
