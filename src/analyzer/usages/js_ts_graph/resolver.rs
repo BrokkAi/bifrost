@@ -1,7 +1,6 @@
+use crate::analyzer::js_ts::syntax::compute_import_binder;
 use crate::analyzer::usages::common::language_for_target_filtered;
-use crate::analyzer::usages::js_ts_graph::extractor::{
-    compute_export_index, compute_import_binder,
-};
+use crate::analyzer::usages::js_ts_graph::extractor::compute_export_index;
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };

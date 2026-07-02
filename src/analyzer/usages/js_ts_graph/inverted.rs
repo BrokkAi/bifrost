@@ -17,12 +17,13 @@
 //! need module/default-export and type inference); those references are simply not
 //! emitted, mirroring a recall gap rather than a wrong edge.
 
-use super::extractor::{
-    compute_import_binder, is_declaration_identifier, is_object_in_member_expression,
-    is_property_key_in_member, rightmost_jsx_identifier, slice,
-};
+use super::extractor::rightmost_jsx_identifier;
 use super::receiver_analysis::JsTsReceiverFactProvider;
 use super::resolver::{JsTsUsageIndex, collect_jsts_files, tree_sitter_language_for};
+use crate::analyzer::js_ts::syntax::{
+    compute_import_binder, is_declaration_identifier, is_object_in_member_expression,
+    is_property_key_in_member, slice,
+};
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeWeights, UsageEdges, UsageNodeKey, build_edge_weights, build_edges,

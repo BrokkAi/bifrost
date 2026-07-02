@@ -1,9 +1,11 @@
 pub(crate) mod cache;
 pub(crate) mod clones;
+pub(crate) mod diagnostics;
 pub(crate) mod hierarchy;
 pub(crate) mod identifiers;
 pub(crate) mod imports;
 pub(crate) mod model;
+pub(crate) mod syntax;
 pub(crate) mod tests;
 pub(crate) mod tsconfig;
 

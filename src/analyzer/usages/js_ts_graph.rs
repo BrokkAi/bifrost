@@ -53,11 +53,11 @@ use crate::analyzer::{
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
+pub(in crate::analyzer::usages) use crate::analyzer::js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::analyzer::usages::inverted_edges::CallSite;
 use crate::analyzer::usages::inverted_edges::UsageEdgeWeights;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::inverted_edges::UsageNodeKey;
-pub(in crate::analyzer::usages) use extractor::compute_import_binder as compute_jsts_import_binder;
 pub(crate) use inverted::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
 
 /// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per
