@@ -291,6 +291,70 @@ end
 }
 
 #[test]
+fn resolves_autoload_symbol_and_cross_file_constant_usages() {
+    let (project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "lib/shop.rb",
+            r#"
+module Shop
+  autoload :Discount, "shop/discount"
+end
+"#,
+        ),
+        (
+            "lib/shop/discount.rb",
+            r#"
+module Shop
+  class Discount
+  end
+end
+"#,
+        ),
+        (
+            "app/catalog.rb",
+            r#"
+class Catalog
+  def run
+    Shop::Discount.default
+  end
+end
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "Shop$Discount");
+    let provider = FixedCandidateProvider {
+        files: [
+            project.file("lib/shop.rb"),
+            project.file("app/catalog.rb"),
+            project.file("lib/shop/discount.rb"),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let hits = UsageFinder::new()
+        .query_with_provider(&analyzer, &[target], Some(&provider), 100, 100)
+        .result
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == r#"autoload :Discount, "shop/discount""#),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line == "Shop::Discount.default"),
+        "{lines:?}"
+    );
+    assert!(texts.iter().any(|text| text == ":Discount"), "{texts:?}");
+    assert!(texts.iter().any(|text| text == "Discount"), "{texts:?}");
+}
+
+#[test]
 fn reports_terminal_class_segment_for_required_qualified_construction() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[
         (
@@ -809,6 +873,100 @@ end
 
     assert!(lines.iter().any(|line| line == "build"), "{lines:?}");
     assert!(lines.iter().any(|line| line == "self.build"), "{lines:?}");
+}
+
+#[test]
+fn resolves_class_receiver_calls_to_singleton_class_methods() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/product.rb",
+        r#"
+class Product
+  class << self
+    def from_sku(sku)
+      new(sku)
+    end
+  end
+end
+
+class OtherProduct
+  def from_sku(sku)
+  end
+end
+
+class Catalog
+  def run
+    Product.from_sku("sku-1")
+    OtherProduct.new.from_sku("sku-2")
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "Product.from_sku");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == r#"Product.from_sku("sku-1")"#),
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line == r#"OtherProduct.new.from_sku("sku-2")"#),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn resolves_module_function_class_receiver_usages() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/pricing.rb",
+        r#"
+module Pricing
+  module_function
+
+  def tax_rate(region)
+    0.1
+  end
+end
+
+class Region
+  def tax_rate(region)
+  end
+end
+
+class Checkout
+  def run
+    Pricing.tax_rate("EU")
+    Region.new.tax_rate("EU")
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "Pricing.tax_rate");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+
+    assert!(
+        lines.iter().any(|line| line == r#"Pricing.tax_rate("EU")"#),
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line == r#"Region.new.tax_rate("EU")"#),
+        "{lines:?}"
+    );
 }
 
 #[test]

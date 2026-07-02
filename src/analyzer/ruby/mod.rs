@@ -29,6 +29,7 @@ pub(crate) use declarations::{
     RubyFieldScope, extract_name_path, extract_name_segments, parse_ruby_tree,
     ruby_field_short_name, ruby_variable_field_name,
 };
+pub(crate) use imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
 
 #[derive(Clone)]
 pub struct RubyAnalyzer {
@@ -40,6 +41,7 @@ pub struct RubyAnalyzer {
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    autoload_constant_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     zeitwerk_project: Arc<OnceLock<bool>>,
     zeitwerk_autoload_files: Arc<OnceLock<HashSet<ProjectFile>>>,
     zeitwerk_consumer_files: Arc<OnceLock<HashSet<ProjectFile>>>,
@@ -116,6 +118,7 @@ impl RubyAnalyzer {
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
+            autoload_constant_files: Arc::new(OnceLock::new()),
             zeitwerk_project: Arc::new(OnceLock::new()),
             zeitwerk_autoload_files: Arc::new(OnceLock::new()),
             zeitwerk_consumer_files: Arc::new(OnceLock::new()),

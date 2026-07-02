@@ -40,6 +40,15 @@ fn string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn symbol_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "simple_symbol" {
+        return None;
+    }
+    let text = super::declarations::ruby_node_text(node, source).trim();
+    let stripped = text.strip_prefix(':').unwrap_or(text);
+    (!stripped.is_empty()).then(|| stripped.to_string())
+}
+
 /// Resolves the in-project file path of a supported Ruby require target.
 ///
 /// `require_relative` is resolved relative to the requiring file's directory.
@@ -47,6 +56,9 @@ fn string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
 /// matching project file exists.
 fn resolve_required_file(file: &ProjectFile, import: &ImportInfo) -> Option<ProjectFile> {
     let raw_path = import.identifier.as_deref()?;
+    if import.raw_snippet.starts_with("autoload") {
+        return resolve_project_required_file(file, Path::new(raw_path));
+    }
     if import.raw_snippet.starts_with("require_relative") {
         let base = file.rel_path().parent().unwrap_or_else(|| Path::new(""));
         return resolve_relative_required_file(file, &base.join(raw_path));
@@ -66,6 +78,7 @@ fn resolve_project_required_file(file: &ProjectFile, path: &Path) -> Option<Proj
         return None;
     }
     resolve_required_path_candidates(file, path)
+        .or_else(|| resolve_required_path_candidates(file, &Path::new("lib").join(path)))
 }
 
 fn resolve_required_path_candidates(file: &ProjectFile, path: &Path) -> Option<ProjectFile> {
@@ -120,6 +133,32 @@ impl RubyAnalyzer {
             .iter()
             .filter_map(|import| resolve_required_file(file, import))
             .collect()
+    }
+
+    pub(crate) fn autoload_visible_files_for_constant(
+        &self,
+        constant: &str,
+    ) -> HashSet<ProjectFile> {
+        self.autoload_constant_files()
+            .get(constant)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn autoload_constant_files(&self) -> &HashMap<String, HashSet<ProjectFile>> {
+        self.autoload_constant_files.get_or_init(|| {
+            let mut index: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
+            for file in self.inner.all_files() {
+                let Ok(source) = self.inner.project().read_source(file) else {
+                    continue;
+                };
+                let Some(tree) = parse_ruby_tree(&source) else {
+                    continue;
+                };
+                collect_ruby_autoload_edges(file, &source, tree.root_node(), &mut index);
+            }
+            index
+        })
     }
 
     fn has_zeitwerk_autoload_conventions(&self) -> bool {
@@ -291,6 +330,111 @@ impl RubyAnalyzer {
         }
         referencing
     }
+}
+
+fn collect_ruby_autoload_edges(
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    index: &mut HashMap<String, HashSet<ProjectFile>>,
+) {
+    enum Exit {
+        Lexical(usize),
+    }
+
+    let mut stack = vec![(root, false)];
+    let mut lexical_stack: Vec<String> = Vec::new();
+    let mut exits: Vec<Exit> = Vec::new();
+    while let Some((node, exiting)) = stack.pop() {
+        if exiting {
+            if let Some(Exit::Lexical(len)) = exits.pop() {
+                lexical_stack.truncate(len);
+            }
+            continue;
+        }
+
+        let mut pushed_exit = false;
+        if matches!(node.kind(), "class" | "module")
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            let previous_len = lexical_stack.len();
+            let mut segments = lexical_stack.clone();
+            segments.extend(super::declarations::extract_name_segments(name, source));
+            if !segments.is_empty() {
+                lexical_stack = segments;
+                exits.push(Exit::Lexical(previous_len));
+                stack.push((node, true));
+                pushed_exit = true;
+            }
+        }
+
+        if node.kind() == "call"
+            && let Some((constant, path)) = parse_ruby_autoload_call(node, source)
+        {
+            let mut segments = lexical_stack.clone();
+            segments.push(constant);
+            let key = segments.join("$");
+            let files = index.entry(key).or_default();
+            files.insert(file.clone());
+            let import = ImportInfo {
+                raw_snippet: super::declarations::ruby_node_text(node, source)
+                    .trim()
+                    .to_string(),
+                is_wildcard: false,
+                identifier: Some(path),
+                alias: None,
+            };
+            if let Some(required) = resolve_required_file(file, &import) {
+                files.insert(required);
+            }
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push((child, false));
+        }
+        if !pushed_exit {
+            continue;
+        }
+    }
+}
+
+pub(crate) fn parse_ruby_autoload_call(node: Node<'_>, source: &str) -> Option<(String, String)> {
+    let method = node.child_by_field_name("method")?;
+    if super::declarations::ruby_node_text(method, source).trim() != "autoload" {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut args = arguments.named_children(&mut cursor);
+    let constant = symbol_name(args.next()?, source)?;
+    let path = args.find_map(|arg| string_literal_value(arg, source))?;
+    Some((constant, path))
+}
+
+pub(crate) fn is_ruby_autoload_symbol_argument(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "simple_symbol" {
+        return false;
+    }
+    let Some(arguments) = node.parent() else {
+        return false;
+    };
+    if arguments.kind() != "argument_list" {
+        return false;
+    }
+    let mut cursor = arguments.walk();
+    if arguments.named_children(&mut cursor).next() != Some(node) {
+        return false;
+    }
+    let Some(call) = arguments.parent() else {
+        return false;
+    };
+    call.kind() == "call" && parse_ruby_autoload_call(call, source).is_some()
+}
+
+pub(crate) fn ruby_symbol_name(node: Node<'_>, source: &str) -> Option<String> {
+    symbol_name(node, source)
 }
 
 impl ImportAnalysisProvider for RubyAnalyzer {

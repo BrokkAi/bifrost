@@ -351,12 +351,51 @@ impl<'a> RubySemanticIndex<'a> {
         node: Node<'_>,
         source: &str,
     ) -> Option<CodeUnit> {
-        let candidates = constant_lookup_candidates(lexical_stack, node, source)?;
+        let path = extract_name_path(node, source);
+        self.resolve_constant_path(
+            file,
+            visible_files,
+            lexical_stack,
+            &path.segments,
+            path.absolute,
+        )
+    }
+
+    pub(crate) fn resolve_constant_name(
+        &self,
+        file: &ProjectFile,
+        visible_files: &HashSet<ProjectFile>,
+        lexical_stack: &[String],
+        name: &str,
+    ) -> Option<CodeUnit> {
+        self.resolve_constant_path(
+            file,
+            visible_files,
+            lexical_stack,
+            &[name.to_string()],
+            false,
+        )
+    }
+
+    fn resolve_constant_path(
+        &self,
+        file: &ProjectFile,
+        visible_files: &HashSet<ProjectFile>,
+        lexical_stack: &[String],
+        segments: &[String],
+        absolute: bool,
+    ) -> Option<CodeUnit> {
+        let candidates = constant_lookup_candidates(lexical_stack, segments, absolute)?;
 
         candidates.into_iter().find_map(|candidate| {
+            let autoload_files = self.ruby.autoload_visible_files_for_constant(&candidate);
             self.analyzer
                 .definitions(&candidate)
-                .find(|unit| visible_files.contains(unit.source()) || unit.source() == file)
+                .find(|unit| {
+                    visible_files.contains(unit.source())
+                        || unit.source() == file
+                        || autoload_files.contains(unit.source())
+                })
                 .cloned()
         })
     }
@@ -766,6 +805,10 @@ impl RubyWalkState<'_, '_> {
     }
 
     fn record_constant_reference(&mut self, node: Node<'_>) {
+        if crate::analyzer::ruby::is_ruby_autoload_symbol_argument(node, self.scan.source) {
+            self.record_autoload_symbol_constant_reference(node);
+            return;
+        }
         if !matches!(node.kind(), "constant" | "scope_resolution") || is_declaration_constant(node)
         {
             return;
@@ -779,6 +822,21 @@ impl RubyWalkState<'_, '_> {
         ) && self.scan.semantic.target_matches_constant(&unit)
         {
             self.record_hit(constant_hit_node(node));
+        }
+    }
+
+    fn record_autoload_symbol_constant_reference(&mut self, node: Node<'_>) {
+        let Some(name) = crate::analyzer::ruby::ruby_symbol_name(node, self.scan.source) else {
+            return;
+        };
+        if let Some(unit) = self.scan.semantic.resolve_constant_name(
+            self.scan.file,
+            &self.scan.visible_files,
+            &self.lexical_stack,
+            &name,
+        ) && self.scan.semantic.target_matches_constant(&unit)
+        {
+            self.record_hit(node);
         }
     }
 
@@ -1560,6 +1618,9 @@ pub(crate) fn is_singleton_method_declaration(analyzer: &dyn IAnalyzer, target: 
     if node.kind() == "singleton_method" {
         return true;
     }
+    if module_function_applies_to_method(node, &source) {
+        return true;
+    }
     let mut parent = node.parent();
     while let Some(current) = parent {
         if current.kind() == "singleton_class" {
@@ -1571,6 +1632,92 @@ pub(crate) fn is_singleton_method_declaration(analyzer: &dyn IAnalyzer, target: 
         parent = current.parent();
     }
     false
+}
+
+fn module_function_applies_to_method(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "method" {
+        return false;
+    }
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let method_name = node_text(name_node, source);
+    let Some(module) = enclosing_module_for_module_function(node) else {
+        return false;
+    };
+    let Some(body) = module.child_by_field_name("body") else {
+        return false;
+    };
+    let mut bare_module_function_active = false;
+    let mut stack = Vec::new();
+    push_children_before(body, node.start_byte(), &mut stack);
+    while let Some(current) = stack.pop() {
+        if current.start_byte() >= node.start_byte() {
+            continue;
+        }
+        if current.kind() == "identifier" && node_text(current, source) == "module_function" {
+            bare_module_function_active = true;
+            continue;
+        }
+        if current.kind() == "call"
+            && let Some(method) = current.child_by_field_name("method")
+            && node_text(method, source) == "module_function"
+        {
+            if module_function_names(current, source).next().is_none() {
+                bare_module_function_active = true;
+            } else if module_function_names(current, source).any(|name| name == method_name) {
+                return true;
+            }
+            continue;
+        }
+        if matches!(
+            current.kind(),
+            "class" | "module" | "method" | "singleton_method"
+        ) {
+            continue;
+        }
+        push_children_before(current, node.start_byte(), &mut stack);
+    }
+    bare_module_function_active
+}
+
+fn enclosing_module_for_module_function(node: Node<'_>) -> Option<Node<'_>> {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        match current.kind() {
+            "module" => return Some(current),
+            "class" => return None,
+            _ => parent = current.parent(),
+        }
+    }
+    None
+}
+
+fn push_children_before<'tree>(
+    node: Node<'tree>,
+    before_byte: usize,
+    stack: &mut Vec<Node<'tree>>,
+) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index)
+            && child.start_byte() < before_byte
+        {
+            stack.push(child);
+        }
+    }
+}
+
+fn module_function_names<'a>(node: Node<'_>, source: &'a str) -> impl Iterator<Item = String> + 'a {
+    let mut names = Vec::new();
+    if let Some(arguments) = node.child_by_field_name("arguments") {
+        let mut cursor = arguments.walk();
+        for arg in arguments.named_children(&mut cursor) {
+            if let Some(name) = symbol_or_string_value(arg, source) {
+                names.push(name);
+            }
+        }
+    }
+    names.into_iter()
 }
 
 pub(crate) fn is_declaration_constant(node: Node<'_>) -> bool {
@@ -1696,28 +1843,27 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 
 fn constant_lookup_candidates(
     lexical_stack: &[String],
-    node: Node<'_>,
-    source: &str,
+    segments: &[String],
+    absolute: bool,
 ) -> Option<Vec<String>> {
-    let path = extract_name_path(node, source);
-    if path.segments.is_empty() {
+    if segments.is_empty() {
         return None;
     }
 
-    let name = path.segments.join("$");
+    let name = segments.join("$");
     let mut candidates = Vec::new();
-    if !path.absolute {
+    if !absolute {
         for owner in lexical_stack.iter().rev() {
             candidates.push(format!("{owner}${name}"));
         }
     }
     candidates.push(name);
 
-    let Some((constant_name, owner_segments)) = path.segments.split_last() else {
+    let Some((constant_name, owner_segments)) = segments.split_last() else {
         return Some(candidates);
     };
     if owner_segments.is_empty() {
-        if !path.absolute {
+        if !absolute {
             for owner in lexical_stack.iter().rev() {
                 candidates.push(format!("{owner}.{constant_name}"));
             }
@@ -1726,7 +1872,7 @@ fn constant_lookup_candidates(
     }
 
     let owner_name = owner_segments.join("$");
-    if !path.absolute {
+    if !absolute {
         for owner in lexical_stack.iter().rev() {
             candidates.push(format!("{owner}${owner_name}.{constant_name}"));
         }

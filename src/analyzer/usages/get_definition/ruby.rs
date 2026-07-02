@@ -39,7 +39,7 @@ pub(super) fn resolve_ruby(
         site.focus_start_byte,
     );
 
-    match ruby_reference_node(node) {
+    match ruby_reference_node(node, source) {
         Some(RubyReferenceNode::Constant(constant)) => {
             if ruby_is_declaration_constant(constant) {
                 return no_definition(
@@ -48,6 +48,9 @@ pub(super) fn resolve_ruby(
                 );
             }
             ruby_constant_outcome(&semantic, file, &visible_files, &context, constant, source)
+        }
+        Some(RubyReferenceNode::AutoloadSymbol(symbol)) => {
+            ruby_autoload_symbol_outcome(&semantic, file, &visible_files, &context, symbol, source)
         }
         Some(RubyReferenceNode::Method { call, method }) => ruby_method_outcome(
             support,
@@ -100,6 +103,7 @@ pub(super) fn resolve_ruby(
 
 enum RubyReferenceNode<'tree> {
     Constant(Node<'tree>),
+    AutoloadSymbol(Node<'tree>),
     Method {
         call: Option<Node<'tree>>,
         method: Node<'tree>,
@@ -108,11 +112,16 @@ enum RubyReferenceNode<'tree> {
     Variable(Node<'tree>),
 }
 
-fn ruby_reference_node(node: Node<'_>) -> Option<RubyReferenceNode<'_>> {
+fn ruby_reference_node<'tree>(node: Node<'tree>, source: &str) -> Option<RubyReferenceNode<'tree>> {
     match node.kind() {
         "constant" => Some(RubyReferenceNode::Constant(ruby_focused_constant_path(
             node,
         ))),
+        "simple_symbol"
+            if crate::analyzer::ruby::is_ruby_autoload_symbol_argument(node, source) =>
+        {
+            Some(RubyReferenceNode::AutoloadSymbol(node))
+        }
         "scope_resolution" => Some(RubyReferenceNode::Constant(node)),
         "instance_variable" | "class_variable" => Some(RubyReferenceNode::Variable(node)),
         "identifier" => {
@@ -174,6 +183,32 @@ fn ruby_constant_outcome(
     let raw = ruby_node_text(node, source);
     let Some(unit) =
         semantic.resolve_constant(file, visible_files, &context.lexical_stack, node, source)
+    else {
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{raw}` did not resolve to an indexed Ruby definition"),
+        );
+    };
+    candidates_outcome(vec![unit])
+}
+
+fn ruby_autoload_symbol_outcome(
+    semantic: &RubySemanticIndex<'_>,
+    file: &ProjectFile,
+    visible_files: &HashSet<ProjectFile>,
+    context: &RubyLookupContext,
+    node: Node<'_>,
+    source: &str,
+) -> DefinitionLookupOutcome {
+    let raw = ruby_node_text(node, source);
+    let Some(name) = crate::analyzer::ruby::ruby_symbol_name(node, source) else {
+        return no_definition(
+            "unsupported_ruby_reference_shape",
+            format!("`{raw}` is not a Ruby autoload constant symbol"),
+        );
+    };
+    let Some(unit) =
+        semantic.resolve_constant_name(file, visible_files, &context.lexical_stack, &name)
     else {
         return no_definition(
             "no_indexed_definition",

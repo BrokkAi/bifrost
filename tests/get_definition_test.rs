@@ -209,6 +209,124 @@ end
 }
 
 #[test]
+fn ruby_get_definition_resolves_autoload_symbol_to_constant() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/shop.rb",
+            r#"module Shop
+  class Discount
+  end
+
+  autoload :Discount, "shop/discount"
+end
+"#,
+        )
+        .build();
+
+    let line = r#"  autoload :Discount, "shop/discount""#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib/shop.rb","line":5,"column":{}}}]}}"#,
+            column_of(line, "Discount")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Shop$Discount", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "lib/shop.rb", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_resolves_cross_file_autoload_constant_path() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/shop.rb",
+            r#"module Shop
+  autoload :Discount, "shop/discount"
+end
+"#,
+        )
+        .file(
+            "lib/shop/discount.rb",
+            r#"module Shop
+  class Discount
+    def self.default
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "app/catalog.rb",
+            r#"class Catalog
+  def run
+    Shop::Discount.default
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    Shop::Discount.default";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/catalog.rb","line":3,"column":{}}}]}}"#,
+            column_of(line, "Discount")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Shop$Discount", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "lib/shop/discount.rb",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_module_function_class_receiver_call() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/pricing.rb",
+            r#"module Pricing
+  module_function
+
+  def tax_rate(region)
+    0.1
+  end
+end
+
+class Checkout
+  def run
+    Pricing.tax_rate("EU")
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = r#"    Pricing.tax_rate("EU")"#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/pricing.rb","line":11,"column":{}}}]}}"#,
+            column_of(line, "tax_rate")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Pricing.tax_rate",
+        "{value}"
+    );
+}
+
+#[test]
 fn ruby_get_definition_resolves_mixin_methods_by_receiver_polarity() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(
