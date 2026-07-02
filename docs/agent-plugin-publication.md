@@ -4,6 +4,8 @@ This is the Bifrost-owned publication path for making the MCP server
 discoverable as an Agent Plugin. The shared package lives in
 `plugins/bifrost-agent`. Codex uses `.agents/plugins/marketplace.json` for the
 repo-local marketplace, while Claude Code uses `.claude-plugin/marketplace.json`.
+Both marketplace manifests use the public namespace `bifrost`, while the
+plugin's stable install name remains `brokk`.
 
 ## Plugin shape
 
@@ -11,7 +13,7 @@ The Codex plugin manifest lives at
 `plugins/bifrost-agent/.codex-plugin/plugin.json`. The Claude Code manifest
 lives at `plugins/bifrost-agent/.claude-plugin/plugin.json`. Keep both manifest
 versions aligned with `Cargo.toml` and keep the stable plugin `name` as
-`bifrost`. Use `Bifrost for Codex` only for Codex-facing display text.
+`brokk`. Use `Bifrost by Brokk` for Codex-facing display text.
 
 The companion MCP configuration lives at `plugins/bifrost-agent/.mcp.json`:
 
@@ -67,6 +69,15 @@ session using the canonical local testing steps in
 `BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost"` before starting the host.
 Then call a lightweight analyzer tool such as `get_summaries` or
 `search_symbols` from the fresh session.
+
+Public GitHub installs use the same `brokk@bifrost` name in both hosts:
+
+```bash
+codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse plugins
+codex plugin add brokk@bifrost
+claude plugin marketplace add BrokkAi/bifrost --sparse .claude-plugin plugins
+claude plugin install brokk@bifrost
+```
 
 Validate that the plugin manifest versions match `Cargo.toml` and that all
 plugin JSON files, skill files, and launcher metadata parse:

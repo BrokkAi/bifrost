@@ -3,12 +3,14 @@
 This package installs Bifrost's MCP server configuration as an agent plugin for
 Codex and Claude Code. It does not bundle the Bifrost binary or the Brokk host
 workflow skills; it installs a launcher that resolves a released Bifrost binary
-and makes a code-intelligence subset of the `bifrost` MCP tools discoverable
-through each host's plugin system. It also includes Bifrost-owned skills for
-using that default MCP toolset effectively.
+and makes a multi-language code analysis subset of the `bifrost` MCP tools
+discoverable through each host's plugin system. It also includes Bifrost-owned
+skills for using that default MCP toolset effectively.
 
-The plugin's stable install name is `bifrost`. The Codex UI-facing display name
-is `Bifrost for Codex`; Claude Code uses the shared `bifrost` package metadata.
+The plugin's stable install name is `brokk`. The Codex UI-facing display name
+is `Bifrost by Brokk`; Claude Code uses the shared plugin package metadata.
+The public marketplace namespace is `bifrost`, so installs read as
+`brokk@bifrost`.
 
 The plugin starts `./bin/bifrost-launcher.mjs --mcp "symbol|extended"`.
 The launcher always starts Bifrost with an explicit `--root`, using
@@ -37,14 +39,20 @@ cargo build --bin bifrost
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" node plugins/bifrost-agent/bin/bifrost-launcher.mjs --root . --mcp "symbol|extended"
 ```
 
-## Codex Local Marketplace Install
+## Codex Install
 
-From the repository root, add this checkout as a local marketplace and install
-the Codex plugin:
+Add the Brokk marketplace from GitHub, then install Bifrost:
+
+```bash
+codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse plugins
+codex plugin add brokk@bifrost
+```
+
+For local development from a checkout, add the repository root instead:
 
 ```bash
 codex plugin marketplace add "$(pwd)"
-codex plugin add bifrost@bifrost-local
+codex plugin add brokk@bifrost
 ```
 
 For a local checkout build, start Codex with this repository's debug binary
@@ -94,6 +102,18 @@ workflows such as guided issue resolution, guided review, PR review, issue
 drafting, today planning, and specialist reviewer agents remain in the Brokk
 host plugin until they are intentionally made Bifrost-owned.
 
+## Claude Code Install
+
+Add the Brokk marketplace from GitHub, then install Bifrost:
+
+```bash
+claude plugin marketplace add BrokkAi/bifrost --sparse .claude-plugin plugins
+claude plugin install brokk@bifrost
+```
+
+Start a fresh Claude Code session after installing the plugin so the MCP server
+configuration is loaded at startup.
+
 ## Claude Code Local Testing
 
 From the repository root, start Claude Code with this package directory:
@@ -110,7 +130,7 @@ To test the repository as a local Claude Code marketplace, run:
 
 ```bash
 claude plugin marketplace add "$(pwd)"
-claude plugin install bifrost@bifrost-marketplace --scope local
+claude plugin install brokk@bifrost --scope local
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude
 ```
 

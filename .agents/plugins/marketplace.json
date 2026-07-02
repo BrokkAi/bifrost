@@ -1,15 +1,16 @@
 {
-  "name": "bifrost-local",
+  "name": "bifrost",
   "interface": {
-    "displayName": "Bifrost for Codex Local"
+    "displayName": "Bifrost"
   },
   "plugins": [
     {
-      "name": "bifrost",
+      "name": "brokk",
       "source": {
         "source": "local",
         "path": "./plugins/bifrost-agent"
       },
+      "description": "Multi-language code analysis and navigation powered by Bifrost.",
       "policy": {
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"

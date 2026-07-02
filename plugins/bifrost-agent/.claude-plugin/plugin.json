@@ -1,7 +1,7 @@
 {
-  "name": "bifrost",
+  "name": "brokk",
   "version": "0.7.2",
-  "description": "Bifrost analyzer-backed code intelligence over MCP.",
+  "description": "Multi-language code analysis and navigation over MCP.",
   "author": {
     "name": "Brokk",
     "url": "https://brokk.ai"
