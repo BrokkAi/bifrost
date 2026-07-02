@@ -122,7 +122,7 @@ impl StructuralSpec for PythonStructuralSpec {
             NormalizedKind::Call => {
                 if let Some(function) = node.child_by_field_name("function") {
                     if let Some(name) = expression_name_node(function) {
-                        sink.role_named(Role::Callee, function, name);
+                        sink.role_named(Role::Callee, name, name);
                         // A call's own name is its callee's, so
                         // { "kind": "call", "name": "eval" } reads naturally.
                         sink.set_name(name);

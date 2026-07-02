@@ -10,6 +10,7 @@ use super::facts::FileFacts;
 use super::matcher::FactMatch;
 use super::query::AstQuery;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use crate::path_utils::rel_path_string;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -17,6 +18,9 @@ use std::sync::Arc;
 /// Longest match/capture snippet reported inline; full content is always
 /// reachable via the returned line range.
 const SNIPPET_MAX_CHARS: usize = 160;
+const MAX_SCANNED_FILES: usize = 20_000;
+const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_FACT_NODES: usize = 2_000_000;
 
 #[derive(Debug, Serialize)]
 pub struct SearchAstOutput {
@@ -59,6 +63,39 @@ type PendingMatch = (Language, ProjectFile, Arc<FileFacts>, FactMatch);
 
 /// Run `query` across every language provider the analyzer exposes.
 pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
+    execute_with_limits(analyzer, query, SearchAstExecutionLimits::default())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SearchAstExecutionLimits {
+    pub max_scanned_files: usize,
+    pub max_scanned_source_bytes: usize,
+    pub max_fact_nodes: usize,
+}
+
+impl Default for SearchAstExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_scanned_files: MAX_SCANNED_FILES,
+            max_scanned_source_bytes: MAX_SCANNED_SOURCE_BYTES,
+            max_fact_nodes: MAX_FACT_NODES,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SearchAstExecutionBudget {
+    scanned_files: usize,
+    scanned_source_bytes: usize,
+    fact_nodes: usize,
+}
+
+#[doc(hidden)]
+pub fn execute_with_limits(
+    analyzer: &dyn IAnalyzer,
+    query: &AstQuery,
+    limits: SearchAstExecutionLimits,
+) -> SearchAstOutput {
     let mut providers = analyzer.structural_search_providers();
     providers.sort_by_key(|provider| provider.structural_language());
     providers.retain(|provider| {
@@ -159,16 +196,33 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
     let anchors = super::planner::collect_anchors(query);
     let global_cap = query.limit.saturating_add(1);
     let mut pending: Vec<PendingMatch> = Vec::new();
+    let mut budget = SearchAstExecutionBudget::default();
+    let mut budget_exhausted = false;
     for (language, provider, file) in candidates {
         let Some(source) = provider.structural_source(&file) else {
             continue;
         };
+        budget.scanned_files += 1;
+        budget.scanned_source_bytes = budget.scanned_source_bytes.saturating_add(source.len());
+        if budget.scanned_files > limits.max_scanned_files
+            || budget.scanned_source_bytes > limits.max_scanned_source_bytes
+        {
+            push_budget_diagnostic(&mut diagnostics, &budget);
+            budget_exhausted = true;
+            break;
+        }
         if !super::planner::source_may_match(source, &anchors) {
             continue;
         }
         let Some(facts) = provider.structural_facts(&file) else {
             continue;
         };
+        budget.fact_nodes = budget.fact_nodes.saturating_add(facts.nodes().len());
+        if budget.fact_nodes > limits.max_fact_nodes {
+            push_budget_diagnostic(&mut diagnostics, &budget);
+            budget_exhausted = true;
+            break;
+        }
         let remaining = global_cap - pending.len();
         for fact_match in super::matcher::match_query(query, &facts, remaining) {
             pending.push((language, file.clone(), Arc::clone(&facts), fact_match));
@@ -178,7 +232,7 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
         }
     }
 
-    let truncated = pending.len() > query.limit;
+    let truncated = pending.len() > query.limit || budget_exhausted;
     pending.truncate(query.limit);
 
     // Enclosing-symbol lookups only for the matches actually returned.
@@ -196,11 +250,24 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
     }
 }
 
+fn push_budget_diagnostic(
+    diagnostics: &mut Vec<SearchAstDiagnostic>,
+    budget: &SearchAstExecutionBudget,
+) {
+    diagnostics.push(SearchAstDiagnostic {
+        language: "workspace",
+        message: format!(
+            "search_ast execution budget exhausted after scanning {} files, {} bytes, and {} facts; refine the query with where, languages, kind/name anchors, or a narrower pattern",
+            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+        ),
+    });
+}
+
 fn file_matches_globs(file: &ProjectFile, query: &AstQuery) -> bool {
     if query.where_globs.is_empty() {
         return true;
     }
-    let rel_path = file.rel_path().to_string_lossy().replace('\\', "/");
+    let rel_path = rel_path_string(file);
     query.where_globs.iter().any(|glob| glob.matches(&rel_path))
 }
 
@@ -222,7 +289,7 @@ fn render_match(
         })
         .collect();
     SearchAstMatch {
-        path: file.rel_path().display().to_string(),
+        path: rel_path_string(file),
         language: language.config_label(),
         kind: fact.kind.label(),
         start_line: fact.range.start_line,

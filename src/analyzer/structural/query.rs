@@ -142,7 +142,14 @@ impl Pattern {
         match role {
             Role::Arg => &self.args,
             Role::Decorator => &self.decorators,
-            _ => &[],
+            Role::Callee
+            | Role::Receiver
+            | Role::Kwarg
+            | Role::Left
+            | Role::Right
+            | Role::Module
+            | Role::Object
+            | Role::Field => &[],
         }
     }
 
@@ -784,7 +791,14 @@ fn decode_role_fields(
             match role {
                 Role::Arg => pattern.args = patterns,
                 Role::Decorator => pattern.decorators = patterns,
-                _ => unreachable!("non-list role"),
+                Role::Callee
+                | Role::Receiver
+                | Role::Kwarg
+                | Role::Left
+                | Role::Right
+                | Role::Module
+                | Role::Object
+                | Role::Field => unreachable!("non-list role"),
             }
         }
     }
@@ -880,6 +894,7 @@ fn string_predicate_to_json(predicate: &StringPredicate) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::super::kinds::ALL_ROLES;
     use super::*;
 
     fn parse(json: Value) -> Result<AstQuery, QueryError> {
@@ -1152,6 +1167,56 @@ mod tests {
             }
         }));
         assert_eq!(error.path, "match.text.regex");
+    }
+
+    #[test]
+    fn role_accessors_cover_every_role_category() {
+        let sub = Pattern {
+            capture: Some("target".to_string()),
+            ..Pattern::default()
+        };
+        let mut pattern = Pattern {
+            callee: Some(Box::new(sub.clone())),
+            receiver: Some(Box::new(sub.clone())),
+            args: vec![sub.clone()],
+            kwargs: vec![("named".to_string(), sub.clone())],
+            left: Some(Box::new(sub.clone())),
+            right: Some(Box::new(sub.clone())),
+            module: Some(Box::new(sub.clone())),
+            decorators: vec![sub.clone()],
+            object: Some(Box::new(sub.clone())),
+            field: Some(Box::new(sub.clone())),
+            ..Pattern::default()
+        };
+
+        for &role in ALL_ROLES {
+            match role {
+                Role::Callee
+                | Role::Receiver
+                | Role::Left
+                | Role::Right
+                | Role::Module
+                | Role::Object
+                | Role::Field => {
+                    assert!(pattern.single_role_pattern(role).is_some(), "{role:?}");
+                    assert!(pattern.list_role_patterns(role).is_empty(), "{role:?}");
+                }
+                Role::Arg | Role::Decorator => {
+                    assert!(pattern.single_role_pattern(role).is_none(), "{role:?}");
+                    assert_eq!(pattern.list_role_patterns(role).len(), 1, "{role:?}");
+                }
+                Role::Kwarg => {
+                    assert!(pattern.single_role_pattern(role).is_none(), "{role:?}");
+                    assert!(pattern.list_role_patterns(role).is_empty(), "{role:?}");
+                    assert_eq!(pattern.kwargs.len(), 1);
+                }
+            }
+        }
+
+        pattern.args.clear();
+        pattern.decorators.clear();
+        pattern.kwargs.clear();
+        assert!(pattern.has_role_constraints());
     }
 
     #[test]

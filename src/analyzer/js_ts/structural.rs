@@ -231,9 +231,11 @@ impl StructuralSpec for JsTsStructuralSpec {
                     "function"
                 };
                 if let Some(function) = node.child_by_field_name(callee_field) {
-                    attach_named_role(sink, Role::Callee, function);
                     if let Some(name) = expression_name_node(function) {
+                        sink.role_named(Role::Callee, name, name);
                         sink.set_name(name);
+                    } else {
+                        sink.role(Role::Callee, function);
                     }
                     if function.kind() == "member_expression"
                         && let Some(object) = function.child_by_field_name("object")

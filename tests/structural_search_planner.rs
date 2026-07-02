@@ -8,7 +8,9 @@
 mod common;
 
 use brokk_bifrost::AnalyzerConfig;
-use brokk_bifrost::analyzer::structural::{AstQuery, SearchAstOutput, execute};
+use brokk_bifrost::analyzer::structural::{
+    AstQuery, SearchAstExecutionLimits, SearchAstOutput, execute, execute_with_limits,
+};
 use brokk_bifrost::{IAnalyzer, Language, WorkspaceAnalyzer};
 use common::InlineTestProject;
 use serde_json::json;
@@ -34,6 +36,15 @@ fn python_workspace() -> (common::BuiltInlineTestProject, WorkspaceAnalyzer) {
 fn run(analyzer: &dyn IAnalyzer, query: serde_json::Value) -> SearchAstOutput {
     let query = AstQuery::from_json(&query).expect("query should parse");
     execute(analyzer, &query)
+}
+
+fn run_with_limits(
+    analyzer: &dyn IAnalyzer,
+    query: serde_json::Value,
+    limits: SearchAstExecutionLimits,
+) -> SearchAstOutput {
+    let query = AstQuery::from_json(&query).expect("query should parse");
+    execute_with_limits(analyzer, &query, limits)
 }
 
 fn extraction_count(analyzer: &dyn IAnalyzer) -> u64 {
@@ -177,6 +188,47 @@ fn limit_stops_after_global_truncation_is_known() {
         extraction_count(analyzer),
         2,
         "only enough files to prove global truncation should be parsed"
+    );
+}
+
+#[test]
+fn execution_budget_bounds_unanchored_no_match_queries() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/a.py", "def a():\n    print('a')\n")
+        .file("src/b.py", "def b():\n    print('b')\n")
+        .file("src/c.py", "def c():\n    print('c')\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    let output = run_with_limits(
+        analyzer,
+        json!({
+            "match": { "kind": "call", "text": { "regex": "a^" } },
+            "limit": 1
+        }),
+        SearchAstExecutionLimits {
+            max_scanned_files: 1,
+            max_scanned_source_bytes: usize::MAX,
+            max_fact_nodes: usize::MAX,
+        },
+    );
+
+    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+    assert!(output.truncated, "budget exhaustion should mark truncation");
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "workspace"
+                && diagnostic.message.contains("execution budget")),
+        "missing execution-budget diagnostic: {:?}",
+        output.diagnostics
+    );
+    assert_eq!(
+        extraction_count(analyzer),
+        1,
+        "budget should stop before parsing every unanchored candidate"
     );
 }
 

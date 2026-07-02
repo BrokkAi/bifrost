@@ -655,6 +655,9 @@ where
         if crate::analyzer::common::is_unparseable_source(source.as_str()) {
             return None;
         }
+        parser
+            .set_language(&adapter.parser_language_for_file(file))
+            .ok()?;
         let tree = parser.parse(source.as_str(), None)?;
         let mut parsed = adapter.parse_file(file, &source, &tree);
         parsed.add_file_scope(file, &source);
@@ -1543,7 +1546,7 @@ where
         if crate::analyzer::common::is_unparseable_source(source) {
             return Vec::new();
         }
-        let mut parser = Self::build_parser(self.adapter.parser_language());
+        let mut parser = Self::build_parser(self.adapter.parser_language_for_file(file));
         let Some(tree) = parser.parse(source, None) else {
             return Vec::new();
         };

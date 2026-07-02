@@ -321,6 +321,69 @@ fn js_ts_import_modules_match_by_unquoted_module_name() {
 }
 
 #[test]
+fn java_import_modules_match_by_full_scoped_name() {
+    let output = run_query_with_files(
+        &[("java/App.java", "import java.util.List;\nclass App {}\n")],
+        json!({
+            "languages": ["java"],
+            "match": { "kind": "import", "module": { "name": "java.util.List" } }
+        }),
+    );
+
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+    assert_eq!(output.matches.len(), 1);
+    assert_eq!(output.matches[0].path, "java/App.java");
+    assert_eq!(output.matches[0].text, "import java.util.List;");
+}
+
+#[test]
+fn member_call_callee_is_terminal_name_and_receiver_carries_object() {
+    let output = run_query_with_files(
+        &[
+            (
+                "python/app.py",
+                "def run(service, code):\n    service.execute(code)\n",
+            ),
+            (
+                "java/App.java",
+                "class App { void run(Service service, String code) { service.execute(code); } }\n",
+            ),
+            (
+                "javascript/app.js",
+                "function run(service, code) { service.execute(code); }\n",
+            ),
+            (
+                "typescript/app.ts",
+                "function run(service: Service, code: string) { service.execute(code); }\n",
+            ),
+        ],
+        json!({
+            "match": {
+                "kind": "call",
+                "receiver": { "name": "service" },
+                "callee": { "kind": "identifier", "name": "execute" }
+            }
+        }),
+    );
+
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+    let rows: Vec<_> = output
+        .matches
+        .iter()
+        .map(|m| (m.language, m.path.as_str(), m.text.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("java", "java/App.java", "service.execute(code)"),
+            ("javascript", "javascript/app.js", "service.execute(code)"),
+            ("typescript", "typescript/app.ts", "service.execute(code)"),
+            ("python", "python/app.py", "service.execute(code)"),
+        ]
+    );
+}
+
+#[test]
 fn tsx_files_use_the_tsx_grammar_for_structural_search() {
     let output = run_query_with_files(
         &[(

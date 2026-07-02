@@ -246,9 +246,12 @@ Result shape (structured JSON; also rendered as text per SearchTools conventions
           "path": "src/app.py",
           "language": "python",
           "kind": "call",
-          "range": { "start_line": 42, "end_line": 42 },
+          "start_line": 42,
+          "end_line": 42,
           "text": "eval(user_input)",
-          "captures": { "code": { "text": "user_input", "start_line": 42 } },
+          "captures": [
+            { "name": "code", "text": "user_input", "start_line": 42 }
+          ],
           "enclosing_symbol": "app.handle_request"
         }
       ],

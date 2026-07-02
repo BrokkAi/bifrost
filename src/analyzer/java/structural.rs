@@ -199,7 +199,7 @@ impl StructuralSpec for JavaStructuralSpec {
                         child.kind(),
                         "identifier" | "scoped_identifier" | "field_access"
                     ) {
-                        attach_named_role(sink, Role::Module, child);
+                        sink.role_named(Role::Module, child, child);
                         break;
                     }
                 }

@@ -36,5 +36,7 @@ pub use query::{
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
     StringPredicate,
 };
-pub use search::{SearchAstMatch, SearchAstOutput, execute};
+pub use search::{
+    SearchAstExecutionLimits, SearchAstMatch, SearchAstOutput, execute, execute_with_limits,
+};
 pub use spec::{RoleSink, StructuralSpec};
