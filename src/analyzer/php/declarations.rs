@@ -436,6 +436,16 @@ fn extract_php_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
             collect_php_supertype_nodes(child, source, &mut raw);
         }
     }
+    if node.kind() == "class_declaration"
+        && let Some(body) = php_class_body(node)
+    {
+        let mut body_cursor = body.walk();
+        for child in body.named_children(&mut body_cursor) {
+            if child.kind() == "use_declaration" {
+                collect_php_supertype_nodes(child, source, &mut raw);
+            }
+        }
+    }
     raw
 }
 

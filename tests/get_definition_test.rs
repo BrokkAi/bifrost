@@ -7956,6 +7956,96 @@ fn php_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn php_trait_method_resolves_through_using_class() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .file(
+            "src/Support/LogsEvents.php",
+            "<?php\nnamespace App\\Support;\ntrait LogsEvents {\n    public function record(string $message): string { return $message; }\n}\n",
+        )
+        .file(
+            "src/Support/AuditsEvents.php",
+            "<?php\nnamespace App\\Support;\ntrait AuditsEvents {\n    public function audit(string $message): string { return $message; }\n}\n",
+        )
+        .file(
+            "src/Service/EmailNotifier.php",
+            "<?php\nnamespace App\\Service;\nuse App\\Support\\LogsEvents;\nuse App\\Support\\AuditsEvents;\nclass EmailNotifier {\n    use LogsEvents, AuditsEvents;\n    public function notify(string $message): void {\n        $this->record($message);\n        $this->audit($message);\n    }\n}\n",
+        )
+        .file(
+            "src/Other/OtherNotifier.php",
+            "<?php\nnamespace App\\Other;\nclass OtherNotifier {\n    public function record(string $message): string { return $message; }\n}\n",
+        )
+        .file(
+            "src/Consumer.php",
+            "<?php\nnamespace App;\nuse App\\Service\\EmailNotifier;\nuse App\\Other\\OtherNotifier;\n$mailer = new EmailNotifier();\n$mailer->record(\"logged\");\n$other = new OtherNotifier();\n$other->record(\"unrelated\");\n",
+        )
+        .build();
+
+    let internal_line = "        $this->record($message);";
+    let internal = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Service/EmailNotifier.php","line":8,"column":{}}}]}}"#,
+            column_of(internal_line, "record")
+        ),
+    );
+    let result = &internal["results"][0];
+    assert_eq!(result["status"], "resolved", "{internal}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Support.LogsEvents.record",
+        "{internal}"
+    );
+
+    let external_line = "$mailer->record(\"logged\");";
+    let external = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Consumer.php","line":6,"column":{}}}]}}"#,
+            column_of(external_line, "record")
+        ),
+    );
+    let result = &external["results"][0];
+    assert_eq!(result["status"], "resolved", "{external}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Support.LogsEvents.record",
+        "{external}"
+    );
+
+    let audit_line = "        $this->audit($message);";
+    let audit = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Service/EmailNotifier.php","line":9,"column":{}}}]}}"#,
+            column_of(audit_line, "audit")
+        ),
+    );
+    let result = &audit["results"][0];
+    assert_eq!(result["status"], "resolved", "{audit}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Support.AuditsEvents.audit",
+        "{audit}"
+    );
+
+    let unrelated_line = "$other->record(\"unrelated\");";
+    let unrelated = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Consumer.php","line":8,"column":{}}}]}}"#,
+            column_of(unrelated_line, "record")
+        ),
+    );
+    let result = &unrelated["results"][0];
+    assert_eq!(result["status"], "resolved", "{unrelated}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Other.OtherNotifier.record",
+        "{unrelated}"
+    );
+}
+
+#[test]
 fn php_repository_receiver_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

@@ -1211,6 +1211,105 @@ function consume(): void {
 }
 
 #[test]
+fn php_graph_finds_trait_method_calls_through_using_class() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        ),
+        (
+            "src/Support/LogsEvents.php",
+            r#"<?php
+namespace App\Support;
+trait LogsEvents {
+    public function record(string $message): string { return $message; }
+}
+"#,
+        ),
+        (
+            "src/Support/AuditsEvents.php",
+            r#"<?php
+namespace App\Support;
+trait AuditsEvents {
+    public function audit(string $message): string { return $message; }
+}
+"#,
+        ),
+        (
+            "src/Service/EmailNotifier.php",
+            r#"<?php
+namespace App\Service;
+use App\Support\LogsEvents;
+use App\Support\AuditsEvents;
+class EmailNotifier {
+    use LogsEvents, AuditsEvents;
+    public function notify(string $message): void {
+        $this->record($message);
+        $this->audit($message);
+    }
+}
+"#,
+        ),
+        (
+            "src/Other/OtherNotifier.php",
+            r#"<?php
+namespace App\Other;
+class OtherNotifier {
+    public function record(string $message): string { return $message; }
+}
+"#,
+        ),
+        (
+            "src/Consumer.php",
+            r#"<?php
+namespace App;
+use App\Service\EmailNotifier;
+use App\Other\OtherNotifier;
+$mailer = new EmailNotifier();
+$mailer->record("logged");
+$other = new OtherNotifier();
+$other->record("unrelated");
+"#,
+        ),
+    ]);
+
+    let record_hits = graph_hits(&analyzer, "App.Support.LogsEvents.record");
+    assert_eq!(2, record_hits.len(), "{record_hits:#?}");
+    assert!(
+        record_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$this->record($message)")),
+        "trait method usages should include in-class calls: {record_hits:#?}"
+    );
+    assert!(
+        record_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$mailer->record(\"logged\")")),
+        "trait method usages should include calls through using class instances: {record_hits:#?}"
+    );
+    assert!(
+        record_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("$other->record(\"unrelated\")")),
+        "same-name method on unrelated class must not match: {record_hits:#?}"
+    );
+    assert!(
+        record_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("public function record")),
+        "trait methods should not emit override-declaration hits: {record_hits:#?}"
+    );
+
+    let audit_hits = graph_hits(&analyzer, "App.Support.AuditsEvents.audit");
+    assert!(
+        audit_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$this->audit($message)")),
+        "multi-trait use should contribute each trait: {audit_hits:#?}"
+    );
+}
+
+#[test]
 fn php_graph_keeps_interface_typed_receiver_unproven() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (

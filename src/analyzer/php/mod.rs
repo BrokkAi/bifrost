@@ -221,6 +221,13 @@ impl PhpAnalyzer {
         })
     }
 
+    pub(crate) fn is_trait(&self, code_unit: &CodeUnit) -> bool {
+        code_unit.is_class()
+            && self
+                .declaration_kind(code_unit)
+                .is_some_and(|kind| kind == "trait_declaration")
+    }
+
     fn resolve_declared_supertype(&self, code_unit: &CodeUnit, raw: &str) -> Option<CodeUnit> {
         let ctx = self.declaration_context(code_unit);
         let fq_name = resolve_php_type(raw, &ctx)?;
@@ -232,7 +239,7 @@ impl PhpAnalyzer {
     pub(crate) fn direct_declared_class_parent(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.get_direct_ancestors(code_unit)
             .into_iter()
-            .find(|ancestor| !self.is_interface(ancestor))
+            .find(|ancestor| !self.is_interface(ancestor) && !self.is_trait(ancestor))
     }
 
     fn declaration_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {

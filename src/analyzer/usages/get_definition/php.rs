@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::usages::php_graph::syntax::{
     assignment_parts, is_local_scope as php_is_local_scope,
     object_creation_type as php_object_creation_type, seed_parameter_types,
@@ -282,7 +283,7 @@ fn php_inherited_member_candidates(
     member: &str,
 ) -> Vec<CodeUnit> {
     let mut seen = HashSet::default();
-    let mut level = php_direct_parent_fqns(php, analyzer, support, owner_fqn);
+    let mut level = php_direct_member_owner_fqns(php, analyzer, support, owner_fqn);
     seen.insert(owner_fqn.to_string());
     while !level.is_empty() {
         let mut level_candidates = Vec::new();
@@ -292,7 +293,9 @@ fn php_inherited_member_candidates(
                 continue;
             }
             level_candidates.extend(support.fqn(&format!("{ancestor}.{member}")));
-            next_level.extend(php_direct_parent_fqns(php, analyzer, support, &ancestor));
+            next_level.extend(php_direct_member_owner_fqns(
+                php, analyzer, support, &ancestor,
+            ));
         }
         sort_units(&mut level_candidates);
         level_candidates.dedup();
@@ -304,15 +307,20 @@ fn php_inherited_member_candidates(
     Vec::new()
 }
 
-fn php_direct_parent_fqns(
+fn php_direct_member_owner_fqns(
     php: &PhpAnalyzer,
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner_fqn: &str,
 ) -> Vec<String> {
-    php_parent_fqn(php, support, owner_fqn)
+    support
+        .fqn(owner_fqn)
         .into_iter()
-        .filter(|parent| analyzer.definitions(parent).next().is_some())
+        .next()
+        .into_iter()
+        .flat_map(|child| php.get_direct_ancestors(&child))
+        .map(|ancestor| ancestor.fq_name())
+        .filter(|ancestor| analyzer.definitions(ancestor).next().is_some())
         .collect()
 }
 
