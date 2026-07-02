@@ -24,6 +24,7 @@
 use super::resolver::{package_name_of, scala_display_name, scala_normalized_fq_name};
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{node_text, scala_import_path};
+use crate::analyzer::CodeUnit;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
@@ -42,12 +43,18 @@ pub(crate) struct ProjectTypes {
     /// `normalized_fqn -> fqn` — resolve a non-wildcard import path (whose text is
     /// `$`-free) to the analyzer's own `$`-encoded fqn.
     by_normalized_fqn: HashMap<String, String>,
+    /// `normalized_member_fqn -> member_fqn` for `import Owner.member` paths.
+    by_normalized_member_fqn: HashMap<String, String>,
+    extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>>,
 }
 
 impl ProjectTypes {
     pub(crate) fn build(scala: &ScalaAnalyzer) -> Self {
         let mut by_package = HashMap::default();
         let mut by_normalized_fqn = HashMap::default();
+        let mut by_normalized_member_fqn = HashMap::default();
+        let mut extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>> =
+            HashMap::default();
         for unit in scala.all_declarations().filter(|unit| unit.is_class()) {
             let fqn = unit.fq_name();
             by_package.insert(
@@ -56,17 +63,50 @@ impl ProjectTypes {
             );
             by_normalized_fqn.insert(scala_normalized_fq_name(&fqn), fqn);
         }
+        for unit in scala
+            .all_declarations()
+            .filter(|unit| unit.is_function() || unit.is_field())
+        {
+            let fqn = unit.fq_name();
+            by_normalized_member_fqn.insert(scala_normalized_fq_name(&fqn), fqn.clone());
+            let signature = unit
+                .signature()
+                .or_else(|| scala.signatures(unit).first().map(String::as_str));
+            if signature.is_some_and(|signature| signature.starts_with("extension "))
+                && let Some(owner_fqn) = owner_fqn(unit)
+            {
+                extension_methods_by_name
+                    .entry(unit.identifier().to_string())
+                    .or_default()
+                    .push(ExtensionMethod {
+                        fqn,
+                        owner_fqn,
+                        receiver_type: signature.and_then(extension_receiver_type),
+                    });
+            }
+        }
         Self {
             by_package,
             by_normalized_fqn,
+            by_normalized_member_fqn,
+            extension_methods_by_name,
         }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct ExtensionMethod {
+    pub(crate) fqn: String,
+    pub(crate) owner_fqn: String,
+    pub(crate) receiver_type: Option<String>,
 }
 
 /// Per-file map from a source-visible type/object name to the analyzer's fqn,
 /// mirroring the forward scanner's [`Visibility`](super::resolver).
 pub(crate) struct NameResolver {
     names: HashMap<String, String>,
+    member_names: HashMap<String, String>,
+    visible_extensions: HashMap<String, Vec<ExtensionMethod>>,
 }
 
 impl NameResolver {
@@ -76,6 +116,8 @@ impl NameResolver {
         types: &ProjectTypes,
     ) -> Self {
         let mut names = HashMap::default();
+        let mut member_names = HashMap::default();
+        let mut visible_extensions: HashMap<String, Vec<ExtensionMethod>> = HashMap::default();
 
         // Types in the file's own package are reachable by simple name.
         if let Some(package) = package_name_of(scala, file) {
@@ -97,6 +139,17 @@ impl NameResolver {
                         names.insert(simple.clone(), fqn.clone());
                     }
                 }
+                let normalized = scala_normalized_fq_name(&path);
+                for methods in types.extension_methods_by_name.values() {
+                    for method in methods {
+                        if scala_normalized_fq_name(&method.owner_fqn) == normalized {
+                            visible_extensions
+                                .entry(scala_member_name(&method.fqn).to_string())
+                                .or_default()
+                                .push(method.clone());
+                        }
+                    }
+                }
                 continue;
             }
             // `import pkg.Type [as Alias]` binds the (possibly renamed) local name.
@@ -107,10 +160,28 @@ impl NameResolver {
                     .clone()
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
                 names.insert(local_name, fqn.clone());
+                continue;
+            }
+            if let Some(fqn) = types.by_normalized_member_fqn.get(&normalized) {
+                let local_name = import
+                    .identifier
+                    .clone()
+                    .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
+                member_names.insert(local_name.clone(), fqn.clone());
+                if let Some(methods) = types.extension_methods_by_name.get(scala_member_name(fqn)) {
+                    visible_extensions
+                        .entry(local_name)
+                        .or_default()
+                        .extend(methods.iter().filter(|method| method.fqn == *fqn).cloned());
+                }
             }
         }
 
-        Self { names }
+        Self {
+            names,
+            member_names,
+            visible_extensions,
+        }
     }
 
     /// Resolve a type/object source name (stripping generics) to its fqn.
@@ -118,6 +189,41 @@ impl NameResolver {
         let simple = simple_type_name(raw)?;
         self.names.get(simple).cloned()
     }
+
+    /// Resolve a source-visible member name imported directly from an owner.
+    pub(crate) fn resolve_member(&self, raw: &str) -> Option<String> {
+        let simple = simple_type_name(raw)?;
+        self.member_names.get(simple).cloned()
+    }
+
+    pub(crate) fn visible_extension_methods(&self, member: &str) -> &[ExtensionMethod] {
+        self.visible_extensions
+            .get(member)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+fn owner_fqn(unit: &CodeUnit) -> Option<String> {
+    let (owner_short, _) = unit.short_name().rsplit_once('.')?;
+    Some(if unit.package_name().is_empty() {
+        owner_short.to_string()
+    } else {
+        format!("{}.{}", unit.package_name(), owner_short)
+    })
+}
+
+fn scala_member_name(fqn: &str) -> &str {
+    fqn.rsplit('.').next().unwrap_or(fqn)
+}
+
+fn extension_receiver_type(signature: &str) -> Option<String> {
+    let trimmed = signature.strip_prefix("extension ")?.trim_start();
+    let parameters = trimmed.strip_prefix('(')?.split_once(')')?.0;
+    let parameter = parameters.split(',').next()?.trim();
+    let (_, type_text) = parameter.split_once(':')?;
+    let receiver_type = type_text.trim();
+    (!receiver_type.is_empty()).then(|| receiver_type.to_string())
 }
 
 /// The leading simple name of a (possibly generic/qualified) type text.
@@ -270,6 +376,10 @@ fn record_reference(
                     }
                     if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
                         ctx.record(format!("{owner}.{name}"), field);
+                    } else if let Some(extension) =
+                        unique_visible_extension(ctx.resolver, name, None)
+                    {
+                        ctx.record(extension.fqn, field);
                     }
                 }
                 // `method(..)` — unqualified, attributes to the enclosing class.
@@ -283,6 +393,19 @@ fn record_reference(
                     }
                 }
                 _ => {}
+            }
+        }
+        "identifier" => {
+            let name = node_text(node, ctx.source);
+            if name.is_empty()
+                || bindings.is_shadowed(name)
+                || has_ancestor_kind(node, "import_declaration")
+                || is_declaration_name(node)
+            {
+                return;
+            }
+            if let Some(fqn) = ctx.resolver.resolve_member(name) {
+                ctx.record(fqn, node);
             }
         }
         _ => {}
@@ -513,4 +636,62 @@ fn seed_typed(name: &str, resolved: Option<String>, bindings: &mut LocalInferenc
         Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
         None => bindings.declare_shadow(name.to_string()),
     }
+}
+
+fn unique_visible_extension(
+    resolver: &NameResolver,
+    member: &str,
+    receiver_owner: Option<&str>,
+) -> Option<ExtensionMethod> {
+    let mut matches = Vec::new();
+    for method in resolver.visible_extension_methods(member) {
+        if extension_receiver_matches(resolver, method, receiver_owner) {
+            matches.push(method.clone());
+        }
+    }
+    matches.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+    matches.dedup_by(|left, right| left.fqn == right.fqn);
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+fn extension_receiver_matches(
+    resolver: &NameResolver,
+    method: &ExtensionMethod,
+    receiver_owner: Option<&str>,
+) -> bool {
+    let (Some(receiver_owner), Some(receiver_type)) =
+        (receiver_owner, method.receiver_type.as_ref())
+    else {
+        return true;
+    };
+    resolver
+        .resolve(receiver_type)
+        .is_none_or(|extension_receiver| extension_receiver == receiver_owner)
+}
+
+fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if current.kind() == kind {
+            return true;
+        }
+        parent = current.parent();
+    }
+    false
+}
+
+fn is_declaration_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "class_definition"
+                | "object_definition"
+                | "trait_definition"
+                | "enum_definition"
+                | "function_definition"
+                | "function_declaration"
+                | "parameter"
+                | "class_parameter"
+        ) && parent.child_by_field_name("name") == Some(node)
+    })
 }

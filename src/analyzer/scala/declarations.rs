@@ -255,6 +255,13 @@ impl<'a> ScalaVisitor<'a> {
         let children = body.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children {
             match child.kind() {
+                "import_declaration" => {
+                    let raw = scala_node_text(child, self.source).trim().to_string();
+                    if !raw.is_empty() {
+                        self.parsed.imports.extend(parse_scala_import_infos(&raw));
+                        self.parsed.import_statements.push(raw);
+                    }
+                }
                 "function_definition" | "function_declaration" => {
                     self.visit_function(child, package_name, Some(parent.clone()))
                 }
@@ -264,6 +271,9 @@ impl<'a> ScalaVisitor<'a> {
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
                     self.visit_type_declaration(child, package_name, Some(parent.clone()), stack)
+                }
+                "extension_definition" => {
+                    self.visit_extension_definition(child, package_name, parent, stack)
                 }
                 "simple_enum_case" => self.visit_enum_case(child, package_name, parent),
                 "enum_case_definitions" | "enum_body" => {
@@ -278,7 +288,108 @@ impl<'a> ScalaVisitor<'a> {
         }
     }
 
+    fn visit_extension_definition<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        package_name: &str,
+        parent: &CodeUnit,
+        stack: &mut Vec<ScalaWork<'tree>>,
+    ) {
+        let receiver_parameters = node.child_by_field_name("parameters");
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "function_definition" | "function_declaration" => self.visit_extension_function(
+                    child,
+                    receiver_parameters,
+                    package_name,
+                    Some(parent.clone()),
+                ),
+                "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
+                    self.visit_field_declaration(child, package_name, Some(parent.clone()))
+                }
+                "class_definition" | "object_definition" | "trait_definition"
+                | "enum_definition" => {
+                    self.visit_type_declaration(child, package_name, Some(parent.clone()), stack)
+                }
+                "template_body" | "block" | "indented_block" => self.visit_extension_block(
+                    child,
+                    receiver_parameters,
+                    package_name,
+                    parent,
+                    stack,
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    fn visit_extension_block<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        receiver_parameters: Option<Node<'tree>>,
+        package_name: &str,
+        parent: &CodeUnit,
+        stack: &mut Vec<ScalaWork<'tree>>,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "function_definition" | "function_declaration" => self.visit_extension_function(
+                    child,
+                    receiver_parameters,
+                    package_name,
+                    Some(parent.clone()),
+                ),
+                "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
+                    self.visit_field_declaration(child, package_name, Some(parent.clone()))
+                }
+                "class_definition" | "object_definition" | "trait_definition"
+                | "enum_definition" => {
+                    self.visit_type_declaration(child, package_name, Some(parent.clone()), stack)
+                }
+                "template_body" | "block" | "indented_block" => self.visit_extension_block(
+                    child,
+                    receiver_parameters,
+                    package_name,
+                    parent,
+                    stack,
+                ),
+                _ => {}
+            }
+        }
+    }
+
     fn visit_function(&mut self, node: Node<'_>, package_name: &str, parent: Option<CodeUnit>) {
+        self.visit_function_with_signature(node, package_name, parent, None);
+    }
+
+    fn visit_extension_function(
+        &mut self,
+        node: Node<'_>,
+        receiver_parameters: Option<Node<'_>>,
+        package_name: &str,
+        parent: Option<CodeUnit>,
+    ) {
+        self.visit_function_with_signature(
+            node,
+            package_name,
+            parent,
+            Some(scala_extension_function_signature(
+                node,
+                receiver_parameters,
+                self.source,
+            )),
+        );
+    }
+
+    fn visit_function_with_signature(
+        &mut self,
+        node: Node<'_>,
+        package_name: &str,
+        parent: Option<CodeUnit>,
+        signature: Option<String>,
+    ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -309,7 +420,7 @@ impl<'a> ScalaVisitor<'a> {
         );
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent, None);
-        let signature = scala_function_signature(node, self.source);
+        let signature = signature.unwrap_or_else(|| scala_function_signature(node, self.source));
         self.parsed.add_signature_with_metadata(
             code_unit,
             scala_function_signature_metadata(signature, node, self.source),
@@ -457,6 +568,20 @@ fn scala_function_signature(node: Node<'_>, source: &str) -> String {
         name,
         parts.join(""),
         return_type
+    )
+}
+
+fn scala_extension_function_signature(
+    node: Node<'_>,
+    receiver_parameters: Option<Node<'_>>,
+    source: &str,
+) -> String {
+    let receiver = receiver_parameters
+        .map(|parameters| scala_node_text(parameters, source).trim().to_string())
+        .unwrap_or_default();
+    format!(
+        "extension {receiver} {}",
+        scala_function_signature(node, source)
     )
 }
 

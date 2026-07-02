@@ -21,6 +21,7 @@ pub(super) struct TargetSpec {
     pub(super) target_fq_name: String,
     pub(super) owner_fq_name: Option<String>,
     pub(super) arity: Option<usize>,
+    pub(super) is_extension_method: bool,
 }
 
 impl TargetSpec {
@@ -36,6 +37,7 @@ impl TargetSpec {
                 owner_fq_name: Some(scala_normalized_fq_name(&target.fq_name())),
                 owner_name: Some(owner_name),
                 arity: None,
+                is_extension_method: false,
             });
         }
 
@@ -54,6 +56,10 @@ impl TargetSpec {
                 .first()
                 .and_then(|sig| signature_arity(sig))
         });
+        let is_extension_method = target
+            .signature()
+            .or_else(|| scala.signatures(target).first().map(String::as_str))
+            .is_some_and(|signature| signature.starts_with("extension "));
         let member_name = if kind == TargetKind::Constructor {
             owner_name.clone()?
         } else {
@@ -70,6 +76,7 @@ impl TargetSpec {
             kind,
             member_name,
             arity,
+            is_extension_method,
         })
     }
 }
@@ -247,6 +254,20 @@ fn ambiguous_wildcard_members(
 }
 
 fn wildcard_path_could_expose(scala: &ScalaAnalyzer, path: &str, spec: &TargetSpec) -> bool {
+    if spec.is_extension_method {
+        return scala.all_declarations().any(|unit| {
+            unit.is_function()
+                && unit.identifier() == spec.member_name
+                && unit
+                    .signature()
+                    .or_else(|| scala.signatures(unit).first().map(String::as_str))
+                    .is_some_and(|signature| signature.starts_with("extension "))
+                && owner_of(scala, unit).is_some_and(|owner| {
+                    scala_normalized_fq_name(&owner.fq_name()) == scala_normalized_fq_name(path)
+                })
+        });
+    }
+
     if spec.owner.is_none() {
         return scala
             .definitions(&format!("{path}.{}", spec.member_name))
@@ -262,6 +283,13 @@ fn wildcard_path_could_expose(scala: &ScalaAnalyzer, path: &str, spec: &TargetSp
 }
 
 fn signature_arity(signature: &str) -> Option<usize> {
+    if let Some(extension_signature) = signature.strip_prefix("extension ") {
+        let after_receiver = extension_signature.split_once(')')?.1.trim_start();
+        return after_receiver
+            .find('(')
+            .and_then(|open| parenthesized_arity(&after_receiver[open..]))
+            .or(Some(0));
+    }
     let open = signature.find('(')?;
     parenthesized_arity(&signature[open..])
 }

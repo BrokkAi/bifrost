@@ -112,6 +112,9 @@ pub(super) fn resolve_scala(
                     format!("`{text}` is a local Scala value"),
                 );
             }
+            if let Some(fqn) = resolver.resolve_member(text) {
+                return scala_fqn_outcome(support, &fqn, text);
+            }
             if let Some(fqn) = resolver.resolve(text) {
                 return scala_fqn_outcome(support, &fqn, text);
             }
@@ -503,6 +506,9 @@ fn resolve_scala_call(
                     format!("`{name}` is a local Scala value"),
                 );
             }
+            if let Some(fqn) = resolver.resolve_member(name) {
+                return scala_fqn_outcome(ctx.support, &fqn, name);
+            }
             if function.kind() == "identifier"
                 && let Some(owner) =
                     scala_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())
@@ -575,7 +581,15 @@ fn resolve_scala_infix_call(
     if let Some(owner) =
         scala_receiver_type_fqn(ctx, resolver, root, receiver, operator.start_byte())
     {
-        return scala_member_candidates(ctx, &owner, name, false);
+        let candidates = scala_member_candidate_units(ctx, &owner, name, false);
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+        return scala_extension_candidates(ctx, resolver, name, Some(&owner));
+    }
+    let extension_candidates = scala_extension_candidate_units(ctx, resolver, name, None);
+    if !extension_candidates.is_empty() {
+        return candidates_outcome(extension_candidates);
     }
     no_definition(
         "unsupported_scala_receiver",
@@ -604,7 +618,15 @@ fn resolve_scala_postfix_call(
     }
     if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, method.start_byte())
     {
-        return scala_member_candidates(ctx, &owner, name, false);
+        let candidates = scala_member_candidate_units(ctx, &owner, name, false);
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+        return scala_extension_candidates(ctx, resolver, name, Some(&owner));
+    }
+    let extension_candidates = scala_extension_candidate_units(ctx, resolver, name, None);
+    if !extension_candidates.is_empty() {
+        return candidates_outcome(extension_candidates);
     }
     no_definition(
         "unsupported_scala_receiver",
@@ -678,6 +700,12 @@ fn resolve_scala_field(
             "Scala field expression has no receiver",
         );
     };
+    if matches!(receiver.kind(), "identifier" | "type_identifier") {
+        let receiver_text = scala_node_text(receiver, ctx.source).trim();
+        if let Some(fqn) = resolver.resolve_member(receiver_text) {
+            return scala_fqn_outcome(ctx.support, &fqn, receiver_text);
+        }
+    }
     if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, field.start_byte())
     {
         let include_companion = scala_receiver_allows_companion_lookup(
@@ -688,7 +716,15 @@ fn resolve_scala_field(
             field.start_byte(),
             &owner,
         );
-        return scala_member_candidates(ctx, &owner, member, include_companion);
+        let candidates = scala_member_candidate_units(ctx, &owner, member, include_companion);
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+        return scala_extension_candidates(ctx, resolver, member, Some(&owner));
+    }
+    let extension_candidates = scala_extension_candidate_units(ctx, resolver, member, None);
+    if !extension_candidates.is_empty() {
+        return candidates_outcome(extension_candidates);
     }
     no_definition(
         "unsupported_scala_receiver",
@@ -784,6 +820,63 @@ fn scala_member_candidate_units(
         include_companion,
         &mut seen_owner_fqns,
     )
+}
+
+fn scala_extension_candidates(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    member: &str,
+    receiver_owner: Option<&str>,
+) -> DefinitionLookupOutcome {
+    let candidates = scala_extension_candidate_units(ctx, resolver, member, receiver_owner);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+    no_definition(
+        "unsupported_scala_receiver",
+        format!("receiver for Scala extension member `{member}` is not resolved"),
+    )
+}
+
+fn scala_extension_candidate_units(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    member: &str,
+    receiver_owner: Option<&str>,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for method in resolver.visible_extension_methods(member) {
+        if !scala_extension_receiver_matches(
+            resolver,
+            method.receiver_type.as_deref(),
+            receiver_owner,
+        ) {
+            continue;
+        }
+        candidates.extend(ctx.support.fqn(&method.fqn));
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.len() == 1 {
+        candidates
+    } else {
+        Vec::new()
+    }
+}
+
+fn scala_extension_receiver_matches(
+    resolver: &ScalaNameResolver,
+    extension_receiver_type: Option<&str>,
+    receiver_owner: Option<&str>,
+) -> bool {
+    let (Some(receiver_owner), Some(extension_receiver_type)) =
+        (receiver_owner, extension_receiver_type)
+    else {
+        return true;
+    };
+    resolver
+        .resolve(extension_receiver_type)
+        .is_none_or(|extension_receiver| extension_receiver == receiver_owner)
 }
 
 fn scala_member_candidate_units_with_seen(

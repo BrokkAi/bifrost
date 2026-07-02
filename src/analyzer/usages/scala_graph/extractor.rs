@@ -111,9 +111,6 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn scan_import_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if !matches!(ctx.spec.kind, TargetKind::Type | TargetKind::Constructor) {
-        return;
-    }
     let matching_names = matching_names_for_import_declaration(node, ctx);
     if matching_names.is_empty() {
         return;
@@ -152,6 +149,7 @@ fn matching_names_for_import_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> H
         let matched = Visibility::matching_import_names(&import, ctx.spec);
         names.extend(matched.type_names);
         names.extend(matched.owner_names);
+        names.extend(matched.direct_member_names);
     }
     names
 }
@@ -496,6 +494,10 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         return true;
     }
 
+    if extension_member_reference_is_proven(node, text, ctx) {
+        return true;
+    }
+
     if text != ctx.spec.member_name {
         return false;
     }
@@ -526,6 +528,37 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         return true;
     }
     receiver_binding_matches(node, qualifier, ctx)
+}
+
+fn extension_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.spec.kind != TargetKind::Method
+        || text != ctx.spec.member_name
+        || !target_is_extension(ctx.spec)
+        || !ctx.visibility.direct_member_names.contains(text)
+        || ctx.visibility.ambiguous_direct_member_names.contains(text)
+        || !has_member_qualifier(node)
+        || !member_call_arity_matches(node, ctx)
+    {
+        return false;
+    }
+
+    let Some(qualifier_node) = member_qualifier_node(node) else {
+        return false;
+    };
+    let qualifier = node_text(qualifier_node, ctx.source).trim();
+    if qualifier.is_empty() || is_locally_shadowed(ctx, qualifier) {
+        return false;
+    }
+    extension_receiver_matches(qualifier, ctx)
+}
+
+fn target_is_extension(spec: &TargetSpec) -> bool {
+    spec.is_extension_method
+}
+
+fn extension_receiver_matches(qualifier: &str, ctx: &ScanCtx<'_>) -> bool {
+    let _ = (qualifier, ctx);
+    true
 }
 
 fn is_locally_shadowed(ctx: &ScanCtx<'_>, name: &str) -> bool {

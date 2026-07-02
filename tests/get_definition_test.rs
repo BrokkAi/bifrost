@@ -11253,6 +11253,110 @@ fn scala_object_apply_call_resolves_from_constructor_like_reference() {
 }
 
 #[test]
+fn scala_renamed_member_import_resolves_to_member_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/ConsoleRenderer.scala",
+            r#"
+package app
+
+class ConsoleRenderer {
+  def render(value: String): String = value
+}
+
+object ConsoleRenderer {
+  def default: ConsoleRenderer = new ConsoleRenderer
+}
+"#,
+        )
+        .file(
+            "app/App.scala",
+            r#"
+package app
+
+object App:
+  import app.ConsoleRenderer.{default => renderer}
+  val direct = renderer.render("ok")
+"#,
+        )
+        .build();
+
+    let app_source = r#"
+package app
+
+object App:
+  import app.ConsoleRenderer.{default => renderer}
+  val direct = renderer.render("ok")
+"#;
+    let renderer_start = app_source.find("renderer.render").expect("renderer token");
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            renderer_start,
+            renderer_start + "renderer".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.ConsoleRenderer$.default",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_extension_method_call_resolves_to_extension_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Syntax.scala",
+            r#"
+package app
+
+object Syntax:
+  extension (value: String)
+    def slug: String = value.toLowerCase
+"#,
+        )
+        .file(
+            "app/App.scala",
+            r#"
+package app
+
+object App:
+  import app.Syntax.*
+  val slugged = "Hello World".slug
+"#,
+        )
+        .build();
+
+    let app_source = r#"
+package app
+
+object App:
+  import app.Syntax.*
+  val slugged = "Hello World".slug
+"#;
+    let slug_start = app_source.find(".slug").expect("slug token") + 1;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            slug_start,
+            slug_start + "slug".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Syntax$.slug",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_unqualified_inherited_helper_call_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

@@ -1,7 +1,7 @@
 mod common;
 
 use brokk_bifrost::usages::{
-    FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit,
+    FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
 };
 use brokk_bifrost::{CodeUnit, CodeUnitType, IAnalyzer, Language, ScalaAnalyzer};
 use common::InlineTestProject;
@@ -820,6 +820,137 @@ def helper(): Int = 2
     let answer_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&answer), &candidates, 1000));
     assert_hit_line(&answer_hits, line_of(wildcard_source, "helper() + answer"));
+}
+
+#[test]
+fn scala_graph_resolves_renamed_member_import_usages_without_external_import_hit() {
+    let consumer_source = r#"
+package app
+
+import app.ConsoleRenderer.{default => renderer}
+
+object App {
+  val direct = renderer.render("ok")
+  val workflow = new Workflow(renderer)
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/ConsoleRenderer.scala",
+            r#"
+package app
+
+class ConsoleRenderer {
+  def render(value: String): String = value
+}
+
+object ConsoleRenderer {
+  def default: ConsoleRenderer = new ConsoleRenderer
+}
+
+class Workflow(renderer: ConsoleRenderer)
+"#,
+        ),
+        ("app/App.scala", consumer_source),
+    ]);
+    let target = definition(&analyzer, "app.ConsoleRenderer$.default");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let editor_hits = result.all_hits_including_imports();
+    let external_hits = result.all_hits();
+
+    assert_hit_line(
+        &external_hits.iter().cloned().collect::<Vec<_>>(),
+        line_of(consumer_source, "renderer.render"),
+    );
+    assert_hit_line(
+        &external_hits.iter().cloned().collect::<Vec<_>>(),
+        line_of(consumer_source, "new Workflow(renderer)"),
+    );
+    assert_no_hit_line(
+        &external_hits.iter().cloned().collect::<Vec<_>>(),
+        line_of(consumer_source, "import app.ConsoleRenderer"),
+    );
+    assert!(
+        editor_hits.iter().any(|hit| {
+            hit.kind == UsageHitKind::Import && hit.snippet.contains("default => renderer")
+        }),
+        "expected renamed member import hit classified as Import: {editor_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_graph_resolves_visible_extension_method_usage() {
+    let app_source = r#"
+package app
+
+object App {
+  import app.Syntax.*
+  val slugged = "Hello World".slug
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Syntax.scala",
+            r#"
+package app
+
+object Syntax:
+  extension (value: String)
+    def slug: String = value.toLowerCase
+"#,
+        ),
+        ("app/App.scala", app_source),
+    ]);
+    let target = definition(&analyzer, "app.Syntax$.slug");
+    let hits = scala_hits(&analyzer, &target, &["app/App.scala"]);
+
+    assert_hit_line(&hits, line_of(app_source, "\"Hello World\".slug"));
+}
+
+#[test]
+fn scala_graph_does_not_pick_between_ambiguous_extension_methods() {
+    let app_source = r#"
+package app
+
+object App {
+  import app.SyntaxA.*
+  import app.SyntaxB.*
+  val slugged = "Hello World".slug
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/SyntaxA.scala",
+            r#"
+package app
+
+object SyntaxA:
+  extension (value: String)
+    def slug: String = value.toLowerCase
+"#,
+        ),
+        (
+            "app/SyntaxB.scala",
+            r#"
+package app
+
+object SyntaxB:
+  extension (value: String)
+    def slug: String = value.reverse
+"#,
+        ),
+        ("app/App.scala", app_source),
+    ]);
+    let target = definition(&analyzer, "app.SyntaxA$.slug");
+    let hits = scala_hits(&analyzer, &target, &["app/App.scala"]);
+
+    assert_no_hit_line(&hits, line_of(app_source, "\"Hello World\".slug"));
 }
 
 #[test]
