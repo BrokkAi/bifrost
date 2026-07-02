@@ -5,8 +5,8 @@
 //! Decoding is hand-rolled over `serde_json::Value` rather than derived: every
 //! error carries the JSON path of the offending field (e.g.
 //! `match.callee.name`), which is what lets agent callers self-correct, and
-//! rules like "`kind` and `kind_exact` are mutually exclusive" or "role
-//! `callee` requires kind `call`" are validation, not shape.
+//! rules like "role `callee` requires a pattern kind that supports it" are
+//! validation, not shape.
 
 use super::kinds::{NormalizedKind, Role};
 use crate::analyzer::Language;
@@ -33,30 +33,6 @@ pub struct AstQuery {
     pub limit: usize,
 }
 
-/// How a pattern's `kind` constraint matches facts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KindSelector {
-    /// Subtype-aware (the default): `literal` matches `string_literal`.
-    Subtype(NormalizedKind),
-    /// Exact: `literal` matches only facts normalized as exactly `literal`.
-    Exact(NormalizedKind),
-}
-
-impl KindSelector {
-    pub fn kind(self) -> NormalizedKind {
-        match self {
-            KindSelector::Subtype(kind) | KindSelector::Exact(kind) => kind,
-        }
-    }
-
-    pub fn matches(self, fact_kind: NormalizedKind) -> bool {
-        match self {
-            KindSelector::Subtype(kind) => fact_kind.satisfies(kind),
-            KindSelector::Exact(kind) => fact_kind == kind,
-        }
-    }
-}
-
 /// Predicate over a string attribute of a fact (its name or source text).
 #[derive(Debug, Clone)]
 pub enum StringPredicate {
@@ -79,7 +55,18 @@ impl StringPredicate {
 /// or empty (an empty `args` entry means "some argument exists").
 #[derive(Debug, Clone, Default)]
 pub struct Pattern {
-    pub kind: Option<KindSelector>,
+    /// JSON `kind`: a union of kinds, each subtype-aware (`literal` matches
+    /// `string_literal`; `["function", "method"]` matches either). Empty
+    /// means unconstrained. There is deliberately no exact-match variant:
+    /// leaf kinds are their own exact match, and "exactly an abstract kind"
+    /// would only select facts from adapters too coarse to classify further —
+    /// adapter precision is surfaced through diagnostics, not query
+    /// semantics.
+    pub kinds: Vec<NormalizedKind>,
+    /// JSON `not_kind`: subtype-aware exclusion, verifier-only (never used
+    /// for candidate pruning). `{"kind": "callable", "not_kind":
+    /// ["constructor", "lambda"]}` matches named functions and methods.
+    pub not_kinds: Vec<NormalizedKind>,
     pub name: Option<StringPredicate>,
     pub text: Option<StringPredicate>,
     pub capture: Option<String>,
@@ -87,7 +74,7 @@ pub struct Pattern {
     /// Verifier-only: never used for candidate pruning.
     pub not_has: Option<Box<Pattern>>,
     // Role sub-patterns. Only valid when `kind` is declared and the role is
-    // valid for it (see `Role::valid_for`).
+    // valid for at least one of its kinds (see `Role::valid_for`).
     pub callee: Option<Box<Pattern>>,
     pub receiver: Option<Box<Pattern>>,
     /// Each listed pattern must match some positional argument; matches must
@@ -107,7 +94,8 @@ pub struct Pattern {
 
 impl Pattern {
     pub fn is_empty(&self) -> bool {
-        self.kind.is_none()
+        self.kinds.is_empty()
+            && self.not_kinds.is_empty()
             && self.name.is_none()
             && self.text.is_none()
             && self.capture.is_none()
@@ -189,10 +177,12 @@ impl AstQuery {
             Some(value) => decode_pattern(value, "match")?,
             None => return Err(QueryError::new("match", "required field is missing")),
         };
-        if root.kind.is_none() && root.name.is_none() && root.text.is_none() {
+        if root.kinds.is_empty() && root.name.is_none() && root.text.is_none() {
+            // `not_kind` alone is near-wildcard, so it does not anchor a
+            // root either.
             return Err(QueryError::new(
                 "match",
-                "root pattern must constrain at least one of \"kind\", \"kind_exact\", \"name\", or \"text\"",
+                "root pattern must constrain at least one of \"kind\", \"name\", or \"text\"",
             ));
         }
 
@@ -370,7 +360,7 @@ fn decode_limit(value: &Value, path: &str) -> Result<usize, QueryError> {
 
 const PATTERN_FIELDS: &[&str] = &[
     "kind",
-    "kind_exact",
+    "not_kind",
     "name",
     "text",
     "capture",
@@ -392,7 +382,14 @@ fn decode_pattern(value: &Value, path: &str) -> Result<Pattern, QueryError> {
     let object = as_object(value, path)?;
     check_known_fields(object, path, PATTERN_FIELDS)?;
 
-    let kind = decode_kind_selector(object, path)?;
+    let kinds = match object.get("kind") {
+        None => Vec::new(),
+        Some(value) => decode_kind_list(value, &child_path(path, "kind"))?,
+    };
+    let not_kinds = match object.get("not_kind") {
+        None => Vec::new(),
+        Some(value) => decode_kind_list(value, &child_path(path, "not_kind"))?,
+    };
 
     let name = object
         .get("name")
@@ -425,7 +422,8 @@ fn decode_pattern(value: &Value, path: &str) -> Result<Pattern, QueryError> {
     let not_has = decode_boxed_sub_pattern(object, path, "not_has")?;
 
     let mut pattern = Pattern {
-        kind,
+        kinds,
+        not_kinds,
         name,
         text,
         capture,
@@ -438,31 +436,36 @@ fn decode_pattern(value: &Value, path: &str) -> Result<Pattern, QueryError> {
     Ok(pattern)
 }
 
-fn decode_kind_selector(
-    object: &Map<String, Value>,
-    path: &str,
-) -> Result<Option<KindSelector>, QueryError> {
-    let kind = object.get("kind");
-    let kind_exact = object.get("kind_exact");
-    if kind.is_some() && kind_exact.is_some() {
-        return Err(QueryError::new(
-            child_path(path, "kind_exact"),
-            "\"kind\" and \"kind_exact\" are mutually exclusive",
-        ));
+/// Decode a `kind` / `not_kind` value: a single kind label or a non-empty
+/// array of them.
+fn decode_kind_list(value: &Value, path: &str) -> Result<Vec<NormalizedKind>, QueryError> {
+    match value {
+        Value::String(label) => Ok(vec![decode_kind_label(label, path)?]),
+        Value::Array(entries) => {
+            if entries.is_empty() {
+                return Err(QueryError::new(path, "kind array must not be empty"));
+            }
+            let mut kinds = Vec::with_capacity(entries.len());
+            for (index, entry) in entries.iter().enumerate() {
+                let entry_path = index_path(path, index);
+                let label = entry
+                    .as_str()
+                    .ok_or_else(|| QueryError::new(&entry_path, "expected a kind label string"))?;
+                kinds.push(decode_kind_label(label, &entry_path)?);
+            }
+            Ok(kinds)
+        }
+        _ => Err(QueryError::new(
+            path,
+            "expected a kind label string or an array of kind labels",
+        )),
     }
-    let (field, value, exact) = match (kind, kind_exact) {
-        (Some(value), None) => ("kind", value, false),
-        (None, Some(value)) => ("kind_exact", value, true),
-        (None, None) => return Ok(None),
-        (Some(_), Some(_)) => unreachable!("handled above"),
-    };
-    let field_path = child_path(path, field);
-    let label = value
-        .as_str()
-        .ok_or_else(|| QueryError::new(&field_path, "expected a kind label string"))?;
-    let normalized = NormalizedKind::from_label(label).ok_or_else(|| {
+}
+
+fn decode_kind_label(label: &str, path: &str) -> Result<NormalizedKind, QueryError> {
+    NormalizedKind::from_label(label).ok_or_else(|| {
         QueryError::new(
-            &field_path,
+            path,
             format!(
                 "unknown kind {label:?}; expected one of: {}",
                 super::kinds::ALL_KINDS
@@ -472,12 +475,7 @@ fn decode_kind_selector(
                     .join(", ")
             ),
         )
-    })?;
-    Ok(Some(if exact {
-        KindSelector::Exact(normalized)
-    } else {
-        KindSelector::Subtype(normalized)
-    }))
+    })
 }
 
 fn decode_string_predicate(
@@ -554,7 +552,7 @@ fn decode_role_fields(
         return Ok(());
     }
 
-    let Some(selector) = pattern.kind else {
+    if pattern.kinds.is_empty() {
         return Err(QueryError::new(
             child_path(path, present_roles[0].label()),
             format!(
@@ -562,15 +560,22 @@ fn decode_role_fields(
                 present_roles[0].label()
             ),
         ));
-    };
+    }
+    // A role must be satisfiable by at least one of the declared kinds;
+    // otherwise the pattern is provably empty and almost certainly a mistake.
     for role in &present_roles {
-        if !role.valid_for(selector.kind()) {
+        if !pattern.kinds.iter().any(|&kind| role.valid_for(kind)) {
+            let kind_labels = pattern
+                .kinds
+                .iter()
+                .map(|kind| kind.label())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(QueryError::new(
                 child_path(path, role.label()),
                 format!(
-                    "role {:?} is not valid for kind {:?}",
+                    "role {:?} is not valid for kind(s) {kind_labels}",
                     role.label(),
-                    selector.kind().label()
                 ),
             ));
         }
@@ -627,16 +632,24 @@ fn decode_role_fields(
     Ok(())
 }
 
+fn kind_list_to_json(kinds: &[NormalizedKind]) -> Value {
+    if kinds.len() == 1 {
+        json!(kinds[0].label())
+    } else {
+        Value::Array(kinds.iter().map(|kind| json!(kind.label())).collect())
+    }
+}
+
 fn pattern_to_json(pattern: &Pattern) -> Value {
     let mut object = Map::new();
-    match pattern.kind {
-        Some(KindSelector::Subtype(kind)) => {
-            object.insert("kind".to_string(), json!(kind.label()));
-        }
-        Some(KindSelector::Exact(kind)) => {
-            object.insert("kind_exact".to_string(), json!(kind.label()));
-        }
-        None => {}
+    if !pattern.kinds.is_empty() {
+        object.insert("kind".to_string(), kind_list_to_json(&pattern.kinds));
+    }
+    if !pattern.not_kinds.is_empty() {
+        object.insert(
+            "not_kind".to_string(),
+            kind_list_to_json(&pattern.not_kinds),
+        );
     }
     if let Some(predicate) = &pattern.name {
         object.insert("name".to_string(), string_predicate_to_json(predicate));
@@ -730,20 +743,42 @@ mod tests {
 
         assert_eq!(query.where_globs.len(), 2);
         assert_eq!(query.limit, 100);
-        assert_eq!(
-            query.root.kind,
-            Some(KindSelector::Subtype(NormalizedKind::Call))
-        );
+        assert_eq!(query.root.kinds, vec![NormalizedKind::Call]);
         let callee = query.root.callee.as_ref().expect("callee pattern");
         assert!(matches!(&callee.name, Some(StringPredicate::Exact(name)) if name == "eval"));
         assert_eq!(query.root.args.len(), 1);
         assert_eq!(query.root.args[0].capture.as_deref(), Some("code"));
         let inside = query.inside.as_ref().expect("inside pattern");
-        assert_eq!(
-            inside.kind,
-            Some(KindSelector::Subtype(NormalizedKind::Function))
-        );
+        assert_eq!(inside.kinds, vec![NormalizedKind::Function]);
         assert_eq!(inside.capture.as_deref(), Some("enclosing_function"));
+    }
+
+    #[test]
+    fn parses_kind_unions_and_exclusions() {
+        // "All named functions, but not constructors or lambdas" — both
+        // spellings from the design discussion.
+        let union = parse_ok(json!({
+            "match": { "kind": ["function", "method"] }
+        }));
+        assert_eq!(
+            union.root.kinds,
+            vec![NormalizedKind::Function, NormalizedKind::Method]
+        );
+
+        let subtractive = parse_ok(json!({
+            "match": { "kind": "callable", "not_kind": ["constructor", "lambda"] }
+        }));
+        assert_eq!(subtractive.root.kinds, vec![NormalizedKind::Callable]);
+        assert_eq!(
+            subtractive.root.not_kinds,
+            vec![NormalizedKind::Constructor, NormalizedKind::Lambda]
+        );
+
+        // Roles are valid when at least one union member supports them.
+        let mixed = parse_ok(json!({
+            "match": { "kind": ["call", "assignment"], "callee": { "name": "eval" } }
+        }));
+        assert!(mixed.root.callee.is_some());
     }
 
     #[test]
@@ -783,7 +818,8 @@ mod tests {
                 "callee": { "name": "eval" },
                 "args": [{ "capture": "code" }]
             },
-            "inside": { "kind_exact": "function", "capture": "fn" },
+            "inside": { "kind": ["function", "method"], "capture": "fn" },
+            "not_inside": { "kind": "class", "not_kind": "declaration" },
             "limit": 50
         });
         let canonical = parse_ok(original).to_canonical_json();
@@ -817,11 +853,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_kind_and_kind_exact_together() {
+    fn rejects_removed_kind_exact_as_unknown_field() {
+        // `kind_exact` existed briefly and was dropped in favor of kind
+        // unions + not_kind; a caller using it gets the unknown-field error
+        // listing the current vocabulary.
         let error = error_of(json!({
-            "match": { "kind": "literal", "kind_exact": "literal" }
+            "match": { "kind_exact": "string_literal" }
         }));
         assert_eq!(error.path, "match.kind_exact");
+        assert!(error.message.contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_empty_and_malformed_kind_arrays() {
+        let error = error_of(json!({ "match": { "kind": [] } }));
+        assert_eq!(error.path, "match.kind");
+
+        let error = error_of(json!({ "match": { "kind": ["call", 3] } }));
+        assert_eq!(error.path, "match.kind[1]");
+
+        let error = error_of(json!({
+            "match": { "kind": "call", "not_kind": ["lambada"] }
+        }));
+        assert_eq!(error.path, "match.not_kind[0]");
     }
 
     #[test]
@@ -831,6 +885,12 @@ mod tests {
         }));
         assert_eq!(error.path, "match.callee");
         assert!(error.message.contains("not valid for kind"));
+
+        // A union where no member supports the role is provably empty.
+        let error = error_of(json!({
+            "match": { "kind": ["assignment", "import"], "callee": { "name": "eval" } }
+        }));
+        assert_eq!(error.path, "match.callee");
     }
 
     #[test]
@@ -891,13 +951,9 @@ mod tests {
     }
 
     #[test]
-    fn kind_selector_semantics() {
-        assert!(
-            KindSelector::Subtype(NormalizedKind::Literal).matches(NormalizedKind::StringLiteral)
-        );
-        assert!(
-            !KindSelector::Exact(NormalizedKind::Literal).matches(NormalizedKind::StringLiteral)
-        );
-        assert!(KindSelector::Exact(NormalizedKind::Literal).matches(NormalizedKind::Literal));
+    fn not_kind_alone_does_not_anchor_a_root() {
+        let error = error_of(json!({ "match": { "not_kind": "lambda" } }));
+        assert_eq!(error.path, "match");
+        assert!(error.message.contains("root pattern"));
     }
 }

@@ -37,6 +37,9 @@ class Controller:
 def helper():
     data = "static"
     return data
+
+
+compute = lambda x: x + retries
 "#;
 
 fn run_query(query: serde_json::Value) -> SearchAstOutput {
@@ -147,11 +150,22 @@ fn assignment_of_string_literal_and_kind_hierarchy() {
     }));
     assert_eq!(broad.matches.len(), 3, "hunter2, retries, and data");
 
-    // Exact kind matching opts out of the hierarchy.
-    let exact = run_query(json!({
-        "match": { "kind": "assignment", "right": { "kind_exact": "literal" } }
+    // Kind unions: string OR numeric literal on the right, spelled out.
+    let union = run_query(json!({
+        "match": { "kind": "assignment", "right": { "kind": ["string_literal", "numeric_literal"] } }
     }));
-    assert!(exact.matches.is_empty());
+    assert_eq!(union.matches.len(), 3);
+
+    // Exclusion narrows the broad kind: literal-but-not-string leaves only
+    // the numeric assignment.
+    let subtractive = run_query(json!({
+        "match": {
+            "kind": "assignment",
+            "right": { "kind": "literal", "not_kind": "string_literal" }
+        }
+    }));
+    assert_eq!(subtractive.matches.len(), 1);
+    assert_eq!(subtractive.matches[0].text, "retries = 3");
 }
 
 #[test]
@@ -166,12 +180,26 @@ fn decorated_functions_and_method_kind_refinement() {
     );
 
     // `method` matches only defs directly inside a class; `callable`
-    // matches functions, methods, and the lambda-free file alike.
+    // matches functions, methods, and lambdas alike.
     let methods = run_query(json!({ "match": { "kind": "method" } }));
     assert_eq!(methods.matches.len(), 2, "execute_action and safe");
 
     let callables = run_query(json!({ "match": { "kind": "callable" } }));
-    assert_eq!(callables.matches.len(), 4, "2 functions + 2 methods");
+    assert_eq!(
+        callables.matches.len(),
+        5,
+        "2 functions + 2 methods + 1 lambda"
+    );
+
+    // "All named functions, but not constructors or lambdas": both the
+    // subtractive and the union spelling agree.
+    let named = run_query(json!({
+        "match": { "kind": "callable", "not_kind": ["constructor", "lambda"] }
+    }));
+    assert_eq!(named.matches.len(), 4, "2 functions + 2 methods");
+
+    let union = run_query(json!({ "match": { "kind": ["function", "method"] } }));
+    assert_eq!(union.matches.len(), 4);
 }
 
 #[test]

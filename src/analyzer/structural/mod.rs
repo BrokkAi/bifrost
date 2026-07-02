@@ -27,6 +27,6 @@ pub mod spec;
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
 pub use provider::StructuralSearchProvider;
-pub use query::{AstQuery, KindSelector, Pattern, QueryError, StringPredicate};
+pub use query::{AstQuery, Pattern, QueryError, StringPredicate};
 pub use search::{SearchAstMatch, SearchAstOutput, execute};
 pub use spec::{RoleSink, StructuralSpec};

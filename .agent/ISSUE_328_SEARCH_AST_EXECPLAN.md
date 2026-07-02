@@ -27,6 +27,7 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 - [x] (2026-07-02) Read issue #328 thread; surveyed analyzer/tool architecture; wrote this plan.
 - [x] (2026-07-02) Milestone 1: kind vocabulary + query IR + JSON frontend + validation. `src/analyzer/structural/{mod,kinds,query}.rs` landed with 17 unit tests (`cargo test --lib analyzer::structural`); fmt + clippy clean.
 - [x] (2026-07-02) Milestone 2: Python structural adapter + matcher + captures + containment; `search_ast` wired end-to-end (MCP descriptor in extended toolset, dispatch arm, provider capability on `IAnalyzer` with `MultiAnalyzer` fan-out). New files: `src/analyzer/structural/{facts,spec,extract,matcher,provider,search}.rs`, `src/analyzer/python/structural.rs`, `tests/structural_search_python.rs` (8 tests). CLI verified: `bifrost --tool search_ast --args '{"match":{"kind":"call","callee":{"name":"eval"},"args":[{"capture":"code"}]},"inside":{"kind":"callable","capture":"fn"}}'` returns the match with `$code`/`$fn` captures and `enclosing_symbol`; malformed queries return path-precise errors.
+- [x] (2026-07-02) Query-language revision after review: dropped `kind_exact`; `kind` now accepts a union array and `not_kind` provides subtype-aware exclusion (see Decision Log). IR, matcher, tool schema, plan, and tests updated; `kind_exact` now fails as an unknown field with the standard path-precise error.
 - [ ] Milestone 3: workspace planner — candidate pruning, parallel parse, moka facts cache, limits, enclosing symbols, capability diagnostics.
 - [ ] Milestone 4: Java and JS/TS structural adapters; kwargs/decorators/annotations; cross-language acceptance tests.
 - [ ] Milestone 5 (deferred): S-expression frontend compiling to the same `AstQuery`, with `--print-json` style canonical echo.
@@ -52,9 +53,13 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
   Rationale: agents/MCP/schema validation benefit from JSON; humans get S-expressions once the IR is stable. Explicit user direction.
   Date/Author: 2026-07-02 / dave.
 
-- Decision: Normalized kinds form an explicit subtype hierarchy encoded in Rust (`NormalizedKind::parent()`), and kind matching is subtype-aware by default (`literal` matches `string_literal`); `kind_exact` opts out. The v1 hierarchy is deliberately shallow: two real branches (`declaration → callable → {function, method, constructor, lambda}`, and `literal → {string_literal, numeric_literal, boolean_literal, null_literal}`); everything else hangs off the implicit root.
+- Decision: Normalized kinds form an explicit subtype hierarchy encoded in Rust (`NormalizedKind::parent()`), and kind matching is subtype-aware, always (`literal` matches `string_literal`). The v1 hierarchy is deliberately shallow: two real branches (`declaration → callable → {function, method, constructor, lambda}`, and `literal → {string_literal, numeric_literal, boolean_literal, null_literal}`); everything else hangs off the implicit root. (An earlier revision also had a `kind_exact` opt-out; superseded — see the kind-union decision below.)
   Rationale: exercises the subtype machinery that tree-sitter grammars also model (cf. Java `declaration` supertype in node-types.json) without over-modeling `expression`/`statement` splits that differ per language (e.g. assignment is an expression in JS, a statement in Python). Deepen only when a query needs it.
   Date/Author: 2026-07-02 / dave + issue thread ("Add normalized subtypes only when they unlock useful user queries").
+
+- Decision: There is no `kind_exact`. `kind` accepts one label or an array forming a union (each entry subtype-aware), and `not_kind` (named to parallel `not_inside`/`not_has`) accepts one label or an array of subtype-aware exclusions, evaluated verifier-only. "All named functions but not constructors or lambdas" is `{"kind": ["function", "method"]}` or `{"kind": "callable", "not_kind": ["constructor", "lambda"]}`. Roles must be valid for at least one positive kind; `not_kind` alone neither anchors a root pattern nor enables roles. On un-normalized role targets (no fact kind), positive kind constraints fail and `not_kind` is vacuously satisfied.
+  Rationale: review feedback (dave) — exact matching only *differs* from subtype matching on abstract kinds, where "exactly `literal`" would select only facts from adapters too coarse to classify further; that is a precision property belonging in capability diagnostics, not a query dimension. Leaf kinds are their own exact match, and union + exclusion express every set the hierarchy can name.
+  Date/Author: 2026-07-02 / dave, replacing the earlier `kind_exact` design after M2 landed.
 
 - Decision: Orthogonal properties (anonymous, closure-ness, string interpolation, class-like form struct/interface/trait/enum) are *not* subtypes; they become optional predicate fields on patterns/facts in later iterations.
   Rationale: issue thread analysis — `lambda` vs `anonymous` vs `closure` answer different questions; forcing them into one inheritance chain breaks.
@@ -85,7 +90,7 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
   Date/Author: 2026-07-02 / issue thread.
 
 - Decision: Query JSON decoding is hand-rolled over `serde_json::Value` rather than serde-derived, and every `QueryError` carries the JSON path of the offending field (`match.callee.name.regex`).
-  Rationale: precise error paths are the agent-self-correction story; cross-field rules (kind/kind_exact exclusivity, role-valid-for-kind, root-must-be-constrained) are validation logic serde derive cannot express cleanly.
+  Rationale: precise error paths are the agent-self-correction story; cross-field rules (role-valid-for-kind, root-must-be-constrained, kind-list shape) are validation logic serde derive cannot express cleanly.
   Date/Author: 2026-07-02 / dave (M1 implementation).
 
 - Decision: Role sub-patterns require the pattern to *declare* a kind, and each role is validated against that kind (`callee` requires `call`; `decorators` accepts any callable/class/declaration kind). A role on a kindless pattern is rejected with a message telling the caller to add `kind`.
@@ -143,11 +148,14 @@ A query is a single JSON object:
       "limit": 100                       // optional result cap (default 100, hard max 1000)
     }
 
-A `<pattern>` is a JSON object with the fields below, all optional. The *root* `match` pattern must constrain at least one of `kind`/`kind_exact`/`name`/`text` (a wildcard root would match every node in the workspace); *nested* patterns (role sub-patterns, `args` entries) may be capture-only or even empty — the issue's own example uses `"args": [{ "capture": "code" }]`, and an empty `args` entry means "some argument exists". `inside`/`not_inside`/`has`/`not_has` patterns must be non-empty (an empty one would be vacuous).
+A `<pattern>` is a JSON object with the fields below, all optional. The *root* `match` pattern must constrain at least one of `kind`/`name`/`text` (a wildcard root would match every node in the workspace, and `not_kind` alone is near-wildcard so it does not anchor either); *nested* patterns (role sub-patterns, `args` entries) may be capture-only or even empty — the issue's own example uses `"args": [{ "capture": "code" }]`, and an empty `args` entry means "some argument exists". `inside`/`not_inside`/`has`/`not_has` patterns must be non-empty (an empty one would be vacuous).
 
     {
-      "kind": "call",                    // subtype-aware normalized kind
-      "kind_exact": "literal",           // exact-kind variant; mutually exclusive with "kind"
+      "kind": "call",                    // one kind, or an array forming a union: ["function", "method"];
+                                         // every entry is subtype-aware ("literal" matches string_literal etc.)
+      "not_kind": ["lambda"],            // subtype-aware exclusion (verifier-only), string or array;
+                                         // e.g. kind "callable" + not_kind ["constructor", "lambda"]
+                                         // = named functions and methods
       "name": "eval",                    // string = exact match; or { "regex": "^handle.*" }
       "text": { "regex": "TODO" },       // predicate on the node's source text (regex only; use sparingly)
       "capture": "code",                 // label this node in results
@@ -240,7 +248,7 @@ Work from the repository root. After each milestone: `cargo fmt`, `cargo clippy-
 Milestone 1:
 
 - Create `src/analyzer/structural/mod.rs`, `kinds.rs`, `query.rs`; register `pub mod structural;` in `src/analyzer/mod.rs`.
-- Unit tests colocated (`#[cfg(test)]`) covering: every kind's serde label round-trips; subtype matching (`string_literal` satisfies `kind: "literal"`; `function` satisfies `callable` and `declaration`); JSON decode of the issue's example queries; rejection with precise error paths for unknown fields, unknown kinds, invalid role-for-kind, bad regex, `kind`+`kind_exact` conflict.
+- Unit tests colocated (`#[cfg(test)]`) covering: every kind's serde label round-trips; subtype matching (`string_literal` satisfies `kind: "literal"`; `function` satisfies `callable` and `declaration`); JSON decode of the issue's example queries plus kind unions and `not_kind` exclusions; rejection with precise error paths for unknown fields, unknown kinds, invalid role-for-kind, bad regex, empty kind arrays.
 - Run: `cargo test structural` — expect the new tests to pass; the same command fails to compile before this milestone (module absent), which is the before/after signal.
 
 Milestone 2:
@@ -315,3 +323,8 @@ In `src/analyzer/i_analyzer.rs` (default `None`; implemented by `TreeSitterAnaly
     fn structural_search_provider(&self) -> Option<&dyn StructuralSearchProvider>;
 
 `StructuralSearchProvider` exposes the language, the file list, per-file facts (through the cache), and access to in-memory source for parsing — the planner in `src/analyzer/structural/planner.rs` is the only consumer.
+
+
+## Revision Notes
+
+- 2026-07-02: Replaced the `kind` / `kind_exact` pair with `kind` (string or union array, each entry subtype-aware) plus `not_kind` (string or array, subtype-aware exclusion, verifier-only). Reason: review feedback (dave) showed `kind_exact` only *differs* from `kind` on abstract kinds, where "exactly `literal`" would select nothing but facts from adapters too coarse to classify — a precision property that belongs in capability diagnostics, not query semantics — while union + exclusion directly express queries like "named functions but not constructors or lambdas". Updated: the query-shape section, Decision Log (superseding entry kept), M1 test description, `src/analyzer/structural/{query,matcher,mod}.rs`, the `search_ast` descriptor text, and both test suites. Note the interface sketch's `fn structural_search_provider(&self)` shipped pluralized as `structural_search_providers(&self) -> Vec<...>` (one provider per language, `MultiAnalyzer` fan-out).

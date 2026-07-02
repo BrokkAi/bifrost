@@ -91,8 +91,13 @@ fn eval_pattern_inner(
     captures: &mut Vec<(String, Span)>,
 ) -> bool {
     let fact = facts.node(node);
-    if let Some(selector) = pattern.kind
-        && !selector.matches(fact.kind)
+    if !pattern.kinds.is_empty() && !pattern.kinds.iter().any(|&kind| fact.kind.satisfies(kind)) {
+        return false;
+    }
+    if pattern
+        .not_kinds
+        .iter()
+        .any(|&kind| fact.kind.satisfies(kind))
     {
         return false;
     }
@@ -237,7 +242,10 @@ fn eval_span_only(
     target: &RoleTarget,
     captures: &mut Vec<(String, Span)>,
 ) -> bool {
-    if pattern.kind.is_some()
+    // An un-normalized target has no fact kind: positive kind constraints
+    // fail, while `not_kind` is vacuously satisfied (the target provably is
+    // none of the normalized kinds).
+    if !pattern.kinds.is_empty()
         || pattern.has.is_some()
         || pattern.not_has.is_some()
         || !pattern.args.is_empty()
