@@ -1,11 +1,12 @@
 # Bifrost Agent Plugin
 
 This package installs Bifrost's MCP server configuration as an agent plugin for
-Codex and Claude Code. It does not bundle the Bifrost binary or the Brokk host
-workflow skills; it installs a launcher that resolves a released Bifrost binary
-and makes a multi-language code analysis subset of the `bifrost` MCP tools
-discoverable through each host's plugin system. It also includes Bifrost-owned
-skills for using that default MCP toolset effectively.
+Codex and Claude Code. It does not bundle the Bifrost binary; it installs a
+launcher that resolves a released Bifrost binary and makes a multi-language
+code analysis subset of the `bifrost` MCP tools discoverable through each
+host's plugin system. It also bundles the Brokk/Bifrost workflow skills and
+specialist agents so the plugin is a one-stop shop for code intelligence,
+GitHub issue work, and code review workflows.
 
 The plugin's stable install name is `brokk`. The Codex UI-facing display name
 is `Bifrost by Brokk`; Claude Code uses the shared plugin package metadata.
@@ -86,7 +87,8 @@ active workspace.
 ## Bundled Skills
 
 The Bifrost plugin owns the skills that explain the analyzer-backed MCP tools
-it installs:
+it installs, plus the broader Brokk/Bifrost workflow skills that build on those
+tools:
 
 - `bifrost-code-navigation`: definitions, references, call sites, and related
   files with `search_symbols`, `get_symbol_locations`, `scan_usages`, and
@@ -95,12 +97,22 @@ it installs:
   `get_summaries` and `get_symbol_sources`.
 - `bifrost-codebase-search`: symbol, usage, file, and related-file discovery
   with shell grep reserved for arbitrary text.
+- `brokk-git-exploration`: git-history exploration and commit inspection.
+- `brokk-guided-issue`: end-to-end GitHub issue resolution.
+- `brokk-guided-review`: interactive review of local changes, branches, or
+  remote PRs with specialist reviewer agents.
+- `brokk-review-pr`: adversarial multi-agent PR review.
+- `review`: concise code-review guidance for ordinary review requests.
+- `brokk-today`: GitHub issue and PR work-queue triage with a Slack-ready
+  summary.
+- `brokk-write-issue`: issue drafting with source-code context.
 
-The default plugin toolset does not expose Bifrost's `workspace` lifecycle
-tools, so the Brokk `workspace` skill is not copied here. Higher-level Brokk
-workflows such as guided issue resolution, guided review, PR review, issue
-drafting, today planning, and specialist reviewer agents remain in the Brokk
-host plugin until they are intentionally made Bifrost-owned.
+The plugin also includes the specialist reviewer and issue-planning agents used
+by those workflows. The default plugin MCP toolset still does not expose
+Bifrost's `workspace` lifecycle tools, so the Brokk `workspace` skill is not
+copied here. Workflow skills should rely on the host-provided workspace context
+and the plugin's analyzer tools, or gracefully skip explicit workspace
+activation when `activate_workspace` is unavailable.
 
 ## Claude Code Install
 

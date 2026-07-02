@@ -10,7 +10,7 @@
         "source": "local",
         "path": "./plugins/bifrost-agent"
       },
-      "description": "Multi-language code analysis and navigation powered by Bifrost.",
+      "description": "Multi-language code intelligence and Brokk/Bifrost engineering workflows.",
       "policy": {
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
