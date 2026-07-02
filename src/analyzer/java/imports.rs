@@ -1,6 +1,13 @@
+use super::external::JavaExternalType;
 use super::*;
 use crate::analyzer::{ImportInfo, build_reverse_import_index};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JavaTypeResolution {
+    Source(CodeUnit),
+    External(JavaExternalType),
+}
 
 impl ImportAnalysisProvider for JavaAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
@@ -214,14 +221,9 @@ impl JavaAnalyzer {
         }
 
         for import in imports {
-            let raw = import
-                .raw_snippet
-                .trim()
-                .strip_prefix("import ")
-                .unwrap_or(import.raw_snippet.trim())
-                .strip_suffix(';')
-                .unwrap_or(import.raw_snippet.trim())
-                .trim();
+            let Some(raw) = non_static_import_path(import) else {
+                continue;
+            };
 
             if !import.is_wildcard {
                 if import.identifier.as_deref() == Some(target_name.as_str()) {
@@ -261,22 +263,9 @@ impl JavaAnalyzer {
         let mut wildcard_resolved = HashMap::<String, CodeUnit>::default();
 
         for import in self.inner.import_info_of(file) {
-            if import
-                .raw_snippet
-                .trim_start()
-                .starts_with("import static ")
-            {
+            let Some(import_path) = non_static_import_path(import) else {
                 continue;
-            }
-
-            let import_path = import
-                .raw_snippet
-                .trim()
-                .strip_prefix("import ")
-                .unwrap_or(import.raw_snippet.trim())
-                .strip_suffix(';')
-                .unwrap_or(import.raw_snippet.trim())
-                .trim();
+            };
 
             if !import.is_wildcard {
                 if let Some(code_unit) = self
@@ -350,6 +339,67 @@ impl JavaAnalyzer {
             .cloned()
     }
 
+    pub(crate) fn resolve_type_name_with_external(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<JavaTypeResolution> {
+        let normalized = raw_name.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+
+        if let Some(code_unit) = self.resolve_type_name(file, normalized) {
+            return Some(JavaTypeResolution::Source(code_unit));
+        }
+
+        let external = self.external_declaration_index();
+        if external.is_empty() {
+            return None;
+        }
+
+        let access_package = self.inner.package_name_of(file).unwrap_or("");
+        if normalized.contains('.')
+            && let Some(external_type) = external.resolve_qualified_name(normalized, access_package)
+        {
+            return Some(JavaTypeResolution::External(external_type.clone()));
+        }
+
+        if let Some(external_type) = self.resolve_external_imports(file, normalized, access_package)
+        {
+            return Some(JavaTypeResolution::External(external_type));
+        }
+
+        if let Some((first, rest)) = normalized.split_once('.')
+            && let Some(owner) =
+                self.resolve_visible_external_simple_type(file, first, access_package)
+        {
+            let nested_fqn = format!("{}.{}", owner.fqn(), rest);
+            if let Some(external_type) =
+                external.resolve_qualified_name(&nested_fqn, access_package)
+            {
+                return Some(JavaTypeResolution::External(external_type.clone()));
+            }
+        }
+
+        let same_package = self.same_package_fqn(file, normalized);
+        if let Some(external_type) = external.resolve_same_package(access_package, normalized) {
+            return Some(JavaTypeResolution::External(external_type.clone()));
+        }
+
+        if same_package != normalized
+            && let Some(external_type) =
+                external.resolve_qualified_name(&same_package, access_package)
+        {
+            return Some(JavaTypeResolution::External(external_type.clone()));
+        }
+
+        external
+            .resolve_java_lang(normalized)
+            .cloned()
+            .map(JavaTypeResolution::External)
+    }
+
     fn resolve_nested_type_name(&self, file: &ProjectFile, normalized: &str) -> Option<CodeUnit> {
         let (first, rest) = normalized.split_once('.')?;
         let owner = self.resolve_visible_simple_type(file, first)?;
@@ -358,6 +408,71 @@ impl JavaAnalyzer {
             .definitions(&nested_fqn)
             .find(|code_unit| code_unit.is_class())
             .cloned()
+    }
+
+    fn resolve_visible_external_simple_type(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        access_package: &str,
+    ) -> Option<JavaExternalType> {
+        if let Some(external_type) = self.resolve_external_imports(file, name, access_package) {
+            return Some(external_type);
+        }
+
+        let external = self.external_declaration_index();
+        external
+            .resolve_same_package(access_package, name)
+            .or_else(|| external.resolve_java_lang(name))
+            .cloned()
+    }
+
+    fn resolve_external_imports(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        access_package: &str,
+    ) -> Option<JavaExternalType> {
+        let external = self.external_declaration_index();
+        for import in self.inner.import_info_of(file) {
+            let Some(import_path) = non_static_import_path(import) else {
+                continue;
+            };
+
+            if !import.is_wildcard {
+                if import.identifier.as_deref() == Some(name)
+                    && let Some(external_type) =
+                        external.resolve_explicit_import(import_path, access_package)
+                {
+                    return Some(external_type.clone());
+                }
+                continue;
+            }
+        }
+
+        let mut wildcard_match: Option<JavaExternalType> = None;
+        for import in self.inner.import_info_of(file) {
+            let Some(import_path) = non_static_import_path(import) else {
+                continue;
+            };
+            if !import.is_wildcard {
+                continue;
+            }
+
+            let package_name = import_path.trim_end_matches(".*");
+            let Some(external_type) =
+                external.resolve_wildcard_import(package_name, name, access_package)
+            else {
+                continue;
+            };
+            match wildcard_match.as_ref() {
+                Some(existing) if existing.fqn() != external_type.fqn() => return None,
+                Some(_) => {}
+                None => wildcard_match = Some(external_type.clone()),
+            }
+        }
+
+        wildcard_match
     }
 
     fn resolve_visible_simple_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
@@ -409,14 +524,29 @@ pub(super) fn parse_import_info(raw: String) -> ImportInfo {
     }
 }
 
-fn extract_package_from_import(raw: &str) -> String {
-    let trimmed = raw
-        .trim()
+fn non_static_import_path(import: &ImportInfo) -> Option<&str> {
+    if import
+        .raw_snippet
+        .trim_start()
+        .starts_with("import static ")
+    {
+        return None;
+    }
+
+    Some(import_path_from_raw(&import.raw_snippet))
+}
+
+fn import_path_from_raw(raw: &str) -> &str {
+    raw.trim()
         .strip_prefix("import ")
         .unwrap_or(raw.trim())
         .strip_suffix(';')
         .unwrap_or(raw.trim())
-        .trim();
+        .trim()
+}
+
+fn extract_package_from_import(raw: &str) -> String {
+    let trimmed = import_path_from_raw(raw);
     let trimmed = trimmed.strip_prefix("static ").unwrap_or(trimmed).trim();
 
     if let Some(package) = trimmed.strip_suffix(".*") {

@@ -20,14 +20,7 @@ pub(super) fn determine_package_name(root: Node<'_>, source: &str) -> String {
                 .to_string();
         }
 
-        if matches!(
-            child.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "annotation_type_declaration"
-        ) {
+        if is_class_like_declaration_kind(child.kind()) {
             break;
         }
     }
@@ -265,17 +258,9 @@ pub(super) fn visit_class_like(
 
         let mut has_explicit_constructor = false;
         if let Some(body) = node.child_by_field_name("body") {
-            for index in (0..body.named_child_count()).rev() {
-                let Some(child) = body.named_child(index) else {
-                    continue;
-                };
-
+            for child in class_like_body_children_rev(body) {
                 match child.kind() {
-                    "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-                    | "annotation_type_declaration" => {
+                    kind if is_class_like_declaration_kind(kind) => {
                         stack.push((child, Some(code_unit.clone()), Some(top_level.clone())));
                     }
                     "method_declaration" | "constructor_declaration" => {
@@ -626,6 +611,28 @@ pub(super) fn is_declaration_parent(kind: &str) -> bool {
             | "enhanced_for_statement"
             | "resource"
     )
+}
+
+pub(super) fn is_class_like_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+    )
+}
+
+pub(super) fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut children = Vec::new();
+    for index in (0..body.named_child_count()).rev() {
+        let Some(child) = body.named_child(index) else {
+            continue;
+        };
+        children.push(child);
+    }
+    children
 }
 
 pub(super) fn find_nearest_declaration_from_node(

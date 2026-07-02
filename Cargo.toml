@@ -80,6 +80,8 @@ jaq-std = "3.0"
 jaq-json = "2.0"
 xee-xpath = "0.1.5"
 xot = "0.31"
+jclassfile = "0.6.0"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [features]
 default = []

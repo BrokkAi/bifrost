@@ -39,10 +39,12 @@ fn parallel_build_matches_sequential_build_observables() {
     let sequential = fixture_analyzer(AnalyzerConfig {
         parallelism: Some(1),
         memo_cache_budget_bytes: Some(1024 * 1024),
+        ..AnalyzerConfig::default()
     });
     let parallel = fixture_analyzer(AnalyzerConfig {
         parallelism: Some(4),
         memo_cache_budget_bytes: Some(1024 * 1024),
+        ..AnalyzerConfig::default()
     });
 
     assert_eq!(
@@ -88,6 +90,7 @@ fn small_budget_memo_caches_do_not_change_update_results() {
     let config = AnalyzerConfig {
         parallelism: Some(4),
         memo_cache_budget_bytes: Some(256),
+        ..AnalyzerConfig::default()
     };
     let (_temp, analyzer) = temp_analyzer(
         &[

@@ -1,8 +1,12 @@
 use brokk_bifrost::{
-    IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile, TestProject,
+    AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, JavaAnalyzerConfig,
+    JavaExternalDependencies, JavaMavenCoordinate, Language, ProjectFile, TestProject,
     TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
 
 fn analyzer_for(files: &[(&str, &str)]) -> JavaAnalyzer {
     let temp = tempfile::tempdir().unwrap();
@@ -16,6 +20,22 @@ fn analyzer_for(files: &[(&str, &str)]) -> JavaAnalyzer {
 
     let project = TestProject::new(root.clone(), Language::Java);
     let analyzer = JavaAnalyzer::from_project(project);
+    std::mem::forget(temp);
+    analyzer
+}
+
+fn analyzer_for_with_config(files: &[(&str, &str)], config: AnalyzerConfig) -> JavaAnalyzer {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+
+    for (path, contents) in files {
+        ProjectFile::new(root.clone(), path)
+            .write(contents)
+            .unwrap();
+    }
+
+    let project = TestProject::new(root.clone(), Language::Java);
+    let analyzer = JavaAnalyzer::from_project_with_config(project, config);
     std::mem::forget(temp);
     analyzer
 }
@@ -34,6 +54,63 @@ fn resolves_explicit_imports() {
         imports
             .iter()
             .any(|code_unit| code_unit.fq_name() == "example.Baz")
+    );
+}
+
+#[test]
+fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_declarations() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    if !create_external_dependency_fixture(&root) {
+        return;
+    }
+
+    let config = AnalyzerConfig {
+        java: JavaAnalyzerConfig {
+            external_dependencies: JavaExternalDependencies {
+                coordinates: vec![JavaMavenCoordinate::new(
+                    "com.example",
+                    "external-lib",
+                    "1.2.3",
+                )],
+                repository_roots: vec![root.join("m2")],
+                ..JavaExternalDependencies::default()
+            },
+        },
+        ..AnalyzerConfig::default()
+    };
+
+    let analyzer = analyzer_for_with_config(
+        &[(
+            "src/App.java",
+            "package app;\n\
+             import com.example.dep.ExternalService;\n\
+             import com.example.dep.ExternalHelper;\n\
+             public class App { ExternalService explicit; ExternalService.Nested nested; ExternalHelper helper; }\n",
+        )],
+        config,
+    );
+    let app = analyzer
+        .get_definitions("app.App")
+        .into_iter()
+        .next()
+        .unwrap();
+
+    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalService"));
+    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalService.Nested"));
+    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalHelper"));
+    assert!(
+        analyzer
+            .resolve_type_name_in_file(app.source(), "ExternalService")
+            .is_none(),
+        "source-only resolution must not create CodeUnits for external dependencies"
+    );
+    assert!(
+        analyzer
+            .get_all_declarations()
+            .into_iter()
+            .all(|code_unit| !code_unit.fq_name().starts_with("com.example.dep.")),
+        "external dependency types must not leak into normal analyzer declarations"
     );
 }
 
@@ -202,5 +279,68 @@ fn resolves_fully_qualified_extends() {
     assert_eq!(
         BTreeSet::from([child]),
         analyzer.get_direct_descendants(&base).into_iter().collect()
+    );
+}
+
+fn create_external_dependency_fixture(root: &Path) -> bool {
+    if !jdk_tool_available("javac") || !jdk_tool_available("jar") {
+        eprintln!(
+            "skipping Java external declaration integration test: `javac` and `jar` are required"
+        );
+        return false;
+    }
+
+    let repo_dir = root.join("m2/com/example/external-lib/1.2.3");
+    let source_dir = root.join("dep-src");
+    let package_dir = source_dir.join("com/example/dep");
+    let classes_dir = root.join("dep-classes");
+    fs::create_dir_all(&repo_dir).unwrap();
+    fs::create_dir_all(&package_dir).unwrap();
+    fs::create_dir_all(&classes_dir).unwrap();
+
+    fs::write(
+        package_dir.join("ExternalService.java"),
+        "package com.example.dep; public class ExternalService { public static class Nested {} }\n",
+    )
+    .unwrap();
+    fs::write(
+        package_dir.join("ExternalHelper.java"),
+        "package com.example.dep; public class ExternalHelper {}\n",
+    )
+    .unwrap();
+
+    run_jdk_command(
+        Command::new("javac")
+            .arg("-d")
+            .arg(&classes_dir)
+            .arg(package_dir.join("ExternalService.java"))
+            .arg(package_dir.join("ExternalHelper.java")),
+    );
+    run_jdk_command(
+        Command::new("jar")
+            .current_dir(&classes_dir)
+            .arg("cf")
+            .arg(repo_dir.join("external-lib-1.2.3.jar"))
+            .arg("."),
+    );
+    true
+}
+
+fn jdk_tool_available(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn run_jdk_command(command: &mut Command) {
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run JDK fixture command {command:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "JDK fixture command failed: {command:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

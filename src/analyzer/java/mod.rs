@@ -4,6 +4,7 @@ mod clones;
 mod comments;
 mod declarations;
 mod exceptions;
+mod external;
 mod hierarchy;
 mod imports;
 mod tests;
@@ -31,12 +32,15 @@ use declarations::{
     parse_tree,
 };
 use exceptions::detect_exception_handling_smells_java;
+use external::JavaExternalDeclarationIndex;
 use tests::detect_test_assertion_smells_java;
 
 #[derive(Clone)]
 pub struct JavaAnalyzer {
     inner: TreeSitterAnalyzer<JavaAdapter>,
     memo_caches: Arc<JavaMemoCaches>,
+    external_dependencies: crate::analyzer::JavaExternalDependencies,
+    external_index: Arc<std::sync::OnceLock<JavaExternalDeclarationIndex>>,
 }
 
 impl JavaAnalyzer {
@@ -46,10 +50,13 @@ impl JavaAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let external_dependencies = config.java.external_dependencies.clone();
         let inner = TreeSitterAnalyzer::new_with_config(project, JavaAdapter, config);
         Self {
             inner,
             memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+            external_dependencies,
+            external_index: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -77,6 +84,7 @@ impl JavaAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let external_dependencies = config.java.external_dependencies.clone();
         let inner = match progress {
             Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
                 project,
@@ -95,6 +103,8 @@ impl JavaAnalyzer {
         Self {
             inner,
             memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+            external_dependencies,
+            external_index: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -114,6 +124,7 @@ impl JavaAnalyzer {
         F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         let memo_budget = config.memo_cache_budget_bytes();
+        let external_dependencies = config.java.external_dependencies.clone();
         let inner = TreeSitterAnalyzer::new_with_config_and_progress(
             project,
             JavaAdapter,
@@ -123,6 +134,8 @@ impl JavaAnalyzer {
         Self {
             inner,
             memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+            external_dependencies,
+            external_index: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -189,8 +202,22 @@ impl JavaAnalyzer {
         self.resolve_type_name(file, raw_name)
     }
 
+    pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
+        self.resolve_type_name_with_external(file, raw_name)
+            .is_some()
+    }
+
     pub fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {
         self.inner.package_name_of(file)
+    }
+
+    pub(crate) fn external_declaration_index(&self) -> &JavaExternalDeclarationIndex {
+        self.external_index.get_or_init(|| {
+            JavaExternalDeclarationIndex::build(
+                &self.external_dependencies,
+                self.inner.project().root(),
+            )
+        })
     }
 }
 
@@ -272,6 +299,8 @@ impl IAnalyzer for JavaAnalyzer {
         Self {
             inner: self.inner.update(_changed_files),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
+            external_dependencies: self.external_dependencies.clone(),
+            external_index: self.external_index.clone(),
         }
     }
 
@@ -279,6 +308,8 @@ impl IAnalyzer for JavaAnalyzer {
         Self {
             inner: self.inner.update_all(),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
+            external_dependencies: self.external_dependencies.clone(),
+            external_index: self.external_index.clone(),
         }
     }
 
