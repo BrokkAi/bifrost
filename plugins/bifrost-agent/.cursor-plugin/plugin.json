@@ -1,0 +1,29 @@
+{
+  "name": "bifrost",
+  "version": "0.7.2",
+  "description": "Bifrost by Brokk: multi-language code intelligence and MCP workflows.",
+  "author": {
+    "name": "Brokk"
+  },
+  "homepage": "https://github.com/BrokkAi/bifrost",
+  "repository": "https://github.com/BrokkAi/bifrost",
+  "license": "LGPL-3.0-or-later",
+  "keywords": [
+    "bifrost",
+    "mcp",
+    "code-intelligence",
+    "tree-sitter"
+  ],
+  "logo": "assets/icon.png",
+  "skills": "./skills/",
+  "agents": [
+    "./agents/architect-reviewer.md",
+    "./agents/devops-reviewer.md",
+    "./agents/dry-reviewer.md",
+    "./agents/issue-diagnostician.md",
+    "./agents/issue-enhancer.md",
+    "./agents/issue-planner.md",
+    "./agents/security-reviewer.md",
+    "./agents/senior-dev-reviewer.md"
+  ]
+}
