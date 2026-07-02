@@ -25,7 +25,7 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 ## Progress
 
 - [x] (2026-07-02) Read issue #328 thread; surveyed analyzer/tool architecture; wrote this plan.
-- [ ] Milestone 1: kind vocabulary + query IR + JSON frontend + validation (library-level, unit tested).
+- [x] (2026-07-02) Milestone 1: kind vocabulary + query IR + JSON frontend + validation. `src/analyzer/structural/{mod,kinds,query}.rs` landed with 17 unit tests (`cargo test --lib analyzer::structural`); fmt + clippy clean.
 - [ ] Milestone 2: Python structural adapter + single-file matcher + captures + containment; `search_ast` tool wired end-to-end for Python.
 - [ ] Milestone 3: workspace planner — candidate pruning, parallel parse, moka facts cache, limits, enclosing symbols, capability diagnostics.
 - [ ] Milestone 4: Java and JS/TS structural adapters; kwargs/decorators/annotations; cross-language acceptance tests.
@@ -37,6 +37,9 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 - Observation: every `TreeSitterAnalyzer` already retains the full source text of every analyzed file in memory (`FileState.source` in `src/analyzer/tree_sitter_analyzer.rs`), but drops parse trees after declaration indexing.
   Evidence: `FileState { pub(crate) source: String, ... }` at `src/analyzer/tree_sitter_analyzer.rs:150`; on-demand re-parse helper `parse_tree_sitter_file` in `src/analyzer/usages/parsed_tree.rs` reads from disk today.
   Implication: re-parsing on a facts-cache miss costs CPU only (no disk IO if we parse from `FileState.source`), and tree-sitter parses are typically well under a millisecond per average file. The "lots of re-parsing" worry is bounded by prune-then-parse plus a facts cache; we should not cache `tree_sitter::Tree`s (roughly 10x source size in memory).
+
+- Observation: on this macOS machine the `cargo clippy-no-cuda` alias fails with `error: Unrecognized option: 'all-targets'` (the alias leaks `--all-targets` into clippy-driver), while the identical spelled-out command `cargo clippy --all-targets --features nlp,python -- -D warnings` — run with the rustup 1.96.0 toolchain bin first on PATH so homebrew's cargo/clippy-driver do not shadow it — passes cleanly.
+  Evidence: M1 verification runs, 2026-07-02.
 
 
 ## Decision Log
@@ -81,6 +84,14 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
   Rationale: issue thread layering agreement; `search_ast` is the substrate.
   Date/Author: 2026-07-02 / issue thread.
 
+- Decision: Query JSON decoding is hand-rolled over `serde_json::Value` rather than serde-derived, and every `QueryError` carries the JSON path of the offending field (`match.callee.name.regex`).
+  Rationale: precise error paths are the agent-self-correction story; cross-field rules (kind/kind_exact exclusivity, role-valid-for-kind, root-must-be-constrained) are validation logic serde derive cannot express cleanly.
+  Date/Author: 2026-07-02 / dave (M1 implementation).
+
+- Decision: Role sub-patterns require the pattern to *declare* a kind, and each role is validated against that kind (`callee` requires `call`; `decorators` accepts any callable/class/declaration kind). A role on a kindless pattern is rejected with a message telling the caller to add `kind`.
+  Rationale: inferring `kind: call` from the presence of `callee` is tempting sugar but makes error cases ambiguous; explicit is cheaper for agents than clever.
+  Date/Author: 2026-07-02 / dave (M1 implementation).
+
 
 ## Outcomes & Retrospective
 
@@ -120,7 +131,7 @@ A query is a single JSON object:
       "limit": 100                       // optional result cap (default 100, hard max 1000)
     }
 
-A `<pattern>` is a JSON object with these fields, all optional except that at least one of `kind`/`kind_exact`/`name`/`text` must be present:
+A `<pattern>` is a JSON object with the fields below, all optional. The *root* `match` pattern must constrain at least one of `kind`/`kind_exact`/`name`/`text` (a wildcard root would match every node in the workspace); *nested* patterns (role sub-patterns, `args` entries) may be capture-only or even empty — the issue's own example uses `"args": [{ "capture": "code" }]`, and an empty `args` entry means "some argument exists". `inside`/`not_inside`/`has`/`not_has` patterns must be non-empty (an empty one would be vacuous).
 
     {
       "kind": "call",                    // subtype-aware normalized kind
