@@ -202,20 +202,23 @@ fn run_tool(
         )
         .map_err(|err| err.to_string())?;
 
-    let text = match output {
-        ToolOutput::Text(text) => text,
+    let result = match output {
+        // Mirror the MCP tool result shape, but omit `content` so one-shot CLI
+        // stdout stays machine-only.
+        ToolOutput::Text(_) => json!({
+            "isError": false,
+        }),
         ToolOutput::Structured {
             structured,
-            rendered_text,
-        } => rendered_text.unwrap_or_else(|| {
-            serde_json::to_string(&structured)
-                .unwrap_or_else(|_| "Failed to serialize tool result".to_string())
+            rendered_text: _,
+        } => json!({
+            "structuredContent": structured,
+            "isError": false,
         }),
     };
-    print!("{text}");
-    if !text.ends_with('\n') {
-        println!();
-    }
+    let encoded = serde_json::to_string(&result)
+        .map_err(|err| format!("Failed to serialize tool result: {err}"))?;
+    println!("{encoded}");
     Ok(())
 }
 
@@ -417,7 +420,7 @@ USAGE:
     bifrost                  Run an MCP server over stdio (default: --mcp searchtools)
     bifrost --mcp TOOLSETS     Run an MCP server over stdio (e.g. --mcp core)
     bifrost --lsp              Run a Language Server (LSP) over stdio
-    bifrost --tool NAME        Run a single tool once, print the result, and exit
+    bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --version | --help [TOOL]
 
 OPTIONS:
@@ -463,7 +466,7 @@ EXAMPLES:
     # MCP server an agent connects to (core toolset), speaking MCP over stdio:
     bifrost --root /path/to/project --mcp core
 
-    # One-shot: run a single tool and print its result, then exit:
+    # One-shot: run a single tool and print its JSON result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
 
     # One-shot against a subset workspace built from a directory and a glob:

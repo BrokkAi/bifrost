@@ -48,7 +48,7 @@ fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
 }
 
 #[test]
-fn tool_get_summaries_renders_text() {
+fn tool_get_summaries_prints_structured_json_without_content() {
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
@@ -66,8 +66,17 @@ fn tool_get_summaries_renders_text() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("A.java"), "{stdout}");
-    assert!(stdout.contains("3..52: public class A"), "{stdout}");
+    let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert!(payload.get("content").is_none(), "{payload}");
+    assert_eq!(
+        payload["structuredContent"]["summaries"][0]["path"], "A.java",
+        "{payload}"
+    );
+    assert_eq!(
+        payload["structuredContent"]["summaries"][0]["elements"][0]["start_line"], 3,
+        "{payload}"
+    );
 }
 
 #[test]
@@ -104,8 +113,27 @@ fn tool_get_summaries_accepts_git_history_path() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("OldDemo"), "{stdout}");
-    assert!(!stdout.contains("NewDemo"), "{stdout}");
+    let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
+    let structured = &payload["structuredContent"];
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        structured["summaries"][0]["elements"][0]["symbol"],
+        "OldDemo"
+    );
+    assert!(
+        structured["summaries"][0]["elements"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("OldDemo"),
+        "{payload}"
+    );
+    assert!(
+        !structured["summaries"][0]["elements"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("NewDemo"),
+        "{payload}"
+    );
 }
 
 #[test]
@@ -142,9 +170,18 @@ fn tool_get_symbol_sources_accepts_git_history_path() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("OldDemo"), "{stdout}");
-    assert!(stdout.contains("value() { return 1; }"), "{stdout}");
-    assert!(!stdout.contains("NewDemo"), "{stdout}");
+    let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
+    let source_text = payload["structuredContent"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|source| source["text"].as_str())
+        .find(|text| text.contains("value() { return 1; }"))
+        .expect("symbol source text");
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert!(source_text.contains("OldDemo"), "{payload}");
+    assert!(source_text.contains("value() { return 1; }"), "{payload}");
+    assert!(!source_text.contains("NewDemo"), "{payload}");
 }
 
 #[test]
@@ -167,9 +204,15 @@ fn tool_no_line_numbers_suppresses_line_prefixes() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("A.java"), "{stdout}");
-    assert!(!stdout.contains("3..52: public class A"), "{stdout}");
-    assert!(stdout.contains("public class A"), "{stdout}");
+    let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
+    let element = &payload["structuredContent"]["summaries"][0]["elements"][0];
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        payload["structuredContent"]["summaries"][0]["path"],
+        "A.java"
+    );
+    assert!(element["text"].as_str().unwrap().contains("public class A"));
+    assert!(!element["text"].as_str().unwrap().contains("3..52:"));
 }
 
 #[test]
@@ -192,8 +235,14 @@ fn tool_normalizes_absolute_paths_inside_workspace() {
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
-    assert_eq!(payload["files"][0]["path"], "A.java", "{payload}");
-    assert!(payload["files"][0]["content"].is_string(), "{payload}");
+    assert_eq!(
+        payload["structuredContent"]["files"][0]["path"], "A.java",
+        "{payload}"
+    );
+    assert!(
+        payload["structuredContent"]["files"][0]["content"].is_string(),
+        "{payload}"
+    );
 }
 
 #[test]
@@ -239,10 +288,16 @@ fn tool_sources_limit_workspace_to_selected_files() {
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
-    assert_eq!(payload["files"].as_array().unwrap().len(), 1, "{payload}");
-    assert_eq!(payload["files"][0]["path"], "A.java", "{payload}");
+    let structured = &payload["structuredContent"];
+    assert_eq!(payload["isError"], false, "{payload}");
     assert_eq!(
-        payload["not_found"],
+        structured["files"].as_array().unwrap().len(),
+        1,
+        "{payload}"
+    );
+    assert_eq!(structured["files"][0]["path"], "A.java", "{payload}");
+    assert_eq!(
+        structured["not_found"],
         serde_json::json!(["B.java"]),
         "{payload}"
     );
@@ -271,7 +326,11 @@ fn tool_sources_accept_absolute_workspace_paths() {
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
-    assert_eq!(payload["files"][0]["path"], "A.java", "{payload}");
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        payload["structuredContent"]["files"][0]["path"], "A.java",
+        "{payload}"
+    );
 }
 
 #[test]
@@ -309,12 +368,14 @@ fn tool_sources_expand_directories_and_globs() {
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
-    let files = payload["files"].as_array().expect("files array");
+    let structured = &payload["structuredContent"];
+    assert_eq!(payload["isError"], false, "{payload}");
+    let files = structured["files"].as_array().expect("files array");
     assert_eq!(files.len(), 2, "{payload}");
     assert_eq!(files[0]["path"], "src/A.java", "{payload}");
     assert_eq!(files[1]["path"], "src/nested/B.java", "{payload}");
     assert_eq!(
-        payload["not_found"],
+        structured["not_found"],
         serde_json::json!(["src/notes.txt"]),
         "{payload}"
     );
