@@ -36,6 +36,7 @@ mod symbol_rename;
 mod test_support;
 mod text_utils;
 pub mod tool_arguments;
+mod util;
 pub use analyzer::usages;
 
 pub use analyzer::{

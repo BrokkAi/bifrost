@@ -11,6 +11,7 @@ use crate::analyzer::{CodeUnit, CodeUnitType, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::position_to_byte_offset;
 use crate::lsp::handlers::util::{identifier_prefix_before_offset, project_file_for_uri};
 use crate::text_utils::compute_line_starts;
+use crate::util::throttled_log::ThrottledLog;
 
 /// Soft cap on completion results. Matches `workspace_symbol`'s cap — most
 /// editors paginate or filter client-side after a few hundred items, and
@@ -25,6 +26,11 @@ const MAX_RESULTS: usize = 500;
 /// hundreds of identical lines per minute.
 const READ_FAILURE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 
+/// Soft cap on the read-failure throttle map. A client can point completion at
+/// many distinct unreadable paths, so bound the log bookkeeping the same way as
+/// other rate-limited stderr emitters.
+const READ_FAILURE_LOG_MAX_ENTRIES: usize = 256;
+
 /// Per-handler state for `textDocument/completion`. Owned by `ServerState`
 /// (single-threaded request loop), invalidated by `didSave` /
 /// `didChangeWatchedFiles`.
@@ -33,17 +39,16 @@ const READ_FAILURE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 /// read and UTF-8 line scan on every keystroke. Mtime-checked so external
 /// edits (git checkout, formatter run) don't serve stale bytes.
 ///
-/// Memory bound: unbounded today. An editor with thousands of files open
-/// concurrently could grow this map without bound. Acceptable for v1 (no
-/// reasonable LSP workflow keeps that many files open at once); revisit if
-/// the cache shows up in heap profiles.
-#[derive(Default)]
+/// File-content cache bound: unbounded today. An editor with thousands of
+/// files open concurrently could grow `files` without bound. Acceptable for
+/// v1 (no reasonable LSP workflow keeps that many files open at once);
+/// revisit if the cache shows up in heap profiles.
 pub(crate) struct CompletionCache {
     files: HashMap<PathBuf, FileCacheEntry>,
     /// Last time we logged a read failure for a given path. Keyed by path
     /// (NOT URI) to coalesce log noise even when the editor sends slightly
     /// different URI forms for the same file.
-    last_log_failure: HashMap<PathBuf, Instant>,
+    last_log_failure: ThrottledLog<PathBuf>,
 }
 
 struct FileCacheEntry {
@@ -54,7 +59,13 @@ struct FileCacheEntry {
 
 impl CompletionCache {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            files: HashMap::new(),
+            last_log_failure: ThrottledLog::new(
+                READ_FAILURE_LOG_THROTTLE,
+                READ_FAILURE_LOG_MAX_ENTRIES,
+            ),
+        }
     }
 
     /// Drop the cached entry (if any) for `path`. Called from `didSave` /
@@ -67,6 +78,12 @@ impl CompletionCache {
     pub(crate) fn clear(&mut self) {
         self.files.clear();
         self.last_log_failure.clear();
+    }
+}
+
+impl Default for CompletionCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -184,7 +201,7 @@ fn load_or_refresh<'cache>(
         Ok(m) => m,
         Err(err) => {
             maybe_log_failure(
-                &mut cache.last_log_failure,
+                &cache.last_log_failure,
                 abs_path,
                 uri,
                 &format_args!("stat failed: {err}").to_string(),
@@ -204,7 +221,7 @@ fn load_or_refresh<'cache>(
         Ok(c) => c,
         Err(err) => {
             maybe_log_failure(
-                &mut cache.last_log_failure,
+                &cache.last_log_failure,
                 abs_path,
                 uri,
                 &format_args!("read failed: {err}").to_string(),
@@ -230,20 +247,15 @@ fn load_or_refresh<'cache>(
 /// PII-bearing absolute paths (e.g. `/Users/me/secrets/.aws/credentials`)
 /// don't accumulate in LSP host logs that an editor may persist verbatim.
 fn maybe_log_failure(
-    last_log: &mut HashMap<PathBuf, Instant>,
+    last_log: &ThrottledLog<PathBuf>,
     abs_path: &Path,
     uri: &lsp_types::Uri,
     detail: &str,
 ) {
     let now = Instant::now();
-    let should_log = match last_log.get(abs_path) {
-        Some(prev) => now.duration_since(*prev) >= READ_FAILURE_LOG_THROTTLE,
-        None => true,
-    };
-    if !should_log {
+    if !last_log.should_log(abs_path, now) {
         return;
     }
-    last_log.insert(abs_path.to_path_buf(), now);
     let label = abs_path
         .file_name()
         .and_then(|name| name.to_str())

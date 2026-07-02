@@ -1,5 +1,6 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, ProjectFile};
+use crate::util::throttled_log::ThrottledLog;
 use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -549,9 +550,9 @@ pub struct OverlayProject {
     overlays: Arc<RwLock<HashMap<PathBuf, String>>>,
     max_overlay_bytes: usize,
     /// Last instant we emitted a rejection log for a given path. Kept on a
-    /// separate `Mutex` so the per-keystroke read path doesn't contend with
-    /// the rejection-logging code on the main overlay lock.
-    last_rejection_log: Mutex<HashMap<PathBuf, Instant>>,
+    /// separate throttle helper so the per-keystroke read path doesn't
+    /// contend with rejection logging on the main overlay lock.
+    last_rejection_log: ThrottledLog<PathBuf>,
 }
 
 impl OverlayProject {
@@ -566,7 +567,10 @@ impl OverlayProject {
             delegate,
             overlays: Arc::new(RwLock::new(HashMap::new())),
             max_overlay_bytes,
-            last_rejection_log: Mutex::new(HashMap::new()),
+            last_rejection_log: ThrottledLog::new(
+                OVERLAY_REJECTION_LOG_THROTTLE,
+                OVERLAY_REJECTION_LOG_MAX_ENTRIES,
+            ),
         }
     }
 
@@ -623,26 +627,7 @@ impl OverlayProject {
     /// critical section.
     fn log_rejection(&self, abs_path: &Path, content_len: usize) {
         let now = Instant::now();
-        let should_log = {
-            let mut log = self
-                .last_rejection_log
-                .lock()
-                .expect("overlay rejection log poisoned");
-            let recent = log
-                .get(abs_path)
-                .map(|last| now.duration_since(*last) < OVERLAY_REJECTION_LOG_THROTTLE)
-                .unwrap_or(false);
-            if recent {
-                false
-            } else {
-                if log.len() >= OVERLAY_REJECTION_LOG_MAX_ENTRIES {
-                    prune_throttle_map(&mut log, now);
-                }
-                log.insert(abs_path.to_path_buf(), now);
-                true
-            }
-        };
-        if should_log {
+        if self.last_rejection_log.should_log(abs_path, now) {
             eprintln!(
                 "[bifrost-lsp] dropping overlay for {}: {} bytes exceeds cap of {} bytes",
                 abs_path.display(),
@@ -650,19 +635,6 @@ impl OverlayProject {
                 self.max_overlay_bytes,
             );
         }
-    }
-}
-
-/// Prune entries past [`OVERLAY_REJECTION_LOG_THROTTLE`] from the throttle
-/// map. When the map is still over capacity afterwards (every entry was
-/// recent), clear it wholesale — accepting at worst one redundant log line
-/// per dropped path. Called only on the slow path where the map has grown
-/// past [`OVERLAY_REJECTION_LOG_MAX_ENTRIES`], so the linear scan amortizes
-/// over the entries that earned it.
-fn prune_throttle_map(log: &mut HashMap<PathBuf, Instant>, now: Instant) {
-    log.retain(|_, last| now.duration_since(*last) < OVERLAY_REJECTION_LOG_THROTTLE);
-    if log.len() >= OVERLAY_REJECTION_LOG_MAX_ENTRIES {
-        log.clear();
     }
 }
 
@@ -960,32 +932,6 @@ mod tests {
         // Sanity check on the constant — bumping the default is a deliberate
         // memory-budget decision and should not happen by accident.
         assert_eq!(DEFAULT_MAX_OVERLAY_BYTES, 8 * 1024 * 1024);
-    }
-
-    #[test]
-    fn overlay_project_throttle_map_stays_bounded_under_distinct_rejections() {
-        // Reject many unique oversized paths in a row. The throttle map's
-        // entry count must never exceed `OVERLAY_REJECTION_LOG_MAX_ENTRIES`
-        // — otherwise the rejection logger would itself become an unbounded
-        // memory source, which is the exact class of bug this PR fixes.
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        write_file(&root, "anchor.txt", "");
-        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let overlay = OverlayProject::with_max_bytes(delegate, 16);
-
-        // Drive more rejections through than the entry cap. Each path is
-        // unique so the map would grow without the prune step.
-        for i in 0..(OVERLAY_REJECTION_LOG_MAX_ENTRIES * 4) {
-            let path = root.join(format!("phantom_{i}.txt"));
-            assert!(!overlay.set(path, "x".repeat(64)));
-        }
-
-        let log_size = overlay.last_rejection_log.lock().expect("lock").len();
-        assert!(
-            log_size <= OVERLAY_REJECTION_LOG_MAX_ENTRIES,
-            "throttle map should stay bounded, got {log_size} entries"
-        );
     }
 
     #[test]

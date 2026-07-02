@@ -4,6 +4,8 @@ This is the Bifrost-owned publication path for making the MCP server
 discoverable as an Agent Plugin. The shared package lives in
 `plugins/bifrost-agent`. Codex uses `.agents/plugins/marketplace.json` for the
 repo-local marketplace, while Claude Code uses `.claude-plugin/marketplace.json`.
+Both marketplace manifests use the public namespace `bifrost`, while the
+plugin's stable install name remains `brokk`.
 
 ## Plugin shape
 
@@ -11,7 +13,7 @@ The Codex plugin manifest lives at
 `plugins/bifrost-agent/.codex-plugin/plugin.json`. The Claude Code manifest
 lives at `plugins/bifrost-agent/.claude-plugin/plugin.json`. Keep both manifest
 versions aligned with `Cargo.toml` and keep the stable plugin `name` as
-`bifrost`. Use `Bifrost for Codex` only for Codex-facing display text.
+`brokk`. Use `Bifrost by Brokk` for Codex-facing display text.
 
 The companion MCP configuration lives at `plugins/bifrost-agent/.mcp.json`:
 
@@ -43,6 +45,12 @@ default plugin toolset is `symbol|extended`, not `searchtools`, so the local
 plugin exposes analyzer navigation and related discovery tools without the
 `activate_workspace` or raw text-file tools.
 
+The plugin manifests also point at `plugins/bifrost-agent/skills` and declare
+the specialist agents under `plugins/bifrost-agent/agents`. Keep the
+code-intelligence skills aligned with the default Bifrost MCP toolset, and keep
+the workflow skills and agents in the same plugin so `brokk@bifrost` remains a
+single installable bundle for code intelligence plus GitHub/review workflows.
+
 ## Local testing
 
 Build the local binary:
@@ -64,8 +72,17 @@ session using the canonical local testing steps in
 Then call a lightweight analyzer tool such as `get_summaries` or
 `search_symbols` from the fresh session.
 
+Public GitHub installs use the same `brokk@bifrost` name in both hosts:
+
+```bash
+codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse plugins
+codex plugin add brokk@bifrost
+claude plugin marketplace add BrokkAi/bifrost --sparse .claude-plugin plugins
+claude plugin install brokk@bifrost
+```
+
 Validate that the plugin manifest versions match `Cargo.toml` and that all
-plugin JSON files and launcher metadata parse:
+plugin JSON files, skill files, and launcher metadata parse:
 
 ```bash
 node --test plugins/bifrost-agent/test/*.test.mjs
@@ -84,18 +101,29 @@ claude plugin validate .
   preparing `plugins/bifrost-agent/bifrost-release.json`.
 - Package the Codex Agent Plugin from `plugins/bifrost-agent` with
   `.codex-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
-  and `assets/icon.png`.
+  `skills/`, `agents/`, and `assets/icon.png`.
 - Package the Claude Code Agent Plugin from `plugins/bifrost-agent` with
   `.claude-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
-  and `assets/icon.png`.
+  `skills/`, `agents/`, and `assets/icon.png`.
 - Validate that the plugin's MCP server entry launches:
   `bifrost --root <resolved-root> --mcp "symbol|extended"`.
 - Confirm that plugin installation and VS Code LSP setup use separate Bifrost
   stdio processes, even when they point at the same binary/release.
 
-## Current skill bundle
+## Skill ownership
 
-The Brokk host skills are still packaged from the Brokk plugin source rather
-than this repository. Until that bundle moves here, publish the Bifrost Agent
-Plugin as an MCP-server package only, and keep skill migration as a separate
-tracked change.
+The Bifrost plugin owns code-intelligence skills that describe the MCP tools it
+installs: code navigation, code reading, and codebase search. These skills must
+refer only to tools available through `symbol|extended` or to host-provided
+shell/file-reading tools.
+
+The same plugin also owns the Brokk/Bifrost workflow skills for git
+exploration, guided issue resolution, guided review, PR review, ordinary code
+review, work-queue triage, and issue drafting. Keep their specialist agents in
+`plugins/bifrost-agent/agents` and list them in both host manifests.
+
+The Brokk `workspace` skill remains excluded because the default Bifrost plugin
+does not expose `activate_workspace`, `get_active_workspace`, or `refresh`.
+Workflow skills should treat explicit workspace activation as optional host
+capability and continue with the plugin's current workspace root when those
+tools are unavailable.

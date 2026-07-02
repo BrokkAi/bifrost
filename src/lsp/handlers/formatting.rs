@@ -19,6 +19,10 @@ const MAX_ERROR_OUTPUT_CHARS: usize = 1_000;
 const MAX_FORMATTER_STDERR_BYTES: usize = 64 * 1024;
 const MAX_FORMATTER_STDOUT_BYTES: usize = 32 * 1024 * 1024;
 const FORMATTER_READER_GRACE: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const FORMATTER_SPAWN_RETRIES: usize = 5;
+#[cfg(unix)]
+const FORMATTER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const FORMATTER_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -425,6 +429,27 @@ fn wait_for_formatter(
 }
 
 fn spawn_formatter(command: &FormatterCommand) -> Result<std::process::Child, String> {
+    #[cfg(unix)]
+    {
+        for attempt in 0..=FORMATTER_SPAWN_RETRIES {
+            match spawn_formatter_once(command) {
+                Ok(child) => return Ok(child),
+                Err(err) if is_text_file_busy(&err) && attempt < FORMATTER_SPAWN_RETRIES => {
+                    thread::sleep(FORMATTER_SPAWN_RETRY_DELAY);
+                }
+                Err(err) => return Err(format_formatter_spawn_error(command, err)),
+            }
+        }
+        unreachable!("formatter spawn retry loop must return");
+    }
+
+    #[cfg(not(unix))]
+    {
+        spawn_formatter_once(command).map_err(|err| format_formatter_spawn_error(command, err))
+    }
+}
+
+fn spawn_formatter_once(command: &FormatterCommand) -> std::io::Result<std::process::Child> {
     let mut builder = Command::new(&command.command);
     builder
         .args(&command.args)
@@ -433,13 +458,20 @@ fn spawn_formatter(command: &FormatterCommand) -> Result<std::process::Child, St
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_formatter_process(&mut builder);
-    builder.spawn().map_err(|err| {
-        format!(
-            "failed to start formatter `{}` in {}: {err}",
-            command_line_for_message(command),
-            command.cwd.display()
-        )
-    })
+    builder.spawn()
+}
+
+fn format_formatter_spawn_error(command: &FormatterCommand, err: std::io::Error) -> String {
+    format!(
+        "failed to start formatter `{}` in {}: {err}",
+        command_line_for_message(command),
+        command.cwd.display()
+    )
+}
+
+#[cfg(unix)]
+fn is_text_file_busy(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ETXTBSY)
 }
 
 #[cfg(unix)]

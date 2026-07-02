@@ -1,7 +1,7 @@
 {
-  "name": "bifrost",
+  "name": "brokk",
   "version": "0.7.2",
-  "description": "Bifrost analyzer-backed code intelligence over MCP.",
+  "description": "Multi-language code intelligence and Brokk/Bifrost engineering workflows.",
   "author": {
     "name": "Brokk",
     "url": "https://brokk.ai"
@@ -15,11 +15,22 @@
     "code-intelligence",
     "tree-sitter"
   ],
+  "skills": "./skills/",
+  "agents": [
+    "./agents/architect-reviewer.md",
+    "./agents/devops-reviewer.md",
+    "./agents/dry-reviewer.md",
+    "./agents/issue-diagnostician.md",
+    "./agents/issue-enhancer.md",
+    "./agents/issue-planner.md",
+    "./agents/security-reviewer.md",
+    "./agents/senior-dev-reviewer.md"
+  ],
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Bifrost for Codex",
-    "shortDescription": "Analyzer-backed code intelligence tools",
-    "longDescription": "Bifrost exposes analyzer-backed search, symbol, workspace, and code-quality tools through a stdio MCP server.",
+    "displayName": "Bifrost by Brokk",
+    "shortDescription": "Code intelligence and review workflows",
+    "longDescription": "Bifrost provides multi-language code navigation, summaries, reference search, related-file discovery, and bundled Brokk/Bifrost workflows for GitHub issue work and code review.",
     "developerName": "Brokk",
     "category": "Developer Tools",
     "capabilities": [

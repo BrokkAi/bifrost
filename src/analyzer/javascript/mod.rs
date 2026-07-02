@@ -10,6 +10,7 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::js_ts::clones::{
     build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
 };
+use crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics;
 use crate::analyzer::js_ts::hierarchy::{
     build_direct_descendant_index_by_unit, extract_js_supertypes, resolve_direct_ancestors,
 };
@@ -26,8 +27,8 @@ use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_inde
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
     ImportInfo, Language, LanguageAdapter, ParameterMetadata, Project, ProjectFile,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -562,6 +563,13 @@ impl IAnalyzer for JavascriptAnalyzer {
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        collect_javascript_semantic_diagnostics(self, file, source, &self.alias_resolver)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
