@@ -15,11 +15,12 @@
     "code-intelligence",
     "tree-sitter"
   ],
+  "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Bifrost for Codex",
     "shortDescription": "Analyzer-backed code intelligence tools",
-    "longDescription": "Bifrost exposes analyzer-backed search, symbol, workspace, and code-quality tools through a stdio MCP server.",
+    "longDescription": "Bifrost exposes analyzer-backed code navigation, summaries, reference search, and related-file discovery through a stdio MCP server.",
     "developerName": "Brokk",
     "category": "Developer Tools",
     "capabilities": [

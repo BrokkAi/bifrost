@@ -15,5 +15,6 @@
     "code-intelligence",
     "tree-sitter"
   ],
+  "skills": "./skills/",
   "mcpServers": "./.mcp.json"
 }

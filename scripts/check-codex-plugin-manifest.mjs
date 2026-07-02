@@ -35,6 +35,7 @@ const sharedManifestFields = [
   "repository",
   "license",
   "keywords",
+  "skills",
   "mcpServers",
 ];
 for (const field of sharedManifestFields) {
@@ -58,6 +59,35 @@ assert.deepStrictEqual(
   `${mcpPath} should use the default Bifrost MCP toolset`,
 );
 fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK);
+
+const skillsRoot = "plugins/bifrost-agent/skills";
+const expectedSkills = [
+  ["bifrost-code-navigation", "search_symbols", "scan_usages", "get_symbol_locations"],
+  ["bifrost-code-reading", "get_summaries", "get_symbol_sources"],
+  ["bifrost-codebase-search", "search_symbols", "find_filenames", "list_files"],
+];
+assert.deepStrictEqual(
+  codexManifest.skills,
+  "./skills/",
+  `${codexManifestPath} should expose Bifrost skills`,
+);
+assert.deepStrictEqual(
+  claudeManifest.skills,
+  "./skills/",
+  `${claudeManifestPath} should expose Bifrost skills`,
+);
+for (const [skillName, ...requiredTerms] of expectedSkills) {
+  const skillPath = `${skillsRoot}/${skillName}/SKILL.md`;
+  const skill = fs.readFileSync(skillPath, "utf8");
+  if (!skill.includes(`name: ${skillName}`)) {
+    throw new Error(`${skillPath} should declare name: ${skillName}`);
+  }
+  for (const term of requiredTerms) {
+    if (!skill.includes(term)) {
+      throw new Error(`${skillPath} should mention ${term}`);
+    }
+  }
+}
 
 const releaseMetadataPath = "plugins/bifrost-agent/bifrost-release.json";
 const releaseMetadata = JSON.parse(fs.readFileSync(releaseMetadataPath, "utf8"));
