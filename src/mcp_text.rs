@@ -5,14 +5,14 @@ pub(crate) fn text_tool_descriptors() -> Vec<Value> {
     vec![
         tool_descriptor(
             "get_file_contents",
-            "Return the text contents of one or more files in the workspace, given project-relative paths or absolute paths inside the active workspace. Very long lines are truncated, and files larger than the line sample cap are returned as a head/tail sample.",
+            "Return the text contents of one or more files in the workspace, given project-relative paths, absolute paths inside the active workspace, or git history paths in <commit-ish>:<path> form. Very long lines are truncated, and files larger than the line sample cap are returned as a head/tail sample.",
             json!({
                 "type": "object",
                 "properties": {
                     "file_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Project-relative paths of files to read, or absolute paths inside the active workspace."
+                        "description": "Project-relative paths of files to read, absolute paths inside the active workspace, or git history paths such as HEAD~2:src/main.rs. In git history form, the path part may be project-relative, absolute, or ~/ prefixed."
                     }
                 },
                 "required": ["file_paths"]

@@ -233,6 +233,135 @@ class Foo {
 }
 
 #[test]
+fn get_file_contents_reads_workspace_git_history() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("file.py"), "print('v1')\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["file.py"], "v1");
+    fs::write(temp.path().join("file.py"), "print('v2')\n").unwrap();
+    commit_paths(&repo, &["file.py"], "v2");
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let history: Value = serde_json::from_str(
+        &service
+            .call_tool_json("get_file_contents", r#"{"file_paths":["HEAD~1:file.py"]}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    let current: Value = serde_json::from_str(
+        &service
+            .call_tool_json("get_file_contents", r#"{"file_paths":["file.py"]}"#)
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!("HEAD~1:file.py", history["files"][0]["path"]);
+    assert_eq!("print('v1')\n", history["files"][0]["content"]);
+    assert_eq!("print('v2')\n", current["files"][0]["content"]);
+}
+
+#[test]
+fn get_file_contents_reads_cross_repo_absolute_git_history() {
+    let repo_a = TempDir::new().unwrap();
+    fs::write(repo_a.path().join("workspace.py"), "print('workspace')\n").unwrap();
+    let repo_a_git = Repository::init(repo_a.path()).unwrap();
+    commit_paths(&repo_a_git, &["workspace.py"], "workspace");
+
+    let repo_b = TempDir::new().unwrap();
+    let b_file = repo_b.path().join("client.py");
+    fs::write(&b_file, "print('repo b v1')\n").unwrap();
+    let repo_b_git = Repository::init(repo_b.path()).unwrap();
+    commit_paths(&repo_b_git, &["client.py"], "v1");
+    fs::write(&b_file, "print('repo b v2')\n").unwrap();
+    commit_paths(&repo_b_git, &["client.py"], "v2");
+
+    let service =
+        SearchToolsService::new_without_semantic_index(repo_a.path().to_path_buf()).unwrap();
+    let args = serde_json::json!({ "file_paths": [format!("HEAD~1:{}", b_file.display())] });
+    let payload = service
+        .call_tool_json("get_file_contents", &args.to_string())
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("print('repo b v1')\n", value["files"][0]["content"]);
+    assert!(value["not_found"].as_array().unwrap().is_empty(), "{value}");
+}
+
+#[test]
+fn get_file_contents_reads_deleted_file_from_git_history() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("keep.py"), "print('keep')\n").unwrap();
+    fs::write(temp.path().join("deleted.py"), "print('deleted')\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["keep.py", "deleted.py"], "add deleted");
+    fs::remove_file(temp.path().join("deleted.py")).unwrap();
+    commit_paths_with_removals(&repo, &["keep.py"], &["deleted.py"], "delete");
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_file_contents",
+            r#"{"file_paths":["HEAD~1:deleted.py"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("print('deleted')\n", value["files"][0]["content"]);
+}
+
+#[test]
+fn get_file_contents_reports_git_history_errors_in_not_found() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("file.py"), "print('present')\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["file.py"], "present");
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_file_contents",
+            r#"{"file_paths":["does-not-exist:file.py","HEAD:missing.py"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let errors = value["not_found"].as_array().unwrap();
+
+    assert_eq!(2, errors.len(), "payload: {value}");
+    assert!(errors[0].as_str().unwrap().contains("does-not-exist"));
+    assert!(errors[0].as_str().unwrap().contains("bad git revision"));
+    assert!(errors[1].as_str().unwrap().contains("missing.py"));
+    assert!(
+        errors[1]
+            .as_str()
+            .unwrap()
+            .contains("absent at git revision `HEAD`")
+    );
+}
+
+#[test]
+fn get_file_contents_prefers_literal_file_over_rev_syntax() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("x:y.txt"), "literal wins\n").unwrap();
+    fs::write(temp.path().join("anchor.py"), "print('anchor')\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["x:y.txt", "anchor.py"], "initial");
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json("get_file_contents", r#"{"file_paths":["x:y.txt"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("x:y.txt", value["files"][0]["path"]);
+    assert_eq!("literal wins\n", value["files"][0]["content"]);
+    assert!(value["not_found"].as_array().unwrap().is_empty(), "{value}");
+}
+
+#[test]
 fn rename_symbol_rejects_oversized_identifier() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let arguments = serde_json::json!({
@@ -2305,6 +2434,35 @@ fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
     let mut index = repo.index().unwrap();
     for path in paths {
         index.add_path(std::path::Path::new(path)).unwrap();
+    }
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = Signature::now("Test User", "test@example.com").unwrap();
+    let parent = repo
+        .head()
+        .ok()
+        .and_then(|head| head.target())
+        .and_then(|oid| repo.find_commit(oid).ok());
+    let parents = parent.iter().collect::<Vec<_>>();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &parents,
+    )
+    .unwrap();
+}
+
+fn commit_paths_with_removals(repo: &Repository, add: &[&str], remove: &[&str], message: &str) {
+    let mut index = repo.index().unwrap();
+    for path in add {
+        index.add_path(std::path::Path::new(path)).unwrap();
+    }
+    for path in remove {
+        index.remove_path(std::path::Path::new(path)).unwrap();
     }
     index.write().unwrap();
     let tree_id = index.write_tree().unwrap();

@@ -1,5 +1,6 @@
+use crate::git_file::parse_rev_path;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn normalize_tool_arguments(
     tool_name: &str,
@@ -19,9 +20,7 @@ pub fn normalize_tool_arguments(
             normalize_string_array_field(&mut arguments, "seed_file_paths", workspace_root)?
         }
         "rename_symbol" => normalize_optional_string_field(&mut arguments, "path", workspace_root)?,
-        "get_file_contents" => {
-            normalize_string_array_field(&mut arguments, "file_paths", workspace_root)?
-        }
+        "get_file_contents" => normalize_get_file_contents_paths(&mut arguments, workspace_root)?,
         "find_filenames" => {
             normalize_string_array_field(&mut arguments, "patterns", workspace_root)?
         }
@@ -47,6 +46,58 @@ pub fn normalize_tool_arguments(
         _ => {}
     }
     Ok(arguments)
+}
+
+fn normalize_get_file_contents_paths(
+    arguments: &mut Value,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let Some(array) = arguments
+        .get_mut("file_paths")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+
+    for item in array {
+        let Some(raw) = item.as_str() else {
+            continue;
+        };
+        if let Some(normalized) = normalize_get_file_contents_path(raw, workspace_root)? {
+            *item = Value::String(normalized);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_get_file_contents_path(
+    raw: &str,
+    workspace_root: &Path,
+) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    let Some((rev, path)) = parse_rev_path(trimmed) else {
+        return normalize_mcp_path_argument(raw, workspace_root);
+    };
+
+    let normalized_path = normalize_rev_path_part(path, workspace_root)?;
+    Ok(Some(format!("{rev}:{normalized_path}")))
+}
+
+fn normalize_rev_path_part(path: &str, workspace_root: &Path) -> Result<String, String> {
+    let trimmed = path.trim();
+    if looks_like_absolute_path(trimmed) {
+        match normalize_mcp_path_argument(trimmed, workspace_root) {
+            Ok(Some(normalized)) => return Ok(normalized),
+            Ok(None) => {}
+            Err(_) => return Ok(slash_string(trimmed)),
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return Ok(format!("~/{rest}"));
+    }
+
+    normalize_relative_path_preserving_escape(trimmed)
 }
 
 fn normalize_string_array_field(
@@ -167,6 +218,30 @@ fn normalize_relative_slash_path(relative: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
+fn normalize_relative_path_preserving_escape(relative: &str) -> Result<String, String> {
+    let path = Path::new(relative);
+    if path.is_absolute() || path.has_root() {
+        return Ok(slash_string(relative));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err("path escapes active workspace".to_string());
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Ok(slash_string(relative));
+            }
+        }
+    }
+    Ok(path_to_slash_string(&normalized))
+}
+
 fn looks_like_absolute_path(raw: &str) -> bool {
     Path::new(raw).is_absolute() || is_windows_absolute_path(raw)
 }
@@ -222,6 +297,38 @@ mod tests {
         .expect("normalize");
 
         assert_eq!(normalized["file_paths"][0], "src/A.java");
+    }
+
+    #[test]
+    fn normalizes_get_file_contents_rev_path_part() {
+        let root = TempDir::new().expect("temp dir");
+        let src = root.path().join("src");
+        fs::create_dir(&src).expect("src dir");
+        let file = src.join("relative.py");
+        fs::write(&file, "print('ok')\n").expect("write file");
+
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": [format!("HEAD:{}", file.display())] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["file_paths"][0], "HEAD:src/relative.py");
+    }
+
+    #[test]
+    fn leaves_plain_get_file_contents_relative_paths_unchanged() {
+        let root = TempDir::new().expect("temp dir");
+
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": ["src/../relative.py"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["file_paths"][0], "src/../relative.py");
     }
 
     #[test]

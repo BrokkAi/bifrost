@@ -1,4 +1,5 @@
 use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::git_file::{parse_rev_path, read_git_file, resolve_git_file_path};
 use crate::model_context;
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
@@ -172,8 +173,9 @@ pub fn get_file_contents(
             continue;
         }
 
-        match resolver.resolve_literal(trimmed) {
-            ResolvedFileInput::File(file) => match file.read_to_string() {
+        let resolved = resolver.resolve_literal(trimmed);
+        if let ResolvedFileInput::File(file) = resolved {
+            match file.read_to_string() {
                 Ok(content) => {
                     let sampled = model_context::sample(&content);
                     files.push(FileContent {
@@ -186,7 +188,49 @@ pub fn get_file_contents(
                     })
                 }
                 Err(_) => not_found.push(trimmed.to_string()),
-            },
+            }
+            continue;
+        }
+
+        if let Some(literal_file) = literal_workspace_file_with_colon(project.root(), trimmed) {
+            match literal_file.read_to_string() {
+                Ok(content) => {
+                    let sampled = model_context::sample(&content);
+                    files.push(FileContent {
+                        path: rel_path_string(&literal_file),
+                        content: sampled.text,
+                        truncated: sampled.truncated,
+                        total_lines: Some(sampled.total_lines),
+                        head_lines: sampled.truncated.then_some(sampled.head_shown),
+                        tail_lines: sampled.truncated.then_some(sampled.tail_shown),
+                    });
+                }
+                Err(_) => not_found.push(trimmed.to_string()),
+            }
+            continue;
+        }
+
+        if let Some((rev, path)) = parse_rev_path(trimmed) {
+            let abs_path = resolve_git_file_path(path, project.root());
+            match read_git_file(rev, &abs_path) {
+                Ok(content) => {
+                    let sampled = model_context::sample(&content);
+                    files.push(FileContent {
+                        path: trimmed.to_string(),
+                        content: sampled.text,
+                        truncated: sampled.truncated,
+                        total_lines: Some(sampled.total_lines),
+                        head_lines: sampled.truncated.then_some(sampled.head_shown),
+                        tail_lines: sampled.truncated.then_some(sampled.tail_shown),
+                    });
+                }
+                Err(err) => not_found.push(err),
+            }
+            continue;
+        }
+
+        match resolved {
+            ResolvedFileInput::File(_) => unreachable!("file case handled above"),
             ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
             ResolvedFileInput::NotFound(item) => not_found.push(item),
         }
@@ -197,6 +241,32 @@ pub fn get_file_contents(
         not_found,
         ambiguous_paths,
     }
+}
+
+fn literal_workspace_file_with_colon(root: &std::path::Path, input: &str) -> Option<ProjectFile> {
+    parse_rev_path(input)?;
+    let normalized = normalize_pattern(input);
+    let path = std::path::Path::new(&normalized);
+    if path.is_absolute() || path.has_root() {
+        return None;
+    }
+
+    let mut rel = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => rel.push(part),
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+
+    let file = ProjectFile::new(root.to_path_buf(), rel);
+    file.abs_path().is_file().then_some(file)
 }
 
 pub fn find_filenames(

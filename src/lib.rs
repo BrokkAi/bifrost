@@ -4,6 +4,7 @@ pub mod code_quality;
 pub mod commit_analysis;
 pub mod file_tools;
 mod get_summaries_output;
+mod git_file;
 pub mod git_tools;
 pub mod hash;
 pub mod lsp;
