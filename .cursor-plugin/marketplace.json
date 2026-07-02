@@ -1,0 +1,37 @@
+{
+  "name": "bifrost",
+  "owner": {
+    "name": "Brokk"
+  },
+  "metadata": {
+    "description": "Bifrost plugins for multi-language code intelligence and engineering workflows.",
+    "version": "0.7.2"
+  },
+  "plugins": [
+    {
+      "name": "bifrost",
+      "source": "plugins/bifrost-agent",
+      "description": "Bifrost by Brokk: multi-language code intelligence and MCP workflows.",
+      "version": "0.7.2",
+      "author": {
+        "name": "Brokk"
+      },
+      "homepage": "https://github.com/BrokkAi/bifrost",
+      "repository": "https://github.com/BrokkAi/bifrost",
+      "license": "LGPL-3.0-or-later",
+      "keywords": [
+        "bifrost",
+        "mcp",
+        "code-intelligence",
+        "tree-sitter"
+      ],
+      "logo": "plugins/bifrost-agent/assets/icon.png",
+      "category": "Developer Tools",
+      "tags": [
+        "mcp",
+        "code-intelligence",
+        "developer-tools"
+      ]
+    }
+  ]
+}

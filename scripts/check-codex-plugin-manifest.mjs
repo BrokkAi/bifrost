@@ -27,17 +27,21 @@ if (claudeManifest.version !== cargoVersion) {
   );
 }
 
+const cursorManifestPath = "plugins/bifrost-agent/.cursor-plugin/plugin.json";
+const cursorManifest = JSON.parse(fs.readFileSync(cursorManifestPath, "utf8"));
+if (cursorManifest.version !== cargoVersion) {
+  throw new Error(
+    `${cursorManifestPath} version ${cursorManifest.version} does not match Cargo.toml version ${cargoVersion}`,
+  );
+}
+
 const sharedManifestFields = [
-  "name",
-  "description",
-  "author",
   "homepage",
   "repository",
   "license",
   "keywords",
   "skills",
   "agents",
-  "mcpServers",
 ];
 for (const field of sharedManifestFields) {
   assert.deepStrictEqual(
@@ -45,19 +49,88 @@ for (const field of sharedManifestFields) {
     codexManifest[field],
     `${claudeManifestPath} field ${field} does not match ${codexManifestPath}`,
   );
+  assert.deepStrictEqual(
+    cursorManifest[field],
+    codexManifest[field],
+    `${cursorManifestPath} field ${field} does not match ${codexManifestPath}`,
+  );
+}
+assert.deepStrictEqual(
+  cursorManifest.name,
+  "bifrost",
+  `${cursorManifestPath} should use Bifrost as the Cursor-facing plugin name`,
+);
+assert.deepStrictEqual(
+  cursorManifest.description,
+  "Bifrost by Brokk: multi-language code intelligence and MCP workflows.",
+  `${cursorManifestPath} should use Bifrost-facing display text`,
+);
+assert.deepStrictEqual(
+  claudeManifest.author,
+  codexManifest.author,
+  `${claudeManifestPath} author does not match ${codexManifestPath}`,
+);
+assert.deepStrictEqual(
+  cursorManifest.author?.name,
+  codexManifest.author?.name,
+  `${cursorManifestPath} author name does not match ${codexManifestPath}`,
+);
+assert.deepStrictEqual(
+  cursorManifest.logo,
+  "assets/icon.png",
+  `${cursorManifestPath} should reference the package icon`,
+);
+fs.accessSync("plugins/bifrost-agent/assets/icon.png", fsConstants.R_OK);
+assert.deepStrictEqual(
+  codexManifest.mcpServers,
+  "./.mcp.json",
+  `${codexManifestPath} should keep using the Claude/Codex MCP config`,
+);
+assert.deepStrictEqual(
+  claudeManifest.mcpServers,
+  "./.mcp.json",
+  `${claudeManifestPath} should keep using the Claude/Codex MCP config`,
+);
+assert.deepStrictEqual(
+  cursorManifest.mcpServers,
+  undefined,
+  `${cursorManifestPath} should let Cursor discover root mcp.json automatically`,
+);
+fs.accessSync("plugins/bifrost-agent/assets/icon.png", fsConstants.R_OK);
+
+const cursorPluginNamePattern = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
+if (!cursorPluginNamePattern.test(cursorManifest.name)) {
+  throw new Error(`${cursorManifestPath} name must be lowercase kebab-case`);
 }
 
 const mcpPath = "plugins/bifrost-agent/.mcp.json";
 const mcpConfig = JSON.parse(fs.readFileSync(mcpPath, "utf8"));
+const cursorMcpPath = "plugins/bifrost-agent/mcp.json";
+const cursorMcpConfig = JSON.parse(fs.readFileSync(cursorMcpPath, "utf8"));
 assert.deepStrictEqual(
   mcpConfig.mcpServers?.bifrost?.command,
   "./bin/bifrost-launcher.mjs",
   `${mcpPath} should launch the package-local Bifrost launcher`,
 );
 assert.deepStrictEqual(
+  cursorMcpConfig.mcpServers?.bifrost?.command,
+  "./bin/bifrost-launcher.mjs",
+  `${cursorMcpPath} should launch the package-local Bifrost launcher`,
+);
+assert.deepStrictEqual(
+  cursorMcpConfig.mcpServers?.bifrost?.type,
+  "stdio",
+  `${cursorMcpPath} should use Cursor's documented stdio MCP type`,
+);
+assert.deepStrictEqual(
   mcpConfig.mcpServers?.bifrost?.args?.slice(0, 2),
   ["--mcp", "symbol|extended"],
   `${mcpPath} should use the default Bifrost MCP toolset`,
+);
+assert.deepStrictEqual(
+  cursorMcpConfig.mcpServers?.bifrost?.args?.slice(0, 2),
+  ["--mcp", "symbol|extended"],
+  `${cursorMcpPath} should use the default Bifrost MCP toolset`,
 );
 fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK);
 
@@ -83,6 +156,11 @@ assert.deepStrictEqual(
   claudeManifest.skills,
   "./skills/",
   `${claudeManifestPath} should expose Bifrost skills`,
+);
+assert.deepStrictEqual(
+  cursorManifest.skills,
+  "./skills/",
+  `${cursorManifestPath} should expose Bifrost skills`,
 );
 for (const [skillDir, skillName, ...requiredTerms] of expectedSkills) {
   const skillPath = `${skillsRoot}/${skillDir}/SKILL.md`;
@@ -117,6 +195,11 @@ assert.deepStrictEqual(
   expectedAgents,
   `${claudeManifestPath} should expose workflow specialist agents`,
 );
+assert.deepStrictEqual(
+  cursorManifest.agents,
+  expectedAgents,
+  `${cursorManifestPath} should expose workflow specialist agents`,
+);
 for (const agentPath of expectedAgents) {
   fs.accessSync(`plugins/bifrost-agent/${agentPath.slice("./".length)}`, fsConstants.R_OK);
 }
@@ -140,5 +223,40 @@ JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
 
 const claudeMarketplacePath = ".claude-plugin/marketplace.json";
 JSON.parse(fs.readFileSync(claudeMarketplacePath, "utf8"));
+
+const cursorMarketplacePath = ".cursor-plugin/marketplace.json";
+const cursorMarketplace = JSON.parse(fs.readFileSync(cursorMarketplacePath, "utf8"));
+if (cursorMarketplace.metadata?.version !== cargoVersion) {
+  throw new Error(
+    `${cursorMarketplacePath} metadata.version ${cursorMarketplace.metadata?.version} does not match Cargo.toml version ${cargoVersion}`,
+  );
+}
+assert.deepStrictEqual(cursorMarketplace.name, "bifrost", `${cursorMarketplacePath} should use the public namespace`);
+assert.deepStrictEqual(cursorMarketplace.owner?.name, "Brokk", `${cursorMarketplacePath} should publish as Brokk`);
+const cursorMarketplacePlugin = cursorMarketplace.plugins?.find((plugin) => plugin.name === cursorManifest.name);
+if (!cursorMarketplacePlugin) {
+  throw new Error(`${cursorMarketplacePath} should list the ${cursorManifest.name} plugin`);
+}
+assert.deepStrictEqual(
+  cursorMarketplacePlugin.source,
+  "plugins/bifrost-agent",
+  `${cursorMarketplacePath} should point at the shared plugin package`,
+);
+assert.deepStrictEqual(
+  cursorMarketplacePlugin.description,
+  cursorManifest.description,
+  `${cursorMarketplacePath} plugin description should match ${cursorManifestPath}`,
+);
+assert.deepStrictEqual(
+  cursorMarketplacePlugin.logo,
+  "plugins/bifrost-agent/assets/icon.png",
+  `${cursorMarketplacePath} plugin logo should be relative to the repository root`,
+);
+fs.accessSync(cursorMarketplacePlugin.logo, fsConstants.R_OK);
+assert.deepStrictEqual(
+  cursorMarketplacePlugin.version,
+  cargoVersion,
+  `${cursorMarketplacePath} plugin version should match Cargo.toml`,
+);
 
 console.log(`Agent plugin manifests are valid for Bifrost ${cargoVersion}.`);

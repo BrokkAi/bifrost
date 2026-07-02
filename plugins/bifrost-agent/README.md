@@ -1,22 +1,26 @@
 # Bifrost Agent Plugin
 
 This package installs Bifrost's MCP server configuration as an agent plugin for
-Codex and Claude Code. It does not bundle the Bifrost binary; it installs a
-launcher that resolves a released Bifrost binary and makes a multi-language
-code analysis subset of the `bifrost` MCP tools discoverable through each
-host's plugin system. It also bundles the Brokk/Bifrost workflow skills and
-specialist agents so the plugin is a one-stop shop for code intelligence,
-GitHub issue work, and code review workflows.
+Codex, Claude Code, and Cursor. It does not bundle the Bifrost binary; it
+installs a launcher that resolves a released Bifrost binary and makes a
+multi-language code analysis subset of the `bifrost` MCP tools discoverable
+through each host's plugin system. It also bundles the Brokk/Bifrost workflow
+skills and specialist agents so the plugin is a one-stop shop for code
+intelligence, GitHub issue work, and code review workflows.
 
-The plugin's stable install name is `brokk`. The Codex UI-facing display name
-is `Bifrost by Brokk`; Claude Code uses the shared plugin package metadata.
-The public marketplace namespace is `bifrost`, so installs read as
-`brokk@bifrost`.
+The Claude Code and Codex stable install name is `brokk`. Cursor uses the
+Cursor-facing plugin name `bifrost` so the package is discoverable as Bifrost in
+Cursor's Customize UI. The public marketplace namespace is `bifrost`, so
+Claude/Codex marketplace installs read as `brokk@bifrost` where the host exposes
+namespace-qualified install names.
 
 The plugin starts `./bin/bifrost-launcher.mjs --mcp "symbol|extended"`.
 The launcher always starts Bifrost with an explicit `--root`, using
 `BIFROST_WORKSPACE_ROOT` when set, then a host-provided `--root` or
 `--workspace-root`, then the host session working directory.
+Claude Code and Codex read this server entry from `.mcp.json`; Cursor reads the
+same entry from root `mcp.json`, using Cursor's documented `type: "stdio"`
+field.
 
 Binary resolution order is:
 
@@ -149,12 +153,53 @@ BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude
 Start a fresh Claude Code session after installing the plugin so the MCP server
 configuration is loaded at startup.
 
+## Cursor Local Testing
+
+From the repository root, build Bifrost and open Cursor with the local binary
+selected:
+
+```bash
+cargo build --bin bifrost
+BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" cursor .
+```
+
+In Cursor, open **Customize**, then use **Manage -> Add Marketplace -> Import
+from Disk** and select the repository root. Cursor should read
+`.cursor-plugin/marketplace.json`, find the `bifrost` plugin at
+`plugins/bifrost-agent`, and offer it for installation. If testing the package
+directory directly instead of the repository marketplace, select
+`plugins/bifrost-agent`.
+
+After installing, enable the Bifrost MCP server for the workspace from the
+plugin's **MCPs** section in Customize. Cursor does not load installed MCP
+servers into chat until they are enabled, and already-open agent chats may need
+a fresh chat before newly enabled MCP tools appear. Then ask Cursor Agent to
+call a lightweight analyzer operation such as `get_summaries` or
+`search_symbols` against files in the active workspace. Use a source directory
+or file, not `README.md`, so the smoke cannot pass through ordinary file
+reading. For example:
+
+```text
+Use the Bifrost MCP get_summaries tool on src/analyzer/usages. Summarize the
+package structure in five bullets and explicitly name the MCP tool result you
+used.
+```
+
+The `cursor agent --plugin-dir` CLI path is useful for checking that Cursor can
+load plugin skills, but it has not proven reliable for plugin-provided MCP
+servers. Treat the desktop Customize/MCP path as the Cursor plugin MCP smoke.
+
+To publish publicly, submit the repository URL at
+<https://cursor.com/marketplace/publish>. The repository root contains
+`.cursor-plugin/marketplace.json`, which points Cursor at this shared package.
+
 ## Difference From `codex mcp add`
 
-`codex mcp add` or `claude mcp add` registers one MCP server directly in a
-user's host configuration. This plugin packages a safer default server shape
-behind a marketplace entry, so users can install or remove Bifrost through the
-host's plugin flow without hand-editing MCP configuration.
+`codex mcp add`, `claude mcp add`, or a manual Cursor `mcp.json` entry
+registers one MCP server directly in a user's host configuration. This plugin
+packages a safer default server shape behind a marketplace entry, so users can
+install or remove Bifrost through the host's plugin flow without hand-editing
+MCP configuration.
 
 The MCP process created by this plugin is independent from the VS Code language
 server process. They may point at the same `bifrost` binary, but each host
