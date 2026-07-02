@@ -9,6 +9,7 @@
 
 use super::extract::extract_file_facts;
 use super::facts::FileFacts;
+use super::kinds::{NormalizedKind, Role};
 use super::spec::StructuralSpec;
 use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use crate::analyzer::{Language, ProjectFile};
@@ -38,6 +39,10 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// performed — i.e. facts-cache misses. Lets planner tests assert that
     /// pruning skipped a file and that repeated queries hit the cache.
     fn structural_extraction_count(&self) -> u64;
+
+    fn structural_supports_kind(&self, kind: NormalizedKind) -> bool;
+
+    fn structural_supports_role(&self, role: Role) -> bool;
 }
 
 /// Byte-budgeted facts cache keyed by file and validated by a hash of the
@@ -125,12 +130,24 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         let spec: &'static dyn StructuralSpec = self.adapter().structural_spec()?;
         let source = self.file_source(file)?;
         self.structural_cache().get_or_extract(file, source, || {
-            let grammar = self.adapter().parser_language();
+            let grammar = self.adapter().parser_language_for_file(file);
             extract_file_facts(spec, &grammar, source)
         })
     }
 
     fn structural_extraction_count(&self) -> u64 {
         self.structural_cache().extraction_count()
+    }
+
+    fn structural_supports_kind(&self, kind: NormalizedKind) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_kind(kind))
+    }
+
+    fn structural_supports_role(&self, role: Role) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_role(role))
     }
 }

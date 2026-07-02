@@ -17,92 +17,68 @@ pub(crate) static TYPESCRIPT_STRUCTURAL_SPEC: JsTsStructuralSpec = JsTsStructura
     language: Language::TypeScript,
 };
 
-const JS_KIND_TABLE: &[(&str, NormalizedKind)] = &[
-    ("call_expression", NormalizedKind::Call),
-    ("new_expression", NormalizedKind::Call),
-    ("member_expression", NormalizedKind::FieldAccess),
-    ("function_declaration", NormalizedKind::Function),
-    ("function_expression", NormalizedKind::Function),
-    ("generator_function_declaration", NormalizedKind::Function),
-    ("generator_function", NormalizedKind::Function),
-    ("method_definition", NormalizedKind::Method),
-    ("arrow_function", NormalizedKind::Lambda),
-    ("class_declaration", NormalizedKind::Class),
-    ("assignment_expression", NormalizedKind::Assignment),
-    ("variable_declarator", NormalizedKind::Assignment),
-    ("import_statement", NormalizedKind::Import),
-    ("identifier", NormalizedKind::Identifier),
-    ("property_identifier", NormalizedKind::Identifier),
-    ("private_property_identifier", NormalizedKind::Identifier),
-    ("shorthand_property_identifier", NormalizedKind::Identifier),
-    (
-        "shorthand_property_identifier_pattern",
-        NormalizedKind::Identifier,
-    ),
-    ("string", NormalizedKind::StringLiteral),
-    ("template_string", NormalizedKind::StringLiteral),
-    ("number", NormalizedKind::NumericLiteral),
-    ("true", NormalizedKind::BooleanLiteral),
-    ("false", NormalizedKind::BooleanLiteral),
-    ("null", NormalizedKind::NullLiteral),
-    ("return_statement", NormalizedKind::Return),
-    ("throw_statement", NormalizedKind::Throw),
-    ("catch_clause", NormalizedKind::Catch),
-    ("if_statement", NormalizedKind::If),
-    ("for_statement", NormalizedKind::Loop),
-    ("for_in_statement", NormalizedKind::Loop),
-    ("while_statement", NormalizedKind::Loop),
-    ("do_statement", NormalizedKind::Loop),
-    ("decorator", NormalizedKind::Decorator),
-];
+macro_rules! js_ts_kind_table {
+    ($($ts_only:expr,)*) => {
+        &[
+            ("call_expression", NormalizedKind::Call),
+            ("new_expression", NormalizedKind::Call),
+            ("member_expression", NormalizedKind::FieldAccess),
+            ("function_declaration", NormalizedKind::Function),
+            ("function_expression", NormalizedKind::Function),
+            ("generator_function_declaration", NormalizedKind::Function),
+            ("generator_function", NormalizedKind::Function),
+            ("method_definition", NormalizedKind::Method),
+            ("arrow_function", NormalizedKind::Lambda),
+            ("class", NormalizedKind::Class),
+            ("class_declaration", NormalizedKind::Class),
+            ("assignment_expression", NormalizedKind::Assignment),
+            ("variable_declarator", NormalizedKind::Assignment),
+            ("import_statement", NormalizedKind::Import),
+            ("identifier", NormalizedKind::Identifier),
+            ("property_identifier", NormalizedKind::Identifier),
+            ("private_property_identifier", NormalizedKind::Identifier),
+            ("shorthand_property_identifier", NormalizedKind::Identifier),
+            (
+                "shorthand_property_identifier_pattern",
+                NormalizedKind::Identifier,
+            ),
+            ("string", NormalizedKind::StringLiteral),
+            ("template_string", NormalizedKind::StringLiteral),
+            ("number", NormalizedKind::NumericLiteral),
+            ("true", NormalizedKind::BooleanLiteral),
+            ("false", NormalizedKind::BooleanLiteral),
+            ("null", NormalizedKind::NullLiteral),
+            ("return_statement", NormalizedKind::Return),
+            ("throw_statement", NormalizedKind::Throw),
+            ("catch_clause", NormalizedKind::Catch),
+            ("if_statement", NormalizedKind::If),
+            ("for_statement", NormalizedKind::Loop),
+            ("for_in_statement", NormalizedKind::Loop),
+            ("while_statement", NormalizedKind::Loop),
+            ("do_statement", NormalizedKind::Loop),
+            ("decorator", NormalizedKind::Decorator),
+            $($ts_only,)*
+        ]
+    };
+}
 
-const TS_KIND_TABLE: &[(&str, NormalizedKind)] = &[
-    ("call_expression", NormalizedKind::Call),
-    ("new_expression", NormalizedKind::Call),
-    ("member_expression", NormalizedKind::FieldAccess),
-    ("function_declaration", NormalizedKind::Function),
-    ("function_expression", NormalizedKind::Function),
-    ("generator_function_declaration", NormalizedKind::Function),
-    ("generator_function", NormalizedKind::Function),
-    ("method_definition", NormalizedKind::Method),
-    ("arrow_function", NormalizedKind::Lambda),
-    ("class_declaration", NormalizedKind::Class),
+const JS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!();
+
+const TS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
     ("abstract_class_declaration", NormalizedKind::Class),
     ("interface_declaration", NormalizedKind::Class),
     ("enum_declaration", NormalizedKind::Class),
     ("type_alias_declaration", NormalizedKind::Declaration),
-    ("assignment_expression", NormalizedKind::Assignment),
-    ("variable_declarator", NormalizedKind::Assignment),
-    ("import_statement", NormalizedKind::Import),
-    ("identifier", NormalizedKind::Identifier),
-    ("property_identifier", NormalizedKind::Identifier),
-    ("private_property_identifier", NormalizedKind::Identifier),
-    ("shorthand_property_identifier", NormalizedKind::Identifier),
-    (
-        "shorthand_property_identifier_pattern",
-        NormalizedKind::Identifier,
-    ),
     ("type_identifier", NormalizedKind::Identifier),
     ("nested_identifier", NormalizedKind::Identifier),
-    ("string", NormalizedKind::StringLiteral),
-    ("template_string", NormalizedKind::StringLiteral),
-    ("number", NormalizedKind::NumericLiteral),
-    ("true", NormalizedKind::BooleanLiteral),
-    ("false", NormalizedKind::BooleanLiteral),
-    ("null", NormalizedKind::NullLiteral),
-    ("return_statement", NormalizedKind::Return),
-    ("throw_statement", NormalizedKind::Throw),
-    ("catch_clause", NormalizedKind::Catch),
-    ("if_statement", NormalizedKind::If),
-    ("for_statement", NormalizedKind::Loop),
-    ("for_in_statement", NormalizedKind::Loop),
-    ("while_statement", NormalizedKind::Loop),
-    ("do_statement", NormalizedKind::Loop),
-    ("decorator", NormalizedKind::Decorator),
-];
+);
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_child(0)
+}
+
+fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    node.utf8_text(source.as_bytes()).ok()
 }
 
 fn unquoted_string_span(node: Node<'_>) -> Option<Span> {
@@ -141,10 +117,7 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
 }
 
 fn attach_named_role(sink: &mut RoleSink<'_>, role: Role, target: Node<'_>) {
-    match expression_name_node(target) {
-        Some(name) => sink.role_named(role, target, name),
-        None => sink.role(role, target),
-    }
+    sink.role_maybe_named(role, target, expression_name_node(target));
 }
 
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
@@ -211,6 +184,44 @@ impl StructuralSpec for JsTsStructuralSpec {
         }
     }
 
+    fn refine_kind(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        _enclosing: Option<NormalizedKind>,
+        source: &str,
+    ) -> NormalizedKind {
+        if kind == NormalizedKind::Method
+            && node.kind() == "method_definition"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| node_text(name, source))
+                == Some("constructor")
+        {
+            NormalizedKind::Constructor
+        } else {
+            kind
+        }
+    }
+
+    fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
+        kind != NormalizedKind::Assignment
+            || node.kind() != "variable_declarator"
+            || node.child_by_field_name("value").is_some()
+    }
+
+    fn supports_role(&self, role: Role) -> bool {
+        role != Role::Kwarg
+    }
+
+    fn supports_kind(&self, kind: NormalizedKind) -> bool {
+        kind == NormalizedKind::Constructor
+            || self
+                .kind_table()
+                .iter()
+                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         match kind {
             NormalizedKind::Call => {
@@ -243,7 +254,11 @@ impl StructuralSpec for JsTsStructuralSpec {
                     attach_named_role(sink, Role::Object, object);
                 }
             }
-            NormalizedKind::Function | NormalizedKind::Method | NormalizedKind::Class => {
+            NormalizedKind::Function
+            | NormalizedKind::Method
+            | NormalizedKind::Constructor
+            | NormalizedKind::Class
+            | NormalizedKind::Declaration => {
                 if let Some(name) = node.child_by_field_name("name") {
                     sink.set_name(name);
                 }

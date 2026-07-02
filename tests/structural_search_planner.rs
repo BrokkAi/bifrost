@@ -126,6 +126,22 @@ fn where_globs_prune_before_any_parse() {
 }
 
 #[test]
+fn where_globs_allow_matching_project_relative_paths() {
+    let (_project, workspace) = python_workspace();
+    let analyzer = workspace.analyzer();
+
+    let output = run(
+        analyzer,
+        json!({
+            "where": ["src/**/*.py"],
+            "match": { "kind": "call", "callee": { "name": "eval" } }
+        }),
+    );
+    assert_eq!(output.matches.len(), 1);
+    assert_eq!(output.matches[0].path, "src/uses_eval.py");
+}
+
+#[test]
 fn limit_truncates_across_files_deterministically() {
     let (_project, workspace) = python_workspace();
     let analyzer = workspace.analyzer();
@@ -138,6 +154,30 @@ fn limit_truncates_across_files_deterministically() {
     assert!(output.truncated);
     // Files are visited in sorted path order: no_eval.py before uses_eval.py.
     assert_eq!(output.matches[0].path, "src/no_eval.py");
+}
+
+#[test]
+fn limit_stops_after_global_truncation_is_known() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/a.py", "def a():\n    pass\n")
+        .file("src/b.py", "def b():\n    pass\n")
+        .file("src/c.py", "def c():\n    pass\n")
+        .file("src/d.py", "def d():\n    pass\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    let output = run(
+        analyzer,
+        json!({ "match": { "kind": "callable" }, "limit": 1 }),
+    );
+    assert_eq!(output.matches.len(), 1);
+    assert!(output.truncated);
+    assert_eq!(
+        extraction_count(analyzer),
+        2,
+        "only enough files to prove global truncation should be parsed"
+    );
 }
 
 #[test]

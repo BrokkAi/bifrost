@@ -30,6 +30,7 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 - [x] (2026-07-02) Query-language revision after review: dropped `kind_exact`; `kind` now accepts a union array and `not_kind` provides subtype-aware exclusion (see Decision Log). IR, matcher, tool schema, plan, and tests updated; `kind_exact` now fails as an unknown field with the standard path-precise error.
 - [x] (2026-07-02) Milestone 3: planner + cache. `src/analyzer/structural/planner.rs` collects positive literal anchors (exact `name` predicates and `kwargs` keywords from conjunctive pattern positions; negation and regex contribute nothing) and prefilters candidates against the in-memory source before any parse; execution is a rayon per-file map with a per-file match cap of `limit+1`; facts are served from a `StructuralFactsCache` (moka, byte-weighted at `memo_cache_budget_bytes()/8`, keyed by file, validated by an FxHash of the in-memory source) that lives on `TreeSitterAnalyzer` and is shared across clones and incremental `update()` generations; enclosing-symbol lookups run only for the ≤limit returned matches. `tests/structural_search_planner.rs` (6 tests) asserts pruning skips anchor-less files, repeated queries do not re-extract, negation never prunes, glob-excluded files never parse, cross-file truncation is deterministic, and unsupported workspace languages surface as diagnostics. Verified on the bifrost repo itself via CLI (`subprocess.run` receiver query over python_tests/ with java/cpp/etc. diagnostics).
 - [x] (2026-07-02) Milestone 4: Java and JS/TS structural adapters. `src/analyzer/java/structural.rs` maps Java calls, field accesses, methods/constructors/classes, variable declarators/assignments, imports, annotations, and literals; `src/analyzer/js_ts/structural.rs` maps JavaScript and TypeScript calls/new expressions, member expressions, functions/methods/classes, variable declarators/assignments, imports, decorators, and literals. Java/JS/TS analyzers now expose structural providers through their existing wrapper analyzers. `tests/structural_search_cross_language.rs` proves the same JSON query finds `eval(code)` calls, `password = "hunter2"`-style initializers, and Python decorators / Java annotations / JS/TS decorators across one inferred-language workspace. Verified with `cargo fmt`, `cargo test structural --lib`, `cargo test --test structural_search_python --test structural_search_planner`, `cargo test --test structural_search_cross_language`, and `cargo clippy-no-cuda`.
+- [x] (2026-07-02) Guided-review remediation: made search execution globally bounded at `limit+1` ordered matches; added subtree intervals to `FileFacts` so `has`/`not_has` only walk real descendants; selected parser grammar per file so `.tsx` uses `LANGUAGE_TSX`; refined JS/TS constructors, class expressions, type aliases, and uninitialized declarators; centralized role metadata; added per-provider unsupported kind/role diagnostics; slash-normalized `where` glob matching; updated stale extended-tool metadata. Added regression coverage in `tests/structural_search_cross_language.rs`, `tests/structural_search_planner.rs`, and structural unit tests. Verified so far with `cargo fmt`, `cargo test structural --lib`, and `cargo test --test structural_search_python --test structural_search_planner --test structural_search_cross_language`.
 - [ ] Milestone 5 (deferred): S-expression frontend compiling to the same `AstQuery`, with `--print-json` style canonical echo.
 
 
@@ -47,6 +48,9 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 
 - Observation: TypeScript decorators on class members can appear as `decorator` siblings under `class_body` immediately before the `method_definition`, while JavaScript decorators in the test fixture are direct children of the `method_definition`.
   Evidence: the cross-language decorator test initially matched Java, JavaScript, and Python only; after collecting immediately preceding class-body decorator siblings, `cargo test --test structural_search_cross_language` found the TypeScript method as well.
+
+- Observation: TypeScript's analyzer language includes both `.ts` and `.tsx`, but structural extraction originally reparsed through the adapter's one default grammar (`LANGUAGE_TYPESCRIPT`).
+  Evidence: guided review compared `src/analyzer/structural/provider.rs` with the existing `js_ts_tree_sitter_language_for_file` helper used by usages/diagnostics; the TSX regression test now exercises `eval(code)` inside JSX.
 
 
 ## Decision Log
@@ -119,26 +123,31 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
   Rationale: hash-validate-on-read is simpler and safer than wiring invalidation into the update path, and the per-language memo caches in this repo do not survive updates at all — sharing plus validation strictly improves on both.
   Date/Author: 2026-07-02 / dave (M3 implementation).
 
-- Decision: Parallel execution collects per-file matches with a per-file cap of `limit+1`, flattens in deterministic (language, then path, then source-order) order, truncates at `limit`, and only then resolves enclosing symbols.
-  Rationale: the cap bounds memory for pathological broad queries while keeping the global `truncated` flag exact; enclosing-symbol lookups are the priciest per-match step and are wasted on matches that get truncated away.
-  Date/Author: 2026-07-02 / dave (M3 implementation).
+- Decision: Search execution walks deterministic candidates (language, path, then source order) and stops once `limit+1` global matches are known; only the first `limit` matches resolve enclosing symbols.
+  Rationale: guided review found the earlier per-file `limit+1` parallel collection could still materialize `files * limit` matches and parse far past the first result page. Bounded ordered collection keeps truncation exact and makes `limit` a real work/memory guard.
+  Date/Author: 2026-07-02 / dave (M3 implementation, revised after guided review).
 
 - Decision: `search_ast` lives in the `extended` toolset, first descriptor in the list; match/capture snippets in results are first-line-only, capped at 160 chars.
   Rationale: extended is the low-risk home while the tool stabilizes (the `symbol` toolset is the curated core surface); snippet caps keep rendered output within tool budgets — full content is always reachable via the returned line range.
   Date/Author: 2026-07-02 / dave (M2 implementation).
 
 - Decision: Normalize variable-initializer nodes as `assignment` facts in Java and JS/TS (`variable_declarator`) in addition to true assignment expressions.
-  Rationale: the user-level structural query is "left has this name, right is this value"; local/field variable initialization is the cross-language form of that shape, and the role edges still come from parser fields (`name`/`value`) rather than source-text parsing.
-  Date/Author: 2026-07-02 / dave (M4 implementation).
+  Rationale: the user-level structural query is "left has this name, right is this value"; local/field variable initialization is the cross-language form of that shape, and the role edges still come from parser fields (`name`/`value`) rather than source-text parsing. Guided review tightened this to value-bearing declarators only; uninitialized declarations are not assignments.
+  Date/Author: 2026-07-02 / dave (M4 implementation, tightened after guided review).
 
 - Decision: JS/TS decorator extraction accepts both direct declaration children and immediately preceding `class_body` decorator siblings.
   Rationale: the two grammars expose equivalent decorator syntax in both placements. Treating the sibling form as a decorator role on the following member preserves the normalized query contract without changing match spans.
   Date/Author: 2026-07-02 / dave (M4 implementation).
 
+- Decision: Structural providers expose supported normalized roles and kinds for diagnostics, including refined kinds such as JS/TS constructors.
+  Rationale: adapter absence is not the only degraded-support case. Queries using unsupported roles such as `kwargs` in Java/JS/TS should get explicit capability diagnostics rather than silent no-match behavior.
+  Date/Author: 2026-07-02 / dave (guided-review remediation).
+
 
 ## Outcomes & Retrospective
 
 - 2026-07-02: Milestone 4 completed. `search_ast` now has first-pass Java, JavaScript, and TypeScript structural adapters in addition to Python. Cross-language tests demonstrate the same JSON query matching calls, variable initializers, and decorator/annotation roles across Python, Java, JavaScript, and TypeScript. Remaining planned work is Milestone 5's deferred S-expression frontend.
+- 2026-07-02: Guided-review remediation completed for the review findings: bounded execution, descendant traversal intervals, TSX grammar selection, JS/TS constructor/class/type-alias semantics, uninitialized declaration filtering, role/kind capability diagnostics, normalized globs, and metadata/test cleanup.
 
 
 ## Context and Orientation

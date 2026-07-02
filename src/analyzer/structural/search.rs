@@ -1,15 +1,15 @@
 //! Workspace-level execution of a structural query (`search_ast`): scope by
 //! path globs and languages, prune candidates with the planner's positive
-//! anchors, run the matcher over candidate files in parallel (facts come from
-//! the per-analyzer cache, extraction happens on miss from in-memory source),
-//! then render the first `limit` matches with captures, enclosing symbols,
-//! and capability diagnostics.
+//! anchors, run the matcher over deterministic candidates until `limit+1`
+//! global matches prove truncation (facts come from the per-analyzer cache,
+//! extraction happens on miss from in-memory source), then render the first
+//! `limit` matches with captures, enclosing symbols, and capability
+//! diagnostics.
 
 use super::facts::FileFacts;
 use super::matcher::FactMatch;
 use super::query::AstQuery;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
-use rayon::prelude::*;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -52,8 +52,8 @@ pub struct SearchAstDiagnostic {
     pub message: String,
 }
 
-/// A match found in the parallel phase, held until the sequential rendering
-/// pass (which truncates at `limit` and does enclosing-symbol lookups).
+/// A match found before rendering, held until the rendering pass (which
+/// truncates at `limit` and does enclosing-symbol lookups).
 type PendingMatch = (Language, ProjectFile, Arc<FileFacts>, FactMatch);
 
 /// Run `query` across every language provider the analyzer exposes.
@@ -81,9 +81,46 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
             });
         }
     }
+    let requested_kinds = query.positive_kinds();
+    let requested_roles = query.used_roles();
+    for provider in &providers {
+        let unsupported_kinds: Vec<&'static str> = requested_kinds
+            .iter()
+            .copied()
+            .filter(|kind| !provider.structural_supports_kind(*kind))
+            .map(|kind| kind.label())
+            .collect();
+        if !unsupported_kinds.is_empty() {
+            diagnostics.push(SearchAstDiagnostic {
+                language: provider.structural_language().config_label(),
+                message: format!(
+                    "structural adapter for {} does not support kind(s): {}",
+                    provider.structural_language().config_label(),
+                    unsupported_kinds.join(", ")
+                ),
+            });
+        }
+
+        let unsupported_roles: Vec<&'static str> = requested_roles
+            .iter()
+            .copied()
+            .filter(|role| !provider.structural_supports_role(*role))
+            .map(|role| role.label())
+            .collect();
+        if !unsupported_roles.is_empty() {
+            diagnostics.push(SearchAstDiagnostic {
+                language: provider.structural_language().config_label(),
+                message: format!(
+                    "structural adapter for {} does not support role(s): {}",
+                    provider.structural_language().config_label(),
+                    unsupported_roles.join(", ")
+                ),
+            });
+        }
+    }
 
     // Deterministic candidate order: providers sorted by language above,
-    // files sorted within each provider; the parallel map preserves it.
+    // files sorted within each provider.
     let mut candidates: Vec<(Language, &dyn super::StructuralSearchProvider, ProjectFile)> =
         Vec::new();
     for provider in providers {
@@ -95,29 +132,27 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
     }
 
     let anchors = super::planner::collect_anchors(query);
-    // Each file needs at most limit+1 matches for global truncation to stay
-    // detectable after flattening.
-    let per_file_cap = query.limit.saturating_add(1);
-    let file_matches: Vec<Vec<PendingMatch>> = candidates
-        .par_iter()
-        .map(|(language, provider, file)| {
-            let Some(source) = provider.structural_source(file) else {
-                return Vec::new();
-            };
-            if !super::planner::source_may_match(source, &anchors) {
-                return Vec::new();
-            }
-            let Some(facts) = provider.structural_facts(file) else {
-                return Vec::new();
-            };
-            super::matcher::match_query(query, &facts, per_file_cap)
-                .into_iter()
-                .map(|fact_match| (*language, file.clone(), Arc::clone(&facts), fact_match))
-                .collect()
-        })
-        .collect();
+    let global_cap = query.limit.saturating_add(1);
+    let mut pending: Vec<PendingMatch> = Vec::new();
+    for (language, provider, file) in candidates {
+        let Some(source) = provider.structural_source(&file) else {
+            continue;
+        };
+        if !super::planner::source_may_match(source, &anchors) {
+            continue;
+        }
+        let Some(facts) = provider.structural_facts(&file) else {
+            continue;
+        };
+        let remaining = global_cap - pending.len();
+        for fact_match in super::matcher::match_query(query, &facts, remaining) {
+            pending.push((language, file.clone(), Arc::clone(&facts), fact_match));
+        }
+        if pending.len() >= global_cap {
+            break;
+        }
+    }
 
-    let mut pending: Vec<PendingMatch> = file_matches.into_iter().flatten().collect();
     let truncated = pending.len() > query.limit;
     pending.truncate(query.limit);
 
@@ -140,10 +175,8 @@ fn file_matches_globs(file: &ProjectFile, query: &AstQuery) -> bool {
     if query.where_globs.is_empty() {
         return true;
     }
-    query
-        .where_globs
-        .iter()
-        .any(|glob| glob.matches_path(file.rel_path()))
+    let rel_path = file.rel_path().to_string_lossy().replace('\\', "/");
+    query.where_globs.iter().any(|glob| glob.matches(&rel_path))
 }
 
 fn render_match(
@@ -234,5 +267,27 @@ impl SearchAstOutput {
             out.push_str(&format!("note: {}\n", diagnostic.message));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::structural::AstQuery;
+    use serde_json::json;
+
+    #[test]
+    fn where_globs_match_slash_normalized_paths() {
+        let query = AstQuery::from_json(&json!({
+            "where": ["src/**/*.py"],
+            "match": { "kind": "call" }
+        }))
+        .expect("query should parse");
+        let file = ProjectFile::new(
+            std::path::PathBuf::from("/workspace"),
+            std::path::PathBuf::from("src\\app.py"),
+        );
+
+        assert!(file_matches_globs(&file, &query));
     }
 }

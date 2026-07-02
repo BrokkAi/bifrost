@@ -56,6 +56,10 @@ pub struct NormalizedNode {
     pub name: Option<Span>,
     /// Role edges in source order (argument order matters for `args`).
     pub roles: Vec<RoleTarget>,
+    /// One-past-the-end fact id for this fact's normalized subtree. Facts are
+    /// stored in pre-order, so descendants are exactly
+    /// `(self_id + 1)..subtree_end`.
+    pub subtree_end: u32,
 }
 
 impl NormalizedNode {
@@ -102,6 +106,10 @@ impl FileFacts {
         &self.nodes[id as usize]
     }
 
+    pub fn subtree_end(&self, id: u32) -> u32 {
+        self.node(id).subtree_end
+    }
+
     /// 1-based line containing `byte`, matching the `Range` convention used
     /// across the analyzer.
     pub fn line_of_byte(&self, byte: usize) -> usize {
@@ -124,13 +132,6 @@ impl FileFacts {
 
     /// Whether `ancestor` lies on `node`'s parent chain (strictly above it).
     pub fn is_ancestor(&self, ancestor: u32, node: u32) -> bool {
-        let mut current = self.node(node).parent;
-        while let Some(id) = current {
-            if id == ancestor {
-                return true;
-            }
-            current = self.node(id).parent;
-        }
-        false
+        ancestor < node && node < self.subtree_end(ancestor)
     }
 }

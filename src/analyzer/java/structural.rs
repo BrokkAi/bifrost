@@ -78,10 +78,7 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
 }
 
 fn attach_named_role(sink: &mut RoleSink<'_>, role: Role, target: Node<'_>) {
-    match expression_name_node(target) {
-        Some(name) => sink.role_named(role, target, name),
-        None => sink.role(role, target),
-    }
+    sink.role_maybe_named(role, target, expression_name_node(target));
 }
 
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
@@ -119,6 +116,16 @@ impl StructuralSpec for JavaStructuralSpec {
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         JAVA_KIND_TABLE
+    }
+
+    fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
+        kind != NormalizedKind::Assignment
+            || node.kind() != "variable_declarator"
+            || node.child_by_field_name("value").is_some()
+    }
+
+    fn supports_role(&self, role: Role) -> bool {
+        role != Role::Kwarg
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

@@ -48,8 +48,14 @@ pub(crate) fn extract_file_facts(
         let mut parent_for_children = enclosing;
         if node.is_named()
             && let Some(kind) = compiled.kind_of(&node)
+            && spec.should_extract(node, kind)
         {
-            let kind = spec.refine_kind(node, kind, enclosing.map(|id| nodes[id as usize].kind));
+            let kind = spec.refine_kind(
+                node,
+                kind,
+                enclosing.map(|id| nodes[id as usize].kind),
+                source,
+            );
             let fact_id = nodes.len() as u32;
             nodes.push(NormalizedNode {
                 kind,
@@ -57,6 +63,7 @@ pub(crate) fn extract_file_facts(
                 parent: enclosing,
                 name: None,
                 roles: Vec::new(),
+                subtree_end: fact_id + 1,
             });
             fact_by_ts_node.insert(node.id(), fact_id);
             fact_sources.push((node, fact_id));
@@ -66,6 +73,14 @@ pub(crate) fn extract_file_facts(
             if let Some(child) = node.named_child(index) {
                 stack.push((child, parent_for_children));
             }
+        }
+    }
+
+    for fact_id in (0..nodes.len()).rev() {
+        if let Some(parent) = nodes[fact_id].parent {
+            let subtree_end = nodes[fact_id].subtree_end;
+            let parent = &mut nodes[parent as usize];
+            parent.subtree_end = parent.subtree_end.max(subtree_end);
         }
     }
 

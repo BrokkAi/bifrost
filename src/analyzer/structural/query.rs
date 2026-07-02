@@ -105,16 +105,38 @@ impl Pattern {
     }
 
     fn constrains_roles(&self) -> bool {
-        self.callee.is_some()
-            || self.receiver.is_some()
-            || !self.args.is_empty()
+        Role::single_target_roles()
+            .iter()
+            .any(|&role| self.single_role_pattern(role).is_some())
+            || Role::list_target_roles()
+                .iter()
+                .any(|&role| !self.list_role_patterns(role).is_empty())
             || !self.kwargs.is_empty()
-            || self.left.is_some()
-            || self.right.is_some()
-            || self.module.is_some()
-            || !self.decorators.is_empty()
-            || self.object.is_some()
-            || self.field.is_some()
+    }
+
+    pub(crate) fn single_role_pattern(&self, role: Role) -> Option<&Pattern> {
+        match role {
+            Role::Callee => self.callee.as_deref(),
+            Role::Receiver => self.receiver.as_deref(),
+            Role::Left => self.left.as_deref(),
+            Role::Right => self.right.as_deref(),
+            Role::Module => self.module.as_deref(),
+            Role::Object => self.object.as_deref(),
+            Role::Field => self.field.as_deref(),
+            Role::Arg | Role::Kwarg | Role::Decorator => None,
+        }
+    }
+
+    pub(crate) fn list_role_patterns(&self, role: Role) -> &[Pattern] {
+        match role {
+            Role::Arg => &self.args,
+            Role::Decorator => &self.decorators,
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn has_role_constraints(&self) -> bool {
+        self.constrains_roles()
     }
 }
 
@@ -258,6 +280,82 @@ impl AstQuery {
         object.insert("limit".to_string(), json!(self.limit));
         Value::Object(object)
     }
+
+    pub(crate) fn positive_kinds(&self) -> Vec<NormalizedKind> {
+        let mut kinds = Vec::new();
+        collect_positive_kinds(&self.root, &mut kinds);
+        if let Some(pattern) = &self.inside {
+            collect_positive_kinds(pattern, &mut kinds);
+        }
+        if let Some(pattern) = &self.not_inside {
+            collect_positive_kinds(pattern, &mut kinds);
+        }
+        kinds.sort_unstable();
+        kinds.dedup();
+        kinds
+    }
+
+    pub(crate) fn used_roles(&self) -> Vec<Role> {
+        let mut roles = Vec::new();
+        collect_used_roles(&self.root, &mut roles);
+        if let Some(pattern) = &self.inside {
+            collect_used_roles(pattern, &mut roles);
+        }
+        if let Some(pattern) = &self.not_inside {
+            collect_used_roles(pattern, &mut roles);
+        }
+        roles.sort_unstable();
+        roles.dedup();
+        roles
+    }
+}
+
+fn collect_positive_kinds(pattern: &Pattern, out: &mut Vec<NormalizedKind>) {
+    out.extend(pattern.kinds.iter().copied());
+    if let Some(pattern) = &pattern.has {
+        collect_positive_kinds(pattern, out);
+    }
+    if let Some(pattern) = &pattern.not_has {
+        collect_positive_kinds(pattern, out);
+    }
+    for &role in Role::single_target_roles() {
+        if let Some(pattern) = pattern.single_role_pattern(role) {
+            collect_positive_kinds(pattern, out);
+        }
+    }
+    for &role in Role::list_target_roles() {
+        for pattern in pattern.list_role_patterns(role) {
+            collect_positive_kinds(pattern, out);
+        }
+    }
+    for (_, pattern) in &pattern.kwargs {
+        collect_positive_kinds(pattern, out);
+    }
+}
+
+fn collect_used_roles(pattern: &Pattern, out: &mut Vec<Role>) {
+    if let Some(pattern) = &pattern.has {
+        collect_used_roles(pattern, out);
+    }
+    if let Some(pattern) = &pattern.not_has {
+        collect_used_roles(pattern, out);
+    }
+    for &role in Role::single_target_roles() {
+        if let Some(pattern) = pattern.single_role_pattern(role) {
+            out.push(role);
+            collect_used_roles(pattern, out);
+        }
+    }
+    for &role in Role::list_target_roles() {
+        for pattern in pattern.list_role_patterns(role) {
+            out.push(role);
+            collect_used_roles(pattern, out);
+        }
+    }
+    for (_, pattern) in &pattern.kwargs {
+        out.push(Role::Kwarg);
+        collect_used_roles(pattern, out);
+    }
 }
 
 fn as_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>, QueryError> {
@@ -358,29 +456,30 @@ fn decode_limit(value: &Value, path: &str) -> Result<usize, QueryError> {
     Ok(limit as usize)
 }
 
-const PATTERN_FIELDS: &[&str] = &[
-    "kind",
-    "not_kind",
-    "name",
-    "text",
-    "capture",
-    "has",
-    "not_has",
-    "callee",
-    "receiver",
-    "args",
-    "kwargs",
-    "left",
-    "right",
-    "module",
-    "decorators",
-    "object",
-    "field",
+const BASE_PATTERN_FIELDS: &[&str] = &[
+    "kind", "not_kind", "name", "text", "capture", "has", "not_has",
 ];
+
+fn is_known_pattern_field(field: &str) -> bool {
+    BASE_PATTERN_FIELDS.contains(&field) || Role::from_label(field).is_some()
+}
 
 fn decode_pattern(value: &Value, path: &str) -> Result<Pattern, QueryError> {
     let object = as_object(value, path)?;
-    check_known_fields(object, path, PATTERN_FIELDS)?;
+    for key in object.keys() {
+        if !is_known_pattern_field(key) {
+            let expected = BASE_PATTERN_FIELDS
+                .iter()
+                .copied()
+                .chain(super::kinds::ALL_ROLES.iter().map(|role| role.label()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(QueryError::new(
+                child_path(path, key),
+                format!("unknown field; expected one of: {expected}"),
+            ));
+        }
+    }
 
     let kinds = match object.get("kind") {
         None => Vec::new(),
@@ -530,21 +629,10 @@ fn decode_role_fields(
     path: &str,
     pattern: &mut Pattern,
 ) -> Result<(), QueryError> {
-    const SINGLE_ROLES: &[Role] = &[
-        Role::Callee,
-        Role::Receiver,
-        Role::Left,
-        Role::Right,
-        Role::Module,
-        Role::Object,
-        Role::Field,
-    ];
-    const LIST_ROLES: &[Role] = &[Role::Arg, Role::Decorator];
-
-    let present_roles: Vec<Role> = SINGLE_ROLES
+    let present_roles: Vec<Role> = Role::single_target_roles()
         .iter()
-        .chain(LIST_ROLES.iter())
-        .chain(std::iter::once(&Role::Kwarg))
+        .chain(Role::list_target_roles().iter())
+        .chain(Role::map_target_roles().iter())
         .copied()
         .filter(|role| object.contains_key(role.label()))
         .collect();
@@ -581,7 +669,7 @@ fn decode_role_fields(
         }
     }
 
-    for &role in SINGLE_ROLES {
+    for &role in Role::single_target_roles() {
         if let Some(value) = object.get(role.label()) {
             let role_path = child_path(path, role.label());
             let sub_pattern = Box::new(decode_pattern(value, &role_path)?);
@@ -593,12 +681,12 @@ fn decode_role_fields(
                 Role::Module => pattern.module = Some(sub_pattern),
                 Role::Object => pattern.object = Some(sub_pattern),
                 Role::Field => pattern.field = Some(sub_pattern),
-                Role::Arg | Role::Kwarg | Role::Decorator => unreachable!("list roles"),
+                Role::Arg | Role::Kwarg | Role::Decorator => unreachable!("non-single role"),
             }
         }
     }
 
-    for &role in LIST_ROLES {
+    for &role in Role::list_target_roles() {
         if let Some(value) = object.get(role.label()) {
             let role_path = child_path(path, role.label());
             let entries = value
@@ -611,7 +699,7 @@ fn decode_role_fields(
             match role {
                 Role::Arg => pattern.args = patterns,
                 Role::Decorator => pattern.decorators = patterns,
-                _ => unreachable!("only args/decorators are list roles"),
+                _ => unreachable!("non-list role"),
             }
         }
     }
@@ -666,31 +754,19 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     if let Some(sub) = &pattern.not_has {
         object.insert("not_has".to_string(), pattern_to_json(sub));
     }
-    let single_roles: &[(Role, &Option<Box<Pattern>>)] = &[
-        (Role::Callee, &pattern.callee),
-        (Role::Receiver, &pattern.receiver),
-        (Role::Left, &pattern.left),
-        (Role::Right, &pattern.right),
-        (Role::Module, &pattern.module),
-        (Role::Object, &pattern.object),
-        (Role::Field, &pattern.field),
-    ];
-    for (role, sub) in single_roles {
-        if let Some(sub) = sub {
+    for &role in Role::single_target_roles() {
+        if let Some(sub) = pattern.single_role_pattern(role) {
             object.insert(role.label().to_string(), pattern_to_json(sub));
         }
     }
-    if !pattern.args.is_empty() {
-        object.insert(
-            Role::Arg.label().to_string(),
-            Value::Array(pattern.args.iter().map(pattern_to_json).collect()),
-        );
-    }
-    if !pattern.decorators.is_empty() {
-        object.insert(
-            Role::Decorator.label().to_string(),
-            Value::Array(pattern.decorators.iter().map(pattern_to_json).collect()),
-        );
+    for &role in Role::list_target_roles() {
+        let patterns = pattern.list_role_patterns(role);
+        if !patterns.is_empty() {
+            object.insert(
+                role.label().to_string(),
+                Value::Array(patterns.iter().map(pattern_to_json).collect()),
+            );
+        }
     }
     if !pattern.kwargs.is_empty() {
         let mut kwargs = Map::new();

@@ -30,8 +30,29 @@ pub trait StructuralSpec: Send + Sync + 'static {
         _node: Node<'_>,
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
+        _source: &str,
     ) -> NormalizedKind {
         kind
+    }
+
+    /// Whether this normalized node should become a fact at all. Use this for
+    /// grammar nodes whose normalized kind is conditional on fields, such as
+    /// variable declarators that are assignments only when they have values.
+    fn should_extract(&self, _node: Node<'_>, _kind: NormalizedKind) -> bool {
+        true
+    }
+
+    /// Whether this adapter can model `role` precisely enough to evaluate a
+    /// query that asks for it.
+    fn supports_role(&self, _role: Role) -> bool {
+        true
+    }
+
+    /// Whether this adapter can produce facts satisfying `kind`.
+    fn supports_kind(&self, kind: NormalizedKind) -> bool {
+        self.kind_table()
+            .iter()
+            .any(|(_, fact_kind)| fact_kind.satisfies(kind))
     }
 
     /// Attach the fact's name and role edges by reading AST fields of `node`.
@@ -103,6 +124,16 @@ impl<'a> RoleSink<'a> {
     /// Attach a role edge whose name is the span of `name_node`.
     pub fn role_named(&mut self, role: Role, target: Node<'_>, name_node: Node<'_>) {
         self.push(role, None, target, Some(span_of(name_node)));
+    }
+
+    /// Attach a role edge with a derived name when the language spec found
+    /// one, otherwise attach the raw role target. This keeps fallback
+    /// semantics consistent across adapters.
+    pub fn role_maybe_named(&mut self, role: Role, target: Node<'_>, name: Option<Node<'_>>) {
+        match name {
+            Some(name) => self.role_named(role, target, name),
+            None => self.role(role, target),
+        }
     }
 
     /// Attach a role edge whose name is a precise span inside `target`.

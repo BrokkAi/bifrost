@@ -51,6 +51,14 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     }
 
+    fn parser_language_for_file(&self, file: &ProjectFile) -> TsLanguage {
+        crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file(
+            file,
+            Language::TypeScript,
+        )
+        .unwrap_or_else(|| self.parser_language())
+    }
+
     fn file_extension(&self) -> &'static str {
         "ts"
     }

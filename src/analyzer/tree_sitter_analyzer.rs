@@ -78,6 +78,9 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn language(&self) -> Language;
     fn query_directory(&self) -> &'static str;
     fn parser_language(&self) -> TsLanguage;
+    fn parser_language_for_file(&self, _file: &ProjectFile) -> TsLanguage {
+        self.parser_language()
+    }
     fn file_extension(&self) -> &'static str;
     fn normalize_full_name(&self, fq_name: &str) -> String {
         fq_name.to_string()

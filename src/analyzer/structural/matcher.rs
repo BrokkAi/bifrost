@@ -127,17 +127,8 @@ fn eval_pattern_inner(
     // Single-target roles: the first (typically only) edge of that role must
     // match the sub-pattern; a role constraint on a fact without that edge
     // fails.
-    let single_roles: [(Role, &Option<Box<Pattern>>); 7] = [
-        (Role::Callee, &pattern.callee),
-        (Role::Receiver, &pattern.receiver),
-        (Role::Left, &pattern.left),
-        (Role::Right, &pattern.right),
-        (Role::Module, &pattern.module),
-        (Role::Object, &pattern.object),
-        (Role::Field, &pattern.field),
-    ];
-    for (role, sub_pattern) in single_roles {
-        if let Some(sub_pattern) = sub_pattern {
+    for &role in Role::single_target_roles() {
+        if let Some(sub_pattern) = pattern.single_role_pattern(role) {
             let matched = fact
                 .role_targets(role)
                 .any(|target| eval_target(sub_pattern, facts, target, captures));
@@ -214,10 +205,10 @@ fn some_descendant_matches(
     node: u32,
     captures: &mut Vec<(String, Span)>,
 ) -> bool {
-    // Facts are stored in pre-order, so descendants of `node` all come after
-    // it; the parent-chain check keeps this exact rather than positional.
-    for candidate in (node + 1)..facts.nodes().len() as u32 {
-        if facts.is_ancestor(node, candidate) && eval_pattern(pattern, facts, candidate, captures) {
+    // Facts are stored in pre-order with subtree intervals, so this walks
+    // only actual descendants and returns immediately for leaves.
+    for candidate in (node + 1)..facts.subtree_end(node) {
+        if eval_pattern(pattern, facts, candidate, captures) {
             return true;
         }
     }
@@ -259,14 +250,7 @@ fn eval_span_only(
         || pattern.not_has.is_some()
         || !pattern.args.is_empty()
         || !pattern.kwargs.is_empty()
-        || !pattern.decorators.is_empty()
-        || pattern.callee.is_some()
-        || pattern.receiver.is_some()
-        || pattern.left.is_some()
-        || pattern.right.is_some()
-        || pattern.module.is_some()
-        || pattern.object.is_some()
-        || pattern.field.is_some()
+        || pattern.has_role_constraints()
     {
         return false;
     }

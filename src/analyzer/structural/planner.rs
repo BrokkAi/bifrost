@@ -15,6 +15,7 @@
 //! source span like any other.
 
 use super::query::{AstQuery, Pattern, StringPredicate};
+use crate::analyzer::structural::Role;
 
 /// Literal strings that must all appear in a file's source for the query's
 /// root (plus `inside`) constraints to possibly match. Empty when the query
@@ -42,21 +43,18 @@ fn collect_pattern_anchors(pattern: &Pattern, out: &mut Vec<String>) {
     if let Some(StringPredicate::Exact(name)) = &pattern.name {
         out.push(name.clone());
     }
-    let sub_patterns = [
-        &pattern.callee,
-        &pattern.receiver,
-        &pattern.left,
-        &pattern.right,
-        &pattern.module,
-        &pattern.object,
-        &pattern.field,
-        &pattern.has,
-    ];
-    for sub in sub_patterns.into_iter().flatten() {
+    for &role in Role::single_target_roles() {
+        if let Some(sub) = pattern.single_role_pattern(role) {
+            collect_pattern_anchors(sub, out);
+        }
+    }
+    if let Some(sub) = &pattern.has {
         collect_pattern_anchors(sub, out);
     }
-    for sub in pattern.args.iter().chain(pattern.decorators.iter()) {
-        collect_pattern_anchors(sub, out);
+    for &role in Role::list_target_roles() {
+        for sub in pattern.list_role_patterns(role) {
+            collect_pattern_anchors(sub, out);
+        }
     }
     for (keyword, sub) in &pattern.kwargs {
         // The keyword itself is spelled in source (`shell=True`).

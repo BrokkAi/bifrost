@@ -158,6 +158,33 @@ pub enum Role {
     Field,
 }
 
+pub const SINGLE_TARGET_ROLES: &[Role] = &[
+    Role::Callee,
+    Role::Receiver,
+    Role::Left,
+    Role::Right,
+    Role::Module,
+    Role::Object,
+    Role::Field,
+];
+
+pub const LIST_TARGET_ROLES: &[Role] = &[Role::Arg, Role::Decorator];
+
+pub const MAP_TARGET_ROLES: &[Role] = &[Role::Kwarg];
+
+pub const ALL_ROLES: &[Role] = &[
+    Role::Callee,
+    Role::Receiver,
+    Role::Arg,
+    Role::Kwarg,
+    Role::Left,
+    Role::Right,
+    Role::Module,
+    Role::Decorator,
+    Role::Object,
+    Role::Field,
+];
+
 impl Role {
     /// The JSON field name this role appears under in a pattern object.
     /// `Arg`/`Kwarg` use the plural spellings from the issue's query shape.
@@ -174,6 +201,22 @@ impl Role {
             Role::Object => "object",
             Role::Field => "field",
         }
+    }
+
+    pub fn from_label(label: &str) -> Option<Role> {
+        ALL_ROLES.iter().copied().find(|role| role.label() == label)
+    }
+
+    pub fn single_target_roles() -> &'static [Role] {
+        SINGLE_TARGET_ROLES
+    }
+
+    pub fn list_target_roles() -> &'static [Role] {
+        LIST_TARGET_ROLES
+    }
+
+    pub fn map_target_roles() -> &'static [Role] {
+        MAP_TARGET_ROLES
     }
 
     /// Whether a pattern of kind `kind` may constrain this role. Validation
@@ -258,5 +301,20 @@ mod tests {
         assert!(Role::Module.valid_for(Import));
         assert!(Role::Object.valid_for(FieldAccess));
         assert!(!Role::Object.valid_for(Identifier));
+    }
+
+    #[test]
+    fn role_metadata_covers_unique_labels() {
+        let mut labels = std::collections::HashSet::new();
+        for role in ALL_ROLES {
+            assert!(labels.insert(role.label()), "duplicate label for {role:?}");
+            assert_eq!(Role::from_label(role.label()), Some(*role));
+        }
+        assert_eq!(
+            Role::single_target_roles().len()
+                + Role::list_target_roles().len()
+                + Role::map_target_roles().len(),
+            ALL_ROLES.len()
+        );
     }
 }

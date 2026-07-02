@@ -13,6 +13,7 @@ def route(path):
     return lambda fn: fn
 
 password = "hunter2"
+empty: str
 
 
 @route("/run")
@@ -29,6 +30,7 @@ package app;
 
 class App {
     String password = "hunter2";
+    String empty;
 
     @route("/run")
     void handle(String code) {
@@ -45,8 +47,11 @@ function route(path) {
 }
 
 const password = "hunter2";
+let empty;
 
 class JsController {
+  constructor() {}
+
   @route("/run")
   handle(code) {
     eval(code);
@@ -60,8 +65,12 @@ function route(path: string) {
 }
 
 const password = "hunter2";
+let empty: string;
+type UserId = string;
 
 class TsController {
+  constructor() {}
+
   @route("/run")
   handle(code: string) {
     eval(code);
@@ -76,6 +85,17 @@ fn run_query(query: serde_json::Value) -> SearchAstOutput {
         .file("javascript/app.js", APP_JS)
         .file("typescript/app.ts", APP_TS)
         .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = AstQuery::from_json(&query).expect("query should parse");
+    execute(workspace.analyzer(), &query)
+}
+
+fn run_query_with_files(files: &[(&str, &str)], query: serde_json::Value) -> SearchAstOutput {
+    let mut project = InlineTestProject::new();
+    for (path, source) in files {
+        project = project.file(*path, *source);
+    }
+    let project = project.build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let query = AstQuery::from_json(&query).expect("query should parse");
     execute(workspace.analyzer(), &query)
@@ -152,6 +172,18 @@ fn assignment_query_matches_variable_initializers_across_languages() {
 }
 
 #[test]
+fn assignment_query_does_not_match_uninitialized_declarations() {
+    let output = run_query(json!({
+        "match": {
+            "kind": "assignment",
+            "left": { "name": "empty" }
+        }
+    }));
+
+    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+}
+
+#[test]
 fn decorator_query_matches_python_decorators_java_annotations_and_js_ts_decorators() {
     let output = run_query(json!({
         "match": {
@@ -186,5 +218,127 @@ fn decorator_query_matches_python_decorators_java_annotations_and_js_ts_decorato
             "handle(code: string) {…",
             "def handle_request(code):…",
         ]
+    );
+}
+
+#[test]
+fn js_ts_constructors_are_refined_and_excluded_from_named_callable_queries() {
+    let constructors = run_query(json!({
+        "languages": ["javascript", "typescript"],
+        "match": { "kind": "constructor" }
+    }));
+    assert!(constructors.diagnostics.is_empty());
+    assert_eq!(constructors.matches.len(), 2);
+    assert!(
+        constructors
+            .matches
+            .iter()
+            .all(|m| m.kind == "constructor" && m.text.starts_with("constructor")),
+        "unexpected constructor matches: {constructors:?}"
+    );
+
+    let named_callables = run_query(json!({
+        "languages": ["javascript", "typescript"],
+        "match": { "kind": "callable", "not_kind": "constructor" }
+    }));
+    assert!(
+        named_callables
+            .matches
+            .iter()
+            .all(|m| !m.text.starts_with("constructor")),
+        "constructors should be excluded: {named_callables:?}"
+    );
+}
+
+#[test]
+fn js_ts_class_expressions_and_type_alias_names_are_searchable() {
+    let output = run_query_with_files(
+        &[
+            (
+                "javascript/expr.js",
+                "const Expr = class {\n  method() {}\n};\n",
+            ),
+            (
+                "typescript/expr.ts",
+                "const Expr = class {\n  method(): void {}\n};\ntype UserId = string;\n",
+            ),
+        ],
+        json!({ "match": { "kind": "class" } }),
+    );
+    assert!(output.diagnostics.is_empty());
+    assert_eq!(output.matches.len(), 2);
+    assert!(
+        output.matches.iter().all(|m| m.text.starts_with("class")),
+        "expected class-expression matches: {output:?}"
+    );
+
+    let alias = run_query_with_files(
+        &[("typescript/alias.ts", "type UserId = string;\n")],
+        json!({ "match": { "kind": "declaration", "name": "UserId" } }),
+    );
+    assert!(alias.diagnostics.is_empty());
+    assert_eq!(alias.matches.len(), 1);
+    assert_eq!(alias.matches[0].text, "type UserId = string;");
+}
+
+#[test]
+fn tsx_files_use_the_tsx_grammar_for_structural_search() {
+    let output = run_query_with_files(
+        &[(
+            "typescript/widget.tsx",
+            r#"export function Widget({ code }: { code: string }) {
+  return <button onClick={() => eval(code)}>Run</button>;
+}
+"#,
+        )],
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "eval" },
+                "args": [{ "capture": "code" }]
+            },
+            "inside": { "kind": "callable", "capture": "fn" }
+        }),
+    );
+
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+    assert_eq!(output.matches.len(), 1);
+    assert_eq!(output.matches[0].path, "typescript/widget.tsx");
+    assert_eq!(output.matches[0].text, "eval(code)");
+}
+
+#[test]
+fn unsupported_role_queries_report_capability_diagnostics() {
+    let output = run_query(json!({
+        "match": {
+            "kind": "call",
+            "kwargs": { "shell": { "kind": "boolean_literal" } }
+        }
+    }));
+
+    assert!(
+        output.diagnostics.iter().any(
+            |diagnostic| diagnostic.language == "java" && diagnostic.message.contains("kwargs")
+        ),
+        "expected java kwargs diagnostic: {:?}",
+        output.diagnostics
+    );
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "javascript"
+                && diagnostic.message.contains("kwargs")),
+        "expected javascript kwargs diagnostic: {:?}",
+        output.diagnostics
+    );
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "typescript"
+                && diagnostic.message.contains("kwargs")),
+        "expected typescript kwargs diagnostic: {:?}",
+        output.diagnostics
     );
 }

@@ -58,10 +58,7 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
 }
 
 fn attach_named_role(sink: &mut RoleSink<'_>, role: Role, target: Node<'_>) {
-    match expression_name_node(target) {
-        Some(name) => sink.role_named(role, target, name),
-        None => sink.role(role, target),
-    }
+    sink.role_maybe_named(role, target, expression_name_node(target));
 }
 
 /// Attach `decorators` edges for a definition wrapped in Python's
@@ -97,6 +94,7 @@ impl StructuralSpec for PythonStructuralSpec {
         _node: Node<'_>,
         kind: NormalizedKind,
         enclosing: Option<NormalizedKind>,
+        _source: &str,
     ) -> NormalizedKind {
         // A def whose nearest normalized ancestor is a class body is a
         // method; nested defs inside methods stay functions.
@@ -105,6 +103,10 @@ impl StructuralSpec for PythonStructuralSpec {
         } else {
             kind
         }
+    }
+
+    fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
+        kind != NormalizedKind::Assignment || node.child_by_field_name("right").is_some()
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

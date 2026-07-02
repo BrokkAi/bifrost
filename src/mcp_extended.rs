@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
+    "search_ast",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "find_filenames",
