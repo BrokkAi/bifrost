@@ -60,7 +60,9 @@ fn resolves_explicit_imports() {
 fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_declarations() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
-    create_external_dependency_fixture(&root);
+    if !create_external_dependency_fixture(&root) {
+        return;
+    }
 
     let config = AnalyzerConfig {
         java_external_dependencies: JavaExternalDependencies {
@@ -80,8 +82,8 @@ fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_d
             "src/App.java",
             "package app;\n\
              import com.example.dep.ExternalService;\n\
-             import com.example.dep.*;\n\
-             public class App { ExternalService explicit; ExternalHelper wildcard; }\n",
+             import com.example.dep.ExternalHelper;\n\
+             public class App { ExternalService explicit; ExternalService.Nested nested; ExternalHelper helper; }\n",
         )],
         config,
     );
@@ -92,6 +94,7 @@ fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_d
         .unwrap();
 
     assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalService"));
+    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalService.Nested"));
     assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalHelper"));
     assert!(
         analyzer
@@ -276,9 +279,13 @@ fn resolves_fully_qualified_extends() {
     );
 }
 
-fn create_external_dependency_fixture(root: &Path) {
-    require_jdk_tool("javac");
-    require_jdk_tool("jar");
+fn create_external_dependency_fixture(root: &Path) -> bool {
+    if !jdk_tool_available("javac") || !jdk_tool_available("jar") {
+        eprintln!(
+            "skipping Java external declaration integration test: `javac` and `jar` are required"
+        );
+        return false;
+    }
 
     let repo_dir = root.join("m2/com/example/external-lib/1.2.3");
     let source_dir = root.join("dep-src");
@@ -290,7 +297,7 @@ fn create_external_dependency_fixture(root: &Path) {
 
     fs::write(
         package_dir.join("ExternalService.java"),
-        "package com.example.dep; public class ExternalService {}\n",
+        "package com.example.dep; public class ExternalService { public static class Nested {} }\n",
     )
     .unwrap();
     fs::write(
@@ -313,18 +320,14 @@ fn create_external_dependency_fixture(root: &Path) {
             .arg(repo_dir.join("external-lib-1.2.3.jar"))
             .arg("."),
     );
+    true
 }
 
-fn require_jdk_tool(tool: &str) {
-    let Ok(output) = Command::new(tool).arg("--version").output() else {
-        panic!(
-            "Java external declaration tests require `{tool}` on PATH. Install a JDK and rerun."
-        );
-    };
-    assert!(
-        output.status.success(),
-        "Java external declaration tests require `{tool}` on PATH. Install a JDK and rerun."
-    );
+fn jdk_tool_available(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn run_jdk_command(command: &mut Command) {

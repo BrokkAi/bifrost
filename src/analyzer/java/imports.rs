@@ -372,7 +372,8 @@ impl JavaAnalyzer {
 
             if !import.is_wildcard {
                 if import.identifier.as_deref() == Some(normalized)
-                    && let Some(external_type) = external.resolve_explicit_import(import_path)
+                    && let Some(external_type) =
+                        external.resolve_explicit_import(import_path, access_package)
                 {
                     return Some(JavaTypeResolution::External(external_type.clone()));
                 }
@@ -380,7 +381,20 @@ impl JavaAnalyzer {
             }
 
             let package_name = import_path.trim_end_matches(".*");
-            if let Some(external_type) = external.resolve_wildcard_import(package_name, normalized)
+            if let Some(external_type) =
+                external.resolve_wildcard_import(package_name, normalized, access_package)
+            {
+                return Some(JavaTypeResolution::External(external_type.clone()));
+            }
+        }
+
+        if let Some((first, rest)) = normalized.split_once('.')
+            && let Some(owner) =
+                self.resolve_visible_external_simple_type(file, first, access_package)
+        {
+            let nested_fqn = format!("{}.{}", owner.fqn(), rest);
+            if let Some(external_type) =
+                external.resolve_qualified_name(&nested_fqn, access_package)
             {
                 return Some(JavaTypeResolution::External(external_type.clone()));
             }
@@ -411,6 +425,42 @@ impl JavaAnalyzer {
         self.inner
             .definitions(&nested_fqn)
             .find(|code_unit| code_unit.is_class())
+            .cloned()
+    }
+
+    fn resolve_visible_external_simple_type(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        access_package: &str,
+    ) -> Option<JavaExternalType> {
+        let external = self.external_declaration_index();
+        for import in self.inner.import_info_of(file) {
+            let Some(import_path) = non_static_import_path(import) else {
+                continue;
+            };
+
+            if !import.is_wildcard {
+                if import.identifier.as_deref() == Some(name)
+                    && let Some(external_type) =
+                        external.resolve_explicit_import(import_path, access_package)
+                {
+                    return Some(external_type.clone());
+                }
+                continue;
+            }
+
+            let package_name = import_path.trim_end_matches(".*");
+            if let Some(external_type) =
+                external.resolve_wildcard_import(package_name, name, access_package)
+            {
+                return Some(external_type.clone());
+            }
+        }
+
+        external
+            .resolve_same_package(access_package, name)
+            .or_else(|| external.resolve_java_lang(name))
             .cloned()
     }
 

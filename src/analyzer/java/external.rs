@@ -16,6 +16,7 @@ const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JavaExternalDeclarationIndex {
@@ -92,17 +93,23 @@ impl JavaExternalDeclarationIndex {
         self.types_by_fqn.get(fqn)
     }
 
-    pub(crate) fn resolve_explicit_import(&self, import_path: &str) -> Option<&JavaExternalType> {
-        self.get(import_path).filter(|ty| ty.is_import_accessible())
+    pub(crate) fn resolve_explicit_import(
+        &self,
+        import_path: &str,
+        access_package: &str,
+    ) -> Option<&JavaExternalType> {
+        self.get(import_path)
+            .filter(|ty| ty.is_accessible_from_package(access_package))
     }
 
     pub(crate) fn resolve_wildcard_import(
         &self,
         package_name: &str,
         short_name: &str,
+        access_package: &str,
     ) -> Option<&JavaExternalType> {
         self.get(&qualified_name(package_name, short_name))
-            .filter(|ty| ty.is_import_accessible())
+            .filter(|ty| ty.is_accessible_from_package(access_package))
     }
 
     pub(crate) fn resolve_same_package(
@@ -116,7 +123,7 @@ impl JavaExternalDeclarationIndex {
 
     pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<&JavaExternalType> {
         self.get(&qualified_name("java.lang", short_name))
-            .filter(|ty| ty.is_import_accessible())
+            .filter(|ty| ty.visibility == JavaVisibility::Public)
     }
 
     pub(crate) fn resolve_qualified_name(
@@ -145,7 +152,7 @@ impl JavaExternalDeclarationIndex {
     }
 
     fn index_source_jar(&mut self, artifact_path: &Path) {
-        let Ok(file) = File::open(artifact_path) else {
+        let Some(file) = open_artifact_file(artifact_path) else {
             return;
         };
         let Ok(mut archive) = ZipArchive::new(file) else {
@@ -180,7 +187,7 @@ impl JavaExternalDeclarationIndex {
     }
 
     fn index_class_jar(&mut self, artifact_path: &Path) {
-        let Ok(file) = File::open(artifact_path) else {
+        let Some(file) = open_artifact_file(artifact_path) else {
             return;
         };
         let Ok(mut archive) = ZipArchive::new(file) else {
@@ -237,18 +244,25 @@ impl JavaExternalType {
         &self.source
     }
 
-    fn is_import_accessible(&self) -> bool {
-        matches!(
-            self.visibility,
-            JavaVisibility::Public | JavaVisibility::Protected
-        )
+    pub(crate) fn fqn(&self) -> &str {
+        &self.fqn
     }
 
     fn is_accessible_from_package(&self, package_name: &str) -> bool {
-        self.is_import_accessible()
-            || (self.visibility == JavaVisibility::PackagePrivate
-                && self.package_name == package_name)
+        self.visibility == JavaVisibility::Public
+            || (matches!(
+                self.visibility,
+                JavaVisibility::Protected | JavaVisibility::PackagePrivate
+            ) && self.package_name == package_name)
     }
+}
+
+fn open_artifact_file(path: &Path) -> Option<File> {
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES {
+        return None;
+    }
+    File::open(path).ok()
 }
 
 fn can_read_entry(entry_size: u64, max_entry_bytes: u64, total_bytes: &mut u64) -> bool {
@@ -437,8 +451,11 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
         }
 
         let child_parent_visible = parent_visible && visibility != JavaVisibility::Private;
-        for index in (0..node.named_child_count()).rev() {
-            let Some(child) = node.named_child(index) else {
+        let Some(body) = node.child_by_field_name("body") else {
+            continue;
+        };
+        for index in (0..body.named_child_count()).rev() {
+            let Some(child) = body.named_child(index) else {
                 continue;
             };
             if is_class_like_declaration_kind(child.kind()) {
@@ -485,15 +502,15 @@ fn class_type(artifact_path: &Path, class_entry: &str, bytes: &[u8]) -> Option<J
         return None;
     }
     let internal_name = class_internal_name(&class_file)?;
-    let fqn = normalize_java_full_name(&internal_name.replace('/', "."));
-    if fqn.is_empty() {
+    let (package_name, short_name) = split_internal_class_name(&internal_name);
+    if short_name.is_empty() {
         return None;
     }
+    let fqn = qualified_name(&package_name, &short_name);
     let visibility = class_visibility(&class_file, &internal_name);
     if visibility == JavaVisibility::Private {
         return None;
     }
-    let (package_name, short_name) = split_fqn(&fqn);
     Some(JavaExternalType {
         fqn,
         package_name,
@@ -591,10 +608,14 @@ fn source_kind(kind: &str) -> JavaExternalTypeKind {
     }
 }
 
-fn split_fqn(fqn: &str) -> (String, String) {
-    fqn.rsplit_once('.')
-        .map(|(package_name, short_name)| (package_name.to_string(), short_name.to_string()))
-        .unwrap_or_else(|| (String::new(), fqn.to_string()))
+fn split_internal_class_name(internal_name: &str) -> (String, String) {
+    let (package_path, class_name) = internal_name
+        .rsplit_once('/')
+        .unwrap_or(("", internal_name));
+    (
+        package_path.replace('/', "."),
+        normalize_java_full_name(&class_name.replace('$', ".")),
+    )
 }
 
 fn qualified_name(package_name: &str, short_name: &str) -> String {
@@ -623,7 +644,9 @@ mod tests {
 
     #[test]
     fn java_external_declaration_indexes_coordinate_and_prefers_source_jar() {
-        let fixture = ExternalJarFixture::new(true);
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
         let config = fixture.coordinate_config();
         let index = JavaExternalDeclarationIndex::build(&config, fixture.project_root());
 
@@ -645,6 +668,15 @@ mod tests {
             index
                 .get("com.example.dep.ExternalService.Nested")
                 .is_some()
+        );
+        assert!(
+            matches!(
+                index
+                    .get("com.example.dep.ExternalService.Nested")
+                    .map(JavaExternalType::source),
+                Some(JavaExternalDeclarationSource::SourceJar { .. })
+            ),
+            "nested source declarations should retain source-JAR provenance"
         );
         assert_eq!(
             Some(JavaVisibility::Protected),
@@ -672,14 +704,16 @@ mod tests {
         );
         assert!(
             index
-                .resolve_wildcard_import("com.example.dep", "ExternalService")
+                .resolve_wildcard_import("com.example.dep", "ExternalService", "app")
                 .is_some()
         );
     }
 
     #[test]
     fn java_external_declaration_uses_classfile_when_source_jar_is_missing() {
-        let fixture = ExternalJarFixture::new(false);
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
         let config = fixture.coordinate_config();
         let index = JavaExternalDeclarationIndex::build(&config, fixture.project_root());
 
@@ -704,6 +738,12 @@ mod tests {
                 .get("com.example.dep.PackageHelper")
                 .map(JavaExternalType::visibility)
         );
+        let package_nested = index
+            .get("com.example.dep.ExternalService.PackageNested")
+            .unwrap();
+        assert_eq!("com.example.dep", package_nested.package_name());
+        assert_eq!("ExternalService.PackageNested", package_nested.short_name());
+        assert_eq!(JavaVisibility::PackagePrivate, package_nested.visibility());
         assert!(
             index
                 .get("com.example.dep.ExternalService.Hidden")
@@ -714,7 +754,9 @@ mod tests {
 
     #[test]
     fn java_external_declaration_indexes_explicit_source_artifact_path() {
-        let fixture = ExternalJarFixture::new(true);
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
         let config = JavaExternalDependencies {
             artifact_paths: vec![JavaExternalArtifact {
                 artifact_path: fixture.source_jar_path(),
@@ -802,8 +844,31 @@ mod tests {
     }
 
     #[test]
+    fn java_external_declaration_skips_oversized_artifacts_before_zip_parse() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let oversized_jar = root.join("oversized.jar");
+        File::create(&oversized_jar)
+            .unwrap()
+            .set_len(MAX_ARTIFACT_BYTES + 1)
+            .unwrap();
+        let config = JavaExternalDependencies {
+            artifact_paths: vec![JavaExternalArtifact {
+                artifact_path: oversized_jar,
+                source_artifact_path: None,
+            }],
+            ..JavaExternalDependencies::default()
+        };
+
+        let index = JavaExternalDeclarationIndex::build(&config, &root);
+        assert!(index.is_empty());
+    }
+
+    #[test]
     fn java_external_declaration_resolver_distinguishes_source_and_external_types() {
-        let fixture = ExternalJarFixture::new(true);
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
         let config = AnalyzerConfig {
             java_external_dependencies: fixture.coordinate_config(),
             ..AnalyzerConfig::default()
@@ -813,8 +878,8 @@ mod tests {
         app.write(
             "package app;\n\
              import com.example.dep.ExternalService;\n\
-             import com.example.dep.*;\n\
-             public class App { ExternalService one; ExternalService.Nested two; }\n",
+             import com.example.dep.ExternalHelper;\n\
+             public class App { ExternalService one; ExternalService.Nested two; ExternalHelper helper; ExternalService.ProtectedNested blocked; }\n",
         )
         .unwrap();
         ProjectFile::new(fixture.project_root().to_path_buf(), "src/LocalType.java")
@@ -842,7 +907,24 @@ mod tests {
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(matches!(
+            analyzer.resolve_type_name_with_external(&app, "ExternalService.Nested"),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
+        ));
+        assert!(
+            analyzer
+                .resolve_type_name_with_external(&app, "ExternalService.ProtectedNested")
+                .is_none(),
+            "protected nested dependency types should not resolve from unrelated packages"
+        );
+        assert!(matches!(
             analyzer.resolve_type_name_with_external(&same_package_app, "PackageHelper"),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
+        ));
+        assert!(matches!(
+            analyzer.resolve_type_name_with_external(
+                &same_package_app,
+                "ExternalService.PackageNested"
+            ),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(
@@ -867,9 +949,13 @@ mod tests {
     }
 
     impl ExternalJarFixture {
-        fn new(include_sources: bool) -> Self {
-            require_jdk_tool("javac");
-            require_jdk_tool("jar");
+        fn new(include_sources: bool) -> Option<Self> {
+            if !jdk_tool_available("javac") || !jdk_tool_available("jar") {
+                eprintln!(
+                    "skipping Java external declaration fixture test: `javac` and `jar` are required"
+                );
+                return None;
+            }
 
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
@@ -889,6 +975,7 @@ mod tests {
                  public class ExternalService {\n\
                    public static class Nested {}\n\
                    protected static class ProtectedNested {}\n\
+                   static class PackageNested {}\n\
                    private static class Hidden { public static class Leaks {} }\n\
                  }\n",
             )
@@ -896,6 +983,11 @@ mod tests {
             fs::write(
                 package_dir.join("ExternalInterface.java"),
                 "package com.example.dep; public interface ExternalInterface {}\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("ExternalHelper.java"),
+                "package com.example.dep; public class ExternalHelper {}\n",
             )
             .unwrap();
             fs::write(
@@ -909,6 +1001,7 @@ mod tests {
                 .arg(&classes_dir)
                 .arg(package_dir.join("ExternalService.java"))
                 .arg(package_dir.join("ExternalInterface.java"))
+                .arg(package_dir.join("ExternalHelper.java"))
                 .arg(package_dir.join("PackageHelper.java")));
             run(Command::new("jar")
                 .current_dir(&classes_dir)
@@ -923,11 +1016,11 @@ mod tests {
                     .arg("."));
             }
 
-            Self {
+            Some(Self {
                 _temp: temp,
                 root,
                 workspace_root,
-            }
+            })
         }
 
         fn project_root(&self) -> &Path {
@@ -951,16 +1044,11 @@ mod tests {
         }
     }
 
-    fn require_jdk_tool(tool: &str) {
-        let Ok(output) = Command::new(tool).arg("--version").output() else {
-            panic!(
-                "Java external declaration tests require `{tool}` on PATH. Install a JDK and rerun."
-            );
-        };
-        assert!(
-            output.status.success(),
-            "Java external declaration tests require `{tool}` on PATH. Install a JDK and rerun."
-        );
+    fn jdk_tool_available(tool: &str) -> bool {
+        Command::new(tool)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
     }
 
     fn run(command: &mut Command) {
