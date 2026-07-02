@@ -103,3 +103,9 @@ tempfile = "3.23.0"
 # Unix: process-group kill for the embedding sidecar (and the peak-RSS bench).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Full debuginfo made every dev test binary ~600 MB, so target/ grew by
+# terabytes; line tables keep file/line backtraces at a fraction of the size.
+# Bump back to `debug = true` locally when a real debugger session is needed.
+[profile.dev]
+debug = "line-tables-only"
