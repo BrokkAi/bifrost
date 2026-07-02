@@ -353,7 +353,9 @@ impl JsTsExportUsageGraphStrategy {
 }
 
 fn target_seed_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String {
-    if let Some(parent) = analyzer.parent_of(target) {
+    if let Some(parent) = analyzer.parent_of(target)
+        && !parent.is_module()
+    {
         return parent.identifier().trim_end_matches("$static").to_string();
     }
     if is_static_member(target)
