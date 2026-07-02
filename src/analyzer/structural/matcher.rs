@@ -22,10 +22,19 @@ pub(crate) struct FactMatch {
     pub captures: Vec<(String, Span)>,
 }
 
-/// Evaluate `query` against one file's facts, in source order.
-pub(crate) fn match_query(query: &AstQuery, facts: &FileFacts) -> Vec<FactMatch> {
+/// Evaluate `query` against one file's facts, in source order, stopping after
+/// `max_matches` hits. Callers pass one more than they can return so global
+/// truncation stays detectable without collecting unbounded per-file results.
+pub(crate) fn match_query(
+    query: &AstQuery,
+    facts: &FileFacts,
+    max_matches: usize,
+) -> Vec<FactMatch> {
     let mut matches = Vec::new();
     for id in 0..facts.nodes().len() as u32 {
+        if matches.len() >= max_matches {
+            break;
+        }
         let mut captures = Vec::new();
         if !eval_pattern(&query.root, facts, id, &mut captures) {
             continue;

@@ -1,13 +1,17 @@
-//! Workspace-level execution of a structural query (`search_ast`, milestone 2
-//! shape): apply path/language scoping, run the matcher per candidate file,
-//! and produce the tool-facing result with captures, enclosing symbols, and
-//! capability diagnostics. Milestone 3 replaces the sequential full scan with
-//! the pruning planner and facts cache without changing this output shape.
+//! Workspace-level execution of a structural query (`search_ast`): scope by
+//! path globs and languages, prune candidates with the planner's positive
+//! anchors, run the matcher over candidate files in parallel (facts come from
+//! the per-analyzer cache, extraction happens on miss from in-memory source),
+//! then render the first `limit` matches with captures, enclosing symbols,
+//! and capability diagnostics.
 
 use super::facts::FileFacts;
+use super::matcher::FactMatch;
 use super::query::AstQuery;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use rayon::prelude::*;
 use serde::Serialize;
+use std::sync::Arc;
 
 /// Longest match/capture snippet reported inline; full content is always
 /// reachable via the returned line range.
@@ -48,6 +52,10 @@ pub struct SearchAstDiagnostic {
     pub message: String,
 }
 
+/// A match found in the parallel phase, held until the sequential rendering
+/// pass (which truncates at `limit` and does enclosing-symbol lookups).
+type PendingMatch = (Language, ProjectFile, Arc<FileFacts>, FactMatch);
+
 /// Run `query` across every language provider the analyzer exposes.
 pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
     let mut providers = analyzer.structural_search_providers();
@@ -74,26 +82,52 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
         }
     }
 
-    let mut matches = Vec::new();
-    let mut truncated = false;
-    'providers: for provider in providers {
+    // Deterministic candidate order: providers sorted by language above,
+    // files sorted within each provider; the parallel map preserves it.
+    let mut candidates: Vec<(Language, &dyn super::StructuralSearchProvider, ProjectFile)> =
+        Vec::new();
+    for provider in providers {
         let language = provider.structural_language();
         let mut files = provider.structural_files();
         files.retain(|file| file_matches_globs(file, query));
         files.sort();
-        for file in files {
-            let Some(facts) = provider.structural_facts(&file) else {
-                continue;
-            };
-            for fact_match in super::matcher::match_query(query, &facts) {
-                if matches.len() >= query.limit {
-                    truncated = true;
-                    break 'providers;
-                }
-                matches.push(render_match(analyzer, language, &file, &facts, &fact_match));
-            }
-        }
+        candidates.extend(files.into_iter().map(|file| (language, provider, file)));
     }
+
+    let anchors = super::planner::collect_anchors(query);
+    // Each file needs at most limit+1 matches for global truncation to stay
+    // detectable after flattening.
+    let per_file_cap = query.limit.saturating_add(1);
+    let file_matches: Vec<Vec<PendingMatch>> = candidates
+        .par_iter()
+        .map(|(language, provider, file)| {
+            let Some(source) = provider.structural_source(file) else {
+                return Vec::new();
+            };
+            if !super::planner::source_may_match(source, &anchors) {
+                return Vec::new();
+            }
+            let Some(facts) = provider.structural_facts(file) else {
+                return Vec::new();
+            };
+            super::matcher::match_query(query, &facts, per_file_cap)
+                .into_iter()
+                .map(|fact_match| (*language, file.clone(), Arc::clone(&facts), fact_match))
+                .collect()
+        })
+        .collect();
+
+    let mut pending: Vec<PendingMatch> = file_matches.into_iter().flatten().collect();
+    let truncated = pending.len() > query.limit;
+    pending.truncate(query.limit);
+
+    // Enclosing-symbol lookups only for the matches actually returned.
+    let matches = pending
+        .into_iter()
+        .map(|(language, file, facts, fact_match)| {
+            render_match(analyzer, language, &file, &facts, &fact_match)
+        })
+        .collect();
 
     SearchAstOutput {
         matches,
@@ -117,7 +151,7 @@ fn render_match(
     language: Language,
     file: &ProjectFile,
     facts: &FileFacts,
-    fact_match: &super::matcher::FactMatch,
+    fact_match: &FactMatch,
 ) -> SearchAstMatch {
     let fact = facts.node(fact_match.node);
     let captures = fact_match

@@ -108,6 +108,20 @@ impl FileFacts {
         self.line_starts.partition_point(|&start| start <= byte)
     }
 
+    /// Rough heap footprint for the facts-cache weigher; exactness doesn't
+    /// matter, monotonicity with actual size does.
+    pub fn estimated_bytes(&self) -> u64 {
+        let roles: usize = self
+            .nodes
+            .iter()
+            .map(|node| node.roles.len() * std::mem::size_of::<RoleTarget>())
+            .sum();
+        (self.source.len()
+            + self.line_starts.len() * std::mem::size_of::<usize>()
+            + self.nodes.len() * std::mem::size_of::<NormalizedNode>()
+            + roles) as u64
+    }
+
     /// Whether `ancestor` lies on `node`'s parent chain (strictly above it).
     pub fn is_ancestor(&self, ancestor: u32, node: u32) -> bool {
         let mut current = self.node(node).parent;

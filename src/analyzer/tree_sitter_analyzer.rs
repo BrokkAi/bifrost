@@ -420,6 +420,11 @@ pub struct TreeSitterAnalyzer<A> {
     config: AnalyzerConfig,
     state: Arc<AnalyzerState>,
     storage: Option<Arc<AnalyzerStorage>>,
+    /// Structural-search facts cache (issue #328). Shared across clones and
+    /// incremental `update()` generations — entries are validated against a
+    /// hash of the current in-memory source, so surviving stale entries are
+    /// self-healing rather than wrong.
+    structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
     _state: PhantomData<A>,
 }
 
@@ -431,6 +436,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             storage: self.storage.as_ref().map(Arc::clone),
+            structural_cache: Arc::clone(&self.structural_cache),
             _state: PhantomData,
         }
     }
@@ -573,14 +579,32 @@ where
             ))
         };
 
+        let structural_cache = Arc::new(Self::build_structural_cache(&config));
         Self {
             project,
             adapter,
             config,
             state,
             storage,
+            structural_cache,
             _state: PhantomData,
         }
+    }
+
+    /// The structural facts cache takes a slice of the shared memo budget,
+    /// like the per-language memo caches do.
+    fn build_structural_cache(
+        config: &AnalyzerConfig,
+    ) -> crate::analyzer::structural::provider::StructuralFactsCache {
+        crate::analyzer::structural::provider::StructuralFactsCache::new(
+            config.memo_cache_budget_bytes() / 8,
+        )
+    }
+
+    pub(crate) fn structural_cache(
+        &self,
+    ) -> &crate::analyzer::structural::provider::StructuralFactsCache {
+        &self.structural_cache
     }
 
     pub fn project(&self) -> &dyn Project {
@@ -597,6 +621,7 @@ where
         config: AnalyzerConfig,
         state: AnalyzerState,
         storage: Option<Arc<AnalyzerStorage>>,
+        structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
     ) -> Self {
         Self {
             project,
@@ -604,6 +629,7 @@ where
             config,
             state: Arc::new(state),
             storage,
+            structural_cache,
             _state: PhantomData,
         }
     }
@@ -1294,6 +1320,7 @@ where
             self.config.clone(),
             state,
             self.storage.as_ref().map(Arc::clone),
+            Arc::clone(&self.structural_cache),
         )
     }
 
@@ -1312,6 +1339,7 @@ where
             self.config.clone(),
             state,
             self.storage.as_ref().map(Arc::clone),
+            Arc::clone(&self.structural_cache),
         )
     }
 
