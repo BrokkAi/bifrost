@@ -220,3 +220,52 @@ fn unsupported_languages_surface_as_diagnostics() {
             .any(|diagnostic| diagnostic.language == "ruby")
     );
 }
+
+#[test]
+fn where_scope_suppresses_out_of_scope_language_diagnostics() {
+    let project = InlineTestProject::new()
+        .file("src/app.py", USES_EVAL_PY)
+        .file("tools/tool.rb", "def run\n  eval(input)\nend\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    let output = run(
+        analyzer,
+        json!({
+            "where": ["src/**/*.py"],
+            "match": { "kind": "call", "callee": { "name": "eval" } }
+        }),
+    );
+
+    assert_eq!(output.matches.len(), 1);
+    assert!(
+        output.diagnostics.is_empty(),
+        "ruby is outside the where scope and should not warn: {:?}",
+        output.diagnostics
+    );
+}
+
+#[test]
+fn not_kind_precision_limits_surface_as_capability_diagnostics() {
+    let (_project, workspace) = python_workspace();
+    let analyzer = workspace.analyzer();
+
+    let output = run(
+        analyzer,
+        json!({
+            "languages": ["python"],
+            "match": { "kind": "callable", "not_kind": "constructor" }
+        }),
+    );
+
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "python"
+                && diagnostic.message.contains("constructor")),
+        "not_kind constraints should be validated: {:?}",
+        output.diagnostics
+    );
+}

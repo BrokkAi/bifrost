@@ -109,6 +109,14 @@ impl StructuralSpec for PythonStructuralSpec {
         kind != NormalizedKind::Assignment || node.child_by_field_name("right").is_some()
     }
 
+    fn supports_kind(&self, kind: NormalizedKind) -> bool {
+        kind == NormalizedKind::Method
+            || self
+                .kind_table()
+                .iter()
+                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         match kind {
             NormalizedKind::Call => {

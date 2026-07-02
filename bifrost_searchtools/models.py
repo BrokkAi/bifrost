@@ -151,6 +151,117 @@ class SearchSymbolsResult:
 
 
 @dataclass(frozen=True)
+class SearchAstCapture:
+    name: str
+    text: str
+    start_line: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SearchAstCapture:
+        return cls(
+            name=data["name"],
+            text=data["text"],
+            start_line=int(data["start_line"]),
+        )
+
+    def render_text(self) -> str:
+        return f"${self.name} = `{self.text}` (line {self.start_line})"
+
+
+@dataclass(frozen=True)
+class SearchAstMatch:
+    path: str
+    language: str
+    kind: str
+    start_line: int
+    end_line: int
+    text: str
+    captures: list[SearchAstCapture]
+    enclosing_symbol: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SearchAstMatch:
+        return cls(
+            path=data["path"],
+            language=data["language"],
+            kind=data["kind"],
+            start_line=int(data["start_line"]),
+            end_line=int(data["end_line"]),
+            text=data["text"],
+            captures=[
+                SearchAstCapture.from_dict(item) for item in data.get("captures", [])
+            ],
+            enclosing_symbol=data.get("enclosing_symbol"),
+        )
+
+    def render_text(self) -> str:
+        if self.start_line == self.end_line:
+            lines = str(self.start_line)
+        else:
+            lines = f"{self.start_line}-{self.end_line}"
+        rendered = f"{self.path}:{lines} [{self.kind}] `{self.text}`"
+        if self.enclosing_symbol is not None:
+            rendered += f" in {self.enclosing_symbol}"
+        if self.captures:
+            rendered += "\n" + "\n".join(
+                f"  {capture.render_text()}" for capture in self.captures
+            )
+        return rendered
+
+
+@dataclass(frozen=True)
+class SearchAstDiagnostic:
+    language: str
+    message: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SearchAstDiagnostic:
+        return cls(language=data["language"], message=data["message"])
+
+    def render_text(self) -> str:
+        return f"note: {self.message}"
+
+
+@dataclass(frozen=True)
+class SearchAstResult:
+    matches: list[SearchAstMatch]
+    truncated: bool
+    diagnostics: list[SearchAstDiagnostic] = field(default_factory=list)
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict, rendered_text: str | None = None) -> SearchAstResult:
+        return cls(
+            matches=[SearchAstMatch.from_dict(item) for item in data.get("matches", [])],
+            truncated=bool(data["truncated"]),
+            diagnostics=[
+                SearchAstDiagnostic.from_dict(item)
+                for item in data.get("diagnostics", [])
+            ],
+            rendered_text=rendered_text,
+        )
+
+    @property
+    def count(self) -> int:
+        return len(self.matches)
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        if self.matches:
+            suffix = " (truncated; refine the query or raise limit)" if self.truncated else ""
+            lines = [
+                f"{len(self.matches)} match{'es' if len(self.matches) != 1 else ''}{suffix}",
+                "",
+            ]
+            lines.extend(match.render_text() for match in self.matches)
+        else:
+            lines = ["No structural matches."]
+        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
+        return "\n".join(lines).strip()
+
+
+@dataclass(frozen=True)
 class SymbolLocation:
     symbol: str
     path: str

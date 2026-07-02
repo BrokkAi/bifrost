@@ -329,6 +329,7 @@ impl SearchToolsService {
             return self.handle_semantic_search_status(arguments);
         }
 
+        let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
         let snapshot = self.snapshot_for_query()?;
         match name {
             "search_symbols" => Self::decode_render_and_run(
@@ -1072,6 +1073,20 @@ impl SearchToolsService {
         self.session
             .read()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
+    fn normalize_arguments_for_current_workspace(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, SearchToolsServiceError> {
+        let root = {
+            let guard = self.read_session()?;
+            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+            session.snapshot.analyzer().project().root().to_path_buf()
+        };
+        crate::tool_arguments::normalize_tool_arguments(name, arguments, &root)
+            .map_err(SearchToolsServiceError::invalid_params)
     }
 
     fn write_session(

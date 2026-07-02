@@ -1,3 +1,8 @@
+use crate::analyzer::structural::{
+    ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
+    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
+    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+};
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -26,7 +31,19 @@ pub fn run_extended_stdio_server(
 }
 
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
-    let pattern_schema_description = "A structural pattern object. Fields (all optional): kind (one normalized kind or an array forming a union, each subtype-aware — e.g. \"literal\" matches string/numeric/boolean/null literals; vocabulary: declaration, callable, function, method, constructor, lambda, class, import, call, assignment, field_access, identifier, literal, string_literal, numeric_literal, boolean_literal, null_literal, return, throw, catch, if, loop, decorator), not_kind (kind or array to exclude, e.g. kind \"callable\" with not_kind [\"constructor\", \"lambda\"] for named functions/methods), name (string for exact match or {\"regex\": ...}), text ({\"regex\": ...}), capture (label reported with each match), has / not_has (descendant patterns), and role sub-patterns valid for the declared kind: callee, receiver, args (array), kwargs (object keyed by keyword name), left, right, module, decorators (array), object, field.";
+    let kind_vocabulary = ALL_KINDS
+        .iter()
+        .map(|kind| kind.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let role_vocabulary = crate::analyzer::structural::kinds::ALL_ROLES
+        .iter()
+        .map(|role| role.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pattern_schema_description = format!(
+        "A structural pattern object. Fields are optional: kind (one normalized kind or an array forming a subtype-aware union; vocabulary: {kind_vocabulary}), not_kind (kind or array to exclude), name (string for exact match or {{\"regex\": ...}}, max {MAX_STRING_PREDICATE_LENGTH} bytes), text ({{\"regex\": ...}}, max {MAX_STRING_PREDICATE_LENGTH} bytes), capture (max {MAX_CAPTURE_LENGTH} bytes), has / not_has (descendant patterns), and role sub-patterns valid for the declared kind: {role_vocabulary}. Query budget: max {MAX_PATTERN_NODES} pattern nodes, max depth {MAX_PATTERN_DEPTH}, max {MAX_ROLE_LIST_ENTRIES} role-list entries per list, max {MAX_KWARGS} kwargs, max keyword length {MAX_KWARG_NAME_LENGTH} bytes."
+    );
     vec![
         tool_descriptor(
             "search_ast",
@@ -48,19 +65,21 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     },
                     "where": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional project-relative path globs limiting which files are searched."
+                        "maxItems": MAX_WHERE_GLOBS,
+                        "items": { "type": "string", "maxLength": MAX_GLOB_LENGTH },
+                        "description": "Optional project-relative path globs limiting which files are searched. Absolute paths/globs inside the active workspace are normalized before execution."
                     },
                     "languages": {
                         "type": "array",
+                        "maxItems": MAX_LANGUAGE_FILTERS,
                         "items": { "type": "string" },
                         "description": "Optional language filter (e.g. \"python\"). Languages without structural support are reported in diagnostics."
                     },
                     "limit": {
                         "type": "integer",
-                        "default": 100,
+                        "default": DEFAULT_LIMIT,
                         "minimum": 1,
-                        "maximum": 1000,
+                        "maximum": MAX_LIMIT,
                         "description": "Maximum number of matches to return."
                     }
                 },

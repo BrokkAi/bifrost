@@ -1436,6 +1436,16 @@ where
             .unwrap_or(&[])
     }
 
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        if self.adapter.structural_spec().is_some() {
+            vec![self]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
         if range.start_byte >= range.end_byte {
             return None;

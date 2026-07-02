@@ -11,6 +11,7 @@ use super::matcher::FactMatch;
 use super::query::AstQuery;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Longest match/capture snippet reported inline; full content is always
@@ -65,13 +66,78 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
     });
 
     let mut diagnostics = Vec::new();
-    let supported: Vec<Language> = providers
-        .iter()
-        .map(|provider| provider.structural_language())
-        .collect();
-    for language in analyzer.languages() {
+    let mut scoped_languages = BTreeSet::new();
+    for file in analyzer.analyzed_files() {
+        let language = crate::analyzer::common::language_for_file(file);
         let requested = query.languages.is_empty() || query.languages.contains(&language);
-        if requested && !supported.contains(&language) {
+        if requested && file_matches_globs(file, query) {
+            scoped_languages.insert(language);
+        }
+    }
+
+    let requested_kinds = query.referenced_kinds();
+    let requested_roles = query.used_roles();
+    let mut supported = BTreeSet::new();
+    let mut provider_scopes: Vec<(
+        Language,
+        &dyn super::StructuralSearchProvider,
+        Vec<ProjectFile>,
+    )> = Vec::new();
+
+    for provider in providers {
+        let language = provider.structural_language();
+        supported.insert(language);
+        let mut files = provider.structural_files();
+        files.retain(|file| file_matches_globs(file, query));
+        files.sort();
+
+        let explicitly_requested = query.languages.contains(&language);
+        if !files.is_empty() || explicitly_requested {
+            let unsupported_kinds: Vec<&'static str> = requested_kinds
+                .iter()
+                .copied()
+                .filter(|kind| !provider.structural_supports_kind(*kind))
+                .map(|kind| kind.label())
+                .collect();
+            if !unsupported_kinds.is_empty() {
+                diagnostics.push(SearchAstDiagnostic {
+                    language: language.config_label(),
+                    message: format!(
+                        "structural adapter for {} does not support kind(s): {}",
+                        language.config_label(),
+                        unsupported_kinds.join(", ")
+                    ),
+                });
+            }
+
+            let unsupported_roles: Vec<&'static str> = requested_roles
+                .iter()
+                .copied()
+                .filter(|role| !provider.structural_supports_role(*role))
+                .map(|role| role.label())
+                .collect();
+            if !unsupported_roles.is_empty() {
+                diagnostics.push(SearchAstDiagnostic {
+                    language: language.config_label(),
+                    message: format!(
+                        "structural adapter for {} does not support role(s): {}",
+                        language.config_label(),
+                        unsupported_roles.join(", ")
+                    ),
+                });
+            }
+        }
+
+        provider_scopes.push((language, provider, files));
+    }
+
+    for language in analyzer.languages() {
+        let explicitly_requested = query.languages.contains(&language);
+        let requested = query.languages.is_empty() || explicitly_requested;
+        if requested
+            && !supported.contains(&language)
+            && (explicitly_requested || scoped_languages.contains(&language))
+        {
             diagnostics.push(SearchAstDiagnostic {
                 language: language.config_label(),
                 message: format!(
@@ -81,53 +147,12 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
             });
         }
     }
-    let requested_kinds = query.positive_kinds();
-    let requested_roles = query.used_roles();
-    for provider in &providers {
-        let unsupported_kinds: Vec<&'static str> = requested_kinds
-            .iter()
-            .copied()
-            .filter(|kind| !provider.structural_supports_kind(*kind))
-            .map(|kind| kind.label())
-            .collect();
-        if !unsupported_kinds.is_empty() {
-            diagnostics.push(SearchAstDiagnostic {
-                language: provider.structural_language().config_label(),
-                message: format!(
-                    "structural adapter for {} does not support kind(s): {}",
-                    provider.structural_language().config_label(),
-                    unsupported_kinds.join(", ")
-                ),
-            });
-        }
-
-        let unsupported_roles: Vec<&'static str> = requested_roles
-            .iter()
-            .copied()
-            .filter(|role| !provider.structural_supports_role(*role))
-            .map(|role| role.label())
-            .collect();
-        if !unsupported_roles.is_empty() {
-            diagnostics.push(SearchAstDiagnostic {
-                language: provider.structural_language().config_label(),
-                message: format!(
-                    "structural adapter for {} does not support role(s): {}",
-                    provider.structural_language().config_label(),
-                    unsupported_roles.join(", ")
-                ),
-            });
-        }
-    }
 
     // Deterministic candidate order: providers sorted by language above,
     // files sorted within each provider.
     let mut candidates: Vec<(Language, &dyn super::StructuralSearchProvider, ProjectFile)> =
         Vec::new();
-    for provider in providers {
-        let language = provider.structural_language();
-        let mut files = provider.structural_files();
-        files.retain(|file| file_matches_globs(file, query));
-        files.sort();
+    for (language, provider, files) in provider_scopes {
         candidates.extend(files.into_iter().map(|file| (language, provider, file)));
     }
 

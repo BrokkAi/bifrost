@@ -99,6 +99,16 @@ fn eval_pattern_inner(
     node: u32,
     captures: &mut Vec<(String, Span)>,
 ) -> bool {
+    eval_pattern_inner_with_name(pattern, facts, node, None, captures)
+}
+
+fn eval_pattern_inner_with_name(
+    pattern: &Pattern,
+    facts: &FileFacts,
+    node: u32,
+    name_override: Option<Span>,
+    captures: &mut Vec<(String, Span)>,
+) -> bool {
     let fact = facts.node(node);
     if !pattern.kinds.is_empty() && !pattern.kinds.iter().any(|&kind| fact.kind.satisfies(kind)) {
         return false;
@@ -111,7 +121,7 @@ fn eval_pattern_inner(
         return false;
     }
     if let Some(predicate) = &pattern.name {
-        let Some(name) = fact.name else {
+        let Some(name) = name_override.or(fact.name) else {
             return false;
         };
         if !predicate.matches(name.text(facts.source())) {
@@ -216,7 +226,8 @@ fn some_descendant_matches(
 }
 
 /// Evaluate a sub-pattern against a role target. When the target is itself a
-/// normalized fact, full pattern semantics apply to that fact; otherwise only
+/// normalized fact, full pattern semantics apply to that fact while name
+/// predicates prefer the role-derived name when present; otherwise only
 /// name/text/capture can be satisfied from the edge's raw span and derived
 /// name (kind or nested constraints fail).
 fn eval_target(
@@ -227,7 +238,7 @@ fn eval_target(
 ) -> bool {
     let checkpoint = captures.len();
     let matched = match target.node {
-        Some(node) => eval_pattern_inner(pattern, facts, node, captures),
+        Some(node) => eval_pattern_inner_with_name(pattern, facts, node, target.name, captures),
         None => eval_span_only(pattern, facts, target, captures),
     };
     if !matched {

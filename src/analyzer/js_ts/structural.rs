@@ -335,4 +335,9 @@ mod structural_spec_tests {
             TS_KIND_TABLE,
         );
     }
+
+    #[test]
+    fn tsx_kind_table_matches_grammar() {
+        assert_kind_table(tree_sitter_typescript::LANGUAGE_TSX.into(), TS_KIND_TABLE);
+    }
 }

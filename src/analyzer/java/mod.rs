@@ -333,7 +333,7 @@ impl IAnalyzer for JavaAnalyzer {
     fn structural_search_providers(
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        vec![&self.inner]
+        self.inner.structural_search_providers()
     }
 
     fn get_all_declarations(&self) -> Vec<CodeUnit> {

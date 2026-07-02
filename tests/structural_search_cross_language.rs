@@ -282,6 +282,45 @@ fn js_ts_class_expressions_and_type_alias_names_are_searchable() {
 }
 
 #[test]
+fn js_ts_import_modules_match_by_unquoted_module_name() {
+    let output = run_query_with_files(
+        &[
+            ("javascript/imports.js", r#"import React from "react";"#),
+            (
+                "typescript/imports.ts",
+                r#"import type { User } from "./types";"#,
+            ),
+        ],
+        json!({
+            "languages": ["javascript", "typescript"],
+            "match": { "kind": "import", "module": { "name": "react" } }
+        }),
+    );
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+    assert_eq!(output.matches.len(), 1);
+    assert_eq!(output.matches[0].path, "javascript/imports.js");
+    assert_eq!(output.matches[0].text, r#"import React from "react";"#);
+
+    let relative = run_query_with_files(
+        &[(
+            "typescript/imports.ts",
+            r#"import type { User } from "./types";"#,
+        )],
+        json!({
+            "languages": ["typescript"],
+            "match": { "kind": "import", "module": { "name": "./types" } }
+        }),
+    );
+    assert!(
+        relative.diagnostics.is_empty(),
+        "{:?}",
+        relative.diagnostics
+    );
+    assert_eq!(relative.matches.len(), 1);
+    assert_eq!(relative.matches[0].path, "typescript/imports.ts");
+}
+
+#[test]
 fn tsx_files_use_the_tsx_grammar_for_structural_search() {
     let output = run_query_with_files(
         &[(

@@ -13,63 +13,63 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NormalizedKind {
-    // declaration branch
-    Declaration,
-    Callable,
-    Function,
-    Method,
-    Constructor,
-    Lambda,
-    Class,
-    Import,
-    // expression-ish kinds (kept flat; see ExecPlan decision log)
-    Call,
-    Assignment,
-    FieldAccess,
-    Identifier,
-    Literal,
-    StringLiteral,
-    NumericLiteral,
-    BooleanLiteral,
-    NullLiteral,
-    // statement-ish kinds
-    Return,
-    Throw,
-    Catch,
-    If,
-    Loop,
-    Decorator,
+macro_rules! normalized_kinds {
+    ($($variant:ident => $label:literal,)+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum NormalizedKind {
+            $($variant,)+
+        }
+
+        /// Every kind, for iteration in validation and docs/tests.
+        pub const ALL_KINDS: &[NormalizedKind] = &[
+            $(NormalizedKind::$variant,)+
+        ];
+
+        impl NormalizedKind {
+            /// The snake_case label used in query JSON and rendered output. Kept in
+            /// lock-step with the serde representation (asserted by test).
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(NormalizedKind::$variant => $label,)+
+                }
+            }
+
+            pub fn from_label(label: &str) -> Option<NormalizedKind> {
+                ALL_KINDS.iter().copied().find(|kind| kind.label() == label)
+            }
+        }
+    };
 }
 
-/// Every kind, for iteration in validation and docs/tests.
-pub const ALL_KINDS: &[NormalizedKind] = &[
-    NormalizedKind::Declaration,
-    NormalizedKind::Callable,
-    NormalizedKind::Function,
-    NormalizedKind::Method,
-    NormalizedKind::Constructor,
-    NormalizedKind::Lambda,
-    NormalizedKind::Class,
-    NormalizedKind::Import,
-    NormalizedKind::Call,
-    NormalizedKind::Assignment,
-    NormalizedKind::FieldAccess,
-    NormalizedKind::Identifier,
-    NormalizedKind::Literal,
-    NormalizedKind::StringLiteral,
-    NormalizedKind::NumericLiteral,
-    NormalizedKind::BooleanLiteral,
-    NormalizedKind::NullLiteral,
-    NormalizedKind::Return,
-    NormalizedKind::Throw,
-    NormalizedKind::Catch,
-    NormalizedKind::If,
-    NormalizedKind::Loop,
-    NormalizedKind::Decorator,
-];
+normalized_kinds! {
+    // declaration branch
+    Declaration => "declaration",
+    Callable => "callable",
+    Function => "function",
+    Method => "method",
+    Constructor => "constructor",
+    Lambda => "lambda",
+    Class => "class",
+    Import => "import",
+    // expression-ish kinds (kept flat; see ExecPlan decision log)
+    Call => "call",
+    Assignment => "assignment",
+    FieldAccess => "field_access",
+    Identifier => "identifier",
+    Literal => "literal",
+    StringLiteral => "string_literal",
+    NumericLiteral => "numeric_literal",
+    BooleanLiteral => "boolean_literal",
+    NullLiteral => "null_literal",
+    // statement-ish kinds
+    Return => "return",
+    Throw => "throw",
+    Catch => "catch",
+    If => "if",
+    Loop => "loop",
+    Decorator => "decorator",
+}
 
 impl NormalizedKind {
     /// The immediate supertype in the normalized hierarchy, or `None` for
@@ -98,41 +98,6 @@ impl NormalizedKind {
         }
         false
     }
-
-    /// The snake_case label used in query JSON and rendered output. Kept in
-    /// lock-step with the serde representation (asserted by test).
-    pub fn label(self) -> &'static str {
-        use NormalizedKind::*;
-        match self {
-            Declaration => "declaration",
-            Callable => "callable",
-            Function => "function",
-            Method => "method",
-            Constructor => "constructor",
-            Lambda => "lambda",
-            Class => "class",
-            Import => "import",
-            Call => "call",
-            Assignment => "assignment",
-            FieldAccess => "field_access",
-            Identifier => "identifier",
-            Literal => "literal",
-            StringLiteral => "string_literal",
-            NumericLiteral => "numeric_literal",
-            BooleanLiteral => "boolean_literal",
-            NullLiteral => "null_literal",
-            Return => "return",
-            Throw => "throw",
-            Catch => "catch",
-            If => "if",
-            Loop => "loop",
-            Decorator => "decorator",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Option<NormalizedKind> {
-        ALL_KINDS.iter().copied().find(|kind| kind.label() == label)
-    }
 }
 
 impl fmt::Display for NormalizedKind {
@@ -144,18 +109,44 @@ impl fmt::Display for NormalizedKind {
 /// A named edge from a matched node to a sub-node, extracted from tree-sitter
 /// AST fields by each language's structural spec. Which roles a pattern may
 /// constrain depends on its kind — see [`Role::valid_for`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Role {
-    Callee,
-    Receiver,
-    Arg,
-    Kwarg,
-    Left,
-    Right,
-    Module,
-    Decorator,
-    Object,
-    Field,
+macro_rules! roles {
+    ($($variant:ident => $label:literal,)+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum Role {
+            $($variant,)+
+        }
+
+        pub const ALL_ROLES: &[Role] = &[
+            $(Role::$variant,)+
+        ];
+
+        impl Role {
+            /// The JSON field name this role appears under in a pattern object.
+            /// `Arg`/`Kwarg` use the plural spellings from the issue's query shape.
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(Role::$variant => $label,)+
+                }
+            }
+
+            pub fn from_label(label: &str) -> Option<Role> {
+                ALL_ROLES.iter().copied().find(|role| role.label() == label)
+            }
+        }
+    };
+}
+
+roles! {
+    Callee => "callee",
+    Receiver => "receiver",
+    Arg => "args",
+    Kwarg => "kwargs",
+    Left => "left",
+    Right => "right",
+    Module => "module",
+    Decorator => "decorators",
+    Object => "object",
+    Field => "field",
 }
 
 pub const SINGLE_TARGET_ROLES: &[Role] = &[
@@ -172,41 +163,7 @@ pub const LIST_TARGET_ROLES: &[Role] = &[Role::Arg, Role::Decorator];
 
 pub const MAP_TARGET_ROLES: &[Role] = &[Role::Kwarg];
 
-pub const ALL_ROLES: &[Role] = &[
-    Role::Callee,
-    Role::Receiver,
-    Role::Arg,
-    Role::Kwarg,
-    Role::Left,
-    Role::Right,
-    Role::Module,
-    Role::Decorator,
-    Role::Object,
-    Role::Field,
-];
-
 impl Role {
-    /// The JSON field name this role appears under in a pattern object.
-    /// `Arg`/`Kwarg` use the plural spellings from the issue's query shape.
-    pub fn label(self) -> &'static str {
-        match self {
-            Role::Callee => "callee",
-            Role::Receiver => "receiver",
-            Role::Arg => "args",
-            Role::Kwarg => "kwargs",
-            Role::Left => "left",
-            Role::Right => "right",
-            Role::Module => "module",
-            Role::Decorator => "decorators",
-            Role::Object => "object",
-            Role::Field => "field",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Option<Role> {
-        ALL_ROLES.iter().copied().find(|role| role.label() == label)
-    }
-
     pub fn single_target_roles() -> &'static [Role] {
         SINGLE_TARGET_ROLES
     }

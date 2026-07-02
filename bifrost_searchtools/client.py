@@ -27,6 +27,7 @@ from .models import (
     MostRelevantFilesResult,
     RefreshResult,
     RenameSymbolResult,
+    SearchAstResult,
     SearchFileContentsResult,
     SemanticSearchResult,
     SemanticSearchStatus,
@@ -175,6 +176,38 @@ class SearchToolsClient:
         return SearchSymbolsResult.from_dict(
             payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
+        )
+
+    def search_ast(
+        self,
+        pattern: dict[str, Any],
+        *,
+        inside: dict[str, Any] | None = None,
+        not_inside: dict[str, Any] | None = None,
+        where: list[str] | None = None,
+        languages: list[str] | None = None,
+        limit: int | None = None,
+    ) -> SearchAstResult:
+        """Search normalized AST structure across supported languages.
+
+        ``pattern`` is sent as the tool's ``match`` object. ``where`` accepts
+        project-relative globs or absolute in-workspace paths/globs.
+        """
+        arguments: dict[str, Any] = {"match": pattern}
+        if inside is not None:
+            arguments["inside"] = inside
+        if not_inside is not None:
+            arguments["not_inside"] = not_inside
+        if where is not None:
+            arguments["where"] = list(where)
+        if languages is not None:
+            arguments["languages"] = list(languages)
+        if limit is not None:
+            arguments["limit"] = limit
+        payload = self._call_tool_payload("search_ast", arguments)
+        return SearchAstResult.from_dict(
+            payload.structured,
             rendered_text=payload.rendered_text,
         )
 

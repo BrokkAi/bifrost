@@ -182,6 +182,11 @@ fn decorated_functions_and_method_kind_refinement() {
     // `method` matches only defs directly inside a class; `callable`
     // matches functions, methods, and lambdas alike.
     let methods = run_query(json!({ "match": { "kind": "method" } }));
+    assert!(
+        methods.diagnostics.is_empty(),
+        "method is a Python refined kind and should not warn: {:?}",
+        methods.diagnostics
+    );
     assert_eq!(methods.matches.len(), 2, "execute_action and safe");
 
     let callables = run_query(json!({ "match": { "kind": "callable" } }));

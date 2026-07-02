@@ -772,7 +772,7 @@ impl IAnalyzer for PythonAnalyzer {
     fn structural_search_providers(
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        vec![&self.inner]
+        self.inner.structural_search_providers()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

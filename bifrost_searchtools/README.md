@@ -62,6 +62,7 @@ exposes:
 | Method | Purpose |
 | --- | --- |
 | `search_symbols(patterns, *, include_tests=False, limit=20)` | Find symbols by name pattern. |
+| `search_ast(pattern, *, inside=None, not_inside=None, where=None, languages=None, limit=None)` | Search normalized AST structure across supported languages. |
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
