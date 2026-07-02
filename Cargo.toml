@@ -27,7 +27,7 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optio
 tokenizers = { version = "0.21", optional = true }
 # 8-bit rotational quantization for the searchable composed vectors (~4x smaller
 # blobs + a branch-free u8 scan).
-fastrq = { git = "https://github.com/BrokkAi/fastrq", rev = "d2423765b1921a7056d559cac6e0391d9134e05f", optional = true }
+fastrq = { version = "0.2.0", optional = true }
 # Scalable Bloom filter for GC reachability: a few MB even for a monorepo's full object
 # set, and sized proportionally (~KB for a small repo). Grows to hold an unknown number
 # of OIDs while holding the target false-positive rate.

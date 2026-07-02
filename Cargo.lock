@@ -717,7 +717,8 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 [[package]]
 name = "fastrq"
 version = "0.2.0"
-source = "git+https://github.com/BrokkAi/fastrq?rev=d2423765b1921a7056d559cac6e0391d9134e05f#d2423765b1921a7056d559cac6e0391d9134e05f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a5f45db643019157eb4248e04317ee65c273fe01a3b2de5dfcbbb4f636105b8"
 
 [[package]]
 name = "filetime"
