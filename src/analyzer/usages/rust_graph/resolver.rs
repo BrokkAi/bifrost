@@ -1,4 +1,8 @@
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, RustAnalyzer};
+use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
+use crate::analyzer::{
+    CodeUnit, DefinitionLookupIndex, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
+    TypeHierarchyProvider,
+};
 use std::collections::BTreeSet;
 
 pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
@@ -44,6 +48,71 @@ pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeU
 
     (rust.is_rust_trait_declaration(&owner) && target.is_function())
         || (rust.is_rust_enum_declaration(&owner) && target.is_field())
+}
+
+pub(crate) fn resolve_scoped_associated_item(
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    refs: &RustReferenceContext,
+    path: &str,
+    method_name: &str,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    if let Some(direct) = refs.resolve_scoped(path, method_name) {
+        let candidates = support.fqn(&direct);
+        if !candidates.is_empty() {
+            return ReceiverAnalysisOutcome::Precise(candidates);
+        }
+    }
+
+    let Some(owner_fqn) = refs.resolve_scoped_owner(path) else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+
+    let owner = match ReceiverAnalysisOutcome::single_precise_or_ambiguous(
+        support
+            .fqn(&owner_fqn)
+            .into_iter()
+            .filter(|unit| rust.supports_type_hierarchy(unit))
+            .filter(|unit| !rust.is_rust_trait_declaration(unit)),
+        ReceiverAnalysisBudget::default(),
+    ) {
+        ReceiverAnalysisOutcome::Precise(mut owners) if owners.len() == 1 => owners.remove(0),
+        ReceiverAnalysisOutcome::Ambiguous(owners) => {
+            return ReceiverAnalysisOutcome::Ambiguous(owners);
+        }
+        ReceiverAnalysisOutcome::Precise(_)
+        | ReceiverAnalysisOutcome::Unknown
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
+            return ReceiverAnalysisOutcome::Unknown;
+        }
+    };
+
+    ReceiverAnalysisOutcome::single_precise_or_ambiguous(
+        rust.get_direct_ancestors(&owner)
+            .into_iter()
+            .filter(|trait_unit| trait_visible_at_call_site(refs, trait_unit))
+            .flat_map(|trait_unit| {
+                support
+                    .fqn_direct_children(&trait_unit.fq_name())
+                    .into_iter()
+                    .filter(move |candidate| {
+                        candidate.is_function()
+                            && candidate.identifier() == method_name
+                            && rust
+                                .parent_of(candidate)
+                                .as_ref()
+                                .is_some_and(|parent| parent == &trait_unit)
+                    })
+            }),
+        ReceiverAnalysisBudget::default(),
+    )
+}
+
+fn trait_visible_at_call_site(refs: &RustReferenceContext, trait_unit: &CodeUnit) -> bool {
+    !refs
+        .bare_names_resolving_to(&trait_unit.fq_name())
+        .is_empty()
 }
 
 pub(super) fn infer_graph_seeds(

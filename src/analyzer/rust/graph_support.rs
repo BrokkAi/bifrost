@@ -60,19 +60,31 @@ impl RustReferenceContext {
     /// The callee fqn a `path::name` refers to: a module function via a namespace
     /// import, or an associated function on an imported / same-file type.
     pub fn resolve_scoped(&self, path: &str, name: &str) -> Option<String> {
+        self.resolve_scoped_owner(path)
+            .map(|owner| join_rust_fqn(&owner, name))
+    }
+
+    /// The owner fqn a scoped `path::name` begins from: a namespace import, a
+    /// rooted module path, or an imported / same-file type.
+    pub fn resolve_scoped_owner(&self, path: &str) -> Option<String> {
+        if let Some((module_path, item_name)) = path.rsplit_once("::")
+            && let Some(package) = self.resolve_scoped_owner(module_path)
+        {
+            return Some(join_rust_fqn(&package, item_name));
+        }
         if let Some(package) = self.namespace.get(path) {
-            return Some(format!("{package}.{name}"));
+            return Some(package.clone());
         }
         if is_rooted_rust_module_path(path)
             && let Some(package) =
                 resolve_rust_module_path_with_crate(&self.package, &self.crate_package, path)
         {
-            return Some(join_rust_fqn(&package, name));
+            return Some(package);
         }
         self.named
             .get(path)
             .or_else(|| self.same_file.get(path))
-            .map(|type_fqn| format!("{type_fqn}.{name}"))
+            .cloned()
     }
 }
 
