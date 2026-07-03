@@ -297,13 +297,22 @@ impl RubyVisitor<'_> {
                 }
             }
             "attr_accessor" | "attr_reader" | "attr_writer" => {
-                self.visit_attr_macro(node, segments, parent);
+                self.visit_attr_macro(node, method_name, segments, parent);
+            }
+            "alias_method" => {
+                self.visit_alias_method(node, segments, parent);
             }
             _ => {}
         }
     }
 
-    fn visit_attr_macro(&mut self, node: Node<'_>, segments: &[String], parent: Option<&CodeUnit>) {
+    fn visit_attr_macro(
+        &mut self,
+        node: Node<'_>,
+        method_name: &str,
+        segments: &[String],
+        parent: Option<&CodeUnit>,
+    ) {
         // `attr_accessor` and friends only declare members inside a type body.
         let Some(parent) = parent else {
             return;
@@ -313,14 +322,14 @@ impl RubyVisitor<'_> {
         };
         let mut cursor = arguments.walk();
         for arg in arguments.named_children(&mut cursor) {
-            let Some(name) = symbol_name(arg, self.source) else {
+            let Some(name) = literal_symbol_or_string_name(arg, self.source) else {
                 continue;
             };
             let code_unit = CodeUnit::new(
                 self.file.clone(),
                 CodeUnitType::Field,
                 String::new(),
-                member_short_name(segments, &name),
+                member_short_name(segments, &attr_field_member_name(node, &name)),
             );
             self.parsed.replace_code_unit(
                 code_unit.clone(),
@@ -333,7 +342,64 @@ impl RubyVisitor<'_> {
                 code_unit,
                 ruby_node_text(node, self.source).trim().to_string(),
             );
+            if matches!(method_name, "attr_accessor" | "attr_reader") {
+                self.add_member_function(node, arg, segments, parent, &name);
+            }
+            if matches!(method_name, "attr_accessor" | "attr_writer") {
+                self.add_member_function(node, arg, segments, parent, &format!("{name}="));
+            }
         }
+    }
+
+    fn visit_alias_method(
+        &mut self,
+        node: Node<'_>,
+        segments: &[String],
+        parent: Option<&CodeUnit>,
+    ) {
+        let Some(parent) = parent else {
+            return;
+        };
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let mut cursor = arguments.walk();
+        let Some(alias_arg) = arguments.named_children(&mut cursor).next() else {
+            return;
+        };
+        let Some(alias_name) = literal_symbol_or_string_name(alias_arg, self.source) else {
+            return;
+        };
+        self.add_member_function(node, alias_arg, segments, parent, &alias_name);
+    }
+
+    fn add_member_function(
+        &mut self,
+        signature_node: Node<'_>,
+        range_node: Node<'_>,
+        segments: &[String],
+        parent: &CodeUnit,
+        name: &str,
+    ) {
+        let code_unit = CodeUnit::new(
+            self.file.clone(),
+            CodeUnitType::Function,
+            String::new(),
+            member_short_name(segments, name),
+        );
+        self.parsed.replace_code_unit(
+            code_unit.clone(),
+            range_node,
+            self.source,
+            Some(parent.clone()),
+            None,
+        );
+        self.parsed.add_signature(
+            code_unit,
+            ruby_node_text(signature_node, self.source)
+                .trim()
+                .to_string(),
+        );
     }
 }
 
@@ -343,6 +409,14 @@ fn member_short_name(segments: &[String], name: &str) -> String {
         name.to_string()
     } else {
         format!("{}.{}", segments.join("$"), name)
+    }
+}
+
+fn attr_field_member_name(node: Node<'_>, name: &str) -> String {
+    if method_is_singleton_context(node) {
+        format!("$singleton.@{name}")
+    } else {
+        format!("@{name}")
     }
 }
 
@@ -495,9 +569,12 @@ fn extract_ruby_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
     supertypes
 }
 
-/// Extracts the bare name from a `attr_*` argument, which is usually a symbol
-/// (`:name`) or string (`"name"`).
-fn symbol_name(node: Node<'_>, source: &str) -> Option<String> {
+/// Extracts the bare name from a literal `attr_*`/`alias_method` argument,
+/// which is usually a symbol (`:name`) or string (`"name"`).
+fn literal_symbol_or_string_name(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "simple_symbol" | "string") {
+        return None;
+    }
     let text = ruby_node_text(node, source).trim();
     let stripped = text
         .strip_prefix(':')

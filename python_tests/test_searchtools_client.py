@@ -249,7 +249,10 @@ class SearchToolsClientTest(unittest.TestCase):
         text = summaries.summaries[0].elements[0].text
         self.assertIn("OldDemo", text)
         self.assertNotIn("NewDemo", text)
-        self.assertIn("Other.java", summaries.not_found)
+        self.assertTrue(
+            any(item["input"] == "Other.java" for item in summaries.not_found),
+            summaries.not_found,
+        )
 
     def test_scan_usages_returns_rendered_native_payload(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
