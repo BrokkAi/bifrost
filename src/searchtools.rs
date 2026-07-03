@@ -3,8 +3,7 @@ use crate::analyzer::common::{
     display_symbol_name, is_scala_object_like, language_for_target,
 };
 use crate::analyzer::symbol_lookup::{
-    CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
-    resolve_typeish_codeunit_fuzzy, strip_trailing_call_suffix,
+    CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
@@ -435,6 +434,8 @@ pub struct SummaryResult {
 pub struct AmbiguousSymbol {
     pub target: String,
     pub matches: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1627,11 +1628,21 @@ fn resolve_selectable_definitions(
         [(_, _)] => SelectableDefinitionResolution::Resolved(
             groups.into_iter().flat_map(|(_, units)| units).collect(),
         ),
-        _ => SelectableDefinitionResolution::Ambiguous(AmbiguousSymbol {
-            target: input.to_string(),
-            matches: groups.into_iter().map(|(selector, _)| selector).collect(),
-        }),
+        _ => {
+            let matches: Vec<String> = groups.into_iter().map(|(selector, _)| selector).collect();
+            SelectableDefinitionResolution::Ambiguous(AmbiguousSymbol {
+                target: input.to_string(),
+                note: ambiguous_symbol_selector_note(&matches),
+                matches,
+            })
+        }
     }
+}
+
+fn ambiguous_symbol_selector_note(matches: &[String]) -> Option<String> {
+    matches.first().map(|example| {
+        format!("Ambiguous; re-call with one selector from `matches` (e.g. {example}).")
+    })
 }
 
 #[derive(Debug)]
@@ -1669,6 +1680,11 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
         .map(|target| target.trim())
         .filter(|target| !target.is_empty())
     {
+        if split_definition_selector(target).0.is_some() {
+            symbol_targets.push(target.to_string());
+            continue;
+        }
+
         let directory_matches = resolve_directory_target(analyzer, target);
         if !directory_matches.is_empty() {
             directory_targets.extend(directory_matches);
@@ -1710,7 +1726,7 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
     let mut ambiguous = Vec::new();
 
     for target in targets {
-        match resolve_selectable_definitions(analyzer, &target, resolve_typeish_codeunit_fuzzy) {
+        match resolve_selectable_definitions(analyzer, &target, resolve_codeunit_fuzzy) {
             SelectableDefinitionResolution::Resolved(code_units) => {
                 let start_len = summaries.len();
                 for code_unit in code_units {

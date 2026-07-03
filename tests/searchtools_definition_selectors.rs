@@ -26,6 +26,10 @@ fn string_array(value: &Value) -> Vec<String> {
         .collect()
 }
 
+fn string_value(value: &Value) -> &str {
+    value.as_str().expect("string")
+}
+
 #[test]
 fn symbol_sources_disambiguates_anonymous_js_default_exports_by_file_selector() {
     let project = InlineTestProject::with_language(Language::JavaScript)
@@ -52,6 +56,12 @@ fn symbol_sources_disambiguates_anonymous_js_default_exports_by_file_selector() 
         string_array(&bare["ambiguous"][0]["matches"]),
         "{bare}"
     );
+    let note = string_value(&bare["ambiguous"][0]["note"]);
+    assert!(
+        note.contains("Ambiguous; re-call with one selector from `matches`"),
+        "{bare}"
+    );
+    assert!(note.contains("src/plugin/a/index.js#default"), "{bare}");
 
     let anchored = call_tool(
         &project,
@@ -204,6 +214,12 @@ export class Widget extends BaseB {
         string_array(&bare_summary["ambiguous"][0]["matches"]),
         "{bare_summary}"
     );
+    let summary_note = string_value(&bare_summary["ambiguous"][0]["note"]);
+    assert!(
+        summary_note.contains("Ambiguous; re-call with one selector from `matches`"),
+        "{bare_summary}"
+    );
+    assert!(summary_note.contains("src/a.js#Widget"), "{bare_summary}");
 
     let anchored_summary = call_tool(
         &project,
@@ -240,6 +256,15 @@ export class Widget extends BaseB {
         string_array(&bare_ancestors["ambiguous"][0]["matches"]),
         "{bare_ancestors}"
     );
+    let ancestors_note = string_value(&bare_ancestors["ambiguous"][0]["note"]);
+    assert!(
+        ancestors_note.contains("Ambiguous; re-call with one selector from `matches`"),
+        "{bare_ancestors}"
+    );
+    assert!(
+        ancestors_note.contains("src/a.js#Widget"),
+        "{bare_ancestors}"
+    );
 
     let anchored_ancestors = call_tool(
         &project,
@@ -265,4 +290,40 @@ export class Widget extends BaseB {
         string_array(&anchored_ancestors["ancestors"][0]["ancestors"]),
         "{anchored_ancestors}"
     );
+}
+
+#[test]
+fn summaries_route_file_anchored_selector_with_extension_like_symbol_member() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/a.js",
+            r#"export class styles {
+  css() {
+    return 'a';
+  }
+}
+"#,
+        )
+        .file(
+            "src/b.js",
+            r#"export class styles {
+  css() {
+    return 'b';
+  }
+}
+"#,
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_summaries",
+        r#"{"targets":["src/a.js#styles.css"]}"#,
+    );
+
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["summaries"].as_array().unwrap().len(), "{result}");
+    assert_eq!("src/a.js", result["summaries"][0]["path"], "{result}");
+    assert_eq!("styles.css", result["summaries"][0]["label"], "{result}");
 }

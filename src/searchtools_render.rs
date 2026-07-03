@@ -319,7 +319,15 @@ fn render_summary_block(block: &SummaryBlock, options: RenderOptions) -> String 
 }
 
 fn render_ambiguous_symbol(symbol: &AmbiguousSymbol) -> String {
-    format!("Ambiguous {}: {}", symbol.target, symbol.matches.join(", "))
+    let mut lines = vec![format!(
+        "Ambiguous {}: {}",
+        symbol.target,
+        symbol.matches.join(", ")
+    )];
+    if let Some(note) = &symbol.note {
+        lines.push(format!("Note: {note}"));
+    }
+    lines.join("\n")
 }
 
 fn render_ambiguous_paths(paths: &[AmbiguousPathInput]) -> String {
@@ -489,14 +497,15 @@ fn render_ambiguous_symbols_table(symbols: &[AmbiguousSymbol]) -> String {
     let mut lines = vec![
         "## Ambiguous symbols".to_string(),
         String::new(),
-        "| Target | Matches |".to_string(),
-        "| --- | --- |".to_string(),
+        "| Target | Matches | Note |".to_string(),
+        "| --- | --- | --- |".to_string(),
     ];
     lines.extend(symbols.iter().map(|symbol| {
         format!(
-            "| {} | {} |",
+            "| {} | {} | {} |",
             escape_markdown_table_cell(&symbol.target),
-            escape_markdown_table_cell(&symbol.matches.join(", "))
+            escape_markdown_table_cell(&symbol.matches.join(", ")),
+            escape_markdown_table_cell(symbol.note.as_deref().unwrap_or(""))
         )
     }));
     lines.join("\n")
@@ -603,6 +612,10 @@ mod tests {
             ambiguous: vec![AmbiguousSymbol {
                 target: "Foo".to_string(),
                 matches: vec!["crate::foo::Foo".to_string(), "other::Foo".to_string()],
+                note: Some(
+                    "Ambiguous; re-call with one selector from `matches` (e.g. crate::foo::Foo)."
+                        .to_string(),
+                ),
             }],
             ambiguous_paths: vec![AmbiguousPathInput {
                 input: "Foo.java".to_string(),
@@ -623,9 +636,9 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("## Ambiguous symbols"), "{text}");
-        assert!(text.contains("| Target | Matches |"), "{text}");
+        assert!(text.contains("| Target | Matches | Note |"), "{text}");
         assert!(
-            text.contains("| Foo | crate::foo::Foo, other::Foo |"),
+            text.contains("| Foo | crate::foo::Foo, other::Foo | Ambiguous; re-call with one selector from `matches` (e.g. crate::foo::Foo). |"),
             "{text}"
         );
     }
