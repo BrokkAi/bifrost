@@ -189,11 +189,13 @@ class SearchToolsClient:
         languages: list[str] | None = None,
         limit: int | None = None,
         result_detail: str | None = None,
+        schema_version: int | None = None,
     ) -> SearchAstResult:
         """Search normalized AST structure across supported languages.
 
-        ``pattern`` is sent as the tool's ``match`` object. ``where`` accepts
-        project-relative globs or absolute in-workspace paths/globs.
+        This is the experimental v1 ``search_ast`` surface. ``pattern`` is
+        sent as the tool's ``match`` object. ``where`` accepts project-relative
+        globs or absolute in-workspace paths/globs.
         ``result_detail="full"`` includes byte/line/column ranges and stable
         match ids for follow-up tooling; the default compact mode is optimized
         for small LLM contexts.
@@ -211,6 +213,8 @@ class SearchToolsClient:
             arguments["limit"] = limit
         if result_detail is not None:
             arguments["result_detail"] = result_detail
+        if schema_version is not None:
+            arguments["schema_version"] = schema_version
         payload = self._call_tool_payload("search_ast", arguments)
         return SearchAstResult.from_dict(
             payload.structured,

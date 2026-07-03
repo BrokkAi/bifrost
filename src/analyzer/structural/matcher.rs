@@ -211,11 +211,9 @@ fn eval_pattern_inner_with_name(
     }
 
     if let Some(label) = &pattern.capture {
-        captures.push(CaptureBinding {
-            name: label.clone(),
-            span: fact.span(),
-            kind: Some(fact.kind),
-        });
+        if !add_capture(label, fact.span(), Some(fact.kind), facts, captures) {
+            return false;
+        }
     }
     true
 }
@@ -290,11 +288,31 @@ fn eval_span_only(
         return false;
     }
     if let Some(label) = &pattern.capture {
-        captures.push(CaptureBinding {
-            name: label.clone(),
-            span: target.span,
-            kind: None,
-        });
+        if !add_capture(label, target.span, None, facts, captures) {
+            return false;
+        }
     }
+    true
+}
+
+fn add_capture(
+    label: &str,
+    span: Span,
+    kind: Option<NormalizedKind>,
+    facts: &FileFacts,
+    captures: &mut Vec<CaptureBinding>,
+) -> bool {
+    if captures
+        .iter()
+        .filter(|capture| capture.name == label)
+        .any(|capture| capture.span.text(facts.source()) != span.text(facts.source()))
+    {
+        return false;
+    }
+    captures.push(CaptureBinding {
+        name: label.to_string(),
+        span,
+        kind,
+    });
     true
 }

@@ -2,7 +2,7 @@ use super::ir::{
     AstQuery, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
     MAX_PATTERN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    Pattern, QueryError, SearchAstResultDetail, StringPredicate,
+    Pattern, QueryError, SCHEMA_VERSION, SearchAstResultDetail, StringPredicate,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
@@ -24,8 +24,13 @@ impl AstQuery {
                 "not_inside",
                 "limit",
                 "result_detail",
+                "schema_version",
             ],
         )?;
+        let schema_version = match object.get("schema_version") {
+            None => SCHEMA_VERSION,
+            Some(value) => decode_schema_version(value, "schema_version")?,
+        };
 
         let where_globs = match object.get("where") {
             None => Vec::new(),
@@ -80,6 +85,7 @@ impl AstQuery {
         };
 
         Ok(Self {
+            schema_version,
             where_globs,
             languages,
             root,
@@ -205,6 +211,19 @@ fn decode_limit(value: &Value, path: &str) -> Result<usize, QueryError> {
         ));
     }
     Ok(limit as usize)
+}
+
+fn decode_schema_version(value: &Value, path: &str) -> Result<u64, QueryError> {
+    let version = value
+        .as_u64()
+        .ok_or_else(|| QueryError::new(path, "expected schema version 1"))?;
+    if version != SCHEMA_VERSION {
+        return Err(QueryError::new(
+            path,
+            format!("unsupported schema version {version}; expected {SCHEMA_VERSION}"),
+        ));
+    }
+    Ok(version)
 }
 
 fn decode_result_detail(value: &Value, path: &str) -> Result<SearchAstResultDetail, QueryError> {

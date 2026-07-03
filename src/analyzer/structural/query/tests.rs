@@ -118,6 +118,25 @@ fn parses_result_detail_mode() {
 }
 
 #[test]
+fn parses_and_rejects_schema_version() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "call" }
+    }));
+    assert_eq!(query.schema_version, SCHEMA_VERSION);
+    assert_eq!(query.to_canonical_json()["schema_version"], 1);
+
+    let defaulted = parse_ok(json!({ "match": { "kind": "call" } }));
+    assert_eq!(defaulted.schema_version, SCHEMA_VERSION);
+
+    let error = error_of(json!({
+        "schema_version": 2,
+        "match": { "kind": "call" }
+    }));
+    assert_eq!(error.path, "schema_version");
+}
+
+#[test]
 fn canonical_json_round_trips() {
     let original = json!({
         "where": ["src/**/*.py"],

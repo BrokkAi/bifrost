@@ -16,7 +16,7 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
 - [x] (2026-07-03T12:34Z) Milestone 1: added opt-in full result detail without changing compact output. `result_detail` now defaults to compact, full detail adds deterministic match IDs, byte/line/column ranges, capture ranges, and optional capture kinds. Python models parse the optional fields. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`, and the targeted Python client unittest through `uv run --python 3.12 --with maturin`.
 - [x] (2026-07-03T12:37Z) Milestone 2: defined the full-detail decorator/annotation span policy in README docs and added cross-language tests for decorated callables and decorated classes. `node_range` remains the matched normalized fact range, `decorator_ranges` report extracted decorator/annotation role spans, and `decorated_range` is their union. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, and `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`.
 - [x] (2026-07-03T12:38Z) Milestone 3: documented capability and precision caveats in `bifrost_searchtools/README.md` and tightened the MCP descriptor text. The docs cover constructor-as-call behavior, kwargs support, aliases/import caveats, syntactic receiver/callee extraction, decorator span policy, argument-subsequence semantics, and unsupported-role diagnostics. Validation passed with `cargo fmt -- --check` and `cargo test structural --lib`.
-- [ ] Milestone 4: add schema versioning and exact-text duplicate capture equality.
+- [x] (2026-07-03T12:42Z) Milestone 4: added `schema_version: 1` validation/canonicalization and exact-text duplicate capture equality. Python client docs now call `search_ast` experimental v1 and can pass `schema_version=1`. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`, and the targeted Python client unittest through `uv run --python 3.12 --with maturin`.
 - [ ] Milestone 5: switch to global project-relative ordering and add truncation diagnostics.
 - [ ] Milestone 6: add compact broad-query performance guidance.
 
@@ -52,12 +52,21 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
   Rationale: The review asked for discoverability, but always emitting the full matrix would inflate LLM context for common queries. Runtime diagnostics remain focused on unsupported features and later broad/truncated query guidance.
   Date/Author: 2026-07-03 / Codex.
 
+- Decision: Treat omitted `schema_version` as v1 and reject any explicit non-v1 version.
+  Rationale: Existing callers remain compatible, while explicit callers get a clear failure instead of silently running an incompatible query shape.
+  Date/Author: 2026-07-03 / Codex.
+
+- Decision: Enforce duplicate capture equality by exact source text during matching.
+  Rationale: This gives repeated labels meaningful rule-like semantics while preserving all successful capture occurrences for full-detail callers.
+  Date/Author: 2026-07-03 / Codex.
+
 
 ## Outcomes & Retrospective
 
 - 2026-07-03T12:34Z: Milestone 1 completed. Existing compact output remains the default and existing structural tests continue to pass. Callers that request `result_detail: "full"` now get match IDs and precise match/capture ranges suitable for follow-up tooling.
 - 2026-07-03T12:37Z: Milestone 2 completed. Full-detail results now have documented decorator/annotation range semantics and cross-language coverage for decorated callables and classes.
 - 2026-07-03T12:38Z: Milestone 3 completed. The Python README and MCP descriptor now make the normalization precision limits explicit without adding per-result verbosity.
+- 2026-07-03T12:42Z: Milestone 4 completed. The query surface now has an explicit v1 compatibility marker, and repeated capture labels are real equality constraints instead of independent labels.
 
 
 ## Context and Orientation

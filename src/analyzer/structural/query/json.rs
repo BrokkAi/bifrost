@@ -8,6 +8,7 @@ impl AstQuery {
     /// query (`parse(json).to_canonical_json() == parse(sexp).to_canonical_json()`).
     pub fn to_canonical_json(&self) -> Value {
         let mut object = Map::new();
+        object.insert("schema_version".to_string(), json!(self.schema_version));
         if !self.where_globs.is_empty() {
             object.insert(
                 "where".to_string(),

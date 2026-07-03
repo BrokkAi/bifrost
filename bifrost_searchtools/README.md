@@ -62,7 +62,7 @@ exposes:
 | Method | Purpose |
 | --- | --- |
 | `search_symbols(patterns, *, include_tests=False, limit=20)` | Find symbols by name pattern. |
-| `search_ast(pattern, *, inside=None, not_inside=None, where=None, languages=None, limit=None, result_detail=None)` | Search normalized AST structure across supported languages. |
+| `search_ast(pattern, *, inside=None, not_inside=None, where=None, languages=None, limit=None, result_detail=None, schema_version=None)` | Search normalized AST structure across supported languages. |
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
@@ -113,12 +113,14 @@ passed through `options` (keys map 1:1 to the Rust tool arguments).
 
 ## `search_ast` detail and ranges
 
-`search_ast` is compact by default: matches include project-relative path,
-language, normalized kind, line range, a short snippet, captures, and an
-enclosing symbol when available. Pass `result_detail="full"` when a rule,
-refactoring step, or follow-up tool call needs precise locations. Full detail
-adds deterministic match ids plus byte offsets and 1-based character columns for
-matches and captures.
+`search_ast` is an experimental v1 query surface. Omit `schema_version` for v1
+or pass `schema_version=1` explicitly when callers want to pin the shape.
+Compact output is the default: matches include project-relative path, language,
+normalized kind, line range, a short snippet, captures, and an enclosing symbol
+when available. Pass `result_detail="full"` when a rule, refactoring step, or
+follow-up tool call needs precise locations. Full detail adds deterministic
+match ids plus byte offsets and 1-based character columns for matches and
+captures.
 
 For decorated or annotated declarations, `node_range` is the matched normalized
 node's parser-backed range. `decorator_ranges` are the decorator or annotation

@@ -16,6 +16,7 @@ pub const MAX_KWARGS: usize = 64;
 pub const MAX_STRING_PREDICATE_LENGTH: usize = 4096;
 pub const MAX_CAPTURE_LENGTH: usize = 128;
 pub const MAX_KWARG_NAME_LENGTH: usize = 128;
+pub const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchAstResultDetail {
@@ -48,6 +49,7 @@ impl SearchAstResultDetail {
 /// workspace scoping. This is the semantic authority both syntaxes parse into.
 #[derive(Debug, Clone)]
 pub struct AstQuery {
+    pub schema_version: u64,
     /// Path globs relative to the workspace root; empty means all files.
     pub where_globs: Vec<glob::Pattern>,
     /// Language filter; empty means all languages with structural adapters.

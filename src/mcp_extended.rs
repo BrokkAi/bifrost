@@ -1,7 +1,7 @@
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
     MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
-    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
 };
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
@@ -87,6 +87,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "enum": ["compact", "full"],
                         "default": "compact",
                         "description": "Use compact for context-efficient snippets and line ranges. Use full when follow-up tools need deterministic match IDs, byte/line/column ranges, decorator ranges, and capture ranges."
+                    },
+                    "schema_version": {
+                        "type": "integer",
+                        "default": SCHEMA_VERSION,
+                        "enum": [SCHEMA_VERSION],
+                        "description": "Optional query schema version. Omit for v1; non-v1 versions are rejected so callers do not accidentally rely on an incompatible query shape."
                     }
                 },
                 "required": ["match"]

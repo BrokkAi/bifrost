@@ -115,6 +115,43 @@ fn full_result_detail_includes_stable_ranges_and_capture_kind() {
 }
 
 #[test]
+fn duplicate_capture_names_require_exact_text_equality() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/app.py",
+            r#"
+def run(x, y):
+    pair(x, x)
+    pair(x, y)
+"#,
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = AstQuery::from_json(&json!({
+        "match": {
+            "kind": "call",
+            "callee": { "name": "pair" },
+            "args": [
+                { "capture": "same" },
+                { "capture": "same" }
+            ]
+        }
+    }))
+    .expect("query should parse");
+    let output = execute(workspace.analyzer(), &query);
+
+    assert_eq!(output.matches.len(), 1);
+    assert_eq!(output.matches[0].text, "pair(x, x)");
+    assert_eq!(output.matches[0].captures.len(), 2);
+    assert!(
+        output.matches[0]
+            .captures
+            .iter()
+            .all(|capture| capture.name == "same" && capture.text == "x")
+    );
+}
+
+#[test]
 fn receiver_and_kwargs_narrow_call_matches() {
     let output = run_query(json!({
         "match": {

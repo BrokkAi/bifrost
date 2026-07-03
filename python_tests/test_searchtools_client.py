@@ -139,6 +139,7 @@ class SearchToolsClientTest(unittest.TestCase):
                 {"kind": "class", "name": "A"},
                 where=[absolute_where],
                 languages=["java"],
+                schema_version=1,
             )
 
         self.assertIsInstance(result, SearchAstResult)
