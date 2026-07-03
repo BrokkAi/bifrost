@@ -147,6 +147,18 @@ BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" amp -x \
   'Load the bifrost-code-intelligence skill. Use the Bifrost MCP get_summaries tool on src/analyzer/usages/rust_graph/*.rs and name three symbols from the MCP result.'
 ```
 
+After merge, verify the default-branch GitHub install path with Amp's
+`owner/repo/path` source syntax:
+
+```bash
+amp skill add BrokkAi/bifrost/plugins/bifrost-agent/amp-skills --target /tmp/bifrost-amp-skills --overwrite
+```
+
+Do not use a browser `https://github.com/.../tree/...` URL for Amp skill
+sources. The tested Amp CLI did not accept branch-qualified GitHub skill
+sources, so PR-branch validation should use a local checkout path and
+default-branch validation should happen after merge.
+
 When testing skill-bundled MCP config in Amp, install the parent skill
 collection, not an individual skill directory. Installing a single skill
 directory can copy only `SKILL.md`, while parent collection installs preserve

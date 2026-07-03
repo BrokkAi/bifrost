@@ -235,6 +235,18 @@ For a user-global install, use Amp's global skill target instead:
 amp skill add "$(pwd)/plugins/bifrost-agent/amp-skills" --global --overwrite
 ```
 
+After the Amp bundle has landed on the repository's default branch, install it
+from GitHub with Amp's `owner/repo/path` source syntax:
+
+```bash
+amp skill add BrokkAi/bifrost/plugins/bifrost-agent/amp-skills --global --overwrite
+```
+
+Do not use a browser `https://github.com/.../tree/...` URL for Amp skill
+sources. The tested Amp CLI did not accept branch-qualified GitHub skill
+sources, so PR-branch validation should use a local checkout path and the
+GitHub shorthand should be re-tested after merge.
+
 The generated `mcp.json` uses Amp's direct server-map shape and a small shell
 shim that locates `bifrost-code-intelligence/bin/bifrost-launcher.mjs` from the
 workspace `.agents/skills` directory, the standard global Amp/agents skill
