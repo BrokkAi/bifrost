@@ -1,7 +1,7 @@
 //! Pattern evaluation over one file's normalized facts.
 //!
 //! The matcher never sees JSON or grammar node names: patterns are the typed
-//! IR from `query.rs`, facts the arena from `facts.rs`. Negative constraints
+//! IR from `query`, facts the arena from `facts`. Negative constraints
 //! (`not_has`, `not_inside`) are evaluated here and only here — planners must
 //! never prune on them.
 //!
