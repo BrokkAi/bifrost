@@ -4,6 +4,11 @@ import fs from "node:fs";
 import assert from "node:assert/strict";
 import { constants as fsConstants } from "node:fs";
 import { SUPPORTED_TARGETS } from "../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
+import {
+  AMP_SKILL_BUNDLE_ROOT,
+  AMP_SKILL_NAME,
+  buildAmpSkillBundleFiles,
+} from "./generate-amp-skill-bundle.mjs";
 
 const cargoToml = fs.readFileSync("Cargo.toml", "utf8");
 const cargoVersion = cargoToml.match(/^version = "([^"]+)"$/m)?.[1];
@@ -172,6 +177,42 @@ for (const [skillDir, skillName, ...requiredTerms] of expectedSkills) {
     if (!skill.includes(term)) {
       throw new Error(`${skillPath} should mention ${term}`);
     }
+  }
+}
+
+for (const [relativePath, expected] of buildAmpSkillBundleFiles()) {
+  const bundlePath = `${AMP_SKILL_BUNDLE_ROOT}/${relativePath}`;
+  const actual = fs.readFileSync(bundlePath, "utf8");
+  assert.equal(
+    actual,
+    expected,
+    `${bundlePath} is stale; run node scripts/generate-amp-skill-bundle.mjs`,
+  );
+}
+fs.accessSync(`${AMP_SKILL_BUNDLE_ROOT}/bin/bifrost-launcher.mjs`, fsConstants.X_OK);
+const ampSkill = fs.readFileSync(`${AMP_SKILL_BUNDLE_ROOT}/SKILL.md`, "utf8");
+if (!ampSkill.includes(`name: ${AMP_SKILL_NAME}`)) {
+  throw new Error(`${AMP_SKILL_BUNDLE_ROOT}/SKILL.md should declare name: ${AMP_SKILL_NAME}`);
+}
+const ampMcpConfig = JSON.parse(fs.readFileSync(`${AMP_SKILL_BUNDLE_ROOT}/mcp.json`, "utf8"));
+assert.deepStrictEqual(
+  Object.keys(ampMcpConfig),
+  ["bifrost"],
+  `${AMP_SKILL_BUNDLE_ROOT}/mcp.json should use Amp's direct server-name map`,
+);
+assert.deepStrictEqual(
+  ampMcpConfig.bifrost.command,
+  "sh",
+  `${AMP_SKILL_BUNDLE_ROOT}/mcp.json should use the portable launcher search shim`,
+);
+assert.deepStrictEqual(
+  ampMcpConfig.bifrost.args?.slice(3, 7),
+  ["--root", ".", "--mcp", "symbol|extended"],
+  `${AMP_SKILL_BUNDLE_ROOT}/mcp.json should launch Bifrost against Amp's current workspace`,
+);
+for (const tool of ["search_symbols", "get_summaries", "scan_usages", "find_filenames"]) {
+  if (!ampMcpConfig.bifrost.includeTools?.includes(tool)) {
+    throw new Error(`${AMP_SKILL_BUNDLE_ROOT}/mcp.json should include ${tool}`);
   }
 }
 

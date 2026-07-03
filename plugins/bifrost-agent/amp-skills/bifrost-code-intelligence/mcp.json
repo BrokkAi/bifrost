@@ -1,0 +1,28 @@
+{
+  "bifrost": {
+    "command": "sh",
+    "args": [
+      "-lc",
+      "set -e\n\nfind_bifrost_launcher() {\n  if [ -n \"${BIFROST_AGENT_SKILL_DIR:-}\" ]; then\n    candidate=\"${BIFROST_AGENT_SKILL_DIR}/bin/bifrost-launcher.mjs\"\n    if [ -x \"$candidate\" ]; then\n      printf '%s\\n' \"$candidate\"\n      return 0\n    fi\n  fi\n\n  dir=\"$PWD\"\n  while :; do\n    candidate=\"$dir/.agents/skills/bifrost-code-intelligence/bin/bifrost-launcher.mjs\"\n    if [ -x \"$candidate\" ]; then\n      printf '%s\\n' \"$candidate\"\n      return 0\n    fi\n    if [ \"$dir\" = \"/\" ]; then\n      break\n    fi\n    dir=\"$(dirname \"$dir\")\"\n  done\n\n  if [ -n \"${HOME:-}\" ]; then\n    for base in \"$HOME/.config/agents/skills\" \"$HOME/.agents/skills\" \"$HOME/.config/amp/skills\"; do\n      candidate=\"$base/bifrost-code-intelligence/bin/bifrost-launcher.mjs\"\n      if [ -x \"$candidate\" ]; then\n        printf '%s\\n' \"$candidate\"\n        return 0\n      fi\n    done\n  fi\n\n  printf '%s\\n' \"Could not find bifrost-code-intelligence/bin/bifrost-launcher.mjs. Reinstall the Bifrost Amp skill bundle or set BIFROST_AGENT_SKILL_DIR.\" >&2\n  return 127\n}\n\nlauncher=\"$(find_bifrost_launcher)\"\nexec \"$launcher\" \"$@\"\n",
+      "bifrost-agent-launcher",
+      "--root",
+      ".",
+      "--mcp",
+      "symbol|extended"
+    ],
+    "includeTools": [
+      "search_symbols",
+      "get_symbol_locations",
+      "scan_usages",
+      "most_relevant_files",
+      "get_summaries",
+      "get_symbol_sources",
+      "find_filenames",
+      "list_files",
+      "get_definition_by_location",
+      "get_type_by_location",
+      "usage_graph",
+      "get_symbol_ancestors"
+    ]
+  }
+}

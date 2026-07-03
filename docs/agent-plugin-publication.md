@@ -21,7 +21,10 @@ Use `Bifrost by Brokk` for UI-facing display text.
 The Claude/Codex MCP configuration lives at `plugins/bifrost-agent/.mcp.json`.
 Cursor uses the same server shape in `plugins/bifrost-agent/mcp.json`, with
 Cursor's documented `type: "stdio"` field, because Cursor's plugin loader
-detects root `mcp.json` directly.
+detects root `mcp.json` directly. Amp does not use either of those wrapper
+shapes: Amp `mcp.json` / `--mcp-config` expects a direct server-name map. The
+Amp package is generated under `plugins/bifrost-agent/amp-skills` from the
+canonical Bifrost code-intelligence skills.
 
 ```json
 {
@@ -35,6 +38,27 @@ detects root `mcp.json` directly.
   }
 }
 ```
+
+The Amp-equivalent direct server-map shape is:
+
+```json
+{
+  "bifrost": {
+    "command": "sh",
+    "args": ["-lc", "<launcher-search-shim>", "bifrost-agent-launcher", "--root", ".", "--mcp", "symbol|extended"],
+    "includeTools": ["search_symbols", "get_summaries", "scan_usages"]
+  }
+}
+```
+
+The generated Amp `mcp.json` uses the shell shim because the tested Amp CLI
+resolved package-relative MCP commands from the Amp process working directory,
+not from the skill directory. The shim finds the installed
+`bifrost-code-intelligence` skill under workspace/global Amp skill locations or
+`BIFROST_AGENT_SKILL_DIR`, then execs its bundled launcher. For released
+binaries, omit `BIFROST_BINARY_PATH` and let the launcher resolve or download
+the pinned Bifrost release. For local checkout testing, keep
+`BIFROST_BINARY_PATH` so Amp cannot pick a stale binary from `PATH`.
 
 Use the same Bifrost release as the Rust crate and release tag. The plugin does
 not bundle release archives; `plugins/bifrost-agent/bifrost-release.json`
@@ -112,11 +136,30 @@ from Customize, and already-open chats may need to be restarted. The
 `cursor agent --plugin-dir` CLI path can load plugin skills, but it has not
 proven reliable for plugin-provided MCP servers.
 
+For Amp validation, install the generated skill collection documented in
+`plugins/bifrost-agent/README.md`. The smoke path is:
+
+```bash
+cargo build --bin bifrost
+node scripts/generate-amp-skill-bundle.mjs
+amp skill add "$(pwd)/plugins/bifrost-agent/amp-skills" --target "$(pwd)/.agents/skills" --overwrite
+BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" amp -x \
+  'Load the bifrost-code-intelligence skill. Use the Bifrost MCP get_summaries tool on src/analyzer/usages/rust_graph/*.rs and name three symbols from the MCP result.'
+```
+
+When testing skill-bundled MCP config in Amp, install the parent skill
+collection, not an individual skill directory. Installing a single skill
+directory can copy only `SKILL.md`, while parent collection installs preserve
+support files such as `mcp.json`, `bin/`, and `bifrost-release.json`. Also
+verify launcher paths in a real Amp prompt smoke because package-relative MCP
+commands are not skill-relative in the tested CLI.
+
 Validate that the plugin manifest versions match `Cargo.toml` and that all
 plugin JSON files, skill files, and launcher metadata parse:
 
 ```bash
 node --test plugins/bifrost-agent/test/*.test.mjs
+node scripts/generate-amp-skill-bundle.mjs
 node scripts/check-codex-plugin-manifest.mjs
 claude plugin validate plugins/bifrost-agent
 claude plugin validate .
@@ -140,6 +183,10 @@ claude plugin validate .
   `.cursor-plugin/plugin.json`, `mcp.json`, `bifrost-release.json`, `bin/`,
   `skills/`, `agents/`, and `assets/icon.png`; submit through Cursor's manual
   marketplace review after local validation.
+- Generate and package the Amp skill collection from
+  `plugins/bifrost-agent/amp-skills` after running
+  `node scripts/generate-amp-skill-bundle.mjs`. Use Amp's direct server-map
+  config, not the Claude/Codex `.mcp.json` wrapper or Cursor root `mcp.json`.
 - Validate that the plugin's MCP server entry launches:
   `bifrost --root <resolved-root> --mcp "symbol|extended"`.
 - Confirm that plugin installation and VS Code LSP setup use separate Bifrost
@@ -151,6 +198,12 @@ The Bifrost plugin owns code-intelligence skills that describe the MCP tools it
 installs: code navigation, code reading, and codebase search. These skills must
 refer only to tools available through `symbol|extended` or to host-provided
 shell/file-reading tools.
+
+The Amp skill bundle is generated from those three canonical source skills.
+Treat `plugins/bifrost-agent/skills/bifrost-code-navigation`,
+`plugins/bifrost-agent/skills/bifrost-code-reading`, and
+`plugins/bifrost-agent/skills/bifrost-codebase-search` as the source of truth;
+do not edit `plugins/bifrost-agent/amp-skills` by hand.
 
 The same plugin also owns the Brokk/Bifrost workflow skills for git
 exploration, guided issue resolution, guided review, PR review, ordinary code
