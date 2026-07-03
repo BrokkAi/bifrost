@@ -14,7 +14,7 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
 
 - [x] (2026-07-03T12:27Z) Created this review-remediation ExecPlan from the accepted implementation plan. No runtime behavior has changed yet.
 - [x] (2026-07-03T12:34Z) Milestone 1: added opt-in full result detail without changing compact output. `result_detail` now defaults to compact, full detail adds deterministic match IDs, byte/line/column ranges, capture ranges, and optional capture kinds. Python models parse the optional fields. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`, and the targeted Python client unittest through `uv run --python 3.12 --with maturin`.
-- [ ] Milestone 2: define and expose decorator/annotation span ranges in full detail.
+- [x] (2026-07-03T12:37Z) Milestone 2: defined the full-detail decorator/annotation span policy in README docs and added cross-language tests for decorated callables and decorated classes. `node_range` remains the matched normalized fact range, `decorator_ranges` report extracted decorator/annotation role spans, and `decorated_range` is their union. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, and `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`.
 - [ ] Milestone 3: document capability and precision caveats for humans and LLMs.
 - [ ] Milestone 4: add schema versioning and exact-text duplicate capture equality.
 - [ ] Milestone 5: switch to global project-relative ordering and add truncation diagnostics.
@@ -44,10 +44,15 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
   Rationale: This preserves the current compact JSON shape via serde skip rules and lets Python callers use one model with optional fields.
   Date/Author: 2026-07-03 / Codex.
 
+- Decision: Expose decorator span policy in full-detail output without changing fact extraction or match semantics.
+  Rationale: The PR review asked for explicit span policy. Reporting `node_range`, `decorator_ranges`, and `decorated_range` makes the behavior inspectable while avoiding adapter-risky semantic rewrites in this milestone.
+  Date/Author: 2026-07-03 / Codex.
+
 
 ## Outcomes & Retrospective
 
 - 2026-07-03T12:34Z: Milestone 1 completed. Existing compact output remains the default and existing structural tests continue to pass. Callers that request `result_detail: "full"` now get match IDs and precise match/capture ranges suitable for follow-up tooling.
+- 2026-07-03T12:37Z: Milestone 2 completed. Full-detail results now have documented decorator/annotation range semantics and cross-language coverage for decorated callables and classes.
 
 
 ## Context and Orientation

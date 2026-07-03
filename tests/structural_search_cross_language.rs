@@ -222,6 +222,113 @@ fn decorator_query_matches_python_decorators_java_annotations_and_js_ts_decorato
 }
 
 #[test]
+fn full_detail_reports_decorator_ranges_for_decorated_callables() {
+    let output = run_query(json!({
+        "match": {
+            "kind": "callable",
+            "not_kind": "lambda",
+            "decorators": [{ "name": "route" }]
+        },
+        "result_detail": "full"
+    }));
+
+    assert_eq!(output.matches.len(), 4);
+    for m in &output.matches {
+        let node_range = m.node_range.expect("full detail node range");
+        assert_eq!(
+            m.decorator_ranges.len(),
+            1,
+            "expected one decorator range for {m:?}"
+        );
+        let decorated_range = m.decorated_range.expect("decorated range");
+        assert!(decorated_range.start_byte <= node_range.start_byte);
+        assert!(decorated_range.end_byte >= node_range.end_byte);
+        let decorator_range = m.decorator_ranges[0];
+        assert!(decorator_range.start_byte < decorator_range.end_byte);
+        assert!(decorator_range.start_byte >= decorated_range.start_byte);
+        assert!(decorator_range.end_byte <= decorated_range.end_byte);
+    }
+}
+
+#[test]
+fn full_detail_reports_decorator_ranges_for_decorated_classes() {
+    let output = run_query_with_files(
+        &[
+            (
+                "python/app.py",
+                r#"
+def route(path):
+    return lambda cls: cls
+
+@route("/class")
+class PyController:
+    pass
+"#,
+            ),
+            (
+                "java/App.java",
+                r#"
+@interface route {
+    String value();
+}
+
+@route("/class")
+class JavaController {}
+"#,
+            ),
+            (
+                "javascript/app.js",
+                r#"
+function route(path) {
+  return target => target;
+}
+
+@route("/class")
+class JsController {}
+"#,
+            ),
+            (
+                "typescript/app.ts",
+                r#"
+function route(path: string) {
+  return (target: unknown) => target;
+}
+
+@route("/class")
+class TsController {}
+"#,
+            ),
+        ],
+        json!({
+            "match": {
+                "kind": "class",
+                "decorators": [{ "name": "route" }]
+            },
+            "result_detail": "full"
+        }),
+    );
+
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+    assert_eq!(output.matches.len(), 4);
+    let mut languages = output
+        .matches
+        .iter()
+        .map(|m| m.language)
+        .collect::<Vec<_>>();
+    languages.sort_unstable();
+    assert_eq!(
+        languages,
+        vec!["java", "javascript", "python", "typescript"]
+    );
+    for m in &output.matches {
+        assert_eq!(m.kind, "class");
+        assert_eq!(m.decorator_ranges.len(), 1, "{m:?}");
+        assert!(m.decorated_range.is_some(), "{m:?}");
+        assert!(m.node_range.is_some(), "{m:?}");
+    }
+}
+
+#[test]
 fn js_ts_constructors_are_refined_and_excluded_from_named_callable_queries() {
     let constructors = run_query(json!({
         "languages": ["javascript", "typescript"],
