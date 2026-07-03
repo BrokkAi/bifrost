@@ -54,6 +54,45 @@ impl RustAnalyzer {
             .get_or_init(|| RustHierarchyIndex::build(self))
     }
 
+    /// Compiler-style trait-candidate step for `Type::member` when `member` is
+    /// not an inherent associated item: enumerate traits implemented for `type_fqn`
+    /// and visible at `call_site`, then return the declared method candidates.
+    /// Call sites use this precise-or-nothing set for #433.
+    pub(crate) fn trait_assoc_member_candidates(
+        &self,
+        call_site: &ProjectFile,
+        type_fqn: &str,
+        member: &str,
+    ) -> Vec<CodeUnit> {
+        let Some(traits) = self.hierarchy_index().direct_ancestors.get(type_fqn) else {
+            return Vec::new();
+        };
+        let refs = self.reference_context_of(call_site);
+        let mut candidates = Vec::new();
+        for trait_unit in traits {
+            let trait_fqn = trait_unit.fq_name();
+            let mut in_scope = !refs.bare_names_resolving_to(&trait_fqn).is_empty();
+            if !in_scope {
+                in_scope = self
+                    .resolve_imported_export(call_site, trait_unit.identifier())
+                    .contains(&(
+                        trait_unit.source().clone(),
+                        trait_unit.identifier().to_string(),
+                    ));
+            }
+            if in_scope {
+                candidates.extend(
+                    self.definitions(&format!("{trait_fqn}.{member}"))
+                        .filter(|unit| unit.is_function())
+                        .cloned(),
+                );
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
     #[allow(dead_code)]
     pub(crate) fn type_relations(&self) -> &[TypeRelation] {
         self.type_relations
@@ -462,6 +501,10 @@ mod tests {
             .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
     }
 
+    fn file(fixture: &AnalyzerFixture, rel_path: &str) -> ProjectFile {
+        ProjectFile::new(fixture.test_project().root_path().to_path_buf(), rel_path)
+    }
+
     fn has_trait_implementation_relation(analyzer: &RustAnalyzer, from: &str, to: &str) -> bool {
         analyzer.type_relations().iter().any(|relation| {
             relation.from.fq_name() == from
@@ -521,5 +564,117 @@ impl Runnable for Worker {}
             vec![runnable.clone()]
         );
         assert!(analyzer.get_direct_descendants(&runnable).contains(&worker));
+    }
+
+    #[test]
+    fn trait_assoc_member_candidates_return_single_in_scope_trait_method() {
+        let (fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Runnable {
+    fn frobnicate();
+}
+struct Worker;
+impl Runnable for Worker {}
+"#,
+        )]);
+
+        let candidates = analyzer.trait_assoc_member_candidates(
+            &file(&fixture, "src/lib.rs"),
+            "Worker",
+            "frobnicate",
+        );
+        assert_eq!(
+            candidates,
+            vec![definition(&analyzer, "Runnable.frobnicate")]
+        );
+    }
+
+    #[test]
+    fn trait_assoc_member_candidates_return_all_ambiguous_in_scope_methods() {
+        let (fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+struct Worker;
+trait A {
+    fn frobnicate();
+}
+trait B {
+    fn frobnicate();
+}
+impl A for Worker {}
+impl B for Worker {}
+"#,
+        )]);
+
+        let candidates = analyzer.trait_assoc_member_candidates(
+            &file(&fixture, "src/lib.rs"),
+            "Worker",
+            "frobnicate",
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                definition(&analyzer, "A.frobnicate"),
+                definition(&analyzer, "B.frobnicate")
+            ]
+        );
+    }
+
+    #[test]
+    fn trait_assoc_member_candidates_filter_traits_by_call_site_scope() {
+        let (fixture, analyzer) = analyzer_with_files(&[
+            (
+                "src/contracts.rs",
+                r#"
+pub trait Runnable {
+    fn frobnicate();
+}
+pub trait Hidden {
+    fn frobnicate();
+}
+"#,
+            ),
+            (
+                "src/worker.rs",
+                r#"
+use crate::contracts::Runnable;
+pub struct Worker;
+impl Runnable for Worker {}
+impl crate::contracts::Hidden for Worker {}
+"#,
+            ),
+        ]);
+
+        let candidates = analyzer.trait_assoc_member_candidates(
+            &file(&fixture, "src/worker.rs"),
+            "worker.Worker",
+            "frobnicate",
+        );
+        assert_eq!(
+            candidates,
+            vec![definition(&analyzer, "contracts.Runnable.frobnicate")]
+        );
+    }
+
+    #[test]
+    fn trait_assoc_member_candidates_return_empty_when_no_trait_declares_member() {
+        let (fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Runnable {
+    fn run();
+}
+struct Worker;
+impl Runnable for Worker {}
+"#,
+        )]);
+
+        let candidates = analyzer.trait_assoc_member_candidates(
+            &file(&fixture, "src/lib.rs"),
+            "Worker",
+            "frobnicate",
+        );
+        assert!(candidates.is_empty(), "got {candidates:?}");
     }
 }

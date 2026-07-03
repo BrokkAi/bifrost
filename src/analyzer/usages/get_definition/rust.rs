@@ -37,10 +37,19 @@ pub(super) fn resolve_rust(
         && let Some(self_type) = rust_enclosing_impl_type_fqn(analyzer, support, file, source, node)
     {
         let candidates = match reference.split_once("::") {
-            Some((_, name)) => rust_member_candidates(
-                support.fqn(&format!("{self_type}.{name}")),
-                RustMemberKind::Function,
-            ),
+            Some((_, name)) => {
+                let mut candidates = rust_member_candidates(
+                    support.fqn(&format!("{self_type}.{name}")),
+                    RustMemberKind::Function,
+                );
+                if candidates.is_empty() {
+                    candidates = rust_member_candidates(
+                        rust.trait_assoc_member_candidates(file, &self_type, name),
+                        RustMemberKind::Function,
+                    );
+                }
+                candidates
+            }
             None => support.fqn(&self_type),
         };
         if !candidates.is_empty() {
@@ -50,12 +59,20 @@ pub(super) fn resolve_rust(
     let refs = rust.reference_context_of(file);
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
-        let resolved = rust_focused_scoped_segment_candidates(rust, support, file, site)
+        let mut resolved = rust_focused_scoped_segment_candidates(rust, support, file, site)
             .unwrap_or_else(|| {
                 refs.resolve_scoped(path, name)
                     .map(|fqn| support.fqn(&fqn))
                     .unwrap_or_default()
             });
+        if resolved.is_empty()
+            && let Some(type_fqn) = refs.resolve_path(path)
+        {
+            resolved = rust_member_candidates(
+                rust.trait_assoc_member_candidates(file, &type_fqn, name),
+                RustMemberKind::Function,
+            );
+        }
         (resolved, true)
     } else {
         // Prefer a type declared in the lexically enclosing scope (module) over the

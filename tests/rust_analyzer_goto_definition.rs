@@ -58,6 +58,56 @@ fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) 
     (temp, lines)
 }
 
+fn definition_lines_in_files(
+    files: &[(&str, &str)],
+    query_name: &str,
+    target_name: &str,
+) -> (TempDir, Vec<u64>) {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let mut query_position = None;
+    for (name, source) in files {
+        let file = root.join(name);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir fixture parent");
+        }
+        let source = if *name == query_name {
+            let (source, line, character) = split_caret(source);
+            query_position = Some((line, character));
+            source
+        } else {
+            source.to_string()
+        };
+        std::fs::write(&file, source).expect("write fixture");
+    }
+
+    let (line, character) = query_position.expect("query fixture must contain <caret>");
+    let query_file = root.join(query_name);
+    let target_file = root.join(target_name);
+    let mut server = LspServer::start(&root);
+    let response = server.text_document_position_response(
+        "textDocument/definition",
+        &uri_for(&query_file),
+        line,
+        character,
+    );
+    server.shutdown();
+
+    let target_uri = uri_for(&target_file);
+    let lines = match &response["result"] {
+        Value::Array(items) => items
+            .iter()
+            .filter(|loc| loc["uri"].as_str() == Some(target_uri.as_str()))
+            .filter_map(|loc| loc["range"]["start"]["line"].as_u64())
+            .collect(),
+        Value::Object(loc) if loc["uri"].as_str() == Some(target_uri.as_str()) => {
+            loc["range"]["start"]["line"].as_u64().into_iter().collect()
+        }
+        _ => Vec::new(),
+    };
+    (temp, lines)
+}
+
 fn assert_resolves_to_line(name: &str, source_with_caret: &str, expected: u64) {
     let (_t, lines) = definition_lines(name, source_with_caret);
     assert!(
@@ -111,21 +161,83 @@ fn ra_goto_def_for_ufcs_trait_methods_through_traits() {
 }
 
 // rust-analyzer: goto_def_for_ufcs_trait_methods_through_self — `Foo::frob()`
-// where `Foo: Trait` resolves to the trait method signature (line 2).
-//
-// DEFERRED: bifrost's name-based `resolve_scoped` maps `Foo` -> its fqn and looks
-// up `Foo.frobnicate`, which is not indexed because the method is declared only
-// on `Trait`. Resolving it needs a type->implemented-traits linkage (only the
-// inverse `trait_implementer_names` exists today) plus an ambiguity policy when
-// several implemented traits share the name. Tracked for a dedicated resolver
-// change; not a wiring fix.
+// where `Foo: Trait` resolves through the trait-candidate lookup (#433) to the
+// trait method signature (line 2).
 #[test]
-#[ignore = "deferred: assoc-fn call through an implemented trait needs type->trait linkage in the resolver"]
 fn ra_goto_def_for_ufcs_trait_methods_through_self() {
     assert_resolves_to_line(
         "ts.rs",
         "struct Foo;\ntrait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\n\nfn bar() {\n    Foo::frobnicate<caret>();\n}\n",
         2,
+    );
+}
+
+// #433: if multiple in-scope implemented traits declare the same associated
+// method, `Foo::frobnicate()` is ambiguous and returns no definition.
+#[test]
+fn ra_goto_def_ufcs_trait_method_ambiguous_traits() {
+    let (_t, lines) = definition_lines(
+        "ambiguous.rs",
+        "struct Foo;\ntrait A {\n    fn frobnicate();\n}\ntrait B {\n    fn frobnicate();\n}\nimpl A for Foo {}\nimpl B for Foo {}\n\nfn bar() {\n    Foo::frobnicate<caret>();\n}\n",
+    );
+    assert!(lines.is_empty(), "expected no definitions, got {lines:?}");
+}
+
+// #433: cross-file `Worker::frobnicate()` resolves through an imported trait
+// implemented for `Worker`.
+#[test]
+fn ra_goto_def_ufcs_trait_method_cross_file() {
+    let (_t, lines) = definition_lines_in_files(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub mod contracts;\npub mod worker;\n"),
+            (
+                "src/contracts.rs",
+                "pub trait Runnable {\n    fn frobnicate();\n}\n",
+            ),
+            (
+                "src/worker.rs",
+                "use crate::contracts::Runnable;\npub struct Worker;\nimpl Runnable for Worker {}\nfn bar() {\n    Worker::frobnicate<caret>();\n}\n",
+            ),
+        ],
+        "src/worker.rs",
+        "src/contracts.rs",
+    );
+    assert!(
+        lines.contains(&1),
+        "expected cross-file trait method to resolve to line 1, got {lines:?}"
+    );
+}
+
+// #433: when two implemented traits declare the method, call-site scope filters
+// candidates to the imported trait.
+#[test]
+fn ra_goto_def_ufcs_trait_method_scope_filtered() {
+    let (_t, lines) = definition_lines_in_files(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub mod contracts;\npub mod worker;\n"),
+            (
+                "src/contracts.rs",
+                "pub trait Runnable {\n    fn frobnicate();\n}\npub trait Hidden {\n    fn frobnicate();\n}\n",
+            ),
+            (
+                "src/worker.rs",
+                "use crate::contracts::Runnable;\npub struct Worker;\nimpl Runnable for Worker {}\nimpl crate::contracts::Hidden for Worker {}\nfn bar() {\n    Worker::frobnicate<caret>();\n}\n",
+            ),
+        ],
+        "src/worker.rs",
+        "src/contracts.rs",
+    );
+    assert!(
+        lines.contains(&1),
+        "expected scope-filtered trait method to resolve to line 1, got {lines:?}"
     );
 }
 
