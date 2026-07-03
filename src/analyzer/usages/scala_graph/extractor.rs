@@ -8,6 +8,7 @@ use crate::analyzer::usages::scala_graph::syntax::{
     call_arity_for_reference, has_ancestor_kind, has_member_qualifier, is_assignment_lhs,
     is_constructor_like_reference, is_identifier_node, is_owner_qualified_this,
     is_type_like_reference, member_qualifier, member_qualifier_node, node_text,
+    parenthesized_arity,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::{HashMap, HashSet};
@@ -92,6 +93,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "call_expression" {
         scan_call_expression(node, ctx);
     }
+    if matches!(node.kind(), "function_definition" | "function_declaration") {
+        scan_method_declaration(node, ctx);
+    }
     if node.kind() == "import_declaration" {
         scan_import_declaration(node, ctx);
     } else if is_identifier_node(node) {
@@ -148,7 +152,7 @@ fn matching_names_for_import_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> H
     for import in parse_scala_import_infos(import_text) {
         let matched = Visibility::matching_import_names(&import, ctx.spec);
         names.extend(matched.type_names);
-        names.extend(matched.owner_names);
+        names.extend(matched.owner_names.into_keys());
         names.extend(matched.direct_member_names);
     }
     names
@@ -170,6 +174,30 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && member_call_arity_matches(function, ctx)
     {
         add_hit(function, ctx);
+    }
+}
+
+fn scan_method_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.spec.kind != TargetKind::Method {
+        return;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    if node_text(name, ctx.source).trim() != ctx.spec.member_name {
+        return;
+    }
+    if !function_arity_matches(node, ctx) {
+        return;
+    }
+    let Some(owner_fq_name) = enclosing_owner_fq_name(name, ctx) else {
+        return;
+    };
+    if ctx
+        .spec
+        .related_override_owner_fq_matches(owner_fq_name.as_str())
+    {
+        add_hit(name, ctx);
     }
 }
 
@@ -204,6 +232,7 @@ fn enters_local_scope(node: Node<'_>) -> bool {
 fn seed_scope_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
         "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+            seed_class_parameter_bindings(node, ctx);
             seed_owner_field_bindings(node, ctx);
         }
         "function_definition" => {
@@ -284,10 +313,16 @@ fn seed_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn seed_class_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(parameters) = node.child_by_field_name("class_parameters") {
+        seed_parameters(parameters, ctx);
+    }
+}
+
 fn seed_parameters(parameters: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let mut cursor = parameters.walk();
     for parameter in parameters.named_children(&mut cursor) {
-        if parameter.kind() == "parameter" {
+        if matches!(parameter.kind(), "parameter" | "class_parameter") {
             seed_parameter(parameter, ctx);
         }
     }
@@ -358,14 +393,12 @@ fn seed_or_shadow_typed_symbol(
     value_name: Option<&str>,
     ctx: &mut ScanCtx<'_>,
 ) {
-    let visible_type = type_name
+    let visible_owner = type_name
         .or(value_name)
-        .filter(|name| ctx.visibility.owner_names.contains(*name));
-    if let Some(_type_name) = visible_type
-        && let Some(owner_fq_name) = ctx.spec.owner_fq_name.as_ref()
-    {
+        .and_then(|name| ctx.visibility.owner_fq_name_for(name));
+    if let Some(owner_fq_name) = visible_owner {
         ctx.bindings
-            .seed_symbol(name.to_string(), owner_fq_name.clone());
+            .seed_symbol(name.to_string(), owner_fq_name.to_string());
         return;
     }
     ctx.bindings.declare_shadow(name.to_string());
@@ -513,7 +546,8 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
             && member_call_arity_matches(node, ctx);
     };
     if is_owner_qualified_this(qualifier_node, ctx.source) {
-        return enclosing_matches_owner(node, ctx) && member_call_arity_matches(node, ctx);
+        return owner_qualified_this_matches(qualifier_node, ctx)
+            && member_call_arity_matches(node, ctx);
     }
     let qualifier = node_text(qualifier_node, ctx.source)
         .trim()
@@ -525,9 +559,22 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         && !is_locally_shadowed(ctx, qualifier)
         && member_call_arity_matches(node, ctx)
     {
-        return true;
+        return ctx
+            .visibility
+            .owner_fq_name_for(qualifier)
+            .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name));
     }
     receiver_binding_matches(node, qualifier, ctx)
+}
+
+fn owner_qualified_this_matches(qualifier_node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let qualifier = node_text(qualifier_node, ctx.source).trim();
+    let Some(owner_name) = qualifier.strip_suffix(".this") else {
+        return false;
+    };
+    ctx.visibility
+        .owner_fq_name_for(owner_name.trim().trim_end_matches('$'))
+        .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name))
 }
 
 fn extension_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
@@ -566,40 +613,46 @@ fn is_locally_shadowed(ctx: &ScanCtx<'_>, name: &str) -> bool {
 }
 
 fn receiver_binding_matches(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) -> bool {
-    let Some(target_owner_fq) = ctx.spec.owner_fq_name.as_ref() else {
+    if ctx.spec.owner.is_none() {
         return false;
-    };
+    }
     if !member_call_arity_matches(node, ctx) {
         return false;
     }
     ctx.bindings
         .resolve_symbol(qualifier)
         .as_precise()
-        .is_some_and(|targets| targets.contains(target_owner_fq))
+        .is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| ctx.spec.owner_fq_matches(target))
+        })
+        || ctx
+            .visibility
+            .receiver_fq_name_for(qualifier)
+            .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name))
 }
 
 fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let Some(owner) = ctx.spec.owner.as_ref() else {
-        return false;
-    };
+    enclosing_owner_fq_name(node, ctx)
+        .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name.as_str()))
+}
+
+fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     };
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
-        return false;
-    };
-    if enclosing == *owner {
-        return true;
+    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range)?;
+    if enclosing.is_class() {
+        return Some(enclosing.fq_name());
     }
-    enclosing.source() == owner.source()
-        && enclosing.package_name() == owner.package_name()
-        && enclosing
-            .short_name()
-            .strip_prefix(owner.short_name())
-            .is_some_and(|rest| rest.starts_with('.'))
+    ctx.analyzer
+        .parent_of(&enclosing)
+        .filter(|owner| owner.is_class())
+        .map(|owner| owner.fq_name())
 }
 
 fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -613,4 +666,17 @@ fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         Some(call_arity) => call_arity == target_arity,
         None => target_arity == 0,
     }
+}
+
+fn function_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(target_arity) = ctx.spec.arity else {
+        return true;
+    };
+    let mut cursor = node.walk();
+    let arity = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "parameters")
+        .and_then(|parameters| parenthesized_arity(node_text(parameters, ctx.source)))
+        .unwrap_or(0);
+    arity == target_arity
 }

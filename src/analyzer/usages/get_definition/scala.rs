@@ -700,12 +700,6 @@ fn resolve_scala_field(
             "Scala field expression has no receiver",
         );
     };
-    if matches!(receiver.kind(), "identifier" | "type_identifier") {
-        let receiver_text = scala_node_text(receiver, ctx.source).trim();
-        if let Some(fqn) = resolver.resolve_member(receiver_text) {
-            return scala_fqn_outcome(ctx.support, &fqn, receiver_text);
-        }
-    }
     if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, field.start_byte())
     {
         let include_companion = scala_receiver_allows_companion_lookup(
@@ -1172,6 +1166,13 @@ fn scala_receiver_type_fqn(
             let bindings = scala_bindings_before(ctx, resolver, root, cutoff_start);
             first_precise(&bindings, name).or_else(|| {
                 scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).or_else(|| {
+                    if !bindings.is_shadowed(name)
+                        && let Some(imported_member) = resolver.resolve_member(name)
+                        && let Some(return_type) =
+                            scala_imported_member_return_type(ctx, resolver, &imported_member)
+                    {
+                        return Some(return_type);
+                    }
                     (!bindings.is_shadowed(name))
                         .then(|| resolver.resolve(name))
                         .flatten()
@@ -1185,6 +1186,34 @@ fn scala_receiver_type_fqn(
         }
         _ => None,
     }
+}
+
+fn scala_imported_member_return_type(
+    ctx: ScalaLookupCtx<'_>,
+    _resolver: &ScalaNameResolver,
+    member_fqn: &str,
+) -> Option<String> {
+    let unit = ctx
+        .support
+        .fqn(member_fqn)
+        .into_iter()
+        .find(|unit| unit.is_function())?;
+    let signature = unit
+        .signature()
+        .or_else(|| ctx.scala.signatures(&unit).first().map(String::as_str))?;
+    let return_type = scala_signature_return_type(signature)?;
+    let factory_resolver = ScalaNameResolver::for_file(ctx.scala, unit.source(), ctx.types);
+    scala_resolve_type_annotation(&factory_resolver, return_type).or_else(|| {
+        scala_package_type_fqn(unit.package_name(), return_type)
+            .filter(|fqn| !ctx.support.fqn(fqn).is_empty())
+    })
+}
+
+fn scala_signature_return_type(signature: &str) -> Option<&str> {
+    let (_, after_colon) = signature.rsplit_once(':')?;
+    let end = after_colon.find(['=', '{']).unwrap_or(after_colon.len());
+    let return_type = after_colon[..end].trim();
+    (!return_type.is_empty()).then_some(return_type)
 }
 
 /// The first `type_identifier` (else `identifier`) in a pre-order walk — the

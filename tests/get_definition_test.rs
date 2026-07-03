@@ -11510,6 +11510,87 @@ object App:
         result["definitions"][0]["fqn"], "app.ConsoleRenderer$.default",
         "{value}"
     );
+
+    let render_start = app_source.find("render(\"ok\")").expect("render token");
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            render_start,
+            render_start + "render".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.ConsoleRenderer.render",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_imported_factory_return_type_uses_factory_scope() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "api/Renderer.scala",
+            r#"
+package api
+
+class Renderer {
+  def render(value: String): String = value
+}
+"#,
+        )
+        .file(
+            "app/Renderer.scala",
+            r#"
+package app
+
+class Renderer {
+  def render(value: String): String = value.trim
+}
+
+object Factory {
+  def default: Renderer = new Renderer
+}
+"#,
+        )
+        .file(
+            "app/App.scala",
+            r#"
+package app
+
+object App:
+  import Factory.{default => renderer}
+  val direct = renderer.render("ok")
+"#,
+        )
+        .build();
+
+    let app_source = r#"
+package app
+
+object App:
+  import Factory.{default => renderer}
+  val direct = renderer.render("ok")
+"#;
+    let render_start = app_source.find("render(\"ok\")").expect("render token");
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            render_start,
+            render_start + "render".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Renderer.render",
+        "{value}"
+    );
 }
 
 #[test]
