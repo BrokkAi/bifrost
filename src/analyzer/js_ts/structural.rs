@@ -1,6 +1,10 @@
 //! Shared JavaScript/TypeScript structural specs for `search_ast`.
 
 use crate::analyzer::Language;
+use crate::analyzer::structural::adapter_helpers::{
+    attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
+    first_named_child,
+};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
 use tree_sitter::Node;
 
@@ -73,10 +77,6 @@ const TS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
     ("nested_identifier", NormalizedKind::Identifier),
 );
 
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    node.named_child(0)
-}
-
 fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
     node.utf8_text(source.as_bytes()).ok()
 }
@@ -116,21 +116,12 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     }
 }
 
-fn attach_named_role(sink: &mut RoleSink<'_>, role: Role, target: Node<'_>) {
-    sink.role_maybe_named(role, target, expression_name_node(target));
-}
-
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
     if arguments.kind() == "template_string" {
         sink.role(Role::Arg, arguments);
         return;
     }
-    for index in 0..arguments.named_child_count() {
-        let Some(argument) = arguments.named_child(index) else {
-            continue;
-        };
-        attach_named_role(sink, Role::Arg, argument);
-    }
+    attach_positional_argument_roles(sink, arguments, expression_name_node);
 }
 
 fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
@@ -139,7 +130,7 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
             continue;
         };
         if child.kind() == "decorator" {
-            attach_named_role(sink, Role::Decorator, child);
+            attach_role_with_derived_name(sink, Role::Decorator, child, expression_name_node);
         }
     }
     attach_preceding_class_body_decorators(sink, declaration);
@@ -159,7 +150,12 @@ fn attach_preceding_class_body_decorators(sink: &mut RoleSink<'_>, declaration: 
         };
         if child.id() == declaration.id() {
             for decorator in pending {
-                attach_named_role(sink, Role::Decorator, decorator);
+                attach_role_with_derived_name(
+                    sink,
+                    Role::Decorator,
+                    decorator,
+                    expression_name_node,
+                );
             }
             return;
         }
@@ -231,16 +227,16 @@ impl StructuralSpec for JsTsStructuralSpec {
                     "function"
                 };
                 if let Some(function) = node.child_by_field_name(callee_field) {
-                    if let Some(name) = expression_name_node(function) {
-                        sink.role_named(Role::Callee, name, name);
-                        sink.set_name(name);
-                    } else {
-                        sink.role(Role::Callee, function);
-                    }
+                    attach_terminal_callee(sink, function, expression_name_node(function));
                     if function.kind() == "member_expression"
                         && let Some(object) = function.child_by_field_name("object")
                     {
-                        attach_named_role(sink, Role::Receiver, object);
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Receiver,
+                            object,
+                            expression_name_node,
+                        );
                     }
                 }
                 if let Some(arguments) = node.child_by_field_name("arguments") {
@@ -253,7 +249,7 @@ impl StructuralSpec for JsTsStructuralSpec {
                     sink.role_named(Role::Field, property, property);
                 }
                 if let Some(object) = node.child_by_field_name("object") {
-                    attach_named_role(sink, Role::Object, object);
+                    attach_role_with_derived_name(sink, Role::Object, object, expression_name_node);
                 }
             }
             NormalizedKind::Function
@@ -269,21 +265,31 @@ impl StructuralSpec for JsTsStructuralSpec {
             NormalizedKind::Assignment => match node.kind() {
                 "variable_declarator" => {
                     if let Some(name) = node.child_by_field_name("name") {
-                        attach_named_role(sink, Role::Left, name);
+                        attach_role_with_derived_name(sink, Role::Left, name, expression_name_node);
                         if let Some(name_node) = expression_name_node(name) {
                             sink.set_name(name_node);
                         }
                     }
                     if let Some(value) = node.child_by_field_name("value") {
-                        attach_named_role(sink, Role::Right, value);
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Right,
+                            value,
+                            expression_name_node,
+                        );
                     }
                 }
                 "assignment_expression" => {
                     if let Some(left) = node.child_by_field_name("left") {
-                        attach_named_role(sink, Role::Left, left);
+                        attach_role_with_derived_name(sink, Role::Left, left, expression_name_node);
                     }
                     if let Some(right) = node.child_by_field_name("right") {
-                        attach_named_role(sink, Role::Right, right);
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Right,
+                            right,
+                            expression_name_node,
+                        );
                     }
                 }
                 _ => {}
@@ -293,7 +299,12 @@ impl StructuralSpec for JsTsStructuralSpec {
                     if let Some(name) = unquoted_string_span(source) {
                         sink.role_named_span(Role::Module, source, name);
                     } else {
-                        attach_named_role(sink, Role::Module, source);
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Module,
+                            source,
+                            expression_name_node,
+                        );
                     }
                 }
             }
@@ -315,31 +326,30 @@ impl StructuralSpec for JsTsStructuralSpec {
 mod structural_spec_tests {
     use super::*;
 
-    fn assert_kind_table(grammar: tree_sitter::Language, table: &[(&str, NormalizedKind)]) {
-        for (name, kind) in table {
-            assert_ne!(
-                grammar.id_for_node_kind(name, true),
-                0,
-                "node type {name:?} (mapped to {kind:?}) does not exist in grammar"
-            );
-        }
-    }
-
     #[test]
     fn javascript_kind_table_matches_grammar() {
-        assert_kind_table(tree_sitter_javascript::LANGUAGE.into(), JS_KIND_TABLE);
+        crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
+            tree_sitter_javascript::LANGUAGE.into(),
+            "tree-sitter-javascript",
+            JS_KIND_TABLE,
+        );
     }
 
     #[test]
     fn typescript_kind_table_matches_grammar() {
-        assert_kind_table(
+        crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "tree-sitter-typescript",
             TS_KIND_TABLE,
         );
     }
 
     #[test]
     fn tsx_kind_table_matches_grammar() {
-        assert_kind_table(tree_sitter_typescript::LANGUAGE_TSX.into(), TS_KIND_TABLE);
+        crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tree-sitter-tsx",
+            TS_KIND_TABLE,
+        );
     }
 }

@@ -4,6 +4,9 @@
 //! `.agent/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the design.
 
 use crate::analyzer::Language;
+use crate::analyzer::structural::adapter_helpers::{
+    attach_role_with_derived_name, attach_terminal_callee, first_named_child,
+};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, StructuralSpec};
 use tree_sitter::Node;
 
@@ -57,10 +60,6 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     }
 }
 
-fn attach_named_role(sink: &mut RoleSink<'_>, role: Role, target: Node<'_>) {
-    sink.role_maybe_named(role, target, expression_name_node(target));
-}
-
 /// Attach `decorators` edges for a definition wrapped in Python's
 /// `decorated_definition` node (which itself is not normalized).
 fn attach_decorators(sink: &mut RoleSink<'_>, definition: Node<'_>) {
@@ -75,7 +74,7 @@ fn attach_decorators(sink: &mut RoleSink<'_>, definition: Node<'_>) {
             continue;
         };
         if child.kind() == "decorator" {
-            attach_named_role(sink, Role::Decorator, child);
+            attach_role_with_derived_name(sink, Role::Decorator, child, expression_name_node);
         }
     }
 }
@@ -121,18 +120,18 @@ impl StructuralSpec for PythonStructuralSpec {
         match kind {
             NormalizedKind::Call => {
                 if let Some(function) = node.child_by_field_name("function") {
-                    if let Some(name) = expression_name_node(function) {
-                        sink.role_named(Role::Callee, name, name);
-                        // A call's own name is its callee's, so
-                        // { "kind": "call", "name": "eval" } reads naturally.
-                        sink.set_name(name);
-                    } else {
-                        sink.role(Role::Callee, function);
-                    }
+                    // A call's own name is its callee's, so
+                    // { "kind": "call", "name": "eval" } reads naturally.
+                    attach_terminal_callee(sink, function, expression_name_node(function));
                     if function.kind() == "attribute"
                         && let Some(object) = function.child_by_field_name("object")
                     {
-                        attach_named_role(sink, Role::Receiver, object);
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Receiver,
+                            object,
+                            expression_name_node,
+                        );
                     }
                 }
                 if let Some(arguments) = node.child_by_field_name("arguments") {
@@ -150,7 +149,12 @@ impl StructuralSpec for PythonStructuralSpec {
                                     sink.kwarg(keyword, value);
                                 }
                             }
-                            _ => attach_named_role(sink, Role::Arg, argument),
+                            _ => attach_role_with_derived_name(
+                                sink,
+                                Role::Arg,
+                                argument,
+                                expression_name_node,
+                            ),
                         }
                     }
                 }
@@ -161,7 +165,7 @@ impl StructuralSpec for PythonStructuralSpec {
                     sink.role_named(Role::Field, attribute, attribute);
                 }
                 if let Some(object) = node.child_by_field_name("object") {
-                    attach_named_role(sink, Role::Object, object);
+                    attach_role_with_derived_name(sink, Role::Object, object, expression_name_node);
                 }
             }
             NormalizedKind::Function | NormalizedKind::Method | NormalizedKind::Class => {
@@ -172,10 +176,10 @@ impl StructuralSpec for PythonStructuralSpec {
             }
             NormalizedKind::Assignment => {
                 if let Some(left) = node.child_by_field_name("left") {
-                    attach_named_role(sink, Role::Left, left);
+                    attach_role_with_derived_name(sink, Role::Left, left, expression_name_node);
                 }
                 if let Some(right) = node.child_by_field_name("right") {
-                    attach_named_role(sink, Role::Right, right);
+                    attach_role_with_derived_name(sink, Role::Right, right, expression_name_node);
                 }
             }
             NormalizedKind::Import => match node.kind() {
@@ -203,7 +207,7 @@ impl StructuralSpec for PythonStructuralSpec {
             },
             NormalizedKind::Identifier => sink.set_name(node),
             NormalizedKind::Decorator => {
-                if let Some(name) = node.named_child(0).and_then(expression_name_node) {
+                if let Some(name) = first_named_child(node).and_then(expression_name_node) {
                     sink.set_name(name);
                 }
             }
@@ -221,13 +225,10 @@ mod structural_spec_tests {
     /// silently dropping facts.
     #[test]
     fn python_kind_table_matches_grammar() {
-        let grammar: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
-        for (name, kind) in PYTHON_KIND_TABLE {
-            assert_ne!(
-                grammar.id_for_node_kind(name, true),
-                0,
-                "node type {name:?} (mapped to {kind:?}) does not exist in tree-sitter-python"
-            );
-        }
+        crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
+            tree_sitter_python::LANGUAGE.into(),
+            "tree-sitter-python",
+            PYTHON_KIND_TABLE,
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! Normalized structural search (`search_ast`, issue #328).
 //!
 //! Layering, language-independent unless noted:
+//! - [`adapter_helpers`]: small shared mechanics for language adapters.
 //! - [`kinds`]: the normalized node vocabulary with its subtype hierarchy,
 //!   and the role-edge vocabulary.
 //! - [`query`]: the canonical typed query IR and its JSON frontend.
@@ -17,6 +18,7 @@
 //!
 //! See `.agent/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the plan and decisions.
 
+pub(crate) mod adapter_helpers;
 pub mod extract;
 pub mod facts;
 pub mod kinds;

@@ -4,6 +4,10 @@
 //! vocabulary and extracts role edges from AST fields.
 
 use crate::analyzer::Language;
+use crate::analyzer::structural::adapter_helpers::{
+    attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
+    first_named_child,
+};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, StructuralSpec};
 use tree_sitter::Node;
 
@@ -55,10 +59,6 @@ const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("marker_annotation", NormalizedKind::Decorator),
 ];
 
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    node.named_child(0)
-}
-
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression;
     loop {
@@ -77,19 +77,6 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     }
 }
 
-fn attach_named_role(sink: &mut RoleSink<'_>, role: Role, target: Node<'_>) {
-    sink.role_maybe_named(role, target, expression_name_node(target));
-}
-
-fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
-    for index in 0..arguments.named_child_count() {
-        let Some(argument) = arguments.named_child(index) else {
-            continue;
-        };
-        attach_named_role(sink, Role::Arg, argument);
-    }
-}
-
 fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
     for index in 0..declaration.named_child_count() {
         let Some(child) = declaration.named_child(index) else {
@@ -103,7 +90,12 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
                 continue;
             };
             if matches!(modifier_child.kind(), "annotation" | "marker_annotation") {
-                attach_named_role(sink, Role::Decorator, modifier_child);
+                attach_role_with_derived_name(
+                    sink,
+                    Role::Decorator,
+                    modifier_child,
+                    expression_name_node,
+                );
             }
         }
     }
@@ -134,16 +126,25 @@ impl StructuralSpec for JavaStructuralSpec {
                 match node.kind() {
                     "method_invocation" => {
                         if let Some(name) = node.child_by_field_name("name") {
-                            sink.role_named(Role::Callee, name, name);
-                            sink.set_name(name);
+                            attach_terminal_callee(sink, name, Some(name));
                         }
                         if let Some(object) = node.child_by_field_name("object") {
-                            attach_named_role(sink, Role::Receiver, object);
+                            attach_role_with_derived_name(
+                                sink,
+                                Role::Receiver,
+                                object,
+                                expression_name_node,
+                            );
                         }
                     }
                     "object_creation_expression" => {
                         if let Some(type_node) = node.child_by_field_name("type") {
-                            attach_named_role(sink, Role::Callee, type_node);
+                            attach_role_with_derived_name(
+                                sink,
+                                Role::Callee,
+                                type_node,
+                                expression_name_node,
+                            );
                             if let Some(name) = expression_name_node(type_node) {
                                 sink.set_name(name);
                             }
@@ -152,7 +153,7 @@ impl StructuralSpec for JavaStructuralSpec {
                     _ => {}
                 }
                 if let Some(arguments) = node.child_by_field_name("arguments") {
-                    attach_argument_roles(sink, arguments);
+                    attach_positional_argument_roles(sink, arguments, expression_name_node);
                 }
             }
             NormalizedKind::FieldAccess => {
@@ -161,7 +162,7 @@ impl StructuralSpec for JavaStructuralSpec {
                     sink.role_named(Role::Field, field, field);
                 }
                 if let Some(object) = node.child_by_field_name("object") {
-                    attach_named_role(sink, Role::Object, object);
+                    attach_role_with_derived_name(sink, Role::Object, object, expression_name_node);
                 }
             }
             NormalizedKind::Method | NormalizedKind::Constructor | NormalizedKind::Class => {
@@ -177,15 +178,25 @@ impl StructuralSpec for JavaStructuralSpec {
                         sink.role_named(Role::Left, name, name);
                     }
                     if let Some(value) = node.child_by_field_name("value") {
-                        attach_named_role(sink, Role::Right, value);
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Right,
+                            value,
+                            expression_name_node,
+                        );
                     }
                 }
                 "assignment_expression" => {
                     if let Some(left) = node.child_by_field_name("left") {
-                        attach_named_role(sink, Role::Left, left);
+                        attach_role_with_derived_name(sink, Role::Left, left, expression_name_node);
                     }
                     if let Some(right) = node.child_by_field_name("right") {
-                        attach_named_role(sink, Role::Right, right);
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Right,
+                            right,
+                            expression_name_node,
+                        );
                     }
                 }
                 _ => {}
@@ -235,13 +246,10 @@ mod structural_spec_tests {
 
     #[test]
     fn java_kind_table_matches_grammar() {
-        let grammar: tree_sitter::Language = tree_sitter_java::LANGUAGE.into();
-        for (name, kind) in JAVA_KIND_TABLE {
-            assert_ne!(
-                grammar.id_for_node_kind(name, true),
-                0,
-                "node type {name:?} (mapped to {kind:?}) does not exist in tree-sitter-java"
-            );
-        }
+        crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
+            tree_sitter_java::LANGUAGE.into(),
+            "tree-sitter-java",
+            JAVA_KIND_TABLE,
+        );
     }
 }
