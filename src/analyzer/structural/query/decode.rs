@@ -2,7 +2,7 @@ use super::ir::{
     AstQuery, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
     MAX_PATTERN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    Pattern, QueryError, StringPredicate,
+    Pattern, QueryError, SearchAstResultDetail, StringPredicate,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
@@ -23,6 +23,7 @@ impl AstQuery {
                 "inside",
                 "not_inside",
                 "limit",
+                "result_detail",
             ],
         )?;
 
@@ -73,6 +74,10 @@ impl AstQuery {
             None => DEFAULT_LIMIT,
             Some(value) => decode_limit(value, "limit")?,
         };
+        let result_detail = match object.get("result_detail") {
+            None => SearchAstResultDetail::Compact,
+            Some(value) => decode_result_detail(value, "result_detail")?,
+        };
 
         Ok(Self {
             where_globs,
@@ -81,6 +86,7 @@ impl AstQuery {
             inside,
             not_inside,
             limit,
+            result_detail,
         })
     }
 }
@@ -199,6 +205,18 @@ fn decode_limit(value: &Value, path: &str) -> Result<usize, QueryError> {
         ));
     }
     Ok(limit as usize)
+}
+
+fn decode_result_detail(value: &Value, path: &str) -> Result<SearchAstResultDetail, QueryError> {
+    let label = value
+        .as_str()
+        .ok_or_else(|| QueryError::new(path, "expected \"compact\" or \"full\""))?;
+    SearchAstResultDetail::from_label(label).ok_or_else(|| {
+        QueryError::new(
+            path,
+            format!("unknown result detail {label:?}; expected \"compact\" or \"full\""),
+        )
+    })
 }
 
 fn reject_too_long(text: &str, path: &str, max_len: usize, label: &str) -> Result<(), QueryError> {

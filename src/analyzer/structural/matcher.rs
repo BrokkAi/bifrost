@@ -11,15 +11,22 @@
 //! loops and parent links.
 
 use super::facts::{FileFacts, RoleTarget, Span};
-use super::kinds::Role;
+use super::kinds::{NormalizedKind, Role};
 use super::query::{AstQuery, Pattern};
+
+#[derive(Debug)]
+pub(crate) struct CaptureBinding {
+    pub name: String,
+    pub span: Span,
+    pub kind: Option<NormalizedKind>,
+}
 
 /// One match of the query's root pattern: the matched fact plus every capture
 /// collected along the accepted pattern path, in pattern order.
 #[derive(Debug)]
 pub(crate) struct FactMatch {
     pub node: u32,
-    pub captures: Vec<(String, Span)>,
+    pub captures: Vec<CaptureBinding>,
 }
 
 /// Evaluate `query` against one file's facts, in source order, stopping after
@@ -63,7 +70,7 @@ fn eval_containment(
     pattern: &Pattern,
     facts: &FileFacts,
     node: u32,
-    captures: &mut Vec<(String, Span)>,
+    captures: &mut Vec<CaptureBinding>,
 ) -> bool {
     let mut current = facts.node(node).parent;
     while let Some(ancestor) = current {
@@ -82,7 +89,7 @@ fn eval_pattern(
     pattern: &Pattern,
     facts: &FileFacts,
     node: u32,
-    captures: &mut Vec<(String, Span)>,
+    captures: &mut Vec<CaptureBinding>,
 ) -> bool {
     let checkpoint = captures.len();
     if eval_pattern_inner(pattern, facts, node, captures) {
@@ -97,7 +104,7 @@ fn eval_pattern_inner(
     pattern: &Pattern,
     facts: &FileFacts,
     node: u32,
-    captures: &mut Vec<(String, Span)>,
+    captures: &mut Vec<CaptureBinding>,
 ) -> bool {
     eval_pattern_inner_with_name(pattern, facts, node, None, captures)
 }
@@ -107,7 +114,7 @@ fn eval_pattern_inner_with_name(
     facts: &FileFacts,
     node: u32,
     name_override: Option<Span>,
-    captures: &mut Vec<(String, Span)>,
+    captures: &mut Vec<CaptureBinding>,
 ) -> bool {
     let fact = facts.node(node);
     if !pattern.kinds.is_empty() && !pattern.kinds.iter().any(|&kind| fact.kind.satisfies(kind)) {
@@ -204,7 +211,11 @@ fn eval_pattern_inner_with_name(
     }
 
     if let Some(label) = &pattern.capture {
-        captures.push((label.clone(), fact.span()));
+        captures.push(CaptureBinding {
+            name: label.clone(),
+            span: fact.span(),
+            kind: Some(fact.kind),
+        });
     }
     true
 }
@@ -213,7 +224,7 @@ fn some_descendant_matches(
     pattern: &Pattern,
     facts: &FileFacts,
     node: u32,
-    captures: &mut Vec<(String, Span)>,
+    captures: &mut Vec<CaptureBinding>,
 ) -> bool {
     // Facts are stored in pre-order with subtree intervals, so this walks
     // only actual descendants and returns immediately for leaves.
@@ -234,7 +245,7 @@ fn eval_target(
     pattern: &Pattern,
     facts: &FileFacts,
     target: &RoleTarget,
-    captures: &mut Vec<(String, Span)>,
+    captures: &mut Vec<CaptureBinding>,
 ) -> bool {
     let checkpoint = captures.len();
     let matched = match target.node {
@@ -251,7 +262,7 @@ fn eval_span_only(
     pattern: &Pattern,
     facts: &FileFacts,
     target: &RoleTarget,
-    captures: &mut Vec<(String, Span)>,
+    captures: &mut Vec<CaptureBinding>,
 ) -> bool {
     // An un-normalized target has no fact kind: positive kind constraints
     // fail, while `not_kind` is vacuously satisfied (the target provably is
@@ -279,7 +290,11 @@ fn eval_span_only(
         return false;
     }
     if let Some(label) = &pattern.capture {
-        captures.push((label.clone(), target.span));
+        captures.push(CaptureBinding {
+            name: label.clone(),
+            span: target.span,
+            kind: None,
+        });
     }
     true
 }

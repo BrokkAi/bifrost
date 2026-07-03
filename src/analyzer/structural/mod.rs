@@ -38,9 +38,10 @@ pub use query::{
     AstQuery, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
     MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
-    StringPredicate,
+    SearchAstResultDetail, StringPredicate,
 };
 pub use search::{
-    SearchAstExecutionLimits, SearchAstMatch, SearchAstOutput, execute, execute_with_limits,
+    SearchAstCapture, SearchAstExecutionLimits, SearchAstMatch, SearchAstOutput, SearchAstRange,
+    execute, execute_with_limits,
 };
 pub use spec::{RoleSink, StructuralSpec};

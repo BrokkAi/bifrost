@@ -13,7 +13,7 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
 ## Progress
 
 - [x] (2026-07-03T12:27Z) Created this review-remediation ExecPlan from the accepted implementation plan. No runtime behavior has changed yet.
-- [ ] Milestone 1: add opt-in full result detail without changing compact output.
+- [x] (2026-07-03T12:34Z) Milestone 1: added opt-in full result detail without changing compact output. `result_detail` now defaults to compact, full detail adds deterministic match IDs, byte/line/column ranges, capture ranges, and optional capture kinds. Python models parse the optional fields. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`, and the targeted Python client unittest through `uv run --python 3.12 --with maturin`.
 - [ ] Milestone 2: define and expose decorator/annotation span ranges in full detail.
 - [ ] Milestone 3: document capability and precision caveats for humans and LLMs.
 - [ ] Milestone 4: add schema versioning and exact-text duplicate capture equality.
@@ -40,10 +40,14 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
   Rationale: The original plan records the feature implementation history; this plan is specifically about PR review remediation and should remain easier to review milestone by milestone.
   Date/Author: 2026-07-03 / dave + Codex.
 
+- Decision: Make full-detail fields optional on the existing result structs instead of introducing parallel compact/full result types.
+  Rationale: This preserves the current compact JSON shape via serde skip rules and lets Python callers use one model with optional fields.
+  Date/Author: 2026-07-03 / Codex.
+
 
 ## Outcomes & Retrospective
 
-- Not started.
+- 2026-07-03T12:34Z: Milestone 1 completed. Existing compact output remains the default and existing structural tests continue to pass. Callers that request `result_detail: "full"` now get match IDs and precise match/capture ranges suitable for follow-up tooling.
 
 
 ## Context and Orientation

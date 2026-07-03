@@ -69,6 +69,9 @@ fn finds_eval_calls_with_argument_capture() {
     assert_eq!(first.captures.len(), 1);
     assert_eq!(first.captures[0].name, "code");
     assert_eq!(first.captures[0].text, "code");
+    assert!(first.id.is_none());
+    assert!(first.node_range.is_none());
+    assert!(first.captures[0].range.is_none());
     assert_eq!(
         first.enclosing_symbol.as_deref(),
         Some("src.app.handle_request")
@@ -80,6 +83,35 @@ fn finds_eval_calls_with_argument_capture() {
         second.enclosing_symbol.as_deref(),
         Some("src.app.Controller.execute_action")
     );
+}
+
+#[test]
+fn full_result_detail_includes_stable_ranges_and_capture_kind() {
+    let output = run_query(json!({
+        "match": {
+            "kind": "call",
+            "callee": { "name": "eval" },
+            "args": [{ "capture": "code" }]
+        },
+        "result_detail": "full",
+        "limit": 1
+    }));
+
+    let first = &output.matches[0];
+    let id = first.id.as_deref().expect("full detail match id");
+    assert!(id.contains("src/app.py:call:"), "{id}");
+    let range = first.node_range.expect("full detail node range");
+    assert!(range.start_byte < range.end_byte);
+    assert_eq!(range.start_line, first.start_line);
+    assert_eq!(range.end_line, first.end_line);
+    assert!(range.start_column >= 1);
+    assert!(range.end_column >= 1);
+
+    let capture = &first.captures[0];
+    assert_eq!(capture.kind, Some("identifier"));
+    let capture_range = capture.range.expect("full detail capture range");
+    assert_eq!(capture_range.start_line, capture.start_line);
+    assert!(capture_range.end_line >= capture_range.start_line);
 }
 
 #[test]

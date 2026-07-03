@@ -188,11 +188,15 @@ class SearchToolsClient:
         where: list[str] | None = None,
         languages: list[str] | None = None,
         limit: int | None = None,
+        result_detail: str | None = None,
     ) -> SearchAstResult:
         """Search normalized AST structure across supported languages.
 
         ``pattern`` is sent as the tool's ``match`` object. ``where`` accepts
         project-relative globs or absolute in-workspace paths/globs.
+        ``result_detail="full"`` includes byte/line/column ranges and stable
+        match ids for follow-up tooling; the default compact mode is optimized
+        for small LLM contexts.
         """
         arguments: dict[str, Any] = {"match": pattern}
         if inside is not None:
@@ -205,6 +209,8 @@ class SearchToolsClient:
             arguments["languages"] = list(languages)
         if limit is not None:
             arguments["limit"] = limit
+        if result_detail is not None:
+            arguments["result_detail"] = result_detail
         payload = self._call_tool_payload("search_ast", arguments)
         return SearchAstResult.from_dict(
             payload.structured,

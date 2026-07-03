@@ -151,10 +151,33 @@ class SearchSymbolsResult:
 
 
 @dataclass(frozen=True)
+class SearchAstRange:
+    start_byte: int
+    end_byte: int
+    start_line: int
+    start_column: int
+    end_line: int
+    end_column: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SearchAstRange:
+        return cls(
+            start_byte=int(data["start_byte"]),
+            end_byte=int(data["end_byte"]),
+            start_line=int(data["start_line"]),
+            start_column=int(data["start_column"]),
+            end_line=int(data["end_line"]),
+            end_column=int(data["end_column"]),
+        )
+
+
+@dataclass(frozen=True)
 class SearchAstCapture:
     name: str
     text: str
     start_line: int
+    range: SearchAstRange | None = None
+    kind: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> SearchAstCapture:
@@ -162,6 +185,8 @@ class SearchAstCapture:
             name=data["name"],
             text=data["text"],
             start_line=int(data["start_line"]),
+            range=SearchAstRange.from_dict(data["range"]) if "range" in data else None,
+            kind=data.get("kind"),
         )
 
     def render_text(self) -> str:
@@ -177,6 +202,10 @@ class SearchAstMatch:
     end_line: int
     text: str
     captures: list[SearchAstCapture]
+    id: str | None = None
+    node_range: SearchAstRange | None = None
+    decorated_range: SearchAstRange | None = None
+    decorator_ranges: list[SearchAstRange] = field(default_factory=list)
     enclosing_symbol: str | None = None
 
     @classmethod
@@ -190,6 +219,17 @@ class SearchAstMatch:
             text=data["text"],
             captures=[
                 SearchAstCapture.from_dict(item) for item in data.get("captures", [])
+            ],
+            id=data.get("id"),
+            node_range=SearchAstRange.from_dict(data["node_range"])
+            if "node_range" in data
+            else None,
+            decorated_range=SearchAstRange.from_dict(data["decorated_range"])
+            if "decorated_range" in data
+            else None,
+            decorator_ranges=[
+                SearchAstRange.from_dict(item)
+                for item in data.get("decorator_ranges", [])
             ],
             enclosing_symbol=data.get("enclosing_symbol"),
         )

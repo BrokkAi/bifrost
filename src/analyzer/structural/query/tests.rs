@@ -100,6 +100,24 @@ fn parses_receiver_kwargs_and_regex_predicates() {
 }
 
 #[test]
+fn parses_result_detail_mode() {
+    let query = parse_ok(json!({
+        "match": { "kind": "call" },
+        "result_detail": "full"
+    }));
+    assert_eq!(query.result_detail, SearchAstResultDetail::Full);
+
+    let defaulted = parse_ok(json!({ "match": { "kind": "call" } }));
+    assert_eq!(defaulted.result_detail, SearchAstResultDetail::Compact);
+
+    let error = error_of(json!({
+        "match": { "kind": "call" },
+        "result_detail": "verbose"
+    }));
+    assert_eq!(error.path, "result_detail");
+}
+
+#[test]
 fn canonical_json_round_trips() {
     let original = json!({
         "where": ["src/**/*.py"],

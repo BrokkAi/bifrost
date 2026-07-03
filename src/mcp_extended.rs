@@ -81,6 +81,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minimum": 1,
                         "maximum": MAX_LIMIT,
                         "description": "Maximum number of matches to return."
+                    },
+                    "result_detail": {
+                        "type": "string",
+                        "enum": ["compact", "full"],
+                        "default": "compact",
+                        "description": "Use compact for context-efficient snippets and line ranges. Use full when follow-up tools need deterministic match IDs, byte/line/column ranges, decorator ranges, and capture ranges."
                     }
                 },
                 "required": ["match"]

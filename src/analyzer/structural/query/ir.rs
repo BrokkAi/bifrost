@@ -17,6 +17,33 @@ pub const MAX_STRING_PREDICATE_LENGTH: usize = 4096;
 pub const MAX_CAPTURE_LENGTH: usize = 128;
 pub const MAX_KWARG_NAME_LENGTH: usize = 128;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchAstResultDetail {
+    Compact,
+    Full,
+}
+
+impl SearchAstResultDetail {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "compact" => Some(Self::Compact),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub fn is_compact(self) -> bool {
+        matches!(self, Self::Compact)
+    }
+}
+
 /// A structural query: one root pattern plus containment constraints and
 /// workspace scoping. This is the semantic authority both syntaxes parse into.
 #[derive(Debug, Clone)]
@@ -31,6 +58,7 @@ pub struct AstQuery {
     /// Verifier-only negative containment: never used for candidate pruning.
     pub not_inside: Option<Pattern>,
     pub limit: usize,
+    pub result_detail: SearchAstResultDetail,
 }
 
 /// Predicate over a string attribute of a fact (its name or source text).

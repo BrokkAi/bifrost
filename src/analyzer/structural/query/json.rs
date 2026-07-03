@@ -38,6 +38,10 @@ impl AstQuery {
             object.insert("not_inside".to_string(), pattern_to_json(pattern));
         }
         object.insert("limit".to_string(), json!(self.limit));
+        object.insert(
+            "result_detail".to_string(),
+            json!(self.result_detail.label()),
+        );
         Value::Object(object)
     }
 }

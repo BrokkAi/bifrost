@@ -116,6 +116,18 @@ impl FileFacts {
         self.line_starts.partition_point(|&start| start <= byte)
     }
 
+    pub fn line_column_of_byte(&self, byte: usize) -> (usize, usize) {
+        let bounded = byte.min(self.source.len());
+        let mut boundary = bounded;
+        while boundary > 0 && !self.source.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let line = self.line_of_byte(boundary);
+        let line_start = *self.line_starts.get(line.saturating_sub(1)).unwrap_or(&0);
+        let prefix = self.source.get(line_start..boundary).unwrap_or("");
+        (line, prefix.chars().count() + 1)
+    }
+
     /// Rough heap footprint for the facts-cache weigher; exactness doesn't
     /// matter, monotonicity with actual size does.
     pub fn estimated_bytes(&self) -> u64 {

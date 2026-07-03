@@ -6,10 +6,11 @@
 //! `limit` matches with captures, enclosing symbols, and capability
 //! diagnostics.
 
-use super::facts::FileFacts;
+use super::facts::{FileFacts, Span};
+use super::kinds::Role;
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
-use super::query::AstQuery;
+use super::query::{AstQuery, SearchAstResultDetail};
 use crate::analyzer::structural::capabilities::QueryFeature;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::path_utils::rel_path_string;
@@ -40,6 +41,14 @@ pub struct SearchAstMatch {
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_range: Option<SearchAstRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decorated_range: Option<SearchAstRange>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub decorator_ranges: Vec<SearchAstRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub captures: Vec<SearchAstCapture>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -51,6 +60,20 @@ pub struct SearchAstCapture {
     pub name: String,
     pub text: String,
     pub start_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<SearchAstRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SearchAstRange {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,7 +240,14 @@ pub fn execute_with_limits(
     let matches = pending
         .into_iter()
         .map(|(language, file, facts, fact_match)| {
-            render_match(analyzer, language, &file, &facts, &fact_match)
+            render_match(
+                analyzer,
+                language,
+                &file,
+                &facts,
+                &fact_match,
+                query.result_detail,
+            )
         })
         .collect();
 
@@ -265,28 +295,80 @@ fn render_match(
     file: &ProjectFile,
     facts: &FileFacts,
     fact_match: &FactMatch,
+    detail: SearchAstResultDetail,
 ) -> SearchAstMatch {
     let fact = facts.node(fact_match.node);
+    let full_detail = matches!(detail, SearchAstResultDetail::Full);
+    let path = rel_path_string(file);
     let captures = fact_match
         .captures
         .iter()
-        .map(|(name, span)| SearchAstCapture {
-            name: name.clone(),
-            text: snippet(span.text(facts.source())),
-            start_line: facts.line_of_byte(span.start_byte),
+        .map(|capture| SearchAstCapture {
+            name: capture.name.clone(),
+            text: snippet(capture.span.text(facts.source())),
+            start_line: facts.line_of_byte(capture.span.start_byte),
+            range: full_detail.then(|| range_for_span(facts, capture.span)),
+            kind: if full_detail {
+                capture.kind.map(|kind| kind.label())
+            } else {
+                None
+            },
         })
         .collect();
+    let node_range = full_detail.then(|| range_for_span(facts, fact.span()));
+    let decorator_spans: Vec<_> = if full_detail {
+        fact.role_targets(Role::Decorator)
+            .map(|target| target.span)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let decorator_ranges = decorator_spans
+        .iter()
+        .map(|&span| range_for_span(facts, span))
+        .collect::<Vec<_>>();
+    let decorated_range = if full_detail && !decorator_spans.is_empty() {
+        let mut decorated = fact.span();
+        for span in decorator_spans {
+            decorated.start_byte = decorated.start_byte.min(span.start_byte);
+            decorated.end_byte = decorated.end_byte.max(span.end_byte);
+        }
+        Some(range_for_span(facts, decorated))
+    } else {
+        None
+    };
     SearchAstMatch {
-        path: rel_path_string(file),
+        id: full_detail.then(|| match_id(&path, fact.kind.label(), fact.span())),
+        path,
         language: language.config_label(),
         kind: fact.kind.label(),
         start_line: fact.range.start_line,
         end_line: fact.range.end_line,
         text: snippet(fact.span().text(facts.source())),
+        node_range,
+        decorated_range,
+        decorator_ranges,
         captures,
         enclosing_symbol: analyzer
             .enclosing_code_unit_for_lines(file, fact.range.start_line, fact.range.end_line)
             .map(|code_unit| code_unit.fq_name()),
+    }
+}
+
+fn match_id(path: &str, kind: &str, span: Span) -> String {
+    format!("{path}:{kind}:{}-{}", span.start_byte, span.end_byte)
+}
+
+fn range_for_span(facts: &FileFacts, span: Span) -> SearchAstRange {
+    let (start_line, start_column) = facts.line_column_of_byte(span.start_byte);
+    let (end_line, end_column) = facts.line_column_of_byte(span.end_byte);
+    SearchAstRange {
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        start_line,
+        start_column,
+        end_line,
+        end_column,
     }
 }
 
