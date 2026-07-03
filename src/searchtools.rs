@@ -4667,7 +4667,10 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
                     end_line,
                     text,
                     presentation: None,
-                    note: None,
+                    note: Some(
+                        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body, or use get_summaries for structured summaries"
+                            .to_string(),
+                    ),
                 });
             }
 

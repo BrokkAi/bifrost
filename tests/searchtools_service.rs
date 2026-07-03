@@ -1017,9 +1017,19 @@ class Thing {
     assert!(source_text.contains("- Thing"), "{source_text}");
     assert!(!source_text.contains("method"), "{source_text}");
     assert!(!source_text.contains("Inner"), "{source_text}");
+    assert_eq!(
+        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body, or use get_summaries for structured summaries",
+        source["note"]
+    );
 
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(rendered.contains("## src/pkg/Thing.java"), "{rendered}");
+    assert!(
+        rendered.contains(
+            "- Note: file target: showing a flat outline of top-level symbols, not the full source"
+        ),
+        "{rendered}"
+    );
     assert!(
         rendered.contains("- Location: src/pkg/Thing.java:1..2"),
         "{rendered}"
