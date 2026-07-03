@@ -307,6 +307,7 @@ mod tests {
         expected.extend(workspace_tool_names());
         expected.extend(
             [
+                "search_ast",
                 "get_symbol_locations",
                 "get_symbol_ancestors",
                 "find_filenames",

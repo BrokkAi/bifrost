@@ -25,7 +25,10 @@ use super::extractor::{first_generic_type_argument, type_node_last_segment};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdges, build_edges, parse_and_collect,
 };
-use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext};
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+use crate::analyzer::{
+    DefinitionLookupIndex, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
+};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -41,6 +44,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = rust.get_analyzed_files().into_iter().collect();
+    let support = analyzer.definition_lookup_index();
     let language = tree_sitter_rust::LANGUAGE.into();
     build_edges(&files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
@@ -54,6 +58,8 @@ where
                 &refs,
             );
             let mut ctx = RustScan {
+                rust,
+                support,
                 source: parsed.source.as_str(),
                 refs,
                 factory_returns,
@@ -66,6 +72,8 @@ where
 }
 
 struct RustScan<'a, 'b> {
+    rust: &'a RustAnalyzer,
+    support: &'a DefinitionLookupIndex,
     source: &'a str,
     refs: Arc<RustReferenceContext>,
     factory_returns: HashMap<String, String>,
@@ -84,7 +92,17 @@ impl RustScan<'_, '_> {
     /// The callee fqn a `path::name` refers to: a module function via a namespace
     /// import, or an associated function on an imported / same-file type.
     fn scoped_callee(&self, path: &str, name: &str) -> Option<String> {
-        self.refs.resolve_scoped(path, name)
+        match super::resolve_scoped_associated_item(self.rust, self.support, &self.refs, path, name)
+        {
+            ReceiverAnalysisOutcome::Precise(mut candidates) if candidates.len() == 1 => {
+                candidates.pop().map(|candidate| candidate.fq_name())
+            }
+            ReceiverAnalysisOutcome::Precise(_)
+            | ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unknown
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => None,
+        }
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {

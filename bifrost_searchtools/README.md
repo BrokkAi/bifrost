@@ -62,6 +62,7 @@ exposes:
 | Method | Purpose |
 | --- | --- |
 | `search_symbols(patterns, *, include_tests=False, limit=20)` | Find symbols by name pattern. |
+| `search_ast(pattern, *, inside=None, not_inside=None, where=None, languages=None, limit=None, result_detail=None, schema_version=None)` | Search normalized AST structure across supported languages. |
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
@@ -109,6 +110,39 @@ The git tools return a `GitTextResult` (`.text`), the slopcop tools return a
 `CodeQualityReport` (`.report`), and the rest return structured dataclasses from
 `bifrost_searchtools.models`. The per-rule tuning knobs on the smell reports are
 passed through `options` (keys map 1:1 to the Rust tool arguments).
+
+## `search_ast` detail and ranges
+
+`search_ast` is an experimental v1 query surface. Omit `schema_version` for v1
+or pass `schema_version=1` explicitly when callers want to pin the shape.
+Compact output is the default: matches include project-relative path, language,
+normalized kind, line range, a short snippet, captures, and an enclosing symbol
+when available. Pass `result_detail="full"` when a rule, refactoring step, or
+follow-up tool call needs precise locations. Full detail adds deterministic
+match ids plus byte offsets and 1-based character columns for matches and
+captures.
+
+For decorated or annotated declarations, `node_range` is the matched normalized
+node's parser-backed range. `decorator_ranges` are the decorator or annotation
+role spans extracted by the language adapter. `decorated_range` is the union of
+`node_range` and those decorator ranges. Matching semantics are unchanged by
+requesting full detail; these fields only make the span policy explicit.
+
+### Current structural precision
+
+`search_ast` normalizes common syntax across Python, Java, JavaScript, and
+TypeScript, but it is still a syntactic structural search tool. Use these
+caveats when writing reusable rules or prompts:
+
+| Area | Current behavior |
+| --- | --- |
+| Constructor calls | Java object creation and JS/TS `new` expressions are normalized as `call`; constructors are also refined as `constructor` declarations where the adapter can identify them. |
+| Keyword arguments | Python supports `kwargs`; Java, JavaScript, and TypeScript currently report unsupported-role diagnostics for `kwargs`. |
+| Imports and aliases | Import matching is based on syntactic module/import spans. It does not resolve aliases or follow re-exports. |
+| Receiver and callee | `callee.name` and `receiver.name` are derived from AST fields and terminal names, not type resolution. Chained calls stay syntactic. |
+| Decorators and annotations | Decorators/annotations are exposed through the `decorators` role. Full detail reports `node_range`, `decorator_ranges`, and `decorated_range`. |
+| Positional arguments | `args` patterns match positional arguments in order as a subsequence; v1 does not require exact positions or arity. |
+| Unsupported capabilities | Queries against unsupported normalized kinds or roles return diagnostics instead of silently pretending the language can answer them. |
 
 ## Semantic search
 

@@ -243,17 +243,10 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     ) {
         return;
     }
-    let hit_node = if is_declaration_name(node) {
-        let Some(scope) = out_of_line_member_qualifier_scope(node) else {
-            return;
-        };
-        scope
-    } else {
-        if is_out_of_line_member_qualifier_scope_child(node) {
-            return;
-        }
-        node
-    };
+    if is_declaration_name(node) {
+        return;
+    }
+    let hit_node = node;
     let text = node_text(hit_node, ctx.source);
     if !name_mentions(text, &ctx.spec.member_name)
         && !ctx
@@ -271,46 +264,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
         *ctx.saw_unproven_match = true;
     }
-}
-
-fn out_of_line_member_qualifier_scope(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() != "qualified_identifier" || !is_qualified_member_declarator(node) {
-        return None;
-    }
-    node.child_by_field_name("scope").filter(|scope| {
-        matches!(
-            scope.kind(),
-            "namespace_identifier"
-                | "type_identifier"
-                | "qualified_identifier"
-                | "scoped_type_identifier"
-                | "template_type"
-        )
-    })
-}
-
-fn is_out_of_line_member_qualifier_scope_child(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "qualified_identifier"
-            && parent.child_by_field_name("scope") == Some(node)
-            && is_qualified_member_declarator(parent)
-    })
-}
-
-fn is_qualified_member_declarator(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    matches!(
-        parent.kind(),
-        "function_declarator" | "pointer_declarator" | "reference_declarator"
-    ) && parent
-        .child_by_field_name("declarator")
-        .is_some_and(|declarator| declarator == node || declarator_contains(declarator, node))
-}
-
-fn declarator_contains(parent: Node<'_>, child: Node<'_>) -> bool {
-    parent.start_byte() <= child.start_byte() && child.end_byte() <= parent.end_byte()
 }
 
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

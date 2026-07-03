@@ -1319,6 +1319,139 @@ extension (target: Target) {
 }
 
 #[test]
+fn scala_graph_connects_trait_methods_to_overrides_and_receiver_calls() {
+    let workflow_source = r#"
+package example
+
+trait Renderer {
+  def render(value: String): String
+}
+
+class ConsoleRenderer extends Renderer {
+  override def render(value: String): String = value.trim
+  def render(): String = "empty"
+}
+
+class OtherRenderer {
+  def render(value: String): String = value
+}
+
+class Workflow(renderer: Renderer, console: ConsoleRenderer, other: OtherRenderer) {
+  def viaTrait(value: String): String = renderer.render(value)
+  def viaConcrete(value: String): String = console.render(value)
+  def overload(): String = console.render()
+  def unrelated(value: String): String = other.render(value)
+}
+
+object ConsoleRenderer {
+  def default: ConsoleRenderer = new ConsoleRenderer()
+}
+
+object App {
+  import ConsoleRenderer.{default => renderer}
+
+  val direct = renderer.render("  ok ")
+}
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("example/Workflow.scala", workflow_source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let render = definition(&analyzer, "example.Renderer.render");
+    let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&render),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&hits, line_of(workflow_source, "override def render"));
+    assert_hit_line(&hits, line_of(workflow_source, "renderer.render(value)"));
+    assert_hit_line(&hits, line_of(workflow_source, "console.render(value)"));
+    assert_hit_line(&hits, line_of(workflow_source, "val direct"));
+    assert_no_hit_in_enclosing(&hits, "example.Workflow.overload");
+    assert_no_hit_in_enclosing(&hits, "example.Workflow.unrelated");
+}
+
+#[test]
+fn scala_graph_keeps_class_methods_exact_owner() {
+    let source = r#"
+package exact
+
+class Base {
+  def run(value: String): String = value
+}
+
+class Child extends Base {
+  override def run(value: String): String = value.trim
+}
+
+class Workflow(base: Base, child: Child) {
+  def viaBase(value: String): String = base.run(value)
+  def viaChild(value: String): String = child.run(value)
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("exact/Workflow.scala", source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let run = definition(&analyzer, "exact.Base.run");
+    let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&hits, line_of(source, "base.run(value)"));
+    assert_no_hit_contains(&hits, "override def run");
+    assert_no_hit_in_enclosing(&hits, "exact.Workflow.viaChild");
+}
+
+#[test]
+fn scala_graph_rejects_unrelated_factory_return_types() {
+    let api_source = r#"
+package api
+
+trait Renderer {
+  def render(value: String): String
+}
+
+object Factory {
+  def default: Renderer = ???
+}
+"#;
+    let app_source = r#"
+package app
+
+class Renderer {
+  def render(value: String): String = value
+}
+
+object Factory {
+  def default: Renderer = new Renderer()
+}
+
+object Consumer {
+  import Factory.{default => renderer}
+
+  val direct = renderer.render("ok")
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("api/Renderer.scala", api_source),
+        ("app/Consumer.scala", app_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let render = definition(&analyzer, "api.Renderer.render");
+    let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&render),
+        &candidates,
+        1000,
+    ));
+
+    assert_no_hit_contains(&hits, "renderer.render");
+}
+
+#[test]
 fn scala_usage_finder_finds_imported_top_level_members_by_default() {
     let consumer_source = r#"
 package app

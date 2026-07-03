@@ -32,6 +32,7 @@ pub fn normalize_tool_arguments(
         "find_filenames" => {
             normalize_string_array_field(&mut arguments, "patterns", workspace_root)?
         }
+        "search_ast" => normalize_string_array_field(&mut arguments, "where", workspace_root)?,
         "search_file_contents" | "jq" | "xml_skim" | "xml_select" => {
             normalize_optional_string_field(&mut arguments, "file_path", workspace_root)?
         }
@@ -126,6 +127,12 @@ pub fn normalize_tool_arguments_for_cli(
         "find_filenames" => normalize_cli_string_array_field(
             &mut arguments,
             "patterns",
+            workspace_root,
+            &mut overlays,
+        )?,
+        "search_ast" => normalize_cli_string_array_field(
+            &mut arguments,
+            "where",
             workspace_root,
             &mut overlays,
         )?,
@@ -511,6 +518,13 @@ fn path_to_slash_string(path: &Path) -> String {
 }
 
 fn slash_string(path: &str) -> String {
+    let path = if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{rest}")
+    } else if let Some(rest) = path.strip_prefix("\\\\?\\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    };
     path.replace('\\', "/")
 }
 
@@ -524,7 +538,7 @@ fn outside_workspace_error(raw: &str, workspace_root: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_tool_arguments;
+    use super::{normalize_tool_arguments, normalize_tool_arguments_for_cli};
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -621,6 +635,60 @@ mod tests {
         .expect("normalize");
 
         assert_eq!(normalized["file_patterns"][0], "src/**/*.rs");
+    }
+
+    #[test]
+    fn normalizes_search_ast_absolute_where_globs() {
+        let root = TempDir::new().expect("temp dir");
+        let raw = format!("{}/src/**/*.py", root.path().display());
+
+        let normalized = normalize_tool_arguments(
+            "search_ast",
+            json!({
+                "where": [raw],
+                "match": { "kind": "call" }
+            }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["where"][0], "src/**/*.py");
+    }
+
+    #[test]
+    fn normalizes_search_ast_absolute_where_globs_for_cli() {
+        let root = TempDir::new().expect("temp dir");
+        let raw = format!("{}/src/**/*.py", root.path().display());
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "search_ast",
+            json!({
+                "where": [raw],
+                "match": { "kind": "call" }
+            }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert!(overlays.is_empty());
+        assert_eq!(normalized["where"][0], "src/**/*.py");
+    }
+
+    #[test]
+    fn normalizes_search_ast_windows_absolute_where_globs_against_verbatim_root() {
+        let root = Path::new(r"\\?\C:\work\root");
+
+        let normalized = normalize_tool_arguments(
+            "search_ast",
+            json!({
+                "where": [r"C:\work\root\src\*.java"],
+                "match": { "kind": "class" }
+            }),
+            root,
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["where"][0], "src/*.java");
     }
 
     #[test]

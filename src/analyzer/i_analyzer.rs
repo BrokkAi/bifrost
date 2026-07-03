@@ -175,6 +175,16 @@ pub trait IAnalyzer: Send + Sync + Any {
         None
     }
 
+    /// Per-language structural-search capabilities (issue #328), one provider
+    /// per language whose adapter has a structural spec. Languages without a
+    /// spec are absent; `search_ast` reports them as capability diagnostics
+    /// instead of silently returning nothing.
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        Vec::new()
+    }
+
     fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {
         if query.is_empty() {
             return Vec::new();

@@ -52,9 +52,15 @@ pub(super) fn resolve_rust(
     {
         let resolved = rust_focused_scoped_segment_candidates(rust, support, file, site)
             .unwrap_or_else(|| {
-                refs.resolve_scoped(path, name)
-                    .map(|fqn| support.fqn(&fqn))
-                    .unwrap_or_default()
+                match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
+                    rust, support, &refs, path, name,
+                ) {
+                    ReceiverAnalysisOutcome::Precise(candidates) => candidates,
+                    ReceiverAnalysisOutcome::Ambiguous(_)
+                    | ReceiverAnalysisOutcome::Unknown
+                    | ReceiverAnalysisOutcome::Unsupported { .. }
+                    | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+                }
             });
         (resolved, true)
     } else {

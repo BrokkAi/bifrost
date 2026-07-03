@@ -131,19 +131,24 @@ impl ScalaAnalyzer {
         }
     }
 
+    pub(crate) fn is_scala_trait_declaration(&self, code_unit: &CodeUnit) -> bool {
+        if !code_unit.is_class() {
+            return false;
+        }
+        let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
+            return false;
+        };
+        let Some(tree) = parse_scala_source(&source) else {
+            return false;
+        };
+        declaration_node_for_unit(tree.root_node(), &source, code_unit, self)
+            .is_some_and(|node| node.kind() == "trait_definition")
+    }
+
     fn scala_trait_fqns(&self) -> HashSet<String> {
         self.all_declarations()
             .filter(|unit| unit.is_class())
-            .filter(|unit| {
-                let Ok(source) = self.inner.project().read_source(unit.source()) else {
-                    return false;
-                };
-                let Some(tree) = parse_scala_source(&source) else {
-                    return false;
-                };
-                declaration_node_for_unit(tree.root_node(), &source, unit, self)
-                    .is_some_and(|node| node.kind() == "trait_definition")
-            })
+            .filter(|unit| self.is_scala_trait_declaration(unit))
             .map(|unit| unit.fq_name())
             .collect()
     }

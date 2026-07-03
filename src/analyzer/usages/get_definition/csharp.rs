@@ -189,7 +189,7 @@ fn csharp_type_lookup_node_resolution(
         let reference = csharp_reference_type_text(node, source);
         return csharp_type_candidates_resolution_with_kind(
             &reference,
-            csharp_visible_type_candidates(csharp, file, &reference),
+            csharp_visible_type_output_candidates(csharp, file, &reference),
             TypeLookupTargetKind::TypeReference,
         );
     }
@@ -333,7 +333,7 @@ fn csharp_type_node_resolution(
 ) -> Option<CSharpTypeLookupResolution> {
     csharp_type_candidates_resolution_with_kind(
         reference,
-        csharp_visible_type_candidates(csharp, file, reference),
+        csharp_visible_type_output_candidates(csharp, file, reference),
         TypeLookupTargetKind::ValueExpression,
     )
 }
@@ -473,7 +473,7 @@ fn csharp_seed_symbol_for_type(
         return;
     }
     let reference = csharp_reference_type_text(type_node, source);
-    let candidates = csharp_visible_type_candidates(csharp, file, &reference);
+    let candidates = csharp_logical_visible_type_candidates(csharp, file, &reference);
     if candidates.is_empty() {
         bindings.declare_shadow(binding_name);
     } else {
@@ -592,7 +592,7 @@ fn resolve_csharp_constructor(
     if csharp.using_aliases_of(file).contains_key(&reference) {
         return csharp_type_outcome(csharp, support, file, &reference);
     }
-    let owners = csharp_visible_type_candidates(csharp, file, &reference);
+    let owners = csharp_logical_visible_type_candidates(csharp, file, &reference);
     let mut constructors = Vec::new();
     for owner in &owners {
         constructors.extend(support.fqn(&format!("{}.{}", owner.fq_name(), owner.identifier())));
@@ -615,7 +615,7 @@ fn csharp_type_outcome(
     file: &ProjectFile,
     reference: &str,
 ) -> DefinitionLookupOutcome {
-    let mut candidates = csharp_visible_type_candidates(csharp, file, reference);
+    let mut candidates = csharp_visible_type_output_candidates(csharp, file, reference);
     if candidates.is_empty() {
         candidates = support.fqn(reference);
     }
@@ -648,8 +648,24 @@ fn csharp_member_outcome(
     };
 
     let mut direct_candidates = Vec::new();
-    for owner in &owners {
-        direct_candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+    if let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) {
+        let mut seen_owner_fqns = HashSet::default();
+        for owner in &owners {
+            let mut parts = csharp.partial_type_parts(owner);
+            if parts.is_empty() {
+                parts.push(owner.clone());
+            }
+            for part in parts {
+                let owner_fqn = part.fq_name();
+                if seen_owner_fqns.insert(owner_fqn.clone()) {
+                    direct_candidates.extend(support.fqn(&format!("{owner_fqn}.{member}")));
+                }
+            }
+        }
+    } else {
+        for owner in &owners {
+            direct_candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+        }
     }
     sort_units(&mut direct_candidates);
     direct_candidates.dedup();
@@ -785,7 +801,7 @@ fn csharp_receiver_type_units(
                     analyzer, csharp, support, file, receiver, name,
                 );
                 if candidates.is_empty() {
-                    candidates = csharp_visible_type_candidates(csharp, file, name);
+                    candidates = csharp_logical_visible_type_candidates(csharp, file, name);
                 }
                 candidates
             }
@@ -802,13 +818,17 @@ fn csharp_receiver_type_units(
             .into_iter()
             .collect(),
         "qualified_name" | "generic_name" => {
-            csharp_visible_type_candidates(csharp, file, csharp_node_text(receiver, source))
+            csharp_logical_visible_type_candidates(csharp, file, csharp_node_text(receiver, source))
         }
         // `new Foo().Member` — the receiver is typed by the class being constructed.
         "object_creation_expression" => receiver
             .child_by_field_name("type")
             .map(|type_node| {
-                csharp_visible_type_candidates(csharp, file, csharp_node_text(type_node, source))
+                csharp_logical_visible_type_candidates(
+                    csharp,
+                    file,
+                    csharp_node_text(type_node, source),
+                )
             })
             .unwrap_or_default(),
         // `GetFoo().Member` / `obj.GetFoo().Member` — the receiver is typed by the
@@ -943,14 +963,24 @@ fn csharp_collect_member_type_units(
     }
 }
 
-fn csharp_visible_type_candidates(
+fn csharp_visible_type_output_candidates(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
     let mut candidates = csharp.visible_type_candidates(file, name);
-    sort_units(&mut candidates);
+    csharp.sort_type_candidates(&mut candidates);
     candidates.dedup();
+    candidates
+}
+
+fn csharp_logical_visible_type_candidates(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = csharp.visible_type_candidates(file, name);
+    csharp.sort_dedup_type_candidates(&mut candidates);
     candidates
 }
 

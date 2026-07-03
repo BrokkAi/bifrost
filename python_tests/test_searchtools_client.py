@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bifrost_searchtools import (
+    SearchAstResult,
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
@@ -130,6 +131,41 @@ class SearchToolsClientTest(unittest.TestCase):
             [(site.path, site.line) for site in twice_edge.sites],
             [("b.py", 14), ("b.py", 15)],
         )
+
+    def test_search_ast_returns_typed_matches(self) -> None:
+        absolute_where = str(self.fixture_root / "*.java")
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.search_ast(
+                {"kind": "class", "name": "A"},
+                where=[absolute_where],
+                languages=["java"],
+                schema_version=1,
+            )
+
+        self.assertIsInstance(result, SearchAstResult)
+        self.assertEqual(result.count, 1)
+        self.assertEqual(result.matches[0].path, "A.java")
+        self.assertEqual(result.matches[0].kind, "class")
+        self.assertEqual(result.matches[0].language, "java")
+        self.assertEqual(result.matches[0].text, "public class A {…")
+        self.assertIsNone(result.matches[0].id)
+        self.assertIsNone(result.matches[0].node_range)
+        self.assertEqual(result.diagnostics, [])
+
+        with SearchToolsClient(root=self.fixture_root) as client:
+            detailed = client.search_ast(
+                {"kind": "class", "name": "A", "capture": "klass"},
+                where=[absolute_where],
+                languages=["java"],
+                result_detail="full",
+            )
+
+        self.assertIsNotNone(detailed.matches[0].id)
+        self.assertIsNotNone(detailed.matches[0].node_range)
+        self.assertGreater(detailed.matches[0].node_range.end_byte, detailed.matches[0].node_range.start_byte)
+        self.assertEqual(detailed.matches[0].captures[0].kind, "class")
+        self.assertIsNotNone(detailed.matches[0].captures[0].range)
+        self.assertGreaterEqual(detailed.matches[0].captures[0].range.end_line, detailed.matches[0].captures[0].start_line)
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

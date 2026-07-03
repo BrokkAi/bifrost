@@ -143,4 +143,8 @@ impl LanguageAdapter for JavaAdapter {
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&JAVA_COGNITIVE_CONFIG)
     }
+
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::JAVA_STRUCTURAL_SPEC)
+    }
 }
