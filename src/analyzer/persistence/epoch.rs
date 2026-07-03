@@ -297,17 +297,19 @@ lang_epoch!(
     "treesitter/cpp/",
     "synthetic-file-scope-code-units-2026-07"
 );
+// JS/TS salts bumped: anonymous `export default` expressions/declarations now
+// emit a synthetic `default` code unit, changing each file's persisted unit set.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07"
 );
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07"
 );
 lang_epoch!(
     Python,

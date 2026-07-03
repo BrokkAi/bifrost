@@ -853,17 +853,148 @@ fn visit_ts_export(
             | "interface_declaration"
             | "enum_declaration"
             | "internal_module" => {
-                visit_ts_class_like(file, source, node, parent, parsed, true);
+                if matches!(
+                    declaration.kind(),
+                    "class_declaration" | "abstract_class_declaration"
+                ) && declaration.child_by_field_name("name").is_none()
+                    && ts_export_is_default(node, source)
+                    && parent.is_none()
+                {
+                    visit_ts_default_export_class(file, source, node, declaration, parsed);
+                } else {
+                    visit_ts_class_like(file, source, node, parent, parsed, true);
+                }
             }
             "function_declaration" | "function_signature" => {
-                visit_ts_function(file, source, node, parent, parsed, true);
+                if declaration.kind() == "function_declaration"
+                    && declaration.child_by_field_name("name").is_none()
+                    && ts_export_is_default(node, source)
+                    && parent.is_none()
+                {
+                    visit_ts_default_export_function(file, source, node, declaration, parsed);
+                } else {
+                    visit_ts_function(file, source, node, parent, parsed, true);
+                }
             }
             "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
                 visit_ts_value(file, source, node, parent, parsed, true);
             }
             _ => {}
         }
+    } else if parent.is_none()
+        && let Some(value) = node.child_by_field_name("value")
+    {
+        visit_ts_default_export_value(file, source, node, value, parsed);
     }
+}
+
+fn ts_export_is_default(node: Node<'_>, source: &str) -> bool {
+    (0..node.child_count()).any(|index| {
+        node.child(index)
+            .is_some_and(|child| child.kind() == "default" || node_text(child, source) == "default")
+    })
+}
+
+fn visit_ts_default_export_value(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'_>,
+    value: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    match value.kind() {
+        "arrow_function" | "function_expression" | "generator_function" => {
+            visit_ts_default_export_function(file, source, export, value, parsed);
+        }
+        "class" => {
+            visit_ts_default_export_class(file, source, export, value, parsed);
+        }
+        "object" => {
+            let code_unit = add_ts_default_export_unit(
+                file,
+                source,
+                export,
+                crate::analyzer::CodeUnitType::Field,
+                parsed,
+            );
+            parsed.add_signature(code_unit.clone(), trim_statement(node_text(export, source)));
+            visit_ts_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
+        }
+        // `export default name` points at an existing binding; indexing `default`
+        // here would duplicate that declaration instead of describing new code.
+        _ => {}
+    }
+}
+
+fn visit_ts_default_export_function(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'_>,
+    function: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> CodeUnit {
+    let code_unit = add_ts_default_export_unit(
+        file,
+        source,
+        export,
+        crate::analyzer::CodeUnitType::Function,
+        parsed,
+    );
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        SignatureMetadata::with_parameter_labels(
+            ts_default_export_function_signature(function, source),
+            ts_parameter_labels(function, source),
+        ),
+    );
+    visit_ts_return_object_literal_properties(
+        file, source, function, &code_unit, &code_unit, parsed,
+    );
+    code_unit
+}
+
+fn visit_ts_default_export_class(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'_>,
+    class: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> CodeUnit {
+    let code_unit = add_ts_default_export_unit(
+        file,
+        source,
+        export,
+        crate::analyzer::CodeUnitType::Class,
+        parsed,
+    );
+    parsed.add_signature(
+        code_unit.clone(),
+        ts_default_export_class_signature(export, source),
+    );
+    let supertypes = extract_ts_supertypes(class, source);
+    if !supertypes.is_empty() {
+        parsed.set_raw_supertypes(code_unit.clone(), supertypes);
+    }
+    let _nested = visit_ts_class_like_body(file, source, class, &code_unit, &code_unit, parsed);
+    code_unit
+}
+
+fn add_ts_default_export_unit(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'_>,
+    kind: crate::analyzer::CodeUnitType,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> CodeUnit {
+    let code_unit = CodeUnit::new(file.clone(), kind, "", "default");
+    parsed.add_code_unit(
+        code_unit.clone(),
+        export,
+        source,
+        None,
+        Some(code_unit.clone()),
+    );
+    code_unit
 }
 
 fn visit_ts_class_like(
@@ -937,37 +1068,51 @@ fn visit_ts_class_like(
             continue;
         }
 
-        if let Some(body) = definition.child_by_field_name("body") {
-            let mut nested_class_like = Vec::new();
-            for index in 0..body.named_child_count() {
-                let Some(child) = body.named_child(index) else {
-                    continue;
-                };
-                match child.kind() {
-                    "method_definition" | "method_signature" | "abstract_method_signature" => {
-                        visit_ts_method(file, source, child, &code_unit, &top_level, parsed);
-                    }
-                    "public_field_definition" | "property_signature" | "index_signature" => {
-                        visit_ts_field(file, source, child, &code_unit, &top_level, parsed);
-                    }
-                    "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "internal_module" => {
-                        nested_class_like.push(child);
-                    }
-                    _ => {}
-                }
-            }
-            stack.extend(
-                nested_class_like
-                    .into_iter()
-                    .rev()
-                    .map(|child| (child, Some(code_unit.clone()), false)),
-            );
-        }
+        let nested_class_like =
+            visit_ts_class_like_body(file, source, definition, &code_unit, &top_level, parsed);
+        stack.extend(
+            nested_class_like
+                .into_iter()
+                .rev()
+                .map(|child| (child, Some(code_unit.clone()), false)),
+        );
     }
     first
+}
+
+fn visit_ts_class_like_body<'tree>(
+    file: &ProjectFile,
+    source: &str,
+    class_like: Node<'tree>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> Vec<Node<'tree>> {
+    let Some(body) = class_like.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    let mut nested_class_like = Vec::new();
+    for index in 0..body.named_child_count() {
+        let Some(child) = body.named_child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "method_definition" | "method_signature" | "abstract_method_signature" => {
+                visit_ts_method(file, source, child, parent, top_level, parsed);
+            }
+            "public_field_definition" | "property_signature" | "index_signature" => {
+                visit_ts_field(file, source, child, parent, top_level, parsed);
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "internal_module" => {
+                nested_class_like.push(child);
+            }
+            _ => {}
+        }
+    }
+    nested_class_like
 }
 
 fn visit_ts_function(
@@ -1679,6 +1824,12 @@ fn ts_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
     )
 }
 
+fn ts_default_export_class_signature(export: Node<'_>, source: &str) -> String {
+    let text = node_text(export, source);
+    let head = trim_statement(text.split('{').next().unwrap_or(text));
+    format!("{head} {{")
+}
+
 fn ts_function_signature(node: Node<'_>, source: &str, exported: bool) -> String {
     let definition = if node.kind() == "export_statement" {
         node.child_by_field_name("declaration").unwrap_or(node)
@@ -1704,6 +1855,37 @@ fn ts_function_signature(node: Node<'_>, source: &str, exported: bool) -> String
         head
     } else {
         format!("{head} {{ ... }}")
+    }
+}
+
+fn ts_default_export_function_signature(function: Node<'_>, source: &str) -> String {
+    let text = node_text(function, source);
+    let async_prefix = if text.trim_start().starts_with("async ") {
+        "async "
+    } else {
+        ""
+    };
+    let params = function
+        .child_by_field_name("parameters")
+        .map(|node| trim_statement(node_text(node, source)))
+        .unwrap_or_else(|| "()".to_string());
+    let return_type = function
+        .child_by_field_name("return_type")
+        .map(|node| trim_statement(node_text(node, source)))
+        .unwrap_or_default();
+    let return_suffix = if return_type.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", return_type.trim_start_matches(':').trim())
+    };
+    match function.kind() {
+        "function_declaration" | "function_expression" => {
+            format!("export default {async_prefix}function{params}{return_suffix} {{ ... }}")
+        }
+        "generator_function" => {
+            format!("export default {async_prefix}function*{params}{return_suffix} {{ ... }}")
+        }
+        _ => format!("export default {async_prefix}{params}{return_suffix} => {{ ... }}"),
     }
 }
 

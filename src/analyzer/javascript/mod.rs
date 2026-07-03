@@ -762,17 +762,135 @@ fn visit_js_export(
     if let Some(declaration) = node.child_by_field_name("declaration") {
         match declaration.kind() {
             "class_declaration" => {
-                visit_js_class(file, source, node, None, parsed, true);
+                if declaration.child_by_field_name("name").is_none()
+                    && js_export_is_default(node, source)
+                {
+                    visit_js_default_export_class(file, source, node, declaration, parsed);
+                } else {
+                    visit_js_class(file, source, node, None, parsed, true);
+                }
             }
             "function_declaration" => {
-                visit_js_function(file, source, node, None, parsed, true);
+                if declaration.child_by_field_name("name").is_none()
+                    && js_export_is_default(node, source)
+                {
+                    visit_js_default_export_function(file, source, node, declaration, parsed);
+                } else {
+                    visit_js_function(file, source, node, None, parsed, true);
+                }
             }
             "lexical_declaration" | "variable_declaration" => {
                 visit_js_variable_statement(file, source, node, None, parsed, true);
             }
             _ => {}
         }
+    } else if let Some(value) = node.child_by_field_name("value") {
+        visit_js_default_export_value(file, source, node, value, parsed);
     }
+}
+
+fn js_export_is_default(node: Node<'_>, source: &str) -> bool {
+    (0..node.child_count()).any(|index| {
+        node.child(index)
+            .is_some_and(|child| child.kind() == "default" || node_text(child, source) == "default")
+    })
+}
+
+fn visit_js_default_export_value(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'_>,
+    value: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    match value.kind() {
+        "arrow_function" | "function_expression" | "generator_function" => {
+            visit_js_default_export_function(file, source, export, value, parsed);
+        }
+        "class" => {
+            visit_js_default_export_class(file, source, export, value, parsed);
+        }
+        "object" => {
+            let code_unit = add_js_default_export_unit(
+                file,
+                source,
+                export,
+                crate::analyzer::CodeUnitType::Field,
+                parsed,
+            );
+            parsed.add_signature(code_unit.clone(), trim_statement(node_text(export, source)));
+            visit_js_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
+        }
+        // `export default name` points at an existing binding; indexing `default`
+        // here would duplicate that declaration instead of describing new code.
+        _ => {}
+    }
+}
+
+fn visit_js_default_export_function(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'_>,
+    function: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> CodeUnit {
+    let code_unit = add_js_default_export_unit(
+        file,
+        source,
+        export,
+        crate::analyzer::CodeUnitType::Function,
+        parsed,
+    );
+    let (signature, parameter_text) = js_default_export_function_signature(function, source);
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        js_signature_metadata(signature, function, source, &parameter_text),
+    );
+    code_unit
+}
+
+fn visit_js_default_export_class(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'_>,
+    class: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> CodeUnit {
+    let code_unit = add_js_default_export_unit(
+        file,
+        source,
+        export,
+        crate::analyzer::CodeUnitType::Class,
+        parsed,
+    );
+    parsed.add_signature(
+        code_unit.clone(),
+        js_default_export_class_signature(export, source),
+    );
+    let supertypes = extract_js_supertypes(class, source);
+    if !supertypes.is_empty() {
+        parsed.set_raw_supertypes(code_unit.clone(), supertypes);
+    }
+    visit_js_class_body(file, source, class, &code_unit, &code_unit, parsed);
+    code_unit
+}
+
+fn add_js_default_export_unit(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'_>,
+    kind: crate::analyzer::CodeUnitType,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> CodeUnit {
+    let code_unit = CodeUnit::new(file.clone(), kind, "", "default");
+    parsed.add_code_unit(
+        code_unit.clone(),
+        export,
+        source,
+        None,
+        Some(code_unit.clone()),
+    );
+    code_unit
 }
 
 fn visit_js_class(
@@ -821,24 +939,34 @@ fn visit_js_class(
         parsed.set_raw_supertypes(code_unit.clone(), supertypes);
     }
 
-    if let Some(body) = definition.child_by_field_name("body") {
-        for index in 0..body.named_child_count() {
-            let Some(child) = body.named_child(index) else {
-                continue;
-            };
-            match child.kind() {
-                "method_definition" => {
-                    visit_js_method(file, source, child, &code_unit, &top_level, parsed)
-                }
-                "field_definition" | "public_field_definition" => {
-                    visit_js_field(file, source, child, &code_unit, &top_level, parsed);
-                }
-                _ => {}
-            }
-        }
-    }
+    visit_js_class_body(file, source, definition, &code_unit, &top_level, parsed);
 
     Some(code_unit)
+}
+
+fn visit_js_class_body(
+    file: &ProjectFile,
+    source: &str,
+    class: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let Some(body) = class.child_by_field_name("body") else {
+        return;
+    };
+    for index in 0..body.named_child_count() {
+        let Some(child) = body.named_child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "method_definition" => visit_js_method(file, source, child, parent, top_level, parsed),
+            "field_definition" | "public_field_definition" => {
+                visit_js_field(file, source, child, parent, top_level, parsed);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn visit_js_function(
@@ -1714,6 +1842,12 @@ fn js_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
     format!("{} {{", one_line(&signature))
 }
 
+fn js_default_export_class_signature(export: Node<'_>, source: &str) -> String {
+    let text = node_text(export, source);
+    let signature = text.split('{').next().unwrap_or(text).trim();
+    format!("{} {{", one_line(signature))
+}
+
 fn js_function_signature(
     node: Node<'_>,
     source: &str,
@@ -1745,6 +1879,26 @@ fn js_function_signature(
         ),
         params,
     )
+}
+
+fn js_default_export_function_signature(function: Node<'_>, source: &str) -> (String, String) {
+    let async_prefix = if node_text(function, source)
+        .trim_start()
+        .starts_with("async ")
+    {
+        "async "
+    } else {
+        ""
+    };
+    let params = js_rendered_parameter_text(function, source);
+    let signature = match function.kind() {
+        "function_declaration" | "function_expression" => {
+            format!("export default {async_prefix}function{params} ...")
+        }
+        "generator_function" => format!("export default {async_prefix}function*{params} ..."),
+        _ => format!("export default {async_prefix}{params} => ..."),
+    };
+    (with_mutation_comment(signature, function, source), params)
 }
 
 fn js_method_signature(node: Node<'_>, source: &str) -> (String, String) {

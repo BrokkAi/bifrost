@@ -393,6 +393,34 @@ fn test_default_export_skeletons() {
 }
 
 #[test]
+fn typescript_anonymous_arrow_default_export_indexes_default_function() {
+    let (project, analyzer) = ts_inline_analyzer(&[(
+        "module.ts",
+        r#"
+            export default (o: Options, c: Constructor, d: Dayjs) => {
+                return d.extend(o, c);
+            };
+        "#,
+    )]);
+    let file = project.file("module.ts");
+    let declarations = analyzer.get_declarations(&file);
+    let default = declarations
+        .iter()
+        .find(|unit| unit.short_name() == "default")
+        .expect("default export declaration");
+
+    assert_eq!(CodeUnitType::Function, default.kind());
+    assert_eq!(
+        "export default (o: Options, c: Constructor, d: Dayjs) => { ... }",
+        analyzer.get_skeleton(default).unwrap()
+    );
+    assert_eq!(
+        "export default (o: Options, c: Constructor, d: Dayjs) => {\n                return d.extend(o, c);\n            };",
+        analyzer.get_source(default, true).unwrap().trim()
+    );
+}
+
+#[test]
 fn test_get_method_source_get_symbols_and_get_class_source() {
     let analyzer = fixture_analyzer();
 

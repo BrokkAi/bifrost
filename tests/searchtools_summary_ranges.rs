@@ -481,6 +481,40 @@ const char* ffDetectCodec(void);
 }
 
 #[test]
+fn javascript_anonymous_default_export_summary_uses_indexed_declaration() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "plugin.js",
+            r#"
+import * as C from './constant';
+
+export default (o, c, d) => {
+    return d.extend(o, c, C);
+};
+"#,
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["plugin.js".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    let summary = &result.summaries[0];
+    assert_eq!(None, summary.fallback_reason.as_deref());
+    assert!(summary.elements.iter().any(|element| {
+        element.kind == "function"
+            && element.symbol == "default"
+            && element.presentation.as_deref() != Some("sampled_excerpt")
+    }));
+}
+
+#[test]
 fn include_only_cpp_headers_use_include_summary_fallback() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

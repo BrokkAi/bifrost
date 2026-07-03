@@ -1,9 +1,17 @@
 mod common;
 
-use brokk_bifrost::{IAnalyzer, JavascriptAnalyzer, Language, TestProject};
+use brokk_bifrost::{CodeUnitType, IAnalyzer, JavascriptAnalyzer, Language, TestProject};
 use tempfile::tempdir;
 
-use common::write_file;
+use common::{InlineTestProject, write_file};
+
+fn inline_js_analyzer(source: &str) -> (common::BuiltInlineTestProject, JavascriptAnalyzer) {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("module.js", source)
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
 
 #[test]
 fn test_top_level_arrow_functions() {
@@ -41,6 +49,112 @@ fn test_top_level_arrow_functions() {
         functions
             .iter()
             .any(|code_unit| code_unit.fq_name().contains("anotherFunc"))
+    );
+}
+
+#[test]
+fn anonymous_arrow_default_export_indexes_default_function_with_full_range() {
+    let (project, analyzer) = inline_js_analyzer(
+        r#"
+            import * as C from './constant';
+            export default (o, c, d) => {
+                return d.extend(o, c, C);
+            };
+        "#,
+    );
+    let file = project.file("module.js");
+    let declarations = analyzer.get_declarations(&file);
+    let default = declarations
+        .iter()
+        .find(|unit| unit.short_name() == "default")
+        .expect("default export declaration");
+
+    assert_eq!(CodeUnitType::Function, default.kind());
+    assert_eq!(
+        "export default (o, c, d) => {\n                return d.extend(o, c, C);\n            };",
+        analyzer.get_source(default, true).unwrap().trim()
+    );
+    assert_eq!(
+        "export default (o, c, d) => ...",
+        analyzer.get_skeleton(default).unwrap()
+    );
+}
+
+#[test]
+fn anonymous_function_default_export_indexes_default_function() {
+    let (project, analyzer) = inline_js_analyzer(
+        r#"
+            export default function () {
+                return 42;
+            }
+        "#,
+    );
+    let file = project.file("module.js");
+    let default = analyzer
+        .get_declarations(&file)
+        .into_iter()
+        .find(|unit| unit.short_name() == "default")
+        .expect("default export declaration");
+
+    assert_eq!(CodeUnitType::Function, default.kind());
+    assert_eq!(
+        "export default function() ...",
+        analyzer.get_skeleton(&default).unwrap()
+    );
+}
+
+#[test]
+fn anonymous_object_default_export_indexes_default_field_with_properties() {
+    let (project, analyzer) = inline_js_analyzer(
+        r#"
+            export default {
+                a: 1,
+                b() {
+                    return 2;
+                }
+            };
+        "#,
+    );
+    let file = project.file("module.js");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| { unit.short_name() == "default" && unit.kind() == CodeUnitType::Field })
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.short_name() == "default.a")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.short_name() == "default.b")
+    );
+}
+
+#[test]
+fn named_identifier_default_export_does_not_synthesize_default_unit() {
+    let (project, analyzer) = inline_js_analyzer(
+        r#"
+            const someIdentifier = (value) => value;
+            export default someIdentifier;
+        "#,
+    );
+    let file = project.file("module.js");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.short_name() != "default")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.short_name() == "someIdentifier")
     );
 }
 
