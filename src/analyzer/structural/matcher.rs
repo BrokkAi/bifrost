@@ -210,10 +210,10 @@ fn eval_pattern_inner_with_name(
         }
     }
 
-    if let Some(label) = &pattern.capture {
-        if !add_capture(label, fact.span(), Some(fact.kind), facts, captures) {
-            return false;
-        }
+    if let Some(label) = &pattern.capture
+        && !add_capture(label, fact.span(), Some(fact.kind), facts, captures)
+    {
+        return false;
     }
     true
 }
@@ -287,10 +287,10 @@ fn eval_span_only(
     {
         return false;
     }
-    if let Some(label) = &pattern.capture {
-        if !add_capture(label, target.span, None, facts, captures) {
-            return false;
-        }
+    if let Some(label) = &pattern.capture
+        && !add_capture(label, target.span, None, facts, captures)
+    {
+        return false;
     }
     true
 }

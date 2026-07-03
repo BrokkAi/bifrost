@@ -19,11 +19,12 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
 - [x] (2026-07-03T12:42Z) Milestone 4: added `schema_version: 1` validation/canonicalization and exact-text duplicate capture equality. Python client docs now call `search_ast` experimental v1 and can pass `schema_version=1`. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`, and the targeted Python client unittest through `uv run --python 3.12 --with maturin`.
 - [x] (2026-07-03T12:46Z) Milestone 5: switched candidate traversal to global project-relative path order with language as the deterministic tiebreaker, while preserving the `limit + 1` truncation proof. Truncated result sets now include a compact workspace diagnostic with scanned file/source/fact counts and refinement guidance. Validation passed with `cargo fmt -- --check` and `cargo test --test structural_search_cross_language --test structural_search_planner`.
 - [x] (2026-07-03T12:49Z) Milestone 6: added compact broad-query performance guidance for unanchored, unscoped searches when they truncate, exhaust a budget, or scan at least 100 files. Anchored and scoped queries stay quiet apart from existing focused diagnostics. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, and `cargo test --test structural_search_planner`.
+- [x] (2026-07-03T12:52Z) Final validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`, `cargo clippy-no-cuda`, and the targeted Python client unittest through `uv run --python 3.12 --with maturin`.
 
 
 ## Surprises & Discoveries
 
-- None yet.
+- `cargo clippy-no-cuda` caught two collapsible capture-attachment `if` blocks from the duplicate-capture matcher work; the final cleanup commit keeps behavior unchanged while satisfying the CI lint gate.
 
 
 ## Decision Log
@@ -81,6 +82,7 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
 - 2026-07-03T12:42Z: Milestone 4 completed. The query surface now has an explicit v1 compatibility marker, and repeated capture labels are real equality constraints instead of independent labels.
 - 2026-07-03T12:46Z: Milestone 5 completed. Mixed-language result order is now path-first across the workspace, and truncated outputs explain how much work was scanned before returning the bounded result set.
 - 2026-07-03T12:49Z: Milestone 6 completed. Broad unanchored queries now receive concise performance guidance only when they are likely to cost meaningful context or compute.
+- 2026-07-03T12:52Z: Final validation completed after a clippy-only matcher cleanup.
 
 
 ## Context and Orientation
