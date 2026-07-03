@@ -318,7 +318,7 @@ fn diagnostic_outcome(
     }
 }
 
-fn sort_units(units: &mut [CodeUnit]) {
+pub(super) fn sort_units(units: &mut [CodeUnit]) {
     units.sort_by(|left, right| {
         left.fq_name()
             .cmp(&right.fq_name())

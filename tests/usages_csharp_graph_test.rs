@@ -1814,3 +1814,68 @@ public sealed class Dto {
         "{dto_hits:#?}"
     );
 }
+
+#[test]
+fn csharp_partial_property_receiver_usages_share_one_type_surface() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Handlers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Name { get; set; }
+
+    public EventRecord(string name)
+    {
+        Name = name;
+    }
+}
+"#,
+        ),
+        (
+            "src/Consumers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Label()
+    {
+        return Name;
+    }
+}
+
+public sealed class Consumer
+{
+    public string Render(EventRecord record)
+    {
+        return record.Name;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let name = member_field(&analyzer, "Demo.EventRecord", "Name");
+    let hits = graph_hits(&analyzer, &name);
+
+    assert_eq!(3, hits.len(), "{hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/Handlers.cs") && hit.snippet.contains("Name = name")
+        }),
+        "constructor assignment should resolve to EventRecord.Name: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/Consumers.cs") && hit.snippet.contains("return Name")
+        }),
+        "unqualified read in the other partial file should resolve to EventRecord.Name: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/Consumers.cs") && hit.snippet.contains("record.Name")
+        }),
+        "typed external receiver should resolve to EventRecord.Name: {hits:#?}"
+    );
+}

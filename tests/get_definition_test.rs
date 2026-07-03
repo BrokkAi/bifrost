@@ -2285,6 +2285,116 @@ namespace App {
 }
 
 #[test]
+fn csharp_type_lookup_preserves_same_fqn_generic_arity_candidates() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Models/Box.cs",
+            "namespace Models { public class Box {} }\n",
+        )
+        .file(
+            "Models/GenericBox.cs",
+            "namespace Models { public class Box<T> {} }\n",
+        )
+        .file(
+            "App/UseBox.cs",
+            r#"
+using Models;
+
+namespace App {
+    public class UseBox {
+        public void Render(Box<int> input) {
+            input.ToString();
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "            input.ToString();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/UseBox.cs","line":7,"column":{}}}]}}"#,
+            column_of(line, "input")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let definitions = result["types"][0]["definitions"]
+        .as_array()
+        .expect("definitions array");
+    assert_eq!(definitions.len(), 2, "{value}");
+}
+
+#[test]
+fn csharp_type_lookup_preserves_partial_declaration_locations() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Handlers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Name { get; set; }
+}
+"#,
+        )
+        .file(
+            "src/Consumers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Label()
+    {
+        return Name;
+    }
+}
+
+public sealed class Consumer
+{
+    public string Render(EventRecord record)
+    {
+        return record.Name;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return record.Name;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Consumers.cs","line":15,"column":{}}}]}}"#,
+            column_of(line, "record")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Demo.EventRecord", "{value}");
+    let definitions = result["types"][0]["definitions"]
+        .as_array()
+        .expect("definitions array");
+    assert_eq!(definitions.len(), 2, "{value}");
+    assert!(
+        definitions
+            .iter()
+            .any(|definition| definition["path"] == "src/Handlers.cs"),
+        "{value}"
+    );
+    assert!(
+        definitions
+            .iter()
+            .any(|definition| definition["path"] == "src/Consumers.cs"),
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_type_lookup_reports_no_type_for_method_declaration_name() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -9145,6 +9255,68 @@ fn csharp_instance_member_receiver_resolves_from_enclosing_property_type() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "App.List$Node.Data",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_partial_property_receiver_resolves_to_declaration() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Handlers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Name { get; set; }
+
+    public EventRecord(string name)
+    {
+        Name = name;
+    }
+}
+"#,
+        )
+        .file(
+            "src/Consumers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Label()
+    {
+        return Name;
+    }
+}
+
+public sealed class Consumer
+{
+    public string Render(EventRecord record)
+    {
+        return record.Name;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return record.Name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Consumers.cs","line":15,"column":{}}}]}}"#,
+            column_of(line, "Name")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.EventRecord.Name",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Handlers.cs",
         "{value}"
     );
 }
