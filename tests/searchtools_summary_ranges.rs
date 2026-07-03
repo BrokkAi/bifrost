@@ -153,6 +153,180 @@ fn get_summaries_accepts_mixed_file_and_class_targets() {
 }
 
 #[test]
+fn get_summaries_symbol_target_returns_plain_function_summary() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "examples/netsniff.js",
+            r#"var page = require('webpage').create();
+
+function createHAR(address, title, startTime, resources) {
+    return {
+        log: {
+            version: '1.2',
+            creator: title,
+            pages: resources
+        }
+    };
+}
+"#,
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["createHAR".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    let summary = &result.summaries[0];
+    assert_eq!("createHAR", summary.label);
+    assert_eq!("examples/netsniff.js", summary.path);
+    assert_eq!(1, summary.elements.len(), "{:#?}", summary.elements);
+    let element = &summary.elements[0];
+    assert_eq!("function", element.kind);
+    assert_eq!("createHAR", element.symbol);
+    assert_eq!(3, element.start_line);
+    assert_eq!(11, element.end_line);
+}
+
+#[test]
+fn get_summaries_symbol_target_returns_parent_qualified_field_summary() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Widget.java",
+            r#"class Widget {
+    private int value;
+
+    int render() {
+        return this.value;
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["Widget.value".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    let summary = &result.summaries[0];
+    assert_eq!("Widget.value", summary.label);
+    assert_eq!("Widget.java", summary.path);
+    assert_eq!(1, summary.elements.len(), "{:#?}", summary.elements);
+    let element = &summary.elements[0];
+    assert_eq!("field", element.kind);
+    assert_eq!("Widget.value", element.symbol);
+    assert_eq!(Some("Widget"), element.parent_symbol.as_deref());
+    assert_eq!(2, element.start_line);
+    assert_eq!(2, element.end_line);
+}
+
+#[test]
+fn get_summaries_symbol_target_keeps_class_skeleton_summary() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/widget.js",
+            r#"class Widget {
+    value = 1;
+
+    render() {
+        return this.value;
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["Widget".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    let summary = &result.summaries[0];
+    assert_eq!("Widget", summary.label);
+    assert_eq!("src/widget.js", summary.path);
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.kind == "class" && element.symbol == "Widget"),
+        "{:#?}",
+        summary.elements
+    );
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.kind == "function" && element.symbol == "Widget.render"),
+        "{:#?}",
+        summary.elements
+    );
+}
+
+#[test]
+fn get_summaries_symbol_target_reports_selector_ambiguity_for_duplicate_function_name() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/one.js",
+            r#"export function duplicate() {
+    return 1;
+}
+"#,
+        )
+        .file(
+            "src/two.js",
+            r#"export function duplicate() {
+    return 2;
+}
+"#,
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["duplicate".to_string()],
+        },
+    );
+
+    // The same fq_name in two files is ambiguous; the matches carry
+    // file-anchored selectors the caller can re-submit verbatim.
+    assert!(result.summaries.is_empty(), "{result:#?}");
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.ambiguous.len(), "{result:#?}");
+    let ambiguous = &result.ambiguous[0];
+    assert_eq!("duplicate", ambiguous.target);
+    assert_eq!(
+        vec![
+            "src/one.js#duplicate".to_string(),
+            "src/two.js#duplicate".to_string(),
+        ],
+        ambiguous.matches
+    );
+    let note = ambiguous.note.as_deref().unwrap_or_default();
+    assert!(note.contains("one selector from `matches`"), "{note}");
+}
+
+#[test]
 fn get_summaries_reports_directory_targets_as_not_found() {
     let analyzer = go_fixture_analyzer();
     let result = get_summaries(

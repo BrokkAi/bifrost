@@ -84,18 +84,6 @@ fn resolve_codeunit_fuzzy_with(
             &mut full_matches,
             &mut suffix_matches,
         );
-        if candidate.is_class() || candidate.is_module() {
-            for member in analyzer.get_members_in_class(candidate) {
-                collect_fuzzy_matches(
-                    analyzer,
-                    &member,
-                    include,
-                    query_paths,
-                    &mut full_matches,
-                    &mut suffix_matches,
-                );
-            }
-        }
     }
 
     resolution_from_matches(analyzer, full_matches, include)
