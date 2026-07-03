@@ -1018,7 +1018,7 @@ class Thing {
     assert!(!source_text.contains("method"), "{source_text}");
     assert!(!source_text.contains("Inner"), "{source_text}");
     assert_eq!(
-        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body, or use get_summaries for structured summaries",
+        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for JS/TS module-scoped symbols, use the full relative path selector such as src/plugin/relativeTime/index.js#default), or use get_summaries for structured summaries",
         source["note"]
     );
 

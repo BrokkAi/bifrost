@@ -1524,34 +1524,33 @@ pub fn get_symbol_ancestors(
         .into_iter()
         .filter(|symbol| !symbol.trim().is_empty())
     {
-        match resolve_codeunit_fuzzy(analyzer, &symbol) {
-            CodeUnitResolution::Resolved(code_units) => {
-                let Some(code_unit) = code_units.into_iter().next() else {
-                    not_found.push(symbol);
-                    continue;
-                };
-                if !is_ancestor_target(&code_unit) {
-                    return Err(format!(
-                        "get_symbol_ancestors only accepts class/module/type symbols; `{symbol}` resolved to a {}",
-                        code_unit_kind_name(code_unit.kind())
-                    ));
+        match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
+            SelectableDefinitionResolution::Resolved(code_units) => {
+                let mut resolved = Vec::new();
+                for code_unit in code_units {
+                    if !is_ancestor_target(&code_unit) {
+                        return Err(format!(
+                            "get_symbol_ancestors only accepts class/module/type symbols; `{symbol}` resolved to a {}",
+                            code_unit_kind_name(code_unit.kind())
+                        ));
+                    }
+                    resolved.push(SymbolAncestors {
+                        symbol: display_symbol_for_target(&code_unit),
+                        ancestors: provider
+                            .get_ancestors(&code_unit)
+                            .into_iter()
+                            .map(|ancestor| display_symbol_for_target(&ancestor))
+                            .collect(),
+                    });
                 }
-                ancestors.push(SymbolAncestors {
-                    symbol: display_symbol_for_target(&code_unit),
-                    ancestors: provider
-                        .get_ancestors(&code_unit)
-                        .into_iter()
-                        .map(|ancestor| display_symbol_for_target(&ancestor))
-                        .collect(),
-                });
+                if resolved.is_empty() {
+                    not_found.push(symbol);
+                } else {
+                    ancestors.extend(resolved);
+                }
             }
-            CodeUnitResolution::Ambiguous(matches) => {
-                ambiguous.push(AmbiguousSymbol {
-                    target: symbol,
-                    matches: code_unit_match_names(matches),
-                });
-            }
-            CodeUnitResolution::NotFound => not_found.push(symbol),
+            SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
+            SelectableDefinitionResolution::NotFound(target) => not_found.push(target),
         }
     }
 
@@ -1560,6 +1559,79 @@ pub fn get_symbol_ancestors(
         not_found,
         ambiguous,
     })
+}
+
+#[derive(Debug)]
+enum SelectableDefinitionResolution {
+    Resolved(Vec<CodeUnit>),
+    Ambiguous(AmbiguousSymbol),
+    NotFound(String),
+}
+
+fn exact_codeunit_resolution(analyzer: &dyn IAnalyzer, input: &str) -> CodeUnitResolution {
+    let units = resolve_codeunit_exact(analyzer, input);
+    if units.is_empty() {
+        CodeUnitResolution::NotFound
+    } else {
+        CodeUnitResolution::Resolved(units)
+    }
+}
+
+fn exact_then_fuzzy_codeunit_resolution(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+) -> CodeUnitResolution {
+    let exact = resolve_codeunit_exact(analyzer, input);
+    if exact.is_empty() {
+        resolve_codeunit_fuzzy(analyzer, input)
+    } else {
+        CodeUnitResolution::Resolved(exact)
+    }
+}
+
+/// Resolve a symbol input into one selectable definition group. A file anchor
+/// (`src/plugin/relativeTime/index.js#default`) narrows same-name module-scoped
+/// definitions to the exact relative path before grouping; a bare name that
+/// spans multiple selectors is ambiguous and returns requestable selectors.
+fn resolve_selectable_definitions(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
+) -> SelectableDefinitionResolution {
+    let (anchor, lookup) = split_definition_selector(input);
+    let code_units = match resolve(analyzer, lookup) {
+        CodeUnitResolution::Resolved(code_units) => code_units,
+        CodeUnitResolution::Ambiguous(matches) => matches,
+        CodeUnitResolution::NotFound => {
+            return SelectableDefinitionResolution::NotFound(input.to_string());
+        }
+    };
+
+    let code_units = match anchor {
+        Some(anchor) => {
+            let narrowed: Vec<CodeUnit> = code_units
+                .into_iter()
+                .filter(|unit| rel_path_string(unit.source()) == anchor)
+                .collect();
+            if narrowed.is_empty() {
+                return SelectableDefinitionResolution::NotFound(input.to_string());
+            }
+            narrowed
+        }
+        None => code_units,
+    };
+
+    let groups = distinct_definitions(code_units);
+    match groups.as_slice() {
+        [] => SelectableDefinitionResolution::NotFound(input.to_string()),
+        [(_, _)] => SelectableDefinitionResolution::Resolved(
+            groups.into_iter().flat_map(|(_, units)| units).collect(),
+        ),
+        _ => SelectableDefinitionResolution::Ambiguous(AmbiguousSymbol {
+            target: input.to_string(),
+            matches: groups.into_iter().map(|(selector, _)| selector).collect(),
+        }),
+    }
 }
 
 #[derive(Debug)]
@@ -1638,8 +1710,8 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
     let mut ambiguous = Vec::new();
 
     for target in targets {
-        match resolve_typeish_codeunit_fuzzy(analyzer, &target) {
-            CodeUnitResolution::Resolved(code_units) => {
+        match resolve_selectable_definitions(analyzer, &target, resolve_typeish_codeunit_fuzzy) {
+            SelectableDefinitionResolution::Resolved(code_units) => {
                 let start_len = summaries.len();
                 for code_unit in code_units {
                     if let Some(block) = summary_block_for_code_unit(analyzer, &code_unit) {
@@ -1650,11 +1722,8 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
                     not_found.push(target);
                 }
             }
-            CodeUnitResolution::Ambiguous(matches) => ambiguous.push(AmbiguousSymbol {
-                target,
-                matches: code_unit_match_names(matches),
-            }),
-            CodeUnitResolution::NotFound => not_found.push(target),
+            SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
+            SelectableDefinitionResolution::NotFound(target) => not_found.push(target),
         }
     }
 
@@ -1711,17 +1780,45 @@ pub fn get_symbol_sources(
         .into_par_iter()
         .enumerate()
         .map(|(index, symbol)| {
+            if split_definition_selector(&symbol).0.is_some() {
+                return match resolve_selectable_definitions(
+                    analyzer,
+                    &symbol,
+                    exact_then_fuzzy_codeunit_resolution,
+                ) {
+                    SelectableDefinitionResolution::Resolved(code_units) => {
+                        let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+                        if sources.is_empty() {
+                            (index, SourceLookupOutcome::NotFound(symbol))
+                        } else {
+                            (index, SourceLookupOutcome::Found(sources))
+                        }
+                    }
+                    SelectableDefinitionResolution::Ambiguous(item) => {
+                        (index, SourceLookupOutcome::Ambiguous(item))
+                    }
+                    SelectableDefinitionResolution::NotFound(target) => {
+                        (index, SourceLookupOutcome::NotFound(target))
+                    }
+                };
+            }
+
             // Exact fully-qualified lookup wins before file patterns, so a
             // canonical symbol containing `/` (e.g. a Go import path) is never
             // misrouted as a filesystem path.
-            let exact = resolve_codeunit_exact(analyzer, &symbol);
-            if !exact.is_empty() {
-                let sources = source_blocks_for_resolved_units(analyzer, &exact);
-                return if sources.is_empty() {
-                    (index, SourceLookupOutcome::NotFound(symbol))
-                } else {
-                    (index, SourceLookupOutcome::Found(sources))
-                };
+            match resolve_selectable_definitions(analyzer, &symbol, exact_codeunit_resolution) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
+                    let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+                    return if sources.is_empty() {
+                        (index, SourceLookupOutcome::NotFound(symbol))
+                    } else {
+                        (index, SourceLookupOutcome::Found(sources))
+                    };
+                }
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    return (index, SourceLookupOutcome::Ambiguous(item));
+                }
+                SelectableDefinitionResolution::NotFound(_) => {}
             }
 
             let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
@@ -1741,8 +1838,8 @@ pub fn get_symbol_sources(
                 return (index, SourceLookupOutcome::NotFound(symbol));
             }
 
-            match resolve_codeunit_fuzzy(analyzer, &symbol) {
-                CodeUnitResolution::Resolved(code_units) => {
+            match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = source_blocks_for_resolved_units(analyzer, &code_units);
                     if sources.is_empty() {
                         (index, SourceLookupOutcome::NotFound(symbol))
@@ -1750,14 +1847,12 @@ pub fn get_symbol_sources(
                         (index, SourceLookupOutcome::Found(sources))
                     }
                 }
-                CodeUnitResolution::Ambiguous(matches) => (
-                    index,
-                    SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
-                        target: symbol,
-                        matches: code_unit_match_names(matches),
-                    }),
-                ),
-                CodeUnitResolution::NotFound => (index, SourceLookupOutcome::NotFound(symbol)),
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    (index, SourceLookupOutcome::Ambiguous(item))
+                }
+                SelectableDefinitionResolution::NotFound(target) => {
+                    (index, SourceLookupOutcome::NotFound(target))
+                }
             }
         })
         .collect();
@@ -2184,11 +2279,11 @@ fn scoped_usage_finder(
     finder
 }
 
-/// Split a `scan_usages` symbol input into an optional file anchor and the name
-/// to resolve. A plain input (`Anchor`) has no anchor; a file-anchored selector
-/// (`charts/Anchor.ts#Anchor`), returned in a prior call's `candidate_targets`,
-/// picks one of several same-named definitions. The `#` separator does not occur
-/// in any language's symbol grammar, so a bare name is never misread as anchored.
+/// Split a definition selector into an optional file anchor and the name to
+/// resolve. A plain input (`Anchor`) has no anchor; a file-anchored selector
+/// (`charts/Anchor.ts#Anchor`), returned in a prior ambiguity result, picks one
+/// of several same-named definitions. The `#` separator does not occur in any
+/// language's symbol grammar, so a bare name is never misread as anchored.
 fn split_definition_selector(input: &str) -> (Option<&str>, &str) {
     match input.split_once('#') {
         Some((anchor, name)) if !anchor.is_empty() && !name.is_empty() => (Some(anchor), name),
@@ -2196,7 +2291,7 @@ fn split_definition_selector(input: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// The selector a caller re-queries to scan exactly this definition. Module-
+/// The selector a caller re-queries to choose exactly this definition. Module-
 /// scoped ecosystems (JS/TS) share bare fqns across files, so the selector is
 /// file-anchored to stay unique; elsewhere the fqn already is.
 fn definition_selector(unit: &CodeUnit) -> String {
@@ -2227,7 +2322,12 @@ fn distinct_definitions(overloads: Vec<CodeUnit>) -> Vec<(String, Vec<CodeUnit>)
 }
 
 fn code_unit_match_names(matches: Vec<CodeUnit>) -> Vec<String> {
-    dedupe_preserving_order(matches.into_iter().map(|unit| unit.fq_name()).collect())
+    dedupe_preserving_order(
+        matches
+            .into_iter()
+            .map(|unit| definition_selector(&unit))
+            .collect(),
+    )
 }
 
 fn ambiguous_usage_symbol_from_groups(
@@ -4668,7 +4768,7 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
                     text,
                     presentation: None,
                     note: Some(
-                        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body, or use get_summaries for structured summaries"
+                        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for JS/TS module-scoped symbols, use the full relative path selector such as src/plugin/relativeTime/index.js#default), or use get_summaries for structured summaries"
                             .to_string(),
                     ),
                 });
