@@ -17,6 +17,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use tree_sitter::{Node, Parser};
 
 use adapter::CSharpAdapter;
 use cache::CSharpMemoCaches;
@@ -177,6 +178,69 @@ impl CSharpAnalyzer {
         self.visible_type_candidates_inner(file, name, true)
     }
 
+    pub(crate) fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        if !owner.is_class() {
+            return Vec::new();
+        }
+        let owner_key = self.type_declaration_key(owner);
+        let mut parts: Vec<_> = self
+            .inner
+            .get_definitions(&owner.fq_name())
+            .into_iter()
+            .filter(|unit| unit.is_class() && self.type_declaration_key(unit) == owner_key)
+            .collect();
+        self.sort_type_candidates(&mut parts);
+        parts.dedup();
+        parts
+    }
+
+    pub(crate) fn sort_dedup_type_candidates(&self, candidates: &mut Vec<CodeUnit>) {
+        let mut keyed: Vec<_> = candidates
+            .drain(..)
+            .map(|unit| {
+                let key = self.type_declaration_key(&unit);
+                let source = crate::path_utils::rel_path_string(unit.source());
+                (unit, key, source)
+            })
+            .collect();
+        keyed.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
+        keyed.dedup_by(|left, right| left.1 == right.1);
+        candidates.extend(keyed.into_iter().map(|(unit, _, _)| unit));
+    }
+
+    pub(crate) fn sort_type_candidates(&self, candidates: &mut [CodeUnit]) {
+        candidates.sort_by_cached_key(|unit| {
+            (
+                self.type_declaration_key(unit),
+                crate::path_utils::rel_path_string(unit.source()),
+            )
+        });
+    }
+
+    pub(crate) fn logical_type_count(&self, candidates: &[CodeUnit]) -> usize {
+        candidates
+            .iter()
+            .map(|unit| self.type_declaration_key(unit))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    pub(crate) fn first_logical_type_fqn(&self, candidates: &[CodeUnit]) -> Option<String> {
+        let mut sorted = candidates.to_vec();
+        self.sort_type_candidates(&mut sorted);
+        sorted.first().map(CodeUnit::fq_name)
+    }
+
+    fn type_declaration_key(&self, unit: &CodeUnit) -> (String, usize) {
+        (
+            unit.fq_name(),
+            self.inner
+                .signatures_of(unit)
+                .first()
+                .map_or(0, |signature| csharp_type_parameter_count(signature)),
+        )
+    }
+
     fn visible_type_candidates_inner(
         &self,
         file: &ProjectFile,
@@ -210,10 +274,59 @@ impl CSharpAnalyzer {
 
     pub fn resolve_visible_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
         let mut candidates = self.visible_type_candidates(file, name);
-        candidates.sort_by_key(CodeUnit::fq_name);
-        candidates.dedup();
+        self.sort_dedup_type_candidates(&mut candidates);
         (candidates.len() == 1).then(|| candidates.remove(0))
     }
+}
+
+fn csharp_type_parameter_count(signature: &str) -> usize {
+    let source = if signature.trim_end().ends_with('{') {
+        format!("{signature} }}")
+    } else {
+        signature.to_string()
+    };
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .is_err()
+    {
+        return 0;
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return 0;
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) {
+            return node
+                .child_by_field_name("type_parameters")
+                .or_else(|| first_named_child_of_kind(node, "type_parameter_list"))
+                .map_or(0, count_type_parameters);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    0
+}
+
+fn count_type_parameters(node: Node<'_>) -> usize {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "type_parameter")
+        .count()
+}
+
+fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
 }
 
 impl TestDetectionProvider for CSharpAnalyzer {}
