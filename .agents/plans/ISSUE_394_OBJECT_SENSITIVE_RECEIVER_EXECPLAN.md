@@ -12,7 +12,7 @@ The change improves both recall and precision. Recall improves because calls thr
 
 ## Progress
 
-- [x] (2026-07-01T10:30Z) Created this ExecPlan at `.agent/ISSUE_394_OBJECT_SENSITIVE_RECEIVER_EXECPLAN.md`.
+- [x] (2026-07-01T10:30Z) Created this ExecPlan at `.agents/plans/ISSUE_394_OBJECT_SENSITIVE_RECEIVER_EXECPLAN.md`.
 - [x] (2026-07-01T10:35Z) Add the shared receiver analysis API, budget model, no-op provider, cache key shape, and unit tests.
 - [x] (2026-07-01T10:48Z) Implement and test the JS/TS milestone, including a second consumer through `get_definition` or type lookup.
 - [x] (2026-07-01T10:54Z) Implement and test the Java milestone.
@@ -223,7 +223,7 @@ From `/Users/dave/.codex/worktrees/a8df/bifrost`:
 
 2. Create this ExecPlan and commit it alone:
 
-       git add .agent/ISSUE_394_OBJECT_SENSITIVE_RECEIVER_EXECPLAN.md
+       git add .agents/plans/ISSUE_394_OBJECT_SENSITIVE_RECEIVER_EXECPLAN.md
        git commit -m "Add issue 394 object-sensitive receiver execplan"
 
 3. Shared API milestone:

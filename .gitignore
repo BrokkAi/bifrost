@@ -1,4 +1,7 @@
 /target
+/docs/dist
+/docs/.astro
+/docs/node_modules
 /benchmark/.cache/
 /benchmark/benchmark-output/
 __pycache__/

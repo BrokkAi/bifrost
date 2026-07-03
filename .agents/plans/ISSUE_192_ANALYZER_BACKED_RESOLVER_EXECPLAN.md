@@ -16,8 +16,8 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 
 - [x] (2026-06-17T07:52Z) Synced the worktree onto `origin/master`, which includes merged PR #189 at `27268d56d724fbc0cb07a447edfc8605aa119308` and later master commits.
 - [x] (2026-06-17T07:52Z) Created branch `192-finish-shared-resolvercache-ownership-for-analyzer-backed-usage-languages` from current `origin/master`.
-- [x] (2026-06-17T07:52Z) Replayed Java analyzer-backed resolver work from commit `6ece78b`, excluding the obsolete `.agent/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md` edit.
-- [x] (2026-06-17T07:52Z) Replayed C# analyzer-backed resolver work from commit `46bce28`, excluding the obsolete `.agent/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md` edit.
+- [x] (2026-06-17T07:52Z) Replayed Java analyzer-backed resolver work from commit `6ece78b`, excluding the obsolete `.agents/plans/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md` edit.
+- [x] (2026-06-17T07:52Z) Replayed C# analyzer-backed resolver work from commit `46bce28`, excluding the obsolete `.agents/plans/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md` edit.
 - [x] (2026-06-17T07:52Z) Added this #192 ExecPlan scoped only to Java, C#, C++, PHP, and Scala.
 - [x] (2026-06-17T07:52Z) Ran `cargo fmt`; it produced no Rust source changes after the replay.
 - [x] (2026-06-17T07:52Z) Ran and passed `cargo test --test usage_graph_java_test`.
@@ -50,7 +50,7 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 
 ## Surprises & Discoveries
 
-- Observation: The Java and C# cherry-picks conflicted only on `.agent/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md`.
+- Observation: The Java and C# cherry-picks conflicted only on `.agents/plans/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md`.
   Evidence: `git cherry-pick -n 6ece78b` and `git cherry-pick -n 46bce28` each reported `CONFLICT (modify/delete)` for that plan file and no source-code conflicts. The file was removed from each cherry-pick as requested.
 
 - Observation: The #192 branch starts from a newer master than the exact #189 merge commit.
@@ -158,7 +158,7 @@ The full #192 plan is accepted when Java, C#, C++, PHP, and Scala all use intern
 
 The sync and cherry-pick steps have already been performed on branch `192-finish-shared-resolvercache-ownership-for-analyzer-backed-usage-languages`. If a future contributor needs to recreate the branch, start from current `origin/master` and replay only analyzer-backed commits or equivalent patches; do not replay the older #185 project-graph commits for Rust, Go, Python, JS, or TS.
 
-If a cherry-pick or migration creates `.agent/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md`, remove it. #192 is the living plan for this continuation. If a test fails after a metadata assertion change from #189, inspect the actual JSON response and update only the expected language/ecosystem metadata when edge behavior is still correct.
+If a cherry-pick or migration creates `.agents/plans/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md`, remove it. #192 is the living plan for this continuation. If a test fails after a metadata assertion change from #189, inspect the actual JSON response and update only the expected language/ecosystem metadata when edge behavior is still correct.
 
 ## Artifacts and Notes
 
@@ -170,8 +170,8 @@ Branch setup evidence:
 
 Cherry-pick conflict evidence:
 
-    CONFLICT (modify/delete): .agent/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md deleted in HEAD and modified in 6ece78b
-    CONFLICT (modify/delete): .agent/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md deleted in HEAD and modified in 46bce28
+    CONFLICT (modify/delete): .agents/plans/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md deleted in HEAD and modified in 6ece78b
+    CONFLICT (modify/delete): .agents/plans/ISSUE_185_SHARED_USAGE_RESOLVER_EXECPLAN.md deleted in HEAD and modified in 46bce28
 
 Validation evidence:
 

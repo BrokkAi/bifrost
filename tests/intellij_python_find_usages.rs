@@ -13,7 +13,7 @@
 //! only IntelliJ cases whose target is such a declaration are portable. Cases
 //! that target locals, parameters, lambda params, or comprehension bindings are
 //! out of scope by architecture and are intentionally not ported (see the
-//! ExecPlan `.agent/EXECPLAN_INTELLIJ_PYTHON_FINDUSAGES.md` for the full triage).
+//! ExecPlan `.agents/plans/EXECPLAN_INTELLIJ_PYTHON_FINDUSAGES.md` for the full triage).
 //!
 //! IntelliJ find-usages excludes the declaration site, so every reference query
 //! here uses `includeDeclaration = false`.

@@ -1,6 +1,6 @@
 //! Cross-language go-to-definition for a *call/construction receiver*
 //! (`new Foo().bar()` etc.) — the pattern generalized from the Java/Python
-//! IntelliJ-parity work (see `.agent/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`,
+//! IntelliJ-parity work (see `.agents/docs/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`,
 //! pattern 1). Each case places the caret on a member accessed on a freshly
 //! constructed object and asserts it resolves to the member declaration.
 

@@ -1,0 +1,50 @@
+---
+title: Bifrost
+description: Brokk's code-intelligence engine for agents, editors, and large repositories.
+template: splash
+hero:
+  tagline: Multi-language static analysis for agents, editors, and large repositories.
+  image:
+    alt: Bifrost signal mark
+    file: ../../assets/bifrost-mark.svg
+  actions:
+    - text: Get started
+      link: install/
+      icon: right-arrow
+      variant: primary
+    - text: Overview
+      link: overview/
+      variant: secondary
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+export const version = import.meta.env.PUBLIC_BIFROST_VERSION ?? 'development';
+export const tag = import.meta.env.PUBLIC_BIFROST_TAG ?? '';
+export const releaseUrl = import.meta.env.PUBLIC_BIFROST_RELEASE_URL ?? '';
+
+<p class="brokk-strip">
+  <span>Bifrost by</span>
+  <a href="https://brokk.ai" aria-label="Brokk">
+    <img src="https://brokk.ai/brokk-logo.svg" alt="Brokk" />
+  </a>
+</p>
+
+<CardGrid>
+  <Card title="Multi-language analysis" icon="code-branch">
+    Parse mixed-language repositories into structured symbols, definitions, declarations, and cross-file relationships.
+  </Card>
+  <Card title="Structured code search" icon="magnifier">
+    Search symbols, inspect summaries, find related files, and navigate code through analyzer-backed repository context.
+  </Card>
+  <Card title="Usage analysis" icon="analytics">
+    Trace definitions, references, call sites, and usages without falling back to raw text search.
+  </Card>
+  <Card title="MCP and LSP" icon="server">
+    Run Bifrost as a stdio MCP server for coding agents or as a workspace-aware language server in editors.
+  </Card>
+</CardGrid>
+
+<p class="version-strip">
+  {tag ? <>Docs build: <a href={releaseUrl}>{tag}</a></> : <>Docs build: Bifrost {version}</>}
+</p>

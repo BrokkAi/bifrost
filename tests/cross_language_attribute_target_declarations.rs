@@ -1,5 +1,5 @@
 //! Attribute/subscript-target over-declaration audit — pattern 4 from
-//! `.agent/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`.
+//! `.agents/docs/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`.
 //!
 //! Assigning to a *member* of some object — `obj.x = 1`, `$obj->x = 1`,
 //! `o.X = 1` — must not spuriously declare a top-level member named `x`. Python
