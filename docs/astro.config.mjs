@@ -32,10 +32,20 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Use Bifrost',
+          label: 'Use Bifrost via MCP',
           items: [
             { label: 'MCP Server', slug: 'mcp' },
-            { label: 'VS Code LSP', slug: 'vscode' },
+            { label: 'Codex', slug: 'codex' },
+            { label: 'Claude Code', slug: 'claude-code' },
+            { label: 'Cursor', slug: 'cursor' },
+            { label: 'Amp', slug: 'amp' },
+          ],
+        },
+        {
+          label: 'Use Bifrost via LSP',
+          items: [
+            { label: 'LSP Server', slug: 'lsp' },
+            { label: 'VS Code', slug: 'vscode' },
           ],
         },
         {

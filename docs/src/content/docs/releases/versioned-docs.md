@@ -17,3 +17,9 @@ The docs site receives these build-time values:
 - `PUBLIC_BIFROST_RELEASE_URL`
 
 This keeps the displayed docs version tied to the same release tags used for Bifrost binaries, the VS Code extension, and the agent plugin artifacts.
+
+## Manual Republish
+
+Use the **Docs** workflow's manual dispatch when a previous release needs a docs-only correction or republish. Pass the release tag in the `tag` input, for example `v0.7.2`.
+
+The workflow checks out that tag, builds the latest docs root, and also refreshes `versions/<tag>/` for the selected release. Existing versioned snapshots for other tags are preserved.
