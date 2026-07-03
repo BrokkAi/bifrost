@@ -41,8 +41,29 @@ impl QueryPlan {
         &self.features
     }
 
-    pub(crate) fn source_may_match(&self, source: &str) -> bool {
-        source_may_match(source, &self.positive_source_anchors)
+    pub(crate) fn build_source_index(&self) -> SourceCandidateIndex<'_> {
+        SourceCandidateIndex {
+            required_anchors: &self.positive_source_anchors,
+        }
+    }
+}
+
+/// Source-level candidate index for a single planned query.
+///
+/// v1 indexes only the query's required literal anchors and checks them against
+/// each file's retained source text. Keeping this behind a named index boundary
+/// lets richer candidate indexes replace the implementation without changing
+/// search execution.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SourceCandidateIndex<'a> {
+    required_anchors: &'a [String],
+}
+
+impl SourceCandidateIndex<'_> {
+    pub(crate) fn may_match(&self, source: &str) -> bool {
+        self.required_anchors
+            .iter()
+            .all(|anchor| source.contains(anchor))
     }
 }
 
@@ -59,10 +80,6 @@ fn collect_positive_source_anchors(query: &AstQuery) -> Vec<String> {
     anchors.sort_unstable();
     anchors.dedup();
     anchors
-}
-
-fn source_may_match(source: &str, anchors: &[String]) -> bool {
-    anchors.iter().all(|anchor| source.contains(anchor))
 }
 
 /// Recurses over pattern nesting (bounded by the query the caller wrote, same
@@ -140,13 +157,14 @@ mod tests {
             positive_source_anchors: anchors,
             features: QueryFeatures::default(),
         };
-        assert!(plan.source_may_match("eval(x, shell=True)"));
-        assert!(!plan.source_may_match("eval(x)"));
+        let index = plan.build_source_index();
+        assert!(index.may_match("eval(x, shell=True)"));
+        assert!(!index.may_match("eval(x)"));
 
         let plan = QueryPlan {
             positive_source_anchors: Vec::new(),
             features: QueryFeatures::default(),
         };
-        assert!(plan.source_may_match("anything"));
+        assert!(plan.build_source_index().may_match("anything"));
     }
 }
