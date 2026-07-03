@@ -15,12 +15,46 @@
 //! source span like any other.
 
 use super::query::{AstQuery, Pattern, StringPredicate};
-use crate::analyzer::structural::Role;
+use crate::analyzer::structural::{NormalizedKind, Role};
+
+/// Language-independent execution plan derived from a parsed query.
+///
+/// The plan is intentionally conservative: it only records facts that are safe
+/// to use before verification, while keeping the original [`AstQuery`] as the
+/// semantic authority for matching.
+#[derive(Debug, Clone)]
+pub(crate) struct QueryPlan {
+    positive_source_anchors: Vec<String>,
+    referenced_kinds: Vec<NormalizedKind>,
+    used_roles: Vec<Role>,
+}
+
+impl QueryPlan {
+    pub(crate) fn for_query(query: &AstQuery) -> Self {
+        Self {
+            positive_source_anchors: collect_positive_source_anchors(query),
+            referenced_kinds: query.referenced_kinds(),
+            used_roles: query.used_roles(),
+        }
+    }
+
+    pub(crate) fn referenced_kinds(&self) -> &[NormalizedKind] {
+        &self.referenced_kinds
+    }
+
+    pub(crate) fn used_roles(&self) -> &[Role] {
+        &self.used_roles
+    }
+
+    pub(crate) fn source_may_match(&self, source: &str) -> bool {
+        source_may_match(source, &self.positive_source_anchors)
+    }
+}
 
 /// Literal strings that must all appear in a file's source for the query's
 /// root (plus `inside`) constraints to possibly match. Empty when the query
 /// has no exact-name anchors (regex/text/kind-only queries prune nothing).
-pub(crate) fn collect_anchors(query: &AstQuery) -> Vec<String> {
+fn collect_positive_source_anchors(query: &AstQuery) -> Vec<String> {
     let mut anchors = Vec::new();
     collect_pattern_anchors(&query.root, &mut anchors);
     if let Some(inside) = &query.inside {
@@ -32,7 +66,7 @@ pub(crate) fn collect_anchors(query: &AstQuery) -> Vec<String> {
     anchors
 }
 
-pub(crate) fn source_may_match(source: &str, anchors: &[String]) -> bool {
+fn source_may_match(source: &str, anchors: &[String]) -> bool {
     anchors.iter().all(|anchor| source.contains(anchor))
 }
 
@@ -70,7 +104,8 @@ mod tests {
     use serde_json::json;
 
     fn anchors_of(query: serde_json::Value) -> Vec<String> {
-        collect_anchors(&AstQuery::from_json(&query).expect("query should parse"))
+        QueryPlan::for_query(&AstQuery::from_json(&query).expect("query should parse"))
+            .positive_source_anchors
     }
 
     #[test]
@@ -106,8 +141,19 @@ mod tests {
     #[test]
     fn source_prefilter_requires_every_anchor() {
         let anchors = vec!["eval".to_string(), "shell".to_string()];
-        assert!(source_may_match("eval(x, shell=True)", &anchors));
-        assert!(!source_may_match("eval(x)", &anchors));
-        assert!(source_may_match("anything", &[]));
+        let plan = QueryPlan {
+            positive_source_anchors: anchors,
+            referenced_kinds: Vec::new(),
+            used_roles: Vec::new(),
+        };
+        assert!(plan.source_may_match("eval(x, shell=True)"));
+        assert!(!plan.source_may_match("eval(x)"));
+
+        let plan = QueryPlan {
+            positive_source_anchors: Vec::new(),
+            referenced_kinds: Vec::new(),
+            used_roles: Vec::new(),
+        };
+        assert!(plan.source_may_match("anything"));
     }
 }

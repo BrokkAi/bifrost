@@ -1,6 +1,6 @@
 //! Workspace-level execution of a structural query (`search_ast`): scope by
-//! path globs and languages, prune candidates with the planner's positive
-//! anchors, run the matcher over deterministic candidates until `limit+1`
+//! path globs and languages, derive the planner's positive anchors and query
+//! requirements, run the matcher over deterministic candidates until `limit+1`
 //! global matches prove truncation (facts come from the per-analyzer cache,
 //! extraction happens on miss from in-memory source), then render the first
 //! `limit` matches with captures, enclosing symbols, and capability
@@ -8,6 +8,7 @@
 
 use super::facts::FileFacts;
 use super::matcher::FactMatch;
+use super::planner::QueryPlan;
 use super::query::AstQuery;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::path_utils::rel_path_string;
@@ -96,6 +97,7 @@ pub fn execute_with_limits(
     query: &AstQuery,
     limits: SearchAstExecutionLimits,
 ) -> SearchAstOutput {
+    let plan = QueryPlan::for_query(query);
     let mut providers = analyzer.structural_search_providers();
     providers.sort_by_key(|provider| provider.structural_language());
     providers.retain(|provider| {
@@ -112,8 +114,6 @@ pub fn execute_with_limits(
         }
     }
 
-    let requested_kinds = query.referenced_kinds();
-    let requested_roles = query.used_roles();
     let mut supported = BTreeSet::new();
     let mut provider_scopes: Vec<(
         Language,
@@ -130,7 +130,8 @@ pub fn execute_with_limits(
 
         let explicitly_requested = query.languages.contains(&language);
         if !files.is_empty() || explicitly_requested {
-            let unsupported_kinds: Vec<&'static str> = requested_kinds
+            let unsupported_kinds: Vec<&'static str> = plan
+                .referenced_kinds()
                 .iter()
                 .copied()
                 .filter(|kind| !provider.structural_supports_kind(*kind))
@@ -147,7 +148,8 @@ pub fn execute_with_limits(
                 });
             }
 
-            let unsupported_roles: Vec<&'static str> = requested_roles
+            let unsupported_roles: Vec<&'static str> = plan
+                .used_roles()
                 .iter()
                 .copied()
                 .filter(|role| !provider.structural_supports_role(*role))
@@ -193,7 +195,6 @@ pub fn execute_with_limits(
         candidates.extend(files.into_iter().map(|file| (language, provider, file)));
     }
 
-    let anchors = super::planner::collect_anchors(query);
     let global_cap = query.limit.saturating_add(1);
     let mut pending: Vec<PendingMatch> = Vec::new();
     let mut budget = SearchAstExecutionBudget::default();
@@ -211,7 +212,7 @@ pub fn execute_with_limits(
             budget_exhausted = true;
             break;
         }
-        if !super::planner::source_may_match(source, &anchors) {
+        if !plan.source_may_match(source) {
             continue;
         }
         let Some(facts) = provider.structural_facts(&file) else {
