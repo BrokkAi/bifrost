@@ -39,6 +39,11 @@ fn assert_scan_usages_failure(value: &Value, symbol: &str, strategy: &str, reaso
     assert_eq!(reason_kind, failures[0]["reason_kind"], "payload: {value}");
 }
 
+fn assert_scan_usages_failure_hint(value: &Value, expected_hint: &str) {
+    let failures = value["failures"].as_array().unwrap();
+    assert_eq!(expected_hint, failures[0]["hint"], "payload: {value}");
+}
+
 #[test]
 fn service_allows_concurrent_read_only_calls() {
     let service = Arc::new(SearchToolsService::new_without_semantic_index(fixture_root()).unwrap());
@@ -1507,11 +1512,66 @@ fn search_symbols_limit_selects_git_important_file_then_renders_alphabetically()
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(true, value["truncated"]);
+    assert_eq!(
+        "Showing 1 of 2 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest.",
+        value["note"],
+        "payload: {value}"
+    );
     let files = value["files"].as_array().unwrap();
     assert_eq!(1, files.len(), "payload: {value}");
     assert_eq!("z_high.java", files[0]["path"]);
     assert_eq!("class ZHigh", files[0]["classes"][0]["signature"]);
     assert_eq!(1, files[0]["classes"][0]["line"]);
+
+    let payload = service
+        .call_tool_payload_json(
+            "search_symbols",
+            r#"{"patterns":[".*"],"include_tests":true,"limit":1}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(
+        rendered.contains("- Note: Showing 1 of 2 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn list_symbols_truncation_reports_recovery_note() {
+    let temp = TempDir::new().unwrap();
+    for index in 0..21 {
+        fs::write(
+            temp.path().join(format!("Generated{index}.java")),
+            format!("class Generated{index} {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_payload_json(
+            "list_symbols",
+            r#"{"file_patterns":["*.java"]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(true, value["structured"]["truncated"], "payload: {value}");
+    assert_eq!(20, value["structured"]["files"].as_array().unwrap().len());
+    assert_eq!(
+        "Showing 20 of 21 selected files. Narrow `file_patterns` on list_symbols or `targets` on get_summaries to see the rest.",
+        value["structured"]["note"],
+        "payload: {value}"
+    );
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(
+        rendered.contains("Note: Showing 20 of 21 selected files. Narrow `file_patterns` on list_symbols or `targets` on get_summaries to see the rest."),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -1847,6 +1907,10 @@ end
         "User.save",
         "RubyUsageGraphStrategy",
         "unsafe_inference",
+    );
+    assert_scan_usages_failure_hint(
+        &value,
+        "Re-call scan_usages with a location-anchored `targets` selector for the definition site, e.g. `targets: [{\"path\":\"...\",\"line\":...,\"column\":...}]`.",
     );
 }
 

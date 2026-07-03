@@ -247,6 +247,8 @@ pub struct SearchSymbolsResult {
     pub truncated: bool,
     pub total_files: usize,
     pub files: Vec<SearchSymbolsFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -532,6 +534,8 @@ pub struct SkimFilesResult {
     pub truncated: bool,
     pub total_files: usize,
     pub files: Vec<SkimFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
@@ -733,6 +737,8 @@ pub struct UsageFailureInfo {
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned before the failure was produced.
     pub candidate_files_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -821,7 +827,7 @@ pub fn search_symbols(
     );
     file_entries.truncate(effective_limit);
 
-    let files = file_entries
+    let files: Vec<SearchSymbolsFile> = file_entries
         .into_iter()
         .map(|(file, code_units)| SearchSymbolsFile {
             path: rel_path_string(&file),
@@ -836,12 +842,29 @@ pub fn search_symbols(
             macros: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Macro),
         })
         .collect();
+    let note = search_symbols_note(truncated, files.len(), total_files);
 
     SearchSymbolsResult {
         patterns,
         truncated,
         total_files,
         files,
+        note,
+    }
+}
+
+fn search_symbols_note(truncated: bool, shown: usize, total: usize) -> Option<String> {
+    if truncated {
+        Some(format!(
+            "Showing {shown} of {total} matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
+        ))
+    } else if total == 0 {
+        Some(
+            "No files matched. Try a broader identifier, qualified, or regex-like pattern; if matches may be in test files, set `include_tests` to true."
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 
@@ -1989,13 +2012,23 @@ fn skim_files_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Sk
         })
         .collect();
     files.sort_by(|left, right| left.path.cmp(&right.path));
+    let note = skim_files_note(truncated, files.len(), total_files);
 
     SkimFilesResult {
         truncated,
         total_files,
         files,
+        note,
         ambiguous_paths: Vec::new(),
     }
+}
+
+fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Option<String> {
+    truncated.then(|| {
+        format!(
+            "Showing {shown} of {total} selected files. Narrow `file_patterns` on list_symbols or `targets` on get_summaries to see the rest."
+        )
+    })
 }
 
 pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
@@ -2510,6 +2543,7 @@ fn location_selector_failure(
     reason_kind: &str,
     reason: impl Into<String>,
 ) -> ScanUsageTargetResolution {
+    let hint = usage_failure_hint(reason_kind, false);
     ScanUsageTargetResolution::Failure(UsageFailureInfo {
         symbol: scan_usages_target_label(target),
         fq_name: String::new(),
@@ -2517,7 +2551,29 @@ fn location_selector_failure(
         reason_kind: reason_kind.to_string(),
         reason: reason.into(),
         candidate_files_truncated: false,
+        hint,
     })
+}
+
+fn usage_failure_hint(reason_kind: &str, candidate_files_truncated: bool) -> Option<String> {
+    if candidate_files_truncated {
+        return Some(
+            "The candidate file set exceeded the per-query cap; re-call scan_usages with narrower `paths` to reduce the scan scope."
+                .to_string(),
+        );
+    }
+
+    match reason_kind {
+        "unsafe_inference" => Some(
+            "Re-call scan_usages with a location-anchored `targets` selector for the definition site, e.g. `targets: [{\"path\":\"...\",\"line\":...,\"column\":...}]`."
+                .to_string(),
+        ),
+        "unsupported_target_language"
+        | "missing_analyzer_capability"
+        | "unsupported_target_shape"
+        | "no_graph_seed" => None,
+        _ => None,
+    }
 }
 
 fn declaration_start_column(unit: &CodeUnit, range: Range) -> Option<usize> {
@@ -3024,15 +3080,17 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             }
             FuzzyResult::Failure { fq_name, reason } => {
                 let diagnostic = query.graph_failure.as_ref();
+                let reason_kind = diagnostic
+                    .map(|diagnostic| diagnostic.reason_kind.clone())
+                    .unwrap_or_default();
                 failures.push(UsageFailureInfo {
                     symbol,
                     fq_name,
                     strategy: diagnostic
                         .map(|diagnostic| diagnostic.strategy.clone())
                         .unwrap_or_default(),
-                    reason_kind: diagnostic
-                        .map(|diagnostic| diagnostic.reason_kind.clone())
-                        .unwrap_or_default(),
+                    hint: usage_failure_hint(&reason_kind, truncated),
+                    reason_kind,
                     reason,
                     candidate_files_truncated: truncated,
                 });

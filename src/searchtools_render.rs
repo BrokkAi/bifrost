@@ -84,7 +84,10 @@ impl RenderText for SearchSymbolsResult {
             .map(|file| file.render_text(options))
             .collect();
         if blocks.is_empty() {
-            return "No matching symbols found.".to_string();
+            return match self.note.as_deref() {
+                Some(note) => format!("No matching symbols found.\n\nNote: {note}"),
+                None => "No matching symbols found.".to_string(),
+            };
         }
         let mut lines = vec![
             "# Symbol search results".to_string(),
@@ -100,6 +103,9 @@ impl RenderText for SearchSymbolsResult {
                 "- Truncated: yes; files ranked by symbol relevance, with recent activity used only as a tie-breaker when available."
                     .to_string(),
             );
+        }
+        if let Some(note) = self.note.as_deref() {
+            lines.push(format!("- Note: {note}"));
         }
         lines.push(String::new());
         lines.push(blocks.join("\n\n"));
@@ -202,7 +208,10 @@ impl RenderText for SkimFilesResult {
     fn render_text(&self, _options: RenderOptions) -> String {
         let blocks: Vec<String> = self.files.iter().map(render_skim_file).collect();
         if blocks.is_empty() {
-            return "No matching files found.".to_string();
+            return match self.note.as_deref() {
+                Some(note) => format!("No matching files found.\n\nNote: {note}"),
+                None => "No matching files found.".to_string(),
+            };
         }
         let mut text = blocks.join("\n\n");
         if self.truncated {
@@ -211,6 +220,10 @@ impl RenderText for SkimFilesResult {
                 self.files.len(),
                 self.total_files
             ));
+        }
+        if let Some(note) = self.note.as_deref() {
+            text.push_str("\n\nNote: ");
+            text.push_str(note);
         }
         if !self.ambiguous_paths.is_empty() {
             text.push_str("\n\n");
@@ -597,6 +610,10 @@ mod tests {
                 modules: Vec::new(),
                 macros: Vec::new(),
             }],
+            note: Some(
+                "Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
+                    .to_string(),
+            ),
         };
 
         let text = result.render_text(RenderOptions::default());
@@ -605,6 +622,10 @@ mod tests {
         assert!(text.contains("- Patterns: `Foo`"), "{text}");
         assert!(text.contains("- Files: 1 of 3"), "{text}");
         assert!(text.contains("- Truncated: yes;"), "{text}");
+        assert!(
+            text.contains("- Note: Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."),
+            "{text}"
+        );
         assert!(text.contains("ranked by symbol relevance"), "{text}");
         assert!(text.contains("## src/foo.rs (42 lines)"), "{text}");
         assert!(
