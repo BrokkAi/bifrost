@@ -126,6 +126,22 @@ role spans extracted by the language adapter. `decorated_range` is the union of
 `node_range` and those decorator ranges. Matching semantics are unchanged by
 requesting full detail; these fields only make the span policy explicit.
 
+### Current structural precision
+
+`search_ast` normalizes common syntax across Python, Java, JavaScript, and
+TypeScript, but it is still a syntactic structural search tool. Use these
+caveats when writing reusable rules or prompts:
+
+| Area | Current behavior |
+| --- | --- |
+| Constructor calls | Java object creation and JS/TS `new` expressions are normalized as `call`; constructors are also refined as `constructor` declarations where the adapter can identify them. |
+| Keyword arguments | Python supports `kwargs`; Java, JavaScript, and TypeScript currently report unsupported-role diagnostics for `kwargs`. |
+| Imports and aliases | Import matching is based on syntactic module/import spans. It does not resolve aliases or follow re-exports. |
+| Receiver and callee | `callee.name` and `receiver.name` are derived from AST fields and terminal names, not type resolution. Chained calls stay syntactic. |
+| Decorators and annotations | Decorators/annotations are exposed through the `decorators` role. Full detail reports `node_range`, `decorator_ranges`, and `decorated_range`. |
+| Positional arguments | `args` patterns match positional arguments in order as a subsequence; v1 does not require exact positions or arity. |
+| Unsupported capabilities | Queries against unsupported normalized kinds or roles return diagnostics instead of silently pretending the language can answer them. |
+
 ## Semantic search
 
 `semantic_search(...)` searches code by meaning rather than name and returns the

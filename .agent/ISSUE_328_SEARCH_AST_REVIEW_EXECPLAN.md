@@ -15,7 +15,7 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
 - [x] (2026-07-03T12:27Z) Created this review-remediation ExecPlan from the accepted implementation plan. No runtime behavior has changed yet.
 - [x] (2026-07-03T12:34Z) Milestone 1: added opt-in full result detail without changing compact output. `result_detail` now defaults to compact, full detail adds deterministic match IDs, byte/line/column ranges, capture ranges, and optional capture kinds. Python models parse the optional fields. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`, and the targeted Python client unittest through `uv run --python 3.12 --with maturin`.
 - [x] (2026-07-03T12:37Z) Milestone 2: defined the full-detail decorator/annotation span policy in README docs and added cross-language tests for decorated callables and decorated classes. `node_range` remains the matched normalized fact range, `decorator_ranges` report extracted decorator/annotation role spans, and `decorated_range` is their union. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, and `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`.
-- [ ] Milestone 3: document capability and precision caveats for humans and LLMs.
+- [x] (2026-07-03T12:38Z) Milestone 3: documented capability and precision caveats in `bifrost_searchtools/README.md` and tightened the MCP descriptor text. The docs cover constructor-as-call behavior, kwargs support, aliases/import caveats, syntactic receiver/callee extraction, decorator span policy, argument-subsequence semantics, and unsupported-role diagnostics. Validation passed with `cargo fmt -- --check` and `cargo test structural --lib`.
 - [ ] Milestone 4: add schema versioning and exact-text duplicate capture equality.
 - [ ] Milestone 5: switch to global project-relative ordering and add truncation diagnostics.
 - [ ] Milestone 6: add compact broad-query performance guidance.
@@ -48,11 +48,16 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
   Rationale: The PR review asked for explicit span policy. Reporting `node_range`, `decorator_ranges`, and `decorated_range` makes the behavior inspectable while avoiding adapter-risky semantic rewrites in this milestone.
   Date/Author: 2026-07-03 / Codex.
 
+- Decision: Keep capability caveats in docs and descriptor prose, not every `search_ast` result.
+  Rationale: The review asked for discoverability, but always emitting the full matrix would inflate LLM context for common queries. Runtime diagnostics remain focused on unsupported features and later broad/truncated query guidance.
+  Date/Author: 2026-07-03 / Codex.
+
 
 ## Outcomes & Retrospective
 
 - 2026-07-03T12:34Z: Milestone 1 completed. Existing compact output remains the default and existing structural tests continue to pass. Callers that request `result_detail: "full"` now get match IDs and precise match/capture ranges suitable for follow-up tooling.
 - 2026-07-03T12:37Z: Milestone 2 completed. Full-detail results now have documented decorator/annotation range semantics and cross-language coverage for decorated callables and classes.
+- 2026-07-03T12:38Z: Milestone 3 completed. The Python README and MCP descriptor now make the normalization precision limits explicit without adding per-result verbosity.
 
 
 ## Context and Orientation
