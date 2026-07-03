@@ -364,7 +364,7 @@ mod tests {
         }))
         .expect("query should parse");
         let file = ProjectFile::new(
-            std::path::PathBuf::from("/workspace"),
+            std::env::temp_dir().join("bifrost-structural-search"),
             std::path::PathBuf::from("src\\app.py"),
         );
 
