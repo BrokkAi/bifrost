@@ -2,7 +2,7 @@
 //!
 //! Layering, language-independent unless noted:
 //! - [`adapter_helpers`]: small shared mechanics for language adapters.
-//! - [`capabilities`]: query feature requirements and capability diagnostics.
+//! - `capabilities`: query feature requirements and capability diagnostics.
 //! - [`kinds`]: the normalized node vocabulary with its subtype hierarchy,
 //!   and the role-edge vocabulary.
 //! - [`query`]: the canonical typed query IR and its JSON frontend.
