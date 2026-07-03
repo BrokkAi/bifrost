@@ -1,6 +1,12 @@
 # ExecPlans
 
-When writing complex features or significant refactors, use an ExecPlan (as described in .agent/PLANS.md) from design to implementation.
+When writing complex features or significant refactors, use an ExecPlan (as described in `.agent/PLANS.md`) from design to implementation.
+
+Store ExecPlans under `.agents/plans/`. Keep `.agent/PLANS.md` as the canonical instructions for how ExecPlans are written; do not place individual ExecPlans beside it.
+
+Store LLM-facing or agent-facing design notes under `.agents/docs/`. These are internal working documents for agent context, publication runbooks, parity notes, and similar material that is not meant to be rendered as public product documentation.
+
+Reserve `docs/` for future human-readable documentation intended for publication. Do not put ExecPlans, agent runbooks, or LLM-only context there.
 
 # Git / version control
 

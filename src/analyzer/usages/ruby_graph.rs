@@ -858,6 +858,18 @@ impl RubyWalkState<'_, '_> {
             );
             return;
         }
+        if let Some(aliased_method) =
+            alias_method_target_argument(node, self.scan.source, &self.scan.spec.member_name)
+        {
+            self.record_bare_method_hit_for_receiver(
+                &self.enclosing_receiver().unwrap_or_else(|| ReceiverType {
+                    owner_fq_name: String::new(),
+                    mode: ReceiverMode::TopLevel,
+                }),
+                aliased_method,
+            );
+            return;
+        }
         let Some(method) = node.child_by_field_name("method") else {
             return;
         };
@@ -1031,6 +1043,25 @@ fn dynamic_dispatch_target_argument<'tree>(
     symbol_or_string_value(first_argument, source)
         .is_some_and(|value| value == member)
         .then_some(first_argument)
+}
+
+fn alias_method_target_argument<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    member: &str,
+) -> Option<Node<'tree>> {
+    let method = node.child_by_field_name("method")?;
+    if node_text(method, source) != "alias_method" {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut args = arguments.named_children(&mut cursor);
+    args.next()?;
+    let target_argument = args.next()?;
+    symbol_or_string_value(target_argument, source)
+        .is_some_and(|value| value == member)
+        .then_some(target_argument)
 }
 
 fn language_for_file(file: &ProjectFile) -> Language {
@@ -1321,7 +1352,7 @@ fn ruby_factory_method_outcome(
         return FactoryMethodOutcome::Unknown;
     };
     let ranges = semantic.analyzer.ranges(&frame.method);
-    let Some(node) = ruby_method_node_for_ranges(tree.root_node(), ranges) else {
+    let Some(node) = ruby_method_node_for_ranges(tree.root_node(), ranges, &source) else {
         return FactoryMethodOutcome::Unknown;
     };
     let Some(expression) = ruby_tail_expression(node) else {
@@ -1342,6 +1373,15 @@ fn ruby_factory_method_outcome(
     {
         return FactoryMethodOutcome::Unknown;
     }
+    if expression.child_by_field_name("receiver").is_none()
+        && ruby_method_lookup_mode_matches(
+            semantic.analyzer,
+            &frame.method,
+            RubyMethodLookupMode::SingletonMethod,
+        )
+    {
+        return FactoryMethodOutcome::Owner(frame.invocation_owner_fq_name.clone());
+    }
     let Some(receiver) = expression.child_by_field_name("receiver") else {
         return FactoryMethodOutcome::Unknown;
     };
@@ -1355,15 +1395,23 @@ fn ruby_factory_method_outcome(
     )
 }
 
-fn ruby_method_node_for_ranges<'tree>(root: Node<'tree>, ranges: &[Range]) -> Option<Node<'tree>> {
+fn ruby_method_node_for_ranges<'tree>(
+    root: Node<'tree>,
+    ranges: &[Range],
+    source: &str,
+) -> Option<Node<'tree>> {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "method" | "singleton_method")
-            && ranges.iter().any(|range| {
-                range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
-            })
+        if ranges
+            .iter()
+            .any(|range| range.start_byte == node.start_byte() && range.end_byte == node.end_byte())
         {
-            return Some(node);
+            if matches!(node.kind(), "method" | "singleton_method" | "call") {
+                return Some(node);
+            }
+            if let Some(call) = ruby_synthetic_method_macro_call(node, source) {
+                return Some(call);
+            }
         }
         for index in (0..node.named_child_count()).rev() {
             if let Some(child) = node.named_child(index) {
@@ -1372,6 +1420,26 @@ fn ruby_method_node_for_ranges<'tree>(root: Node<'tree>, ranges: &[Range]) -> Op
         }
     }
     None
+}
+
+fn ruby_synthetic_method_macro_call<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if !matches!(node.kind(), "simple_symbol" | "string") {
+        return None;
+    }
+    let arguments = node.parent()?;
+    if arguments.kind() != "argument_list" {
+        return None;
+    }
+    let call = arguments.parent()?;
+    if call.kind() != "call" {
+        return None;
+    }
+    let method = call.child_by_field_name("method")?;
+    matches!(
+        node_text(method, source),
+        "attr_accessor" | "attr_reader" | "attr_writer" | "alias_method"
+    )
+    .then_some(call)
 }
 
 fn ruby_factory_new_receiver_outcome(
@@ -1612,7 +1680,7 @@ pub(crate) fn is_singleton_method_declaration(analyzer: &dyn IAnalyzer, target: 
     if ranges.is_empty() {
         return false;
     }
-    let Some(node) = ruby_method_node_for_ranges(tree.root_node(), ranges) else {
+    let Some(node) = ruby_method_node_for_ranges(tree.root_node(), ranges, &source) else {
         return false;
     };
     if node.kind() == "singleton_method" {

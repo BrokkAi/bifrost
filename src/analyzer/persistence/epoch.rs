@@ -345,7 +345,7 @@ lang_epoch!(
     Ruby,
     "ruby",
     "treesitter/ruby/",
-    "synthetic-file-scope-code-units-2026-07"
+    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07"
 );
 
 #[cfg(test)]

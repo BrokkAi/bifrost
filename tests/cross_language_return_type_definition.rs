@@ -1,6 +1,6 @@
 //! Cross-language go-to-definition through a *method-call return type*
 //! (`getFoo().member`) — the deeper half of pattern 1 in
-//! `.agent/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`. The construction leg
+//! `.agents/docs/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`. The construction leg
 //! (`new Foo().member`) is covered by `cross_language_receiver_definition.rs`;
 //! here the receiver is typed by the *declared/inferred return type* of the
 //! called method.

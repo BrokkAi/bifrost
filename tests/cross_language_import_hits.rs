@@ -1,5 +1,5 @@
 //! `Import`-kind hit emission — pattern 3 from
-//! `.agent/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`.
+//! `.agents/docs/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`.
 //!
 //! When a symbol is imported into another file, LSP find-references should
 //! report the *import binding* line (the token that brings the target into the

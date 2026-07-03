@@ -112,6 +112,197 @@ end
 }
 
 #[test]
+fn ruby_get_definition_resolves_attr_reader_and_alias_method_calls() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/shop/product.rb",
+            r#"
+class Product
+  attr_reader :name
+  alias_method :label, :name
+
+  def self.featured
+    new("featured")
+  end
+
+  def initialize(name)
+    @name = name
+  end
+
+  def summary
+    label
+  end
+end
+"#,
+        )
+        .file(
+            "app/catalog.rb",
+            r#"
+require "lib/shop/product"
+
+product = Product.featured
+product.name
+product.label
+"#,
+        )
+        .build();
+
+    let name_line = "product.name";
+    let name_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/catalog.rb","line":5,"column":{}}}]}}"#,
+            column_of(name_line, "name")
+        ),
+    );
+    assert_eq!(
+        name_value["results"][0]["status"], "resolved",
+        "{name_value}"
+    );
+    assert_eq!(
+        name_value["results"][0]["definitions"][0]["fqn"], "Product.name",
+        "{name_value}"
+    );
+    assert_eq!(
+        name_value["results"][0]["definitions"][0]["kind"], "function",
+        "{name_value}"
+    );
+
+    let label_line = "product.label";
+    let label_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/catalog.rb","line":6,"column":{}}}]}}"#,
+            column_of(label_line, "label")
+        ),
+    );
+    assert_eq!(
+        label_value["results"][0]["status"], "resolved",
+        "{label_value}"
+    );
+    assert_eq!(
+        label_value["results"][0]["definitions"][0]["fqn"], "Product.label",
+        "{label_value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_singleton_attr_reader_and_alias_method_calls() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"
+class Product
+  class << self
+    attr_reader :version
+    alias_method :label, :version
+  end
+end
+
+Product.version
+Product.label
+Product.new.version
+"#,
+        )
+        .build();
+
+    let version_line = "Product.version";
+    let version_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":9,"column":{}}}]}}"#,
+            column_of(version_line, "version")
+        ),
+    );
+    assert_eq!(
+        version_value["results"][0]["status"], "resolved",
+        "{version_value}"
+    );
+    assert_eq!(
+        version_value["results"][0]["definitions"][0]["fqn"], "Product.version",
+        "{version_value}"
+    );
+
+    let label_line = "Product.label";
+    let label_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":10,"column":{}}}]}}"#,
+            column_of(label_line, "label")
+        ),
+    );
+    assert_eq!(
+        label_value["results"][0]["status"], "resolved",
+        "{label_value}"
+    );
+    assert_eq!(
+        label_value["results"][0]["definitions"][0]["fqn"], "Product.label",
+        "{label_value}"
+    );
+
+    let instance_line = "Product.new.version";
+    let instance_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":11,"column":{}}}]}}"#,
+            column_of(instance_line, "version")
+        ),
+    );
+    assert_eq!(
+        instance_value["results"][0]["status"], "no_definition",
+        "{instance_value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_does_not_index_dynamic_attr_or_alias_names() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"
+class Product
+  ATTR_NAME = :name
+  alias_name = :label
+
+  attr_reader ATTR_NAME
+  alias_method alias_name, :name
+end
+
+product = Product.new
+product.ATTR_NAME
+product.alias_name
+"#,
+        )
+        .build();
+
+    let attr_line = "product.ATTR_NAME";
+    let attr_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":11,"column":{}}}]}}"#,
+            column_of(attr_line, "ATTR_NAME")
+        ),
+    );
+    assert_eq!(
+        attr_value["results"][0]["status"], "no_definition",
+        "{attr_value}"
+    );
+
+    let alias_line = "product.alias_name";
+    let alias_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":12,"column":{}}}]}}"#,
+            column_of(alias_line, "alias_name")
+        ),
+    );
+    assert_eq!(
+        alias_value["results"][0]["status"], "no_definition",
+        "{alias_value}"
+    );
+}
+
+#[test]
 fn ruby_get_definition_resolves_top_level_bare_method_call() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(

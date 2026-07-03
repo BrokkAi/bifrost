@@ -12,7 +12,7 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 
 ## Progress
 
-- [x] (2026-07-01T07:58Z) Created this ExecPlan at `.agent/ISSUE_393_RECEIVER_FACTS_EXECPLAN.md`.
+- [x] (2026-07-01T07:58Z) Created this ExecPlan at `.agents/plans/ISSUE_393_RECEIVER_FACTS_EXECPLAN.md`.
 - [x] (2026-07-01T08:03Z) Added the shared receiver/fact vocabulary and usage-hit surface helpers; focused surface and existing JS/TS/Python usage tests passed.
 - [x] (2026-07-01T09:39Z) Implemented and tested self-receiver hit classification for #387 across JS/TS, C++, and Rust.
 - [x] (2026-07-01T10:13Z) Implemented and tested JS/TS member-assignment declaration filtering for #386.
@@ -106,7 +106,7 @@ From `/Users/dave/.codex/worktrees/a8df/bifrost`:
 
        git status --short --branch
 
-2. Create `.agent/ISSUE_393_RECEIVER_FACTS_EXECPLAN.md` from this plan and commit that file alone.
+2. Create `.agents/plans/ISSUE_393_RECEIVER_FACTS_EXECPLAN.md` from this plan and commit that file alone.
 
 3. Implement the hit-surface milestone and run:
 
