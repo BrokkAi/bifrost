@@ -4,6 +4,8 @@
 __pycache__/
 .codex
 .claude/
+.amp/
+.agents/skills/
 .bifrost/
 bifrost_searchtools/*.so
 
