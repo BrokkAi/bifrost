@@ -17,15 +17,15 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: docs-pages
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
-    name: build and publish docs
+  build:
+    name: build docs
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
@@ -33,31 +33,13 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Resolve docs version
         id: docs_version
         env:
           RELEASE_TAG_INPUT: ${{ inputs.tag }}
         run: node scripts/resolve-docs-version.mjs
-
-      - name: Resolve docs target
-        id: docs_target
-        shell: bash
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-            echo "mode=preview" >> "$GITHUB_OUTPUT"
-            echo "base=/bifrost/previews/pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-            echo "label=PR #${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-            echo "preview_path=previews/pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=release" >> "$GITHUB_OUTPUT"
-            echo "base=/bifrost" >> "$GITHUB_OUTPUT"
-            echo "label=${{ steps.docs_version.outputs.label }}" >> "$GITHUB_OUTPUT"
-            echo "preview_path=" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -79,105 +61,59 @@ jobs:
           PUBLIC_BIFROST_TAG: ${{ steps.docs_version.outputs.tag }}
           PUBLIC_BIFROST_RELEASE_URL: ${{ steps.docs_version.outputs.release_url }}
           PUBLIC_DOCS_SITE: https://brokkai.github.io
-          PUBLIC_DOCS_BASE: ${{ steps.docs_target.outputs.base }}
+          PUBLIC_DOCS_BASE: /bifrost
 
-      - name: Preserve latest docs build
-        run: |
-          rm -rf .docs-latest
-          cp -a docs/dist .docs-latest
-
-      - name: Build versioned docs snapshot
-        if: steps.docs_version.outputs.is_release == 'true'
-        run: npm run build
-        working-directory: docs
-        env:
-          ASTRO_TELEMETRY_DISABLED: 1
-          PUBLIC_BIFROST_VERSION: ${{ steps.docs_version.outputs.version }}
-          PUBLIC_BIFROST_TAG: ${{ steps.docs_version.outputs.tag }}
-          PUBLIC_BIFROST_RELEASE_URL: ${{ steps.docs_version.outputs.release_url }}
-          PUBLIC_DOCS_SITE: https://brokkai.github.io
-          PUBLIC_DOCS_BASE: /bifrost/versions/${{ steps.docs_version.outputs.tag }}
-
-      - name: Preserve versioned docs build
-        if: steps.docs_version.outputs.is_release == 'true'
-        run: |
-          rm -rf .docs-version
-          cp -a docs/dist .docs-version
-
-      - name: Fetch existing Pages branch
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Prepare Pages artifact
+        if: github.event_name != 'pull_request'
         shell: bash
-        run: |
-          set -euo pipefail
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            git clone --depth 1 --branch gh-pages \
-              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-              .pages
-          else
-            mkdir -p .pages
-          fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Prepare Pages content
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        shell: bash
+          DOCS_IS_RELEASE: ${{ steps.docs_version.outputs.is_release }}
+          DOCS_RELEASE_TAG: ${{ steps.docs_version.outputs.tag }}
         run: |
           set -euo pipefail
           rm -rf .publish
           mkdir -p .publish
-          if [ -d .pages/.git ]; then
-            rsync -a --exclude .git .pages/ .publish/
+          cp -a docs/dist/. .publish/
+
+          if [ "${DOCS_IS_RELEASE}" = "true" ]; then
+            PUBLIC_BIFROST_VERSION="${DOCS_RELEASE_TAG#v}" \
+            PUBLIC_BIFROST_TAG="${DOCS_RELEASE_TAG}" \
+            PUBLIC_BIFROST_RELEASE_URL="https://github.com/BrokkAi/bifrost/releases/tag/${DOCS_RELEASE_TAG}" \
+            PUBLIC_DOCS_SITE="https://brokkai.github.io" \
+            PUBLIC_DOCS_BASE="/bifrost/versions/${DOCS_RELEASE_TAG}" \
+            ASTRO_TELEMETRY_DISABLED=1 \
+            npm run build --prefix docs
+
+            mkdir -p ".publish/versions/${DOCS_RELEASE_TAG}"
+            cp -a docs/dist/. ".publish/versions/${DOCS_RELEASE_TAG}/"
           fi
-          if [ "${{ steps.docs_target.outputs.mode }}" = "preview" ]; then
-            preview_dir=".publish/${{ steps.docs_target.outputs.preview_path }}"
-            rm -rf "${preview_dir}"
-            mkdir -p "${preview_dir}"
-            cp -a .docs-latest/. "${preview_dir}/"
-          else
-            find .publish -mindepth 1 -maxdepth 1 \
-              ! -name versions \
-              ! -name previews \
-              ! -name .git \
-              -exec rm -rf {} +
-            cp -a .docs-latest/. .publish/
-          fi
-          if [ "${{ steps.docs_target.outputs.mode }}" = "release" ] && [ "${{ steps.docs_version.outputs.is_release }}" = "true" ]; then
-            version_dir=".publish/versions/${{ steps.docs_version.outputs.tag }}"
-            rm -rf "${version_dir}"
-            mkdir -p "${version_dir}"
-            cp -a .docs-version/. "${version_dir}/"
-          fi
+
           node <<'NODE'
-          const { existsSync, readdirSync, writeFileSync } = require('node:fs');
-          const versionsDir = '.publish/versions';
-          const versions = existsSync(versionsDir)
-            ? readdirSync(versionsDir, { withFileTypes: true })
-                .filter((entry) => entry.isDirectory())
-                .map((entry) => entry.name)
-                .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
-            : [];
+          const { writeFileSync } = require('node:fs');
+          const tag = process.env.DOCS_RELEASE_TAG || '';
+          const versions = tag ? [tag] : [];
           writeFileSync('.publish/versions.json', `${JSON.stringify({ latest: versions[0] ?? null, versions }, null, 2)}\n`);
           NODE
           touch .publish/.nojekyll
 
-      - name: Publish Pages branch
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd .publish
-          git init
-          git checkout -B gh-pages
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No docs changes to publish."
-            exit 0
-          fi
-          git commit -m "Publish docs for ${{ steps.docs_target.outputs.label }}"
-          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push --force origin gh-pages
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: .publish
+
+  deploy:
+    name: deploy docs
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
