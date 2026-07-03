@@ -1521,6 +1521,181 @@ end
 }
 
 #[test]
+fn finds_attr_reader_and_alias_method_usages_through_inferred_receiver() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "lib/shop/product.rb",
+            r#"
+class Product
+  attr_reader :name
+  alias_method :label, :name
+
+  def self.featured
+    new("featured")
+  end
+
+  def initialize(name)
+    @name = name
+  end
+
+  def summary
+    label
+  end
+end
+"#,
+        ),
+        (
+            "app/catalog.rb",
+            r#"
+require "lib/shop/product"
+
+product = Product.featured
+product.name
+product.label
+"#,
+        ),
+    ]);
+
+    let name_target = analyzer
+        .get_definitions("Product.name")
+        .into_iter()
+        .find(|unit| unit.is_function())
+        .expect("missing attr_reader method declaration");
+    let name_hits = analyzer
+        .find_usages(&[name_target])
+        .into_either()
+        .expect("attr_reader usage lookup should succeed");
+    let name_lines = hit_source_lines(&name_hits);
+    assert!(
+        name_lines.iter().any(|line| line == "product.name"),
+        "expected Product#name external usage, got {name_lines:?}"
+    );
+
+    let label_target = definition(&analyzer, "Product.label");
+    let label_hits = analyzer
+        .find_usages(&[label_target])
+        .into_either()
+        .expect("alias_method usage lookup should succeed");
+    let label_lines = hit_source_lines(&label_hits);
+    assert!(
+        label_lines.iter().any(|line| line == "label"),
+        "expected Product#label internal usage, got {label_lines:?}"
+    );
+    assert!(
+        label_lines.iter().any(|line| line == "product.label"),
+        "expected Product#label external usage, got {label_lines:?}"
+    );
+}
+
+#[test]
+fn finds_namespaced_attr_reader_usage_from_alias_target_and_inferred_receiver() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "lib/shop/product.rb",
+            r#"
+module Shop
+  class Product
+    attr_reader :name
+
+    def initialize(name)
+      @name = name
+    end
+
+    alias_method :label, :name
+
+    def summary
+      label
+    end
+
+    def self.featured
+      new("featured")
+    end
+  end
+end
+"#,
+        ),
+        (
+            "app/catalog.rb",
+            r#"
+require "lib/shop/product"
+
+product = Shop::Product.featured
+product.name
+product.label
+"#,
+        ),
+    ]);
+
+    let name_target = definition(&analyzer, "Shop$Product.name");
+    let name_hits = analyzer
+        .find_usages(&[name_target])
+        .into_either()
+        .expect("namespaced attr_reader usage lookup should succeed");
+    let name_lines = hit_source_lines(&name_hits);
+    assert!(
+        name_lines
+            .iter()
+            .any(|line| line == "alias_method :label, :name"),
+        "expected alias_method target argument usage, got {name_lines:?}"
+    );
+    assert!(
+        name_lines.iter().any(|line| line == "product.name"),
+        "expected namespaced Product#name external usage, got {name_lines:?}"
+    );
+}
+
+#[test]
+fn finds_singleton_attr_reader_and_alias_method_usages_without_instance_false_positive() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app.rb",
+        r#"
+class Product
+  class << self
+    attr_reader :version
+    alias_method :label, :version
+  end
+end
+
+Product.version
+Product.label
+Product.new.version
+"#,
+    )]);
+
+    let version_target = analyzer
+        .get_definitions("Product.version")
+        .into_iter()
+        .find(|unit| unit.is_function())
+        .expect("missing singleton attr_reader method declaration");
+    let version_hits = analyzer
+        .find_usages(&[version_target])
+        .into_either()
+        .expect("singleton attr_reader usage lookup should succeed");
+    let version_lines = hit_source_lines(&version_hits);
+    assert!(
+        version_lines.iter().any(|line| line == "Product.version"),
+        "expected Product.version usage, got {version_lines:?}"
+    );
+    assert!(
+        version_lines
+            .iter()
+            .all(|line| line != "Product.new.version"),
+        "singleton attr_reader must not resolve through instance receiver: {version_lines:?}"
+    );
+
+    let label_target = definition(&analyzer, "Product.label");
+    let label_hits = analyzer
+        .find_usages(&[label_target])
+        .into_either()
+        .expect("singleton alias_method usage lookup should succeed");
+    let label_lines = hit_source_lines(&label_hits);
+    assert!(
+        label_lines.iter().any(|line| line == "Product.label"),
+        "expected Product.label usage, got {label_lines:?}"
+    );
+}
+
+#[test]
 fn zeitwerk_candidates_are_filtered_before_usage_file_cap() {
     let mut builder = InlineTestProject::with_language(Language::Ruby)
         .file(

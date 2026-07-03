@@ -101,18 +101,58 @@ fn captures_attr_macros_and_constants() {
     let analyzer = analyzer();
     let decls = declarations(&analyzer, "accessors.rb");
 
-    for accessor in ["balance", "owner", "pin"] {
+    for accessor in ["@balance", "@owner", "@pin"] {
         assert!(
             decls
                 .iter()
                 .any(|cu| cu.is_field() && cu.identifier() == accessor),
-            "missing attr field {accessor:?}",
+            "missing attr backing field {accessor:?}",
+        );
+    }
+    for accessor in ["balance", "owner", "pin="] {
+        assert!(
+            decls
+                .iter()
+                .any(|cu| cu.is_function() && cu.identifier() == accessor),
+            "missing attr reader method {accessor:?}",
         );
     }
     assert!(
         decls
             .iter()
             .any(|cu| cu.is_field() && cu.identifier() == "MAX_BALANCE")
+    );
+}
+
+#[test]
+fn ignores_dynamic_attr_and_alias_method_names() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "dynamic_accessors.rb",
+            r#"class Account
+  ATTR_NAME = :owner
+  alias_name = :label
+
+  attr_reader ATTR_NAME
+  alias_method alias_name, :owner
+end
+"#,
+        )
+        .build();
+    let analyzer = RubyAnalyzer::new(project.project_dyn());
+    let decls = declarations(&analyzer, "dynamic_accessors.rb");
+
+    assert!(
+        decls
+            .iter()
+            .all(|cu| !(cu.is_function() && cu.identifier() == "ATTR_NAME")),
+        "dynamic attr_reader name should not become a method declaration"
+    );
+    assert!(
+        decls
+            .iter()
+            .all(|cu| !(cu.is_function() && cu.identifier() == "alias_name")),
+        "dynamic alias_method name should not become a method declaration"
     );
 }
 
