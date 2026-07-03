@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
 function readCargoVersion() {
@@ -20,9 +21,32 @@ function parseReleaseTag(rawTag) {
   return { tag, version };
 }
 
-const release = parseReleaseTag(
-  process.env.RELEASE_TAG_INPUT || (process.env.GITHUB_REF_TYPE === 'tag' ? process.env.GITHUB_REF_NAME : '') || process.env.GITHUB_REF || ''
-);
+function currentReleaseTag() {
+  if (process.env.RELEASE_TAG_INPUT) {
+    return process.env.RELEASE_TAG_INPUT;
+  }
+  if (process.env.GITHUB_REF_TYPE === 'tag') {
+    return process.env.GITHUB_REF_NAME || process.env.GITHUB_REF || '';
+  }
+  if (process.env.GITHUB_REF?.startsWith('refs/tags/')) {
+    return process.env.GITHUB_REF;
+  }
+  return latestReleaseTag();
+}
+
+function latestReleaseTag() {
+  const output = execFileSync('git', ['tag', '--list', 'v*.*.*', '--sort=-v:refname'], { encoding: 'utf8' });
+  const tag = output
+    .split('\n')
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (!tag) {
+    throw new Error('Could not find any release tags matching v*.*.*');
+  }
+  return tag;
+}
+
+const release = parseReleaseTag(currentReleaseTag());
 const version = release?.version ?? readCargoVersion();
 const tag = release?.tag ?? '';
 const label = tag || `development-${version}`;
