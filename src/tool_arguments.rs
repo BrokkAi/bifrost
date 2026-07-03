@@ -518,6 +518,13 @@ fn path_to_slash_string(path: &Path) -> String {
 }
 
 fn slash_string(path: &str) -> String {
+    let path = if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{rest}")
+    } else if let Some(rest) = path.strip_prefix("\\\\?\\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    };
     path.replace('\\', "/")
 }
 
@@ -665,6 +672,23 @@ mod tests {
 
         assert!(overlays.is_empty());
         assert_eq!(normalized["where"][0], "src/**/*.py");
+    }
+
+    #[test]
+    fn normalizes_search_ast_windows_absolute_where_globs_against_verbatim_root() {
+        let root = Path::new(r"\\?\C:\work\root");
+
+        let normalized = normalize_tool_arguments(
+            "search_ast",
+            json!({
+                "where": [r"C:\work\root\src\*.java"],
+                "match": { "kind": "class" }
+            }),
+            root,
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["where"][0], "src/*.java");
     }
 
     #[test]
