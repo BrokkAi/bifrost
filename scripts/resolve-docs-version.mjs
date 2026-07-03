@@ -22,6 +22,9 @@ function parseReleaseTag(rawTag) {
 }
 
 function currentReleaseTag() {
+  if (process.env.GITHUB_EVENT_NAME === 'pull_request') {
+    return '';
+  }
   if (process.env.RELEASE_TAG_INPUT) {
     return process.env.RELEASE_TAG_INPUT;
   }
