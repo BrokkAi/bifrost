@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  pull_request:
+    paths:
+      - '.github/workflows/docs.yml'
+      - 'docs/**'
+      - 'scripts/resolve-docs-version.mjs'
   workflow_dispatch:
     inputs:
       tag:
@@ -35,6 +40,25 @@ jobs:
           RELEASE_TAG_INPUT: ${{ inputs.tag }}
         run: node scripts/resolve-docs-version.mjs
 
+      - name: Resolve docs target
+        id: docs_target
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            echo "mode=preview" >> "$GITHUB_OUTPUT"
+            echo "base=/bifrost/previews/pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "label=PR #${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "preview_path=previews/pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+            echo "base=/bifrost" >> "$GITHUB_OUTPUT"
+            echo "label=${{ steps.docs_version.outputs.label }}" >> "$GITHUB_OUTPUT"
+            echo "preview_path=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
@@ -55,7 +79,7 @@ jobs:
           PUBLIC_BIFROST_TAG: ${{ steps.docs_version.outputs.tag }}
           PUBLIC_BIFROST_RELEASE_URL: ${{ steps.docs_version.outputs.release_url }}
           PUBLIC_DOCS_SITE: https://brokkai.github.io
-          PUBLIC_DOCS_BASE: /bifrost
+          PUBLIC_DOCS_BASE: ${{ steps.docs_target.outputs.base }}
 
       - name: Preserve latest docs build
         run: |
@@ -80,14 +104,23 @@ jobs:
           rm -rf .docs-version
           cp -a docs/dist .docs-version
 
-      - name: Checkout existing Pages branch
-        uses: actions/checkout@v5
-        continue-on-error: true
-        with:
-          ref: gh-pages
-          path: .pages
+      - name: Fetch existing Pages branch
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              .pages
+          else
+            mkdir -p .pages
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prepare Pages content
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: |
           set -euo pipefail
@@ -96,12 +129,20 @@ jobs:
           if [ -d .pages/.git ]; then
             rsync -a --exclude .git .pages/ .publish/
           fi
-          find .publish -mindepth 1 -maxdepth 1 \
-            ! -name versions \
-            ! -name .git \
-            -exec rm -rf {} +
-          cp -a .docs-latest/. .publish/
-          if [ "${{ steps.docs_version.outputs.is_release }}" = "true" ]; then
+          if [ "${{ steps.docs_target.outputs.mode }}" = "preview" ]; then
+            preview_dir=".publish/${{ steps.docs_target.outputs.preview_path }}"
+            rm -rf "${preview_dir}"
+            mkdir -p "${preview_dir}"
+            cp -a .docs-latest/. "${preview_dir}/"
+          else
+            find .publish -mindepth 1 -maxdepth 1 \
+              ! -name versions \
+              ! -name previews \
+              ! -name .git \
+              -exec rm -rf {} +
+            cp -a .docs-latest/. .publish/
+          fi
+          if [ "${{ steps.docs_target.outputs.mode }}" = "release" ] && [ "${{ steps.docs_version.outputs.is_release }}" = "true" ]; then
             version_dir=".publish/versions/${{ steps.docs_version.outputs.tag }}"
             rm -rf "${version_dir}"
             mkdir -p "${version_dir}"
@@ -121,6 +162,7 @@ jobs:
           touch .publish/.nojekyll
 
       - name: Publish Pages branch
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: |
           set -euo pipefail
@@ -134,7 +176,7 @@ jobs:
             echo "No docs changes to publish."
             exit 0
           fi
-          git commit -m "Publish docs for ${{ steps.docs_version.outputs.label }}"
+          git commit -m "Publish docs for ${{ steps.docs_target.outputs.label }}"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push --force origin gh-pages
         env:
