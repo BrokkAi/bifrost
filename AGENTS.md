@@ -67,6 +67,9 @@ Backwards compatibility is not yet a concern. Clean up APIs instead when our req
 
 # Implementation details
 
+- Bifrost builds and tests on Windows as well as Unix-like targets. Keep file and path handling OS-agnostic: use
+  `Path`/`PathBuf`, temp/project roots that are absolute on the current platform, and explicit slash normalization only
+  at API/rendering boundaries where a stable workspace-relative string is required.
 - Prefer stack-safe iterative traversal over recursive Rust calls for analyzer tree/graph walks, especially during
   workspace initialization, parser declaration collection, usage analysis, and other paths that may touch many files or
   deeply nested ASTs. Use an explicit stack/queue or shared traversal helper unless the recursion depth is provably

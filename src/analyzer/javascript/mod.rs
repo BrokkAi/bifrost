@@ -135,6 +135,10 @@ impl LanguageAdapter for JavascriptAdapter {
 
         parsed
     }
+
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&crate::analyzer::js_ts::structural::JAVASCRIPT_STRUCTURAL_SPEC)
+    }
 }
 
 #[derive(Clone)]
@@ -657,6 +661,12 @@ impl IAnalyzer for JavascriptAnalyzer {
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

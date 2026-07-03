@@ -628,6 +628,15 @@ impl IAnalyzer for MultiAnalyzer {
             .then_some(self as &dyn TestDetectionProvider)
     }
 
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.delegates
+            .values()
+            .flat_map(|delegate| delegate.analyzer().structural_search_providers())
+            .collect()
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().contains_tests(file))

@@ -1,8 +1,14 @@
+use crate::analyzer::structural::{
+    ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
+    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
+    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
+};
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
+    "search_ast",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "find_filenames",
@@ -25,7 +31,73 @@ pub fn run_extended_stdio_server(
 }
 
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
+    let kind_vocabulary = ALL_KINDS
+        .iter()
+        .map(|kind| kind.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let role_vocabulary = crate::analyzer::structural::kinds::ALL_ROLES
+        .iter()
+        .map(|role| role.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pattern_schema_description = format!(
+        "A structural pattern object. Fields are optional: kind (one normalized kind or an array forming a subtype-aware union; vocabulary: {kind_vocabulary}), not_kind (kind or array to exclude), name (string for exact match or {{\"regex\": ...}}, max {MAX_STRING_PREDICATE_LENGTH} bytes), text ({{\"regex\": ...}}, max {MAX_STRING_PREDICATE_LENGTH} bytes), capture (max {MAX_CAPTURE_LENGTH} bytes), has / not_has (descendant patterns), and role sub-patterns valid for the declared kind: {role_vocabulary}. Query budget: max {MAX_PATTERN_NODES} pattern nodes, max depth {MAX_PATTERN_DEPTH}, max {MAX_ROLE_LIST_ENTRIES} role-list entries per list, max {MAX_KWARGS} kwargs, max keyword length {MAX_KWARG_NAME_LENGTH} bytes."
+    );
     vec![
+        tool_descriptor(
+            "search_ast",
+            "Search code structure across languages using normalized node kinds instead of grammar-specific node names. Finds shapes like calls to a named function, assignments of literals, decorated functions, or imports of a module, with named captures and enclosing symbols. This is syntactic structural search, not type or alias resolution: constructor calls are included in call searches where adapters support them, positional args match as an ordered subsequence, and unsupported roles/kinds are reported in diagnostics. Use scan_usages instead when you already know the exact symbol; use this for structural shapes.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "match": {
+                        "type": "object",
+                        "description": pattern_schema_description
+                    },
+                    "inside": {
+                        "type": "object",
+                        "description": "Optional containment constraint: the match must be lexically inside a node matching this pattern (same shape as match)."
+                    },
+                    "not_inside": {
+                        "type": "object",
+                        "description": "Optional negative containment: the match must NOT be inside a node matching this pattern."
+                    },
+                    "where": {
+                        "type": "array",
+                        "maxItems": MAX_WHERE_GLOBS,
+                        "items": { "type": "string", "maxLength": MAX_GLOB_LENGTH },
+                        "description": "Optional project-relative path globs limiting which files are searched. Absolute paths/globs inside the active workspace are normalized before execution."
+                    },
+                    "languages": {
+                        "type": "array",
+                        "maxItems": MAX_LANGUAGE_FILTERS,
+                        "items": { "type": "string" },
+                        "description": "Optional language filter (e.g. \"python\"). Languages without structural support are reported in diagnostics."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": DEFAULT_LIMIT,
+                        "minimum": 1,
+                        "maximum": MAX_LIMIT,
+                        "description": "Maximum number of matches to return."
+                    },
+                    "result_detail": {
+                        "type": "string",
+                        "enum": ["compact", "full"],
+                        "default": "compact",
+                        "description": "Use compact for context-efficient snippets and line ranges. Use full when follow-up tools need deterministic match IDs, byte/line/column ranges, decorator ranges, and capture ranges."
+                    },
+                    "schema_version": {
+                        "type": "integer",
+                        "default": SCHEMA_VERSION,
+                        "enum": [SCHEMA_VERSION],
+                        "description": "Optional query schema version. Omit for v1; non-v1 versions are rejected so callers do not accidentally rely on an incompatible query shape."
+                    }
+                },
+                "required": ["match"]
+            }),
+        ),
         tool_descriptor(
             "get_symbol_locations",
             "Get project-relative file paths and line ranges for known symbols after search_symbols; use before opening exact definitions.",

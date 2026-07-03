@@ -78,6 +78,9 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn language(&self) -> Language;
     fn query_directory(&self) -> &'static str;
     fn parser_language(&self) -> TsLanguage;
+    fn parser_language_for_file(&self, _file: &ProjectFile) -> TsLanguage {
+        self.parser_language()
+    }
     fn file_extension(&self) -> &'static str;
     fn normalize_full_name(&self, fq_name: &str) -> String {
         fq_name.to_string()
@@ -104,6 +107,12 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// [`TreeSitterAnalyzer::compute_cognitive_complexities`] yield an empty
     /// result.
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        None
+    }
+    /// Optional structural-search spec (issue #328). Languages that return
+    /// `Some` expose `search_ast` support through
+    /// [`crate::analyzer::structural::StructuralSearchProvider`].
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
         None
     }
 }
@@ -414,6 +423,11 @@ pub struct TreeSitterAnalyzer<A> {
     config: AnalyzerConfig,
     state: Arc<AnalyzerState>,
     storage: Option<Arc<AnalyzerStorage>>,
+    /// Structural-search facts cache (issue #328). Shared across clones and
+    /// incremental `update()` generations — entries are validated against a
+    /// hash of the current in-memory source, so surviving stale entries are
+    /// self-healing rather than wrong.
+    structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
     _state: PhantomData<A>,
 }
 
@@ -425,6 +439,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             storage: self.storage.as_ref().map(Arc::clone),
+            structural_cache: Arc::clone(&self.structural_cache),
             _state: PhantomData,
         }
     }
@@ -567,14 +582,32 @@ where
             ))
         };
 
+        let structural_cache = Arc::new(Self::build_structural_cache(&config));
         Self {
             project,
             adapter,
             config,
             state,
             storage,
+            structural_cache,
             _state: PhantomData,
         }
+    }
+
+    /// The structural facts cache takes a slice of the shared memo budget,
+    /// like the per-language memo caches do.
+    fn build_structural_cache(
+        config: &AnalyzerConfig,
+    ) -> crate::analyzer::structural::provider::StructuralFactsCache {
+        crate::analyzer::structural::provider::StructuralFactsCache::new(
+            config.memo_cache_budget_bytes() / 8,
+        )
+    }
+
+    pub(crate) fn structural_cache(
+        &self,
+    ) -> &crate::analyzer::structural::provider::StructuralFactsCache {
+        &self.structural_cache
     }
 
     pub fn project(&self) -> &dyn Project {
@@ -591,6 +624,7 @@ where
         config: AnalyzerConfig,
         state: AnalyzerState,
         storage: Option<Arc<AnalyzerStorage>>,
+        structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
     ) -> Self {
         Self {
             project,
@@ -598,6 +632,7 @@ where
             config,
             state: Arc::new(state),
             storage,
+            structural_cache,
             _state: PhantomData,
         }
     }
@@ -620,6 +655,9 @@ where
         if crate::analyzer::common::is_unparseable_source(source.as_str()) {
             return None;
         }
+        parser
+            .set_language(&adapter.parser_language_for_file(file))
+            .ok()?;
         let tree = parser.parse(source.as_str(), None)?;
         let mut parsed = adapter.parse_file(file, &source, &tree);
         parsed.add_file_scope(file, &source);
@@ -1009,6 +1047,12 @@ where
         self.state.files.get(file)
     }
 
+    /// The retained source text of an analyzed file. Structural search
+    /// re-parses from this instead of touching disk.
+    pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<&str> {
+        self.file_state(file).map(|state| state.source.as_str())
+    }
+
     pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {
         self.file_state(file)
             .map(|state| state.package_name.as_str())
@@ -1282,6 +1326,7 @@ where
             self.config.clone(),
             state,
             self.storage.as_ref().map(Arc::clone),
+            Arc::clone(&self.structural_cache),
         )
     }
 
@@ -1300,6 +1345,7 @@ where
             self.config.clone(),
             state,
             self.storage.as_ref().map(Arc::clone),
+            Arc::clone(&self.structural_cache),
         )
     }
 
@@ -1391,6 +1437,16 @@ where
         self.file_state(file)
             .map(|state| state.import_statements.as_slice())
             .unwrap_or(&[])
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        if self.adapter.structural_spec().is_some() {
+            vec![self]
+        } else {
+            Vec::new()
+        }
     }
 
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
@@ -1490,7 +1546,7 @@ where
         if crate::analyzer::common::is_unparseable_source(source) {
             return Vec::new();
         }
-        let mut parser = Self::build_parser(self.adapter.parser_language());
+        let mut parser = Self::build_parser(self.adapter.parser_language_for_file(file));
         let Some(tree) = parser.parse(source, None) else {
             return Vec::new();
         };

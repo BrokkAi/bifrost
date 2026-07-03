@@ -5,6 +5,7 @@ pub(crate) mod hierarchy;
 pub(crate) mod identifiers;
 pub(crate) mod imports;
 pub(crate) mod model;
+pub(crate) mod structural;
 pub(crate) mod syntax;
 pub(crate) mod tests;
 pub(crate) mod tsconfig;

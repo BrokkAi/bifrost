@@ -132,6 +132,28 @@ fn python_boundary_returns_structured_json() {
 }
 
 #[test]
+fn service_normalizes_search_ast_absolute_where_globs() {
+    let root = fixture_root();
+    let service = SearchToolsService::new_without_semantic_index(root.clone()).unwrap();
+    let arguments = serde_json::json!({
+        "match": { "kind": "class", "name": "A" },
+        "where": [root.join("A.java").display().to_string()],
+        "languages": ["java"]
+    });
+
+    let value = service
+        .call_tool_value("search_ast", arguments)
+        .expect("search_ast should accept an absolute where path");
+
+    assert_eq!(value["matches"][0]["path"], "A.java", "payload: {value}");
+    assert_eq!(value["matches"][0]["kind"], "class", "payload: {value}");
+    assert_eq!(
+        value["matches"][0]["enclosing_symbol"], "A",
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn rename_symbol_returns_non_mutating_edit_set() {
     let root = fixture_root();
     let before_a = fs::read_to_string(root.join("A.java")).unwrap();
