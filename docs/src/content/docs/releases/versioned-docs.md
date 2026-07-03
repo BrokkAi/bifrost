@@ -23,3 +23,7 @@ This keeps the displayed docs version tied to the same release tags used for Bif
 Use the **Docs** workflow's manual dispatch when a previous release needs a docs-only correction or republish. Leave `tag` empty to republish the latest release tag, or pass a specific release tag, for example `v0.7.2`.
 
 The workflow builds from the current docs source, labels the build with the selected tag, and refreshes `versions/<tag>/` for that release. Existing versioned snapshots for other tags are preserved.
+
+## Pull Request Previews
+
+Docs pull requests publish preview builds under `previews/pr-<number>/`. Preview builds use the current PR source, keep release snapshots untouched, and preserve the existing published root docs.
