@@ -53,6 +53,25 @@ fn extraction_count(analyzer: &dyn IAnalyzer) -> u64 {
     providers[0].structural_extraction_count()
 }
 
+fn assert_truncation_diagnostic(output: &SearchAstOutput, limit: usize) {
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "workspace"
+                && diagnostic
+                    .message
+                    .contains(&format!("returned the first {limit} matches"))
+                && diagnostic.message.contains("after scanning")
+                && diagnostic.message.contains("project-relative path")
+                && diagnostic.message.contains("where")
+                && diagnostic.message.contains("languages")
+                && diagnostic.message.contains("exact")),
+        "missing truncation diagnostic: {:?}",
+        output.diagnostics
+    );
+}
+
 #[test]
 fn anchor_pruning_skips_files_without_the_anchor() {
     let (_project, workspace) = python_workspace();
@@ -165,6 +184,7 @@ fn limit_truncates_across_files_deterministically() {
     assert!(output.truncated);
     // Files are visited in sorted path order: no_eval.py before uses_eval.py.
     assert_eq!(output.matches[0].path, "src/no_eval.py");
+    assert_truncation_diagnostic(&output, 1);
 }
 
 #[test]
@@ -184,6 +204,7 @@ fn limit_stops_after_global_truncation_is_known() {
     );
     assert_eq!(output.matches.len(), 1);
     assert!(output.truncated);
+    assert_truncation_diagnostic(&output, 1);
     assert_eq!(
         extraction_count(analyzer),
         2,

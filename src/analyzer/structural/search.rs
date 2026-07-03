@@ -187,19 +187,28 @@ pub fn execute_with_limits(
         }
     }
 
-    // Deterministic candidate order: providers sorted by language above,
-    // files sorted within each provider.
-    let mut candidates: Vec<(Language, &dyn super::StructuralSearchProvider, ProjectFile)> =
-        Vec::new();
+    // Deterministic candidate order: global project-relative path order, with
+    // language only as a tiebreaker for providers that share a path.
+    let mut candidates: Vec<(
+        String,
+        Language,
+        &dyn super::StructuralSearchProvider,
+        ProjectFile,
+    )> = Vec::new();
     for (language, provider, files) in provider_scopes {
-        candidates.extend(files.into_iter().map(|file| (language, provider, file)));
+        candidates.extend(
+            files
+                .into_iter()
+                .map(|file| (rel_path_string(&file), language, provider, file)),
+        );
     }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
     let global_cap = query.limit.saturating_add(1);
     let mut pending: Vec<PendingMatch> = Vec::new();
     let mut budget = SearchAstExecutionBudget::default();
     let mut budget_exhausted = false;
-    for (language, provider, file) in candidates {
+    for (_path, language, provider, file) in candidates {
         let Some(source) = provider.structural_source(&file) else {
             continue;
         };
@@ -233,7 +242,11 @@ pub fn execute_with_limits(
         }
     }
 
-    let truncated = pending.len() > query.limit || budget_exhausted;
+    let match_truncated = pending.len() > query.limit;
+    let truncated = match_truncated || budget_exhausted;
+    if match_truncated {
+        push_truncation_diagnostic(&mut diagnostics, &budget, query.limit);
+    }
     pending.truncate(query.limit);
 
     // Enclosing-symbol lookups only for the matches actually returned.
@@ -276,6 +289,20 @@ fn push_budget_diagnostic(
         language: "workspace",
         message: format!(
             "search_ast execution budget exhausted after scanning {} files, {} bytes, and {} facts; refine the query with where, languages, kind/name anchors, or a narrower pattern",
+            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+        ),
+    });
+}
+
+fn push_truncation_diagnostic(
+    diagnostics: &mut Vec<SearchAstDiagnostic>,
+    budget: &SearchAstExecutionBudget,
+    limit: usize,
+) {
+    diagnostics.push(SearchAstDiagnostic {
+        language: "workspace",
+        message: format!(
+            "search_ast returned the first {limit} matches after scanning {} files, {} bytes, and {} facts; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
             budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
         ),
     });

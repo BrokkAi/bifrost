@@ -129,8 +129,8 @@ fn same_eval_call_query_matches_python_java_javascript_and_typescript() {
         vec![
             ("java", "java/App.java", "eval(code)"),
             ("javascript", "javascript/app.js", "eval(code)"),
-            ("typescript", "typescript/app.ts", "eval(code)"),
             ("python", "python/app.py", "eval(code)"),
+            ("typescript", "typescript/app.ts", "eval(code)"),
         ]
     );
 
@@ -204,8 +204,8 @@ fn decorator_query_matches_python_decorators_java_annotations_and_js_ts_decorato
         vec![
             ("java", "java/App.java", "method"),
             ("javascript", "javascript/app.js", "method"),
-            ("typescript", "typescript/app.ts", "method"),
             ("python", "python/app.py", "function"),
+            ("typescript", "typescript/app.ts", "method"),
         ]
     );
 
@@ -215,8 +215,8 @@ fn decorator_query_matches_python_decorators_java_annotations_and_js_ts_decorato
         vec![
             "@route(\"/run\")…",
             "@route(\"/run\")…",
-            "handle(code: string) {…",
             "def handle_request(code):…",
+            "handle(code: string) {…",
         ]
     );
 }
@@ -484,8 +484,8 @@ fn member_call_callee_is_terminal_name_and_receiver_carries_object() {
         vec![
             ("java", "java/App.java", "service.execute(code)"),
             ("javascript", "javascript/app.js", "service.execute(code)"),
-            ("typescript", "typescript/app.ts", "service.execute(code)"),
             ("python", "python/app.py", "service.execute(code)"),
+            ("typescript", "typescript/app.ts", "service.execute(code)"),
         ]
     );
 }
