@@ -482,6 +482,8 @@ pub struct SourceBlock {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1883,15 +1885,7 @@ fn summary_fallback_for_file(
         ));
     }
 
-    excerpt_fallback_elements(analyzer, file).map(|elements| {
-        (
-            elements,
-            Some(
-                "no indexed declarations or top-level includes found; showing head/tail sample"
-                    .to_string(),
-            ),
-        )
-    })
+    excerpt_fallback_elements(analyzer, file).map(|(elements, note)| (elements, Some(note)))
 }
 
 fn include_fallback_elements(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<SummaryElement> {
@@ -1951,13 +1945,14 @@ fn include_fallback_elements(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Ve
 fn excerpt_fallback_elements(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-) -> Option<Vec<SummaryElement>> {
+) -> Option<(Vec<SummaryElement>, String)> {
     let content = analyzer.project().read_source(file).ok()?;
     let sampled = model_context::sample(&content);
     if sampled.text.is_empty() {
         return None;
     }
-    Some(vec![SummaryElement {
+    let note = sampled_excerpt_note(&sampled);
+    let elements = vec![SummaryElement {
         path: rel_path_string(file),
         symbol: rel_path_string(file),
         kind: "excerpt".to_string(),
@@ -1966,7 +1961,22 @@ fn excerpt_fallback_elements(
         text: sampled.text,
         parent_symbol: None,
         presentation: Some("sampled_excerpt".to_string()),
-    }])
+    }];
+    Some((elements, note))
+}
+
+fn sampled_excerpt_note(sampled: &model_context::HeadTail) -> String {
+    if sampled.truncated {
+        format!(
+            "no indexed declarations or top-level includes found in this file; showing a head/tail sample with the first {} and last {} of its {} lines (the middle is omitted)",
+            sampled.head_shown, sampled.tail_shown, sampled.total_lines
+        )
+    } else {
+        format!(
+            "no indexed declarations or top-level includes found in this file; showing its full text ({} lines)",
+            sampled.total_lines
+        )
+    }
 }
 
 fn is_include_statement(statement: &str) -> bool {
@@ -4636,6 +4646,7 @@ fn source_blocks_for_code_unit(
                 end_line: start_line + text.lines().count().saturating_sub(1),
                 text,
                 presentation: None,
+                note: None,
             })
         })
         .collect()
@@ -4656,6 +4667,7 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
                     end_line,
                     text,
                     presentation: None,
+                    note: None,
                 });
             }
 
@@ -4699,6 +4711,10 @@ fn include_fallback_source_block(
         end_line,
         text,
         presentation: None,
+        note: Some(
+            "no indexed declarations found in this file; showing its top-level #include lines, not the full source"
+                .to_string(),
+        ),
     })
 }
 
@@ -4706,9 +4722,8 @@ fn excerpt_fallback_source_block(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
 ) -> Option<SourceBlock> {
-    let sampled = excerpt_fallback_elements(analyzer, file)?
-        .into_iter()
-        .next()?;
+    let (elements, note) = excerpt_fallback_elements(analyzer, file)?;
+    let sampled = elements.into_iter().next()?;
     Some(SourceBlock {
         label: sampled.path.clone(),
         path: sampled.path,
@@ -4716,6 +4731,7 @@ fn excerpt_fallback_source_block(
         end_line: sampled.end_line,
         text: sampled.text,
         presentation: sampled.presentation,
+        note: Some(note),
     })
 }
 
@@ -4728,6 +4744,7 @@ fn module_file_listing_blocks(code_unit: &CodeUnit) -> Vec<SourceBlock> {
         text: "Module/object lookup returns defining files instead of the full source body."
             .to_string(),
         presentation: Some("file_listing".to_string()),
+        note: None,
     }]
 }
 
@@ -5360,6 +5377,7 @@ def gamma():
             end_line: 12,
             text: "class A {}".to_string(),
             presentation: None,
+            note: None,
         };
         let _element = SummaryElement {
             path: "A.java".to_string(),

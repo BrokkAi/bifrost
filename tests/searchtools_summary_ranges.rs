@@ -539,7 +539,9 @@ fn empty_cpp_headers_use_excerpt_summary_fallback() {
     assert_eq!(1, result.summaries.len(), "{result:#?}");
     let summary = &result.summaries[0];
     assert_eq!(
-        Some("no indexed declarations or top-level includes found; showing head/tail sample"),
+        Some(
+            "no indexed declarations or top-level includes found in this file; showing its full text (25 lines)"
+        ),
         summary.fallback_reason.as_deref()
     );
     assert_eq!(1, summary.elements.len(), "{:#?}", summary.elements);
@@ -574,7 +576,14 @@ fn larger_empty_cpp_headers_use_head_tail_excerpt_summary_fallback() {
         },
     );
 
-    let excerpt = &result.summaries[0].elements[0];
+    let summary = &result.summaries[0];
+    assert_eq!(
+        Some(
+            "no indexed declarations or top-level includes found in this file; showing a head/tail sample with the first 25 and last 25 of its 60 lines (the middle is omitted)"
+        ),
+        summary.fallback_reason.as_deref()
+    );
+    let excerpt = &summary.elements[0];
     assert_eq!(Some("sampled_excerpt"), excerpt.presentation.as_deref());
     assert_eq!(60, excerpt.end_line);
     assert!(excerpt.text.contains("// line 1"));

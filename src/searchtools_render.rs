@@ -416,7 +416,7 @@ impl SourceBlock {
                 self.text
             );
         }
-        let header = if options.render_line_numbers {
+        let mut header = if options.render_line_numbers {
             format!(
                 "## {}\n\n- Location: {}:{}..{}",
                 escape_markdown_heading(&self.label),
@@ -431,10 +431,17 @@ impl SourceBlock {
                 self.path
             )
         };
-        format!(
-            "{header}\n\n{}",
-            fenced_code_block(&render_source_body(&self.text, self.start_line, options))
-        )
+        if let Some(note) = &self.note {
+            header.push_str(&format!("\n- Note: {note}"));
+        }
+        // A sampled excerpt is head+tail with an OMITTED delimiter in between, so
+        // sequential numbering would fabricate line numbers after the gap.
+        let body = if self.presentation.as_deref() == Some("sampled_excerpt") {
+            model_context::cap_lines(&self.text)
+        } else {
+            render_source_body(&self.text, self.start_line, options)
+        };
+        format!("{header}\n\n{}", fenced_code_block(&body))
     }
 }
 
@@ -590,6 +597,7 @@ mod tests {
                 end_line: 14,
                 text: "fn bar() {\n    println!(\"hi\");\n}".to_string(),
                 presentation: None,
+                note: None,
             }],
             not_found: vec!["Missing".to_string()],
             ambiguous: vec![AmbiguousSymbol {

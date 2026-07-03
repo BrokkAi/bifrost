@@ -320,6 +320,12 @@ fn get_symbol_sources_file_input_uses_include_fallback_when_outline_is_empty() {
         "#include \"only/include.h\"\n#include <stdint.h>",
         source.text
     );
+    assert_eq!(
+        Some(
+            "no indexed declarations found in this file; showing its top-level #include lines, not the full source"
+        ),
+        source.note.as_deref()
+    );
 }
 
 #[test]
@@ -351,6 +357,12 @@ fn get_symbol_sources_file_input_uses_sampled_excerpt_fallback_when_no_outline_o
     assert_eq!(1, source.start_line);
     assert_eq!(60, source.end_line);
     assert_eq!(Some("sampled_excerpt"), source.presentation.as_deref());
+    assert_eq!(
+        Some(
+            "no indexed declarations or top-level includes found in this file; showing a head/tail sample with the first 25 and last 25 of its 60 lines (the middle is omitted)"
+        ),
+        source.note.as_deref()
+    );
     assert!(source.text.contains("// line 1"), "{source:#?}");
     assert!(source.text.contains("// line 25"), "{source:#?}");
     assert!(

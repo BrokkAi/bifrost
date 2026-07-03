@@ -1070,6 +1070,10 @@ fn get_symbol_sources_file_input_uses_include_and_sample_fallbacks() {
         "#include \"only/include.h\"\n#include <stdint.h>",
         include_source["text"]
     );
+    assert_eq!(
+        "no indexed declarations found in this file; showing its top-level #include lines, not the full source",
+        include_source["note"]
+    );
 
     let sampled_source = sources
         .iter()
@@ -1078,6 +1082,10 @@ fn get_symbol_sources_file_input_uses_include_and_sample_fallbacks() {
     assert_eq!(1, sampled_source["start_line"]);
     assert_eq!(60, sampled_source["end_line"]);
     assert_eq!("sampled_excerpt", sampled_source["presentation"]);
+    assert_eq!(
+        "no indexed declarations or top-level includes found in this file; showing a head/tail sample with the first 25 and last 25 of its 60 lines (the middle is omitted)",
+        sampled_source["note"]
+    );
     let sampled_text = sampled_source["text"].as_str().expect("sampled text");
     assert!(sampled_text.contains("// line 1"), "{sampled_text}");
     assert!(
@@ -1100,9 +1108,26 @@ fn get_symbol_sources_file_input_uses_include_and_sample_fallbacks() {
         "{rendered}"
     );
     assert!(
+        rendered.contains(
+            "- Note: no indexed declarations or top-level includes found in this file; showing a head/tail sample with the first 25 and last 25 of its 60 lines (the middle is omitted)"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "- Note: no indexed declarations found in this file; showing its top-level #include lines, not the full source"
+        ),
+        "{rendered}"
+    );
+    assert!(
         rendered.contains("----- OMITTED 10 LINES -----"),
         "{rendered}"
     );
+    // The sampled excerpt body must not be line-numbered: sequential numbering
+    // across the omitted gap would fabricate line numbers for the tail half.
+    assert!(!rendered.contains(": ----- OMITTED"), "{rendered}");
+    assert!(rendered.contains("// line 60"), "{rendered}");
+    assert!(!rendered.contains(": // line 60"), "{rendered}");
 }
 
 #[test]
@@ -1196,7 +1221,7 @@ fn get_summaries_renders_include_and_excerpt_fallbacks() {
         .find(|summary| summary["path"] == "src/emptyish.h")
         .unwrap();
     assert_eq!(
-        "no indexed declarations or top-level includes found; showing head/tail sample",
+        "no indexed declarations or top-level includes found in this file; showing its full text (25 lines)",
         excerpt_summary["fallback_reason"]
     );
     assert_eq!("excerpt", excerpt_summary["elements"][0]["kind"]);
@@ -1217,7 +1242,7 @@ fn get_summaries_renders_include_and_excerpt_fallbacks() {
     );
     assert!(
         rendered.contains(
-            "Note: no indexed declarations or top-level includes found; showing head/tail sample"
+            "Note: no indexed declarations or top-level includes found in this file; showing its full text (25 lines)"
         ),
         "{rendered}"
     );
