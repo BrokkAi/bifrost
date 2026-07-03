@@ -99,10 +99,16 @@ fn run() -> Result<(), String> {
     };
 
     if !result.not_found.is_empty() {
-        return Err(format!(
-            "Seed files not found: {}",
-            result.not_found.join(", ")
-        ));
+        let not_found = result
+            .not_found
+            .iter()
+            .map(|item| match &item.note {
+                Some(note) => format!("{} ({note})", item.input),
+                None => item.input.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("Seed files not found: {}", not_found));
     }
     if !result.duplicates.is_empty() {
         return Err(format!(

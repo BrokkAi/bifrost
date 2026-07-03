@@ -343,7 +343,7 @@ impl SearchToolsService {
                 render_options,
                 |workspace, params| get_symbol_locations(workspace.analyzer(), params),
             ),
-            "get_symbol_ancestors" => Self::decode_render_and_try_run(
+            "get_symbol_ancestors" => Self::decode_render_and_run(
                 &snapshot,
                 strip_legacy_kind_filter(arguments),
                 render_options,

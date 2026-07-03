@@ -30,6 +30,14 @@ fn string_value(value: &Value) -> &str {
     value.as_str().expect("string")
 }
 
+fn not_found_input(value: &Value) -> &str {
+    value["input"].as_str().expect("not_found input")
+}
+
+fn not_found_note(value: &Value) -> &str {
+    value["note"].as_str().expect("not_found note")
+}
+
 #[test]
 fn symbol_sources_disambiguates_anonymous_js_default_exports_by_file_selector() {
     let project = InlineTestProject::with_language(Language::JavaScript)
@@ -326,4 +334,93 @@ fn summaries_route_file_anchored_selector_with_extension_like_symbol_member() {
     assert_eq!(1, result["summaries"].as_array().unwrap().len(), "{result}");
     assert_eq!("src/a.js", result["summaries"][0]["path"], "{result}");
     assert_eq!("styles.css", result["summaries"][0]["label"], "{result}");
+}
+
+#[test]
+fn ancestors_batch_returns_valid_class_and_reports_non_type_target() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/main.js",
+            r#"class Base {}
+export class ValidClass extends Base {}
+export function someFunction() {}
+"#,
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_ancestors",
+        r#"{"symbols":["ValidClass","someFunction"]}"#,
+    );
+
+    assert_eq!(1, result["ancestors"].as_array().unwrap().len(), "{result}");
+    assert_eq!("ValidClass", result["ancestors"][0]["symbol"], "{result}");
+    assert_eq!(
+        vec!["Base".to_string()],
+        string_array(&result["ancestors"][0]["ancestors"]),
+        "{result}"
+    );
+    assert_eq!(1, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(
+        "someFunction",
+        not_found_input(&result["not_found"][0]),
+        "{result}"
+    );
+    assert_eq!(
+        "resolves to a function; get_symbol_ancestors only accepts class/module/type symbols",
+        not_found_note(&result["not_found"][0]),
+        "{result}"
+    );
+}
+
+#[test]
+fn anchored_selector_wrong_path_reports_anchor_recovery_note() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/a.js", "export class Widget {}\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["src/wrong.js#Widget"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(
+        "src/wrong.js#Widget",
+        not_found_input(&result["not_found"][0]),
+        "{result}"
+    );
+    assert_eq!(
+        "`Widget` resolved, but no definition is in `src/wrong.js`; re-call with the bare name to list valid selectors",
+        not_found_note(&result["not_found"][0]),
+        "{result}"
+    );
+}
+
+#[test]
+fn unresolvable_symbol_reports_search_symbols_recovery_note() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/a.js", "export class Widget {}\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["MissingWidget"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(
+        "MissingWidget",
+        not_found_input(&result["not_found"][0]),
+        "{result}"
+    );
+    assert!(
+        not_found_note(&result["not_found"][0]).contains("search_symbols"),
+        "{result}"
+    );
 }

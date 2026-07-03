@@ -301,7 +301,7 @@ fn scoped_service_reads_selected_files_from_revision() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item == "Other.java"),
+            .any(|item| item["input"] == "Other.java"),
         "unselected files must not be analyzer-visible: {value}"
     );
 
@@ -639,11 +639,11 @@ fn get_summaries_directory_target_stays_narrow_on_service_path() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item == "."),
+            .any(|item| item["input"] == "."),
         "{value}"
     );
     let rendered = value["rendered_text"].as_str().expect("rendered text");
-    assert!(rendered.contains("Not found: ."), "{rendered}");
+    assert!(rendered.contains("Not found: `.`"), "{rendered}");
     assert!(rendered.contains("A.java"), "{rendered}");
 }
 
@@ -665,7 +665,7 @@ fn get_summaries_mixed_targets_stay_narrow_on_service_path() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item == "."),
+            .any(|item| item["input"] == "."),
         "{value}"
     );
     assert!(
@@ -674,7 +674,7 @@ fn get_summaries_mixed_targets_stay_narrow_on_service_path() {
     );
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(rendered.contains("A.java"), "{rendered}");
-    assert!(rendered.contains("Not found: ."), "{rendered}");
+    assert!(rendered.contains("Not found: `.`"), "{rendered}");
 }
 
 #[test]
@@ -1164,7 +1164,7 @@ fn legacy_kind_filter_is_ignored_for_symbol_sources_and_locations() {
 }
 
 #[test]
-fn get_symbol_ancestors_rejects_non_type_targets() {
+fn get_symbol_ancestors_reports_non_type_targets_as_not_found() {
     let temp = TempDir::new().unwrap();
     fs::write(
         temp.path().join("Thing.java"),
@@ -1174,14 +1174,18 @@ fn get_symbol_ancestors_rejects_non_type_targets() {
     let service =
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
 
-    let err = service
+    let payload = service
         .call_tool_json("get_symbol_ancestors", r#"{"symbols":["Thing.run"]}"#)
-        .unwrap_err();
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(SearchToolsServiceErrorCode::InvalidParams, err.code);
-    assert!(
-        err.message
-            .contains("only accepts class/module/type symbols")
+    assert_eq!(0, value["ancestors"].as_array().unwrap().len(), "{value}");
+    assert_eq!(1, value["not_found"].as_array().unwrap().len(), "{value}");
+    assert_eq!("Thing.run", value["not_found"][0]["input"], "{value}");
+    assert_eq!(
+        "resolves to a function; get_symbol_ancestors only accepts class/module/type symbols",
+        value["not_found"][0]["note"],
+        "{value}"
     );
 }
 
@@ -2080,7 +2084,11 @@ fn scan_usages_reports_unknown_symbol_as_not_found() {
     assert_eq!(0, array_len(&value, "usages"));
     let not_found = value["not_found"].as_array().unwrap();
     assert_eq!(1, not_found.len());
-    assert_eq!("does.not.Exist", not_found[0]);
+    assert_eq!("does.not.Exist", not_found[0]["input"]);
+    assert_eq!(
+        "no symbol matched; try search_symbols with a substring or regex pattern",
+        not_found[0]["note"]
+    );
     assert_eq!(0, array_len(&value, "failures"));
 }
 

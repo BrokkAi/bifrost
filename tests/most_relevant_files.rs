@@ -680,7 +680,14 @@ fn missing_seed_files_are_reported() {
     )
     .unwrap();
 
-    assert_eq!(vec!["missing.java".to_string()], results.not_found);
+    assert_eq!(
+        vec!["missing.java".to_string()],
+        results
+            .not_found
+            .iter()
+            .map(|item| item.input.clone())
+            .collect::<Vec<_>>()
+    );
     assert!(results.files.is_empty());
 }
 

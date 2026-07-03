@@ -158,7 +158,10 @@ fn get_symbol_locations_uses_canonical_suffix_without_losing_ambiguity() {
     );
     assert_eq!(
         vec!["list.Run".to_string()],
-        bare.not_found,
+        bare.not_found
+            .iter()
+            .map(|item| item.input.clone())
+            .collect::<Vec<_>>(),
         "ambiguous bare suffix must not collapse to one location: {bare:#?}"
     );
     assert!(bare.locations.is_empty(), "{bare:#?}");

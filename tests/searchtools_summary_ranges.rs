@@ -8,6 +8,14 @@ use brokk_bifrost::{
 mod common;
 use common::InlineTestProject;
 
+fn not_found_inputs(result: &brokk_bifrost::searchtools::SummaryResult) -> Vec<String> {
+    result
+        .not_found
+        .iter()
+        .map(|item| item.input.clone())
+        .collect()
+}
+
 fn java_fixture_analyzer() -> JavaAnalyzer {
     let root = std::env::current_dir()
         .unwrap()
@@ -154,7 +162,7 @@ fn get_summaries_reports_directory_targets_as_not_found() {
         },
     );
 
-    assert_eq!(vec!["anotherpkg"], result.not_found);
+    assert_eq!(vec!["anotherpkg"], not_found_inputs(&result));
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
     assert!(result.summaries.is_empty(), "{:?}", result.summaries);
 }
@@ -169,7 +177,7 @@ fn get_summaries_reports_workspace_root_directory_target_as_not_found() {
         },
     );
 
-    assert_eq!(vec!["."], result.not_found);
+    assert_eq!(vec!["."], not_found_inputs(&result));
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
     assert!(result.summaries.is_empty(), "{:?}", result.summaries);
 }
@@ -219,7 +227,7 @@ fn get_summaries_reports_unmatched_file_like_targets() {
     );
 
     assert!(result.summaries.is_empty());
-    assert_eq!(vec!["Missing.java"], result.not_found);
+    assert_eq!(vec!["Missing.java"], not_found_inputs(&result));
     assert!(result.ambiguous.is_empty());
 }
 

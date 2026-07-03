@@ -401,7 +401,7 @@ fn unresolved_targets(targets: &[String], structured: &Value) -> Vec<String> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(Value::as_str)
+        .filter_map(not_found_input_value)
         .collect();
     targets
         .iter()
@@ -410,6 +410,12 @@ fn unresolved_targets(targets: &[String], structured: &Value) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+fn not_found_input_value(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("input").and_then(Value::as_str))
 }
 
 fn degrade_get_summaries_value(

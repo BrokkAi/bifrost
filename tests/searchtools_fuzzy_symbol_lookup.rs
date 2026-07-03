@@ -32,7 +32,7 @@ class SMTP {
         "PHPMailer/PHPMailer/SMTP.authenticate",
     ] {
         let result = source_for(&analyzer, symbol);
-        assert_eq!(Vec::<String>::new(), result.not_found, "{symbol}");
+        assert!(result.not_found.is_empty(), "{symbol}");
         assert!(result.ambiguous.is_empty(), "{symbol}");
         assert_eq!(1, result.sources.len(), "{symbol}");
         assert_eq!(
@@ -276,7 +276,14 @@ class Other {
     );
 
     assert!(result.ambiguous.is_empty(), "{result:#?}");
-    assert_eq!(vec!["src/pkg/Missing.java".to_string()], result.not_found);
+    assert_eq!(
+        vec!["src/pkg/Missing.java".to_string()],
+        result
+            .not_found
+            .iter()
+            .map(|item| item.input.clone())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         vec![
             "src/pkg/Thing.java".to_string(),
@@ -692,7 +699,15 @@ fn fuzzy_lookup_does_not_treat_arrow_or_hash_as_symbol_delimiters() {
     for symbol in ["A->method", "A#method"] {
         let result = source_for(&analyzer, symbol);
         assert!(result.sources.is_empty(), "{symbol}");
-        assert_eq!(vec![symbol.to_string()], result.not_found, "{symbol}");
+        assert_eq!(
+            vec![symbol.to_string()],
+            result
+                .not_found
+                .iter()
+                .map(|item| item.input.clone())
+                .collect::<Vec<_>>(),
+            "{symbol}"
+        );
         assert!(result.ambiguous.is_empty(), "{symbol}");
     }
 }

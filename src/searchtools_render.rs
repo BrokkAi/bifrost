@@ -1,7 +1,7 @@
 use crate::model_context;
 use crate::path_utils::AmbiguousPathInput;
 use crate::searchtools::{
-    AmbiguousSymbol, MostRelevantFilesResult, SearchSymbolHit, SearchSymbolsFile,
+    AmbiguousSymbol, MostRelevantFilesResult, NotFoundInput, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
     SummaryResult, SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
     SymbolSourcesResult,
@@ -115,7 +115,10 @@ impl RenderText for SymbolLocationsResult {
             .map(|location| location.render_text(options))
             .collect();
         if !self.not_found.is_empty() {
-            lines.push(format!("Not found: {}", self.not_found.join(", ")));
+            lines.push(format!(
+                "Not found: {}",
+                render_not_found_inline(&self.not_found)
+            ));
         }
         if lines.is_empty() {
             "No matching symbols found.".to_string()
@@ -154,7 +157,10 @@ impl RenderText for SummaryResult {
             .map(|summary| summary.render_text(options))
             .collect();
         if !self.not_found.is_empty() {
-            blocks.push(format!("Not found: {}", self.not_found.join(", ")));
+            blocks.push(format!(
+                "Not found: {}",
+                render_not_found_inline(&self.not_found)
+            ));
         }
         blocks.extend(self.ambiguous.iter().map(render_ambiguous_symbol));
         if !self.ambiguous_paths.is_empty() {
@@ -226,7 +232,10 @@ impl RenderText for MostRelevantFilesResult {
 
         let mut lines = self.files.clone();
         if !self.not_found.is_empty() {
-            lines.push(format!("Not found: {}", self.not_found.join(", ")));
+            lines.push(format!(
+                "Not found: {}",
+                render_not_found_inline(&self.not_found)
+            ));
         }
         if !self.duplicates.is_empty() {
             lines.push(format!("Duplicate seeds: {}", self.duplicates.join(", ")));
@@ -483,12 +492,28 @@ fn render_inline_list<'a>(items: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
-fn render_not_found(items: &[String]) -> String {
+fn render_not_found_inline(items: &[NotFoundInput]) -> String {
+    items
+        .iter()
+        .map(render_not_found_item)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_not_found_item(item: &NotFoundInput) -> String {
+    let input = escape_markdown_inline_code(&item.input);
+    match &item.note {
+        Some(note) => format!("{input}: {note}"),
+        None => input,
+    }
+}
+
+fn render_not_found(items: &[NotFoundInput]) -> String {
     let mut lines = vec!["## Not found".to_string(), String::new()];
     lines.extend(
         items
             .iter()
-            .map(|item| format!("- {}", escape_markdown_inline_code(item))),
+            .map(|item| format!("- {}", render_not_found_item(item))),
     );
     lines.join("\n")
 }
@@ -608,7 +633,13 @@ mod tests {
                 presentation: None,
                 note: None,
             }],
-            not_found: vec!["Missing".to_string()],
+            not_found: vec![NotFoundInput {
+                input: "Missing".to_string(),
+                note: Some(
+                    "no symbol matched; try search_symbols with a substring or regex pattern"
+                        .to_string(),
+                ),
+            }],
             ambiguous: vec![AmbiguousSymbol {
                 target: "Foo".to_string(),
                 matches: vec!["crate::foo::Foo".to_string(), "other::Foo".to_string()],
@@ -629,7 +660,10 @@ mod tests {
         assert!(text.contains("- Location: src/foo.rs:12..14"), "{text}");
         assert!(text.contains("```text\n12: fn bar() {"), "{text}");
         assert!(text.contains("13:     println!(\"hi\");"), "{text}");
-        assert!(text.contains("## Not found\n\n- `Missing`"), "{text}");
+        assert!(
+            text.contains("## Not found\n\n- `Missing`: no symbol matched; try search_symbols with a substring or regex pattern"),
+            "{text}"
+        );
         assert!(text.contains("Ambiguous paths:"), "{text}");
         assert!(
             text.contains("- Foo.java -> app/Foo.java, lib/Foo.java"),
