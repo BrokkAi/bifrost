@@ -13,7 +13,7 @@ The server does not open a network port. It speaks LSP over stdin and stdout, bu
 
 ## Editor Integration
 
-Use the [VS Code extension](./vscode/) for the packaged editor experience. The extension starts Bifrost with:
+Use the [VS Code extension](../vscode/) for the packaged editor experience. The extension starts Bifrost with:
 
 ```bash
 bifrost --root <workspace-root> --lsp
