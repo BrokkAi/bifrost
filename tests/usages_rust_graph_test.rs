@@ -1184,6 +1184,367 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_ufcs_trait_method_through_implementer() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/contracts.rs",
+            r#"
+pub trait Trait {
+    fn frobnicate();
+}
+"#,
+        ),
+        (
+            "src/service.rs",
+            r#"
+use crate::contracts::Trait;
+
+pub struct Foo;
+impl Trait for Foo {}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::contracts::Trait;
+use crate::service::Foo;
+
+fn run() {
+    Foo::frobnicate();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/contracts.rs"),
+        "Trait",
+        "frobnicate",
+    );
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("UFCS trait method success");
+
+    assert_eq!(1, hits.len(), "hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/main.rs"))
+    );
+}
+
+#[test]
+fn rust_graph_strategy_resolves_ufcs_trait_method_through_module_qualified_implementer() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub trait Trait {
+    fn frobnicate();
+}
+
+pub struct Foo;
+impl Trait for Foo {}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::{self, Trait};
+
+fn run() {
+    service::Foo::frobnicate();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "Trait",
+        "frobnicate",
+    );
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("module-qualified UFCS trait method success");
+
+    assert_eq!(1, hits.len(), "hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/main.rs"))
+    );
+}
+
+#[test]
+fn rust_graph_strategy_requires_visible_trait_for_ufcs_trait_method() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub trait Trait {
+    fn frobnicate();
+}
+
+pub struct Foo;
+impl Trait for Foo {}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service;
+
+fn run() {
+    service::Foo::frobnicate();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "Trait",
+        "frobnicate",
+    );
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("non-visible UFCS trait method success");
+
+    assert!(hits.is_empty(), "hits: {hits:?}");
+}
+
+#[test]
+fn rust_graph_strategy_prefers_inherent_static_method_over_trait_method() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub trait Trait {
+    fn frobnicate();
+}
+
+pub struct Foo;
+impl Foo {
+    pub fn frobnicate() {}
+}
+impl Trait for Foo {}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Trait;
+use crate::service::Foo;
+
+fn run() {
+    Foo::frobnicate();
+}
+"#,
+        ),
+    ]);
+
+    let trait_method = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "Trait",
+        "frobnicate",
+    );
+    let inherent_method = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "Foo",
+        "frobnicate",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+
+    assert!(
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&trait_method),
+                &candidates,
+                1000
+            )
+            .into_either()
+            .expect("trait method success")
+            .is_empty()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&inherent_method),
+                &candidates,
+                1000
+            )
+            .into_either()
+            .expect("inherent method success")
+            .len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_does_not_guess_ambiguous_ufcs_trait_method() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/contracts.rs",
+            r#"
+pub trait One {
+    fn frobnicate();
+}
+
+pub trait Two {
+    fn frobnicate();
+}
+"#,
+        ),
+        (
+            "src/service.rs",
+            r#"
+use crate::contracts::{One, Two};
+
+pub struct Foo;
+impl One for Foo {}
+impl Two for Foo {}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::contracts::{One, Two};
+use crate::service::Foo;
+
+fn run() {
+    Foo::frobnicate();
+}
+"#,
+        ),
+    ]);
+
+    let one = member(
+        &analyzer,
+        &project.file("src/contracts.rs"),
+        "One",
+        "frobnicate",
+    );
+    let two = member(
+        &analyzer,
+        &project.file("src/contracts.rs"),
+        "Two",
+        "frobnicate",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+
+    assert!(
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&one), &candidates, 1000)
+            .into_either()
+            .expect("ambiguous One success")
+            .is_empty()
+    );
+    assert!(
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&two), &candidates, 1000)
+            .into_either()
+            .expect("ambiguous Two success")
+            .is_empty()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_filters_ufcs_trait_candidates_by_visible_trait() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/contracts.rs",
+            r#"
+pub trait One {
+    fn frobnicate();
+}
+
+pub trait Two {
+    fn frobnicate();
+}
+"#,
+        ),
+        (
+            "src/service.rs",
+            r#"
+use crate::contracts::{One, Two};
+
+pub struct Foo;
+impl One for Foo {}
+impl Two for Foo {}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::contracts::One;
+use crate::service::Foo;
+
+fn run() {
+    Foo::frobnicate();
+}
+"#,
+        ),
+    ]);
+
+    let one = member(
+        &analyzer,
+        &project.file("src/contracts.rs"),
+        "One",
+        "frobnicate",
+    );
+    let two = member(
+        &analyzer,
+        &project.file("src/contracts.rs"),
+        "Two",
+        "frobnicate",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&one), &candidates, 1000)
+            .into_either()
+            .expect("visible One success")
+            .len()
+    );
+    assert!(
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&two), &candidates, 1000)
+            .into_either()
+            .expect("hidden Two success")
+            .is_empty()
+    );
+}
+
+#[test]
 fn rust_graph_strategy_resolves_comment_separated_member_references() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
