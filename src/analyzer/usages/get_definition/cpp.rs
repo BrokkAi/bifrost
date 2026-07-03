@@ -1,4 +1,8 @@
 use super::*;
+use crate::analyzer::usages::cpp_call_match::{
+    CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_parameter_type_text,
+    cpp_type_text_pointer_depth, normalize_cpp_type_name,
+};
 
 pub(super) fn resolve_cpp(
     analyzer: &dyn IAnalyzer,
@@ -885,19 +889,7 @@ fn cpp_filter_candidates_by_call(
     let Some(arg_types) = arg_types else {
         return arity_filtered;
     };
-    if arg_types.iter().any(Option::is_none) {
-        return arity_filtered;
-    }
-    let filtered: Vec<_> = arity_filtered
-        .iter()
-        .filter(|unit| cpp_candidate_params_match_args(unit, arg_types, analyzer, visibility, file))
-        .cloned()
-        .collect();
-    if filtered.is_empty() {
-        arity_filtered
-    } else {
-        filtered
-    }
+    cpp_filter_candidates_by_call_arg_types(arity_filtered, arg_types, analyzer, visibility, file)
 }
 
 fn cpp_filter_candidates_by_call_lazy<F>(
@@ -918,21 +910,35 @@ where
     let Some(arg_types) = resolve_arg_types() else {
         return arity_filtered;
     };
-    if arg_types.iter().any(Option::is_none) {
-        return arity_filtered;
-    }
-    let filtered: Vec<_> = arity_filtered
+    cpp_filter_candidates_by_call_arg_types(arity_filtered, &arg_types, analyzer, visibility, file)
+}
+
+fn cpp_filter_candidates_by_call_arg_types(
+    candidates: Vec<CodeUnit>,
+    arg_types: &[Option<CppType>],
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+) -> Vec<CodeUnit> {
+    let shared_arg_types: Vec<_> = arg_types
         .iter()
-        .filter(|unit| {
-            cpp_candidate_params_match_args(unit, &arg_types, analyzer, visibility, file)
-        })
-        .cloned()
+        .map(|arg| arg.as_ref().map(CppType::as_arg_type))
         .collect();
-    if filtered.is_empty() {
-        arity_filtered
-    } else {
-        filtered
-    }
+    cpp_filter_candidates_by_args(
+        candidates,
+        &shared_arg_types,
+        &|name| cpp_resolve_type_unit(analyzer, visibility, file, name),
+        &|arg_type, param_type| {
+            cpp_type_assignable_to(
+                analyzer,
+                visibility,
+                file,
+                arg_type,
+                param_type,
+                &mut HashSet::default(),
+            )
+        },
+    )
 }
 
 fn cpp_filter_candidates_by_arity(
@@ -957,96 +963,6 @@ fn cpp_filter_candidates_by_arity(
     } else {
         filtered
     }
-}
-
-fn cpp_candidate_params_match_args(
-    candidate: &CodeUnit,
-    arg_types: &[Option<CppType>],
-    analyzer: &dyn IAnalyzer,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-) -> bool {
-    let Some(param_types) = candidate.signature().and_then(cpp_signature_param_types) else {
-        return false;
-    };
-    param_types.len() == arg_types.len()
-        && param_types
-            .iter()
-            .zip(arg_types.iter())
-            .all(|(param_type, arg_type)| {
-                let Some(arg_type) = arg_type else {
-                    return false;
-                };
-                if cpp_type_text_pointer_depth(param_type) != arg_type.indirection {
-                    return false;
-                }
-                let Some(param_unit) = visibility.resolve_type(file, param_type) else {
-                    return false;
-                };
-                cpp_type_assignable_to(
-                    analyzer,
-                    visibility,
-                    file,
-                    &arg_type.unit,
-                    &param_unit,
-                    &mut HashSet::default(),
-                )
-            })
-}
-
-fn cpp_signature_param_types(signature: &str) -> Option<Vec<String>> {
-    let inner = signature
-        .find('(')
-        .and_then(|open| {
-            signature[open + 1..]
-                .find(')')
-                .map(|close| &signature[open + 1..open + 1 + close])
-        })
-        .unwrap_or(signature)
-        .trim();
-    if inner.is_empty() || inner == "void" {
-        return Some(Vec::new());
-    }
-    Some(
-        cpp_split_top_level_commas(inner)
-            .map(cpp_parameter_type_text)
-            .collect(),
-    )
-}
-
-fn cpp_parameter_type_text(parameter: &str) -> String {
-    let mut text = parameter
-        .split('=')
-        .next()
-        .unwrap_or(parameter)
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    // Pointer depth must be read from the raw text: the type normalizer
-    // (`normalize_cpp_type_text`) deliberately strips `*`/`&` to get the bare type
-    // name, so we capture the depth first and re-append it after normalizing.
-    let pointer_depth = cpp_type_text_pointer_depth(text);
-    if let Some((before, last)) = text.rsplit_once(char::is_whitespace)
-        && cpp_parameter_name_token(last)
-    {
-        text = before.trim();
-    }
-    format!(
-        "{}{}",
-        normalize_cpp_type_text(text),
-        "*".repeat(pointer_depth as usize)
-    )
-}
-
-fn cpp_parameter_name_token(token: &str) -> bool {
-    let token = token.trim_start_matches('*').trim_start_matches('&').trim();
-    token
-        .chars()
-        .next()
-        .is_some_and(|ch| ch == '_' || ch.is_ascii_lowercase())
-        && token
-            .chars()
-            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn cpp_type_assignable_to(
@@ -1110,26 +1026,45 @@ fn cpp_base_type_text(base: &str) -> String {
 /// parameter for overload matching.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CppType {
-    unit: CodeUnit,
+    name: String,
+    unit: Option<CodeUnit>,
     indirection: i32,
     alias_unit: Option<CodeUnit>,
 }
 
-/// Top-level pointer depth declared by `text` (the number of `*` outside any
-/// template/array/parameter brackets). `&` is ignored: a reference parameter
-/// binds from a value argument.
-fn cpp_type_text_pointer_depth(text: &str) -> i32 {
-    let mut depth = 0i32;
-    let mut bracket = 0i32;
-    for ch in text.chars() {
-        match ch {
-            '<' | '(' | '[' => bracket += 1,
-            '>' | ')' | ']' => bracket -= 1,
-            '*' if bracket <= 0 => depth += 1,
-            _ => {}
+impl CppType {
+    fn from_text(
+        analyzer: &dyn IAnalyzer,
+        visibility: &CppVisibilityIndex,
+        file: &ProjectFile,
+        type_text: &str,
+        indirection: i32,
+    ) -> Self {
+        let name = normalize_cpp_type_name(type_text);
+        Self {
+            name: name.clone(),
+            unit: cpp_resolve_type_unit(analyzer, visibility, file, &name),
+            indirection,
+            alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
         }
     }
-    depth
+
+    fn from_unit(unit: CodeUnit, indirection: i32) -> Self {
+        Self {
+            name: cpp_name_for(&unit),
+            unit: Some(unit),
+            indirection,
+            alias_unit: None,
+        }
+    }
+
+    fn as_arg_type(&self) -> CppArgType {
+        CppArgType {
+            name: self.name.clone(),
+            unit: self.unit.clone(),
+            indirection: self.indirection,
+        }
+    }
 }
 
 /// Pointer depth contributed by a declarator: one per `pointer_declarator`
@@ -1189,6 +1124,9 @@ fn cpp_expression_type(
     node: Node<'_>,
 ) -> Option<CppType> {
     match node.kind() {
+        "number_literal" | "true" | "false" | "char_literal" | "string_literal"
+        | "unary_expression" => cpp_literal_type_name(node, source)
+            .map(|name| CppType::from_text(analyzer, visibility, file, name, 0)),
         "identifier" => {
             let name = cpp_node_text(node, source);
             let ctx = CppLookupCtx {
@@ -1205,9 +1143,15 @@ fn cpp_expression_type(
         "field_expression" => {
             cpp_field_expression_type(analyzer, support, visibility, file, source, root, node)
         }
-        "new_expression" | "call_expression" => {
-            cpp_infer_type_from_value(analyzer, support, visibility, file, source, node)
-        }
+        "new_expression" | "call_expression" => cpp_infer_type_from_value(
+            analyzer,
+            support,
+            visibility,
+            file,
+            source,
+            Some(root),
+            node,
+        ),
         "parenthesized_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
@@ -1289,13 +1233,13 @@ fn cpp_field_declared_type(
         return None;
     }
     let indirection = cpp_type_text_pointer_depth(type_text);
-    visibility
-        .resolve_type(file, type_text)
-        .map(|unit| CppType {
-            unit,
-            indirection,
-            alias_unit: None,
-        })
+    Some(CppType::from_text(
+        analyzer,
+        visibility,
+        file,
+        type_text,
+        indirection,
+    ))
 }
 
 fn cpp_receiver_type_units(
@@ -1308,11 +1252,9 @@ fn cpp_receiver_type_units(
             let name = cpp_node_text(receiver, ctx.source);
             let bindings = cpp_bindings_before(ctx, ctx.root, receiver.start_byte());
             if let Some(cpp_type) = first_precise(&bindings, name) {
-                return vec![cpp_receiver_unit_for_access(
-                    ctx,
-                    cpp_type,
-                    unwrap_template_alias,
-                )];
+                return cpp_receiver_unit_for_access(ctx, cpp_type, unwrap_template_alias)
+                    .into_iter()
+                    .collect();
             }
             if bindings.is_shadowed(name) {
                 Vec::new()
@@ -1326,11 +1268,9 @@ fn cpp_receiver_type_units(
                 receiver,
                 name,
             ) {
-                vec![cpp_receiver_unit_for_access(
-                    ctx,
-                    cpp_type,
-                    unwrap_template_alias,
-                )]
+                cpp_receiver_unit_for_access(ctx, cpp_type, unwrap_template_alias)
+                    .into_iter()
+                    .collect()
             } else {
                 ctx.visibility
                     .resolve_type(ctx.file, name)
@@ -1357,7 +1297,7 @@ fn cpp_receiver_type_units(
             ctx.root,
             receiver,
         )
-        .map(|cpp_type| cpp_type.unit)
+        .and_then(|cpp_type| cpp_type.unit)
         .into_iter()
         .collect(),
         // `Foo().member` / `(new Foo())->member` — a temporary-construction or
@@ -1371,7 +1311,7 @@ fn cpp_receiver_type_units(
             ctx.root,
             receiver,
         )
-        .map(|cpp_type| cpp_type.unit)
+        .and_then(|cpp_type| cpp_type.unit)
         .into_iter()
         .collect(),
         "parenthesized_expression" | "pointer_expression" => receiver
@@ -1413,12 +1353,12 @@ fn cpp_receiver_unit_for_access(
     ctx: CppLookupCtx<'_, '_>,
     cpp_type: CppType,
     unwrap_template_alias: bool,
-) -> CodeUnit {
+) -> Option<CodeUnit> {
     if unwrap_template_alias
         && let Some(alias) = cpp_type.alias_unit.as_ref()
         && let Some(target) = cpp_alias_arrow_target_unit(ctx, alias)
     {
-        return target;
+        return Some(target);
     }
     cpp_type.unit
 }
@@ -1676,6 +1616,7 @@ fn cpp_seed_typed_binding(
         type_text.as_deref(),
         cpp_declarator_pointer_depth(declarator),
         None,
+        None,
         bindings,
     );
 }
@@ -1712,6 +1653,7 @@ fn cpp_seed_for_range_binding(
         &name,
         type_text.as_deref(),
         cpp_declarator_pointer_depth(declarator),
+        None,
         None,
         bindings,
     );
@@ -1774,6 +1716,7 @@ fn cpp_seed_variable_declaration(
                 &name,
                 type_text.as_deref(),
                 cpp_declarator_pointer_depth(declarator),
+                Some(ctx.root),
                 value,
                 bindings,
             );
@@ -1814,6 +1757,7 @@ fn cpp_seed_recovered_statement_declaration(
             &name,
             Some(&type_text),
             pointer_depth,
+            None,
             None,
             bindings,
         );
@@ -2153,6 +2097,7 @@ fn cpp_seed_binding(
     name: &str,
     type_text: Option<&str>,
     declarator_depth: i32,
+    root: Option<Node<'_>>,
     value: Option<Node<'_>>,
     bindings: &mut LocalInferenceEngine<CppType>,
 ) {
@@ -2161,18 +2106,24 @@ fn cpp_seed_binding(
     }
     let resolved = type_text
         .filter(|text| *text != "auto")
-        .and_then(|text| {
-            cpp_resolve_type_unit_in_namespace(analyzer, visibility, file, text, lexical_namespace)
-        })
-        .map(|unit| CppType {
-            unit,
-            indirection: 0,
-            alias_unit: type_text
-                .and_then(|text| cpp_resolve_type_alias_unit(analyzer, visibility, file, text)),
+        .map(|text| {
+            let name = normalize_cpp_type_name(text);
+            CppType {
+                name: name.clone(),
+                unit: cpp_resolve_type_unit_in_namespace(
+                    analyzer,
+                    visibility,
+                    file,
+                    &name,
+                    lexical_namespace,
+                ),
+                indirection: 0,
+                alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
+            }
         })
         .or_else(|| {
             value.and_then(|value| {
-                cpp_infer_type_from_value(analyzer, support, visibility, file, source, value)
+                cpp_infer_type_from_value(analyzer, support, visibility, file, source, root, value)
             })
         });
     match resolved {
@@ -2477,34 +2428,24 @@ fn cpp_infer_type_from_value(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
+    root: Option<Node<'_>>,
     node: Node<'_>,
 ) -> Option<CppType> {
     match node.kind() {
         "new_expression" => {
             let text = cpp_node_text(node, source).trim();
             let rest = text.strip_prefix("new ").unwrap_or(text);
-            visibility
-                .resolve_type(file, rest.split(['(', '{']).next().unwrap_or(rest))
-                // `new T` yields a `T*`.
-                .map(|unit| CppType {
-                    unit,
-                    indirection: 1,
-                    alias_unit: None,
-                })
+            let type_text = rest.split(['(', '{']).next().unwrap_or(rest);
+            Some(CppType::from_text(analyzer, visibility, file, type_text, 1))
         }
-        "call_expression" => {
-            cpp_call_return_type(analyzer, support, visibility, file, source, node).or_else(|| {
-                node.child_by_field_name("function")
-                    .and_then(|function| {
-                        visibility.resolve_type(file, cpp_node_text(function, source))
-                    })
-                    .map(|unit| CppType {
-                        unit,
-                        indirection: 0,
-                        alias_unit: None,
-                    })
-            })
-        }
+        "call_expression" => cpp_call_return_type(
+            analyzer, support, visibility, file, source, root, node,
+        )
+        .or_else(|| {
+            node.child_by_field_name("function")
+                .and_then(|function| visibility.resolve_type(file, cpp_node_text(function, source)))
+                .map(|unit| CppType::from_unit(unit, 0))
+        }),
         _ => None,
     }
 }
@@ -2515,6 +2456,7 @@ fn cpp_call_return_type(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
+    root: Option<Node<'_>>,
     call: Node<'_>,
 ) -> Option<CppType> {
     let function = call.child_by_field_name("function")?;
@@ -2541,11 +2483,55 @@ fn cpp_call_return_type(
             ),
             Some(arity),
         ),
+        "field_expression" => {
+            let root = root?;
+            let member = function
+                .child_by_field_name("field")
+                .map(|field| cpp_node_text(field, source))?;
+            let receiver = function
+                .child_by_field_name("argument")
+                .or_else(|| function.named_child(0))?;
+            let owners = cpp_field_receiver_type_units(
+                analyzer, support, visibility, file, source, root, function, receiver,
+            );
+            cpp_member_candidates(
+                CppLookupCtx {
+                    analyzer,
+                    support,
+                    file,
+                    visibility,
+                    source,
+                    root,
+                },
+                owners,
+                member,
+                Some(arity),
+                None,
+            )
+        }
         _ => Vec::new(),
     };
-    candidates
-        .iter()
-        .find_map(|candidate| cpp_function_return_type(analyzer, visibility, file, candidate))
+    cpp_unanimous_function_return_type(analyzer, visibility, file, &candidates)
+}
+
+fn cpp_unanimous_function_return_type(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    candidates: &[CodeUnit],
+) -> Option<CppType> {
+    let mut resolved_return: Option<CppType> = None;
+    for candidate in candidates {
+        let return_type = cpp_function_return_type(analyzer, visibility, file, candidate)?;
+        if let Some(existing) = resolved_return.as_ref()
+            && (existing.name != return_type.name
+                || existing.indirection != return_type.indirection)
+        {
+            return None;
+        }
+        resolved_return = Some(return_type);
+    }
+    resolved_return
 }
 
 fn cpp_function_return_type(
@@ -2557,13 +2543,13 @@ fn cpp_function_return_type(
     let type_text = cpp_function_return_type_text(analyzer, function)?;
     let indirection = cpp_type_text_pointer_depth(&type_text);
     let type_text = normalize_cpp_type_text(&type_text);
-    visibility
-        .resolve_type(file, &type_text)
-        .map(|unit| CppType {
-            unit,
-            indirection,
-            alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &type_text),
-        })
+    Some(CppType::from_text(
+        analyzer,
+        visibility,
+        file,
+        &type_text,
+        indirection,
+    ))
 }
 
 fn cpp_unresolved_include_boundary(

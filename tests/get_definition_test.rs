@@ -9752,6 +9752,111 @@ fn cpp_typed_receiver_method_filters_overloads_by_argument_type() {
 }
 
 #[test]
+fn cpp_same_arity_free_function_overloads_filter_by_argument_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/parity.h",
+            r#"#pragma once
+#include <string>
+namespace parity {
+struct AuditSink {
+    std::string last;
+    void record(const std::string& value);
+};
+class BaseHandler {
+public:
+    virtual ~BaseHandler() = default;
+    virtual std::string handle(const std::string& name) = 0;
+};
+class ConsoleHandler : public BaseHandler {
+public:
+    explicit ConsoleHandler(AuditSink& sink);
+    std::string handle(const std::string& name) override;
+private:
+    AuditSink& sink_;
+};
+std::string format(const std::string& value);
+std::string format(int value);
+} // namespace parity
+"#,
+        )
+        .file(
+            "src/parity.cpp",
+            r#"#include "parity.h"
+namespace parity {
+void AuditSink::record(const std::string& value) { last = value; }
+ConsoleHandler::ConsoleHandler(AuditSink& sink) : sink_(sink) {}
+std::string ConsoleHandler::handle(const std::string& name) {
+    sink_.record(name);
+    return name;
+}
+std::string format(const std::string& value) { return "s:" + value; }
+std::string format(int value) { return "i:" + std::to_string(value); }
+} // namespace parity
+"#,
+        )
+        .file(
+            "src/main.cpp",
+            r#"#include "parity.h"
+namespace app {
+std::string run() {
+    parity::AuditSink sink;
+    parity::ConsoleHandler handler(sink);
+    parity::BaseHandler& base = handler;
+    auto first = base.handle("Ada");
+    auto formatted = parity::format(first);
+    auto number = parity::format(7);
+    return formatted + number;
+}
+} // namespace app
+"#,
+        )
+        .build();
+
+    let first_line = "    auto formatted = parity::format(first);";
+    let first_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/main.cpp","line":8,"column":{}}}]}}"#,
+            column_of(first_line, "format(first)")
+        ),
+    );
+    assert_cpp_format_overload_definitions(&first_value, "string");
+
+    let int_line = "    auto number = parity::format(7);";
+    let int_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/main.cpp","line":9,"column":{}}}]}}"#,
+            column_of(int_line, "format(7)")
+        ),
+    );
+    assert_cpp_format_overload_definitions(&int_value, "int");
+}
+
+fn assert_cpp_format_overload_definitions(value: &Value, expected_signature_fragment: &str) {
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let definitions = result["definitions"].as_array().unwrap();
+    assert_eq!(definitions.len(), 2, "{value}");
+    let mut paths = definitions
+        .iter()
+        .map(|definition| definition["path"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(paths, vec!["include/parity.h", "src/parity.cpp"], "{value}");
+    assert!(
+        definitions.iter().all(|definition| {
+            definition["fqn"] == "parity.format"
+                && definition["signature"]
+                    .as_str()
+                    .is_some_and(|signature| signature.contains(expected_signature_fragment))
+        }),
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

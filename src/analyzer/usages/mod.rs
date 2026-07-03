@@ -14,6 +14,7 @@
 
 mod candidates;
 mod common;
+mod cpp_call_match;
 pub(crate) mod cpp_graph;
 pub(crate) mod csharp_graph;
 mod finder;

@@ -1,4 +1,8 @@
 use crate::analyzer::usages::common::language_for_file;
+use crate::analyzer::usages::cpp_call_match::{
+    CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_signature_param_types,
+    cpp_type_text_pointer_depth, normalize_cpp_type_name,
+};
 use crate::analyzer::usages::cpp_graph::hits::{
     enclosing_context, is_member_field_declaration_context, push_definition_hit, push_hit,
     push_self_receiver_hit,
@@ -27,7 +31,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
-    pub(super) bindings: LocalInferenceEngine<CodeUnit>,
+    pub(super) bindings: LocalInferenceEngine<CppScanBinding>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) saw_unproven_match: &'a mut bool,
     pub(super) raw_match_count: &'a mut usize,
@@ -132,7 +136,7 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let type_text = node
         .child_by_field_name("type")
         .or_else(|| first_type_child(node))
-        .map(|node| normalize_type_text(node_text(node, ctx.source)));
+        .map(|node| node_text(node, ctx.source).to_string());
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let declarator = if child.kind() == "init_declarator" {
@@ -175,7 +179,7 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let type_text = node
         .child_by_field_name("type")
         .or_else(|| first_type_child(node))
-        .map(|node| normalize_type_text(node_text(node, ctx.source)));
+        .map(|node| node_text(node, ctx.source).to_string());
     seed_binding_from_type_or_value(&name, type_text.as_deref(), None, ctx);
 }
 
@@ -189,8 +193,15 @@ fn seed_binding_from_type_or_value(
         return;
     }
     let resolved = type_text
-        .filter(|text| *text != "auto")
-        .and_then(|text| ctx.visibility.resolve_type(ctx.file, text))
+        .filter(|text| normalize_type_text(text) != "auto")
+        .map(|text| {
+            let name = normalize_cpp_type_name(text);
+            CppScanBinding::from_type_name(
+                name.clone(),
+                ctx.visibility.resolve_type(ctx.file, &name),
+                cpp_type_text_pointer_depth(text),
+            )
+        })
         .or_else(|| value.and_then(|value| infer_type_from_value(value, ctx)));
 
     if let Some(resolved) = resolved {
@@ -205,23 +216,32 @@ fn seed_binding_from_type_or_value(
     }
 }
 
-fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CppScanBinding> {
     match node.kind() {
-        "new_expression" | "call_expression" => {
-            infer_cpp_initializer_type(ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
-        }
+        "new_expression" | "call_expression" => infer_cpp_initializer_binding(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            node,
+            Some(&|receiver, source| receiver_type_units(receiver, source, ctx)),
+        ),
         "initializer_list" => None,
         "identifier" => {
             let resolved = ctx.bindings.resolve_symbol(node_text(node, ctx.source));
             resolved
                 .as_precise()?
                 .iter()
-                .find(|unit| unit.is_class())
+                .find(|binding| binding.unit.as_ref().is_some_and(CodeUnit::is_class))
                 .cloned()
         }
-        _ => ctx
-            .visibility
-            .resolve_type(ctx.file, node_text(node, ctx.source)),
+        _ => {
+            let text = node_text(node, ctx.source);
+            let name = normalize_cpp_type_name(text);
+            ctx.visibility
+                .resolve_type(ctx.file, &name)
+                .map(|unit| CppScanBinding::from_unit(unit, 0))
+        }
     }
 }
 
@@ -401,6 +421,9 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
+    if !free_function_call_may_target(node, text, ctx) {
+        return;
+    }
     if ctx.visibility.contains_named_symbol(
         ctx.file,
         text,
@@ -418,6 +441,83 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         // the target is `ns::run`) is a proven non-match, not an unresolved reference.
     } else {
         *ctx.saw_unproven_match = true;
+    }
+}
+
+fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.spec.param_types.is_none() {
+        return true;
+    }
+    let mut candidates = ctx
+        .visibility
+        .named_candidates(ctx.file, text, TargetKind::FreeFunction);
+    if let Some(expected) = ctx.spec.method_arity {
+        candidates.retain(|unit| signature_arity(unit.signature()) == expected);
+    }
+    if candidates.is_empty()
+        || !candidates
+            .iter()
+            .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+    {
+        return true;
+    }
+    let arg_types = call_argument_types(call, ctx);
+    let filtered = cpp_filter_candidates_by_args(
+        candidates,
+        &arg_types,
+        &|name| ctx.visibility.resolve_type(ctx.file, name),
+        &|left, right| same_visible_symbol(left, right),
+    );
+    filtered
+        .iter()
+        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+}
+
+fn call_argument_types(call: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Option<CppArgType>> {
+    let Some(args) = call
+        .child_by_field_name("arguments")
+        .or_else(|| call.child_by_field_name("parameters"))
+        .or_else(|| call.child_by_field_name("value"))
+    else {
+        return Vec::new();
+    };
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor)
+        .map(|arg| expression_arg_type(arg, ctx))
+        .collect()
+}
+
+fn expression_arg_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CppArgType> {
+    match node.kind() {
+        "number_literal" | "true" | "false" | "char_literal" | "string_literal"
+        | "unary_expression" => cpp_literal_type_name(node, ctx.source).map(|name| CppArgType {
+            name: name.to_string(),
+            unit: ctx.visibility.resolve_type(ctx.file, name),
+            indirection: 0,
+        }),
+        "identifier" => ctx
+            .bindings
+            .resolve_symbol(node_text(node, ctx.source))
+            .as_precise()
+            .and_then(|bindings| bindings.iter().find_map(CppScanBinding::as_arg_type)),
+        "parenthesized_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.named_child(0))
+            .and_then(|inner| expression_arg_type(inner, ctx)),
+        "pointer_expression" => {
+            let delta = match node.child_by_field_name("operator")?.kind() {
+                "&" => 1,
+                "*" => -1,
+                _ => return None,
+            };
+            let inner = node
+                .child_by_field_name("argument")
+                .or_else(|| node.named_child(0))?;
+            let mut arg_type = expression_arg_type(inner, ctx)?;
+            arg_type.indirection += delta;
+            Some(arg_type)
+        }
+        _ => None,
     }
 }
 
@@ -559,6 +659,9 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
+    if !method_call_may_target(node, ctx) {
+        return;
+    }
     if receiver_matches_target(function, ctx) {
         if receiver_is_self_like(function) {
             push_self_receiver_hit(function_terminal_node(function), ctx);
@@ -572,6 +675,44 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         *ctx.saw_unproven_match = true;
     }
+}
+
+fn method_call_may_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner) = ctx.spec.owner.as_ref() else {
+        return true;
+    };
+    if ctx.spec.param_types.is_none() {
+        return true;
+    }
+    let mut candidates = ctx
+        .visibility
+        .visible_units(ctx.file)
+        .filter(|unit| {
+            unit.is_function()
+                && unit.fq_name() == format!("{}.{}", owner.fq_name(), ctx.spec.member_name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(expected) = ctx.spec.method_arity {
+        candidates.retain(|unit| signature_arity(unit.signature()) == expected);
+    }
+    if candidates.is_empty()
+        || !candidates
+            .iter()
+            .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+    {
+        return true;
+    }
+    let arg_types = call_argument_types(call, ctx);
+    let filtered = cpp_filter_candidates_by_args(
+        candidates,
+        &arg_types,
+        &|name| ctx.visibility.resolve_type(ctx.file, name),
+        &|left, right| same_visible_symbol(left, right),
+    );
+    filtered
+        .iter()
+        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
 }
 
 fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -683,7 +824,7 @@ fn function_definition_signature_matches_target(node: Node<'_>, ctx: &ScanCtx<'_
     let Some(target_signature) = ctx.spec.target.signature() else {
         return true;
     };
-    signature_parameter_types(definition) == signature_parameter_types(target_signature)
+    cpp_signature_param_types(definition) == cpp_signature_param_types(target_signature)
 }
 
 fn definition_name_candidates(function: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<String> {
@@ -706,85 +847,6 @@ fn definition_name_candidates(function: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Stri
     } else {
         vec![raw]
     }
-}
-
-fn signature_parameter_types(signature: &str) -> Vec<String> {
-    let Some(parameters) = signature_parameter_text(signature) else {
-        return Vec::new();
-    };
-    if parameters.is_empty() || parameters == "void" {
-        return Vec::new();
-    }
-    split_top_level_commas(parameters)
-        .map(normalize_parameter_type)
-        .collect()
-}
-
-fn signature_parameter_text(signature: &str) -> Option<&str> {
-    let open = signature.find('(')?;
-    let mut depth = 0i32;
-    for (offset, ch) in signature[open..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(signature[open + 1..open + offset].trim());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn normalize_parameter_type(parameter: &str) -> String {
-    let without_default = parameter
-        .split_once('=')
-        .map(|(before, _)| before)
-        .unwrap_or(parameter)
-        .trim();
-    normalize_type_text(strip_parameter_name(without_default))
-        .replace(" &", "&")
-        .replace(" *", "*")
-}
-
-fn strip_parameter_name(parameter: &str) -> &str {
-    let trimmed = parameter.trim_end();
-    let Some(name_end) = trimmed
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| is_identifier_char(*ch))
-        .map(|(index, ch)| index + ch.len_utf8())
-    else {
-        return trimmed;
-    };
-    if name_end != trimmed.len() {
-        return trimmed;
-    }
-    let name_start = trimmed[..name_end]
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| !is_identifier_char(*ch))
-        .map(|(index, ch)| index + ch.len_utf8())
-        .unwrap_or(0);
-    if name_start == 0 {
-        return trimmed;
-    }
-    let before_name = &trimmed[..name_start];
-    if before_name
-        .chars()
-        .next_back()
-        .is_some_and(|ch| ch.is_whitespace() || ch == '*' || ch == '&')
-    {
-        before_name.trim_end()
-    } else {
-        trimmed
-    }
-}
-
-fn is_identifier_char(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
 }
 
 fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
@@ -972,6 +1034,38 @@ fn owner_is_unscoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
     })
 }
 
+fn receiver_type_units(node: Node<'_>, source: &str, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
+    match node.kind() {
+        "identifier" => ctx
+            .bindings
+            .resolve_symbol(node_text(node, source))
+            .as_precise()
+            .into_iter()
+            .flatten()
+            .filter_map(|binding| binding.unit.clone())
+            .collect(),
+        "pointer_expression" | "parenthesized_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.named_child(0))
+            .map(|inner| receiver_type_units(inner, source, ctx))
+            .unwrap_or_default(),
+        "call_expression" | "new_expression" => infer_type_from_value(node, ctx)
+            .and_then(|binding| binding.unit)
+            .into_iter()
+            .collect(),
+        "field_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.child_by_field_name("object"))
+            .map(|receiver| receiver_type_units(receiver, source, ctx))
+            .unwrap_or_default(),
+        _ => ctx
+            .visibility
+            .resolve_type(ctx.file, node_text(node, source))
+            .into_iter()
+            .collect(),
+    }
+}
+
 fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let Some(owner) = ctx.spec.owner.as_ref() else {
         return false;
@@ -992,7 +1086,12 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .bindings
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()
-            .is_some_and(|targets| targets.iter().any(|target| same_symbol(target, owner))),
+            .is_some_and(|targets| {
+                targets
+                    .iter()
+                    .filter_map(|target| target.unit.as_ref())
+                    .any(|target| same_symbol(target, owner))
+            }),
         "this" => same_owner_context(node, ctx),
         "qualified_identifier" | "scoped_identifier" | "field_identifier" => {
             qualified_owner_matches(node_text(node, ctx.source), ctx)
@@ -1043,8 +1142,12 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()
             .is_some_and(|targets| {
-                !targets.is_empty()
-                    && targets
+                let units = targets
+                    .iter()
+                    .filter_map(|target| target.unit.as_ref())
+                    .collect::<Vec<_>>();
+                !units.is_empty()
+                    && units
                         .iter()
                         .all(|target| !same_visible_symbol(target, owner))
             }),

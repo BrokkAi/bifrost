@@ -78,6 +78,79 @@ fn function_definition_with_signature(
     })
 }
 
+fn parity_overload_analyzer() -> (common::BuiltInlineTestProject, CppAnalyzer) {
+    cpp_analyzer_with_files(&[
+        (
+            "include/parity.h",
+            r#"#pragma once
+#include <string>
+namespace parity {
+struct AuditSink {
+    std::string last;
+    void record(const std::string& value);
+};
+class BaseHandler {
+public:
+    virtual ~BaseHandler() = default;
+    virtual std::string handle(const std::string& name) = 0;
+};
+class ConsoleHandler : public BaseHandler {
+public:
+    explicit ConsoleHandler(AuditSink& sink);
+    std::string handle(const std::string& name) override;
+private:
+    AuditSink& sink_;
+};
+std::string format(const std::string& value);
+std::string format(int value);
+} // namespace parity
+"#,
+        ),
+        (
+            "src/parity.cpp",
+            r#"#include "parity.h"
+namespace parity {
+void AuditSink::record(const std::string& value) { last = value; }
+ConsoleHandler::ConsoleHandler(AuditSink& sink) : sink_(sink) {}
+std::string ConsoleHandler::handle(const std::string& name) {
+    sink_.record(name);
+    return name;
+}
+std::string format(const std::string& value) { return "s:" + value; }
+std::string format(int value) { return "i:" + std::to_string(value); }
+} // namespace parity
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "parity.h"
+namespace app {
+std::string run() {
+    parity::AuditSink sink;
+    parity::ConsoleHandler handler(sink);
+    parity::BaseHandler& base = handler;
+    auto first = base.handle("Ada");
+    auto formatted = parity::format(first);
+    auto number = parity::format(7);
+    return formatted + number;
+}
+} // namespace app
+"#,
+        ),
+    ])
+}
+
+fn parity_format_header_overload(analyzer: &CppAnalyzer, signature_fragment: &str) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "parity.format"
+            && slash_path(unit.source()) == "include/parity.h"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains(signature_fragment))
+    })
+}
+
 fn field_definition(analyzer: &CppAnalyzer, name: &str) -> CodeUnit {
     definition_by(analyzer, |unit| {
         unit.kind() == CodeUnitType::Field && unit.identifier() == name
@@ -1085,6 +1158,68 @@ void call() {
     assert_hit_contains(&one_hits, "consumer.cpp", "ns::run(1)");
     assert_no_hit_contains(&one_hits, "ns::run();");
     assert_no_hit_contains(&one_hits, "other::run()");
+}
+
+#[test]
+fn cpp_graph_filters_same_arity_free_function_overloads_by_argument_type() {
+    let (_project, analyzer) = parity_overload_analyzer();
+    let string_overload = parity_format_header_overload(&analyzer, "std::string");
+    let int_overload = parity_format_header_overload(&analyzer, "int");
+
+    let string_hits = usage_hits(&analyzer, &string_overload);
+    assert_eq!(2, string_hits.len(), "string hits: {string_hits:#?}");
+    assert_hit_contains(
+        &string_hits,
+        "src/parity.cpp",
+        "std::string format(const std::string& value)",
+    );
+    assert_hit_contains(&string_hits, "src/main.cpp", "parity::format(first)");
+    assert_no_hit_contains(&string_hits, "parity::format(7)");
+
+    let int_hits = usage_hits(&analyzer, &int_overload);
+    assert_eq!(2, int_hits.len(), "int hits: {int_hits:#?}");
+    assert_hit_contains(&int_hits, "src/parity.cpp", "std::string format(int value)");
+    assert_hit_contains(&int_hits, "src/main.cpp", "parity::format(7)");
+    assert_no_hit_contains(&int_hits, "parity::format(first)");
+}
+
+#[test]
+fn cpp_graph_keeps_unknown_argument_overload_calls_conservative() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/parity.h",
+            r#"#pragma once
+#include <string>
+namespace parity {
+struct AuditSink {
+    std::string last;
+};
+std::string format(const std::string& value);
+std::string format(int value);
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "parity.h"
+namespace app {
+std::string run() {
+    parity::AuditSink sink;
+    auto formatted = parity::format(sink.last);
+    return formatted;
+}
+}
+"#,
+        ),
+    ]);
+    let string_overload = parity_format_header_overload(&analyzer, "std::string");
+    let int_overload = parity_format_header_overload(&analyzer, "int");
+
+    let string_hits = usage_hits(&analyzer, &string_overload);
+    assert_hit_contains(&string_hits, "src/main.cpp", "parity::format(sink.last)");
+
+    let int_hits = usage_hits(&analyzer, &int_overload);
+    assert_hit_contains(&int_hits, "src/main.cpp", "parity::format(sink.last)");
 }
 
 #[test]

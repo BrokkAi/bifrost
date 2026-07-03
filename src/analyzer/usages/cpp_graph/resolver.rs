@@ -1,4 +1,7 @@
 use crate::analyzer::usages::common::same_node;
+use crate::analyzer::usages::cpp_call_match::{
+    CppArgType, cpp_signature_param_types, normalize_cpp_type_name,
+};
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
@@ -8,6 +11,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
+use std::hash::Hash;
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,6 +32,7 @@ pub(super) struct TargetSpec {
     pub(super) owner_fq_name: Option<String>,
     pub(super) owner_cpp_name: Option<String>,
     pub(super) method_arity: Option<usize>,
+    pub(super) param_types: Option<Vec<String>>,
 }
 
 impl TargetSpec {
@@ -38,6 +43,7 @@ impl TargetSpec {
                 TargetKind::Type,
                 Some(target.clone()),
                 target.identifier().to_string(),
+                None,
                 None,
             ));
         }
@@ -59,6 +65,7 @@ impl TargetSpec {
                 kind,
                 owner,
                 target.identifier().to_string(),
+                None,
                 None,
             ));
         }
@@ -83,6 +90,7 @@ impl TargetSpec {
                 owner,
                 target.identifier().to_string(),
                 Some(signature_arity(target.signature())),
+                target.signature().and_then(cpp_signature_param_types),
             ));
         }
 
@@ -95,6 +103,7 @@ impl TargetSpec {
         owner: Option<CodeUnit>,
         member_name: String,
         method_arity: Option<usize>,
+        param_types: Option<Vec<String>>,
     ) -> Self {
         let owner_fq_name = owner.as_ref().map(CodeUnit::fq_name);
         let owner_cpp_name = owner.as_ref().map(cpp_name_for);
@@ -106,7 +115,49 @@ impl TargetSpec {
             owner_fq_name,
             owner_cpp_name,
             method_arity,
+            param_types,
         }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct CppScanBinding {
+    pub(super) unit: Option<CodeUnit>,
+    pub(super) type_name: Option<String>,
+    pub(super) indirection: i32,
+}
+
+impl CppScanBinding {
+    pub(super) fn from_unit(unit: CodeUnit, indirection: i32) -> Self {
+        Self {
+            type_name: Some(cpp_name_for(&unit)),
+            unit: Some(unit),
+            indirection,
+        }
+    }
+
+    pub(super) fn from_type_name(
+        type_name: String,
+        unit: Option<CodeUnit>,
+        indirection: i32,
+    ) -> Self {
+        Self {
+            type_name: Some(type_name),
+            unit,
+            indirection,
+        }
+    }
+
+    pub(super) fn as_arg_type(&self) -> Option<CppArgType> {
+        let name = self
+            .type_name
+            .clone()
+            .or_else(|| self.unit.as_ref().map(cpp_name_for))?;
+        Some(CppArgType {
+            name,
+            unit: self.unit.clone(),
+            indirection: self.indirection,
+        })
     }
 }
 
@@ -119,6 +170,8 @@ struct CppAlias {
     name: String,
     target: String,
 }
+
+type ReceiverResolver<'a> = dyn for<'tree> Fn(Node<'tree>, &str) -> Vec<CodeUnit> + 'a;
 
 impl VisibilityIndex {
     pub(in crate::analyzer::usages) fn build(
@@ -317,6 +370,26 @@ impl VisibilityIndex {
         })
     }
 
+    pub(super) fn named_candidates(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+        kind: TargetKind,
+    ) -> Vec<CodeUnit> {
+        let Some(normalized) = normalize_reference_name(raw_name) else {
+            return Vec::new();
+        };
+        self.visible_by_file
+            .get(file)
+            .into_iter()
+            .flatten()
+            .filter(|unit| {
+                matches_kind_for_lookup(unit, kind) && reference_matches_unit(&normalized, unit)
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn resolve_known_non_target(
         &self,
         file: &ProjectFile,
@@ -337,14 +410,14 @@ impl VisibilityIndex {
             })
     }
 
-    pub(super) fn resolve_call_return_type(
+    pub(super) fn resolve_call_return_binding(
         &self,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         raw_name: &str,
         arity: usize,
         lexical_namespace: Option<&str>,
-    ) -> Option<CodeUnit> {
+    ) -> Option<CppScanBinding> {
         let normalized = normalize_reference_name(raw_name)?;
         let visible = self.visible_by_file.get(file)?;
         let mut candidates = Vec::new();
@@ -354,7 +427,7 @@ impl VisibilityIndex {
         }) {
             let signature = cpp_function_signature_text(analyzer, function)?;
             if signature_arity(Some(&signature)) == arity {
-                candidates.push((function, signature));
+                candidates.push(function.clone());
             }
         }
         if !normalized.contains("::")
@@ -362,25 +435,14 @@ impl VisibilityIndex {
         {
             let scoped: Vec<_> = candidates
                 .iter()
-                .filter(|(function, _)| cpp_namespace_for(function).as_deref() == Some(namespace))
+                .filter(|function| cpp_namespace_for(function).as_deref() == Some(namespace))
                 .cloned()
                 .collect();
             if !scoped.is_empty() {
                 candidates = scoped;
             }
         }
-        let mut resolved_return: Option<CodeUnit> = None;
-        for (function, signature) in candidates {
-            let return_text = cpp_function_return_type_text_from_signature(&signature)?;
-            let return_type = self.resolve_type_for_declaration(file, function, &return_text)?;
-            if let Some(existing) = resolved_return.as_ref()
-                && !same_visible_symbol(existing, &return_type)
-            {
-                return None;
-            }
-            resolved_return = Some(return_type);
-        }
-        resolved_return
+        unanimous_return_binding(analyzer, self, file, &candidates)
     }
 }
 
@@ -391,15 +453,33 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
     source: &str,
     node: Node<'_>,
 ) -> Option<CodeUnit> {
+    infer_cpp_initializer_binding(analyzer, visibility, file, source, node, None)
+        .and_then(|binding| binding.unit)
+}
+
+pub(super) fn infer_cpp_initializer_binding(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    receiver_resolver: Option<&ReceiverResolver<'_>>,
+) -> Option<CppScanBinding> {
     match node.kind() {
         "new_expression" => {
             let text = normalize_cpp_whitespace(node_text(node, source));
             let rest = text.strip_prefix("new ").unwrap_or(text.as_str());
-            visibility.resolve_type(file, rest.split(['(', '{']).next().unwrap_or(rest))
+            let type_text = rest.split(['(', '{']).next().unwrap_or(rest);
+            let name = normalize_cpp_type_name(type_text);
+            Some(CppScanBinding::from_type_name(
+                name.clone(),
+                visibility.resolve_type(file, &name),
+                1,
+            ))
         }
         "call_expression" => node.child_by_field_name("function").and_then(|function| {
             let function_text = node_text(function, source);
-            resolve_static_method_call_return_type(
+            resolve_static_method_call_return_binding(
                 analyzer,
                 visibility,
                 file,
@@ -407,9 +487,13 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
                 function,
                 call_arity(node),
             )
-            .or_else(|| visibility.resolve_type(file, function_text))
             .or_else(|| {
-                visibility.resolve_call_return_type(
+                visibility
+                    .resolve_type(file, function_text)
+                    .map(|unit| CppScanBinding::from_unit(unit, 0))
+            })
+            .or_else(|| {
+                visibility.resolve_call_return_binding(
                     analyzer,
                     file,
                     function_text,
@@ -417,19 +501,30 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
                     enclosing_namespace_context(node, source).as_deref(),
                 )
             })
+            .or_else(|| {
+                resolve_field_method_call_return_binding(
+                    analyzer,
+                    visibility,
+                    file,
+                    source,
+                    function,
+                    call_arity(node),
+                    receiver_resolver,
+                )
+            })
         }),
         _ => None,
     }
 }
 
-fn resolve_static_method_call_return_type(
+fn resolve_static_method_call_return_binding(
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
     file: &ProjectFile,
     source: &str,
     function: Node<'_>,
     arity: usize,
-) -> Option<CodeUnit> {
+) -> Option<CppScanBinding> {
     if function.kind() != "qualified_identifier" {
         return None;
     }
@@ -437,20 +532,78 @@ fn resolve_static_method_call_return_type(
     let name = function.child_by_field_name("name")?;
     let owner = visibility.resolve_type(file, node_text(scope, source))?;
     let method_fqn = format!("{}.{}", owner.fq_name(), node_text(name, source));
-    let mut resolved_return = None;
-    for method in visibility.visible_units(file).filter(|unit| {
-        unit.is_function()
-            && unit.fq_name() == method_fqn
-            && signature_arity(unit.signature()) == arity
-    }) {
-        let return_text = cpp_function_return_type_text(analyzer, method)?;
-        let return_type = visibility.resolve_type_for_declaration(file, method, &return_text)?;
+    let candidates = visibility
+        .visible_units(file)
+        .filter(|unit| {
+            unit.is_function()
+                && unit.fq_name() == method_fqn
+                && signature_arity(unit.signature()) == arity
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    unanimous_return_binding(analyzer, visibility, file, &candidates)
+}
+
+fn resolve_field_method_call_return_binding(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    arity: usize,
+    receiver_resolver: Option<&ReceiverResolver<'_>>,
+) -> Option<CppScanBinding> {
+    if function.kind() != "field_expression" {
+        return None;
+    }
+    let receiver_resolver = receiver_resolver?;
+    let field = function.child_by_field_name("field")?;
+    let member_name = node_text(field, source);
+    let receiver = function
+        .child_by_field_name("argument")
+        .or_else(|| function.named_child(0))?;
+    let owners = receiver_resolver(receiver, source);
+    let mut candidates = Vec::new();
+    for owner in owners {
+        let method_fqn = format!("{}.{}", owner.fq_name(), member_name);
+        candidates.extend(
+            visibility
+                .visible_units(file)
+                .filter(|unit| {
+                    unit.is_function()
+                        && unit.fq_name() == method_fqn
+                        && signature_arity(unit.signature()) == arity
+                })
+                .cloned(),
+        );
+    }
+    unanimous_return_binding(analyzer, visibility, file, &candidates)
+}
+
+fn unanimous_return_binding(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    candidates: &[CodeUnit],
+) -> Option<CppScanBinding> {
+    let mut resolved_return: Option<CppScanBinding> = None;
+    for function in candidates {
+        let return_text = cpp_function_return_type_text(analyzer, function)?;
+        let indirection =
+            crate::analyzer::usages::cpp_call_match::cpp_type_text_pointer_depth(&return_text);
+        let name = normalize_cpp_type_name(&return_text);
+        let binding = CppScanBinding::from_type_name(
+            name.clone(),
+            visibility.resolve_type_for_declaration(file, function, &name),
+            indirection,
+        );
         if let Some(existing) = resolved_return.as_ref()
-            && !same_visible_symbol(existing, &return_type)
+            && (existing.type_name != binding.type_name
+                || existing.indirection != binding.indirection)
         {
             return None;
         }
-        resolved_return = Some(return_type);
+        resolved_return = Some(binding);
     }
     resolved_return
 }
@@ -929,13 +1082,13 @@ pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<No
     })
 }
 
-pub(in crate::analyzer::usages) fn constructor_style_local_declaration(
+pub(in crate::analyzer::usages) fn constructor_style_local_declaration<T: Clone + Eq + Hash>(
     visibility: &VisibilityIndex,
     file: &ProjectFile,
     source: &str,
     declarator: Node<'_>,
     type_text: Option<&str>,
-    bindings: &LocalInferenceEngine<CodeUnit>,
+    bindings: &LocalInferenceEngine<T>,
 ) -> bool {
     if !has_ancestor_kind(declarator, "compound_statement") {
         return false;
@@ -959,10 +1112,10 @@ pub(in crate::analyzer::usages) fn constructor_style_local_declaration(
         })
 }
 
-fn constructor_parameters_look_like_expressions(
+fn constructor_parameters_look_like_expressions<T: Clone + Eq + Hash>(
     parameters: Node<'_>,
     source: &str,
-    bindings: &LocalInferenceEngine<CodeUnit>,
+    bindings: &LocalInferenceEngine<T>,
 ) -> bool {
     let mut cursor = parameters.walk();
     parameters.named_children(&mut cursor).any(|parameter| {
@@ -973,10 +1126,10 @@ fn constructor_parameters_look_like_expressions(
     })
 }
 
-fn parameter_declaration_is_local_expression(
+fn parameter_declaration_is_local_expression<T: Clone + Eq + Hash>(
     parameter: Node<'_>,
     source: &str,
-    bindings: &LocalInferenceEngine<CodeUnit>,
+    bindings: &LocalInferenceEngine<T>,
 ) -> bool {
     let text = node_text(parameter, source).trim();
     text.chars()
