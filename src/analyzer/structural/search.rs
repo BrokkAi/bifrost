@@ -10,6 +10,7 @@ use super::facts::FileFacts;
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
 use super::query::AstQuery;
+use crate::analyzer::structural::capabilities::QueryFeature;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::path_utils::rel_path_string;
 use serde::Serialize;
@@ -130,41 +131,16 @@ pub fn execute_with_limits(
 
         let explicitly_requested = query.languages.contains(&language);
         if !files.is_empty() || explicitly_requested {
-            let unsupported_kinds: Vec<&'static str> = plan
-                .referenced_kinds()
-                .iter()
-                .copied()
-                .filter(|kind| !provider.structural_supports_kind(*kind))
-                .map(|kind| kind.label())
-                .collect();
-            if !unsupported_kinds.is_empty() {
-                diagnostics.push(SearchAstDiagnostic {
-                    language: language.config_label(),
-                    message: format!(
-                        "structural adapter for {} does not support kind(s): {}",
-                        language.config_label(),
-                        unsupported_kinds.join(", ")
-                    ),
-                });
-            }
-
-            let unsupported_roles: Vec<&'static str> = plan
-                .used_roles()
-                .iter()
-                .copied()
-                .filter(|role| !provider.structural_supports_role(*role))
-                .map(|role| role.label())
-                .collect();
-            if !unsupported_roles.is_empty() {
-                diagnostics.push(SearchAstDiagnostic {
-                    language: language.config_label(),
-                    message: format!(
-                        "structural adapter for {} does not support role(s): {}",
-                        language.config_label(),
-                        unsupported_roles.join(", ")
-                    ),
-                });
-            }
+            diagnostics.extend(
+                plan.features()
+                    .unsupported_by(|feature| provider_supports_feature(provider, feature))
+                    .into_diagnostics(language)
+                    .into_iter()
+                    .map(|diagnostic| SearchAstDiagnostic {
+                        language: diagnostic.language().config_label(),
+                        message: diagnostic.message(),
+                    }),
+            );
         }
 
         provider_scopes.push((language, provider, files));
@@ -248,6 +224,16 @@ pub fn execute_with_limits(
         matches,
         truncated,
         diagnostics,
+    }
+}
+
+fn provider_supports_feature(
+    provider: &dyn super::StructuralSearchProvider,
+    feature: QueryFeature,
+) -> bool {
+    match feature {
+        QueryFeature::Kind(kind) => provider.structural_supports_kind(kind),
+        QueryFeature::Role(role) => provider.structural_supports_role(role),
     }
 }
 

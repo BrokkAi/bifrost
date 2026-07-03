@@ -14,8 +14,9 @@
 //! happens. This subsumes declaration-index pruning: a declared name is a
 //! source span like any other.
 
+use super::capabilities::QueryFeatures;
 use super::query::{AstQuery, Pattern, StringPredicate};
-use crate::analyzer::structural::{NormalizedKind, Role};
+use crate::analyzer::structural::Role;
 
 /// Language-independent execution plan derived from a parsed query.
 ///
@@ -25,25 +26,19 @@ use crate::analyzer::structural::{NormalizedKind, Role};
 #[derive(Debug, Clone)]
 pub(crate) struct QueryPlan {
     positive_source_anchors: Vec<String>,
-    referenced_kinds: Vec<NormalizedKind>,
-    used_roles: Vec<Role>,
+    features: QueryFeatures,
 }
 
 impl QueryPlan {
     pub(crate) fn for_query(query: &AstQuery) -> Self {
         Self {
             positive_source_anchors: collect_positive_source_anchors(query),
-            referenced_kinds: query.referenced_kinds(),
-            used_roles: query.used_roles(),
+            features: QueryFeatures::for_query(query),
         }
     }
 
-    pub(crate) fn referenced_kinds(&self) -> &[NormalizedKind] {
-        &self.referenced_kinds
-    }
-
-    pub(crate) fn used_roles(&self) -> &[Role] {
-        &self.used_roles
+    pub(crate) fn features(&self) -> &QueryFeatures {
+        &self.features
     }
 
     pub(crate) fn source_may_match(&self, source: &str) -> bool {
@@ -143,16 +138,14 @@ mod tests {
         let anchors = vec!["eval".to_string(), "shell".to_string()];
         let plan = QueryPlan {
             positive_source_anchors: anchors,
-            referenced_kinds: Vec::new(),
-            used_roles: Vec::new(),
+            features: QueryFeatures::default(),
         };
         assert!(plan.source_may_match("eval(x, shell=True)"));
         assert!(!plan.source_may_match("eval(x)"));
 
         let plan = QueryPlan {
             positive_source_anchors: Vec::new(),
-            referenced_kinds: Vec::new(),
-            used_roles: Vec::new(),
+            features: QueryFeatures::default(),
         };
         assert!(plan.source_may_match("anything"));
     }
