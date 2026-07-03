@@ -1,0 +1,80 @@
+:root {
+  --sl-font: "Rajdhani", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --sl-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --sl-color-accent-low: #48120f;
+  --sl-color-accent: #eb3f33;
+  --sl-color-accent-high: #ffd7d3;
+  --sl-color-white: #f4f1ec;
+  --sl-color-gray-1: #ece8df;
+  --sl-color-gray-2: #cbc4b7;
+  --sl-color-gray-3: #948b7e;
+  --sl-color-gray-4: #5f5a52;
+  --sl-color-gray-5: #3d3934;
+  --sl-color-gray-6: #24221f;
+  --sl-color-black: #050505;
+  --sl-content-width: 52rem;
+  --sl-sidebar-width: 18rem;
+}
+
+@font-face {
+  font-family: "Brokk Docs Display";
+  src: local("Staatliches");
+  font-display: swap;
+}
+
+body {
+  background:
+    radial-gradient(circle at 88% 12%, rgb(235 63 51 / 0.18), transparent 24rem),
+    linear-gradient(rgb(255 255 255 / 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 0.035) 1px, transparent 1px),
+    #050505;
+  background-size: auto, 32px 32px, 32px 32px, auto;
+}
+
+.site-title,
+.hero h1,
+.sl-markdown-content h1,
+.sl-markdown-content h2 {
+  font-family: "Staatliches", "Brokk Docs Display", Impact, Haettenschweiler, "Arial Black", system-ui, sans-serif;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.hero h1 {
+  color: #f4f1ec;
+}
+
+.hero .tagline {
+  color: #cbc4b7;
+  font-weight: 500;
+}
+
+.version-strip {
+  border: 1px solid rgb(235 63 51 / 0.45);
+  background: linear-gradient(90deg, rgb(235 63 51 / 0.16), rgb(255 255 255 / 0.03));
+  color: #f4f1ec;
+  font-family: var(--sl-font-mono);
+  font-size: 0.86rem;
+  padding: 0.75rem 1rem;
+}
+
+.card {
+  border-radius: 0;
+  border-color: rgb(235 63 51 / 0.34);
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 0.055), rgb(255 255 255 / 0.016)),
+    #151311;
+}
+
+.card .title {
+  color: #f4f1ec;
+  font-family: var(--sl-font-mono);
+}
+
+.sl-markdown-content code:not(:where(.not-content *)) {
+  color: #ffd7d3;
+}
+
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: #ff6a5f;
+}

@@ -1,0 +1,43 @@
+---
+title: Bifrost
+description: Brokk's code-intelligence engine for agents, editors, and large repositories.
+template: splash
+hero:
+  tagline: Code intelligence for AI development workflows.
+  image:
+    alt: Bifrost signal mark
+    file: ../../assets/bifrost-mark.svg
+  actions:
+    - text: Install Bifrost
+      link: install/
+      icon: right-arrow
+      variant: primary
+    - text: Use MCP
+      link: mcp/
+      variant: secondary
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+export const version = import.meta.env.PUBLIC_BIFROST_VERSION ?? 'development';
+export const tag = import.meta.env.PUBLIC_BIFROST_TAG ?? '';
+export const releaseUrl = import.meta.env.PUBLIC_BIFROST_RELEASE_URL ?? '';
+
+<p class="version-strip">
+  {tag ? <>Docs build: <a href={releaseUrl}>{tag}</a></> : <>Docs build: Bifrost {version}</>}
+</p>
+
+<CardGrid>
+  <Card title="Analyzer-first context">
+    Bifrost parses mixed-language repositories and returns structured symbols, definitions, summaries, usages, and related files.
+  </Card>
+  <Card title="Agent-ready MCP">
+    Run Bifrost as a stdio MCP server for code navigation and repository discovery in Codex, Claude Code, and other MCP hosts.
+  </Card>
+  <Card title="Editor LSP">
+    Use the VS Code extension to run Bifrost as a workspace-aware language server.
+  </Card>
+  <Card title="Versioned with releases">
+    Release-tag docs can be published alongside Bifrost binaries and preserved under versioned paths.
+  </Card>
+</CardGrid>

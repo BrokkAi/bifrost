@@ -33,6 +33,18 @@ Bifrost includes analyzers for:
 
 For local development, test commands, repository-local Python workflow, and release tagging, see [CONTRIBUTING.md](/home/jonathan/Projects/bifrost/CONTRIBUTING.md).
 
+## Documentation Site
+
+The human-readable documentation site lives in `docs/` and uses Astro Starlight.
+
+```bash
+cd docs
+npm install
+npm run dev
+```
+
+GitHub Pages publication is handled by `.github/workflows/docs.yml`. Release tag builds such as `v0.7.2` publish both the latest docs site and a versioned snapshot under `versions/v0.7.2/`.
+
 ## Rust Library Usage
 
 The crate name is `brokk_bifrost`.
