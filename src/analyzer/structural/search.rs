@@ -24,6 +24,7 @@ const SNIPPET_MAX_CHARS: usize = 160;
 const MAX_SCANNED_FILES: usize = 20_000;
 const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FACT_NODES: usize = 2_000_000;
+const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
 
 #[derive(Debug, Serialize)]
 pub struct SearchAstOutput {
@@ -247,6 +248,9 @@ pub fn execute_with_limits(
     if match_truncated {
         push_truncation_diagnostic(&mut diagnostics, &budget, query.limit);
     }
+    if should_report_broad_query(&plan, query, &budget, truncated) {
+        push_broad_query_diagnostic(&mut diagnostics, &budget);
+    }
     pending.truncate(query.limit);
 
     // Enclosing-symbol lookups only for the matches actually returned.
@@ -303,6 +307,31 @@ fn push_truncation_diagnostic(
         language: "workspace",
         message: format!(
             "search_ast returned the first {limit} matches after scanning {} files, {} bytes, and {} facts; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+        ),
+    });
+}
+
+fn should_report_broad_query(
+    plan: &QueryPlan,
+    query: &AstQuery,
+    budget: &SearchAstExecutionBudget,
+    truncated: bool,
+) -> bool {
+    !plan.has_source_anchors()
+        && query.where_globs.is_empty()
+        && query.languages.is_empty()
+        && (truncated || budget.scanned_files >= BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD)
+}
+
+fn push_broad_query_diagnostic(
+    diagnostics: &mut Vec<SearchAstDiagnostic>,
+    budget: &SearchAstExecutionBudget,
+) {
+    diagnostics.push(SearchAstDiagnostic {
+        language: "workspace",
+        message: format!(
+            "broad unanchored search_ast query scanned {} files, {} bytes, and {} facts; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",
             budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
         ),
     });

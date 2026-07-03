@@ -41,6 +41,10 @@ impl QueryPlan {
         &self.features
     }
 
+    pub(crate) fn has_source_anchors(&self) -> bool {
+        !self.positive_source_anchors.is_empty()
+    }
+
     pub(crate) fn build_source_index(&self) -> SourceCandidateIndex<'_> {
         SourceCandidateIndex {
             required_anchors: &self.positive_source_anchors,
@@ -148,6 +152,25 @@ mod tests {
             anchors.is_empty(),
             "negations/regexes must never prune: {anchors:?}"
         );
+    }
+
+    #[test]
+    fn reports_whether_a_query_has_source_anchors() {
+        let anchored = QueryPlan::for_query(
+            &AstQuery::from_json(&json!({
+                "match": { "kind": "call", "callee": { "name": "eval" } }
+            }))
+            .expect("query should parse"),
+        );
+        assert!(anchored.has_source_anchors());
+
+        let unanchored = QueryPlan::for_query(
+            &AstQuery::from_json(&json!({
+                "match": { "kind": "call", "callee": { "name": { "regex": "^eval$" } } }
+            }))
+            .expect("query should parse"),
+        );
+        assert!(!unanchored.has_source_anchors());
     }
 
     #[test]

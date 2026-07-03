@@ -72,6 +72,32 @@ fn assert_truncation_diagnostic(output: &SearchAstOutput, limit: usize) {
     );
 }
 
+fn has_broad_query_diagnostic(output: &SearchAstOutput) -> bool {
+    output.diagnostics.iter().any(|diagnostic| {
+        diagnostic.language == "workspace"
+            && diagnostic.message.contains("broad unanchored")
+            && diagnostic.message.contains("where")
+            && diagnostic.message.contains("languages")
+            && diagnostic.message.contains("exact name")
+    })
+}
+
+fn assert_broad_query_diagnostic(output: &SearchAstOutput) {
+    assert!(
+        has_broad_query_diagnostic(output),
+        "missing broad-query diagnostic: {:?}",
+        output.diagnostics
+    );
+}
+
+fn assert_no_broad_query_diagnostic(output: &SearchAstOutput) {
+    assert!(
+        !has_broad_query_diagnostic(output),
+        "unexpected broad-query diagnostic: {:?}",
+        output.diagnostics
+    );
+}
+
 #[test]
 fn anchor_pruning_skips_files_without_the_anchor() {
     let (_project, workspace) = python_workspace();
@@ -210,6 +236,63 @@ fn limit_stops_after_global_truncation_is_known() {
         2,
         "only enough files to prove global truncation should be parsed"
     );
+}
+
+#[test]
+fn broad_unanchored_truncated_queries_get_guidance() {
+    let (_project, workspace) = python_workspace();
+    let analyzer = workspace.analyzer();
+
+    let output = run(
+        analyzer,
+        json!({ "match": { "kind": "callable" }, "limit": 1 }),
+    );
+
+    assert!(output.truncated);
+    assert_truncation_diagnostic(&output, 1);
+    assert_broad_query_diagnostic(&output);
+}
+
+#[test]
+fn anchored_and_scoped_queries_do_not_get_broad_guidance() {
+    let (_project, workspace) = python_workspace();
+    let analyzer = workspace.analyzer();
+
+    let anchored = run(
+        analyzer,
+        json!({ "match": { "kind": "call", "callee": { "name": "eval" } } }),
+    );
+    assert_eq!(anchored.matches.len(), 1);
+    assert!(!anchored.truncated);
+    assert_no_broad_query_diagnostic(&anchored);
+
+    let scoped = run(
+        analyzer,
+        json!({ "languages": ["python"], "match": { "kind": "callable" }, "limit": 1 }),
+    );
+    assert!(scoped.truncated);
+    assert_truncation_diagnostic(&scoped, 1);
+    assert_no_broad_query_diagnostic(&scoped);
+}
+
+#[test]
+fn broad_unanchored_large_complete_queries_get_guidance() {
+    let mut project = InlineTestProject::with_language(Language::Python);
+    for index in 0..100 {
+        project = project.file(
+            format!("src/file_{index:03}.py"),
+            format!("def function_{index}():\n    pass\n"),
+        );
+    }
+    let project = project.build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    let output = run(analyzer, json!({ "match": { "kind": "class" } }));
+
+    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+    assert!(!output.truncated);
+    assert_broad_query_diagnostic(&output);
 }
 
 #[test]

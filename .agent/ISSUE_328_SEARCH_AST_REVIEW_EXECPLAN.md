@@ -18,7 +18,7 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
 - [x] (2026-07-03T12:38Z) Milestone 3: documented capability and precision caveats in `bifrost_searchtools/README.md` and tightened the MCP descriptor text. The docs cover constructor-as-call behavior, kwargs support, aliases/import caveats, syntactic receiver/callee extraction, decorator span policy, argument-subsequence semantics, and unsupported-role diagnostics. Validation passed with `cargo fmt -- --check` and `cargo test structural --lib`.
 - [x] (2026-07-03T12:42Z) Milestone 4: added `schema_version: 1` validation/canonicalization and exact-text duplicate capture equality. Python client docs now call `search_ast` experimental v1 and can pass `schema_version=1`. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, `cargo test --test structural_search_cross_language --test structural_search_planner --test structural_search_python`, and the targeted Python client unittest through `uv run --python 3.12 --with maturin`.
 - [x] (2026-07-03T12:46Z) Milestone 5: switched candidate traversal to global project-relative path order with language as the deterministic tiebreaker, while preserving the `limit + 1` truncation proof. Truncated result sets now include a compact workspace diagnostic with scanned file/source/fact counts and refinement guidance. Validation passed with `cargo fmt -- --check` and `cargo test --test structural_search_cross_language --test structural_search_planner`.
-- [ ] Milestone 6: add compact broad-query performance guidance.
+- [x] (2026-07-03T12:49Z) Milestone 6: added compact broad-query performance guidance for unanchored, unscoped searches when they truncate, exhaust a budget, or scan at least 100 files. Anchored and scoped queries stay quiet apart from existing focused diagnostics. Validation passed with `cargo fmt -- --check`, `cargo test structural --lib`, and `cargo test --test structural_search_planner`.
 
 
 ## Surprises & Discoveries
@@ -68,6 +68,10 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
   Rationale: Compact outputs should stay quiet when complete; when incomplete, callers need scan counts and concrete refinement knobs to make the next query narrower.
   Date/Author: 2026-07-03 / Codex.
 
+- Decision: Gate broad-query guidance on no source anchors, no `where`, no `languages`, and either truncation, budget exhaustion, or 100 scanned files.
+  Rationale: This catches expensive context-heavy searches without warning on small complete queries or deliberately scoped language/path searches.
+  Date/Author: 2026-07-03 / Codex.
+
 
 ## Outcomes & Retrospective
 
@@ -76,6 +80,7 @@ Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `
 - 2026-07-03T12:38Z: Milestone 3 completed. The Python README and MCP descriptor now make the normalization precision limits explicit without adding per-result verbosity.
 - 2026-07-03T12:42Z: Milestone 4 completed. The query surface now has an explicit v1 compatibility marker, and repeated capture labels are real equality constraints instead of independent labels.
 - 2026-07-03T12:46Z: Milestone 5 completed. Mixed-language result order is now path-first across the workspace, and truncated outputs explain how much work was scanned before returning the bounded result set.
+- 2026-07-03T12:49Z: Milestone 6 completed. Broad unanchored queries now receive concise performance guidance only when they are likely to cost meaningful context or compute.
 
 
 ## Context and Orientation
