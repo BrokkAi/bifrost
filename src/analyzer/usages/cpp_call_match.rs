@@ -256,11 +256,14 @@ fn cpp_number_literal_is_float(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::analyzer::{CodeUnitType, ProjectFile};
-    use std::path::PathBuf;
+
+    fn test_file() -> ProjectFile {
+        ProjectFile::new(std::env::temp_dir(), "test.cpp")
+    }
 
     fn function(name: &str, signature: &str) -> CodeUnit {
         CodeUnit::with_signature(
-            ProjectFile::new(PathBuf::from("/tmp"), "test.cpp"),
+            test_file(),
             CodeUnitType::Function,
             "ns",
             name,
@@ -270,12 +273,7 @@ mod tests {
     }
 
     fn class(name: &str) -> CodeUnit {
-        CodeUnit::new(
-            ProjectFile::new(PathBuf::from("/tmp"), "test.cpp"),
-            CodeUnitType::Class,
-            "ns",
-            name,
-        )
+        CodeUnit::new(test_file(), CodeUnitType::Class, "ns", name)
     }
 
     #[test]
