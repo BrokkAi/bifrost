@@ -304,6 +304,126 @@ fn scoped_service_reads_selected_files_from_revision() {
             .any(|item| item == "Other.java"),
         "unselected files must not be analyzer-visible: {value}"
     );
+
+    let payload = service
+        .call_tool_json("get_file_contents", r#"{"file_paths":["Demo.java"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert!(
+        value["files"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("OldDemo"),
+        "file tools must read selected content from the revision: {value}"
+    );
+    assert!(
+        !value["files"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("NewDemo"),
+        "file tools must not read live content in pinned scoped sessions: {value}"
+    );
+}
+
+#[test]
+fn scoped_service_resolves_literal_source_paths_at_revision() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/java/org/jsimpledb")).unwrap();
+    fs::write(
+        temp.path().join("src/java/org/jsimpledb/Demo.java"),
+        "package org.jsimpledb;\nclass Demo { String value() { return \"old\"; } }\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["src/java/org/jsimpledb/Demo.java"], "old layout");
+
+    fs::remove_file(temp.path().join("src/java/org/jsimpledb/Demo.java")).unwrap();
+    fs::create_dir_all(temp.path().join("src/main/java/io/permazen")).unwrap();
+    fs::write(
+        temp.path().join("src/main/java/io/permazen/Demo.java"),
+        "package io.permazen;\nclass Demo { String value() { return \"new\"; } }\n",
+    )
+    .unwrap();
+    commit_paths_with_removals(
+        &repo,
+        &["src/main/java/io/permazen/Demo.java"],
+        &["src/java/org/jsimpledb/Demo.java"],
+        "new layout",
+    );
+
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["src/java/org/jsimpledb/Demo.java".to_string()],
+        Some("HEAD~1"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_file_contents",
+            r#"{"file_paths":["src/java/org/jsimpledb/Demo.java"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(
+        "package org.jsimpledb;\nclass Demo { String value() { return \"old\"; } }\n",
+        value["files"][0]["content"],
+        "payload: {value}"
+    );
+    assert!(value["not_found"].as_array().unwrap().is_empty(), "{value}");
+
+    for source in ["src/java/org/jsimpledb", "src/java/org/jsimpledb/*.java"] {
+        let service = create_scoped_service(
+            temp.path().to_path_buf(),
+            &[source.to_string()],
+            Some("HEAD~1"),
+        )
+        .unwrap();
+        let payload = service
+            .call_tool_json(
+                "get_file_contents",
+                r#"{"file_paths":["src/java/org/jsimpledb/Demo.java"]}"#,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(
+            "package org.jsimpledb;\nclass Demo { String value() { return \"old\"; } }\n",
+            value["files"][0]["content"],
+            "revision-scoped source {source} should select old content: {value}"
+        );
+    }
+}
+
+#[test]
+fn scoped_service_without_revision_rejects_nonexistent_literal_source_paths() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/main/java/io/permazen")).unwrap();
+    fs::write(
+        temp.path().join("src/main/java/io/permazen/Demo.java"),
+        "package io.permazen;\nclass Demo {}\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(
+        &repo,
+        &["src/main/java/io/permazen/Demo.java"],
+        "current layout",
+    );
+
+    let err = match create_scoped_service(
+        temp.path().to_path_buf(),
+        &["src/java/org/jsimpledb/Demo.java".to_string()],
+        None,
+    ) {
+        Ok(_) => panic!("live scoped service unexpectedly accepted missing source path"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains("source path does not exist: src/java/org/jsimpledb/Demo.java"),
+        "{err}"
+    );
 }
 
 #[test]

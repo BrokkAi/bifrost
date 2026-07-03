@@ -175,7 +175,7 @@ pub fn get_file_contents(
 
         let resolved = resolver.resolve_literal(trimmed);
         if let ResolvedFileInput::File(file) = resolved {
-            match file.read_to_string() {
+            match project.read_source(&file) {
                 Ok(content) => {
                     let sampled = model_context::sample(&content);
                     files.push(FileContent {
@@ -376,7 +376,7 @@ pub fn find_files_containing(
             if !is_searchable_text_file(&file) {
                 return None;
             }
-            let contents = file.read_to_string().ok()?;
+            let contents = project.read_source(&file).ok()?;
             if regexes.iter().any(|regex| regex.is_match(&contents)) {
                 Some(rel_path_string(&file))
             } else {
@@ -478,7 +478,7 @@ pub fn search_file_contents(
             if !is_searchable_text_file(&file) {
                 return None;
             }
-            let contents = file.read_to_string().ok()?;
+            let contents = project.read_source(&file).ok()?;
             // Bound the per-file line count before allocating `Vec<&str>`.
             // A 5 MB single-byte-line file would otherwise produce ~5M slices
             // (≈120 MB of Vec headers) across rayon workers — a memory-pressure

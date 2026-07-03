@@ -121,6 +121,104 @@ pub(crate) fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String
         })
 }
 
+pub(crate) fn list_git_files_at_revision(
+    workspace_root: &Path,
+    rev: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let canonical_root = workspace_root.canonicalize().map_err(|err| {
+        format!(
+            "unable to canonicalize workspace root {}: {err}",
+            workspace_root.display()
+        )
+    })?;
+    let repo = Repository::discover(&canonical_root).map_err(|err| {
+        format!(
+            "workspace root is not in any git repository: {} ({err})",
+            workspace_root.display()
+        )
+    })?;
+    let workdir = repo.workdir().ok_or_else(|| {
+        format!(
+            "git repository has no working tree: {}",
+            repo.path().display()
+        )
+    })?;
+    let canonical_workdir = workdir.canonicalize().map_err(|err| {
+        format!(
+            "unable to canonicalize git workdir {}: {err}",
+            workdir.display()
+        )
+    })?;
+    let workspace_repo_rel = canonical_root
+        .strip_prefix(&canonical_workdir)
+        .map_err(|_| {
+            format!(
+                "workspace root is outside discovered git workdir: {} (workdir: {})",
+                workspace_root.display(),
+                canonical_workdir.display()
+            )
+        })?;
+
+    let object = repo
+        .revparse_single(rev)
+        .map_err(|err| format!("bad git revision `{rev}`: {err}"))?;
+    let commit = object
+        .peel_to_commit()
+        .map_err(|err| format!("git revision `{rev}` is not a commit: {err}"))?;
+    let tree = commit
+        .tree()
+        .map_err(|err| format!("unable to read tree for git revision `{rev}`: {err}"))?;
+
+    let root_tree = if workspace_repo_rel.as_os_str().is_empty() {
+        tree
+    } else {
+        let entry = tree.get_path(workspace_repo_rel).map_err(|err| {
+            format!(
+                "workspace root `{}` is absent at git revision `{rev}`: {err}",
+                workspace_repo_rel.display()
+            )
+        })?;
+        if entry.kind() != Some(ObjectType::Tree) {
+            return Err(format!(
+                "workspace root `{}` at git revision `{rev}` is not a tree",
+                workspace_repo_rel.display()
+            ));
+        }
+        repo.find_tree(entry.id()).map_err(|err| {
+            format!(
+                "unable to read workspace tree `{}` at git revision `{rev}`: {err}",
+                workspace_repo_rel.display()
+            )
+        })?
+    };
+
+    let mut files = Vec::new();
+    let mut stack = vec![(PathBuf::new(), root_tree)];
+    while let Some((prefix, tree)) = stack.pop() {
+        for entry in &tree {
+            let Some(name) = entry.name() else {
+                continue;
+            };
+            let rel = prefix.join(name);
+            match entry.kind() {
+                Some(ObjectType::Blob) => files.push(rel),
+                Some(ObjectType::Tree) => {
+                    let child = repo.find_tree(entry.id()).map_err(|err| {
+                        format!(
+                            "unable to read tree `{}` at git revision `{rev}`: {err}",
+                            rel.display()
+                        )
+                    })?;
+                    stack.push((rel, child));
+                }
+                _ => {}
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() {
         path

@@ -1,5 +1,5 @@
 use crate::analyzer::{FileSetProject, OverlayProject, Project};
-use crate::git_file::read_git_file;
+use crate::git_file::{list_git_files_at_revision, read_git_file};
 use crate::tool_arguments::GitHistoryOverlay;
 use crate::{SearchToolsService, collect_workspace_files};
 use glob::Pattern;
@@ -15,11 +15,13 @@ pub fn create_scoped_service(
     let root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
-    let rel_paths = resolve_sources(&root, sources)?;
-    let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
     let Some(revision) = revision.map(str::trim).filter(|rev| !rev.is_empty()) else {
+        let rel_paths = resolve_sources(&root, sources)?;
+        let project = Arc::new(FileSetProject::new(root, rel_paths));
         return SearchToolsService::new_manual_for_project(project);
     };
+    let rel_paths = resolve_sources_at_revision(&root, sources, revision)?;
+    let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
 
     let overlay_project = Arc::new(OverlayProject::new(project));
     for file in overlay_project
@@ -143,6 +145,78 @@ pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, S
                     "source directory `{trimmed}` contains no analyzer-visible files"
                 ));
             }
+            continue;
+        }
+
+        return Err(format!("source path does not exist: {trimmed}"));
+    }
+
+    if selected.is_empty() {
+        return Err("sources resolved to an empty workspace".to_string());
+    }
+    Ok(selected.into_iter().collect())
+}
+
+fn resolve_sources_at_revision(
+    root: &Path,
+    inputs: &[String],
+    revision: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let revision_rel_paths: Vec<String> = list_git_files_at_revision(root, revision)?
+        .into_iter()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    resolve_sources_from_rel_paths(root, inputs, &revision_rel_paths)
+}
+
+fn resolve_sources_from_rel_paths(
+    root: &Path,
+    inputs: &[String],
+    workspace_rel_paths: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    let workspace_rel_set: BTreeSet<&str> =
+        workspace_rel_paths.iter().map(String::as_str).collect();
+    let mut selected = BTreeSet::new();
+    for input in inputs {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if contains_glob_syntax(trimmed) {
+            let pattern = normalize_source_pattern(trimmed, root)?;
+            let glob = Pattern::new(&pattern)
+                .map_err(|err| format!("Invalid source glob `{trimmed}`: {err}"))?;
+            let mut matched_any = false;
+            for rel in workspace_rel_paths {
+                if glob.matches(rel) {
+                    matched_any = true;
+                    selected.insert(PathBuf::from(rel));
+                }
+            }
+            if !matched_any {
+                return Err(format!("source glob `{trimmed}` matched no files"));
+            }
+            continue;
+        }
+
+        let rel = normalize_literal_source_path(trimmed, root)?;
+        let rel_string = rel.to_string_lossy().replace('\\', "/");
+        if workspace_rel_set.contains(rel_string.as_str()) {
+            selected.insert(rel);
+            continue;
+        }
+
+        let prefix_slash = format!("{rel_string}/");
+        let mut matched_any = false;
+        for workspace_rel in workspace_rel_paths {
+            if workspace_rel.starts_with(&prefix_slash) {
+                matched_any = true;
+                selected.insert(PathBuf::from(workspace_rel));
+            }
+        }
+        if matched_any {
             continue;
         }
 
