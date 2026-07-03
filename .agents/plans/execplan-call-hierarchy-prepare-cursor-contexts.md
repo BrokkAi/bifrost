@@ -43,7 +43,7 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
   Evidence: Go, C#, C++, Scala, Python, and PHP declaration/call-reference positives plus local-variable negatives passed in `bifrost_lsp_server_call_hierarchy_prepare_filters_remaining_language_contexts`; Ruby declaration prepare passed while Ruby call-reference prepare returned `null`.
 
 - Observation: The final branch diff is limited to the intended implementation, tests, and ExecPlan.
-  Evidence: `git diff --stat origin/master...HEAD` listed only `docs/execplan-call-hierarchy-prepare-cursor-contexts.md`, `src/lsp/handlers/call_hierarchy.rs`, and `tests/bifrost_lsp_server.rs`; `git diff --check origin/master...HEAD` produced no output.
+  Evidence: `git diff --stat origin/master...HEAD` listed only `.agents/plans/execplan-call-hierarchy-prepare-cursor-contexts.md`, `src/lsp/handlers/call_hierarchy.rs`, and `tests/bifrost_lsp_server.rs`; `git diff --check origin/master...HEAD` produced no output.
 
 ## Decision Log
 

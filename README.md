@@ -166,7 +166,7 @@ Those skills are currently packaged by the Brokk host plugin, whose source lives
 in `BrokkAi/brokk` under `claude-plugin/`. The repository name is historical:
 the plugin uses Bifrost for its analyzer-backed MCP tools, but the skill bundle
 has not yet moved into this repository. See
-`docs/agent-plugin-publication.md` for the Bifrost-owned Agent Plugin
+`.agents/docs/agent-plugin-publication.md` for the Bifrost-owned Agent Plugin
 publication path.
 
 Claude Code plugin install:

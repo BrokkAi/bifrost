@@ -28,7 +28,7 @@ After this work, Bifrost will still advertise the same LSP capabilities, but ina
   Evidence: `git status --short --branch` printed `## 333-audit-broad-lsp-identifier-endpoints-for-inappropriate-cursor-contexts...origin/333-audit-broad-lsp-identifier-endpoints-for-inappropriate-cursor-contexts`.
 
 - Observation: The project has recent LSP cursor-context ExecPlans that use the same milestone pattern requested here.
-  Evidence: `docs/execplan-type-definition-cursor-contexts.md` and `docs/execplan-call-hierarchy-prepare-cursor-contexts.md` both keep provider advertisements unchanged, add LSP regressions, run focused tests, run guided-review checkpoints, and commit between milestones.
+  Evidence: `.agents/plans/execplan-type-definition-cursor-contexts.md` and `.agents/plans/execplan-call-hierarchy-prepare-cursor-contexts.md` both keep provider advertisements unchanged, add LSP regressions, run focused tests, run guided-review checkpoints, and commit between milestones.
 
 - Observation: `origin/master` advanced after the initial plan commit, while the issue branch upstream stayed at the prior master commit.
   Evidence: After `git fetch`, `git rev-parse HEAD origin/master origin/333-audit-broad-lsp-identifier-endpoints-for-inappropriate-cursor-contexts` printed `7a842496243f92952cab6fe8fefc13791a37e080`, `e3fc1367b41c22ede25934798349d0e3cc443fea`, and `f1e2cd37fc80877a09578fe685043e3de92ed8c3`. Per project instructions, no rebase was run.
@@ -171,7 +171,7 @@ Run `brokk:brokk-guided-review` in uncommitted-changes mode. Include this scopin
 Commit commands must stage explicit files only. For example, after Milestone 1:
 
     git status --short
-    git add docs/execplan-broad-lsp-identifier-cursor-contexts.md tests/bifrost_lsp_server.rs
+    git add .agents/plans/execplan-broad-lsp-identifier-cursor-contexts.md tests/bifrost_lsp_server.rs
     git commit -m "Add broad LSP cursor-context regression plan and tests"
 
 At the final quality gate on this macOS worktree, avoid `--all-features` because it enables CUDA-dependent `nlp-gpu`. Run:

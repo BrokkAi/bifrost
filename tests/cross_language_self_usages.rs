@@ -1,5 +1,5 @@
 //! Cross-language find-usages for a `self`/`this`-receiver method call — pattern
-//! 2 from `.agent/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`. The caret is on a
+//! 2 from `.agents/docs/PARITY_CROSS_LANGUAGE_GENERALIZATION.md`. The caret is on a
 //! method declaration; the same-class call via `self`/`this` (or the implicit
 //! receiver) should be reported as a usage.
 
