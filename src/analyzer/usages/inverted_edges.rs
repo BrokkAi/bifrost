@@ -271,6 +271,10 @@ impl<'a, K: NodeKey> EdgeCollector<'a, K> {
             .map(|(_, _, key)| key)
     }
 
+    pub(crate) fn is_node(&self, key: &K) -> bool {
+        self.nodes.contains(key)
+    }
+
     /// Record a reference at `[start, end)` that resolves to `callee`. Updates the
     /// per-callee call-site count (for the cap) and, when the site is a real edge,
     /// the `(caller, callee)` weight.

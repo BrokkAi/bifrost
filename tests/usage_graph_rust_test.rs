@@ -35,6 +35,20 @@ fn usage_graph() -> Value {
     serde_json::from_str(&payload).expect("usage_graph returned invalid JSON")
 }
 
+fn inline_usage_graph(files: &[(&str, &str)]) -> Value {
+    let mut builder = InlineTestProject::with_language(Language::Rust);
+    for (path, contents) in files {
+        builder = builder.file(path, *contents);
+    }
+    let project = builder.build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("failed to build searchtools service over inline project");
+    let payload = service
+        .call_tool_json("usage_graph", "{}")
+        .expect("usage_graph call failed");
+    serde_json::from_str(&payload).expect("usage_graph returned invalid JSON")
+}
+
 #[test]
 fn resolves_named_import_calls_and_aggregates_weight() {
     let value = usage_graph();
@@ -67,6 +81,64 @@ fn resolves_namespace_qualified_and_associated_calls() {
     assert!(
         find_edge(&value, "consumer.make_config", "util.Config.new").is_some(),
         "expected make_config -> util.Config.new edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn resolves_unique_trait_associated_function_candidate() {
+    let value = inline_usage_graph(&[(
+        "src/lib.rs",
+        r#"
+trait Trait {
+    fn frobnicate();
+}
+
+struct Foo;
+
+impl Trait for Foo {}
+
+fn bar() {
+    Foo::frobnicate();
+}
+"#,
+    )]);
+
+    assert!(
+        find_edge(&value, "bar", "Trait.frobnicate").is_some(),
+        "expected bar -> Trait.frobnicate edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn ambiguous_trait_associated_function_candidates_produce_no_edge() {
+    let value = inline_usage_graph(&[(
+        "src/lib.rs",
+        r#"
+trait Trait {
+    fn frobnicate();
+}
+
+trait OtherTrait {
+    fn frobnicate();
+}
+
+struct Foo;
+
+impl Trait for Foo {}
+impl OtherTrait for Foo {}
+
+fn bar() {
+    Foo::frobnicate();
+}
+"#,
+    )]);
+
+    assert!(
+        find_edge(&value, "bar", "Trait.frobnicate").is_none()
+            && find_edge(&value, "bar", "OtherTrait.frobnicate").is_none(),
+        "ambiguous trait candidates must not emit partial edges: {}",
         value["edges"]
     );
 }

@@ -54,6 +54,8 @@ where
                 &refs,
             );
             let mut ctx = RustScan {
+                rust,
+                file,
                 source: parsed.source.as_str(),
                 refs,
                 factory_returns,
@@ -66,6 +68,8 @@ where
 }
 
 struct RustScan<'a, 'b> {
+    rust: &'a RustAnalyzer,
+    file: &'a ProjectFile,
     source: &'a str,
     refs: Arc<RustReferenceContext>,
     factory_returns: HashMap<String, String>,
@@ -84,7 +88,21 @@ impl RustScan<'_, '_> {
     /// The callee fqn a `path::name` refers to: a module function via a namespace
     /// import, or an associated function on an imported / same-file type.
     fn scoped_callee(&self, path: &str, name: &str) -> Option<String> {
-        self.refs.resolve_scoped(path, name)
+        let direct = self.refs.resolve_scoped(path, name)?;
+        if self.collector.is_node(&direct) {
+            return Some(direct);
+        }
+
+        let Some(type_fqn) = self.refs.resolve_path(path) else {
+            return Some(direct);
+        };
+        let candidates = self
+            .rust
+            .trait_assoc_member_candidates(self.file, &type_fqn, name);
+        match candidates.as_slice() {
+            [candidate] => Some(candidate.fq_name()),
+            _ => Some(direct),
+        }
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
