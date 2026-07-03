@@ -287,26 +287,40 @@ class Consumer {
 }
 
 #[test]
-fn unsupported_trait_receiver_emits_no_partial_edge() {
+fn trait_method_receivers_and_overrides_emit_structured_edges() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
             "example/App.scala",
             r#"package example
 
-trait Runner {
-  def run(): Int
+trait Renderer {
+  def render(value: String): String
 }
 
-class Service {
-  def run(): Int = 1
+class ConsoleRenderer extends Renderer {
+  override def render(value: String): String = value.trim
+  def render(): String = "empty"
 }
 
-class Other {
-  def run(): Int = 2
+class OtherRenderer {
+  def render(value: String): String = value
 }
 
 class Consumer {
-  def ambiguous(receiver: Runner): Int = receiver.run()
+  def viaTrait(renderer: Renderer, value: String): String = renderer.render(value)
+  def viaConcrete(console: ConsoleRenderer, value: String): String = console.render(value)
+  def overload(console: ConsoleRenderer): String = console.render()
+  def unrelated(other: OtherRenderer, value: String): String = other.render(value)
+}
+
+object ConsoleRenderer {
+  def default: ConsoleRenderer = new ConsoleRenderer()
+}
+
+object App {
+  import ConsoleRenderer.{default => renderer}
+
+  def direct(): String = renderer.render("  ok ")
 }
 "#,
         )
@@ -314,9 +328,93 @@ class Consumer {
 
     let value = usage_graph_at(project.root(), "{}");
     assert!(
-        !has_edge(&value, "example.Consumer.ambiguous", "example.Service.run")
-            && !has_edge(&value, "example.Consumer.ambiguous", "example.Other.run"),
-        "unsupported trait receiver must not emit partial same-name edges: {}",
+        has_edge(
+            &value,
+            "example.ConsoleRenderer.render",
+            "example.Renderer.render"
+        ),
+        "override declaration should edge to the trait method: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "example.Consumer.viaTrait",
+            "example.Renderer.render"
+        ),
+        "trait-typed receiver should edge to Renderer.render: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "example.Consumer.viaConcrete",
+            "example.ConsoleRenderer.render"
+        ),
+        "concrete receiver should edge to ConsoleRenderer.render: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "example.App$.direct",
+            "example.ConsoleRenderer.render"
+        ),
+        "imported factory alias receiver should edge to ConsoleRenderer.render: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "example.Consumer.overload",
+            "example.Renderer.render"
+        ) && !has_edge(
+            &value,
+            "example.Consumer.unrelated",
+            "example.Renderer.render"
+        ),
+        "overloads and unrelated same-name methods must not edge to the trait method: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn class_method_overrides_do_not_emit_family_edges() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "exact/App.scala",
+            r#"package exact
+
+class Base {
+  def run(value: String): String = value
+}
+
+class Child extends Base {
+  override def run(value: String): String = value.trim
+}
+
+class Consumer {
+  def viaBase(base: Base, value: String): String = base.run(value)
+  def viaChild(child: Child, value: String): String = child.run(value)
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "exact.Consumer.viaBase", "exact.Base.run"),
+        "base-typed receiver should edge to Base.run: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "exact.Consumer.viaChild", "exact.Child.run"),
+        "child-typed receiver should edge to Child.run: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "exact.Child.run", "exact.Base.run"),
+        "ordinary class override should not edge to base method: {}",
         value["edges"]
     );
 }

@@ -9,13 +9,14 @@ use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 
 pub(super) struct ScalaEdgeGraph<'a> {
     pub(super) scala: &'a ScalaAnalyzer,
     pub(super) files: Vec<ProjectFile>,
     pub(super) types: ProjectTypes,
+    pub(super) override_targets_by_method_fqn: HashMap<String, Vec<String>>,
 }
 
 pub(crate) struct ScalaQueryResolver<'a> {
@@ -101,6 +102,9 @@ impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
             graph: ScalaEdgeGraph {
                 scala,
                 files,
+                override_targets_by_method_fqn: inverted::build_method_override_targets(
+                    scala, &types,
+                ),
                 types,
             },
         })
