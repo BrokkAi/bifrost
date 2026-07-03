@@ -587,7 +587,7 @@ void call(Sink& sink) {
 }
 
 #[test]
-fn cpp_graph_counts_alias_typed_declarations_and_out_of_line_member_qualifiers_as_type_usages() {
+fn cpp_graph_excludes_out_of_line_member_qualifiers_from_class_usages() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
             "include/parity.h",
@@ -634,12 +634,8 @@ void run(parity::Sink& sink) {
         .expect("cpp graph success");
     let summaries = hits.iter().cloned().map(hit_summary).collect::<Vec<_>>();
 
-    assert_hit_contains(
-        &summaries,
-        "src/parity.cpp",
-        "ConsoleHandler::ConsoleHandler",
-    );
-    assert_hit_contains(&summaries, "src/parity.cpp", "ConsoleHandler::handle");
+    assert_no_hit_contains(&summaries, "ConsoleHandler::ConsoleHandler");
+    assert_no_hit_contains(&summaries, "ConsoleHandler::handle");
     assert_hit_contains(&summaries, "src/main.cpp", "parity::HandlerAlias handler");
     assert_no_hit_contains(&summaries, "class ConsoleHandler");
 
@@ -651,16 +647,8 @@ void run(parity::Sink& sink) {
         })
         .collect::<Vec<_>>();
     assert!(
-        selected_texts
-            .iter()
-            .filter(|text| text.as_str() == "ConsoleHandler")
-            .count()
-            >= 2,
-        "out-of-line member qualifier hits should select the class qualifier: {selected_texts:?}"
-    );
-    assert!(
         !selected_texts.iter().any(|text| text == "handle"),
-        "class query must not select the member name itself: {selected_texts:?}"
+        "class query must not select out-of-line member declarator parts: {selected_texts:?}"
     );
     let main_source = project
         .file("src/main.cpp")
@@ -2279,6 +2267,33 @@ std::string Service::execute(const std::string& name) {
         "Service build_service(Repository& repository)",
     );
     assert_no_hit_contains(&constructor_hits, "src/unrelated.cpp");
+
+    let service_class = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "Service"
+            && unit.package_name() == "example"
+            && slash_path(unit.source()) == "include/service.h"
+    });
+    let service_class_hits = graph_success_hits(&analyzer, &service_class);
+    assert_hit_contains(
+        &service_class_hits,
+        "include/service.h",
+        "Service build_service(Repository& repository)",
+    );
+    assert_hit_contains(
+        &service_class_hits,
+        "src/service.cpp",
+        "Service build_service(Repository& repository)",
+    );
+    assert_no_hit_contains(
+        &service_class_hits,
+        "Service::Service(Repository& repository)",
+    );
+    assert_no_hit_contains(
+        &service_class_hits,
+        "std::string Service::execute(const std::string& name)",
+    );
+    assert_no_hit_contains(&service_class_hits, "src/unrelated.cpp");
 }
 
 #[test]
