@@ -111,14 +111,10 @@ pub(crate) fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String
             repo_rel.display()
         ));
     }
-    std::str::from_utf8(blob.content())
-        .map(str::to_owned)
-        .map_err(|err| {
-            format!(
-                "path `{}` at git revision `{rev}` is not valid UTF-8: {err}",
-                repo_rel.display()
-            )
-        })
+    // Non-UTF8 text (legacy encodings like Windows-1252/GBK) passes the binary
+    // check above; convert lossily so pinned-revision reads tolerate the same
+    // files a live session does instead of failing session startup.
+    Ok(String::from_utf8_lossy(blob.content()).into_owned())
 }
 
 pub(crate) fn list_git_files_at_revision(

@@ -353,6 +353,37 @@ fn scoped_service_reads_selected_files_from_revision() {
 }
 
 #[test]
+fn scoped_service_reads_non_utf8_text_from_revision() {
+    let temp = TempDir::new().unwrap();
+    // Windows-1252 "é" (0xE9) in a comment: text to git (no NUL bytes) but not
+    // valid UTF-8, like the C++/C# sources from brokkbench repos.
+    fs::write(
+        temp.path().join("Demo.java"),
+        b"// caf\xE9\nclass Demo {\n  int value() { return 1; }\n}\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Demo.java"], "v1");
+
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["Demo.java".to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json("get_file_contents", r#"{"file_paths":["Demo.java"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let content = value["files"][0]["content"].as_str().unwrap();
+    assert!(content.contains("class Demo"), "payload: {value}");
+    assert!(
+        content.contains('\u{FFFD}'),
+        "invalid bytes must be replaced lossily: {value}"
+    );
+}
+
+#[test]
 fn scoped_service_resolves_literal_source_paths_at_revision() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("src/java/org/jsimpledb")).unwrap();
