@@ -152,7 +152,10 @@ pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, S
     }
 
     if selected.is_empty() {
-        return Err("sources resolved to an empty workspace".to_string());
+        return Err(
+            "sources resolved to an empty workspace (no non-empty source paths were provided)"
+                .to_string(),
+        );
     }
     Ok(selected.into_iter().collect())
 }
@@ -167,12 +170,13 @@ fn resolve_sources_at_revision(
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
         .collect();
 
-    resolve_sources_from_rel_paths(root, inputs, &revision_rel_paths)
+    resolve_sources_from_rel_paths(root, inputs, revision, &revision_rel_paths)
 }
 
 fn resolve_sources_from_rel_paths(
     root: &Path,
     inputs: &[String],
+    revision: &str,
     workspace_rel_paths: &[String],
 ) -> Result<Vec<PathBuf>, String> {
     let workspace_rel_set: BTreeSet<&str> =
@@ -196,7 +200,9 @@ fn resolve_sources_from_rel_paths(
                 }
             }
             if !matched_any {
-                return Err(format!("source glob `{trimmed}` matched no files"));
+                return Err(format!(
+                    "source glob `{trimmed}` matched no files at git revision `{revision}`"
+                ));
             }
             continue;
         }
@@ -220,11 +226,21 @@ fn resolve_sources_from_rel_paths(
             continue;
         }
 
-        return Err(format!("source path does not exist: {trimmed}"));
+        let working_tree_note = if root.join(&rel).is_file() {
+            " (path exists in the working tree but not at this revision)"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "source path does not exist at git revision `{revision}`: {trimmed}{working_tree_note}"
+        ));
     }
 
     if selected.is_empty() {
-        return Err("sources resolved to an empty workspace".to_string());
+        return Err(
+            "sources resolved to an empty workspace (no non-empty source paths were provided)"
+                .to_string(),
+        );
     }
     Ok(selected.into_iter().collect())
 }

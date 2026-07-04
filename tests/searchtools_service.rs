@@ -454,6 +454,95 @@ fn scoped_service_resolves_literal_source_paths_at_revision() {
 }
 
 #[test]
+fn scoped_service_at_revision_reports_working_tree_only_literal_source_path() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("Keep.java"), "class Keep {}\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Keep.java"], "base");
+
+    fs::create_dir_all(temp.path().join("src/main/java/io/permazen")).unwrap();
+    fs::write(
+        temp.path().join("src/main/java/io/permazen/Demo.java"),
+        "package io.permazen;\nclass Demo {}\n",
+    )
+    .unwrap();
+    commit_paths(&repo, &["src/main/java/io/permazen/Demo.java"], "add demo");
+
+    let revision = "HEAD~1";
+    let source = "src/main/java/io/permazen/Demo.java";
+    let err = match create_scoped_service(
+        temp.path().to_path_buf(),
+        &[source.to_string()],
+        Some(revision),
+    ) {
+        Ok(_) => panic!("pinned scoped service unexpectedly accepted future source path"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains(source),
+        "error must include missing source path: {err}"
+    );
+    assert!(
+        err.contains(revision),
+        "error must include pinned revision: {err}"
+    );
+    assert!(
+        err.contains("path exists in the working tree but not at this revision"),
+        "error must distinguish working-tree-only paths: {err}"
+    );
+}
+
+#[test]
+fn scoped_service_at_revision_rejects_only_empty_source_paths() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("Demo.java"), "class Demo {}\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Demo.java"], "base");
+
+    let err = match create_scoped_service(
+        temp.path().to_path_buf(),
+        &["".to_string(), "   ".to_string()],
+        Some("HEAD"),
+    ) {
+        Ok(_) => panic!("pinned scoped service unexpectedly accepted empty source paths"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains(
+            "sources resolved to an empty workspace (no non-empty source paths were provided)"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn scoped_service_at_revision_reports_revision_for_unmatched_glob() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("Demo.java"), "class Demo {}\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Demo.java"], "base");
+
+    let revision = "HEAD";
+    let glob = "src/**/*.java";
+    let err = match create_scoped_service(
+        temp.path().to_path_buf(),
+        &[glob.to_string()],
+        Some(revision),
+    ) {
+        Ok(_) => panic!("pinned scoped service unexpectedly accepted unmatched glob"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains(glob), "error must include source glob: {err}");
+    assert!(
+        err.contains(revision),
+        "error must include pinned revision: {err}"
+    );
+}
+
+#[test]
 fn scoped_service_without_revision_rejects_nonexistent_literal_source_paths() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("src/main/java/io/permazen")).unwrap();
