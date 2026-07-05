@@ -87,6 +87,20 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertNotIn("8..10:", text_without_lines)
         self.assertNotIn("41..43:", text_without_lines)
 
+    def test_manual_client_does_not_create_analyzer_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "A.java").write_text(
+                "class A {\n    void method() {}\n}\n",
+                encoding="utf-8",
+            )
+
+            with SearchToolsClient(root=root, manual=True) as client:
+                summaries = client.get_summaries(["A.java"])
+
+            self.assertEqual("A.java", summaries.summaries[0].path)
+            self.assertFalse((root / ".bifrost" / "analyzer.db").exists())
+
     def test_usage_graph_builds_resolved_reference_graph(self) -> None:
         python_fixture = ROOT / "tests" / "fixtures" / "usage-graph-python"
         with SearchToolsClient(root=python_fixture) as client:

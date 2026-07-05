@@ -243,7 +243,7 @@ impl SearchToolsService {
     /// Construct with no file watcher and no semantic indexer. This is useful
     /// for immutable, short-lived workspaces such as inline test fixtures.
     pub fn new_manual_without_semantic_index(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(root, UpdateStrategy::Manual, false)
+        Self::new_transient_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
     /// Construct a manual, non-persistent, non-semantic service over an
@@ -267,7 +267,7 @@ impl SearchToolsService {
     /// updates via the incremental `update_paths` tool. For batch consumers that
     /// re-use one session across many revisions of one worktree.
     pub fn new_for_python_manual(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(root, UpdateStrategy::Manual, false)
+        Self::new_transient_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
     pub fn call_tool_json(
@@ -563,7 +563,25 @@ impl SearchToolsService {
         update_strategy: UpdateStrategy,
         semantic_indexing: bool,
     ) -> Result<Self, String> {
-        let (project, workspace) = build_workspace(root)?;
+        let (project, workspace) = build_persisted_workspace(root)?;
+        let root = project.root().to_path_buf();
+        let session = assemble_session(project, workspace, update_strategy, semantic_indexing);
+        Ok(Self {
+            root: RwLock::new(root),
+            session: RwLock::new(Some(session)),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy,
+            semantic_indexing,
+        })
+    }
+
+    fn new_transient_with_strategy(
+        root: PathBuf,
+        update_strategy: UpdateStrategy,
+        semantic_indexing: bool,
+    ) -> Result<Self, String> {
+        let (project, workspace) = build_transient_workspace(root)?;
         let root = project.root().to_path_buf();
         let session = assemble_session(project, workspace, update_strategy, semantic_indexing);
         Ok(Self {
@@ -703,8 +721,8 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
             .is_none()
         {
-            let (project, workspace) =
-                build_workspace(self.service_root()?).map_err(SearchToolsServiceError::internal)?;
+            let (project, workspace) = build_persisted_workspace(self.service_root()?)
+                .map_err(SearchToolsServiceError::internal)?;
             let session = assemble_session(
                 project,
                 workspace,
@@ -840,12 +858,13 @@ impl SearchToolsService {
 
         // Build the new project + workspace before mutating self so a failed
         // switch leaves the existing workspace queryable.
-        let (new_project, new_workspace) = build_workspace(resolved.clone()).map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!(
-                "Failed to activate workspace {}: {err}",
-                resolved.display()
-            ))
-        })?;
+        let (new_project, new_workspace) =
+            build_persisted_workspace(resolved.clone()).map_err(|err| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "Failed to activate workspace {}: {err}",
+                    resolved.display()
+                ))
+            })?;
 
         // Drop the old watcher first so its inotify/kqueue handle is released
         // before we start watching the same tree from the new root.
@@ -1173,13 +1192,26 @@ fn strip_legacy_kind_filter(mut arguments: Value) -> Value {
     arguments
 }
 
-fn build_workspace(root: PathBuf) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project: Arc<dyn Project> = Arc::new(
-        FilesystemProject::new(root)
-            .map_err(|err| format!("Failed to initialize project root: {err}"))?,
-    );
+fn build_project(root: PathBuf) -> Result<Arc<dyn Project>, String> {
+    Ok(Arc::new(FilesystemProject::new(root).map_err(|err| {
+        format!("Failed to initialize project root: {err}")
+    })?))
+}
+
+fn build_persisted_workspace(
+    root: PathBuf,
+) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
+    let project = build_project(root)?;
     let workspace =
         WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    Ok((project, workspace))
+}
+
+fn build_transient_workspace(
+    root: PathBuf,
+) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
+    let project = build_project(root)?;
+    let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
     Ok((project, workspace))
 }
 
@@ -1266,7 +1298,7 @@ mod tests {
             "public class Thing { public String value() { return \"value\"; } }\n",
         )
         .unwrap();
-        let (_project, workspace) = build_workspace(dir.path().to_path_buf()).unwrap();
+        let (_project, workspace) = build_persisted_workspace(dir.path().to_path_buf()).unwrap();
         let snapshot = Arc::new(workspace);
         let indexer = SemanticIndexer::start_with_provider(
             dir.path().to_path_buf(),
@@ -1304,7 +1336,7 @@ mod tests {
             "public class Thing { public String value() { return \"value\"; } }\n",
         )
         .unwrap();
-        let (_project, workspace) = build_workspace(dir.path().to_path_buf()).unwrap();
+        let (_project, workspace) = build_persisted_workspace(dir.path().to_path_buf()).unwrap();
         let snapshot = Arc::new(workspace);
 
         // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
