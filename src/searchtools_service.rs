@@ -1276,6 +1276,7 @@ mod tests {
             },
         );
         let service = SearchToolsService {
+            root: RwLock::new(dir.path().to_path_buf()),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot,
                 watcher: None,
@@ -1284,6 +1285,7 @@ mod tests {
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
+            semantic_indexing: true,
         };
 
         service.close().unwrap();
