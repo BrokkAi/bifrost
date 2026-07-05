@@ -107,23 +107,6 @@ pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, S
             continue;
         }
 
-        if contains_glob_syntax(trimmed) {
-            let pattern = normalize_source_pattern(trimmed, root)?;
-            let glob = Pattern::new(&pattern)
-                .map_err(|err| format!("Invalid source glob `{trimmed}`: {err}"))?;
-            let mut matched_any = false;
-            for rel in &workspace_rel_paths {
-                if glob.matches(rel) {
-                    matched_any = true;
-                    selected.insert(PathBuf::from(rel));
-                }
-            }
-            if !matched_any {
-                return Err(format!("source glob `{trimmed}` matched no files"));
-            }
-            continue;
-        }
-
         let rel = normalize_literal_source_path(trimmed, root)?;
         let abs = root.join(&rel);
         if abs.is_file() {
@@ -144,6 +127,23 @@ pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, S
                 return Err(format!(
                     "source directory `{trimmed}` contains no analyzer-visible files"
                 ));
+            }
+            continue;
+        }
+
+        if contains_glob_syntax(trimmed) {
+            let pattern = normalize_source_pattern(trimmed, root)?;
+            let glob = Pattern::new(&pattern)
+                .map_err(|err| format!("Invalid source glob `{trimmed}`: {err}"))?;
+            let mut matched_any = false;
+            for rel in &workspace_rel_paths {
+                if glob.matches(rel) {
+                    matched_any = true;
+                    selected.insert(PathBuf::from(rel));
+                }
+            }
+            if !matched_any {
+                return Err(format!("source glob `{trimmed}` matched no files"));
             }
             continue;
         }
@@ -188,25 +188,6 @@ fn resolve_sources_from_rel_paths(
             continue;
         }
 
-        if contains_glob_syntax(trimmed) {
-            let pattern = normalize_source_pattern(trimmed, root)?;
-            let glob = Pattern::new(&pattern)
-                .map_err(|err| format!("Invalid source glob `{trimmed}`: {err}"))?;
-            let mut matched_any = false;
-            for rel in workspace_rel_paths {
-                if glob.matches(rel) {
-                    matched_any = true;
-                    selected.insert(PathBuf::from(rel));
-                }
-            }
-            if !matched_any {
-                return Err(format!(
-                    "source glob `{trimmed}` matched no files at git revision `{revision}`"
-                ));
-            }
-            continue;
-        }
-
         let rel = normalize_literal_source_path(trimmed, root)?;
         let rel_string = rel.to_string_lossy().replace('\\', "/");
         if workspace_rel_set.contains(rel_string.as_str()) {
@@ -223,6 +204,25 @@ fn resolve_sources_from_rel_paths(
             }
         }
         if matched_any {
+            continue;
+        }
+
+        if contains_glob_syntax(trimmed) {
+            let pattern = normalize_source_pattern(trimmed, root)?;
+            let glob = Pattern::new(&pattern)
+                .map_err(|err| format!("Invalid source glob `{trimmed}`: {err}"))?;
+            let mut matched_any = false;
+            for rel in workspace_rel_paths {
+                if glob.matches(rel) {
+                    matched_any = true;
+                    selected.insert(PathBuf::from(rel));
+                }
+            }
+            if !matched_any {
+                return Err(format!(
+                    "source glob `{trimmed}` matched no files at git revision `{revision}`"
+                ));
+            }
             continue;
         }
 

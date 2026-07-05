@@ -454,6 +454,69 @@ fn scoped_service_resolves_literal_source_paths_at_revision() {
 }
 
 #[test]
+fn scoped_service_at_revision_prefers_literal_sources_with_glob_metacharacters() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("a/[x]")).unwrap();
+    fs::write(temp.path().join("a/[x]/b.txt"), "literal\n").unwrap();
+    fs::write(temp.path().join("a/glob.txt"), "glob\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["a/[x]/b.txt", "a/glob.txt"], "add sources");
+
+    let literal_source = "a/[x]/b.txt";
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &[literal_source.to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_file_contents",
+            r#"{"file_paths":["a/[x]/b.txt","a/glob.txt"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!("a/[x]/b.txt", value["files"][0]["path"], "payload: {value}");
+    assert_eq!(
+        "literal\n", value["files"][0]["content"],
+        "payload: {value}"
+    );
+    assert!(
+        value["not_found"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("a/glob.txt")),
+        "literal source must not select unrelated files: {value}"
+    );
+
+    let glob_source = "a/g*.txt";
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &[glob_source.to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_file_contents",
+            r#"{"file_paths":["a/glob.txt","a/[x]/b.txt"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!("a/glob.txt", value["files"][0]["path"], "payload: {value}");
+    assert_eq!("glob\n", value["files"][0]["content"], "payload: {value}");
+    assert!(
+        value["not_found"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("a/[x]/b.txt")),
+        "glob source should keep normal glob semantics: {value}"
+    );
+}
+
+#[test]
 fn scoped_service_at_revision_reports_working_tree_only_literal_source_path() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("Keep.java"), "class Keep {}\n").unwrap();
