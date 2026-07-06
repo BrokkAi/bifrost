@@ -450,6 +450,7 @@ pub(super) fn scan_files_for_member_target(
             line_starts: &line_starts,
             owner: &owner,
             member_name: &member_name,
+            target,
             target_is_field: target.is_field(),
             receiver_names: &receiver_names,
             receiver_type_names: &receiver_type_names,
@@ -477,6 +478,7 @@ struct MemberScanCtx<'a> {
     line_starts: &'a [usize],
     owner: &'a CodeUnit,
     member_name: &'a str,
+    target: &'a CodeUnit,
     target_is_field: bool,
     receiver_names: &'a Vec<String>,
     receiver_type_names: &'a HashSet<String>,
@@ -897,7 +899,8 @@ fn scoped_static_member_matches_target(owner_name: &str, ctx: &MemberScanCtx<'_>
         ctx.member_name,
     ) {
         ReceiverAnalysisOutcome::Precise(candidates) => candidates.into_iter().any(|candidate| {
-            candidate.fq_name() == format!("{}.{}", ctx.owner.fq_name(), ctx.member_name)
+            candidate == *ctx.target
+                || candidate.fq_name() == format!("{}.{}", ctx.owner.fq_name(), ctx.member_name)
         }),
         ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unknown

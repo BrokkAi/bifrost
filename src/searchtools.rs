@@ -2586,10 +2586,11 @@ fn usage_failure_hint(reason_kind: &str, candidate_files_truncated: bool) -> Opt
             "Re-call scan_usages with a location-anchored `targets` selector for the definition site, e.g. `targets: [{\"path\":\"...\",\"line\":...,\"column\":...}]`."
                 .to_string(),
         ),
-        "unsupported_target_language"
-        | "missing_analyzer_capability"
-        | "unsupported_target_shape"
-        | "no_graph_seed" => None,
+        "no_graph_seed" => Some(
+            "No export seed was resolved for this symbol. Use search_symbols or get_symbol_sources to choose an exported declaration, or re-call scan_usages with a location-anchored `targets` selector for the definition site."
+                .to_string(),
+        ),
+        "unsupported_target_language" | "missing_analyzer_capability" | "unsupported_target_shape" => None,
         _ => None,
     }
 }

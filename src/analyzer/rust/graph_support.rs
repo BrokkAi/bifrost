@@ -508,6 +508,19 @@ impl RustAnalyzer {
         self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "trait_item")
     }
 
+    pub(crate) fn is_rust_trait_impl_member_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, _source| {
+            let mut parent = node.parent();
+            while let Some(candidate) = parent {
+                if candidate.kind() == "impl_item" {
+                    return candidate.child_by_field_name("trait").is_some();
+                }
+                parent = candidate.parent();
+            }
+            false
+        })
+    }
+
     pub(crate) fn is_rust_struct_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "struct_item")
     }

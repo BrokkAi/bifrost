@@ -50,6 +50,51 @@ pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeU
 
     (rust.is_rust_trait_declaration(&owner) && target.is_function())
         || (rust.is_rust_enum_declaration(&owner) && target.is_field())
+        || is_trait_impl_member_target(rust, target, &owner)
+}
+
+pub(super) fn trait_member_for_impl_member(
+    rust: &RustAnalyzer,
+    target: &CodeUnit,
+) -> Option<CodeUnit> {
+    let owner = rust.parent_of(target)?;
+    if !is_trait_impl_member_target(rust, target, &owner) {
+        return None;
+    }
+    rust.get_direct_ancestors(&owner)
+        .into_iter()
+        .filter(|trait_unit| rust.is_rust_trait_declaration(trait_unit))
+        .find_map(|trait_unit| trait_member(rust, &trait_unit, target.identifier()))
+}
+
+fn is_trait_impl_member_target(rust: &RustAnalyzer, target: &CodeUnit, owner: &CodeUnit) -> bool {
+    if !target.is_function() || rust.is_rust_trait_declaration(owner) {
+        return false;
+    }
+    if rust.is_rust_trait_impl_member_declaration(target) {
+        return true;
+    }
+    rust.get_direct_ancestors(owner)
+        .into_iter()
+        .filter(|trait_unit| rust.is_rust_trait_declaration(trait_unit))
+        .any(|trait_unit| trait_member(rust, &trait_unit, target.identifier()).is_some())
+}
+
+fn trait_member(rust: &RustAnalyzer, trait_unit: &CodeUnit, member_name: &str) -> Option<CodeUnit> {
+    rust.exact_member(
+        trait_unit.source(),
+        trait_unit.identifier(),
+        member_name,
+        true,
+    )
+    .or_else(|| {
+        rust.exact_member(
+            trait_unit.source(),
+            trait_unit.identifier(),
+            member_name,
+            false,
+        )
+    })
 }
 
 pub(crate) fn resolve_scoped_associated_item(

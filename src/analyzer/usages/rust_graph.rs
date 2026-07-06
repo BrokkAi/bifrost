@@ -13,7 +13,8 @@ use crate::analyzer::usages::rust_graph::extractor::{
 };
 use crate::analyzer::usages::rust_graph::resolver::{
     infer_graph_seeds, is_graph_visible_member_target, is_member_target,
-    supports_same_file_local_scan, unresolved_external_frontier_specifiers,
+    supports_same_file_local_scan, trait_member_for_impl_member,
+    unresolved_external_frontier_specifiers,
 };
 use crate::analyzer::usages::traits::{
     UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
@@ -110,7 +111,16 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 }
                 let scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
                 let graph = build_rust_graph_for_files(scan_files.clone());
-                scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
+                let scan_target = trait_member_for_impl_member(rust, target);
+                let scan_target = scan_target.as_ref().unwrap_or(target);
+                scan_files_for_member_target(
+                    analyzer,
+                    &graph,
+                    rust,
+                    scan_files,
+                    scan_target,
+                    &seeds,
+                )
             }
         } else {
             let seeds = infer_graph_seeds(rust, target);

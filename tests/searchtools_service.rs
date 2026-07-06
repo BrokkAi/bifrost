@@ -2366,6 +2366,10 @@ function run() {
         "JsTsExportUsageGraphStrategy",
         "no_graph_seed",
     );
+    assert_scan_usages_failure_hint(
+        &method,
+        "No export seed was resolved for this symbol. Use search_symbols or get_symbol_sources to choose an exported declaration, or re-call scan_usages with a location-anchored `targets` selector for the definition site.",
+    );
 }
 
 #[test]

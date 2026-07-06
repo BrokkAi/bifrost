@@ -1282,6 +1282,53 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_impl_side_trait_method_through_implementer_export() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+pub struct Bson;
+
+impl From<i32> for Bson {
+    fn from(_value: i32) -> Self {
+        Bson
+    }
+}
+
+pub mod caller;
+"#,
+        ),
+        (
+            "src/caller.rs",
+            r#"
+use crate::Bson;
+
+pub fn make() {
+    let _ = Bson::from(1);
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/lib.rs"), "Bson", "from");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("impl-side trait method success");
+
+    assert_eq!(1, hits.len(), "hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/caller.rs"))
+    );
+}
+
+#[test]
 fn rust_graph_strategy_resolves_ufcs_trait_method_through_module_qualified_implementer() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
