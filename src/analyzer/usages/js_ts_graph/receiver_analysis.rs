@@ -7,9 +7,11 @@
 
 use crate::analyzer::js_ts::syntax::slice;
 use crate::analyzer::usages::get_definition::js_ts::{
+    parse_js_ts_tree, resolve_js_ts_module_binding_candidates,
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
 };
-use crate::analyzer::usages::model::ImportBinder;
+use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
+use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
     ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverContext, ReceiverFactProvider,
@@ -163,6 +165,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         }
         match expression.kind() {
             "new_expression" => self.resolve_new_expression(expression, budget),
+            "object" if self.language == Language::JavaScript => {
+                self.resolve_object_expression(expression, budget)
+            }
             "call_expression" => self.summarize_call_node(
                 expression,
                 expression.start_byte(),
@@ -216,6 +221,39 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 file: self.file.clone(),
                 range: node_range(expression),
             })
+            .collect::<Vec<_>>();
+        ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
+    }
+
+    fn resolve_object_expression(
+        &self,
+        expression: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        let Some(declarator) = expression
+            .parent()
+            .filter(|parent| parent.kind() == "variable_declarator")
+        else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        if declarator
+            .child_by_field_name("value")
+            .is_none_or(|value| value.id() != expression.id())
+        {
+            return ReceiverAnalysisOutcome::Unknown;
+        }
+        let Some(name) = declarator
+            .child_by_field_name("name")
+            .and_then(|name| simple_identifier_text(name, self.source))
+        else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        let values = self
+            .support
+            .file_identifier(self.file, name)
+            .into_iter()
+            .filter(|unit| unit.source() == self.file && unit.is_field())
+            .map(ReceiverValue::ModuleOrExportObject)
             .collect::<Vec<_>>();
         ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
     }
@@ -460,14 +498,79 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return ReceiverAnalysisOutcome::Unknown;
         }
         let functions = self.visible_function_declarations_named(name, site);
-        if functions.is_empty() {
-            return ReceiverAnalysisOutcome::Unknown;
-        }
-        let outcomes: Vec<_> = functions
+        let mut outcomes: Vec<_> = functions
             .into_iter()
             .map(|function| self.summarize_function_body(function, depth + 1, budget, tracker))
             .collect();
+        if let Some(imported) = self.summarize_imported_function(name, depth + 1, budget, tracker) {
+            outcomes.push(imported);
+        }
+        if outcomes.is_empty() {
+            return ReceiverAnalysisOutcome::Unknown;
+        }
         ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
+    }
+
+    fn summarize_imported_function(
+        &self,
+        name: &str,
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
+        if self.language != Language::JavaScript {
+            return None;
+        }
+        let binding = self.imports.bindings.get(name)?;
+        if !matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
+            return None;
+        }
+        let exported_name = match binding.kind {
+            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
+            ImportKind::Default => "default",
+            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => return None,
+        };
+        let functions = resolve_js_ts_module_binding_candidates(
+            self.analyzer,
+            self.support,
+            self.language,
+            self.file,
+            &binding.module_specifier,
+            exported_name,
+            Some(&self.aliases),
+            true,
+        )
+        .into_iter()
+        .filter(|unit| unit.is_function())
+        .collect::<Vec<_>>();
+        if functions.is_empty() {
+            return None;
+        }
+
+        let mut outcomes = Vec::new();
+        for function in functions {
+            let Ok(source) = function.source().read_to_string() else {
+                continue;
+            };
+            let Some(tree) = parse_js_ts_tree(function.source(), &source, self.language) else {
+                continue;
+            };
+            let imports = compute_jsts_import_binder(&source, &tree);
+            let provider = JsTsReceiverFactProvider::new(
+                self.analyzer,
+                self.support,
+                self.language,
+                function.source(),
+                &source,
+                tree.root_node(),
+                imports,
+            );
+            for node in nodes_for_code_unit(self.analyzer, &function, tree.root_node()) {
+                outcomes.push(provider.summarize_function_body(node, depth + 1, budget, tracker));
+            }
+        }
+        (!outcomes.is_empty())
+            .then(|| ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget))
     }
 
     fn summarize_member_call(
@@ -842,6 +945,23 @@ fn smallest_named_node_covering<'tree>(
         }
     }
     Some(best)
+}
+
+fn nodes_for_code_unit<'tree>(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    root: Node<'tree>,
+) -> Vec<Node<'tree>> {
+    analyzer
+        .ranges(unit)
+        .iter()
+        .filter_map(|range| smallest_named_node_covering(root, range.start_byte, range.end_byte))
+        .map(|node| {
+            node.child_by_field_name("declaration")
+                .filter(|_| node.kind() == "export_statement")
+                .unwrap_or(node)
+        })
+        .collect()
 }
 
 fn is_scope_boundary(kind: &str) -> bool {

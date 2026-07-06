@@ -1229,10 +1229,11 @@ fn visit_ts_value(
             range_node,
             source,
             parent.cloned(),
-            Some(top_level),
+            Some(top_level.clone()),
         );
         parsed.add_signature(code_unit.clone(), trim_statement(node_text(node, source)));
-        parsed.mark_type_alias(code_unit);
+        parsed.mark_type_alias(code_unit.clone());
+        visit_ts_type_alias_members(file, source, definition, &code_unit, &top_level, parsed);
         return;
     }
 
@@ -1313,6 +1314,34 @@ fn visit_ts_value(
             visit_ts_object_literal_properties(
                 file, source, object, &code_unit, &top_level, parsed,
             );
+        }
+    }
+}
+
+fn visit_ts_type_alias_members(
+    file: &ProjectFile,
+    source: &str,
+    definition: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let Some(value) = definition.child_by_field_name("value") else {
+        return;
+    };
+    let container = value.child_by_field_name("body").unwrap_or(value);
+    for index in 0..container.named_child_count() {
+        let Some(child) = container.named_child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "method_signature" | "abstract_method_signature" => {
+                visit_ts_method(file, source, child, parent, top_level, parsed);
+            }
+            "property_signature" | "index_signature" => {
+                visit_ts_field(file, source, child, parent, top_level, parsed);
+            }
+            _ => {}
         }
     }
 }

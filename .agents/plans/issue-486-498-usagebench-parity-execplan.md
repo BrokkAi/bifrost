@@ -71,7 +71,7 @@ First, run focused existing tests that directly match the issue shapes. Record p
 
 Second, implement only current failures. For JS/TS, keep shared member resolution fixes in the shared JS/TS modules. For Java, C++, C#, PHP, Python, Rust, Scala, and Go, keep changes in structured graph/get-definition helpers and reuse existing resolver metadata. Do not add regex/text-search fallbacks or source-text mini parsers.
 
-Third, run focused validation after each language slice. Commit checkpoints with only files changed by that slice. Since no usagebench checkout is available locally, do not attempt usagebench expected-failure marker cleanup in this repo; record it as blocked unless the checkout appears.
+Third, run focused validation after each language slice. Commit checkpoints with only files changed by that slice. Usagebench is available at `../usagebench`; use it as the source of truth with `--bifrost-working-tree` and a writable `/tmp` work directory.
 
 ## Concrete Steps
 
@@ -136,3 +136,14 @@ Focused reconciliation commands passed on 2026-07-06:
     BIFROST_SEMANTIC_INDEX=off cargo test --test usages_cpp_graph_test cpp_graph_resolves_header_declaration_to_out_of_line_definition_sites
 
 Revision note, 2026-07-06 / Codex: Recorded local reconciliation results and the decision not to patch analyzer code without a current failing local test. Usagebench marker cleanup remains blocked by the missing usagebench checkout.
+
+Revision note, 2026-07-06 / Codex: Usagebench is now checked out at `../usagebench`. Exact runs against the Bifrost working tree showed the expected-failure markers are real analyzer gaps, not stale usagebench metadata. A JS/TS checkpoint added structured receiver support for JavaScript imported factory calls, JavaScript object-literal receiver values, and TypeScript object-type alias member declarations. Local validation passed:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test get_definition_test --test usages_js_ts_graph_test -- --nocapture
+    cargo clippy-no-cuda
+
+Usagebench validation command:
+
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-jsts
+
+The checkpoint improved `js-method-call` from XFAIL to IMPROVED. Remaining JS/TS usagebench failures after this checkpoint are `js-class-property-access`, `js-parity-object-literal-method-call`, `ts-object-property-access`, and `ts-parity-static-method-call`; these now need follow-up in declaration-site property indexing/self-receiver handling and the usage graph’s exact target-key selection for CommonJS object-literal/static member cases.

@@ -1862,6 +1862,84 @@ fn typescript_interface_typed_parameter_property_resolves_to_declaration() {
 }
 
 #[test]
+fn typescript_type_alias_typed_parameter_property_resolves_to_declaration() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "components.tsx",
+            r#"
+export type User = {
+  id: string;
+  name: string;
+};
+"#,
+        )
+        .file(
+            "app.tsx",
+            "import { type User } from './components';\ndeclare const user: User;\nconst label = user.name;\n",
+        )
+        .build();
+
+    let line = "const label = user.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.tsx","line":3,"column":{}}}]}}"#,
+            column_of(line, ".name") + 1
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "components.tsx.User.name",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "components.tsx",
+        "{value}"
+    );
+}
+
+#[test]
+fn typescript_type_alias_typed_parameter_member_resolves_to_declaration() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "components.tsx",
+            r#"
+export type User = {
+  id: string;
+  name: string;
+};
+
+export function formatName(user: User): string {
+  return user.name.trim();
+}
+"#,
+        )
+        .build();
+
+    let line = "  return user.name.trim();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"components.tsx","line":8,"column":{}}}]}}"#,
+            column_of(line, ".name") + 1
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "components.tsx.User.name",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "components.tsx",
+        "{value}"
+    );
+}
+
+#[test]
 fn typescript_declared_return_object_key_resolves_to_interface_property() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -6089,6 +6167,111 @@ function run() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "Greeter.greet", "{value}");
+}
+
+#[test]
+fn javascript_imported_factory_receiver_method_resolves_to_class_member() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "components.js",
+            r#"
+export class Greeter {
+  greet(user) {
+    return user.name;
+  }
+}
+
+export function createGreeter() {
+  return new Greeter();
+}
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+import { createGreeter } from "./components.js";
+
+const greeter = createGreeter();
+const message = greeter.greet({ name: "Ada" });
+"#,
+        )
+        .build();
+
+    let line = r#"const message = greeter.greet({ name: "Ada" });"#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":5,"column":{}}}]}}"#,
+            column_of(line, "greet(")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Greeter.greet", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "components.js", "{value}");
+}
+
+#[test]
+fn javascript_object_literal_method_receiver_resolves_to_method_definition() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "library.js",
+            r#"
+class Task {
+  finish() {
+    return helpers.formatTask(this);
+  }
+}
+
+const helpers = {
+  formatTask(task) {
+    return task.label;
+  },
+};
+
+exports.helpers = helpers;
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"
+const { helpers } = require("./library");
+
+helpers.formatTask({ label: "direct" });
+"#,
+        )
+        .build();
+
+    let library_line = "    return helpers.formatTask(this);";
+    let library_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"library.js","line":4,"column":{}}}]}}"#,
+            column_of(library_line, "formatTask")
+        ),
+    );
+    let library_result = &library_value["results"][0];
+    assert_eq!(library_result["status"], "resolved", "{library_value}");
+    assert_eq!(
+        library_result["definitions"][0]["fqn"], "library.js.helpers.formatTask",
+        "{library_value}"
+    );
+
+    let consumer_line = r#"helpers.formatTask({ label: "direct" });"#;
+    let consumer_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"consumer.js","line":4,"column":{}}}]}}"#,
+            column_of(consumer_line, "formatTask")
+        ),
+    );
+    let consumer_result = &consumer_value["results"][0];
+    assert_eq!(consumer_result["status"], "resolved", "{consumer_value}");
+    assert_eq!(
+        consumer_result["definitions"][0]["fqn"], "library.js.helpers.formatTask",
+        "{consumer_value}"
+    );
 }
 
 #[test]

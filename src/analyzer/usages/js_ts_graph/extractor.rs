@@ -7,6 +7,7 @@ use crate::analyzer::usages::get_definition::js_ts::{
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
 };
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
+use crate::analyzer::usages::js_ts_graph::JsTsReceiverFactProvider;
 use crate::analyzer::usages::js_ts_graph::hits::{
     record_hit, record_import_hit, record_self_receiver_hit,
 };
@@ -16,6 +17,10 @@ use crate::analyzer::usages::js_ts_graph::resolver::{
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinder, UsageHit};
 use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
+use crate::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverContext,
+    ReceiverFactProvider,
+};
 use crate::analyzer::{AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
@@ -109,6 +114,8 @@ pub(super) fn scan_files_for_seeds(
             target_owner_source: target_owner_source.as_ref(),
             imports,
             aliases,
+            language,
+            root: tree_ref.root_node(),
             scope_stack: vec![HashMap::default()],
             binding_engine,
             hits: &mut local_hits,
@@ -149,6 +156,8 @@ pub(super) struct ScanCtx<'a> {
     target_owner_source: Option<&'a ProjectFile>,
     imports: ImportBinder,
     aliases: AliasResolver,
+    language: Language,
+    root: Node<'a>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -802,7 +811,10 @@ pub(super) fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Opt
 
 fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBinding> {
     let value = node.child_by_field_name("value")?;
-    if expression_is_target_constructor(value, ctx) || has_target_type_annotation(node, ctx) {
+    if expression_is_target_constructor(value, ctx)
+        || expression_resolves_to_target_owner(value, ctx)
+        || has_target_type_annotation(node, ctx)
+    {
         return Some(LocalBinding::TargetReceiver);
     }
 
@@ -828,6 +840,38 @@ fn expression_is_target_constructor(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         }
         _ => false,
     }
+}
+
+fn expression_resolves_to_target_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner) = ctx.target_owner else {
+        return false;
+    };
+    let provider = JsTsReceiverFactProvider::new(
+        ctx.analyzer,
+        ctx.analyzer.definition_lookup_index(),
+        ctx.language,
+        ctx.file,
+        ctx.source,
+        ctx.root,
+        ctx.imports.clone(),
+    );
+    let query = ReceiverAnalysisQuery {
+        language: ctx.language,
+        file: ctx.file,
+        receiver_text: slice(node, ctx.source),
+        receiver_range: Some(node_range(node)),
+        member_name: ctx.target_member,
+        context: ReceiverContext::new(None, node.start_byte()),
+        budget: ReceiverAnalysisBudget::default(),
+    };
+    matches!(
+        provider.resolve_receiver(query),
+        ReceiverAnalysisOutcome::Precise(values)
+            if values.iter().any(|value| {
+                let resolved = value.owner();
+                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
+            })
+    )
 }
 
 fn has_target_type_annotation(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -871,6 +915,15 @@ fn name_subtree_mentions_target_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool 
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(|child| name_subtree_mentions_target_type(child, ctx))
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    }
 }
 
 fn simple_identifier_text_for_source<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {

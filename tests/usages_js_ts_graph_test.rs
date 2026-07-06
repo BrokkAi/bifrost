@@ -839,6 +839,105 @@ export function render(user: User) {
 }
 
 #[test]
+fn js_imported_factory_receiver_method_call_is_found() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "components.js",
+            r#"
+export class Greeter {
+  greet(user) {
+    return user.name;
+  }
+}
+
+export function createGreeter() {
+  return new Greeter();
+}
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+import { createGreeter } from "./components.js";
+
+const greeter = createGreeter();
+const message = greeter.greet({ name: "Ada" });
+"#,
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("components.js"), |cu| {
+        cu.short_name() == "Greeter.greet" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("app.js") && hit.snippet.contains("greeter.greet")),
+        "imported factory receiver call should count as Greeter.greet usage: {hits:?}"
+    );
+}
+
+#[test]
+fn js_commonjs_object_literal_method_member_calls_are_found() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "library.js",
+            r#"
+class Task {
+  finish() {
+    return helpers.formatTask(this);
+  }
+}
+
+const helpers = {
+  formatTask(task) {
+    return task.label;
+  },
+};
+
+exports.helpers = helpers;
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"
+const { helpers } = require("./library");
+
+helpers.formatTask({ label: "direct" });
+"#,
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("library.js"), |cu| {
+        cu.short_name().ends_with(".helpers.formatTask")
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("library.js")
+                && hit.snippet.contains("helpers.formatTask(this)")
+        }),
+        "same-file CommonJS object-literal method call should count: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("consumer.js") && hit.snippet.contains("helpers.formatTask")
+        }),
+        "destructured CommonJS object-literal method call should count: {hits:?}"
+    );
+}
+
+#[test]
 fn ts_receiver_shadowing_and_unknown_sources_do_not_count() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file("a.ts", "export class Foo { bar() {} }\n")
