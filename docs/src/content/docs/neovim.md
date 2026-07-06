@@ -172,7 +172,3 @@ For deeper debugging, inspect Neovim's LSP log path:
 ```vim
 :lua print(vim.lsp.log.get_filename())
 ```
-
-## Validation Notes
-
-This setup was smoke-tested with Neovim `v0.12.4` using an isolated config at `/private/tmp/bifrost-nvim-smoke-java/init.lua`. The test launched `/Users/dave/.codex/worktrees/b4f3/bifrost/target/debug/bifrost --root /private/tmp/bifrost-nvim-smoke-java/workspace --lsp`, opened a small Java workspace, confirmed the attached client was named `bifrost`, resolved `textDocument/definition` from `B.java` to `A.java`, and returned two `textDocument/references` locations for the same symbol.
