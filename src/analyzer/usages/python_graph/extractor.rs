@@ -219,6 +219,7 @@ pub(super) fn scan_files_for_seeds(
         let target_self_file = *file == target.source();
         let scope_facts = collect_scope_facts_from_parsed_source(
             analyzer,
+            py,
             file,
             target_short.as_str(),
             source_str,
@@ -233,6 +234,7 @@ pub(super) fn scan_files_for_seeds(
             source: source_str,
             line_starts: &line_starts,
             analyzer,
+            target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
             target_owner: target_owner.clone(),
@@ -264,6 +266,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
+    target: &'a CodeUnit,
     target_short: &'a str,
     target_member: Option<&'a str>,
     target_owner: Option<CodeUnit>,
@@ -464,6 +467,21 @@ impl ScanCtx<'_> {
             .into_iter()
             .any(|ancestor| ancestor == *target_owner)
     }
+
+    fn target_class_method_named(&self, attribute: &str) -> bool {
+        if !self.target.is_class() {
+            return false;
+        }
+        self.analyzer
+            .get_all_declarations()
+            .into_iter()
+            .any(|unit| {
+                unit.is_function()
+                    && unit.identifier() == attribute
+                    && self.analyzer.parent_of(&unit).as_ref() == Some(self.target)
+                    && python_callable_has_decorator(self.analyzer, &unit, "classmethod")
+            })
+    }
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -560,6 +578,17 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && attribute_text == member
     {
         record_hit(attribute, ctx);
+    }
+
+    if ctx.target_member.is_none()
+        && object.kind() == "identifier"
+        && ctx.binds_target(object_text, node)
+        && ctx.target_class_method_named(attribute_text)
+        && !ctx.edges.iter().any(|edge| {
+            matches!(edge.kind, ImportEdgeKind::Namespace) && edge.local_name == object_text
+        })
+    {
+        record_hit(object, ctx);
     }
 
     // A bare member name used as the *object* of an attribute access in the
@@ -696,13 +725,158 @@ pub(in crate::analyzer::usages) fn collect_assigned_identifiers(
 
 pub(in crate::analyzer::usages) fn collect_scope_facts_from_parsed_source(
     analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
     file: &ProjectFile,
     target_short: &str,
     source: &str,
     root: Node<'_>,
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
-    let factory_return_types = collect_factory_return_types_from_root(root, source);
+    let mut factory_return_types = collect_factory_return_types_from_root(root, source);
+    collect_imported_factory_return_types(analyzer, py, file, &mut factory_return_types);
     collect_scope_facts_with_factory_returns(analyzer, file, target_short, &factory_return_types)
+}
+
+fn collect_imported_factory_return_types(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    factory_return_types: &mut HashMap<String, String>,
+) {
+    let binder = py.import_binder_of(file);
+    for (local, binding) in &binder.bindings {
+        if !matches!(
+            binding.kind,
+            crate::analyzer::usages::model::ImportKind::Named
+        ) {
+            continue;
+        }
+        let Some(imported) = binding.imported_name.as_deref() else {
+            continue;
+        };
+        let fqn = format!("{}.{}", binding.module_specifier, imported);
+        let units: Vec<CodeUnit> = analyzer
+            .definitions(&fqn)
+            .cloned()
+            .chain(py.resolve_exported_fqn(&fqn))
+            .collect();
+        for unit in units {
+            if unit.is_function() {
+                if let Some(return_type) = callable_return_type_name(analyzer, &unit) {
+                    factory_return_types
+                        .entry(local.clone())
+                        .or_insert(return_type);
+                }
+                continue;
+            }
+            if !unit.is_class() {
+                continue;
+            }
+            factory_return_types
+                .entry(local.clone())
+                .or_insert_with(|| unit.identifier().to_string());
+            collect_imported_class_method_return_types(
+                analyzer,
+                local,
+                &unit,
+                factory_return_types,
+            );
+        }
+    }
+}
+
+fn collect_imported_class_method_return_types(
+    analyzer: &dyn IAnalyzer,
+    local_class_name: &str,
+    class_unit: &CodeUnit,
+    factory_return_types: &mut HashMap<String, String>,
+) {
+    for member in analyzer.get_all_declarations() {
+        if !member.is_function() {
+            continue;
+        }
+        if analyzer.parent_of(&member).as_ref() != Some(class_unit) {
+            continue;
+        }
+        let Some(return_type) = callable_return_type_name(analyzer, &member) else {
+            continue;
+        };
+        factory_return_types
+            .entry(format!("{}.{}", local_class_name, member.identifier()))
+            .or_insert(return_type);
+    }
+}
+
+fn callable_return_type_name(analyzer: &dyn IAnalyzer, callable: &CodeUnit) -> Option<String> {
+    let source = analyzer.get_source(callable, false)?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source.as_str(), None)?;
+    let function = first_function_definition(tree.root_node())?;
+    factory_return_type(function, &source)
+}
+
+fn python_callable_has_decorator(
+    analyzer: &dyn IAnalyzer,
+    callable: &CodeUnit,
+    decorator_name: &str,
+) -> bool {
+    let Some(source) = analyzer.get_source(callable, false) else {
+        return false;
+    };
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return false;
+    };
+    let Some(function) = first_function_definition(tree.root_node()) else {
+        return false;
+    };
+    let Some(parent) = function.parent() else {
+        return false;
+    };
+    if parent.kind() != "decorated_definition" {
+        return false;
+    }
+    let mut cursor = parent.walk();
+    parent
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .any(|decorator| decorator_contains_identifier(decorator, &source, decorator_name))
+}
+
+fn decorator_contains_identifier(node: Node<'_>, source: &str, identifier: &str) -> bool {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && slice(node, source) == identifier {
+            return true;
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    false
+}
+
+fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    None
 }
 
 fn collect_scope_facts_with_factory_returns(

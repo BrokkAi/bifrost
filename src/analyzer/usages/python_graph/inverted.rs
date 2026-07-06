@@ -85,6 +85,7 @@ where
             // `recv.method` resolves to the receiver's class fqn.
             let scope_facts = collect_scope_facts_from_parsed_source(
                 analyzer,
+                py,
                 file,
                 "",
                 source,

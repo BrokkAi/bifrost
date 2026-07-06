@@ -1,4 +1,4 @@
-use brokk_bifrost::{IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
+use brokk_bifrost::{CodeUnitType, IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
 
 fn inline_project(path: &str, source: &str) -> (TestProject, ProjectFile) {
     let temp = tempfile::tempdir().unwrap();
@@ -60,6 +60,25 @@ fn test_decorated_top_level_function_and_class() {
             .iter()
             .any(|cu| cu.fq_name() == "decorators.TopClass.static_m")
     );
+}
+
+#[test]
+fn property_getter_is_indexed_as_field() {
+    let (project, file) = inline_project(
+        "models.py",
+        r#"
+        class User:
+            @property
+            def normalized_name(self) -> str:
+                return "guest"
+        "#,
+    );
+    let analyzer = PythonAnalyzer::from_project(project);
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.iter().any(|cu| {
+        cu.fq_name() == "models.User.normalized_name" && cu.kind() == CodeUnitType::Field
+    }));
 }
 
 #[test]

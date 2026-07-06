@@ -271,12 +271,17 @@ impl<'a> PythonVisitor<'a> {
         };
 
         if capture {
+            let code_unit_type = if python_function_has_decorator(node, self.source, "property") {
+                CodeUnitType::Field
+            } else {
+                CodeUnitType::Function
+            };
             let signature = node
                 .child_by_field_name("parameters")
                 .map(|parameters| py_node_text(parameters, self.source).trim().to_string());
             let code_unit = CodeUnit::with_signature(
                 self.file.clone(),
-                CodeUnitType::Function,
+                code_unit_type,
                 self.package_name.to_string(),
                 short_name.clone(),
                 signature,

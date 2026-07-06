@@ -154,6 +154,7 @@ fn reexported_class_alias_receiver_resolves_member_usages() {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
     for (fqn, snippet) in [
+        ("shop.models.User", "Account.guest()"),
         ("shop.models.User.guest", "Account.guest()"),
         ("shop.models.User.format_name", "Account.format_name"),
     ] {
@@ -172,6 +173,111 @@ fn reexported_class_alias_receiver_resolves_member_usages() {
         assert_eq!(hit.file, project.file("tests/test_models.py"), "{fqn}");
         assert!(hit.snippet.contains(snippet), "{fqn}: {hit:#?}");
     }
+}
+
+#[test]
+fn imported_factory_return_receiver_resolves_member_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/example/service.py",
+            r#"
+class Service:
+    def execute(self, name):
+        return name
+
+def build_service():
+    return Service()
+"#,
+        )
+        .file(
+            "src/example/__init__.py",
+            "from .service import Service, build_service\n",
+        )
+        .file(
+            "tests/test_service.py",
+            r#"
+from example import Service, build_service
+
+def test_service_execution():
+    service = build_service()
+    service.execute(" Ada ")
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "example.service.Service.execute");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve imported factory return receiver");
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one hit");
+    assert_eq!(hit.file, project.file("tests/test_service.py"));
+    assert!(hit.snippet.contains("service.execute"), "{hit:#?}");
+}
+
+#[test]
+fn imported_classmethod_factory_return_receiver_resolves_property_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/shop/models.py",
+            r#"
+from dataclasses import dataclass
+
+@dataclass
+class User:
+    name: str
+
+    @property
+    def normalized_name(self) -> str:
+        return self.name.lower()
+
+    @classmethod
+    def guest(cls) -> "User":
+        return cls("guest")
+
+    @staticmethod
+    def format_name(name: str) -> str:
+        return name.title()
+
+class DynamicConfig:
+    def __getattr__(self, key: str) -> str:
+        return key
+"#,
+        )
+        .file(
+            "src/shop/__init__.py",
+            "from .models import User as Account\n",
+        )
+        .file(
+            "tests/test_models.py",
+            "from shop import Account\nfrom shop.models import DynamicConfig\nuser = Account.guest()\nAccount.format_name(\"ada\")\nuser.normalized_name\nconfig = DynamicConfig()\nconfig.theme\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "shop.models.User.normalized_name");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve classmethod factory return receiver");
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one hit");
+    assert_eq!(hit.file, project.file("tests/test_models.py"));
+    assert!(hit.snippet.contains("user.normalized_name"), "{hit:#?}");
 }
 
 #[test]

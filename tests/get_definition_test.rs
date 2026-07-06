@@ -9316,6 +9316,96 @@ fn python_reexported_class_alias_resolves_static_members_and_name_range() {
 }
 
 #[test]
+fn python_imported_factory_return_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/example/service.py",
+            r#"
+class Service:
+    def execute(self, name):
+        return name
+
+def build_service():
+    return Service()
+"#,
+        )
+        .file(
+            "src/example/__init__.py",
+            "from .service import Service, build_service\n",
+        )
+        .file(
+            "tests/test_service.py",
+            r#"
+from example import Service, build_service
+
+def test_service_execution():
+    service = build_service()
+    service.execute(" Ada ")
+"#,
+        )
+        .build();
+
+    let line = r#"    service.execute(" Ada ")"#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tests/test_service.py","line":6,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.service.Service.execute",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_reexported_classmethod_factory_return_property_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/shop/models.py",
+            r#"
+class User:
+    @property
+    def normalized_name(self) -> str:
+        return self.name.lower()
+
+    @classmethod
+    def guest(cls) -> "User":
+        return cls("guest")
+"#,
+        )
+        .file(
+            "src/shop/__init__.py",
+            "from .models import User as Account\n",
+        )
+        .file(
+            "tests/test_models.py",
+            "from shop import Account\nuser = Account.guest()\nuser.normalized_name\n",
+        )
+        .build();
+
+    let line = "user.normalized_name";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tests/test_models.py","line":3,"column":{}}}]}}"#,
+            column_of(line, "normalized_name")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "shop.models.User.normalized_name",
+        "{value}"
+    );
+}
+
+#[test]
 fn python_namespace_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("pkg/util.py", "def helper():\n    pass\n")

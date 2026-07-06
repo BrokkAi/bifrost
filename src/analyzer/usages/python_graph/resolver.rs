@@ -105,7 +105,8 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
 }
 
 pub(super) fn normalized_receiver_type(annotation: &str) -> Option<String> {
-    let annotation = unwrap_supported_receiver_wrapper(annotation.trim());
+    let annotation = unwrap_python_string_annotation(annotation.trim());
+    let annotation = unwrap_supported_receiver_wrapper(annotation);
     if annotation.is_empty()
         || annotation.contains('|')
         || annotation.contains('[')
@@ -120,6 +121,18 @@ pub(super) fn normalized_receiver_type(annotation: &str) -> Option<String> {
         return None;
     }
     Some(annotation.to_string())
+}
+
+fn unwrap_python_string_annotation(annotation: &str) -> &str {
+    if annotation.len() >= 2 {
+        let bytes = annotation.as_bytes();
+        let first = bytes[0];
+        let last = bytes[annotation.len() - 1];
+        if (first == b'\'' || first == b'"') && first == last {
+            return annotation[1..annotation.len() - 1].trim();
+        }
+    }
+    annotation
 }
 
 fn unwrap_supported_receiver_wrapper(annotation: &str) -> &str {
