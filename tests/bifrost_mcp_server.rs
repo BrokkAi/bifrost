@@ -138,6 +138,8 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_eq!("2.0", initialize["jsonrpc"]);
     assert_eq!(0, initialize["id"]);
     assert_eq!("2025-11-25", initialize["result"]["protocolVersion"]);
+    assert_eq!(initialize["result"]["capabilities"]["tools"], json!({}));
+    assert_eq!(initialize["result"]["capabilities"]["resources"], json!({}));
 
     write_line(
         &mut stdin,
@@ -254,6 +256,84 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_scan_usages_schema_requires_non_empty_selectors(tools);
     assert_type_lookup_schema_limits_and_requires_location(tools);
     assert_rename_symbol_schema_requires_location_and_new_name(tools);
+
+    let list_resources = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1_1,
+            "method": "resources/list"
+        }),
+    );
+    assert_eq!(
+        list_resources["result"]["resources"],
+        json!([
+            {
+                "uri": "bifrost://agent-guidance/agents.md",
+                "name": "bifrost-agents.md",
+                "title": "Bifrost AGENTS.md guidance",
+                "description": "Appendable agent instructions for Bifrost code-intelligence workflows.",
+                "mimeType": "text/markdown",
+                "annotations": {
+                    "audience": ["user", "assistant"],
+                    "priority": 0.8
+                }
+            }
+        ]),
+        "{list_resources}"
+    );
+
+    let resource = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1_2,
+            "method": "resources/read",
+            "params": { "uri": "bifrost://agent-guidance/agents.md" }
+        }),
+    );
+    assert_eq!(
+        resource["result"]["contents"][0]["uri"], "bifrost://agent-guidance/agents.md",
+        "{resource}"
+    );
+    assert_eq!(
+        resource["result"]["contents"][0]["mimeType"], "text/markdown",
+        "{resource}"
+    );
+    let guidance = resource["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("resource guidance text");
+    assert!(guidance.contains("get_summaries"), "{guidance}");
+    assert!(guidance.contains("search_symbols"), "{guidance}");
+    assert!(guidance.contains("get_symbol_sources"), "{guidance}");
+    assert!(guidance.contains("scan_usages"), "{guidance}");
+
+    let missing_resource = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1_3,
+            "method": "resources/read",
+            "params": { "uri": "bifrost://agent-guidance/missing.md" }
+        }),
+    );
+    assert_eq!(
+        missing_resource["error"]["code"], -32002,
+        "{missing_resource}"
+    );
+    assert!(
+        missing_resource["error"]["message"]
+            .as_str()
+            .expect("missing resource error message")
+            .contains("Resource not found"),
+        "{missing_resource}"
+    );
 
     let ping = round_trip(
         &mut stdin,
@@ -1825,6 +1905,7 @@ fn assert_server_tool_names(root: &std::path::Path, mode: &str, expected: &[&str
         expected,
         "mode {mode} published unexpected tools"
     );
+    assert_agents_guidance_resource_available(&mut stdin, &mut reader, &mut stderr);
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
@@ -1949,6 +2030,39 @@ fn assert_unknown_tool(root: &std::path::Path, mode: &str, tool_name: &str, argu
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+fn assert_agents_guidance_resource_available(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+) {
+    let list_resources = round_trip(
+        stdin,
+        reader,
+        stderr,
+        json!({ "jsonrpc": "2.0", "id": 101, "method": "resources/list" }),
+    );
+    assert_eq!(
+        list_resources["result"]["resources"][0]["uri"], "bifrost://agent-guidance/agents.md",
+        "{list_resources}"
+    );
+
+    let read_resource = round_trip(
+        stdin,
+        reader,
+        stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "resources/read",
+            "params": { "uri": "bifrost://agent-guidance/agents.md" }
+        }),
+    );
+    let text = read_resource["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("resource text");
+    assert!(text.contains("get_summaries"), "{read_resource}");
 }
 
 fn initialize_session(stdin: &mut impl Write, reader: &mut impl BufRead, stderr: &mut impl Read) {

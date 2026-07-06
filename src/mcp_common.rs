@@ -15,7 +15,11 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
+const RESOURCE_NOT_FOUND: i64 = -32002;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
+const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
+const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
+const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bifrost-agents.md");
 
 pub const SEARCHTOOLS_INSTRUCTIONS: &str =
     "Analyzer-backed search tools for source code workspaces.";
@@ -187,6 +191,8 @@ fn dispatch_request(
     let response = match method {
         "initialize" => Ok(initialize_result(spec.instructions)),
         "ping" => Ok(json!({})),
+        "resources/list" => Ok(list_resources_result()),
+        "resources/read" => handle_resource_read(params),
         "tools/list" => Ok(list_tools_result(spec)),
         "tools/call" => handle_tool_call(service, params, render_options, spec),
         _ => Err((METHOD_NOT_FOUND, format!("Unknown method: {method}"))),
@@ -206,6 +212,7 @@ fn initialize_result(instructions: &str) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {
+            "resources": {},
             "tools": {},
         },
         "serverInfo": {
@@ -220,6 +227,53 @@ fn list_tools_result(spec: &McpServerSpec) -> Value {
     json!({
         "tools": &spec.tool_descriptors,
     })
+}
+
+fn list_resources_result() -> Value {
+    json!({
+        "resources": [agents_guidance_resource_descriptor()],
+    })
+}
+
+fn agents_guidance_resource_descriptor() -> Value {
+    json!({
+        "uri": AGENTS_GUIDANCE_URI,
+        "name": "bifrost-agents.md",
+        "title": "Bifrost AGENTS.md guidance",
+        "description": "Appendable agent instructions for Bifrost code-intelligence workflows.",
+        "mimeType": AGENTS_GUIDANCE_MIME_TYPE,
+        "annotations": {
+            "audience": ["user", "assistant"],
+            "priority": 0.8,
+        },
+    })
+}
+
+fn handle_resource_read(params: Value) -> Result<Value, (i64, String)> {
+    let Some(object) = params.as_object() else {
+        return Err((
+            INVALID_PARAMS,
+            "resources/read params must be an object".to_string(),
+        ));
+    };
+    let Some(uri) = object.get("uri").and_then(Value::as_str) else {
+        return Err((
+            INVALID_PARAMS,
+            "resources/read params missing uri".to_string(),
+        ));
+    };
+    if uri != AGENTS_GUIDANCE_URI {
+        return Err((RESOURCE_NOT_FOUND, format!("Resource not found: {uri}")));
+    }
+    Ok(json!({
+        "contents": [
+            {
+                "uri": AGENTS_GUIDANCE_URI,
+                "mimeType": AGENTS_GUIDANCE_MIME_TYPE,
+                "text": AGENTS_GUIDANCE_TEXT,
+            }
+        ],
+    }))
 }
 
 fn handle_tool_call(

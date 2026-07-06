@@ -1,0 +1,22 @@
+---
+title: Agent Instructions
+description: Append Bifrost guidance to AGENTS.md or retrieve it through MCP resources.
+---
+
+import agentsGuidance from '../../../../resources/agent-guidance/bifrost-agents.md?raw';
+
+Bifrost includes a host-neutral `AGENTS.md` section that tells coding agents to
+use structured code-intelligence tools before broad refactors or risky changes.
+Append it to an existing project `AGENTS.md` when you want agents to gather
+Bifrost context before planning.
+
+MCP-capable clients can retrieve the same guidance from the Bifrost server with
+`resources/list` and `resources/read` using this URI:
+
+```text
+bifrost://agent-guidance/agents.md
+```
+
+## Template
+
+<pre><code>{agentsGuidance.trim()}</code></pre>
