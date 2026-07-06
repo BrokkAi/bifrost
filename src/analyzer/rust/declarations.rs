@@ -195,7 +195,7 @@ fn visit_rust_class_like(
                 "field_declaration" | "enum_variant" | "const_item" => {
                     visit_rust_field(file, source, child, Some(&code_unit), package_name, parsed);
                 }
-                "function_signature_item" => {
+                "function_item" | "function_signature_item" => {
                     visit_rust_function(
                         file,
                         source,
@@ -204,6 +204,9 @@ fn visit_rust_class_like(
                         package_name,
                         parsed,
                     );
+                }
+                "associated_type" | "type_item" => {
+                    visit_rust_alias(file, source, child, Some(&code_unit), package_name, parsed);
                 }
                 _ => {}
             }

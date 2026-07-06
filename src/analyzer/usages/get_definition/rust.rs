@@ -16,6 +16,13 @@ pub(super) fn resolve_rust(
     };
     let mut cache = RustTypeLookupCache::default();
     let reference = site.text.as_str();
+    if let Some(tree) = tree
+        && let Some(outcome) = rust_impl_associated_type_declaration_outcome(
+            analyzer, support, file, source, tree, site,
+        )
+    {
+        return outcome;
+    }
     if reference.contains('.')
         && let Some(tree) = tree
         && let Some(outcome) =
@@ -145,6 +152,75 @@ pub(super) fn resolve_rust(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Rust definition"),
     )
+}
+
+fn rust_impl_associated_type_declaration_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let type_item =
+        rust_enclosing_named_associated_type(node, site.focus_start_byte, site.focus_end_byte)?;
+    let name = type_item.child_by_field_name("name")?;
+    let associated_type = rust_node_text(name, source).trim();
+    if associated_type.is_empty() {
+        return None;
+    }
+    let impl_item = rust_enclosing_ancestor(type_item, "impl_item")?;
+    let trait_type = impl_item.child_by_field_name("trait")?;
+    let trait_fqn = rust_resolve_type_node_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        trait_type,
+        Some(trait_type.start_byte()),
+    )?;
+    let mut candidates: Vec<_> = support
+        .fqn(&format!("{trait_fqn}.{associated_type}"))
+        .into_iter()
+        .filter(CodeUnit::is_field)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(candidates_outcome(candidates))
+}
+
+fn rust_enclosing_named_associated_type(
+    node: Node<'_>,
+    focus_start_byte: usize,
+    focus_end_byte: usize,
+) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if matches!(candidate.kind(), "associated_type" | "type_item")
+            && let Some(name) = candidate.child_by_field_name("name")
+            && name.start_byte() <= focus_start_byte
+            && focus_end_byte <= name.end_byte()
+        {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn rust_enclosing_ancestor<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == kind {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
 }
 
 fn rust_use_path_module_candidates(

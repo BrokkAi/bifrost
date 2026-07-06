@@ -1370,6 +1370,60 @@ pub trait Named {
 }
 
 #[test]
+fn rust_trait_impl_items_resolve_to_trait_declarations() {
+    let source = r#"
+pub trait Runner {
+    type Output;
+
+    fn run() -> Self::Output {
+        String::new()
+    }
+}
+
+pub struct LocalRunner;
+
+impl Runner for LocalRunner {
+    type Output = String;
+}
+
+pub fn run_via_trait() -> String {
+    LocalRunner::run()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let call_line = "    LocalRunner::run()";
+    let method = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":17,"column":{}}}]}}"#,
+            column_of(call_line, "run")
+        ),
+    );
+    assert_eq!(method["results"][0]["status"], "resolved", "{method}");
+    assert_eq!(
+        method["results"][0]["definitions"][0]["fqn"], "Runner.run",
+        "{method}"
+    );
+
+    let assoc_line = "    type Output = String;";
+    let assoc = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":13,"column":{}}}]}}"#,
+            column_of(assoc_line, "Output")
+        ),
+    );
+    assert_eq!(assoc["results"][0]["status"], "resolved", "{assoc}");
+    assert_eq!(
+        assoc["results"][0]["definitions"][0]["fqn"], "Runner.Output",
+        "{assoc}"
+    );
+}
+
+#[test]
 fn rust_associated_path_type_segment_resolves_imported_sibling_type() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file("src/main.rs", common::RUST_ASSOCIATED_PATH_MAIN)
