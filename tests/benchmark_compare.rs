@@ -5,7 +5,7 @@ use brokk_bifrost::benchmark::{
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
 use tempfile::TempDir;
 
 #[test]
@@ -36,7 +36,10 @@ fn compare_report_detects_threshold_and_failure_regressions() {
     let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
 
     assert!(comparison.has_regressions, "{comparison:?}");
+    assert!(comparison.has_actionable_regressions, "{comparison:?}");
+    assert_eq!(comparison.environment_variance, None, "{comparison:?}");
     assert_eq!(comparison.regression_count, 2, "{comparison:?}");
+    assert_eq!(comparison.actionable_regression_count, 2, "{comparison:?}");
     assert_eq!(comparison.improvement_count, 1, "{comparison:?}");
     assert_eq!(comparison.missing_candidate_count, 0, "{comparison:?}");
     assert_eq!(comparison.new_candidate_count, 0, "{comparison:?}");
@@ -69,50 +72,140 @@ fn compare_report_detects_threshold_and_failure_regressions() {
 }
 
 #[test]
-fn compare_subcommand_writes_json_and_fails_in_strict_mode() {
-    let temp = TempDir::new().expect("temp dir");
-    let baseline_path = temp.path().join("baseline.json");
-    let candidate_path = temp.path().join("candidate.json");
-    let output_path = temp.path().join("compare.json");
+fn isolated_timing_regressions_remain_actionable() {
+    let baseline = report_with_scenarios(vec![
+        repo_with_scenarios(
+            "fixture-a",
+            vec![scenario_with_transport(
+                BenchmarkScenario::WorkspaceBuild,
+                ScenarioTransport::Direct,
+                true,
+                Some(200.0),
+            )],
+        ),
+        repo_with_scenarios(
+            "fixture-b",
+            vec![scenario_with_transport(
+                BenchmarkScenario::SearchSymbols,
+                ScenarioTransport::Mcp,
+                true,
+                Some(200.0),
+            )],
+        ),
+    ]);
+    let candidate = report_with_scenarios(vec![
+        repo_with_scenarios(
+            "fixture-a",
+            vec![scenario_with_transport(
+                BenchmarkScenario::WorkspaceBuild,
+                ScenarioTransport::Direct,
+                true,
+                Some(270.0),
+            )],
+        ),
+        repo_with_scenarios(
+            "fixture-b",
+            vec![scenario_with_transport(
+                BenchmarkScenario::SearchSymbols,
+                ScenarioTransport::Mcp,
+                true,
+                Some(270.0),
+            )],
+        ),
+    ]);
 
-    fs::write(
-        &baseline_path,
-        serde_json::to_string_pretty(&report_with_scenarios(vec![repo_with_scenarios(
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+
+    assert!(comparison.has_regressions, "{comparison:?}");
+    assert!(comparison.has_actionable_regressions, "{comparison:?}");
+    assert_eq!(comparison.environment_variance, None, "{comparison:?}");
+    assert_eq!(comparison.regression_count, 2, "{comparison:?}");
+    assert_eq!(comparison.actionable_regression_count, 2, "{comparison:?}");
+}
+
+#[test]
+fn broad_workspace_slowdown_is_classified_as_environment_variance() {
+    let baseline = report_with_scenarios(broad_slowdown_repos(200.0, 100.0, 200.0));
+    let candidate = report_with_scenarios(broad_slowdown_repos(260.0, 125.0, 230.0));
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+
+    assert!(comparison.has_regressions, "{comparison:?}");
+    assert!(!comparison.has_actionable_regressions, "{comparison:?}");
+    assert_eq!(comparison.regression_count, 4, "{comparison:?}");
+    assert_eq!(comparison.actionable_regression_count, 0, "{comparison:?}");
+    let variance = comparison
+        .environment_variance
+        .as_ref()
+        .expect("environment variance report");
+    assert_eq!(variance.affected_repo_count, 4, "{variance:?}");
+    assert_eq!(variance.timed_scenario_count, 12, "{variance:?}");
+    assert_eq!(variance.timing_regression_count, 4, "{variance:?}");
+    assert_eq!(variance.covered_regression_count, 4, "{variance:?}");
+    assert_eq!(variance.workspace_build_regression_count, 4, "{variance:?}");
+    assert_eq!(variance.median_workspace_build_delta_ms, 60.0);
+    assert_eq!(variance.median_workspace_build_delta_pct, 30.0);
+}
+
+#[test]
+fn broad_slowdown_with_uncovered_regression_remains_actionable() {
+    let mut baseline_repos = broad_slowdown_repos(200.0, 100.0, 200.0);
+    baseline_repos.push(repo_with_scenarios(
+        "fixture-extra",
+        vec![scenario_with_transport(
+            BenchmarkScenario::ScanUsages,
+            ScenarioTransport::Mcp,
+            true,
+            Some(100.0),
+        )],
+    ));
+    let mut candidate_repos = broad_slowdown_repos(260.0, 125.0, 230.0);
+    candidate_repos.push(repo_with_scenarios(
+        "fixture-extra",
+        vec![scenario_with_transport(
+            BenchmarkScenario::ScanUsages,
+            ScenarioTransport::Mcp,
+            true,
+            Some(500.0),
+        )],
+    ));
+
+    let comparison = BenchmarkCompareReport::from_reports(
+        &report_with_scenarios(baseline_repos),
+        &report_with_scenarios(candidate_repos),
+    );
+
+    assert!(comparison.has_regressions, "{comparison:?}");
+    assert!(comparison.has_actionable_regressions, "{comparison:?}");
+    assert_eq!(comparison.regression_count, 5, "{comparison:?}");
+    assert_eq!(comparison.actionable_regression_count, 1, "{comparison:?}");
+    let variance = comparison
+        .environment_variance
+        .as_ref()
+        .expect("environment variance report");
+    assert_eq!(variance.covered_regression_count, 4, "{variance:?}");
+}
+
+#[test]
+fn compare_subcommand_writes_json_and_fails_in_strict_mode() {
+    let (output, compare_report) = run_compare_subcommand(
+        report_with_scenarios(vec![repo_with_scenarios(
             "fixture-java",
             vec![scenario(
                 BenchmarkScenario::WorkspaceBuild,
                 true,
                 Some(100.0),
             )],
-        )]))
-        .expect("serialize baseline"),
-    )
-    .expect("write baseline");
-    fs::write(
-        &candidate_path,
-        serde_json::to_string_pretty(&report_with_scenarios(vec![repo_with_scenarios(
+        )]),
+        report_with_scenarios(vec![repo_with_scenarios(
             "fixture-java",
             vec![scenario(
                 BenchmarkScenario::WorkspaceBuild,
                 true,
                 Some(160.0),
             )],
-        )]))
-        .expect("serialize candidate"),
-    )
-    .expect("write candidate");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
-        .arg("compare")
-        .arg("--baseline")
-        .arg(&baseline_path)
-        .arg("--candidate")
-        .arg(&candidate_path)
-        .arg("--output")
-        .arg(&output_path)
-        .arg("--strict")
-        .output()
-        .expect("run bifrost_benchmark compare");
+        )]),
+    );
 
     assert!(
         !output.status.success(),
@@ -128,11 +221,89 @@ fn compare_subcommand_writes_json_and_fails_in_strict_mode() {
         "{stdout}"
     );
 
-    let compare_report: Value =
+    assert_eq!(compare_report["has_regressions"], true, "{compare_report}");
+    assert_eq!(
+        compare_report["has_actionable_regressions"], true,
+        "{compare_report}"
+    );
+    assert_eq!(
+        compare_report["actionable_regression_count"], 1,
+        "{compare_report}"
+    );
+    assert_eq!(compare_report["regression_count"], 1, "{compare_report}");
+}
+
+#[test]
+fn compare_subcommand_strict_mode_allows_environment_variance() {
+    let (output, compare_report) = run_compare_subcommand(
+        report_with_scenarios(broad_slowdown_repos(200.0, 100.0, 200.0)),
+        report_with_scenarios(broad_slowdown_repos(260.0, 125.0, 230.0)),
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("regressions detected: 4"), "{stdout}");
+    assert!(
+        stdout.contains("suspected environment variance:"),
+        "{stdout}"
+    );
+
+    assert_eq!(compare_report["has_regressions"], true, "{compare_report}");
+    assert_eq!(
+        compare_report["has_actionable_regressions"], false,
+        "{compare_report}"
+    );
+    assert_eq!(
+        compare_report["actionable_regression_count"], 0,
+        "{compare_report}"
+    );
+    assert!(
+        compare_report["environment_variance"].is_object(),
+        "{compare_report}"
+    );
+}
+
+fn run_compare_subcommand(
+    baseline: BenchmarkRunReport,
+    candidate: BenchmarkRunReport,
+) -> (Output, Value) {
+    let temp = TempDir::new().expect("temp dir");
+    let baseline_path = temp.path().join("baseline.json");
+    let candidate_path = temp.path().join("candidate.json");
+    let output_path = temp.path().join("compare.json");
+
+    fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&baseline).expect("serialize baseline"),
+    )
+    .expect("write baseline");
+    fs::write(
+        &candidate_path,
+        serde_json::to_string_pretty(&candidate).expect("serialize candidate"),
+    )
+    .expect("write candidate");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("compare")
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .arg("--candidate")
+        .arg(&candidate_path)
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--strict")
+        .output()
+        .expect("run bifrost_benchmark compare");
+    let compare_report =
         serde_json::from_str(&fs::read_to_string(output_path).expect("read compare report"))
             .expect("parse compare report");
-    assert_eq!(compare_report["has_regressions"], true, "{compare_report}");
-    assert_eq!(compare_report["regression_count"], 1, "{compare_report}");
+    (output, compare_report)
 }
 
 fn report_with_scenarios(repos: Vec<BenchmarkRepoReport>) -> BenchmarkRunReport {
@@ -159,15 +330,59 @@ fn repo_with_scenarios(name: &str, scenarios: Vec<ScenarioReport>) -> BenchmarkR
 }
 
 fn scenario(name: BenchmarkScenario, success: bool, median_ms: Option<f64>) -> ScenarioReport {
+    scenario_with_transport(name, ScenarioTransport::Mcp, success, median_ms)
+}
+
+fn scenario_with_transport(
+    name: BenchmarkScenario,
+    transport: ScenarioTransport,
+    success: bool,
+    median_ms: Option<f64>,
+) -> ScenarioReport {
     let measured_durations_ms = median_ms.into_iter().collect::<Vec<_>>();
     ScenarioReport::from_timings(
         name,
-        ScenarioTransport::Mcp,
+        transport,
         success,
         Vec::new(),
         measured_durations_ms,
         (!success).then_some("scenario failed".to_string()),
     )
+}
+
+fn broad_slowdown_repos(
+    workspace_build_ms: f64,
+    search_symbols_ms: f64,
+    get_summaries_ms: f64,
+) -> Vec<BenchmarkRepoReport> {
+    ["fixture-a", "fixture-b", "fixture-c", "fixture-d"]
+        .into_iter()
+        .map(|name| {
+            repo_with_scenarios(
+                name,
+                vec![
+                    scenario_with_transport(
+                        BenchmarkScenario::WorkspaceBuild,
+                        ScenarioTransport::Direct,
+                        true,
+                        Some(workspace_build_ms),
+                    ),
+                    scenario_with_transport(
+                        BenchmarkScenario::SearchSymbols,
+                        ScenarioTransport::Mcp,
+                        true,
+                        Some(search_symbols_ms),
+                    ),
+                    scenario_with_transport(
+                        BenchmarkScenario::GetSummaries,
+                        ScenarioTransport::Mcp,
+                        true,
+                        Some(get_summaries_ms),
+                    ),
+                ],
+            )
+        })
+        .collect()
 }
 
 fn find_scenario<'a>(
