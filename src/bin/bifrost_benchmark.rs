@@ -222,10 +222,10 @@ fn compare_reports(
 
     print_compare_summary(&comparison);
 
-    if strict && comparison.has_regressions {
+    if strict && comparison.has_actionable_regressions {
         return Err(format!(
             "benchmark compare recorded {} regression(s)",
-            comparison.regression_count
+            comparison.actionable_regression_count
         ));
     }
 
@@ -318,6 +318,12 @@ fn print_compare_summary(report: &BenchmarkCompareReport) {
         "threshold: {:.1}% and {:.1} ms absolute floor",
         report.thresholds.relative_pct, report.thresholds.absolute_ms
     );
+    if let Some(environment_variance) = &report.environment_variance {
+        println!(
+            "suspected environment variance: {}",
+            environment_variance.detail
+        );
+    }
     if report.improvement_count > 0 {
         println!("improvements: {}", report.improvement_count);
     }

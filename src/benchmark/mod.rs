@@ -12,6 +12,7 @@ pub use manifest::{
 };
 pub use report::{
     BenchmarkCompareReport, BenchmarkRepoReport, BenchmarkRunReport, CompareThresholds,
-    ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport, ScenarioTransport,
+    EnvironmentVarianceReport, ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport,
+    ScenarioTransport,
 };
 pub use runner::{RunRequest, run_benchmark};

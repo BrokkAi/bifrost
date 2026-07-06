@@ -1,6 +1,6 @@
 use crate::benchmark::BenchmarkScenario;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,7 +52,11 @@ pub struct BenchmarkCompareReport {
     pub improvement_count: usize,
     pub missing_candidate_count: usize,
     pub new_candidate_count: usize,
+    pub actionable_regression_count: usize,
     pub has_regressions: bool,
+    pub has_actionable_regressions: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_variance: Option<EnvironmentVarianceReport>,
     pub scenarios: Vec<ScenarioCompareReport>,
 }
 
@@ -60,6 +64,18 @@ pub struct BenchmarkCompareReport {
 pub struct CompareThresholds {
     pub relative_pct: f64,
     pub absolute_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentVarianceReport {
+    pub affected_repo_count: usize,
+    pub timed_scenario_count: usize,
+    pub timing_regression_count: usize,
+    pub covered_regression_count: usize,
+    pub workspace_build_regression_count: usize,
+    pub median_workspace_build_delta_pct: f64,
+    pub median_workspace_build_delta_ms: f64,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +194,13 @@ impl BenchmarkCompareReport {
             scenarios.push(comparison);
         }
 
+        let environment_variance = detect_environment_variance(&scenarios, thresholds);
+        let actionable_regression_count = regression_count
+            - environment_variance
+                .as_ref()
+                .map_or(0, |variance| variance.covered_regression_count);
+        let has_actionable_regressions = actionable_regression_count > 0;
+
         Self {
             thresholds,
             compared_scenarios_count: scenarios.len(),
@@ -185,7 +208,10 @@ impl BenchmarkCompareReport {
             improvement_count,
             missing_candidate_count,
             new_candidate_count,
+            actionable_regression_count,
             has_regressions: regression_count > 0,
+            has_actionable_regressions,
+            environment_variance,
             scenarios,
         }
     }
@@ -383,4 +409,119 @@ fn compare_present_scenarios(
 
 fn relative_delta_pct(baseline_ms: f64, candidate_ms: f64) -> Option<f64> {
     (baseline_ms > 0.0).then_some(((candidate_ms - baseline_ms) / baseline_ms) * 100.0)
+}
+
+fn detect_environment_variance(
+    scenarios: &[ScenarioCompareReport],
+    thresholds: CompareThresholds,
+) -> Option<EnvironmentVarianceReport> {
+    if scenarios.iter().any(non_timing_regression) {
+        return None;
+    }
+
+    let timed = scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario.baseline_success == Some(true)
+                && scenario.candidate_success == Some(true)
+                && scenario.delta_ms.is_some()
+                && scenario.delta_pct.is_some()
+        })
+        .collect::<Vec<_>>();
+    if timed.len() < 10 {
+        return None;
+    }
+
+    let timing_regressions = timed
+        .iter()
+        .copied()
+        .filter(|scenario| scenario.is_regression)
+        .collect::<Vec<_>>();
+    if timing_regressions.is_empty() {
+        return None;
+    }
+
+    let workspace_builds = timed
+        .iter()
+        .copied()
+        .filter(|scenario| {
+            scenario.scenario == BenchmarkScenario::WorkspaceBuild
+                && scenario.transport == ScenarioTransport::Direct
+        })
+        .collect::<Vec<_>>();
+    let workspace_build_regressions = workspace_builds
+        .iter()
+        .copied()
+        .filter(|scenario| scenario.is_regression)
+        .collect::<Vec<_>>();
+    if workspace_build_regressions.len() < 3
+        || workspace_build_regressions.len() * 2 < workspace_builds.len()
+    {
+        return None;
+    }
+
+    let median_workspace_build_delta_ms = median_ms(
+        &workspace_builds
+            .iter()
+            .filter_map(|scenario| scenario.delta_ms)
+            .collect::<Vec<_>>(),
+    )?;
+    let median_workspace_build_delta_pct = median_ms(
+        &workspace_builds
+            .iter()
+            .filter_map(|scenario| scenario.delta_pct)
+            .collect::<Vec<_>>(),
+    )?;
+    if median_workspace_build_delta_ms < thresholds.absolute_ms
+        || median_workspace_build_delta_pct < thresholds.relative_pct
+    {
+        return None;
+    }
+
+    let positive_delta_count = timed
+        .iter()
+        .filter(|scenario| scenario.delta_ms.is_some_and(|delta| delta > 0.0))
+        .count();
+    if positive_delta_count * 10 < timed.len() * 7 {
+        return None;
+    }
+
+    let affected_repo_count = timing_regressions
+        .iter()
+        .map(|scenario| scenario.repo_name.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    if affected_repo_count < 3 {
+        return None;
+    }
+
+    let workspace_build_regression_repos = workspace_build_regressions
+        .iter()
+        .map(|scenario| scenario.repo_name.as_str())
+        .collect::<HashSet<_>>();
+    let covered_regression_count = timing_regressions
+        .iter()
+        .filter(|scenario| workspace_build_regression_repos.contains(scenario.repo_name.as_str()))
+        .count();
+
+    Some(EnvironmentVarianceReport {
+        affected_repo_count,
+        timed_scenario_count: timed.len(),
+        timing_regression_count: timing_regressions.len(),
+        covered_regression_count,
+        workspace_build_regression_count: workspace_build_regressions.len(),
+        median_workspace_build_delta_pct,
+        median_workspace_build_delta_ms,
+        detail: format!(
+            "broad timing slowdown across {affected_repo_count} repos; median direct workspace_build delta={median_workspace_build_delta_ms:.1} ms ({median_workspace_build_delta_pct:.1}%)"
+        ),
+    })
+}
+
+fn non_timing_regression(scenario: &ScenarioCompareReport) -> bool {
+    scenario.is_regression
+        && !(scenario.baseline_success == Some(true)
+            && scenario.candidate_success == Some(true)
+            && scenario.delta_ms.is_some()
+            && scenario.delta_pct.is_some())
 }
