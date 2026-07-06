@@ -3,7 +3,9 @@ use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::hits::{add_hit, add_import_hit};
-use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec, Visibility};
+use crate::analyzer::usages::scala_graph::resolver::{
+    TargetKind, TargetSpec, Visibility, package_name_of,
+};
 use crate::analyzer::usages::scala_graph::syntax::{
     call_arity_for_reference, has_ancestor_kind, has_member_qualifier, is_assignment_lhs,
     is_constructor_like_reference, is_identifier_node, is_owner_qualified_this,
@@ -46,10 +48,12 @@ pub(super) fn scan_file(
     };
     let line_starts = compute_line_starts(&source);
     let visibility = Visibility::for_file(scala, file, spec);
+    let file_package = package_name_of(scala, file).unwrap_or_default();
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let mut ctx = ScanCtx {
         analyzer,
         file,
+        file_package: &file_package,
         source: &source,
         line_starts: &line_starts,
         spec,
@@ -66,6 +70,7 @@ pub(super) fn scan_file(
 pub(super) struct ScanCtx<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) file: &'a ProjectFile,
+    pub(super) file_package: &'a str,
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
@@ -150,7 +155,7 @@ fn matching_names_for_import_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> H
     let import_text = node_text(node, ctx.source);
     let mut names = HashSet::default();
     for import in parse_scala_import_infos(import_text) {
-        let matched = Visibility::matching_import_names(&import, ctx.spec);
+        let matched = Visibility::matching_import_names(&import, ctx.spec, ctx.file_package);
         names.extend(matched.type_names);
         names.extend(matched.owner_names.into_keys());
         names.extend(matched.direct_member_names);
@@ -242,6 +247,7 @@ fn seed_scope_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     ctx.bindings.declare_shadow(name.to_string());
                 }
             }
+            seed_enclosing_owner_field_bindings(node, ctx);
             seed_parameter_bindings(node, ctx);
         }
         "case_clause" => seed_case_pattern_shadow(node, ctx),
@@ -279,11 +285,33 @@ fn seed_owner_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn seed_enclosing_owner_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.spec.owner.is_none() {
+        return;
+    }
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+                seed_owner_field_bindings(ancestor, ctx);
+                return;
+            }
+            "function_definition"
+            | "block"
+            | "block_expression"
+            | "case_clause"
+            | "lambda_expression"
+            | "anonymous_function" => return,
+            _ => current = ancestor.parent(),
+        }
+    }
+}
+
 fn seed_direct_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
-            "val_definition" | "var_definition" => seed_value_definition(child, ctx),
+            "val_definition" | "var_definition" => seed_owner_field_definition(child, ctx),
             "function_definition"
             | "class_definition"
             | "object_definition"
@@ -291,6 +319,19 @@ fn seed_direct_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "enum_definition" => {}
             _ => seed_direct_field_bindings(child, ctx),
         }
+    }
+}
+
+fn seed_owner_field_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(owner_fq_name) = ctx.spec.owner_fq_name.as_deref() else {
+        return;
+    };
+    let Some(pattern) = node.child_by_field_name("pattern") else {
+        return;
+    };
+    for name in pattern_names(pattern, ctx.source) {
+        ctx.bindings
+            .seed_symbol(name.to_string(), owner_fq_name.to_string());
     }
 }
 
@@ -483,12 +524,22 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if proven {
         add_hit(node, ctx);
     }
-    if is_assignment_lhs(node) && !ctx.bindings.resolve_symbol(text).is_unknown() {
+    if is_assignment_lhs(node)
+        && !ctx.bindings.resolve_symbol(text).is_unknown()
+        && !assignment_lhs_is_target_member_write(proven, text, ctx)
+    {
         ctx.bindings.declare_shadow(text.to_string());
     }
 }
 
+fn assignment_lhs_is_target_member_write(proven: bool, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    proven && ctx.spec.kind == TargetKind::Field && text == ctx.spec.member_name
+}
+
 fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'_>) -> bool {
+    if is_direct_owner_field_declaration_identifier(node, ctx) {
+        return true;
+    }
     let before = ctx.source[..node.start_byte()].trim_end();
     let Some(keyword) = previous_word(before) else {
         return false;
@@ -509,6 +560,33 @@ fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'
         .and_then(|(_, value)| constructor_type_name(value));
     seed_or_shadow_typed_symbol(text, type_name, value_name, ctx);
     true
+}
+
+fn is_direct_owner_field_declaration_identifier(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !matches!(parent.kind(), "val_definition" | "var_definition")
+        || parent.child_by_field_name("pattern") != Some(node)
+    {
+        return false;
+    }
+    let mut current = parent.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "function_definition"
+            | "block"
+            | "block_expression"
+            | "case_clause"
+            | "lambda_expression"
+            | "anonymous_function" => return false,
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+                return enclosing_type_matches_owner(ancestor, ctx);
+            }
+            _ => current = ancestor.parent(),
+        }
+    }
+    false
 }
 
 fn previous_word(value: &str) -> Option<&str> {

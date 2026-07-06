@@ -106,7 +106,7 @@ pub(super) fn resolve_scala(
                 return no_definition("no_reference_text", "Scala identifier is blank");
             }
             let bindings = scala_bindings_before(ctx, &resolver, root, identifier.start_byte());
-            if bindings.is_shadowed(text) {
+            if scala_is_locally_shadowed(&bindings, text) {
                 return no_definition(
                     "local_variable_reference",
                     format!("`{text}` is a local Scala value"),
@@ -117,6 +117,14 @@ pub(super) fn resolve_scala(
             }
             if let Some(fqn) = resolver.resolve(text) {
                 return scala_fqn_outcome(support, &fqn, text);
+            }
+            if let Some(owner) =
+                scala_enclosing_class(ctx.analyzer, ctx.file, identifier.start_byte())
+            {
+                let candidates = scala_member_candidate_units(ctx, &owner.fq_name(), text, false);
+                if !candidates.is_empty() {
+                    return candidates_outcome(candidates);
+                }
             }
             if scala_import_boundary_for_name(scala, context.support, file, text) {
                 return boundary(format!(
@@ -427,7 +435,7 @@ fn resolve_scala_type(
     }
     if !scala_is_type_position(node) {
         let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
-        if bindings.is_shadowed(text) {
+        if scala_is_locally_shadowed(&bindings, text) {
             return no_definition(
                 "local_variable_reference",
                 format!("`{text}` is a local Scala value"),
@@ -500,7 +508,7 @@ fn resolve_scala_call(
                 return no_definition("no_function_name", "Scala call name is blank");
             }
             let bindings = scala_bindings_before(ctx, resolver, root, function.start_byte());
-            if bindings.is_shadowed(name) {
+            if scala_is_locally_shadowed(&bindings, name) {
                 return no_definition(
                     "local_variable_reference",
                     format!("`{name}` is a local Scala value"),
@@ -1524,6 +1532,7 @@ fn scala_seed_active_path(
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
+    let root = node;
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         if node.start_byte() >= cutoff_start {
@@ -1541,7 +1550,7 @@ fn scala_seed_active_path(
                 scala_seed_parameters(ctx, resolver, node, cutoff_start, bindings)
             }
             "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
-                scala_seed_value_definition(ctx, resolver, node, cutoff_start, bindings)
+                scala_seed_value_definition(ctx, resolver, root, node, cutoff_start, bindings)
             }
             _ => {}
         }
@@ -1605,12 +1614,13 @@ fn scala_seed_parameter(
             let type_text = scala_node_text(type_node, ctx.source);
             scala_resolve_visible_type_annotation(ctx, resolver, type_text)
         });
-    scala_seed_typed(binding_name, resolved, bindings);
+    scala_seed_typed(binding_name, resolved, false, bindings);
 }
 
 fn scala_seed_value_definition(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
+    root: Node<'_>,
     node: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<String>,
@@ -1630,6 +1640,13 @@ fn scala_seed_value_definition(
                 .filter(|value| value.end_byte() <= cutoff_start)
                 .and_then(|value| scala_constructed_type(ctx, value, resolver))
                 .or_else(|| {
+                    node.child_by_field_name("value")
+                        .filter(|value| value.end_byte() <= cutoff_start)
+                        .and_then(|value| {
+                            scala_call_result_type(ctx, resolver, root, value, value.start_byte())
+                        })
+                })
+                .or_else(|| {
                     scala_constructor_type_text(scala_node_text(node, ctx.source)).and_then(
                         |type_text| scala_resolve_visible_type_annotation(ctx, resolver, type_text),
                     )
@@ -1641,9 +1658,72 @@ fn scala_seed_value_definition(
     if pattern.start_byte() >= cutoff_start {
         return;
     }
+    let is_direct_member = scala_is_direct_member_value_definition(node);
     for name in scala_pattern_names(pattern, ctx.source) {
-        scala_seed_typed(name, resolved.clone(), bindings);
+        scala_seed_typed(name, resolved.clone(), is_direct_member, bindings);
     }
+}
+
+fn scala_call_result_type(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    value: Node<'_>,
+    cutoff_start: usize,
+) -> Option<String> {
+    if value.kind() != "call_expression" {
+        return None;
+    }
+    let function = value.child_by_field_name("function")?;
+    match function.kind() {
+        "field_expression" => {
+            let receiver = function.child_by_field_name("value")?;
+            let field = function.child_by_field_name("field")?;
+            let member = scala_node_text(field, ctx.source).trim();
+            if member.is_empty() {
+                return None;
+            }
+            let owner = scala_receiver_type_fqn(ctx, resolver, root, receiver, cutoff_start)?;
+            let include_companion = scala_receiver_allows_companion_lookup(
+                ctx,
+                resolver,
+                root,
+                receiver,
+                cutoff_start,
+                &owner,
+            );
+            scala_member_candidate_units(ctx, &owner, member, include_companion)
+                .into_iter()
+                .filter(|unit| unit.is_function())
+                .find_map(|unit| scala_function_return_type(ctx, &unit))
+        }
+        "identifier" => {
+            let name = scala_node_text(function, ctx.source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            if let Some(member_fqn) = resolver.resolve_member(name)
+                && let Some(return_type) =
+                    scala_imported_member_return_type(ctx, resolver, &member_fqn)
+            {
+                return Some(return_type);
+            }
+            let owner = scala_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())?;
+            scala_member_candidate_units(ctx, &owner.fq_name(), name, false)
+                .into_iter()
+                .filter(|unit| unit.is_function())
+                .find_map(|unit| scala_function_return_type(ctx, &unit))
+        }
+        _ => None,
+    }
+}
+
+fn scala_function_return_type(ctx: ScalaLookupCtx<'_>, unit: &CodeUnit) -> Option<String> {
+    scala_imported_member_return_type(
+        ctx,
+        &ScalaNameResolver::for_file(ctx.scala, unit.source(), ctx.types),
+        &unit.fq_name(),
+    )
 }
 
 fn scala_constructed_type(
@@ -1733,12 +1813,37 @@ fn scala_pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
 fn scala_seed_typed(
     name: &str,
     resolved: Option<String>,
+    is_direct_member: bool,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     match resolved {
         Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-        None => bindings.declare_shadow(name.to_string()),
+        None if !is_direct_member => bindings.declare_shadow(name.to_string()),
+        None => {}
     }
+}
+
+fn scala_is_locally_shadowed(bindings: &LocalInferenceEngine<String>, name: &str) -> bool {
+    bindings.is_shadowed(name) && bindings.resolve_symbol(name).is_unknown()
+}
+
+fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "function_definition"
+            | "block"
+            | "block_expression"
+            | "indented_block"
+            | "case_clause"
+            | "lambda_expression" => return false,
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+                return true;
+            }
+            _ => current = ancestor.parent(),
+        }
+    }
+    false
 }
 
 fn scala_import_boundary_for_name(

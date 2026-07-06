@@ -12898,6 +12898,58 @@ fn scala_service_execute_receiver_resolves_to_definition() {
 }
 
 #[test]
+fn scala_factory_returned_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/Service.scala",
+            r#"
+package example
+
+class Repository
+
+class Service(repository: Repository) {
+  def execute(name: String): String = name.trim
+}
+
+object Service {
+  def build(repository: Repository): Service = new Service(repository)
+}
+"#,
+        )
+        .file(
+            "example/Consumer.scala",
+            r#"
+package example
+
+object Consumer {
+  def run(): String = {
+    val repository = new Repository()
+    val service = Service.build(repository)
+    service.execute(" Ada ")
+  }
+}
+"#,
+        )
+        .build();
+
+    let line = r#"    service.execute(" Ada ")"#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"example/Consumer.scala","line":8,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.Service.execute",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_generic_constructor_receiver_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -12953,6 +13005,44 @@ fn scala_constructor_parameter_field_resolves_to_definition() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.Context.registry",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_unqualified_owner_field_read_after_write_resolves_to_definition() {
+    let service_source = r#"
+package example
+
+class Repository {
+  var last: String = ""
+
+  def save(value: String): String = {
+    last = value.trim
+    last
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("example/Service.scala", service_source)
+        .build();
+    let read_start = service_source
+        .find("    last\n")
+        .expect("unqualified field read")
+        + "    ".len();
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"example/Service.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            read_start,
+            read_start + "last".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.Repository.last",
         "{value}"
     );
 }

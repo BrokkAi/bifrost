@@ -560,6 +560,7 @@ class Target {
   var field: Int = 1
   def run(): Int = field
   def call(): Int = {
+    field = 2
     this.field = 2
     this.run()
     field + run()
@@ -589,7 +590,13 @@ class Other {
     let field = definition(&analyzer, "pkg.Target.field");
     let field_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000));
+    assert_hit_line(
+        &field_hits,
+        line_of(target_source, "def run(): Int = field"),
+    );
     assert_hit_line(&field_hits, line_of(target_source, "this.field = 2"));
+    assert_hit_line(&field_hits, line_of(target_source, "field = 2"));
+    assert_hit_line(&field_hits, line_of(target_source, "field + run()"));
     assert_no_hit_line(&field_hits, line_of(target_source, "this.field = 4"));
     assert_no_hit_in_enclosing(&field_hits, "pkg.Other.call");
 
@@ -882,6 +889,48 @@ class Workflow(renderer: ConsoleRenderer)
         }),
         "expected renamed member import hit classified as Import: {editor_hits:#?}"
     );
+}
+
+#[test]
+fn scala_graph_resolves_same_package_scala3_renamed_companion_import_usages() {
+    let workflow_source = r#"
+package example
+
+trait Renderer:
+  def render(value: String): String
+
+class ConsoleRenderer extends Renderer:
+  override def render(value: String): String =
+    value.trim
+
+object ConsoleRenderer:
+  def default: ConsoleRenderer =
+    new ConsoleRenderer
+
+class Workflow(renderer: Renderer):
+  def run(value: String): String =
+    renderer.render(value)
+
+object App:
+  import ConsoleRenderer.{default => renderer}
+
+  val workflow = new Workflow(renderer)
+  val direct = renderer.render("  ok ")
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("example/Workflow.scala", workflow_source)]);
+    let target = definition(&analyzer, "example.ConsoleRenderer$.default");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&hits, line_of(workflow_source, "new Workflow(renderer)"));
+    assert_hit_line(&hits, line_of(workflow_source, "val direct"));
+    assert_no_hit_line(&hits, line_of(workflow_source, "import ConsoleRenderer"));
 }
 
 #[test]

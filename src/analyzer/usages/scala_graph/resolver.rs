@@ -318,7 +318,7 @@ impl Visibility {
         spec: &TargetSpec,
         file_package: &str,
     ) {
-        let names = Self::matching_import_names(import, spec);
+        let names = Self::matching_import_names(import, spec, file_package);
         self.type_names.extend(names.type_names);
         for (owner_name, owner_fq_name) in names.owner_names {
             self.add_owner_name(owner_name, owner_fq_name);
@@ -397,7 +397,11 @@ impl Visibility {
         }
     }
 
-    pub(super) fn matching_import_names(import: &ImportInfo, spec: &TargetSpec) -> ImportNames {
+    pub(super) fn matching_import_names(
+        import: &ImportInfo,
+        spec: &TargetSpec,
+        file_package: &str,
+    ) -> ImportNames {
         let Some(path) = scala_import_path(import) else {
             return ImportNames::default();
         };
@@ -435,14 +439,17 @@ impl Visibility {
             return names;
         }
 
-        let normalized = scala_normalized_fq_name(&path);
-        if normalized == spec.target_fq_name {
+        let normalized_candidates: HashSet<String> = import_candidate_fq_names(&path, file_package)
+            .into_iter()
+            .map(|candidate| scala_normalized_fq_name(&candidate))
+            .collect();
+        if normalized_candidates.contains(&spec.target_fq_name) {
             names.type_names.insert(local_name.clone());
         }
         if spec
             .owner_fq_name
             .as_ref()
-            .is_some_and(|owner_fq| normalized == *owner_fq)
+            .is_some_and(|owner_fq| normalized_candidates.contains(owner_fq))
         {
             if let Some(owner_fq_name) = spec.owner_fq_name.as_ref() {
                 names
@@ -453,7 +460,7 @@ impl Visibility {
                 names.type_names.insert(local_name.clone());
             }
         }
-        if normalized == spec.target_fq_name && spec.kind != TargetKind::Type {
+        if normalized_candidates.contains(&spec.target_fq_name) && spec.kind != TargetKind::Type {
             names.direct_member_names.insert(local_name);
         }
         names
