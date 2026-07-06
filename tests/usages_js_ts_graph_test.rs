@@ -1069,6 +1069,45 @@ fn js_this_receiver_is_editor_only_member_usage() {
 }
 
 #[test]
+fn js_this_property_assignment_is_editor_visible_field_usage() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "components.js",
+            r#"
+export class Greeter {
+  constructor(title) {
+    this.title = title;
+  }
+
+  greet(user) {
+    return `${this.title}, ${user.name}`;
+  }
+}
+"#,
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("components.js"), |cu| {
+        cu.short_name() == "Greeter.title" && cu.is_field()
+    });
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    assert!(
+        result.all_hits().is_empty(),
+        "self-receiver field hits should stay off external usage surface: {:?}",
+        result.all_hits()
+    );
+    let editor_hits = result.all_hits_including_imports();
+    assert_eq!(1, editor_hits.len(), "editor hits: {editor_hits:?}");
+    assert!(
+        editor_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("this.title"))
+    );
+}
+
+#[test]
 fn ts_this_receiver_is_editor_only_member_usage() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file(

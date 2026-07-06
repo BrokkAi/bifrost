@@ -147,3 +147,11 @@ Usagebench validation command:
     ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-jsts
 
 The checkpoint improved `js-method-call` from XFAIL to IMPROVED. Remaining JS/TS usagebench failures after this checkpoint are `js-class-property-access`, `js-parity-object-literal-method-call`, `ts-object-property-access`, and `ts-parity-static-method-call`; these now need follow-up in declaration-site property indexing/self-receiver handling and the usage graph’s exact target-key selection for CommonJS object-literal/static member cases.
+
+Revision note, 2026-07-06 / Codex: A follow-up local fix indexes JavaScript constructor assignments such as `this.title = title` as class fields and resolves `this` to the enclosing class in JS/TS receiver analysis. Focused local validation passed:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test get_definition_test javascript_this_property -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_js_ts_graph_test js_this_property_assignment_is_editor_visible_field_usage -- --nocapture
+    cargo clippy-no-cuda
+
+`../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/javascript-baseline.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-js-baseline` still reports `js-class-property-access` as XFAIL, so the remaining discrepancy appears to be in the usagebench lookup path or exact fixture/target selection rather than the local location resolver path covered by `get_definition_test`.

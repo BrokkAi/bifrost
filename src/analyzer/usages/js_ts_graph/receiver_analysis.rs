@@ -168,6 +168,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             "object" if self.language == Language::JavaScript => {
                 self.resolve_object_expression(expression, budget)
             }
+            "this" => self.resolve_this_expression(expression, budget),
             "call_expression" => self.summarize_call_node(
                 expression,
                 expression.start_byte(),
@@ -221,6 +222,28 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 file: self.file.clone(),
                 range: node_range(expression),
             })
+            .collect::<Vec<_>>();
+        ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
+    }
+
+    fn resolve_this_expression(
+        &self,
+        expression: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        let Some(class_node) = enclosing_class_scope(expression) else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        let Some(name_node) = class_node.child_by_field_name("name") else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        let Some(name) = simple_identifier_text(name_node, self.source) else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        let values = self
+            .class_units_named(name, expression)
+            .into_iter()
+            .map(ReceiverValue::CurrentReceiver)
             .collect::<Vec<_>>();
         ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
     }
@@ -803,6 +826,18 @@ fn enclosing_function_scope<'tree>(mut node: Node<'tree>) -> Option<Node<'tree>>
         if matches!(
             node.kind(),
             "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn enclosing_class_scope<'tree>(mut node: Node<'tree>) -> Option<Node<'tree>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "class_declaration" | "abstract_class_declaration" | "class"
         ) {
             return Some(node);
         }

@@ -6275,6 +6275,80 @@ helpers.formatTask({ label: "direct" });
 }
 
 #[test]
+fn javascript_this_property_resolves_to_constructor_assignment() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "components.js",
+            r#"
+export class Greeter {
+  constructor(title) {
+    this.title = title;
+  }
+
+  greet(user) {
+    return `${this.title}, ${user.name}`;
+  }
+}
+"#,
+        )
+        .build();
+
+    let line = "    return `${this.title}, ${user.name}`;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"components.js","line":8,"column":{}}}]}}"#,
+            column_of(line, "title")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Greeter.title", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
+}
+
+#[test]
+fn javascript_this_property_in_exported_class_resolves_to_constructor_assignment() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "components.js",
+            r#"
+export const DEFAULT_TITLE = "Welcome";
+
+export class Greeter {
+  constructor(title = DEFAULT_TITLE) {
+    this.title = title;
+  }
+
+  greet(user) {
+    return `${this.title}, ${formatName(user)}`;
+  }
+}
+
+export function formatName(user) {
+  return user.name.trim();
+}
+"#,
+        )
+        .build();
+
+    let line = "    return `${this.title}, ${formatName(user)}`;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"components.js","line":10,"column":{}}}]}}"#,
+            column_of(line, "title")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Greeter.title", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 6, "{value}");
+}
+
+#[test]
 fn javascript_member_assignment_object_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
