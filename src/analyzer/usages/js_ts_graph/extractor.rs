@@ -580,7 +580,11 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && property_text == member
     {
         if this_receiver_matches_target(object, ctx) {
-            record_self_receiver_hit(property, ctx);
+            if ctx.target.is_field() {
+                record_hit(property, ctx);
+            } else {
+                record_self_receiver_hit(property, ctx);
+            }
             return;
         }
         // `BaseClass.staticMethod()` style — object binds to the target's parent class, the

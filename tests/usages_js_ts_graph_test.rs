@@ -915,7 +915,7 @@ helpers.formatTask({ label: "direct" });
     });
 
     let target = find_js_target(&analyzer, &project.file("library.js"), |cu| {
-        cu.short_name().ends_with(".helpers.formatTask")
+        cu.short_name().ends_with(".helpers.formatTask") && cu.is_function()
     });
 
     let hits = flatten_hits(
@@ -1093,18 +1093,9 @@ export class Greeter {
     });
 
     let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
-    assert!(
-        result.all_hits().is_empty(),
-        "self-receiver field hits should stay off external usage surface: {:?}",
-        result.all_hits()
-    );
-    let editor_hits = result.all_hits_including_imports();
-    assert_eq!(1, editor_hits.len(), "editor hits: {editor_hits:?}");
-    assert!(
-        editor_hits
-            .iter()
-            .all(|hit| hit.snippet.contains("this.title"))
-    );
+    let hits = result.all_hits();
+    assert_eq!(1, hits.len(), "field hits: {hits:?}");
+    assert!(hits.iter().all(|hit| hit.snippet.contains("this.title")));
 }
 
 #[test]
@@ -1250,6 +1241,16 @@ export function boot() {
 }
 "#,
         )
+        .file(
+            "app.ts",
+            r#"
+import { ApiClient } from "./api";
+
+export function bootDirect() {
+  return ApiClient.create("/direct");
+}
+"#,
+        )
         .build()
     });
 
@@ -1261,7 +1262,7 @@ export function boot() {
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
     );
 
-    assert_eq!(1, hits.len(), "hits: {hits:?}");
+    assert_eq!(2, hits.len(), "hits: {hits:?}");
     assert!(
         hits.iter()
             .any(|hit| hit.snippet.contains("ApiClient.create")),
@@ -1300,7 +1301,7 @@ export function run(directTask) {
     });
 
     let target = find_js_target(&analyzer, &project.file("library.js"), |cu| {
-        cu.short_name().ends_with(".helpers.formatTask")
+        cu.short_name().ends_with(".helpers.formatTask") && cu.is_function()
     });
 
     let hits = flatten_hits(

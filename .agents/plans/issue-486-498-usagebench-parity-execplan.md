@@ -155,3 +155,12 @@ Revision note, 2026-07-06 / Codex: A follow-up local fix indexes JavaScript cons
     cargo clippy-no-cuda
 
 `../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/javascript-baseline.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-js-baseline` still reports `js-class-property-access` as XFAIL, so the remaining discrepancy appears to be in the usagebench lookup path or exact fixture/target selection rather than the local location resolver path covered by `get_definition_test`.
+
+Revision note, 2026-07-06 / Codex: The prior `js-class-property-access` discrepancy was caused by stale `.bifrost` fixture caches under the usagebench checkout. After clearing fixture caches, the JS/TS fixes now flip the remaining usagebench expected-failure cases to `IMPROVED` on fresh runs:
+
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/javascript-baseline.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-js-baseline-fresh
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/javascript-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-js-lsp-fresh
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/typescript-baseline.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-ts-baseline-fresh
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/typescript-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-ts-lsp-fresh
+
+Confirmed improved cases: `js-method-call`, `js-class-property-access`, `js-parity-object-literal-method-call`, `ts-object-property-access`, and `ts-parity-static-method-call`. The follow-up fixes made `this.field` class-field reads part of the external usage surface, indexed JavaScript object-literal methods as functions, accepted public TypeScript static method symbols without leaking the internal `$static` suffix, and kept `scan_usages` resolving both public and internal static method spellings.

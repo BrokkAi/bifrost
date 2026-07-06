@@ -323,7 +323,25 @@ fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
         variants.push(dollar_split);
     }
 
+    if language == Language::TypeScript
+        && let Some(ts_static) = trim_trailing_static_member_segment(&primary)
+    {
+        variants.push(ts_static);
+    }
+
     variants
+}
+
+fn trim_trailing_static_member_segment(segments: &[String]) -> Option<Vec<String>> {
+    let (last, prefix) = segments.split_last()?;
+    let member = last.strip_suffix("$static")?;
+    if member.is_empty() {
+        return None;
+    }
+
+    let mut variant = prefix.to_vec();
+    variant.push(member.to_string());
+    Some(variant)
 }
 
 fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {

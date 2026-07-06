@@ -1308,9 +1308,14 @@ fn visit_js_object_literal_properties_for_surface(
         let Some(name) = js_object_literal_property_name(child, source) else {
             continue;
         };
+        let kind = if js_object_literal_property_is_function(child) {
+            crate::analyzer::CodeUnitType::Function
+        } else {
+            crate::analyzer::CodeUnitType::Field
+        };
         let code_unit = CodeUnit::new(
             file.clone(),
-            crate::analyzer::CodeUnitType::Field,
+            kind,
             "",
             format!("{}.{}", parent.short_name(), name),
         );
@@ -1330,6 +1335,13 @@ fn visit_js_object_literal_properties_for_surface(
         }
         parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
     }
+}
+
+fn js_object_literal_property_is_function(node: Node<'_>) -> bool {
+    node.kind() == "method_definition"
+        || node
+            .child_by_field_name("value")
+            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
 }
 
 fn js_object_literal_property_name(node: Node<'_>, source: &str) -> Option<String> {

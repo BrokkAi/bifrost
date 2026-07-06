@@ -62,6 +62,7 @@ pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
             .map(|segment| segment.replace('$', "."))
             .collect::<Vec<_>>()
             .join("."),
+        Language::TypeScript => symbol.strip_suffix("$static").unwrap_or(symbol).to_string(),
         _ => symbol.to_string(),
     }
 }
@@ -78,7 +79,17 @@ pub(crate) fn display_symbol_for_target(target: &CodeUnit) -> String {
 /// line spans. The hierarchy is encoded in `short_name` (members after `.`, nested types
 /// via `$`), so we strip the last segment and re-qualify with the package.
 pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<String> {
-    let short = target.short_name();
+    let short_storage;
+    let short = if language_for_target(target) == Language::TypeScript {
+        short_storage = target
+            .short_name()
+            .strip_suffix("$static")
+            .unwrap_or(target.short_name())
+            .to_string();
+        short_storage.as_str()
+    } else {
+        target.short_name()
+    };
     let cut = short.rfind(['.', '$'])?;
     let parent_short = &short[..cut];
     if parent_short.is_empty() {

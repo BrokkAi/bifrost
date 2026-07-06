@@ -6337,7 +6337,7 @@ export function formatName(user) {
     let value = lookup(
         project.root(),
         &format!(
-            r#"{{"references":[{{"path":"components.js","line":10,"column":{}}}]}}"#,
+            r#"{{"references":[{{"path":"components.js","line":10,"column":{},"symbol":"title"}}]}}"#,
             column_of(line, "title")
         ),
     );

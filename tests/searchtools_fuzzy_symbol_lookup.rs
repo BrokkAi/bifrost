@@ -1,14 +1,173 @@
 mod common;
 
 use brokk_bifrost::{
-    CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer, RustAnalyzer,
-    ScalaAnalyzer,
+    CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language,
+    PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
     searchtools::{
         ScanUsagesParams, SearchSymbolsParams, SymbolLookupParams, SymbolSourcesResult,
         get_symbol_locations, get_symbol_sources, scan_usages, search_symbols,
     },
 };
 use common::InlineTestProject;
+
+#[test]
+fn javascript_constructor_assigned_field_is_searchable_by_property_name() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/components.js",
+            r#"export const DEFAULT_TITLE = "Welcome";
+
+export class Greeter {
+  constructor(title = DEFAULT_TITLE) {
+    this.title = title;
+  }
+
+  greet(user) {
+    return `${this.title}, ${user.name}`;
+  }
+}
+"#,
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["title".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+
+    let components = search
+        .files
+        .iter()
+        .find(|file| file.path == "src/components.js")
+        .unwrap_or_else(|| panic!("missing components.js in {search:#?}"));
+    assert!(
+        components
+            .fields
+            .iter()
+            .any(|hit| hit.symbol == "Greeter.title" && hit.line == 5),
+        "expected Greeter.title on constructor assignment line: {search:#?}"
+    );
+}
+
+#[test]
+fn javascript_object_literal_method_is_searchable_as_function_symbol() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/library.js",
+            r#"const helpers = {
+  formatTask(task) {
+    return task.label;
+  },
+};
+"#,
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["formatTask".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+
+    let library = search
+        .files
+        .iter()
+        .find(|file| file.path == "src/library.js")
+        .unwrap_or_else(|| panic!("missing library.js in {search:#?}"));
+    assert!(
+        library
+            .functions
+            .iter()
+            .any(|hit| hit.symbol == "library.js.helpers.formatTask" && hit.line == 2),
+        "expected object-literal method in functions bucket: {search:#?}"
+    );
+}
+
+#[test]
+fn scan_usages_resolves_public_typescript_static_method_symbol() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/api.ts",
+            r#"export class ApiClient {
+  static create(baseUrl: string): ApiClient {
+    return new ApiClient(baseUrl);
+  }
+
+  constructor(private readonly baseUrl: string) {}
+}
+
+export default function createClient(): ApiClient {
+  return ApiClient.create("/api");
+}
+"#,
+        )
+        .file(
+            "src/app.ts",
+            r#"import { ApiClient } from "./api";
+
+const direct = ApiClient.create("/direct");
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["create".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+    let api = search
+        .files
+        .iter()
+        .find(|file| file.path == "src/api.ts")
+        .unwrap_or_else(|| panic!("missing api.ts in {search:#?}"));
+    assert!(
+        api.functions
+            .iter()
+            .any(|hit| hit.symbol == "ApiClient.create" && hit.line == 2),
+        "expected public static method symbol without internal suffix: {search:#?}"
+    );
+
+    let result = scan_usages(
+        &analyzer,
+        ScanUsagesParams {
+            symbols: Some(vec!["ApiClient.create".to_string()]),
+            targets: Vec::new(),
+            include_tests: true,
+            paths: None,
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert!(result.failures.is_empty(), "{result:#?}");
+    assert_eq!(1, result.usages.len(), "{result:#?}");
+    let lines = result.usages[0]
+        .files
+        .iter()
+        .flat_map(|file| {
+            file.hits
+                .iter()
+                .map(move |hit| (file.path.as_str(), hit.line))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        lines.contains(&("src/api.ts", 10)) && lines.contains(&("src/app.ts", 3)),
+        "expected both static method call sites: {result:#?}"
+    );
+}
 
 #[test]
 fn php_symbol_sources_accept_common_foreign_delimiters() {
