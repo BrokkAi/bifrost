@@ -227,6 +227,9 @@ jobs:
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
 
+      - name: Generate Amp skill bundle
+        run: node scripts/generate-amp-skill-bundle.mjs
+
       - name: Validate agent plugin manifests
         run: node scripts/check-codex-plugin-manifest.mjs
 
