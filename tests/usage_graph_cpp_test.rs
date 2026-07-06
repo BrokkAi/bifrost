@@ -82,6 +82,75 @@ fn new_expression_and_type_reference_edge_to_the_class() {
 }
 
 #[test]
+fn out_of_line_member_definition_qualifiers_edge_to_class() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/parity.h",
+            r#"#pragma once
+#include <string>
+namespace parity {
+struct Sink {};
+class ConsoleHandler {
+public:
+    explicit ConsoleHandler(Sink& s);
+    std::string handle(const std::string& value);
+    std::string alias_handle(const std::string& value);
+};
+using HandlerAlias = ConsoleHandler;
+}
+namespace other {
+struct OtherSink {};
+class ConsoleHandler {
+public:
+    explicit ConsoleHandler(OtherSink& s);
+    std::string handle(const std::string& value);
+};
+}
+"#,
+        )
+        .file(
+            "src/parity.cpp",
+            r#"#include "../include/parity.h"
+namespace parity {
+ConsoleHandler::ConsoleHandler(Sink& s) {}
+std::string ConsoleHandler::handle(const std::string& value) { return value; }
+std::string HandlerAlias::alias_handle(const std::string& value) { return value; }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "parity.ConsoleHandler.ConsoleHandler",
+            "parity.ConsoleHandler"
+        ),
+        "expected constructor definition qualifier to edge to ConsoleHandler: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "parity.ConsoleHandler.handle",
+            "parity.ConsoleHandler"
+        ),
+        "expected method definition qualifier to edge to ConsoleHandler: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "parity.HandlerAlias.alias_handle",
+            "parity.ConsoleHandler"
+        ),
+        "expected alias-qualified method definition qualifier to edge to ConsoleHandler: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn namespace_free_function_return_type_edges() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

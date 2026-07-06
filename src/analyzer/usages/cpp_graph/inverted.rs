@@ -25,7 +25,7 @@
 use super::resolver::{
     TargetKind, VisibilityIndex, constructor_style_local_declaration, extract_variable_name,
     first_type_child, infer_cpp_initializer_type, is_declaration_name, is_declarator_node,
-    normalize_type_text, type_owner_of,
+    normalize_type_text, out_of_line_member_definition_owner, type_owner_of,
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -140,7 +140,15 @@ fn record_reference(
         // to the class. `new Foo()` reaches its type via this case (its type child
         // is itself one of these nodes), so there is no separate construction case.
         "type_identifier" | "qualified_identifier" | "template_type" => {
-            if is_declaration_name(node) || is_nested_type_node(node) {
+            if is_declaration_name(node) {
+                if let Some((scope, owner)) =
+                    out_of_line_member_definition_owner(ctx.visibility, ctx.file, ctx.source, node)
+                {
+                    ctx.record(owner.fq_name(), scope);
+                }
+                return;
+            }
+            if is_nested_type_node(node) {
                 return;
             }
             // A `X::m(..)` static/scoped call appears as a `qualified_identifier`

@@ -264,6 +264,13 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if is_declaration_name(node) {
+        if let Some((scope, owner)) =
+            out_of_line_member_definition_owner(ctx.visibility, ctx.file, ctx.source, node)
+            && same_visible_symbol(&owner, &ctx.spec.target)
+        {
+            *ctx.raw_match_count += 1;
+            push_hit(scope, ctx);
+        }
         return;
     }
     let hit_node = node;
