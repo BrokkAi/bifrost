@@ -14,6 +14,7 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
 - [x] (2026-07-06T16:18Z) Checked for a sibling usagebench checkout under `/home/jonathan/Projects`; none was found.
 - [x] (2026-07-06T16:24Z) Ran focused existing Bifrost tests for the issue shapes that current summaries showed were already covered.
 - [x] (2026-07-06T16:24Z) Determined no analyzer code fix is justified from local evidence because all targeted current-state tests passed.
+- [x] (2026-07-06T22:05Z) Fixed and usagebench-validated the Java issue #486 cases.
 - [ ] Remove usagebench expected-failure markers after a usagebench checkout is available and the matching cases pass there.
 
 ## Surprises & Discoveries
@@ -164,3 +165,16 @@ Revision note, 2026-07-06 / Codex: The prior `js-class-property-access` discrepa
     ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/typescript-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-ts-lsp-fresh
 
 Confirmed improved cases: `js-method-call`, `js-class-property-access`, `js-parity-object-literal-method-call`, `ts-object-property-access`, and `ts-parity-static-method-call`. The follow-up fixes made `this.field` class-field reads part of the external usage surface, indexed JavaScript object-literal methods as functions, accepted public TypeScript static method symbols without leaking the internal `$static` suffix, and kept `scan_usages` resolving both public and internal static method spellings.
+
+Revision note, 2026-07-06 / Codex: Java issue #486 is fixed on fresh usagebench runs. The constructor false positive was a structured nested-type resolution bug: `new Service.Repository()` could resolve as the outer `Service` constructor. The usage graph resolver now resolves `scoped_type_identifier` nodes through their qualifier and nested child before falling back to simple file-scope type resolution. The annotated override discrepancy was a rendering mismatch in `search_symbols`; symbol search now reports the declaration display/name range instead of the whole declaration range, preserving analyzer ranges for enclosing-scope logic. Focused local validation passed:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_java_graph_test java_graph_strategy_keeps_nested_constructor_usage_narrow -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_java_graph_test java_graph_strategy_handles_nested_type_references -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test searchtools_fuzzy_symbol_lookup java_annotated_method_search_symbol_uses_name_line -- --nocapture
+
+Fresh usagebench validation after clearing Java fixture `.bifrost` caches:
+
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/java-baseline.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-java-baseline-fresh
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/java-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-java-lsp-fresh
+
+Confirmed improved cases: `java-service-class-construction` and `java-parity-concrete-implementation-method-call`.

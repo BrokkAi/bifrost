@@ -170,6 +170,46 @@ const direct = ApiClient.create("/direct");
 }
 
 #[test]
+fn java_annotated_method_search_symbol_uses_name_line() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/example/parity/ConsoleHandler.java",
+            r#"package example.parity;
+
+public class ConsoleHandler {
+    @Override
+    public String handle(String value) {
+        return value.trim();
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["handle".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+
+    let file = search
+        .files
+        .iter()
+        .find(|file| file.path == "src/main/java/example/parity/ConsoleHandler.java")
+        .unwrap_or_else(|| panic!("missing ConsoleHandler.java in {search:#?}"));
+    assert!(
+        file.functions
+            .iter()
+            .any(|hit| hit.symbol == "example.parity.ConsoleHandler.handle" && hit.line == 5),
+        "expected annotated method on name line, not annotation line: {search:#?}"
+    );
+}
+
+#[test]
 fn php_symbol_sources_accept_common_foreign_delimiters() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

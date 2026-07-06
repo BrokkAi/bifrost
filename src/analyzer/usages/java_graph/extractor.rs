@@ -240,6 +240,12 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     ) {
         return;
     }
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "scoped_type_identifier")
+    {
+        return;
+    }
     if is_ignored_type_context(node) {
         return;
     }

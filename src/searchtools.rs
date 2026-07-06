@@ -4628,7 +4628,9 @@ fn collect_ranked_kind_names(
                 .map(move |signature| SearchSymbolHit {
                     symbol: display_symbol_for_target(&candidate.code_unit),
                     signature,
-                    line: candidate.line,
+                    line: definition_display_range(analyzer, &candidate.code_unit)
+                        .map(|range| range.start_line)
+                        .unwrap_or(candidate.line),
                 })
         })
         .collect();

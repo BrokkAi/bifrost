@@ -200,6 +200,12 @@ pub(super) fn argument_list_arity(node: Node<'_>) -> usize {
 }
 
 pub(super) fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    if node.kind() == "scoped_type_identifier"
+        && let Some(resolved) = resolve_nested_type_from_scoped_node(node, ctx)
+    {
+        return Some(resolved);
+    }
+
     let raw = node_text(node, ctx.source);
     if raw.is_empty() {
         return None;
@@ -212,6 +218,40 @@ pub(super) fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Optio
         .trim_end_matches("[]")
         .trim();
     ctx.java.resolve_type_name_in_file(ctx.file, normalized)
+}
+
+fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    let mut cursor = node.walk();
+    let typed_children: Vec<_> = node
+        .named_children(&mut cursor)
+        .filter(|child| {
+            matches!(
+                child.kind(),
+                "type_identifier" | "scoped_type_identifier" | "generic_type"
+            )
+        })
+        .collect();
+    let (name, qualifier) = typed_children.split_last()?;
+    let qualifier = qualifier.last().copied()?;
+    let qualifier_type = resolve_type_from_node(qualifier, ctx)?;
+    let name = node_text(*name, ctx.source);
+    if name.is_empty() {
+        return None;
+    }
+
+    let nested = |owner: &CodeUnit| {
+        ctx.analyzer
+            .definitions(&format!("{}.{}", owner.fq_name(), name))
+            .find(|unit| unit.is_class())
+            .cloned()
+    };
+    nested(&qualifier_type).or_else(|| {
+        ctx.analyzer
+            .type_hierarchy_provider()?
+            .get_ancestors(&qualifier_type)
+            .into_iter()
+            .find_map(|ancestor| nested(&ancestor))
+    })
 }
 
 pub(super) fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
