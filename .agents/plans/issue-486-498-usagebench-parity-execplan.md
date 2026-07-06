@@ -20,7 +20,7 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
 - [x] (2026-07-06T19:08Z) Fixed and usagebench-validated Go issue #495 by resolving imported package factory return types relative to the factory declaration file.
 - [x] (2026-07-06T19:14Z) Fixed and usagebench-validated the remaining PHP issue #496 interface implementation case.
 - [x] (2026-07-06T19:38Z) Fixed and usagebench-validated Rust issue #497 UFCS trait method and impl-associated-type definition lookup cases.
-- [ ] Fix and usagebench-validate remaining Scala issue #498.
+- [x] (2026-07-06T20:03Z) Fixed and usagebench-validated Scala issue #498 relative wildcard import visibility for extension methods.
 
 ## Surprises & Discoveries
 
@@ -55,6 +55,9 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
 - Decision: For Rust #497, index trait default method bodies and trait associated types as declaration children, then special-case only impl associated-type declaration names in `get_definition`.
   Rationale: UFCS lookup already knew how to resolve a proven implementer to a visible trait item once the trait method declaration existed in the index. The associated-type failure was declaration-site ambiguity: selecting `type Output` inside an `impl Trait for Type` should navigate to the trait contract item, while ordinary type references should keep the existing Rust resolution flow.
   Date/Author: 2026-07-06 / Codex.
+- Decision: For Scala #498, keep extension methods represented as ordinary function declarations with an `extension (...)` signature and fix the shared visibility model for wildcard imports.
+  Rationale: Existing extension receiver matching, ambiguity handling, and declaration-to-usage logic worked for fully qualified imports such as `import app.Syntax.*`. The remaining usagebench fixture used same-package relative import syntax, `import Syntax.*`; wildcard import visibility must normalize both absolute and package-relative candidates so `get_definition` and scan-usages share the same visible extension set without adding name-only fallbacks.
+  Date/Author: 2026-07-06 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -65,6 +68,8 @@ Go issue #495 is complete on the Bifrost side. The existing embedded-promotion m
 PHP issue #496 is complete on the Bifrost side. Trait method calls, interface method calls through concrete receivers, interface implementation declarations, aliased static calls, and static property accesses now all improve in `php-lsp-parity.yaml`; the magic `__get` scenario remains explicitly not planned in usagebench.
 
 Rust issue #497 is complete on the Bifrost side. Trait default methods and associated types are indexed as trait-owned items, so `LocalRunner::run(...)` resolves to `Runner::run`, and declaration-site lookup on an impl associated type resolves to the associated type declared by the implemented trait.
+
+Scala issue #498 is complete on the Bifrost side. Same-package relative wildcard imports now expose extension methods consistently across get-definition and usage scans, so `import Syntax.*` makes `Syntax` extension members visible just like `import example.Syntax.*`.
 
 ## Context and Orientation
 
@@ -258,3 +263,18 @@ Fresh usagebench validation after clearing Rust fixture `.bifrost` caches:
     ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/rust-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-rust-lsp-497
 
 Confirmed improved cases: `rust-parity-module-declaration-definition`, `rust-parity-ufcs-trait-method-definition`, and `rust-parity-associated-type-impl-definition`. The macro-generated function reference remains `NOTPLANNED`.
+
+Revision note, 2026-07-06 / Codex: Scala issue #498 is fixed on fresh usagebench runs. The fixture failure was not missing extension-method modeling in general; it was same-package relative wildcard visibility. `import Syntax.*` in package `example` did not expose extension methods owned by `example.Syntax`, while `import example.Syntax.*` already worked. The Scala graph name resolvers now expand wildcard import paths through both absolute and package-relative candidates for type/package visibility, extension method visibility, family-owner visibility, and ambiguity detection. Focused validation passed:
+
+    cargo test --test get_definition_test scala_relative_wildcard_extension_method_call_resolves_to_extension_definition -- --nocapture
+    cargo test --test usages_scala_graph_test scala_graph_resolves_relative_wildcard_extension_method_usage -- --nocapture
+    cargo test --test get_definition_test scala_
+    cargo test --test usages_scala_graph_test
+    cargo test --test metals_goto_definition scala_
+    cargo clippy-no-cuda
+
+Fresh usagebench validation after clearing Scala fixture `.bifrost` caches:
+
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/scala-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-scala-lsp-498
+
+Confirmed improved cases: `scala-parity-import-alias-companion-method` and `scala-parity-extension-method-call`. The generated/synthetic case remains `NOTPLANNED`.

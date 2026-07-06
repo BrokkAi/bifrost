@@ -247,16 +247,17 @@ impl NameResolver {
                 continue;
             };
             if import.is_wildcard {
+                let package_candidates = import_candidate_paths(&path, &file_package);
                 // `import pkg._` exposes every type in `pkg` by simple name.
                 for ((decl_package, simple), fqn) in &types.by_package {
-                    if *decl_package == path {
+                    if package_candidates.contains(decl_package) {
                         names.insert(simple.clone(), fqn.clone());
                     }
                 }
-                let normalized = scala_normalized_fq_name(&path);
+                let normalized_paths = import_candidate_normalized_paths(&path, &file_package);
                 for methods in types.extension_methods_by_name.values() {
                     for method in methods {
-                        if scala_normalized_fq_name(&method.owner_fqn) == normalized {
+                        if normalized_paths.contains(&scala_normalized_fq_name(&method.owner_fqn)) {
                             visible_extensions
                                 .entry(scala_member_name(&method.fqn).to_string())
                                 .or_default()
@@ -325,10 +326,16 @@ impl NameResolver {
 }
 
 fn import_candidate_normalized_paths(path: &str, package_name: &str) -> HashSet<String> {
-    let normalized = scala_normalized_fq_name(path);
-    let mut candidates = HashSet::from_iter([normalized.clone()]);
-    if !package_name.is_empty() && !normalized.starts_with(&format!("{package_name}.")) {
-        candidates.insert(scala_normalized_fq_name(&format!("{package_name}.{path}")));
+    import_candidate_paths(path, package_name)
+        .into_iter()
+        .map(|candidate| scala_normalized_fq_name(&candidate))
+        .collect()
+}
+
+fn import_candidate_paths(path: &str, package_name: &str) -> HashSet<String> {
+    let mut candidates = HashSet::from_iter([path.to_string()]);
+    if !package_name.is_empty() && !path.starts_with(&format!("{package_name}.")) {
+        candidates.insert(format!("{package_name}.{path}"));
     }
     candidates
 }

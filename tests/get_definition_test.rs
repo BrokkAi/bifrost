@@ -12748,6 +12748,42 @@ object App:
 }
 
 #[test]
+fn scala_relative_wildcard_extension_method_call_resolves_to_extension_definition() {
+    let source = r#"
+package example
+
+object Syntax:
+  extension (value: String)
+    def slug: String =
+      value.toLowerCase.replace(" ", "-")
+
+object App:
+  import Syntax.*
+  val slugged = "Hello World".slug
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/main/scala/example/Workflow.scala", source)
+        .build();
+
+    let slug_start = source.find(".slug").expect("slug token") + 1;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/main/scala/example/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            slug_start,
+            slug_start + "slug".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.Syntax$.slug",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_unqualified_inherited_helper_call_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

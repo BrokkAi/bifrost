@@ -324,17 +324,23 @@ impl Visibility {
             self.add_owner_name(owner_name, owner_fq_name);
         }
         self.direct_member_names.extend(names.direct_member_names);
-        self.apply_family_owner_import(import, spec);
+        self.apply_family_owner_import(import, spec, file_package);
         self.apply_imported_factory_receiver(scala, import, spec, file_package);
     }
 
-    fn apply_family_owner_import(&mut self, import: &ImportInfo, spec: &TargetSpec) {
+    fn apply_family_owner_import(
+        &mut self,
+        import: &ImportInfo,
+        spec: &TargetSpec,
+        file_package: &str,
+    ) {
         let Some(path) = scala_import_path(import) else {
             return;
         };
         if import.is_wildcard {
+            let candidates = import_candidate_fq_names(&path, file_package);
             for owner in &spec.family_owners {
-                if path == owner.package_name() {
+                if candidates.contains(owner.package_name()) {
                     self.add_owner_name(
                         scala_display_name(owner),
                         scala_normalized_fq_name(&owner.fq_name()),
@@ -412,7 +418,12 @@ impl Visibility {
             .map(str::to_string)
             .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()).to_string());
         if import.is_wildcard {
-            if path == spec.target.package_name() {
+            let candidates = import_candidate_fq_names(&path, file_package);
+            let normalized_candidates: HashSet<String> = candidates
+                .iter()
+                .map(|candidate| scala_normalized_fq_name(candidate))
+                .collect();
+            if candidates.contains(spec.target.package_name()) {
                 names.type_names.insert(spec.member_name.clone());
                 if spec.owner.is_none() {
                     names.direct_member_names.insert(spec.member_name.clone());
@@ -421,7 +432,7 @@ impl Visibility {
             if spec
                 .owner
                 .as_ref()
-                .is_some_and(|owner| path == owner.package_name())
+                .is_some_and(|owner| candidates.contains(owner.package_name()))
                 && let Some(owner_name) = spec.owner_name.as_ref()
                 && let Some(owner_fq_name) = spec.owner_fq_name.as_ref()
             {
@@ -432,7 +443,7 @@ impl Visibility {
             if spec
                 .owner_fq_name
                 .as_ref()
-                .is_some_and(|owner_fq| path == *owner_fq)
+                .is_some_and(|owner_fq| normalized_candidates.contains(owner_fq))
             {
                 names.direct_member_names.insert(spec.member_name.clone());
             }
@@ -503,6 +514,7 @@ fn ambiguous_wildcard_members(
     }
 
     let mut exposing_wildcards = HashSet::default();
+    let file_package = package_name_of(scala, file).unwrap_or_default();
     for import in scala.import_info_of(file) {
         if !import.is_wildcard {
             continue;
@@ -510,7 +522,7 @@ fn ambiguous_wildcard_members(
         let Some(path) = scala_import_path(import) else {
             continue;
         };
-        if wildcard_path_could_expose(scala, &path, spec) {
+        if wildcard_path_could_expose(scala, &path, &file_package, spec) {
             exposing_wildcards.insert(path);
         }
     }
@@ -522,7 +534,17 @@ fn ambiguous_wildcard_members(
     ambiguous
 }
 
-fn wildcard_path_could_expose(scala: &ScalaAnalyzer, path: &str, spec: &TargetSpec) -> bool {
+fn wildcard_path_could_expose(
+    scala: &ScalaAnalyzer,
+    path: &str,
+    file_package: &str,
+    spec: &TargetSpec,
+) -> bool {
+    let candidates = import_candidate_fq_names(path, file_package);
+    let normalized_candidates: HashSet<String> = candidates
+        .iter()
+        .map(|candidate| scala_normalized_fq_name(candidate))
+        .collect();
     if spec.is_extension_method {
         return scala.all_declarations().any(|unit| {
             unit.is_function()
@@ -532,23 +554,25 @@ fn wildcard_path_could_expose(scala: &ScalaAnalyzer, path: &str, spec: &TargetSp
                     .or_else(|| scala.signatures(unit).first().map(String::as_str))
                     .is_some_and(|signature| signature.starts_with("extension "))
                 && owner_of(scala, unit).is_some_and(|owner| {
-                    scala_normalized_fq_name(&owner.fq_name()) == scala_normalized_fq_name(path)
+                    normalized_candidates.contains(&scala_normalized_fq_name(&owner.fq_name()))
                 })
         });
     }
 
     if spec.owner.is_none() {
-        return scala
-            .definitions(&format!("{path}.{}", spec.member_name))
-            .any(|unit| {
-                matches!(spec.kind, TargetKind::Method) && unit.is_function()
-                    || matches!(spec.kind, TargetKind::Field) && unit.is_field()
-            });
+        return candidates.iter().any(|candidate| {
+            scala
+                .definitions(&format!("{candidate}.{}", spec.member_name))
+                .any(|unit| {
+                    matches!(spec.kind, TargetKind::Method) && unit.is_function()
+                        || matches!(spec.kind, TargetKind::Field) && unit.is_field()
+                })
+        });
     }
 
     spec.owner_fq_name
         .as_ref()
-        .is_some_and(|owner_fq| path == owner_fq)
+        .is_some_and(|owner_fq| normalized_candidates.contains(owner_fq))
 }
 
 fn signature_arity(signature: &str) -> Option<usize> {

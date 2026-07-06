@@ -963,6 +963,32 @@ object Syntax:
 }
 
 #[test]
+fn scala_graph_resolves_relative_wildcard_extension_method_usage() {
+    let workflow_source = r#"
+package example
+
+object Syntax:
+  extension (value: String)
+    def slug: String =
+      value.toLowerCase.replace(" ", "-")
+
+object App:
+  import Syntax.*
+  val slugged = "Hello World".slug
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("src/main/scala/example/Workflow.scala", workflow_source)]);
+    let target = definition(&analyzer, "example.Syntax$.slug");
+    let hits = scala_hits(
+        &analyzer,
+        &target,
+        &["src/main/scala/example/Workflow.scala"],
+    );
+
+    assert_hit_line(&hits, line_of(workflow_source, "\"Hello World\".slug"));
+}
+
+#[test]
 fn scala_graph_does_not_pick_between_ambiguous_extension_methods() {
     let app_source = r#"
 package app
