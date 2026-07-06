@@ -3075,10 +3075,9 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
     assert_eq!(1, value["summary"]["resolved_symbols"].as_u64().unwrap());
     assert_eq!(350, value["summary"]["total_hits"].as_u64().unwrap());
     assert_eq!(
-        "scan_usages",
-        value["summary"]["recommended_next_call"]["tool"]
-            .as_str()
-            .unwrap()
+        None,
+        value["summary"].get("recommended_next_call"),
+        "payload: {value}"
     );
     assert_eq!(0, array_len(&value, "too_many_callsites"));
     let usages = value["usages"].as_array().unwrap();
@@ -3092,6 +3091,12 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
         "payload: {value}"
     );
     assert_eq!(330, usage["files_truncated"].as_u64().unwrap());
+    assert!(
+        usage["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("narrower `paths`")),
+        "payload: {value}"
+    );
     assert!(
         usage["top_enclosing"]
             .as_array()

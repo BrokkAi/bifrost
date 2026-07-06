@@ -584,8 +584,6 @@ pub struct ScanUsagesSummary {
     pub partial: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub symbols: Vec<ScanUsagesSymbolSummary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recommended_next_call: Option<ScanUsagesRecommendedNextCall>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
@@ -613,13 +611,6 @@ pub struct ScanUsagesSymbolSummary {
 pub struct ScanUsagesFileSummary {
     pub path: String,
     pub hit_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ScanUsagesRecommendedNextCall {
-    pub tool: String,
-    pub arguments: serde_json::Value,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -3858,8 +3849,6 @@ fn build_scan_usages_summary(
         })
         .collect::<Vec<_>>();
 
-    let recommended_next_call = recommended_scan_usages_next_call(usages, too_many_callsites);
-
     let mut warnings = Vec::new();
     if !not_found.is_empty() {
         warnings.push(format!(
@@ -3908,45 +3897,8 @@ fn build_scan_usages_summary(
         total_hits,
         partial,
         symbols,
-        recommended_next_call,
         warnings,
     }
-}
-
-fn recommended_scan_usages_next_call(
-    usages: &[SymbolUsages],
-    too_many_callsites: &[TooManyCallsitesInfo],
-) -> Option<ScanUsagesRecommendedNextCall> {
-    if let Some(usage) = usages
-        .iter()
-        .find(|usage| usage.rendering == UsageRendering::Summary && !usage.files.is_empty())
-    {
-        let paths = usage
-            .files
-            .iter()
-            .take(3)
-            .map(|file| serde_json::Value::String(file.path.clone()))
-            .collect::<Vec<_>>();
-        return Some(ScanUsagesRecommendedNextCall {
-            tool: "scan_usages".to_string(),
-            arguments: serde_json::json!({
-                "symbols": [usage.symbol.clone()],
-                "paths": paths,
-            }),
-            reason: "Summary-mode result; narrow to top files for line-level detail.".to_string(),
-        });
-    }
-
-    too_many_callsites
-        .first()
-        .map(|item| ScanUsagesRecommendedNextCall {
-            tool: "scan_usages".to_string(),
-            arguments: serde_json::json!({
-                "symbols": [item.symbol.clone()],
-            }),
-            reason: "Callsite count exceeded the exact scan cap; use a more specific symbol or add paths."
-                .to_string(),
-        })
 }
 
 fn demote_largest_symbol(states: &mut [SymbolUsageRenderState]) -> bool {
@@ -4071,7 +4023,7 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
             state.total_hits
         )),
         UsageRendering::Summary => notes.push(format!(
-            "{} hits; showing per-file counts. Re-call with a single symbol or narrower scope for line detail.",
+            "{} hits; showing bounded per-file counts instead of line-level callers. Re-call with narrower `paths` or a more specific symbol for line detail.",
             state.total_hits
         )),
     }
@@ -4288,7 +4240,7 @@ fn some_if_nonzero(value: usize) -> Option<usize> {
 
 fn too_many_callsites_note(limit: usize) -> String {
     format!(
-        "Stopped after {limit} callsites. Re-call with a single symbol or narrower paths for detail."
+        "Stopped after the {limit}-callsite cap for this high-fanout symbol. Re-call with narrower `paths` or a more specific declaration; exhaustive output is intentionally suppressed for this query."
     )
 }
 
