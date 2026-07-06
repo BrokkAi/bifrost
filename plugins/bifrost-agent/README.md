@@ -122,6 +122,16 @@ copied here. Workflow skills should rely on the host-provided workspace context
 and the plugin's analyzer tools, or gracefully skip explicit workspace
 activation when `activate_workspace` is unavailable.
 
+Codex does not register plugin-provided `agents/*.md` files as named
+`brokk:*` subagent types. The Codex manifest therefore loads generated skills
+from `codex-skills/`; those files embed the specialist prompts and instruct
+Codex to use generic subagents with the matching prompt. Do not edit
+`codex-skills/` directly. Update `skills/` or `agents/`, then regenerate:
+
+```bash
+node scripts/generate-codex-skill-bundle.mjs
+```
+
 ## Claude Code Install
 
 Add the Brokk marketplace from GitHub, then install Bifrost:
