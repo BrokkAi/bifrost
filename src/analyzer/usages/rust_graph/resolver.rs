@@ -7,7 +7,9 @@ use std::collections::BTreeSet;
 
 pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     target.is_function()
-        && analyzer.parent_of(target).is_none()
+        && analyzer
+            .parent_of(target)
+            .is_none_or(|parent| parent.is_module())
         && (!is_public_like_declaration(analyzer, target)
             || analyzer.is_rust_cfg_test_declaration(target))
 }

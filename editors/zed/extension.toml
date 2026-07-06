@@ -1,0 +1,47 @@
+id = "bifrost"
+name = "Bifrost"
+description = "Bifrost multi-language code intelligence."
+version = "0.0.1"
+schema_version = 1
+authors = ["Brokk <support@brokk.ai>"]
+repository = "https://github.com/BrokkAi/bifrost"
+
+[language_servers.bifrost-rust]
+name = "Bifrost"
+language = "Rust"
+
+[language_servers.bifrost-python]
+name = "Bifrost"
+language = "Python"
+
+[language_servers.bifrost-go]
+name = "Bifrost"
+language = "Go"
+
+[language_servers.bifrost-javascript]
+name = "Bifrost"
+language = "JavaScript"
+
+[language_servers.bifrost-typescript]
+name = "Bifrost"
+language = "TypeScript"
+
+[language_servers.bifrost-ruby]
+name = "Bifrost"
+language = "Ruby"
+
+[language_servers.bifrost-php]
+name = "Bifrost"
+language = "PHP"
+
+[language_servers.bifrost-csharp]
+name = "Bifrost"
+language = "C#"
+
+[language_servers.bifrost-scala]
+name = "Bifrost"
+language = "Scala"
+
+[language_servers.bifrost-java]
+name = "Bifrost"
+language = "Java"
