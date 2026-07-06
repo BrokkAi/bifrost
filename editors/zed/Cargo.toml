@@ -1,0 +1,13 @@
+[package]
+name = "bifrost_zed"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "LGPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"

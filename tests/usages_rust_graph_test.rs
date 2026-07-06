@@ -124,6 +124,48 @@ pub fn get_summaries() {
 }
 
 #[test]
+fn rust_graph_strategy_finds_same_file_private_module_function_calls() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "mod agent;\n"),
+        (
+            "src/agent.rs",
+            r#"
+fn parse_setup_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_flag(value: &str) -> Option<bool> {
+    parse_setup_bool(value)
+}
+
+fn parse_other(value: &str) -> Option<bool> {
+    match parse_setup_bool(value) {
+        Some(value) => Some(value),
+        None => None,
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "agent.parse_setup_bool");
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = result
+        .into_either()
+        .expect("expected same-file private module function usages");
+
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected both same-file call sites: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_pub_cfg_test_async_function_calls() {
     let (_project, analyzer) = rust_analyzer_with_files(&[(
         "src/db.rs",
