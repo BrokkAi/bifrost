@@ -1,6 +1,6 @@
 use brokk_bifrost::{
-    GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, ScalaAnalyzer, TestProject,
-    TypescriptAnalyzer,
+    GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, RustAnalyzer, ScalaAnalyzer,
+    TestProject, TypescriptAnalyzer,
     searchtools::{SummariesParams, SummaryElement, get_summaries},
     searchtools_render::{RenderOptions, RenderText},
 };
@@ -660,6 +660,59 @@ const char* ffDetectCodec(void);
         "{:#?}",
         summary.elements
     );
+}
+
+#[test]
+fn rust_file_summaries_surface_macro_rules_inside_wrapper_invocation() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/macros/join.rs",
+            r#"
+macro_rules! doc {
+    ($join:item) => { $join };
+}
+
+#[cfg(doc)]
+doc! {macro_rules! join {
+    ($(biased;)? $($future:expr),*) => { unimplemented!() }
+}}
+
+#[cfg(not(doc))]
+doc! {macro_rules! join {
+    ( $($e:expr),+ $(,)? ) => {{
+        let _ = ($($e),+);
+    }};
+}}
+"#,
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["src/macros/join.rs".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    let join_elements = result.summaries[0]
+        .elements
+        .iter()
+        .filter(|element| {
+            element.kind == "macro"
+                && element.symbol == "macros.join.join"
+                && element.text == "macro_rules! join"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        2,
+        join_elements.len(),
+        "{:#?}",
+        result.summaries[0].elements
+    );
+    assert_ne!(join_elements[0].start_line, join_elements[1].start_line);
 }
 
 #[test]

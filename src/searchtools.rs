@@ -4761,10 +4761,18 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
     let path = rel_path_string(code_unit.source());
     let fallback_start = ranges.first().map(|range| range.start_line).unwrap_or(1);
 
-    signatures
-        .iter()
-        .enumerate()
-        .filter_map(|(index, signature)| {
+    let element_count = if signatures.len() == 1 {
+        ranges.len().max(1)
+    } else {
+        signatures.len()
+    };
+
+    (0..element_count)
+        .filter_map(|index| {
+            let signature = signatures
+                .get(index)
+                .or_else(|| signatures.first())
+                .expect("signatures is not empty");
             let text = trim_summary_signature(signature);
             if text.is_empty() {
                 return None;

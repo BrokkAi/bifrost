@@ -1,7 +1,8 @@
 mod common;
 
 use brokk_bifrost::{
-    CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer, ScalaAnalyzer,
+    CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer, RustAnalyzer,
+    ScalaAnalyzer,
     searchtools::{
         ScanUsagesParams, SearchSymbolsParams, SymbolLookupParams, SymbolSourcesResult,
         get_symbol_locations, get_symbol_sources, scan_usages, search_symbols,
@@ -472,6 +473,80 @@ const char* ffDetectBootmgr(FFBootmgrResult* result) {
             .text
             .contains("return \"iBoot\";"),
         "{function_source:#?}"
+    );
+}
+
+#[test]
+fn rust_wrapped_macro_rules_lookup_supports_sources_search_and_file_outline() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/macros/join.rs",
+            r#"
+macro_rules! doc {
+    ($join:item) => { $join };
+}
+
+#[cfg(doc)]
+doc! {macro_rules! join {
+    ($(biased;)? $($future:expr),*) => { unimplemented!() }
+}}
+
+#[cfg(not(doc))]
+doc! {macro_rules! join {
+    (@ { rotator_select=$rotator_select:ty; ( $($s:tt)* ) ( $($n:tt)* ) $($t:tt)* } $e:expr, $($r:tt)* ) => {
+        $crate::join!(@{ rotator_select=$rotator_select; ($($s)* _) ($($n)* + 1) $($t)* ($($s)*) $e, } $($r)*)
+    };
+
+    ( $($e:expr),+ $(,)? ) => {
+        $crate::join!(@{ rotator_select=$crate::macros::support::SelectNormal; () (0) } $($e,)*)
+    };
+}}
+"#,
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["join".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+    assert_eq!(1, search.files.len(), "{search:#?}");
+    assert_eq!("src/macros/join.rs", search.files[0].path);
+    assert!(
+        search.files[0]
+            .macros
+            .iter()
+            .any(|hit| hit.symbol == "macros.join.join"),
+        "{search:#?}"
+    );
+
+    let macro_source = source_for(&analyzer, "join");
+    assert!(macro_source.not_found.is_empty(), "{macro_source:#?}");
+    assert!(
+        macro_source
+            .sources
+            .iter()
+            .any(|source| source.text.contains("( $($e:expr),+ $(,)? )")),
+        "{macro_source:#?}"
+    );
+    assert!(
+        macro_source
+            .sources
+            .iter()
+            .any(|source| source.text.contains("rotator_select=$rotator_select:ty")),
+        "{macro_source:#?}"
+    );
+
+    let file_outline = source_for(&analyzer, "src/macros/join.rs");
+    assert!(file_outline.not_found.is_empty(), "{file_outline:#?}");
+    assert_eq!(1, file_outline.sources.len(), "{file_outline:#?}");
+    assert!(
+        file_outline.sources[0].text.contains("- join"),
+        "{file_outline:#?}"
     );
 }
 

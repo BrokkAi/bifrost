@@ -118,9 +118,17 @@ impl Language {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CodeUnitType {
     Class,
+    /// Runtime-invocable executable units: free functions, methods, closures,
+    /// lambdas, and language-specific equivalents. These share a callable body
+    /// model even when their declaration syntax differs.
     Function,
     Field,
     Module,
+    /// Compile-time invocable units such as Rust `macro_rules!` and C/C++
+    /// preprocessor macros. Keep these distinct from `Function` because their
+    /// bodies are token/template rules, their "calls" expand inline before
+    /// ordinary semantic analysis, and resolving them does not imply a runtime
+    /// call edge.
     Macro,
     FileScope,
 }

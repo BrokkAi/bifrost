@@ -258,21 +258,32 @@ impl ParsedFile {
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
-        if parent.is_none() {
+        self.add_code_unit_with_range(code_unit, node_range(node), parent, top_level);
+    }
+
+    pub fn add_code_unit_with_range(
+        &mut self,
+        code_unit: CodeUnit,
+        range: Range,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        let inserted = self.declarations.insert(code_unit.clone());
+
+        if inserted && parent.is_none() {
             self.top_level_declarations.push(code_unit.clone());
         }
 
-        self.declarations.insert(code_unit.clone());
-        self.ranges
-            .entry(code_unit.clone())
-            .or_default()
-            .push(node_range(node));
+        let ranges = self.ranges.entry(code_unit.clone()).or_default();
+        if !ranges.contains(&range) {
+            ranges.push(range);
+        }
 
         if let Some(parent) = parent {
-            self.children
-                .entry(parent)
-                .or_default()
-                .push(code_unit.clone());
+            let children = self.children.entry(parent).or_default();
+            if !children.contains(&code_unit) {
+                children.push(code_unit.clone());
+            }
         }
 
         if let Some(top_level) = top_level {
@@ -305,17 +316,17 @@ impl ParsedFile {
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
-        if parent.is_none() {
+        let inserted = self.declarations.insert(code_unit.clone());
+
+        if inserted && parent.is_none() {
             self.top_level_declarations.push(code_unit.clone());
         }
 
-        self.declarations.insert(code_unit.clone());
-
         if let Some(parent) = parent {
-            self.children
-                .entry(parent)
-                .or_default()
-                .push(code_unit.clone());
+            let children = self.children.entry(parent).or_default();
+            if !children.contains(&code_unit) {
+                children.push(code_unit.clone());
+            }
         }
 
         if let Some(top_level) = top_level {

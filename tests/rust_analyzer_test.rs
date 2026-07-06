@@ -1,7 +1,10 @@
 use brokk_bifrost::{
-    CodeUnit, IAnalyzer, Language, Project, ProjectFile, RustAnalyzer, TestProject,
+    CodeUnit, CodeUnitType, IAnalyzer, Language, Project, ProjectFile, RustAnalyzer, TestProject,
 };
 use tempfile::tempdir;
+
+mod common;
+use common::InlineTestProject;
 
 fn rust_project(files: &[(&str, &str)]) -> TestProject {
     let temp = tempdir().unwrap();
@@ -207,6 +210,83 @@ fn test_nested_modules_with_test_function() {
     assert!(!analyzer.get_definitions("outer.outer_helper").is_empty());
     assert!(!analyzer.get_definitions("top_level").is_empty());
     assert!(analyzer.contains_tests(&file));
+}
+
+#[test]
+fn test_wrapped_macro_rules_declaration_is_indexed_as_macro() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/macros/join.rs",
+            r#"
+macro_rules! doc {
+    ($join:item) => { $join };
+}
+
+#[cfg(doc)]
+doc! {macro_rules! join {
+    ($(biased;)? $($future:expr),*) => { unimplemented!() }
+}}
+
+#[cfg(not(doc))]
+doc! {macro_rules! join {
+    ( $($e:expr),+ $(,)? ) => {{
+        let _ = ($($e),+);
+    }};
+}}
+"#,
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let file = project.file("src/macros/join.rs");
+
+    let declarations = analyzer.get_declarations(&file);
+    let join = declarations
+        .iter()
+        .find(|unit| unit.identifier() == "join")
+        .unwrap_or_else(|| panic!("missing join macro in {declarations:#?}"));
+    assert_eq!(CodeUnitType::Macro, join.kind());
+    assert_eq!("macros.join.join", join.fq_name());
+    assert_eq!(2, analyzer.ranges(join).len());
+    assert_eq!(
+        1,
+        analyzer
+            .get_top_level_declarations(&file)
+            .iter()
+            .filter(|unit| unit.fq_name() == "macros.join.join")
+            .count()
+    );
+}
+
+#[test]
+fn test_inert_macro_rules_tokens_are_not_indexed_as_macros() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/macros/inert.rs",
+            r#"
+macro_rules! drop_tokens {
+    ($item:item) => {};
+}
+
+drop_tokens! { macro_rules! fake {
+    () => {};
+}}
+
+stringify! { macro_rules! also_fake {
+    () => {};
+}}
+"#,
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let file = project.file("src/macros/inert.rs");
+
+    let declarations = analyzer.get_declarations(&file);
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.identifier() != "fake" && unit.identifier() != "also_fake"),
+        "{declarations:#?}"
+    );
 }
 
 #[test]
