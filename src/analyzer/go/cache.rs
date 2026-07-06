@@ -15,6 +15,9 @@ pub(super) struct GoMemoCaches {
     pub(super) reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     pub(super) hierarchy_index: Arc<OnceLock<GoHierarchyIndex>>,
     pub(super) package_clause_names: Arc<OnceLock<HashMap<ProjectFile, String>>>,
+    pub(super) package_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
+    pub(super) dir_parent_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
+    pub(super) dir_parent_suffix_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
 }
 
 impl GoMemoCaches {
@@ -26,6 +29,9 @@ impl GoMemoCaches {
             reverse_import_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             package_clause_names: Arc::new(OnceLock::new()),
+            package_files: Arc::new(OnceLock::new()),
+            dir_parent_files: Arc::new(OnceLock::new()),
+            dir_parent_suffix_files: Arc::new(OnceLock::new()),
         }
     }
 

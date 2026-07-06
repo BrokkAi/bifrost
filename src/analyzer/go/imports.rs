@@ -2,7 +2,7 @@ use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
     build_reverse_import_index,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::GoAnalyzer;
@@ -21,28 +21,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 continue;
             };
-            // Prefer exact canonical-package identity: with a go.mod present a
-            // package's `package_name` is its import path, so this is
-            // unambiguous. Fall back to the directory-suffix heuristic only
-            // when nothing matches exactly (module-less or vendored layouts
-            // where the import path is a suffix of the directory).
-            let mut matching_files: Vec<_> = self
-                .inner
-                .all_files()
-                .filter(|candidate| *candidate != file)
-                .filter(|candidate| self.go_package_of(candidate).as_deref() == Some(path.as_str()))
-                .cloned()
-                .collect();
-            if matching_files.is_empty() {
-                matching_files = self
-                    .inner
-                    .all_files()
-                    .filter(|candidate| *candidate != file)
-                    .filter(|candidate| dir_suffix_matches(candidate, &path))
-                    .cloned()
-                    .collect();
-            }
-            for target_file in matching_files {
+            for target_file in self.matching_import_files(file, &path) {
                 resolved.extend(
                     self.inner
                         .top_level_declarations(&target_file)
@@ -131,14 +110,128 @@ impl GoAnalyzer {
             .next()
             .map(|unit| unit.package_name().to_string())
     }
+
+    fn matching_import_files(
+        &self,
+        source_file: &ProjectFile,
+        import_path: &str,
+    ) -> Vec<ProjectFile> {
+        // Prefer exact canonical-package identity: with a go.mod present a
+        // package's `package_name` is its import path, so this is unambiguous.
+        if let Some(files) = self.package_files().get(import_path) {
+            let exact: Vec<_> = files
+                .iter()
+                .filter(|candidate| *candidate != source_file)
+                .cloned()
+                .collect();
+            if !exact.is_empty() {
+                return exact;
+            }
+        }
+
+        // Fall back to the legacy directory-suffix heuristic only when no
+        // canonical package matches (module-less or vendored layouts).
+        let mut seen = HashSet::default();
+        let mut matching = Vec::new();
+        for suffix in path_suffixes(import_path) {
+            if let Some(files) = self.dir_parent_files().get(suffix) {
+                for candidate in files.iter() {
+                    if candidate != source_file && seen.insert(candidate.clone()) {
+                        matching.push(candidate.clone());
+                    }
+                }
+            }
+        }
+        if let Some(files) = self.dir_parent_suffix_files().get(import_path) {
+            for candidate in files.iter() {
+                if candidate != source_file && seen.insert(candidate.clone()) {
+                    matching.push(candidate.clone());
+                }
+            }
+        }
+        matching
+    }
+
+    fn package_files(&self) -> &HashMap<String, Arc<Vec<ProjectFile>>> {
+        self.memo_caches.package_files.get_or_init(|| {
+            let mut files_by_package: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for file in self.inner.all_files() {
+                if let Some(package) = self.go_package_of(file) {
+                    files_by_package
+                        .entry(package)
+                        .or_default()
+                        .push(file.clone());
+                }
+            }
+            files_by_package
+                .into_iter()
+                .map(|(package, files)| (package, Arc::new(files)))
+                .collect()
+        })
+    }
+
+    fn dir_parent_files(&self) -> &HashMap<String, Arc<Vec<ProjectFile>>> {
+        self.memo_caches.dir_parent_files.get_or_init(|| {
+            let mut files_by_parent: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for file in self.inner.all_files() {
+                if self.go_package_of(file).is_none() {
+                    continue;
+                }
+                files_by_parent
+                    .entry(parent_path_key(file))
+                    .or_default()
+                    .push(file.clone());
+            }
+            files_by_parent
+                .into_iter()
+                .map(|(parent, files)| (parent, Arc::new(files)))
+                .collect()
+        })
+    }
+
+    fn dir_parent_suffix_files(&self) -> &HashMap<String, Arc<Vec<ProjectFile>>> {
+        self.memo_caches.dir_parent_suffix_files.get_or_init(|| {
+            let mut files_by_suffix: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for file in self.inner.all_files() {
+                if self.go_package_of(file).is_none() {
+                    continue;
+                }
+                for suffix in path_suffixes(&parent_path_key(file)) {
+                    files_by_suffix
+                        .entry(suffix.to_string())
+                        .or_default()
+                        .push(file.clone());
+                }
+            }
+            files_by_suffix
+                .into_iter()
+                .map(|(suffix, files)| (suffix, Arc::new(files)))
+                .collect()
+        })
+    }
 }
 
 /// Legacy directory-suffix import match, used only as a fallback when no
 /// declaration's canonical package equals the import path (module-less or
 /// vendored layouts).
 fn dir_suffix_matches(candidate: &ProjectFile, path: &str) -> bool {
-    let parent = candidate.parent().to_string_lossy().replace('\\', "/");
+    let parent = parent_path_key(candidate);
     parent == path || path.ends_with(&format!("/{parent}")) || parent.ends_with(&format!("/{path}"))
+}
+
+fn parent_path_key(file: &ProjectFile) -> String {
+    file.parent().to_string_lossy().replace('\\', "/")
+}
+
+fn path_suffixes(path: &str) -> impl Iterator<Item = &str> {
+    let mut suffixes = Vec::new();
+    suffixes.push(path);
+    suffixes.extend(
+        path.match_indices('/')
+            .map(|(index, _)| &path[index + 1..])
+            .filter(|suffix| !suffix.is_empty()),
+    );
+    suffixes.into_iter()
 }
 
 pub(super) fn extract_go_import_path(raw_import: &str) -> Option<String> {
