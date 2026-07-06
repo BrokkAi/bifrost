@@ -27,22 +27,11 @@ impl ImportAnalysisProvider for CppAnalyzer {
             return (*cached).clone();
         }
 
-        let file_name = file.rel_path().file_name().and_then(|value| value.to_str());
-        let mut references = HashSet::default();
-        for candidate in self.inner.all_files() {
-            if candidate == file {
-                continue;
-            }
-            if quoted_include_paths(self.inner.import_statements(candidate))
-                .iter()
-                .any(|include| {
-                    file.rel_path() == Path::new(include)
-                        || file_name.is_some_and(|name| include.ends_with(name))
-                })
-            {
-                references.insert(candidate.clone());
-            }
-        }
+        let references = self
+            .reverse_include_index()
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
 
         self.referencing_files
             .insert(file.clone(), Arc::new(references.clone()));
@@ -91,6 +80,69 @@ impl ImportAnalysisProvider for CppAnalyzer {
             })
         })
     }
+}
+
+impl CppAnalyzer {
+    fn reverse_include_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        self.reverse_include_index.get_or_init(|| {
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            let mut by_rel_path: HashMap<PathBuf, Vec<ProjectFile>> = HashMap::default();
+            let mut by_file_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for file in &files {
+                by_rel_path
+                    .entry(file.rel_path().to_path_buf())
+                    .or_default()
+                    .push(file.clone());
+                if let Some(file_name) =
+                    file.rel_path().file_name().and_then(|value| value.to_str())
+                {
+                    by_file_name
+                        .entry(file_name.to_string())
+                        .or_default()
+                        .push(file.clone());
+                }
+            }
+
+            let mut references_by_target: HashMap<ProjectFile, HashSet<ProjectFile>> =
+                HashMap::default();
+            for candidate in &files {
+                for include in quoted_include_paths(self.inner.import_statements(candidate)) {
+                    let mut matched_targets = HashSet::default();
+                    if let Some(targets) = by_rel_path.get(Path::new(&include)) {
+                        for target in targets {
+                            if target != candidate && matched_targets.insert(target.clone()) {
+                                references_by_target
+                                    .entry(target.clone())
+                                    .or_default()
+                                    .insert(candidate.clone());
+                            }
+                        }
+                    }
+                    for suffix in string_suffixes(&include) {
+                        if let Some(targets) = by_file_name.get(suffix) {
+                            for target in targets {
+                                if target != candidate && matched_targets.insert(target.clone()) {
+                                    references_by_target
+                                        .entry(target.clone())
+                                        .or_default()
+                                        .insert(candidate.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            references_by_target
+                .into_iter()
+                .map(|(target, files)| (target, Arc::new(files)))
+                .collect()
+        })
+    }
+}
+
+fn string_suffixes(value: &str) -> impl Iterator<Item = &str> {
+    value.char_indices().map(|(index, _)| &value[index..])
 }
 
 pub(crate) fn parse_quoted_include(line: &str) -> Option<String> {
