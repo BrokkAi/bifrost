@@ -40,6 +40,7 @@ export default defineConfig({
             { label: 'Codex', slug: 'codex' },
             { label: 'Claude Code', slug: 'claude-code' },
             { label: 'Cursor', slug: 'cursor' },
+            { label: 'Zed Agent', slug: 'zed-mcp' },
             { label: 'Amp', slug: 'amp' },
             { label: 'Antigravity', slug: 'antigravity' },
           ],
@@ -49,6 +50,7 @@ export default defineConfig({
           items: [
             { label: 'LSP Server', slug: 'lsp' },
             { label: 'VS Code', slug: 'vscode' },
+            { label: 'Zed', slug: 'zed-lsp' },
             { label: 'Neovim', slug: 'neovim' },
             { label: 'Helix', slug: 'helix' },
           ],
