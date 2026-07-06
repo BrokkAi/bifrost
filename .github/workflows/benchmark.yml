@@ -195,7 +195,10 @@ jobs:
           new_candidate_count="0"
           has_regressions="false"
           has_actionable_regressions="false"
-          environment_variance="null"
+          environment_variance_detected="false"
+          environment_variance_detail=""
+          environment_variance_covered_regression_count="0"
+          environment_variance_workspace_build_regression_count="0"
           if [ -f "$compare_path" ]; then
             compared_scenarios_count="$(jq -r '.compared_scenarios_count // 0' "$compare_path")"
             regression_count="$(jq -r '.regression_count // 0' "$compare_path")"
@@ -205,7 +208,10 @@ jobs:
             new_candidate_count="$(jq -r '.new_candidate_count // 0' "$compare_path")"
             has_regressions="$(jq -r '.has_regressions // false' "$compare_path")"
             has_actionable_regressions="$(jq -r '.has_actionable_regressions // .has_regressions // false' "$compare_path")"
-            environment_variance="$(jq -c '.environment_variance // null' "$compare_path")"
+            environment_variance_detected="$(jq -r '(.environment_variance // null) != null' "$compare_path")"
+            environment_variance_detail="$(jq -r '.environment_variance.detail // ""' "$compare_path")"
+            environment_variance_covered_regression_count="$(jq -r '.environment_variance.covered_regression_count // 0' "$compare_path")"
+            environment_variance_workspace_build_regression_count="$(jq -r '.environment_variance.workspace_build_regression_count // 0' "$compare_path")"
           fi
 
           summary_text=""
@@ -252,6 +258,7 @@ jobs:
               --arg compare_summary_path "$compare_summary_path" \
               --arg generated_at "$generated_at" \
               --arg selected_repo "$selected_repo" \
+              --arg environment_variance_detail "$environment_variance_detail" \
               --arg summary_text "$summary_text" \
               --argjson ok "$ok" \
               --argjson strict_compare "$strict_compare" \
@@ -266,7 +273,9 @@ jobs:
               --argjson new_candidate_count "$new_candidate_count" \
               --argjson has_regressions "$has_regressions" \
               --argjson has_actionable_regressions "$has_actionable_regressions" \
-              --argjson environment_variance "$environment_variance" \
+              --argjson environment_variance_detected "$environment_variance_detected" \
+              --argjson environment_variance_covered_regression_count "$environment_variance_covered_regression_count" \
+              --argjson environment_variance_workspace_build_regression_count "$environment_variance_workspace_build_regression_count" \
               '{
                 ok: $ok,
                 error_text: $error_text,
@@ -295,7 +304,10 @@ jobs:
                 new_candidate_count: $new_candidate_count,
                 has_regressions: $has_regressions,
                 has_actionable_regressions: $has_actionable_regressions,
-                environment_variance: $environment_variance,
+                environment_variance_detected: $environment_variance_detected,
+                environment_variance_detail: $environment_variance_detail,
+                environment_variance_covered_regression_count: $environment_variance_covered_regression_count,
+                environment_variance_workspace_build_regression_count: $environment_variance_workspace_build_regression_count,
                 summary_text: $summary_text
               }'
           )"
