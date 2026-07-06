@@ -782,6 +782,20 @@ void run(parity::Sink& sink) {
                 && main_source[hit.start_offset..hit.end_offset] == *"parity::HandlerAlias"),
         "alias-typed declaration site should resolve through the alias: {selected_texts:?}"
     );
+
+    let other_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "ConsoleHandler"
+            && unit.package_name() == "other"
+    });
+    let other_summaries = CppUsageGraphStrategy::new()
+        .find_usages(&analyzer, &[other_target], &candidates, 1000)
+        .into_either()
+        .expect("cpp graph success")
+        .into_iter()
+        .map(hit_summary)
+        .collect::<Vec<_>>();
+    assert_no_hit_contains(&other_summaries, "HandlerAlias::alias_handle");
 }
 
 #[test]

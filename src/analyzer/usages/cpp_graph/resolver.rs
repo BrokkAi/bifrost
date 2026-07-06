@@ -169,6 +169,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
 struct CppAlias {
     name: String,
     target: String,
+    namespace: Option<String>,
 }
 
 type ReceiverResolver<'a> = dyn for<'tree> Fn(Node<'tree>, &str) -> Vec<CodeUnit> + 'a;
@@ -295,12 +296,12 @@ impl VisibilityIndex {
             .trim()
             .trim_end_matches(';')
             .trim();
-        self.visible_by_file
-            .get(alias.source())?
-            .iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class)
-            .find(|unit| reference_matches_unit(raw_target, unit))
-            .cloned()
+        let resolved = self.resolve_type_for_declaration(alias.source(), alias, raw_target)?;
+        match resolved.kind() {
+            CodeUnitType::Class => Some(resolved),
+            _ if is_type_alias(&resolved) => self.alias_target(&resolved),
+            _ => None,
+        }
     }
 
     pub(super) fn canonical_type_for_reference(
@@ -328,8 +329,7 @@ impl VisibilityIndex {
                     .get(&source_file)
                     .is_some_and(|aliases| {
                         aliases.iter().any(|alias| {
-                            alias.name == alias_name
-                                && type_text_matches_target(&alias.target, target)
+                            alias.name == alias_name && alias_target_matches_target(alias, target)
                         })
                     })
             })
@@ -683,7 +683,11 @@ fn cpp_alias_from_alias_declaration(node: Node<'_>, source: &str) -> Option<CppA
     let target = node
         .child_by_field_name("type")
         .and_then(|node| normalize_reference_name(node_text(node, source)))?;
-    Some(CppAlias { name, target })
+    Some(CppAlias {
+        name,
+        target,
+        namespace: enclosing_namespace_context(node, source),
+    })
 }
 
 fn collect_typedef_aliases(node: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
@@ -703,6 +707,7 @@ fn collect_typedef_aliases(node: Node<'_>, source: &str, out: &mut Vec<CppAlias>
             out.push(CppAlias {
                 name,
                 target: target.clone(),
+                namespace: enclosing_namespace_context(node, source),
             });
         }
     }
@@ -1312,9 +1317,18 @@ pub(super) fn is_type_alias(unit: &CodeUnit) -> bool {
         })
 }
 
-pub(super) fn type_text_matches_target(type_text: &str, target: &CodeUnit) -> bool {
-    let normalized = normalize_cpp_reference_text(type_text.trim().trim_end_matches(';'));
-    normalized == cpp_name_for(target) || normalized == target.identifier()
+fn alias_target_matches_target(alias: &CppAlias, target: &CodeUnit) -> bool {
+    let normalized = normalize_cpp_reference_text(alias.target.trim().trim_end_matches(';'));
+    let target_name = cpp_name_for(target);
+    if normalized.contains("::") {
+        return normalized == target_name;
+    }
+    if let Some(namespace) = alias.namespace.as_deref() {
+        return namespace_prefixes(namespace)
+            .into_iter()
+            .any(|prefix| format!("{prefix}::{normalized}") == target_name);
+    }
+    target.package_name().is_empty() && normalized == target.identifier()
 }
 
 /// The declared return type text of a C++ function unit, with leading declaration specifiers
