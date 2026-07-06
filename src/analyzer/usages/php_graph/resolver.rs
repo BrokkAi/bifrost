@@ -173,7 +173,7 @@ pub(super) fn static_receiver_matches(
         "self" | "static" => {
             receiver_is_enclosing_subtype(analyzer, file, start, end, line_starts, owner, hierarchy)
         }
-        "parent" => enclosing_owner_at(analyzer, file, start, end, line_starts)
+        "parent" => enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
             .is_some_and(|enclosing_owner| hierarchy.is_subtype(&enclosing_owner, owner)),
         _ => resolve_php_type(receiver, ctx)
             .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy)),
@@ -189,11 +189,11 @@ pub(super) fn receiver_is_enclosing_subtype(
     owner: &str,
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
-    enclosing_owner_at(analyzer, file, start, end, line_starts)
+    enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
         .is_some_and(|receiver| receiver_type_matches(&receiver, owner, hierarchy))
 }
 
-fn enclosing_owner_at(
+pub(super) fn enclosing_owner_fq_name_at(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     start: usize,

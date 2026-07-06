@@ -1,7 +1,7 @@
 use super::*;
 use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::usages::php_graph::syntax::{
-    assignment_parts, is_local_scope as php_is_local_scope,
+    assignment_parts, declared_field_type_fq_name, is_local_scope as php_is_local_scope,
     object_creation_type as php_object_creation_type, seed_parameter_types,
     static_member_parts as php_static_member_parts, variable_identifier as php_variable_identifier,
 };
@@ -69,9 +69,26 @@ pub(super) fn resolve_php(
         }
         Some(PhpReferenceNode::InstanceMember { object, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
-            let bindings =
-                php_bindings_before(php, file, source, root, site.range.start_byte, &ctx);
-            let owner = php_instance_receiver_fqn(object, source, &class_ranges, &bindings, &ctx);
+            let bindings = php_bindings_before(
+                php,
+                file,
+                source,
+                root,
+                site.range.start_byte,
+                &class_ranges,
+                &ctx,
+                support,
+            );
+            let owner = php_instance_receiver_fqn(
+                php,
+                analyzer,
+                support,
+                object,
+                source,
+                &class_ranges,
+                &bindings,
+                &ctx,
+            );
             php_member_outcome(php, analyzer, support, owner, member)
         }
         None => no_definition(
@@ -363,7 +380,11 @@ fn php_parent_fqn(
         .map(|parent| parent.fq_name())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn php_instance_receiver_fqn(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     object: Node<'_>,
     source: &str,
     class_ranges: &ClassRangeIndex,
@@ -384,19 +405,72 @@ fn php_instance_receiver_fqn(
         "object_creation_expression" => php_object_creation_type(object)
             .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
         "parenthesized_expression" => object.named_child(0).and_then(|inner| {
-            php_instance_receiver_fqn(inner, source, class_ranges, bindings, ctx)
+            php_instance_receiver_fqn(
+                php,
+                analyzer,
+                support,
+                inner,
+                source,
+                class_ranges,
+                bindings,
+                ctx,
+            )
         }),
+        "member_access_expression" => php_member_access_receiver_fqn(
+            php,
+            analyzer,
+            support,
+            object,
+            source,
+            class_ranges,
+            bindings,
+            ctx,
+        ),
         _ => None,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn php_member_access_receiver_fqn(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    access: Node<'_>,
+    source: &str,
+    class_ranges: &ClassRangeIndex,
+    bindings: &LocalInferenceEngine<String>,
+    ctx: &FileContext,
+) -> Option<String> {
+    let object = access.child_by_field_name("object")?;
+    let name = access.child_by_field_name("name")?;
+    let owner = php_instance_receiver_fqn(
+        php,
+        analyzer,
+        support,
+        object,
+        source,
+        class_ranges,
+        bindings,
+        ctx,
+    )?;
+    let member = php_node_text(name, source).trim_start_matches('$');
+    let field = support
+        .fqn(&format!("{owner}.{member}"))
+        .into_iter()
+        .find(|unit| unit.is_field())?;
+    declared_field_type_fq_name(php, analyzer, &field)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn php_bindings_before(
     php: &PhpAnalyzer,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     byte: usize,
+    class_ranges: &ClassRangeIndex,
     ctx: &FileContext,
+    support: &DefinitionLookupIndex,
 ) -> LocalInferenceEngine<String> {
     let scope = php_enclosing_scope(root, byte).unwrap_or(root);
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -410,7 +484,16 @@ fn php_bindings_before(
         }
         php_seed_parameters(node, source, ctx, &mut bindings);
         if node.end_byte() <= byte {
-            php_seed_assignment(php, file, node, source, ctx, &mut bindings);
+            php_seed_assignment(
+                php,
+                file,
+                node,
+                source,
+                class_ranges,
+                ctx,
+                support,
+                &mut bindings,
+            );
         }
         let mut cursor = node.walk();
         let children: Vec<_> = node.named_children(&mut cursor).collect();
@@ -449,12 +532,15 @@ fn php_seed_parameters(
     seed_parameter_types(node, source, bindings, |raw| resolve_php_type(raw, ctx));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn php_seed_assignment(
-    _php: &PhpAnalyzer,
+    php: &PhpAnalyzer,
     _file: &ProjectFile,
     node: Node<'_>,
     source: &str,
+    class_ranges: &ClassRangeIndex,
     ctx: &FileContext,
+    support: &DefinitionLookupIndex,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let Some((left, right)) = assignment_parts(node) else {
@@ -467,14 +553,101 @@ fn php_seed_assignment(
     if name.is_empty() {
         return;
     }
-    let resolved = (right.kind() == "object_creation_expression")
-        .then(|| php_object_creation_type(right))
-        .flatten()
-        .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx));
+    let resolved = php_assignment_receiver_fqn(php, support, right, source, class_ranges, ctx);
     match resolved {
         Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
         None => bindings.declare_shadow(name.to_string()),
     }
+}
+
+fn php_assignment_receiver_fqn(
+    php: &PhpAnalyzer,
+    support: &DefinitionLookupIndex,
+    right: Node<'_>,
+    source: &str,
+    class_ranges: &ClassRangeIndex,
+    ctx: &FileContext,
+) -> Option<String> {
+    match right.kind() {
+        "object_creation_expression" => php_object_creation_type(right)
+            .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
+        "scoped_call_expression" => {
+            let (scope, name) = php_static_member_parts(right)?;
+            let owner = php_static_scope_fqn(php, support, scope, source, ctx, class_ranges)?;
+            let method = php_node_text(name, source);
+            if method.is_empty() {
+                return None;
+            }
+            php_declared_callable_return_type_fqn(php, support, &format!("{owner}.{method}"))
+        }
+        "parenthesized_expression" => right.named_child(0).and_then(|inner| {
+            php_assignment_receiver_fqn(php, support, inner, source, class_ranges, ctx)
+        }),
+        _ => None,
+    }
+}
+
+fn php_declared_callable_return_type_fqn(
+    php: &PhpAnalyzer,
+    support: &DefinitionLookupIndex,
+    callable_fqn: &str,
+) -> Option<String> {
+    let mut definitions = support
+        .fqn(callable_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_function());
+    let callable = definitions.next()?;
+    if definitions.next().is_some() {
+        return None;
+    }
+    php_declared_return_type_fqn(php, &callable)
+}
+
+fn php_declared_return_type_fqn(php: &PhpAnalyzer, callable: &CodeUnit) -> Option<String> {
+    let source = callable.source().read_to_string().ok()?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .ok()?;
+    let tree = parser.parse(source.as_str(), None)?;
+    let declaration = php_callable_declaration_node(php, callable, tree.root_node())?;
+    let return_type = declaration.child_by_field_name("return_type")?;
+    let raw = php_node_text(return_type, &source).trim();
+    if matches!(raw, "self" | "static") {
+        return php.parent_of(callable).map(|owner| owner.fq_name());
+    }
+    resolve_php_type(
+        raw,
+        &php.file_context_from_source(callable.source(), &source),
+    )
+}
+
+fn php_callable_declaration_node<'tree>(
+    php: &PhpAnalyzer,
+    callable: &CodeUnit,
+    root: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let ranges = php.ranges(callable);
+    let start = ranges.iter().map(|range| range.start_byte).min()?;
+    let end = ranges.iter().map(|range| range.end_byte).max()?;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "function_definition" | "method_declaration")
+            && node.start_byte() >= start
+            && node.end_byte() <= end
+        {
+            return Some(node);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index)
+                && child.end_byte() >= start
+                && child.start_byte() <= end
+            {
+                stack.push(child);
+            }
+        }
+    }
+    None
 }
 
 fn php_is_in_object_creation(node: Node<'_>) -> bool {

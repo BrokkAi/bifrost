@@ -683,6 +683,72 @@ $count = Mailer::$sent;
 }
 
 #[test]
+fn php_scan_usages_includes_non_composer_files_with_explicit_type_aliases() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "src/Service/EmailNotifier.php",
+            r#"<?php
+namespace App\Service;
+class EmailNotifier {
+    public static int $sent = 0;
+    public static function create(): self { return new self(); }
+}
+"#,
+        ),
+        (
+            "src/Consumer.php",
+            r#"<?php
+namespace App;
+use App\Service\EmailNotifier as Mailer;
+$mailer = Mailer::create();
+$count = Mailer::$sent;
+"#,
+        ),
+    ]);
+
+    let result = scan_usages(
+        &analyzer,
+        ScanUsagesParams {
+            symbols: Some(vec![
+                "App.Service.EmailNotifier.create".to_string(),
+                "App.Service.EmailNotifier.sent".to_string(),
+            ]),
+            targets: Vec::new(),
+            paths: None,
+            include_tests: true,
+        },
+    );
+    assert!(
+        result.usages.iter().any(|usage| {
+            usage.symbol == "App.Service.EmailNotifier.create"
+                && usage.files.iter().any(|file| {
+                    file.path == "src/Consumer.php"
+                        && file.hits.iter().any(|hit| {
+                            hit.snippet
+                                .as_deref()
+                                .is_some_and(|snippet| snippet.contains("Mailer::create()"))
+                        })
+                })
+        }),
+        "expected scan_usages to include explicit type-alias static method call: {result:#?}"
+    );
+    assert!(
+        result.usages.iter().any(|usage| {
+            usage.symbol == "App.Service.EmailNotifier.sent"
+                && usage.files.iter().any(|file| {
+                    file.path == "src/Consumer.php"
+                        && file.hits.iter().any(|hit| {
+                            hit.snippet
+                                .as_deref()
+                                .is_some_and(|snippet| snippet.contains("Mailer::$sent"))
+                        })
+                })
+        }),
+        "expected scan_usages to include explicit type-alias static property access: {result:#?}"
+    );
+}
+
+#[test]
 fn php_graph_finds_instance_methods_and_properties_with_local_receiver_types() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
@@ -739,6 +805,39 @@ function consume(Target $target): void {
         .into_either()
         .expect("property success");
     assert_eq!(2, property_hits.len());
+}
+
+#[test]
+fn php_graph_resolves_this_property_receiver_type_for_member_calls() {
+    let (_project, analyzer) = php_analyzer_with_files(&[(
+        "Service.php",
+        r#"<?php
+namespace App;
+class Repository {
+    public function save(string $value): string {
+        return $value;
+    }
+}
+class Service {
+    public function __construct(private Repository $repository) {}
+    public function execute(string $name): string {
+        return $this->repository->save($name);
+    }
+}
+"#,
+    )]);
+
+    let hits = graph_hits(&analyzer, "App.Repository.save");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected promoted-property receiver hit: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("$this->repository->save($name)")),
+        "expected chained receiver method call: {hits:?}"
+    );
 }
 
 #[test]

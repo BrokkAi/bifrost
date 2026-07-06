@@ -104,6 +104,7 @@ impl UsageFinder {
 
         if explicit_provider.is_none() {
             add_php_composer_candidates(target, analyzer, &mut candidates);
+            add_php_import_alias_candidates(target, analyzer, &mut candidates);
         }
 
         if let Some(filter) = self.file_filter.as_ref() {
@@ -193,6 +194,70 @@ fn add_php_composer_candidates(
         return;
     };
     candidates.extend(files);
+}
+
+fn add_php_import_alias_candidates(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    candidates: &mut HashSet<ProjectFile>,
+) {
+    if language_for_target(target) != Language::Php {
+        return;
+    }
+    let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
+        return;
+    };
+    let relevant_types = php_relevant_candidate_types(target, analyzer, php);
+    if relevant_types.is_empty() {
+        return;
+    }
+    for fq_name in &relevant_types {
+        candidates.extend(
+            analyzer
+                .definitions(fq_name)
+                .filter(|unit| unit.is_class())
+                .map(|unit| unit.source().clone()),
+        );
+    }
+    let Ok(files) = analyzer.project().analyzable_files(Language::Php) else {
+        return;
+    };
+    for file in files {
+        let aliases = php.use_aliases_by_kind_of(&file);
+        if aliases
+            .type_aliases
+            .values()
+            .any(|fq_name| relevant_types.contains(fq_name))
+        {
+            candidates.insert(file);
+        }
+    }
+}
+
+fn php_relevant_candidate_types(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    php: &PhpAnalyzer,
+) -> HashSet<String> {
+    let mut types = HashSet::default();
+    let owner = if target.is_class() {
+        Some(target.clone())
+    } else {
+        php.parent_of(target)
+    };
+    let Some(owner) = owner else {
+        return types;
+    };
+    types.insert(owner.fq_name());
+    if let Some(provider) = analyzer.type_hierarchy_provider() {
+        types.extend(
+            provider
+                .get_descendants(&owner)
+                .into_iter()
+                .map(|unit| unit.fq_name()),
+        );
+    }
+    types
 }
 
 fn truncate_candidates(

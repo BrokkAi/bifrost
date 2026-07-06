@@ -31,8 +31,8 @@
 
 use super::resolver::node_text;
 use super::syntax::{
-    assignment_parts, is_local_scope, object_creation_type, seed_parameter_types,
-    variable_identifier,
+    assignment_parts, declared_field_type_fq_name, is_local_scope, object_creation_type,
+    seed_parameter_types, static_member_parts, variable_identifier,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
@@ -68,6 +68,7 @@ where
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let ctx = php.file_context_from_source(file, parsed.source.as_str());
             let mut scan = PhpScan {
+                analyzer,
                 php,
                 file,
                 ctx,
@@ -85,6 +86,7 @@ where
 }
 
 struct PhpScan<'a, 'b> {
+    analyzer: &'a dyn IAnalyzer,
     php: &'a PhpAnalyzer,
     file: &'a ProjectFile,
     ctx: PhpFileContext,
@@ -169,10 +171,7 @@ fn record_reference(
         }
         // `X::method(..)` static call: resolve the scope to a class fqn.
         "scoped_call_expression" => {
-            let (Some(scope), Some(name_node)) = (
-                node.child_by_field_name("scope"),
-                node.child_by_field_name("name"),
-            ) else {
+            let Some((scope, name_node)) = static_member_parts(node) else {
                 return;
             };
             let method = node_text(name_node, scan.source);
@@ -181,6 +180,19 @@ fn record_reference(
             }
             if let Some(owner) = scope_class_fqn(scope, scan) {
                 scan.record(format!("{owner}.{method}"), name_node);
+            }
+        }
+        // `X::$property` static property access.
+        "scoped_property_access_expression" => {
+            let Some((scope, name_node)) = static_member_parts(node) else {
+                return;
+            };
+            let property = variable_identifier(name_node, scan.source);
+            if property.is_empty() {
+                return;
+            }
+            if let Some(owner) = scope_class_fqn(scope, scan) {
+                scan.record(format!("{owner}.{property}"), name_node);
             }
         }
         // `$obj->method(..)` instance call: type the receiver, giving `Owner.method`.
@@ -242,8 +254,34 @@ fn receiver_type_fqn(
             }
             first_precise(bindings, name)
         }
+        "object_creation_expression" => object_creation_type(object)
+            .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source))),
+        "parenthesized_expression" => object
+            .named_child(0)
+            .and_then(|inner| receiver_type_fqn(inner, scan, bindings)),
+        "member_access_expression" => receiver_member_access_type_fqn(object, scan, bindings),
         _ => None,
     }
+}
+
+fn receiver_member_access_type_fqn(
+    access: Node<'_>,
+    scan: &PhpScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let object = access.child_by_field_name("object")?;
+    let name = access.child_by_field_name("name")?;
+    let owner = receiver_type_fqn(object, scan, bindings)?;
+    let member = node_text(name, scan.source);
+    if member.is_empty() {
+        return None;
+    }
+    let field_fqn = format!("{owner}.{member}");
+    let field = scan
+        .analyzer
+        .definitions(&field_fqn)
+        .find(|unit| unit.is_field())?;
+    declared_field_type_fq_name(scan.php, scan.analyzer, field)
 }
 
 /// Seed parameter types into the binding scope: a `simple_parameter` with a type

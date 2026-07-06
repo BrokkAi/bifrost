@@ -3,14 +3,15 @@ use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResol
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::php_graph::hits::{push_hit, push_hit_range, push_import_hit};
 use crate::analyzer::usages::php_graph::resolver::{
-    PhpHierarchyIndex, TargetKind, TargetSpec, is_const_declaration_name, is_function_call_name,
-    is_function_declaration_name, is_member_or_scoped_access_name, is_object_creation_type_name,
-    node_text, qualified_candidate_text, receiver_is_enclosing_subtype, receiver_type_matches,
-    static_receiver_matches,
+    PhpHierarchyIndex, TargetKind, TargetSpec, enclosing_owner_fq_name_at,
+    is_const_declaration_name, is_function_call_name, is_function_declaration_name,
+    is_member_or_scoped_access_name, is_object_creation_type_name, node_text,
+    qualified_candidate_text, receiver_type_matches, static_receiver_matches,
 };
 use crate::analyzer::usages::php_graph::syntax::{
-    assignment_parts, is_local_scope, literal_member_identifier, object_creation_type,
-    seed_parameter_types, static_member_parts, static_property_identifier, variable_identifier,
+    assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
+    is_local_scope, literal_member_identifier, object_creation_type, seed_parameter_types,
+    static_member_parts, static_property_identifier, variable_identifier,
 };
 use crate::analyzer::{
     IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
@@ -57,6 +58,7 @@ pub(super) fn scan_file(
     let line_starts = compute_line_starts(&source);
     if matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
         scan_member_patterns(
+            php,
             tree.root_node(),
             analyzer,
             file,
@@ -304,6 +306,7 @@ fn is_reference_context(node: Node<'_>) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn scan_member_patterns(
+    php: &PhpAnalyzer,
     root: Node<'_>,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -330,6 +333,7 @@ fn scan_member_patterns(
         hierarchy,
         owner,
         spec,
+        php,
         hits,
     );
 }
@@ -345,6 +349,7 @@ fn scan_member_tree<'tree>(
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
+    php: &PhpAnalyzer,
     hits: &mut BTreeSet<UsageHit>,
 ) {
     let mut scopes: Vec<(Node<'tree>, bool)> = vec![(node, false)];
@@ -363,6 +368,7 @@ fn scan_member_tree<'tree>(
             hierarchy,
             owner,
             spec,
+            php,
             &mut engine,
             &mut scopes,
             hits,
@@ -381,6 +387,7 @@ fn scan_member_scope<'tree>(
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
+    php: &PhpAnalyzer,
     engine: &mut LocalInferenceEngine<String>,
     scopes: &mut Vec<(Node<'tree>, bool)>,
     hits: &mut BTreeSet<UsageHit>,
@@ -391,7 +398,7 @@ fn scan_member_scope<'tree>(
             scopes.push((node, true));
             continue;
         }
-        apply_receiver_assignment(node, source, ctx, engine);
+        apply_receiver_assignment(node, php, analyzer, source, ctx, engine);
         record_member_hit(
             node,
             analyzer,
@@ -402,6 +409,7 @@ fn scan_member_scope<'tree>(
             hierarchy,
             owner,
             spec,
+            php,
             engine,
             hits,
         );
@@ -456,6 +464,8 @@ fn seed_parameter_receivers(
 
 fn apply_receiver_assignment(
     node: Node<'_>,
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
     source: &str,
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
@@ -470,10 +480,7 @@ fn apply_receiver_assignment(
     if lhs.is_empty() {
         return;
     }
-    let resolved = (right.kind() == "object_creation_expression")
-        .then(|| object_creation_type(right))
-        .flatten()
-        .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx));
+    let resolved = assignment_receiver_type(right, php, analyzer, source, ctx);
     match resolved {
         Some(fq) => engine.seed_symbol(lhs.to_string(), fq),
         None => {
@@ -489,6 +496,40 @@ fn apply_receiver_assignment(
     }
 }
 
+fn assignment_receiver_type(
+    node: Node<'_>,
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    source: &str,
+    ctx: &PhpFileContext,
+) -> Option<String> {
+    match node.kind() {
+        "object_creation_expression" => object_creation_type(node)
+            .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx)),
+        "scoped_call_expression" => {
+            let (scope, name) = static_member_parts(node)?;
+            let owner = resolve_php_type(node_text(scope, source), ctx)?;
+            let method = node_text(name, source);
+            if method.is_empty() {
+                return None;
+            }
+            let callable_fqn = format!("{owner}.{method}");
+            let mut definitions = analyzer
+                .definitions(&callable_fqn)
+                .filter(|unit| unit.is_function());
+            let callable = definitions.next()?;
+            if definitions.next().is_some() {
+                return None;
+            }
+            declared_callable_return_type_fq_name(php, analyzer, callable)
+        }
+        "parenthesized_expression" => node
+            .named_child(0)
+            .and_then(|inner| assignment_receiver_type(inner, php, analyzer, source, ctx)),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_member_hit(
     node: Node<'_>,
@@ -500,6 +541,7 @@ fn record_member_hit(
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
+    php: &PhpAnalyzer,
     engine: &LocalInferenceEngine<String>,
     hits: &mut BTreeSet<UsageHit>,
 ) {
@@ -514,21 +556,18 @@ fn record_member_hit(
             if literal_member_identifier(member_node, source) != Some(spec.member_name.as_str()) {
                 return;
             }
-            let receiver_matches = if variable_identifier(receiver_node, source) == "this" {
-                receiver_is_enclosing_subtype(
-                    analyzer,
-                    file,
-                    member_node.start_byte(),
-                    member_node.end_byte(),
-                    line_starts,
-                    owner,
-                    hierarchy,
-                )
-            } else {
-                precise_receiver_type(engine, variable_identifier(receiver_node, source))
-                    .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy))
-            };
-            if receiver_matches {
+            if receiver_expression_type(
+                receiver_node,
+                php,
+                analyzer,
+                file,
+                source,
+                line_starts,
+                ctx,
+                engine,
+            )
+            .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy))
+            {
                 push_member_hit(member_node, analyzer, file, source, line_starts, spec, hits);
             }
         }
@@ -581,6 +620,74 @@ fn precise_receiver_type(engine: &LocalInferenceEngine<String>, receiver: &str) 
             None
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receiver_expression_type(
+    node: Node<'_>,
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    ctx: &PhpFileContext,
+    engine: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    match node.kind() {
+        "variable_name" => {
+            let name = variable_identifier(node, source);
+            if name == "this" {
+                return enclosing_owner_fq_name_at(
+                    analyzer,
+                    file,
+                    node.start_byte(),
+                    node.end_byte(),
+                    line_starts,
+                );
+            }
+            precise_receiver_type(engine, name)
+        }
+        "object_creation_expression" => object_creation_type(node)
+            .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx)),
+        "parenthesized_expression" => node.named_child(0).and_then(|inner| {
+            receiver_expression_type(inner, php, analyzer, file, source, line_starts, ctx, engine)
+        }),
+        "member_access_expression" => {
+            receiver_member_access_type(node, php, analyzer, file, source, line_starts, ctx, engine)
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receiver_member_access_type(
+    node: Node<'_>,
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    ctx: &PhpFileContext,
+    engine: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let object = node.child_by_field_name("object")?;
+    let member = node.child_by_field_name("name")?;
+    let owner = receiver_expression_type(
+        object,
+        php,
+        analyzer,
+        file,
+        source,
+        line_starts,
+        ctx,
+        engine,
+    )?;
+    let member = literal_member_identifier(member, source)?;
+    let field_fqn = format!("{owner}.{member}");
+    let field = analyzer
+        .definitions(&field_fqn)
+        .find(|unit| unit.is_field())?;
+    declared_field_type_fq_name(php, analyzer, field)
 }
 
 #[allow(clippy::too_many_arguments)]

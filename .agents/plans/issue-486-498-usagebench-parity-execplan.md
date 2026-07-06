@@ -15,6 +15,7 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
 - [x] (2026-07-06T16:24Z) Ran focused existing Bifrost tests for the issue shapes that current summaries showed were already covered.
 - [x] (2026-07-06T16:24Z) Determined no analyzer code fix is justified from local evidence because all targeted current-state tests passed.
 - [x] (2026-07-06T22:05Z) Fixed and usagebench-validated the Java issue #486 cases.
+- [x] (2026-07-06T23:05Z) Fixed and usagebench-validated PHP #489 cases plus the trait/static portions of #496.
 - [ ] Remove usagebench expected-failure markers after a usagebench checkout is available and the matching cases pass there.
 
 ## Surprises & Discoveries
@@ -178,3 +179,20 @@ Fresh usagebench validation after clearing Java fixture `.bifrost` caches:
     ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/java-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-java-lsp-fresh
 
 Confirmed improved cases: `java-service-class-construction` and `java-parity-concrete-implementation-method-call`.
+
+Revision note, 2026-07-06 / Codex: PHP issue #489 is fixed on fresh usagebench runs, and issue #496 is partially fixed. The PHP graph and definition lookup now type receiver chains through declared/promoted properties, seed locals from static factory calls with declared return types, record static property edges, and expand non-composer PHP candidates only for files with explicit type aliases to the target owner or descendant type. Focused validation passed:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_php_graph_test php_graph_resolves_this_property_receiver_type_for_member_calls -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test get_definition_test php_promoted_property_receiver_resolves_member_definition -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test get_definition_test php_static_factory_result_receiver_resolves_instance_method -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_php_graph_test php_scan_usages_includes_non_composer_files_with_explicit_type_aliases -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_php_graph_test non_composer_php_project_does_not_expand_usage_candidates_by_namespace_shape -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_php_graph_test php_graph_finds_trait_method_calls_through_using_class -- --nocapture
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_php_graph_test php_graph_lsp_references_include_php_interface_method_implementations -- --nocapture
+
+Fresh usagebench validation after clearing PHP fixture `.bifrost` caches:
+
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/php-baseline.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-php-baseline-final
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/php-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-php-lsp-final
+
+Confirmed improved cases: `php-repository-method-call`, `php-parity-use-alias-static-method-call`, `php-parity-trait-method-call`, and `php-parity-static-property-access`. Remaining PHP expected failure: `php-parity-interface-method-implementation` still expects the concrete implementation declaration (`EmailNotifier::notify`) in the external usage surface and expects definition lookup from that declaration site to jump to the interface method. Bifrost already exposes implementation declarations as `OverrideDeclaration` hits on the LSP references surface, and `tests/usages_php_graph_test.rs::php_graph_lsp_references_include_php_interface_method_implementations` explicitly asserts they must not appear in external usages. Treat this remaining usagebench expectation as a harness/surface mismatch unless that Bifrost contract is intentionally changed.

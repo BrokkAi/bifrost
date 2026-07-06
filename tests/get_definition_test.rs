@@ -8614,7 +8614,7 @@ fn php_trait_method_resolves_through_using_class() {
     let external = lookup(
         project.root(),
         &format!(
-            r#"{{"references":[{{"path":"src/Consumer.php","line":6,"column":{}}}]}}"#,
+            r#"{{"references":[{{"path":"src/Consumer.php","line":5,"column":{}}}]}}"#,
             column_of(external_line, "record")
         ),
     );
@@ -8922,6 +8922,40 @@ fn php_aliased_static_property_resolves_to_definition() {
 }
 
 #[test]
+fn php_static_factory_result_receiver_resolves_instance_method() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .file(
+            "src/Service/EmailNotifier.php",
+            "<?php\nnamespace App\\Service;\nclass EmailNotifier {\n    public static function create(): self { return new self(); }\n    public function notify(string $message): void {}\n}\n",
+        )
+        .file(
+            "src/Consumer.php",
+            "<?php\nnamespace App;\nuse App\\Service\\EmailNotifier as Mailer;\n$mailer = Mailer::create();\n$mailer->notify('hello');\n",
+        )
+        .build();
+
+    let line = "$mailer->notify('hello');";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Consumer.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "notify")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Service.EmailNotifier.notify",
+        "{value}"
+    );
+}
+
+#[test]
 fn php_enum_cases_resolve_as_static_members() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(
@@ -9028,6 +9062,56 @@ class AttachmentController
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "App.Uploads.AttachmentController.pageQueries",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_promoted_property_receiver_resolves_member_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            r#"
+<?php
+
+namespace App;
+
+class Repository
+{
+    public function save(string $value): string
+    {
+        return $value;
+    }
+}
+
+class Service
+{
+    public function __construct(private Repository $repository)
+    {
+    }
+
+    public function execute(string $name): string
+    {
+        return $this->repository->save($name);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return $this->repository->save($name);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Service.php","line":22,"column":{}}}]}}"#,
+            column_of(line, "save")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Repository.save",
         "{value}"
     );
 }
