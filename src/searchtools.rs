@@ -670,9 +670,13 @@ pub struct UsageFileGroup {
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageLocation {
     pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_range: Option<String>,
     pub enclosing: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hit_count: Option<usize>,
     #[serde(skip_serializing_if = "is_full_confidence")]
     pub confidence: f64,
 }
@@ -3646,9 +3650,10 @@ impl SymbolUsageRenderState {
         base_note: Option<String>,
     ) -> Self {
         let total_hits = hits.len();
+        let clustered_line_rows = clustered_usage_line_row_count(&hits);
         let rendering = if total_hits <= 10 {
             UsageRendering::Full
-        } else if total_hits <= 100 {
+        } else if clustered_line_rows <= 100 {
             UsageRendering::Lines
         } else {
             UsageRendering::Summary
@@ -4025,7 +4030,7 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
             Vec::new(),
         ),
         UsageRendering::Lines => (
-            render_usage_file_groups(&state.hits, false),
+            render_clustered_usage_file_groups(&state.hits),
             None,
             Vec::new(),
         ),
@@ -4062,7 +4067,7 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
     match state.rendering {
         UsageRendering::Full => {}
         UsageRendering::Lines => notes.push(format!(
-            "{} hits; showing line-level callers without snippets. Re-call with a single symbol or narrower scope for snippet detail.",
+            "{} hits; showing line-level callers clustered by enclosing symbol. Snippets are included for low-repeat callers.",
             state.total_hits
         )),
         UsageRendering::Summary => notes.push(format!(
@@ -4100,8 +4105,10 @@ fn render_usage_file_groups(hits: &[UsageHitRow], include_snippets: bool) -> Vec
             .or_default()
             .push(UsageLocation {
                 line: hit.line,
+                line_range: None,
                 enclosing: hit.enclosing.clone(),
                 snippet: include_snippets.then(|| hit.snippet.clone()),
+                hit_count: None,
                 confidence: hit.confidence,
             });
     }
@@ -4116,6 +4123,80 @@ fn render_usage_file_groups(hits: &[UsageHitRow], include_snippets: bool) -> Vec
             UsageFileGroup {
                 path,
                 hits,
+                hit_count: None,
+            }
+        })
+        .collect()
+}
+
+fn clustered_usage_line_row_count(hits: &[UsageHitRow]) -> usize {
+    let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for hit in hits {
+        *counts
+            .entry((hit.path.as_str(), hit.enclosing.as_str()))
+            .or_default() += 1;
+    }
+    counts
+        .into_values()
+        .map(|count| if count > 2 { 1 } else { count })
+        .sum()
+}
+
+fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGroup> {
+    let mut by_file: BTreeMap<String, BTreeMap<String, Vec<&UsageHitRow>>> = BTreeMap::new();
+    for hit in hits {
+        by_file
+            .entry(hit.path.clone())
+            .or_default()
+            .entry(hit.enclosing.clone())
+            .or_default()
+            .push(hit);
+    }
+
+    by_file
+        .into_iter()
+        .map(|(path, enclosing_groups)| {
+            let mut rendered_hits = Vec::new();
+            for (enclosing, mut group) in enclosing_groups {
+                group.sort_by(|left, right| left.line.cmp(&right.line));
+                if group.len() > 2 {
+                    let first = group.first().expect("non-empty group");
+                    let last = group.last().expect("non-empty group");
+                    let max_confidence = group
+                        .iter()
+                        .map(|hit| hit.confidence)
+                        .fold(0.0_f64, f64::max);
+                    rendered_hits.push(UsageLocation {
+                        line: first.line,
+                        line_range: Some(if first.line == last.line {
+                            first.line.to_string()
+                        } else {
+                            format!("{}-{}", first.line, last.line)
+                        }),
+                        enclosing,
+                        snippet: None,
+                        hit_count: Some(group.len()),
+                        confidence: max_confidence,
+                    });
+                } else {
+                    rendered_hits.extend(group.into_iter().map(|hit| UsageLocation {
+                        line: hit.line,
+                        line_range: None,
+                        enclosing: hit.enclosing.clone(),
+                        snippet: Some(hit.snippet.clone()),
+                        hit_count: None,
+                        confidence: hit.confidence,
+                    }));
+                }
+            }
+            rendered_hits.sort_by(|left, right| {
+                left.line
+                    .cmp(&right.line)
+                    .then_with(|| left.enclosing.cmp(&right.enclosing))
+            });
+            UsageFileGroup {
+                path,
+                hits: rendered_hits,
                 hit_count: None,
             }
         })

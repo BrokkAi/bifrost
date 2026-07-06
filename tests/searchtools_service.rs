@@ -2120,6 +2120,75 @@ fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sampl
     );
 }
 
+#[test]
+fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_snippets() {
+    let repeated_calls = (0..101)
+        .map(|idx| format!("        Service.target(); // {idx}\n"))
+        .collect::<String>();
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Service.java",
+            "public class Service {\n    public static void target() {}\n}\n",
+        )
+        .file(
+            "BulkCaller.java",
+            format!(
+                "public class BulkCaller {{\n    public void run() {{\n{repeated_calls}    }}\n}}\n"
+            ),
+        )
+        .file(
+            "SingleA.java",
+            "public class SingleA {\n    public void run() { Service.target(); }\n}\n",
+        )
+        .file(
+            "SingleB.java",
+            "public class SingleB {\n    public void run() { Service.target(); }\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Service.target"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let usage = &value["usages"][0];
+    assert_eq!("lines", usage["rendering"], "payload: {value}");
+    assert_eq!(103, usage["total_hits"], "payload: {value}");
+
+    let bulk = usage["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "BulkCaller.java")
+        .unwrap_or_else(|| panic!("missing BulkCaller.java: {value}"));
+    let bulk_hits = bulk["hits"].as_array().unwrap();
+    assert_eq!(1, bulk_hits.len(), "payload: {value}");
+    assert_eq!(101, bulk_hits[0]["hit_count"], "payload: {value}");
+    assert_eq!("3-103", bulk_hits[0]["line_range"], "payload: {value}");
+    assert!(bulk_hits[0]["snippet"].is_null(), "payload: {value}");
+
+    for path in ["SingleA.java", "SingleB.java"] {
+        let file = usage["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == path)
+            .unwrap_or_else(|| panic!("missing {path}: {value}"));
+        let hit = &file["hits"].as_array().unwrap()[0];
+        assert!(
+            hit["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains("Service.target()")),
+            "payload: {value}"
+        );
+    }
+}
+
 fn assert_ruby_user_save_scan_usages_hit(user_call: &str, account_call: &str, expected_hit: &str) {
     let source = format!(
         r#"
