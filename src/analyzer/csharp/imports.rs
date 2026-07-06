@@ -18,16 +18,15 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         if namespaces.is_empty() && aliases.is_empty() {
             return HashSet::default();
         }
-        let mut imported: HashSet<CodeUnit> = self
-            .get_all_declarations()
-            .into_iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class)
-            .filter(|unit| {
-                namespaces
+        let mut imported: HashSet<CodeUnit> = HashSet::default();
+        for namespace in &namespaces {
+            imported.extend(
+                self.inner
+                    .class_declarations_in_package(namespace)
                     .iter()
-                    .any(|namespace| unit.package_name() == namespace)
-            })
-            .collect();
+                    .cloned(),
+            );
+        }
         for target in aliases.values() {
             imported.extend(self.visible_type_candidates(file, target));
         }
@@ -41,25 +40,24 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.referencing_files.get(file) {
             return (*cached).clone();
         }
-        let target_namespaces: HashSet<String> = self
+        let target_classes = self
             .get_declarations(file)
             .into_iter()
             .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .collect::<Vec<_>>();
+        let target_namespaces: HashSet<String> = target_classes
+            .iter()
             .map(|unit| unit.package_name().to_string())
             .collect();
         if target_namespaces.is_empty() {
             return HashSet::default();
         }
-        let target_identifiers: HashSet<String> = self
-            .get_declarations(file)
-            .into_iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class)
+        let target_identifiers: HashSet<String> = target_classes
+            .iter()
             .map(|unit| unit.identifier().to_string())
             .collect();
-        let target_fq_names: HashSet<String> = self
-            .get_declarations(file)
-            .into_iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class)
+        let target_fq_names: HashSet<String> = target_classes
+            .iter()
             .flat_map(|unit| [unit.fq_name(), unit.fq_name().replace('$', ".")])
             .collect();
 

@@ -1,8 +1,8 @@
 mod common;
 
 use brokk_bifrost::{
-    FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile,
-    TestProject,
+    CSharpAnalyzer, FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
+    ProjectFile, TestProject,
     searchtools::{MostRelevantFilesParams, most_relevant_files},
 };
 use common::InlineTestProject;
@@ -99,6 +99,58 @@ fn no_git_fallback_uses_import_page_ranker() {
     assert!(!results.files.contains(&"test/A.java".to_string()));
     assert!(results.files.contains(&"test/B.java".to_string()));
     assert!(results.files.contains(&"test/C.java".to_string()));
+}
+
+#[test]
+fn csharp_namespace_imports_rank_related_files_without_git() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Consumer.cs",
+            r#"
+            using Demo.Services;
+
+            namespace Demo.App;
+
+            public class Consumer
+            {
+                private readonly Service service;
+            }
+            "#,
+        )
+        .file(
+            "Services/Service.cs",
+            r#"
+            namespace Demo.Services;
+
+            public class Service { }
+            "#,
+        )
+        .file(
+            "Other.cs",
+            r#"
+            namespace Demo.Other;
+
+            public class Other { }
+            "#,
+        )
+        .build();
+
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["Consumer.cs".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            limit: 5,
+        },
+    )
+    .unwrap();
+
+    assert!(results.not_found.is_empty());
+    assert!(results.files.contains(&"Services/Service.cs".to_string()));
+    assert!(!results.files.contains(&"Consumer.cs".to_string()));
+    assert!(!results.files.contains(&"Other.cs".to_string()));
 }
 
 #[test]
