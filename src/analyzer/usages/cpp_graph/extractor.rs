@@ -198,7 +198,9 @@ fn seed_binding_from_type_or_value(
             let name = normalize_cpp_type_name(text);
             CppScanBinding::from_type_name(
                 name.clone(),
-                ctx.visibility.resolve_type(ctx.file, &name),
+                ctx.visibility
+                    .canonical_type_for_reference(ctx.file, &name)
+                    .or_else(|| ctx.visibility.resolve_type(ctx.file, &name)),
                 cpp_type_text_pointer_depth(text),
             )
         })
@@ -1132,6 +1134,9 @@ fn qualified_owner_matches(text: &str, ctx: &ScanCtx<'_>) -> bool {
 }
 
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if let Some(matches) = out_of_line_owner_context_matches_target(node, ctx) {
+        return matches;
+    }
     if let Some(owner_text) = textual_owner_context(node, ctx) {
         return ctx
             .spec
@@ -1157,6 +1162,9 @@ fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 fn known_non_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if let Some(matches) = out_of_line_owner_context_matches_target(node, ctx) {
+        return !matches;
+    }
     let Some(owner_text) = textual_owner_context(node, ctx) else {
         return false;
     };
@@ -1171,6 +1179,25 @@ fn known_non_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                     .as_ref()
                     .is_none_or(|owner| owner_text != owner.identifier())
         })
+}
+
+fn out_of_line_owner_context_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<bool> {
+    let target_owner = ctx.spec.owner.as_ref()?;
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "function_definition" {
+            let function = function_definition_name_node(parent)?;
+            let (_, owner) = out_of_line_member_definition_owner(
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                function,
+            )?;
+            return Some(same_visible_symbol(&owner, target_owner));
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 fn textual_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {

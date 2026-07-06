@@ -623,6 +623,54 @@ void call(Target* ptr) {
 }
 
 #[test]
+fn cpp_graph_counts_unqualified_fields_inside_out_of_line_method_body() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/service.h",
+            r#"#pragma once
+#include <string>
+namespace example {
+struct Repository {
+    std::string last;
+    std::string save(const std::string& value);
+};
+}
+"#,
+        ),
+        (
+            "src/service.cpp",
+            r#"#include "service.h"
+namespace example {
+std::string Repository::save(const std::string& value) {
+    last = value;
+    return last;
+}
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "service.h"
+namespace example {
+std::string run_demo() {
+    Repository repository;
+    return repository.last;
+}
+}
+"#,
+        ),
+    ]);
+
+    let last = field_definition_with_owner(&analyzer, "Repository", "last");
+    let hits = usage_hits(&analyzer, &last);
+
+    assert_eq!(3, hits.len(), "{hits:#?}");
+    assert_hit_contains(&hits, "src/service.cpp", "last = value");
+    assert_hit_contains(&hits, "src/service.cpp", "return last");
+    assert_hit_contains(&hits, "src/main.cpp", "repository.last");
+}
+
+#[test]
 fn cpp_graph_seeds_direct_initialized_receivers_for_method_usages() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (
@@ -657,6 +705,71 @@ void call(Sink& sink) {
 
     assert_hit_contains(&hits, "main.cpp", "handler.handle(\"Ben\")");
     assert_hit_contains(&hits, "main.cpp", "braced.handle(\"Ada\")");
+}
+
+#[test]
+fn cpp_graph_resolves_using_alias_concrete_override_receiver_call() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/parity.h",
+            r#"#pragma once
+#include <string>
+namespace parity {
+struct AuditSink {
+    void record(const std::string& value);
+};
+class BaseHandler {
+public:
+    virtual ~BaseHandler() = default;
+    virtual std::string handle(const std::string& name) = 0;
+};
+class ConsoleHandler : public BaseHandler {
+public:
+    explicit ConsoleHandler(AuditSink& sink);
+    std::string handle(const std::string& name) override;
+};
+using HandlerAlias = ConsoleHandler;
+}
+"#,
+        ),
+        (
+            "src/parity.cpp",
+            r#"#include "parity.h"
+namespace parity {
+void AuditSink::record(const std::string& value) {}
+ConsoleHandler::ConsoleHandler(AuditSink& sink) {}
+std::string ConsoleHandler::handle(const std::string& name) {
+    return name;
+}
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "parity.h"
+namespace app {
+std::string run() {
+    parity::AuditSink sink;
+    parity::HandlerAlias handler(sink);
+    auto result = handler.handle("Ben");
+    return result;
+}
+}
+"#,
+        ),
+    ]);
+
+    let handle = member_function_definition_in_source(
+        &analyzer,
+        "ConsoleHandler",
+        "handle",
+        "include/parity.h",
+    );
+    let hits = usage_hits(&analyzer, &handle);
+
+    assert_eq!(2, hits.len(), "{hits:#?}");
+    assert_hit_contains(&hits, "src/parity.cpp", "ConsoleHandler::handle");
+    assert_hit_contains(&hits, "src/main.cpp", "handler.handle(\"Ben\")");
 }
 
 #[test]
