@@ -290,10 +290,9 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node_text(node, ctx.source) != ctx.spec.member_name {
         return;
     }
-    if node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "member_access_expression")
-    {
+    if node.parent().is_some_and(|parent| {
+        parent.kind() == "member_access_expression" && member_access_name(parent) == Some(node)
+    }) {
         return;
     }
     match ctx.spec.kind {

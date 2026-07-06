@@ -1841,8 +1841,13 @@ public partial class EventRecord
 {
     public string Label()
     {
-        return Name;
+        return Name.Tag();
     }
+}
+
+public static class StringExtensions
+{
+    public static string Tag(this string value) => value;
 }
 
 public sealed class Consumer
@@ -1868,9 +1873,9 @@ public sealed class Consumer
     );
     assert!(
         hits.iter().any(|hit| {
-            hit.file == project.file("src/Consumers.cs") && hit.snippet.contains("return Name")
+            hit.file == project.file("src/Consumers.cs") && hit.snippet.contains("return Name.Tag")
         }),
-        "unqualified read in the other partial file should resolve to EventRecord.Name: {hits:#?}"
+        "unqualified receiver read in the other partial file should resolve to EventRecord.Name: {hits:#?}"
     );
     assert!(
         hits.iter().any(|hit| {
