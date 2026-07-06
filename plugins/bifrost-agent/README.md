@@ -197,6 +197,56 @@ To publish publicly, submit the repository URL at
 <https://cursor.com/marketplace/publish>. The repository root contains
 `.cursor-plugin/marketplace.json`, which points Cursor at this shared package.
 
+## Antigravity Install and Local Testing
+
+Antigravity 2.2.1 can load Bifrost through a manual MCP entry in
+`~/.gemini/config/mcp_config.json`. The visible **Add MCP** flow is a curated
+marketplace, but the local config file accepts the standard `mcpServers` shape:
+see Antigravity's official [MCP](https://antigravity.google/docs/mcp)
+documentation for the host-side convention.
+
+```json
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "/absolute/path/to/bifrost/target/debug/bifrost",
+      "args": [
+        "--root",
+        "/absolute/path/to/workspace",
+        "--mcp",
+        "symbol|extended"
+      ]
+    }
+  }
+}
+```
+
+Restart Antigravity or click **Refresh** in **Settings -> Customizations**. The
+tested app showed `bifrost` with 21 enabled tools after reading this file.
+
+Antigravity documents skills under workspace and global skill directories; see
+the official [Skills](https://antigravity.google/docs/skills) documentation for
+the host-side convention. In Antigravity 2.2.1 validation, workspace-local
+skills loaded reliably and appeared in project-specific settings. If global
+skills do not appear in your app session, install the generated Bifrost
+code-intelligence skill into each target workspace. The skill is named
+`bifrost-code-intelligence` because it exposes the analyzer-backed navigation,
+reading, search, and usage tools used by guided review workflows:
+
+```bash
+mkdir -p /absolute/path/to/workspace/.agents/skills
+cp -R "$(pwd)/plugins/bifrost-agent/amp-skills/bifrost-code-intelligence" \
+  /absolute/path/to/workspace/.agents/skills/bifrost-code-intelligence
+```
+
+Open the project-specific settings page in Antigravity. The project
+**Customizations** section should list `bifrost-code-intelligence`. Validate
+with a guided-review prompt that requires a Bifrost MCP tool on source code:
+
+```text
+Use the bifrost-code-intelligence skill for a guided review. Inspect the current changes, use the Bifrost MCP get_summaries tool on src/analyzer/usages for source context, and report review findings with file and line references.
+```
+
 ## Amp Install and Local Testing
 
 Amp uses a generated skill collection at
