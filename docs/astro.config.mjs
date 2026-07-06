@@ -46,6 +46,7 @@ export default defineConfig({
           items: [
             { label: 'LSP Server', slug: 'lsp' },
             { label: 'VS Code', slug: 'vscode' },
+            { label: 'Neovim', slug: 'neovim' },
           ],
         },
         {
