@@ -2,11 +2,12 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 const site = process.env.PUBLIC_DOCS_SITE ?? 'https://brokkai.github.io';
-const base = process.env.PUBLIC_DOCS_BASE ?? '/bifrost';
+const productionBase = process.env.PUBLIC_DOCS_BASE ?? '/bifrost';
+const isDev = process.argv.includes('dev');
 
 export default defineConfig({
   site,
-  base,
+  base: isDev ? '/' : productionBase,
   integrations: [
     starlight({
       title: 'Bifrost Docs',
@@ -35,6 +36,7 @@ export default defineConfig({
           label: 'Use Bifrost via MCP',
           items: [
             { label: 'MCP Server', slug: 'mcp' },
+            { label: 'Agent Instructions', slug: 'agents' },
             { label: 'Codex', slug: 'codex' },
             { label: 'Claude Code', slug: 'claude-code' },
             { label: 'Cursor', slug: 'cursor' },
