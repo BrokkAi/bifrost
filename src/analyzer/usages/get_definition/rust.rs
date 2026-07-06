@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::RustReferenceContext;
 use crate::analyzer::rust::lexical_scope;
 use crate::hash::HashMap;
 
@@ -69,6 +70,13 @@ pub(super) fn resolve_rust(
         }
     }
     let refs = rust.reference_context_of(file);
+    if let Some(tree) = tree
+        && let Some(candidates) =
+            rust_use_path_module_candidates(rust, support, file, source, tree, site, &refs)
+        && !candidates.is_empty()
+    {
+        return candidates_outcome(candidates);
+    }
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
         let resolved = rust_focused_scoped_segment_candidates(rust, support, file, site)
@@ -137,6 +145,71 @@ pub(super) fn resolve_rust(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Rust definition"),
     )
+}
+
+fn rust_use_path_module_candidates(
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    refs: &RustReferenceContext,
+) -> Option<Vec<CodeUnit>> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    if !matches!(node.kind(), "identifier" | "self" | "super" | "crate") {
+        return None;
+    }
+    let path = rust_enclosing_scoped_use_path(node)?;
+    if !(path.start_byte() <= site.focus_start_byte && site.focus_start_byte < path.end_byte()) {
+        return None;
+    }
+    let path_text = rust_node_text(path, source).trim();
+    if path_text.is_empty() {
+        return None;
+    }
+    let fqn = rust_module_path_fqn(rust, file, refs, path_text)?;
+    let candidates: Vec<_> = support
+        .fqn(&fqn)
+        .into_iter()
+        .filter(CodeUnit::is_module)
+        .collect();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
+fn rust_enclosing_scoped_use_path(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        let parent = node.parent()?;
+        match parent.kind() {
+            "use_declaration" | "use_list" => return None,
+            "scoped_use_list" => {
+                let path = parent.child_by_field_name("path")?;
+                return node_within(path, node).then_some(path);
+            }
+            _ => node = parent,
+        }
+    }
+}
+
+fn node_within(container: Node<'_>, node: Node<'_>) -> bool {
+    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
+}
+
+fn rust_module_path_fqn(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    refs: &RustReferenceContext,
+    path: &str,
+) -> Option<String> {
+    if let Some((module_path, name)) = path.rsplit_once("::")
+        && let Some(fqn) = refs.resolve_scoped(module_path, name)
+    {
+        return Some(fqn);
+    }
+    refs.resolve_bare(path)
+        .map(str::to_string)
+        .or_else(|| rust.resolve_module_package(file, path))
 }
 
 fn rust_focused_scoped_segment_candidates(

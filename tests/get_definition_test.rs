@@ -1327,6 +1327,49 @@ pub fn format_value() {}
 }
 
 #[test]
+fn rust_grouped_use_prefix_resolves_to_module_declaration() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod workflow;
+
+use workflow::{Job, Named};
+
+pub fn run(job: Job) -> String {
+    job.name().to_string()
+}
+"#,
+        )
+        .file(
+            "src/workflow.rs",
+            r#"
+pub struct Job;
+
+pub trait Named {
+    fn name(&self) -> &str;
+}
+"#,
+        )
+        .build();
+
+    let line = "use workflow::{Job, Named};";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":4,"column":{}}}]}}"#,
+            column_of(line, "workflow")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "workflow::", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "workflow", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
+}
+
+#[test]
 fn rust_associated_path_type_segment_resolves_imported_sibling_type() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file("src/main.rs", common::RUST_ASSOCIATED_PATH_MAIN)

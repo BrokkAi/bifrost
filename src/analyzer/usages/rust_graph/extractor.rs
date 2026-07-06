@@ -481,6 +481,7 @@ struct MemberScanCtx<'a> {
 fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     match node.kind() {
         "field_expression" => record_instance_member_hit(node, ctx),
+        "token_tree" => record_token_tree_instance_member_hits(node, ctx),
         "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
         "struct_expression" if ctx.target_is_field => record_struct_literal_field_hit(node, ctx),
         _ => {}
@@ -553,6 +554,63 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             ctx.hits,
         );
     } else {
+        push_member_hit(
+            ctx.file,
+            ctx.source,
+            ctx.line_starts,
+            start,
+            end,
+            enclosing,
+            ctx.hits,
+        );
+    }
+}
+
+fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    if ctx.target_is_field {
+        return;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+    for window in children.windows(4) {
+        let [receiver, dot, member, call_args] = window else {
+            continue;
+        };
+        if receiver.kind() != "identifier" || dot.kind() != "." || call_args.kind() != "token_tree"
+        {
+            continue;
+        }
+        if simple_node_text(*member, ctx.source).as_deref() != Some(ctx.member_name) {
+            continue;
+        }
+        let receiver_name = simple_node_text(*receiver, ctx.source);
+        let start = member.start_byte();
+        let end = member.end_byte();
+        let Some(enclosing) =
+            member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+        else {
+            continue;
+        };
+        if !receiver_matches_owner(*receiver, receiver_name.as_deref(), &enclosing, ctx) {
+            continue;
+        }
+        if let Some(receiver_name) = receiver_name.as_ref() {
+            let receiver_mismatched = ctx
+                .analyzer
+                .get_source(&enclosing, false)
+                .map(|enclosing_source| {
+                    receiver_explicitly_mismatched(
+                        ctx.source,
+                        &enclosing_source,
+                        ctx.receiver_type_names,
+                        receiver_name,
+                    )
+                })
+                .unwrap_or(false);
+            if receiver_mismatched {
+                continue;
+            }
+        }
         push_member_hit(
             ctx.file,
             ctx.source,

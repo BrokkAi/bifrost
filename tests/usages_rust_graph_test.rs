@@ -3503,6 +3503,76 @@ pub fn run_demo() -> String {
 }
 
 #[test]
+fn rust_usage_finder_finds_macro_method_call_on_grouped_reexported_factory_returned_local() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub const DEFAULT_PREFIX: &str = "job";
+
+#[derive(Default)]
+pub struct MemoryRepository {
+    pub last: String,
+}
+
+impl MemoryRepository {
+    pub fn save(&mut self, value: &str) -> String {
+        self.last = value.to_string();
+        value.trim().to_string()
+    }
+}
+
+pub struct Service {
+    repository: MemoryRepository,
+}
+
+impl Service {
+    pub fn new(repository: MemoryRepository) -> Self {
+        Self { repository }
+    }
+
+    pub fn execute(mut self, name: &str) -> String {
+        let stored = self.repository.save(name);
+        format!("{DEFAULT_PREFIX}:{stored}")
+    }
+}
+
+pub fn build_service(repository: MemoryRepository) -> Service {
+    Service::new(repository)
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+pub mod service;
+
+pub use service::{DEFAULT_PREFIX, MemoryRepository, Service, build_service};
+
+pub fn run_demo() -> String {
+    let mut repository = MemoryRepository::default();
+    repository.save("Ada");
+    let service = build_service(repository);
+    format!("{}:done", service.execute(" Grace "))
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Service.execute");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .into_either()
+        .expect("expected Rust graph success");
+
+    assert!(
+        hits.iter().any(|hit| hit.file == project.file("src/lib.rs")
+            && hit.snippet.contains(r#"service.execute(" Grace ")"#)),
+        "expected macro argument method call on factory-returned local: {hits:?}",
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_direct_self_field_in_qualified_cross_module_impl() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
