@@ -1228,20 +1228,6 @@ namespace App {
 }
 "#,
         ),
-        (
-            "App/AliasConsumer.cs",
-            r#"
-using Alias = Domain.Target;
-
-namespace App {
-    public class AliasConsumer {
-        public void Execute() {
-            Alias.Configure();
-        }
-    }
-}
-"#,
-        ),
     ]);
 
     let configure = member_function(&analyzer, "Domain.Target", "Configure");
@@ -1255,7 +1241,7 @@ namespace App {
 
     assert!(
         matches!(result, FuzzyResult::Failure { .. }),
-        "using static and alias using member forms are deferred and should fall back"
+        "using static member forms are deferred and should fall back when there are no proven hits"
     );
 }
 
@@ -1473,8 +1459,8 @@ namespace App {
 }
 
 #[test]
-fn csharp_graph_fails_unknown_receiver_but_accepts_typed_receiver() {
-    let (_project, analyzer) = csharp_analyzer_with_files(&[
+fn csharp_graph_returns_proven_hits_despite_unknown_same_name_receiver() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
         (
             "Domain/Target.cs",
             "namespace Domain { public class Target { public void Run() {} } }\n",
@@ -1500,17 +1486,17 @@ namespace App {
     ]);
 
     let run = member_function(&analyzer, "Domain.Target", "Run");
-    let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let result = CSharpUsageGraphStrategy::new().find_usages(
-        &analyzer,
-        std::slice::from_ref(&run),
-        &candidates,
-        1000,
-    );
+    let hits = graph_hits(&analyzer, &run);
 
+    assert_eq!(
+        1,
+        hits.len(),
+        "the typed receiver hit must survive the unknown same-name receiver: {hits:#?}"
+    );
     assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "mixed typed and unknown receivers should fall back instead of returning partial proof"
+        hits.iter()
+            .all(|hit| hit.file == project.file("App/Consumer.cs")),
+        "{hits:#?}"
     );
 }
 

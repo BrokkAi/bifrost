@@ -31,8 +31,15 @@ pub const DEFAULT_MAX_USAGES: usize = 1000;
 pub struct QueryResult {
     pub candidate_files: HashSet<ProjectFile>,
     pub candidate_files_truncated: bool,
+    pub candidate_files_sample: Option<CandidateFilesSample>,
     pub result: FuzzyResult,
     pub graph_failure: Option<crate::analyzer::usages::model::UsageAnalysisDiagnostic>,
+}
+
+pub struct CandidateFilesSample {
+    pub scanned: Vec<ProjectFile>,
+    pub omitted: Vec<ProjectFile>,
+    pub omitted_count: usize,
 }
 
 /// Facade that wires a [`CandidateFileProvider`] together with language-specific usage
@@ -88,6 +95,7 @@ impl UsageFinder {
             return QueryResult {
                 candidate_files: HashSet::default(),
                 candidate_files_truncated: false,
+                candidate_files_sample: None,
                 result: FuzzyResult::empty_success(),
                 graph_failure: None,
             };
@@ -113,9 +121,13 @@ impl UsageFinder {
         }
 
         let candidate_files_truncated = candidates.len() > max_files;
+        let all_candidates = candidate_files_truncated.then(|| candidates.clone());
         if candidate_files_truncated {
             candidates = truncate_candidates(candidates, &protected_candidates, max_files);
         }
+        let candidate_files_sample = all_candidates
+            .as_ref()
+            .map(|all_candidates| candidate_files_sample(all_candidates, &candidates));
 
         let mut graph_failure = None;
         let result = match graph_find_usages(
@@ -145,6 +157,7 @@ impl UsageFinder {
         QueryResult {
             candidate_files: candidates,
             candidate_files_truncated,
+            candidate_files_sample,
             result,
             graph_failure,
         }
@@ -288,6 +301,33 @@ fn truncate_candidates(
         kept.insert(file);
     }
     kept
+}
+
+const CANDIDATE_FILE_SAMPLE_LIMIT: usize = 10;
+
+fn candidate_files_sample(
+    all_candidates: &HashSet<ProjectFile>,
+    scanned_candidates: &HashSet<ProjectFile>,
+) -> CandidateFilesSample {
+    let scanned = sorted_files(scanned_candidates)
+        .into_iter()
+        .take(CANDIDATE_FILE_SAMPLE_LIMIT)
+        .collect();
+    let omitted_all: HashSet<ProjectFile> = all_candidates
+        .iter()
+        .filter(|file| !scanned_candidates.contains(*file))
+        .cloned()
+        .collect();
+    let omitted_count = omitted_all.len();
+    let omitted = sorted_files(&omitted_all)
+        .into_iter()
+        .take(CANDIDATE_FILE_SAMPLE_LIMIT)
+        .collect();
+    CandidateFilesSample {
+        scanned,
+        omitted,
+        omitted_count,
+    }
 }
 
 fn sorted_files(files: &HashSet<ProjectFile>) -> Vec<ProjectFile> {

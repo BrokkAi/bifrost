@@ -593,6 +593,7 @@ pub struct ScanUsagesSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanUsagesSymbolSummary {
     pub symbol: String,
+    pub resolution: ScanUsageResolution,
     pub total_hits: usize,
     pub rendering: UsageRendering,
     pub files_returned: usize,
@@ -629,9 +630,16 @@ pub enum UsageRendering {
     Summary,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanUsageResolution {
+    Resolved,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolUsages {
     pub symbol: String,
+    pub resolution: ScanUsageResolution,
     pub total_hits: usize,
     pub rendering: UsageRendering,
     /// True when the candidate file set exceeded the analyzer's per-query cap
@@ -738,7 +746,16 @@ pub struct UsageFailureInfo {
     /// and an arbitrary subset was scanned before the failure was produced.
     pub candidate_files_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesCandidateFilesSample {
+    pub scanned: Vec<String>,
+    pub omitted: Vec<String>,
+    pub omitted_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2551,6 +2568,7 @@ fn location_selector_failure(
         reason_kind: reason_kind.to_string(),
         reason: reason.into(),
         candidate_files_truncated: false,
+        candidate_files_sample: None,
         hint,
     })
 }
@@ -2573,6 +2591,30 @@ fn usage_failure_hint(reason_kind: &str, candidate_files_truncated: bool) -> Opt
         | "unsupported_target_shape"
         | "no_graph_seed" => None,
         _ => None,
+    }
+}
+
+fn truncated_zero_hit_failure(
+    symbol: String,
+    overloads: &[CodeUnit],
+    candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
+) -> UsageFailureInfo {
+    UsageFailureInfo {
+        symbol,
+        fq_name: overloads
+            .first()
+            .map(CodeUnit::fq_name)
+            .unwrap_or_default(),
+        strategy: "UsageFinder".to_string(),
+        reason_kind: "candidate_files_truncated".to_string(),
+        reason: "Candidate files exceeded the cap before hit extraction; zero hits means no hits in the scanned subset, not no workspace usages."
+            .to_string(),
+        candidate_files_truncated: true,
+        candidate_files_sample,
+        hint: Some(
+            "Re-call scan_usages with narrower `paths` chosen from candidate_files_sample."
+                .to_string(),
+        ),
     }
 }
 
@@ -2989,6 +3031,15 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             SCAN_USAGES_MAX_CALLSITES,
         );
         let truncated = query.candidate_files_truncated;
+        let candidate_files_sample =
+            query
+                .candidate_files_sample
+                .as_ref()
+                .map(|sample| ScanUsagesCandidateFilesSample {
+                    scanned: sample.scanned.iter().map(rel_path_string).collect(),
+                    omitted: sample.omitted.iter().map(rel_path_string).collect(),
+                    omitted_count: sample.omitted_count,
+                });
 
         match query.result {
             FuzzyResult::Success { hits_by_overload } => {
@@ -2997,6 +3048,14 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     .flat_map(BTreeSet::into_iter)
                     .collect();
                 let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
+                if truncated && filtered.hits.is_empty() {
+                    failures.push(truncated_zero_hit_failure(
+                        symbol,
+                        &overloads,
+                        candidate_files_sample,
+                    ));
+                    continue;
+                }
 
                 render_states.push(SymbolUsageRenderState::new(
                     symbol,
@@ -3093,6 +3152,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     reason_kind,
                     reason,
                     candidate_files_truncated: truncated,
+                    candidate_files_sample,
                 });
             }
             FuzzyResult::TooManyCallsites {
@@ -3772,6 +3832,7 @@ fn build_scan_usages_summary(
         .iter()
         .map(|usage| ScanUsagesSymbolSummary {
             symbol: usage.symbol.clone(),
+            resolution: usage.resolution,
             total_hits: usage.total_hits,
             rendering: usage.rendering,
             files_returned: usage.files.len(),
@@ -4014,6 +4075,7 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
 
     SymbolUsages {
         symbol: state.symbol.clone(),
+        resolution: ScanUsageResolution::Resolved,
         total_hits: state.total_hits,
         rendering: state.rendering,
         candidate_files_truncated: state.candidate_files_truncated,

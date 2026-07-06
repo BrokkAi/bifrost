@@ -64,7 +64,7 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
             }
         }
 
-        if saw_unproven_match && spec.kind != TargetKind::Type {
+        if hits.is_empty() && saw_unproven_match && spec.kind != TargetKind::Type {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsafeInference("no proven structured hits"),

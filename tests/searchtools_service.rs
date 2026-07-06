@@ -1978,6 +1978,8 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
     let usages = value["usages"].as_array().unwrap();
     assert_eq!(1, usages.len(), "payload: {value}");
     assert_eq!("E.iMethod", usages[0]["symbol"]);
+    assert_eq!("resolved", usages[0]["resolution"]);
+    assert_eq!("resolved", value["summary"]["symbols"][0]["resolution"]);
     assert!(
         usages[0]["total_hits"].as_u64().unwrap() >= 1,
         "expected >=1 hit, payload: {value}"
@@ -2005,6 +2007,117 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
     assert_eq!(0, array_len(&value, "ambiguous"));
     assert_eq!(0, array_len(&value, "failures"));
     assert_eq!(0, array_len(&value, "too_many_callsites"));
+}
+
+#[test]
+fn scan_usages_distinguishes_resolved_zero_from_unresolved_symbol() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Greeter.java",
+            "public class Greeter {\n    public String unused() { return \"hi\"; }\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let resolved_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.unused"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let resolved: Value = serde_json::from_str(&resolved_payload).unwrap();
+    assert_eq!(1, array_len(&resolved, "usages"), "payload: {resolved}");
+    assert_eq!(0, array_len(&resolved, "not_found"), "payload: {resolved}");
+    assert_eq!("resolved", resolved["usages"][0]["resolution"]);
+    assert_eq!(0, resolved["usages"][0]["total_hits"].as_u64().unwrap());
+
+    let unresolved_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.missing"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let unresolved: Value = serde_json::from_str(&unresolved_payload).unwrap();
+    assert_eq!(0, array_len(&unresolved, "usages"), "payload: {unresolved}");
+    assert_eq!(
+        1,
+        array_len(&unresolved, "not_found"),
+        "payload: {unresolved}"
+    );
+    assert_eq!("Greeter.missing", unresolved["not_found"][0]["input"]);
+    assert!(
+        unresolved["not_found"][0]["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("no symbol matched")),
+        "payload: {unresolved}"
+    );
+}
+
+#[test]
+fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sample() {
+    let mut project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {}\n",
+        );
+    for idx in 0..1005 {
+        project = project.file(
+            format!("aaa/Decoy{idx:04}.php"),
+            "<?php\nnamespace Decoy;\nfunction noop() {}\n",
+        );
+    }
+    let project = project
+        .file(
+            "zzz/RealCaller.php",
+            "<?php\nnamespace Later;\nfunction build(): \\App\\Service { return new \\App\\Service(); }\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["App.Service"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, array_len(&value, "usages"), "payload: {value}");
+    assert_eq!(1, array_len(&value, "failures"), "payload: {value}");
+    assert_eq!(true, value["summary"]["partial"], "payload: {value}");
+    let failure = &value["failures"][0];
+    assert_eq!("candidate_files_truncated", failure["reason_kind"]);
+    assert_eq!(true, failure["candidate_files_truncated"]);
+    assert!(
+        failure["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not no workspace usages")),
+        "payload: {value}"
+    );
+    assert!(
+        failure["candidate_files_sample"]["scanned"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "payload: {value}"
+    );
+    assert!(
+        failure["candidate_files_sample"]["omitted"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "payload: {value}"
+    );
+    assert!(
+        failure["candidate_files_sample"]["omitted_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "payload: {value}"
+    );
 }
 
 fn assert_ruby_user_save_scan_usages_hit(user_call: &str, account_call: &str, expected_hit: &str) {
