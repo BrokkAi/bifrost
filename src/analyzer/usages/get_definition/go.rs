@@ -592,6 +592,13 @@ fn go_value_type_fqn(
     value_node: Node<'_>,
     byte: usize,
 ) -> Option<String> {
+    if value_node.kind() == "call_expression"
+        && let Some(fqn) = go_call_expression_return_type_fqn(
+            analyzer, support, file, source, root, value_node, byte,
+        )
+    {
+        return Some(fqn);
+    }
     go_value_type_text(analyzer, support, file, source, root, value_node, byte)
         .and_then(|type_text| go_resolve_type_text_fqn(analyzer, support, file, source, &type_text))
 }
@@ -893,6 +900,20 @@ fn go_call_expression_return_type_text(
         "selector_expression" => {
             let qualifier_node = go_first_named_child(function)?;
             let method_node = go_last_named_child(function)?;
+            if qualifier_node.kind() == "identifier" {
+                let qualifier = go_node_text(qualifier_node, source).trim();
+                if let Some(import_path) =
+                    go_import_paths(resolve_analyzer::<GoAnalyzer>(analyzer)?, file).get(qualifier)
+                {
+                    let function_name = go_node_text(method_node, source).trim();
+                    if let Some(return_type) = go_callable_return_type_text(
+                        analyzer,
+                        go_package_member_candidates(support, import_path, function_name),
+                    ) {
+                        return Some(return_type);
+                    }
+                }
+            }
             let owner_fqn = go_expression_type_fqn(
                 analyzer,
                 support,
@@ -917,6 +938,67 @@ fn go_call_expression_return_type_text(
     }
 }
 
+fn go_call_expression_return_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    if expression.kind() != "call_expression" {
+        return None;
+    }
+    let function = expression
+        .child_by_field_name("function")
+        .or_else(|| go_first_named_child(expression))?;
+    match function.kind() {
+        "selector_expression" => {
+            let qualifier_node = go_first_named_child(function)?;
+            let method_node = go_last_named_child(function)?;
+            if qualifier_node.kind() == "identifier" {
+                let qualifier = go_node_text(qualifier_node, source).trim();
+                if let Some(import_path) =
+                    go_import_paths(resolve_analyzer::<GoAnalyzer>(analyzer)?, file).get(qualifier)
+                {
+                    let function_name = go_node_text(method_node, source).trim();
+                    let candidates =
+                        go_package_member_candidates(support, import_path, function_name);
+                    if let Some(fqn) = go_callable_return_type_fqn(analyzer, support, candidates) {
+                        return Some(fqn);
+                    }
+                }
+            }
+            let owner_fqn = go_expression_type_fqn(
+                analyzer,
+                support,
+                file,
+                source,
+                root,
+                qualifier_node,
+                byte.min(expression.start_byte()),
+            )?;
+            let method = go_node_text(method_node, source).trim();
+            go_callable_return_type_fqn(
+                analyzer,
+                support,
+                support.fqn(&format!("{owner_fqn}.{method}")),
+            )
+        }
+        "identifier" => {
+            let package = go_package_name(file, source);
+            let name = go_node_text(function, source).trim();
+            go_callable_return_type_fqn(
+                analyzer,
+                support,
+                go_package_member_candidates(support, &package, name),
+            )
+        }
+        _ => None,
+    }
+}
+
 fn go_callable_return_type_text(
     analyzer: &dyn IAnalyzer,
     candidates: Vec<CodeUnit>,
@@ -931,6 +1013,22 @@ fn go_callable_return_type_text(
             .signature()
             .and_then(go_function_return_type_text)
             .map(str::to_string)
+    })
+}
+
+fn go_callable_return_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    candidates: Vec<CodeUnit>,
+) -> Option<String> {
+    candidates.into_iter().find_map(|candidate| {
+        let return_type = analyzer
+            .signatures(&candidate)
+            .iter()
+            .find_map(|signature| go_function_return_type_text(signature))
+            .or_else(|| candidate.signature().and_then(go_function_return_type_text))?;
+        let source = candidate.source().read_to_string().ok()?;
+        go_resolve_type_text_fqn(analyzer, support, candidate.source(), &source, return_type)
     })
 }
 

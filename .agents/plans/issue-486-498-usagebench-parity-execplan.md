@@ -16,6 +16,8 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
 - [x] (2026-07-06T16:24Z) Determined no analyzer code fix is justified from local evidence because all targeted current-state tests passed.
 - [x] (2026-07-06T22:05Z) Fixed and usagebench-validated the Java issue #486 cases.
 - [x] (2026-07-06T23:05Z) Fixed and usagebench-validated PHP #489 cases plus the trait/static portions of #496.
+- [x] (2026-07-06T19:05Z) Fixed, pushed, and closed Scala issue #494; Scala baseline direct-member cases and Scala renamed companion import now improve in usagebench.
+- [x] (2026-07-06T19:08Z) Fixed and usagebench-validated Go issue #495 by resolving imported package factory return types relative to the factory declaration file.
 - [ ] Remove usagebench expected-failure markers after a usagebench checkout is available and the matching cases pass there.
 
 ## Surprises & Discoveries
@@ -28,6 +30,8 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
   Evidence: `get_summaries` showed current tests for Go promoted embedded members, PHP trait/interface relations, Rust UFCS and associated types, Scala extension methods, C# partial property access, JS/TS object/static/property lookup, and Python reexported class alias/decorator/property lookup.
 - Observation: The targeted current-state reconciliation tests all passed on this checkout.
   Evidence: Focused `cargo test` commands listed in `Artifacts and Notes` passed for Go #495, PHP #489/#496, Rust #497, Scala #494/#498, C# #492, JS/TS #487/#488, Python #490, Java #486, and C++ #491 representative shapes.
+- Observation: Go #495 is not a declaration-to-usage failure on current `master`; both promoted-member usage scans report `0 missing, 0 extra`.
+  Evidence: `../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/go-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-go-lsp-495` reported XFAIL only because usage lookups at `worker.Record` and `worker.Last` returned `no_definition` with "`worker.Record` is shadowed by a local Go binding" and "`worker.Last` is shadowed by a local Go binding".
 
 ## Decision Log
 
@@ -40,10 +44,15 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
 - Decision: Do not add analyzer patches in this checkpoint.
   Rationale: Every focused local test corresponding to the reported shapes passed. The remaining action is usagebench expected-failure cleanup, but the usagebench checkout is not present locally.
   Date/Author: 2026-07-06 / Codex.
+- Decision: For Go #495, keep embedded promotion represented in the existing nearest-depth member helper and fix only imported factory return typing.
+  Rationale: Current graph and get-definition helpers already know how to walk promoted fields and methods once the receiver type is known. The failing usagebench fixture binds `worker := svc.NewWorker()`, and the missing type is the return type of an imported package selector call, not a missing embedded-promotion model.
+  Date/Author: 2026-07-06 / Codex.
 
 ## Outcomes & Retrospective
 
 Current-state reconciliation is complete for the local Bifrost checkout. No analyzer code was changed because no current local failure was reproduced. The remaining work is to run the matching usagebench cases and remove expected-failure markers in the usagebench repository; that work is blocked in this environment because no usagebench checkout was found.
+
+Go issue #495 is complete on the Bifrost side. The existing embedded-promotion model was sufficient once `worker := svc.NewWorker()` typed `worker` as `*Worker`; the fix resolves imported selector-call return types such as `svc.NewWorker()` against the source file that declares `NewWorker`, so unqualified return types like `*Worker` are interpreted in the `service` package rather than the caller's `main` package.
 
 ## Context and Orientation
 
@@ -196,3 +205,16 @@ Fresh usagebench validation after clearing PHP fixture `.bifrost` caches:
     ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/php-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-php-lsp-final
 
 Confirmed improved cases: `php-repository-method-call`, `php-parity-use-alias-static-method-call`, `php-parity-trait-method-call`, and `php-parity-static-property-access`. Remaining PHP expected failure: `php-parity-interface-method-implementation` still expects the concrete implementation declaration (`EmailNotifier::notify`) in the external usage surface and expects definition lookup from that declaration site to jump to the interface method. Bifrost already exposes implementation declarations as `OverrideDeclaration` hits on the LSP references surface, and `tests/usages_php_graph_test.rs::php_graph_lsp_references_include_php_interface_method_implementations` explicitly asserts they must not appear in external usages. Treat this remaining usagebench expectation as a harness/surface mismatch unless that Bifrost contract is intentionally changed.
+
+Revision note, 2026-07-06 / Codex: Go issue #495 is fixed on fresh usagebench runs. The failure was not the existing embedded promotion walk; usage lookup could not type `worker := svc.NewWorker()` because the `*Worker` return type from `NewWorker` was resolved in the caller package. `src/analyzer/usages/get_definition/go.rs` now resolves call return types to FQNs using each callable declaration's source file. Focused validation passed:
+
+    cargo test --test get_definition_test go_imported_factory_result_resolves_promoted_embedded_members -- --nocapture
+    cargo test --test get_definition_test go_
+    cargo test --test usages_go_graph_test
+    cargo clippy-no-cuda
+
+Fresh usagebench validation after clearing Go fixture `.bifrost` caches:
+
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/go-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-go-lsp-495
+
+Confirmed improved cases: `go-parity-embedded-promoted-method-call` and `go-parity-embedded-promoted-field-access`.

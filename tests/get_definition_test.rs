@@ -4408,6 +4408,80 @@ func (m *Model) Handle() {
 }
 
 #[test]
+fn go_imported_factory_result_resolves_promoted_embedded_members() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/parity\n\ngo 1.22\n")
+        .file(
+            "pkg/service/service.go",
+            r#"
+package service
+
+type AuditLog struct {
+    Last string
+}
+
+func (a *AuditLog) Record(message string) string {
+    a.Last = message
+    return a.Last
+}
+
+type Worker struct {
+    *AuditLog
+}
+
+func NewWorker() *Worker {
+    return &Worker{AuditLog: &AuditLog{}}
+}
+"#,
+        )
+        .file(
+            "cmd/app/main.go",
+            r#"
+package main
+
+import svc "example.com/parity/pkg/service"
+
+func main() {
+    worker := svc.NewWorker()
+    worker.Record("start")
+    _ = worker.Last
+}
+"#,
+        )
+        .build();
+
+    let method_line = r#"    worker.Record("start")"#;
+    let method = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"cmd/app/main.go","line":8,"column":{}}}]}}"#,
+            column_of(method_line, "Record")
+        ),
+    );
+    assert_eq!(method["results"][0]["status"], "resolved", "{method}");
+    assert_eq!(
+        method["results"][0]["definitions"][0]["fqn"],
+        "example.com/parity/pkg/service.AuditLog.Record",
+        "{method}"
+    );
+
+    let field_line = "    _ = worker.Last";
+    let field = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"cmd/app/main.go","line":9,"column":{}}}]}}"#,
+            column_of(field_line, "Last")
+        ),
+    );
+    assert_eq!(field["results"][0]["status"], "resolved", "{field}");
+    assert_eq!(
+        field["results"][0]["definitions"][0]["fqn"],
+        "example.com/parity/pkg/service.AuditLog.Last",
+        "{field}"
+    );
+}
+
+#[test]
 fn go_imported_package_var_resolves_inside_longer_selector_chain() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n\ngo 1.22\n")
