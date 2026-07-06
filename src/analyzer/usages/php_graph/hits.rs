@@ -97,22 +97,19 @@ pub(super) fn push_override_declaration_hit(
     let enclosing = analyzer
         .enclosing_code_unit(file, &range)
         .unwrap_or_else(|| declaration.clone());
-    hits.insert(
-        usage_hit(
-            file,
+    hits.insert(usage_hit(
+        file,
+        range.start_line,
+        start,
+        end,
+        enclosing,
+        snippet_around_line(
+            &source,
+            &line_starts,
             range.start_line,
-            start,
-            end,
-            enclosing,
-            snippet_around_line(
-                &source,
-                &line_starts,
-                range.start_line,
-                SNIPPET_CONTEXT_LINES,
-            ),
-        )
-        .into_override_declaration(),
-    );
+            SNIPPET_CONTEXT_LINES,
+        ),
+    ));
 }
 
 fn declaration_name_range(

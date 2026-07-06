@@ -1200,7 +1200,7 @@ function byChild(Child $child): void {
     ]);
 
     assert_eq!(1, graph_hits(&analyzer, "App.Target.run").len());
-    assert_eq!(1, graph_hits(&analyzer, "App.Service.run").len());
+    assert_eq!(2, graph_hits(&analyzer, "App.Service.run").len());
 }
 
 #[test]
@@ -1230,7 +1230,7 @@ function consume(): void {
         ),
     ]);
 
-    assert_eq!(1, graph_hits(&analyzer, "App.Service.run").len());
+    assert_eq!(2, graph_hits(&analyzer, "App.Service.run").len());
 }
 
 #[test]
@@ -1292,8 +1292,8 @@ function consume(): void {
     assert!(
         external_hits
             .iter()
-            .all(|hit| !hit.snippet.contains("public function notify")),
-        "override declarations must not appear in external usages: {external_hits:#?}"
+            .any(|hit| hit.snippet.contains("public function notify")),
+        "implementation declarations should appear as interface method usages: {external_hits:#?}"
     );
     assert!(
         lsp_hits

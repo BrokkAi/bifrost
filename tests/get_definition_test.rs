@@ -8731,7 +8731,7 @@ fn php_trait_method_resolves_through_using_class() {
     let external = lookup(
         project.root(),
         &format!(
-            r#"{{"references":[{{"path":"src/Consumer.php","line":5,"column":{}}}]}}"#,
+            r#"{{"references":[{{"path":"src/Consumer.php","line":6,"column":{}}}]}}"#,
             column_of(external_line, "record")
         ),
     );
@@ -8770,6 +8770,40 @@ fn php_trait_method_resolves_through_using_class() {
     assert_eq!(
         result["definitions"][0]["fqn"], "App.Other.OtherNotifier.record",
         "{unrelated}"
+    );
+}
+
+#[test]
+fn php_interface_implementation_method_declaration_resolves_to_interface_method() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .file(
+            "src/Contracts/Notifier.php",
+            "<?php\nnamespace App\\Contracts;\ninterface Notifier {\n    public function notify(string $message): void;\n}\n",
+        )
+        .file(
+            "src/Service/EmailNotifier.php",
+            "<?php\nnamespace App\\Service;\nuse App\\Contracts\\Notifier;\nclass EmailNotifier implements Notifier {\n    public function notify(string $message): void {}\n}\n",
+        )
+        .build();
+
+    let line = "    public function notify(string $message): void {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Service/EmailNotifier.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "notify")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Contracts.Notifier.notify",
+        "{value}"
     );
 }
 

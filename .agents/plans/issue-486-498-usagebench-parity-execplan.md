@@ -18,6 +18,7 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
 - [x] (2026-07-06T23:05Z) Fixed and usagebench-validated PHP #489 cases plus the trait/static portions of #496.
 - [x] (2026-07-06T19:05Z) Fixed, pushed, and closed Scala issue #494; Scala baseline direct-member cases and Scala renamed companion import now improve in usagebench.
 - [x] (2026-07-06T19:08Z) Fixed and usagebench-validated Go issue #495 by resolving imported package factory return types relative to the factory declaration file.
+- [x] (2026-07-06T19:14Z) Fixed and usagebench-validated the remaining PHP issue #496 interface implementation case.
 - [ ] Remove usagebench expected-failure markers after a usagebench checkout is available and the matching cases pass there.
 
 ## Surprises & Discoveries
@@ -47,12 +48,17 @@ Usagebench issue reports #486 through #498 describe residual declaration-to-usag
 - Decision: For Go #495, keep embedded promotion represented in the existing nearest-depth member helper and fix only imported factory return typing.
   Rationale: Current graph and get-definition helpers already know how to walk promoted fields and methods once the receiver type is known. The failing usagebench fixture binds `worker := svc.NewWorker()`, and the missing type is the return type of an imported package selector call, not a missing embedded-promotion model.
   Date/Author: 2026-07-06 / Codex.
+- Decision: For PHP #496, align `scan_usages` with the usagebench/LSP parity expectation that interface implementation declarations count as usages of the interface method.
+  Rationale: PHP already computed implementation declarations through `PhpHierarchyIndex`; the remaining failure was surface classification and declaration-site lookup. Usagebench expects selecting `EmailNotifier::notify` to resolve to `Notifier::notify`, so the PHP definition resolver now treats method declaration names as reference sites only when they structurally implement an interface method.
+  Date/Author: 2026-07-06 / Codex.
 
 ## Outcomes & Retrospective
 
 Current-state reconciliation is complete for the local Bifrost checkout. No analyzer code was changed because no current local failure was reproduced. The remaining work is to run the matching usagebench cases and remove expected-failure markers in the usagebench repository; that work is blocked in this environment because no usagebench checkout was found.
 
 Go issue #495 is complete on the Bifrost side. The existing embedded-promotion model was sufficient once `worker := svc.NewWorker()` typed `worker` as `*Worker`; the fix resolves imported selector-call return types such as `svc.NewWorker()` against the source file that declares `NewWorker`, so unqualified return types like `*Worker` are interpreted in the `service` package rather than the caller's `main` package.
+
+PHP issue #496 is complete on the Bifrost side. Trait method calls, interface method calls through concrete receivers, interface implementation declarations, aliased static calls, and static property accesses now all improve in `php-lsp-parity.yaml`; the magic `__get` scenario remains explicitly not planned in usagebench.
 
 ## Context and Orientation
 
@@ -218,3 +224,17 @@ Fresh usagebench validation after clearing Go fixture `.bifrost` caches:
     ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/go-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-go-lsp-495
 
 Confirmed improved cases: `go-parity-embedded-promoted-method-call` and `go-parity-embedded-promoted-field-access`.
+
+Revision note, 2026-07-06 / Codex: PHP issue #496 is now fully fixed on fresh usagebench runs. Implementation method declarations for interface targets are emitted on the PHP `scan_usages` surface, and `get_definition` on an implementing method declaration name resolves to the structurally implemented interface method. Focused validation passed:
+
+    cargo test --test get_definition_test php_interface_implementation_method_declaration_resolves_to_interface_method -- --nocapture
+    cargo test --test usages_php_graph_test php_graph_lsp_references_include_php_interface_method_implementations -- --nocapture
+    cargo test --test usages_php_graph_test
+    cargo test --test get_definition_test php_
+    cargo clippy-no-cuda
+
+Fresh usagebench validation after clearing PHP fixture `.bifrost` caches:
+
+    ../usagebench/target/debug/usagebench run-bifrost ../usagebench/benchmarks/cases/php-lsp-parity.yaml --bifrost-repo /home/jonathan/Projects/bifrost --bifrost-working-tree --work-dir /tmp/usagebench-php-lsp-496
+
+Confirmed improved cases: `php-parity-use-alias-static-method-call`, `php-parity-trait-method-call`, `php-parity-interface-method-implementation`, and `php-parity-static-property-access`. The magic `__get` case remains `NOTPLANNED`.

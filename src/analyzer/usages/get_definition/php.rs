@@ -31,6 +31,14 @@ pub(super) fn resolve_php(
             ),
         );
     };
+    let ctx = php.file_context_from_source(file, source);
+    let class_ranges = ClassRangeIndex::build(analyzer, file);
+    if php_is_declaration_name(node)
+        && let Some(outcome) =
+            php_interface_method_declaration_outcome(php, support, source, node, &class_ranges)
+    {
+        return outcome;
+    }
     if php_is_non_reference_context(node) || php_is_declaration_name(node) {
         return no_definition(
             "declaration_or_import_site",
@@ -47,8 +55,6 @@ pub(super) fn resolve_php(
         );
     }
 
-    let ctx = php.file_context_from_source(file, source);
-    let class_ranges = ClassRangeIndex::build(analyzer, file);
     match php_reference_node(node) {
         Some(PhpReferenceNode::Type(type_node)) => {
             let raw = php_qualified_candidate_text(type_node, source);
@@ -100,6 +106,46 @@ pub(super) fn resolve_php(
             ),
         ),
     }
+}
+
+fn php_interface_method_declaration_outcome(
+    php: &PhpAnalyzer,
+    support: &DefinitionLookupIndex,
+    source: &str,
+    node: Node<'_>,
+    class_ranges: &ClassRangeIndex,
+) -> Option<DefinitionLookupOutcome> {
+    let method = php_method_declaration_name(node, source)?;
+    let owner_fqn = class_ranges.enclosing(node.start_byte())?;
+    let owner = support.fqn(owner_fqn).into_iter().next()?;
+    let mut candidates = Vec::new();
+    let mut stack = php.get_direct_ancestors(&owner);
+    let mut seen = HashSet::default();
+    while let Some(ancestor) = stack.pop() {
+        let ancestor_fqn = ancestor.fq_name();
+        if !seen.insert(ancestor_fqn.clone()) {
+            continue;
+        }
+        if php.is_interface(&ancestor) {
+            candidates.extend(support.fqn(&format!("{ancestor_fqn}.{method}")));
+        }
+        stack.extend(php.get_direct_ancestors(&ancestor));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(candidates_outcome(candidates))
+}
+
+fn php_method_declaration_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let parent = node.parent()?;
+    if parent.kind() != "method_declaration" || parent.child_by_field_name("name") != Some(node) {
+        return None;
+    }
+    let name = php_node_text(node, source).trim();
+    (!name.is_empty()).then_some(name)
 }
 
 pub(super) fn parse_php_tree(source: &str) -> Option<Tree> {
