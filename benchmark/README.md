@@ -149,11 +149,21 @@ The webhook payload is benchmark-specific. The workflow sends these fields:
 - `failed_scenarios_count`
 - `compared_scenarios_count`
 - `regression_count`
+- `actionable_regression_count`
 - `improvement_count`
 - `missing_candidate_count`
 - `new_candidate_count`
 - `has_regressions`
+- `has_actionable_regressions`
+- `environment_variance`
 - `summary_text`
+
+`has_regressions` preserves the raw compare result: it is true whenever any
+scenario crosses the regression threshold. `has_actionable_regressions` is the
+operator-facing status bit: it remains false when all threshold hits are covered
+by a suspected whole-run environment variance classification. When present,
+`environment_variance` explains the broad slowdown; Slack should render it as a
+warning or context line, not as a failed benchmark by itself.
 
 Slack-side setup:
 

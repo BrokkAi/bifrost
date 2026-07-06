@@ -189,17 +189,23 @@ jobs:
 
           compared_scenarios_count="0"
           regression_count="0"
+          actionable_regression_count="0"
           improvement_count="0"
           missing_candidate_count="0"
           new_candidate_count="0"
           has_regressions="false"
+          has_actionable_regressions="false"
+          environment_variance="null"
           if [ -f "$compare_path" ]; then
             compared_scenarios_count="$(jq -r '.compared_scenarios_count // 0' "$compare_path")"
             regression_count="$(jq -r '.regression_count // 0' "$compare_path")"
+            actionable_regression_count="$(jq -r '.actionable_regression_count // .regression_count // 0' "$compare_path")"
             improvement_count="$(jq -r '.improvement_count // 0' "$compare_path")"
             missing_candidate_count="$(jq -r '.missing_candidate_count // 0' "$compare_path")"
             new_candidate_count="$(jq -r '.new_candidate_count // 0' "$compare_path")"
             has_regressions="$(jq -r '.has_regressions // false' "$compare_path")"
+            has_actionable_regressions="$(jq -r '.has_actionable_regressions // .has_regressions // false' "$compare_path")"
+            environment_variance="$(jq -c '.environment_variance // null' "$compare_path")"
           fi
 
           summary_text=""
@@ -220,7 +226,7 @@ jobs:
           elif [ "$failed_scenarios_count" != "0" ]; then
             ok="false"
             error_text="benchmark report recorded scenario failures"
-          elif [ "$has_regressions" = "true" ]; then
+          elif [ "$has_actionable_regressions" = "true" ]; then
             ok="false"
             error_text="benchmark compare detected regressions"
           elif [ "$compare_outcome" = "failure" ]; then
@@ -254,10 +260,13 @@ jobs:
               --argjson failed_scenarios_count "$failed_scenarios_count" \
               --argjson compared_scenarios_count "$compared_scenarios_count" \
               --argjson regression_count "$regression_count" \
+              --argjson actionable_regression_count "$actionable_regression_count" \
               --argjson improvement_count "$improvement_count" \
               --argjson missing_candidate_count "$missing_candidate_count" \
               --argjson new_candidate_count "$new_candidate_count" \
               --argjson has_regressions "$has_regressions" \
+              --argjson has_actionable_regressions "$has_actionable_regressions" \
+              --argjson environment_variance "$environment_variance" \
               '{
                 ok: $ok,
                 error_text: $error_text,
@@ -280,10 +289,13 @@ jobs:
                 failed_scenarios_count: $failed_scenarios_count,
                 compared_scenarios_count: $compared_scenarios_count,
                 regression_count: $regression_count,
+                actionable_regression_count: $actionable_regression_count,
                 improvement_count: $improvement_count,
                 missing_candidate_count: $missing_candidate_count,
                 new_candidate_count: $new_candidate_count,
                 has_regressions: $has_regressions,
+                has_actionable_regressions: $has_actionable_regressions,
+                environment_variance: $environment_variance,
                 summary_text: $summary_text
               }'
           )"
