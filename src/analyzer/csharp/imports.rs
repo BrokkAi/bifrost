@@ -1,6 +1,6 @@
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
-    build_reverse_import_index,
+    build_reverse_file_index, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -137,43 +137,25 @@ impl CSharpAnalyzer {
                 }
             }
 
-            let mut references_by_target: HashMap<ProjectFile, HashSet<ProjectFile>> =
-                HashMap::default();
-            for candidate in self.inner.all_files() {
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_file_index(&files, |candidate| {
                 let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
-                    continue;
+                    return Vec::new();
                 };
                 let candidate_namespace = self.namespace_of_file(candidate);
+                let mut resolved_targets = Vec::new();
                 for identifier in identifiers {
-                    if let Some(targets) = by_namespace_and_name
+                    if let Some(namespace_targets) = by_namespace_and_name
                         .get(&(candidate_namespace.clone(), identifier.clone()))
                     {
-                        for target in targets {
-                            if target != candidate {
-                                references_by_target
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .insert(candidate.clone());
-                            }
-                        }
+                        resolved_targets.extend(namespace_targets.iter().cloned());
                     }
-                    if let Some(targets) = by_fq_name.get(identifier) {
-                        for target in targets {
-                            if target != candidate {
-                                references_by_target
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .insert(candidate.clone());
-                            }
-                        }
+                    if let Some(fq_targets) = by_fq_name.get(identifier) {
+                        resolved_targets.extend(fq_targets.iter().cloned());
                     }
                 }
-            }
-
-            references_by_target
-                .into_iter()
-                .map(|(target, files)| (target, Arc::new(files)))
-                .collect()
+                resolved_targets
+            })
         })
     }
 }

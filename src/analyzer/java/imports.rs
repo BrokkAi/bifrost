@@ -1,6 +1,6 @@
 use super::external::JavaExternalType;
 use super::*;
-use crate::analyzer::{ImportInfo, build_reverse_import_index};
+use crate::analyzer::{ImportInfo, build_reverse_file_index, build_reverse_import_index};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,37 +196,26 @@ impl JavaAnalyzer {
                     }
                 }
 
-                let mut references_by_target: HashMap<ProjectFile, HashSet<ProjectFile>> =
-                    HashMap::default();
-                for candidate in self.inner.all_files() {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_file_index(&files, |candidate| {
                     let package = self
                         .inner
                         .package_name_of(candidate)
                         .unwrap_or("")
                         .to_string();
                     let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
-                        continue;
+                        return Vec::new();
                     };
+                    let mut targets = Vec::new();
                     for identifier in identifiers {
-                        if let Some(targets) =
+                        if let Some(matching_targets) =
                             targets_by_package_and_name.get(&(package.clone(), identifier.clone()))
                         {
-                            for target in targets {
-                                if target != candidate {
-                                    references_by_target
-                                        .entry(target.clone())
-                                        .or_default()
-                                        .insert(candidate.clone());
-                                }
-                            }
+                            targets.extend(matching_targets.iter().cloned());
                         }
                     }
-                }
-
-                references_by_target
-                    .into_iter()
-                    .map(|(target, files)| (target, Arc::new(files)))
-                    .collect()
+                    targets
+                })
             })
     }
 

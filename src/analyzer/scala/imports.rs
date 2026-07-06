@@ -1,7 +1,7 @@
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
-    build_reverse_import_index,
+    build_reverse_file_index, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -57,23 +57,16 @@ impl ScalaAnalyzer {
                 }
             }
 
-            let mut references_by_target: HashMap<ProjectFile, HashSet<ProjectFile>> =
-                HashMap::default();
-            for files in files_by_package.values() {
-                for target in files {
-                    let references = references_by_target.entry(target.clone()).or_default();
-                    for candidate in files {
-                        if candidate != target {
-                            references.insert(candidate.clone());
-                        }
-                    }
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_file_index(&files, |candidate| {
+                if file_language(candidate) != Language::Scala {
+                    return Vec::new();
                 }
-            }
-
-            references_by_target
-                .into_iter()
-                .map(|(target, files)| (target, Arc::new(files)))
-                .collect()
+                let Some(package) = self.inner.package_name_of(candidate) else {
+                    return Vec::new();
+                };
+                files_by_package.get(package).cloned().unwrap_or_default()
+            })
         })
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::build_reverse_file_index;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -103,40 +104,29 @@ impl CppAnalyzer {
                 }
             }
 
-            let mut references_by_target: HashMap<ProjectFile, HashSet<ProjectFile>> =
-                HashMap::default();
-            for candidate in &files {
+            build_reverse_file_index(&files, |candidate| {
+                let mut matched_targets = HashSet::default();
+                let mut resolved_targets = Vec::new();
                 for include in quoted_include_paths(self.inner.import_statements(candidate)) {
-                    let mut matched_targets = HashSet::default();
-                    if let Some(targets) = by_rel_path.get(Path::new(&include)) {
-                        for target in targets {
-                            if target != candidate && matched_targets.insert(target.clone()) {
-                                references_by_target
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .insert(candidate.clone());
+                    if let Some(path_targets) = by_rel_path.get(Path::new(&include)) {
+                        for target in path_targets {
+                            if matched_targets.insert(target.clone()) {
+                                resolved_targets.push(target.clone());
                             }
                         }
                     }
                     for suffix in string_suffixes(&include) {
-                        if let Some(targets) = by_file_name.get(suffix) {
-                            for target in targets {
-                                if target != candidate && matched_targets.insert(target.clone()) {
-                                    references_by_target
-                                        .entry(target.clone())
-                                        .or_default()
-                                        .insert(candidate.clone());
+                        if let Some(name_targets) = by_file_name.get(suffix) {
+                            for target in name_targets {
+                                if matched_targets.insert(target.clone()) {
+                                    resolved_targets.push(target.clone());
                                 }
                             }
                         }
                     }
                 }
-            }
-
-            references_by_target
-                .into_iter()
-                .map(|(target, files)| (target, Arc::new(files)))
-                .collect()
+                resolved_targets
+            })
         })
     }
 }

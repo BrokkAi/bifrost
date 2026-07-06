@@ -1,7 +1,7 @@
 use super::*;
+use crate::analyzer::build_reverse_file_index;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{ImportInfo, Language};
-use rayon::prelude::*;
 use std::ffi::OsStr;
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
@@ -289,24 +289,7 @@ impl RubyAnalyzer {
     ) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
         self.reverse_import_index.get_or_init(|| {
             let files: Vec<_> = self.inner.all_files().cloned().collect();
-            let edges: Vec<_> = files
-                .par_iter()
-                .flat_map(|file| {
-                    self.required_files(file)
-                        .into_iter()
-                        .filter(|required| required != file)
-                        .map(|required| (required, file.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
-            for (required, importer) in edges {
-                reverse.entry(required).or_default().insert(importer);
-            }
-            reverse
-                .into_iter()
-                .map(|(file, refs)| (file, Arc::new(refs)))
-                .collect()
+            build_reverse_file_index(&files, |file| self.required_files(file))
         })
     }
 

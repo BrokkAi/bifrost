@@ -45,24 +45,37 @@ pub(crate) fn build_reverse_import_index<F>(
 where
     F: Fn(&ProjectFile) -> HashSet<CodeUnit> + Sync,
 {
-    let imported_by_file: Vec<_> = files
+    build_reverse_file_index(files, |file| {
+        resolve_imported(file)
+            .into_iter()
+            .map(|code_unit| code_unit.source().clone())
+            .collect::<Vec<_>>()
+    })
+}
+
+pub(crate) fn build_reverse_file_index<F, I>(
+    files: &[ProjectFile],
+    resolve_targets: F,
+) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>
+where
+    F: Fn(&ProjectFile) -> I + Sync,
+    I: IntoIterator<Item = ProjectFile>,
+{
+    let edges: Vec<_> = files
         .par_iter()
-        .map(|file| (file.clone(), resolve_imported(file)))
+        .flat_map(|file| {
+            let source = file.clone();
+            resolve_targets(file)
+                .into_iter()
+                .filter_map(move |target| (target != source).then(|| (target, source.clone())))
+                .collect::<Vec<_>>()
+        })
         .collect();
 
     let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
-    for (file, imported) in imported_by_file {
-        for code_unit in imported {
-            let target = code_unit.source();
-            if target != &file {
-                reverse
-                    .entry(target.clone())
-                    .or_default()
-                    .insert(file.clone());
-            }
-        }
+    for (target, source) in edges {
+        reverse.entry(target).or_default().insert(source);
     }
-
     reverse
         .into_iter()
         .map(|(file, refs)| (file, Arc::new(refs)))
