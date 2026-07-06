@@ -3,7 +3,7 @@ title: LSP Server
 description: Run Bifrost as a language server for editor code intelligence.
 ---
 
-Bifrost can run as a Language Server Protocol server over stdio. Editors launch it with an explicit workspace root:
+Bifrost can run as a Language Server Protocol server over stdio. Start it with an explicit workspace root:
 
 ```bash
 bifrost --root /path/to/project --lsp
@@ -11,15 +11,20 @@ bifrost --root /path/to/project --lsp
 
 The server does not open a network port. It speaks LSP over stdin and stdout, builds the workspace index in the background, and lets the first request wait for indexing when necessary.
 
-## Editor Integration
+## Workspace Root
 
-Use the [VS Code extension](../vscode/) for the packaged editor experience. The extension starts Bifrost with:
+`--root` is the fallback workspace root. During LSP initialization, clients may send `workspaceFolders`, `rootUri`, or `rootPath`; Bifrost uses those client-provided roots when available. Use `--root` to make the server process deterministic and to provide a fallback when the client does not send a usable workspace root.
 
-```bash
-bifrost --root <workspace-root> --lsp
+Clients can also pass Bifrost-specific `initializationOptions`:
+
+```json
+{
+  "roots": ["src", "tests"],
+  "exclude": ["target", "vendor/generated"]
+}
 ```
 
-Other editors that can launch a stdio LSP server can use the same command shape. Pass the repository or workspace directory as `--root` so Bifrost analyzes the intended project.
+`roots` limits indexing to selected directories under the fallback root. `exclude` removes generated output, dependency caches, or other directories from workspace symbols and document-level lookups.
 
 ## CLI Tooling
 
