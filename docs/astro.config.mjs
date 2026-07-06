@@ -41,6 +41,7 @@ export default defineConfig({
             { label: 'Claude Code', slug: 'claude-code' },
             { label: 'Cursor', slug: 'cursor' },
             { label: 'Amp', slug: 'amp' },
+            { label: 'Antigravity', slug: 'antigravity' },
           ],
         },
         {
