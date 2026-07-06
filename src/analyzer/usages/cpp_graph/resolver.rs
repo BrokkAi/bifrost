@@ -303,6 +303,15 @@ impl VisibilityIndex {
             .cloned()
     }
 
+    pub(super) fn canonical_type_for_reference(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        let resolved = self.resolve_type(file, raw_name)?;
+        self.alias_target(&resolved).or(Some(resolved))
+    }
+
     pub(super) fn parser_alias_resolves_to_type(
         &self,
         file: &ProjectFile,
@@ -1147,6 +1156,29 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
             && parent
                 .child_by_field_name("declarator")
                 .is_some_and(|declarator| node_contains(declarator, node))
+}
+
+pub(super) fn out_of_line_member_definition_owner<'tree>(
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'tree>,
+) -> Option<(Node<'tree>, CodeUnit)> {
+    if node.kind() != "qualified_identifier" || !has_ancestor_kind(node, "function_definition") {
+        return None;
+    }
+    let scope = node.child_by_field_name("scope")?;
+    let text = node_text(scope, source);
+    let qualified;
+    let lookup = if text.contains("::") {
+        text
+    } else {
+        let namespace = enclosing_namespace_context(scope, source)?;
+        qualified = format!("{namespace}::{text}");
+        qualified.as_str()
+    };
+    let owner = visibility.canonical_type_for_reference(file, lookup)?;
+    Some((scope, owner))
 }
 
 fn node_contains(parent: Node<'_>, child: Node<'_>) -> bool {

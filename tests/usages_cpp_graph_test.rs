@@ -660,7 +660,7 @@ void call(Sink& sink) {
 }
 
 #[test]
-fn cpp_graph_excludes_out_of_line_member_qualifiers_from_class_usages() {
+fn cpp_graph_includes_out_of_line_member_qualifiers_as_class_usages() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
             "include/parity.h",
@@ -673,8 +673,17 @@ class ConsoleHandler {
 public:
     explicit ConsoleHandler(Sink& s);
     std::string handle(const std::string& value);
+    std::string alias_handle(const std::string& value);
 };
 using HandlerAlias = ConsoleHandler;
+}
+namespace other {
+struct OtherSink {};
+class ConsoleHandler {
+public:
+    explicit ConsoleHandler(OtherSink& s);
+    std::string handle(const std::string& value);
+};
 }
 "#,
         ),
@@ -685,6 +694,7 @@ using HandlerAlias = ConsoleHandler;
 namespace parity {
 ConsoleHandler::ConsoleHandler(Sink& s) {}
 std::string ConsoleHandler::handle(const std::string& value) { return value; }
+std::string HandlerAlias::alias_handle(const std::string& value) { return value; }
 }
 "#,
         ),
@@ -699,7 +709,11 @@ void run(parity::Sink& sink) {
         ),
     ]);
 
-    let target = class_definition(&analyzer, "ConsoleHandler");
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "ConsoleHandler"
+            && unit.package_name() == "parity"
+    });
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = CppUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -707,8 +721,13 @@ void run(parity::Sink& sink) {
         .expect("cpp graph success");
     let summaries = hits.iter().cloned().map(hit_summary).collect::<Vec<_>>();
 
-    assert_no_hit_contains(&summaries, "ConsoleHandler::ConsoleHandler");
-    assert_no_hit_contains(&summaries, "ConsoleHandler::handle");
+    assert_hit_contains(
+        &summaries,
+        "src/parity.cpp",
+        "ConsoleHandler::ConsoleHandler",
+    );
+    assert_hit_contains(&summaries, "src/parity.cpp", "ConsoleHandler::handle");
+    assert_hit_contains(&summaries, "src/parity.cpp", "HandlerAlias::alias_handle");
     assert_hit_contains(&summaries, "src/main.cpp", "parity::HandlerAlias handler");
     assert_no_hit_contains(&summaries, "class ConsoleHandler");
 
@@ -719,9 +738,39 @@ void run(parity::Sink& sink) {
             source[hit.start_offset..hit.end_offset].to_string()
         })
         .collect::<Vec<_>>();
+    let selected_texts_by_file = hits
+        .iter()
+        .map(|hit| {
+            let source = hit.file.read_to_string().expect("hit source");
+            (
+                slash_path(&hit.file),
+                source[hit.start_offset..hit.end_offset].to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
     assert!(
         !selected_texts.iter().any(|text| text == "handle"),
         "class query must not select out-of-line member declarator parts: {selected_texts:?}"
+    );
+    assert!(
+        !selected_texts
+            .iter()
+            .any(|text| text == "ConsoleHandler::handle"),
+        "class query must select only the class qualifier, not the full member declarator: {selected_texts:?}"
+    );
+    assert_eq!(
+        2,
+        selected_texts_by_file
+            .iter()
+            .filter(|(file, text)| file == "src/parity.cpp" && text == "ConsoleHandler")
+            .count(),
+        "constructor and method qualifiers should both select the class token: {selected_texts_by_file:?}"
+    );
+    assert!(
+        selected_texts_by_file
+            .iter()
+            .any(|(file, text)| file == "src/parity.cpp" && text == "HandlerAlias"),
+        "alias-qualified member definition should select the alias qualifier as a class usage: {selected_texts_by_file:?}"
     );
     let main_source = project
         .file("src/main.cpp")
@@ -2420,12 +2469,14 @@ std::string Service::execute(const std::string& name) {
         "src/service.cpp",
         "Service build_service(Repository& repository)",
     );
-    assert_no_hit_contains(
+    assert_hit_contains(
         &service_class_hits,
+        "src/service.cpp",
         "Service::Service(Repository& repository)",
     );
-    assert_no_hit_contains(
+    assert_hit_contains(
         &service_class_hits,
+        "src/service.cpp",
         "std::string Service::execute(const std::string& name)",
     );
     assert_no_hit_contains(&service_class_hits, "src/unrelated.cpp");
