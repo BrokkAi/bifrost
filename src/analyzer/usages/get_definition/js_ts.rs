@@ -2127,6 +2127,15 @@ fn jsts_local_receiver_value_owner_candidates(
                 )
             })
             .unwrap_or_default(),
+        "call_expression" => value
+            .child_by_field_name("function")
+            .map(|function| {
+                let callees = jsts_call_expression_callees(
+                    analyzer, support, file, language, source, imports, aliases, function,
+                );
+                ts_expand_property_owners(analyzer, support, callees, depth + 1)
+            })
+            .unwrap_or_default(),
         "identifier" | "type_identifier" => source
             .get(value.start_byte()..value.end_byte())
             .map(str::trim)
@@ -2144,6 +2153,32 @@ fn jsts_local_receiver_value_owner_candidates(
                     alias,
                     value.start_byte(),
                     depth + 1,
+                )
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_call_expression_callees(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    function: Node<'_>,
+) -> Vec<CodeUnit> {
+    match function.kind() {
+        "identifier" | "type_identifier" | "property_identifier" => source
+            .get(function.start_byte()..function.end_byte())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                jsts_identifier_candidates(
+                    analyzer, support, language, file, source, imports, aliases, name, true,
                 )
             })
             .unwrap_or_default(),
@@ -2334,6 +2369,31 @@ fn ts_identifier_candidates(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
+    source: &str,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    name: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    jsts_identifier_candidates(
+        analyzer,
+        support,
+        Language::TypeScript,
+        file,
+        source,
+        imports,
+        aliases,
+        name,
+        value_position,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_identifier_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    language: Language,
+    file: &ProjectFile,
     _source: &str,
     imports: &ImportBinder,
     aliases: &AliasResolver,
@@ -2350,7 +2410,7 @@ fn ts_identifier_candidates(
             resolve_js_ts_module_binding_candidates(
                 analyzer,
                 support,
-                Language::TypeScript,
+                language,
                 file,
                 &binding.module_specifier,
                 exported_name,

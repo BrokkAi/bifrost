@@ -22,7 +22,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T11:03Z) Milestone 5: added the Java interface/implementation/hierarchy click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted wildcard/override coverage findings and the exposed Java method-family reference gap, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:21Z) Milestone 6: added the C# partial/interface click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted syntax/ambiguity/coverage findings, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:28Z) Milestone 7: added the C++ typed-receiver/out-of-line click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted method-reference coverage finding, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 8: JavaScript click-around fixture.
+- [x] (2026-07-07T11:37Z) Milestone 8: added the JavaScript CommonJS/object click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the exposed factory-returned object resolver gap, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 9: TypeScript click-around fixture.
 - [ ] Milestone 10: Python click-around fixture.
 - [ ] Milestone 11: Ruby click-around fixture.
@@ -68,6 +68,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 
 - Observation: C++ out-of-line method references report the definition range at the qualified owner start rather than at the method-name token used by go-to-definition.
   Evidence: Strengthening the C++ fixture with `Derived::tick` and `Base::tick` references initially failed because references returned the `Derived`/`Base` range in `Derived::tick` and `Base::tick`; the final fixture uses separate reference markers for those LSP ranges while retaining method-name markers for definition lookup.
+
+- Observation: JavaScript declaration collection materialized returned object members such as `makeToolbox.format`, but definition lookup did not infer that a local initialized from `makeToolbox()` had that returned-object surface.
+  Evidence: Adding `const toolbox = makeToolbox(); toolbox.format(widget);` to the Milestone 8 LSP fixture initially returned `null`. `jsts_local_receiver_value_owner_candidates` now resolves call-expression initializers through the import-aware callee resolver and expands the callee's materialized return surface.
 
 ## Decision Log
 
@@ -157,6 +160,10 @@ Milestone 7 is complete. The C++ fixture now covers typed value and pointer rece
 
 Milestone 7 Brokk Guided Review outcome: security, duplication, devops, and architecture found no blocking issues. Senior-dev found that references coverage was too narrow because only the free-function relation was asserted. Accepted fixes add exact references coverage for both derived and base out-of-line methods, including typed value and pointer receiver call sites. C++ field declaration references currently return empty on this LSP path, so field coverage stays focused on precise definition and shadowing behavior in this milestone. Focused C++ LSP, formatting, and diff checks pass.
 
+Milestone 8 is complete. The JavaScript fixture now covers class `this` fields, constructed receivers, class-instance factory receivers, object-literal factory receivers, object-literal methods, CommonJS destructured imports, unrelated same-name object members, references, hover, and unsupported type-definition behavior.
+
+Milestone 8 Brokk Guided Review outcome: security, duplication, devops, and architecture found no blocking issues. Senior-dev coverage review found that factory-returned objects should be covered with an object-literal factory, not only a factory returning a class instance. Accepting that feedback exposed the JavaScript get-definition gap recorded above; the fix reuses structured imports, CodeUnits, and materialized returned-object surfaces. Focused JavaScript LSP, focused JavaScript get-definition, formatting, and diff checks pass.
+
 ## Timing Log
 
 - Milestone 0: Harness and Timing Infrastructure
@@ -230,6 +237,15 @@ Milestone 7 Brokk Guided Review outcome: security, duplication, devops, and arch
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_7_cpp --features nlp -- --nocapture` passed in 5.24s real time after recompiling the changed test; test execution took 3.18s. `cargo fmt --check` and `git diff --check` also passed.
   - Click cases added: 14.
   - Slowest fixture/operation: `milestone_7_cpp_typed_receivers`, case `derived receiver resolves to out-of-line method`, marker `derived_tick_call`, operation `definition`, 53 ms before review and 45 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 8: JavaScript
+  - Language: JavaScript.
+  - Start: 2026-07-07T11:28Z.
+  - End: 2026-07-07T11:37Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_8_javascript --features nlp -- --nocapture` passed in 6.87s real time after recompiling the changed test; test execution took 3.16s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_8_javascript --features nlp -- --nocapture` passed in 30.84s real time after waiting on the build lock and recompiling the JS/TS resolver; test execution took 8.27s. Additional focused check `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test get_definition_test javascript_ --features nlp -- --nocapture` passed in 20.45s real time. `cargo fmt --check` and `git diff --check` also passed.
+  - Click cases added: 14 LSP click cases plus 1 lower-level JavaScript definition regression.
+  - Slowest fixture/operation: `milestone_8_javascript_commonjs_objects`, case `class instance method resolves from constructed receiver`, marker `widget_render_call`, operation `definition`, 51 ms before review and 37 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -322,3 +338,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 6 Guided Review gate.
 Revision note, 2026-07-07 / Codex: Started Milestone 7 and added the C++ typed receiver/out-of-line fixture. The pre-review focused C++ filter passes, covering typed value and pointer receiver method definitions, field definitions with base/derived shadowing, unrelated same-name method and field owners, bare member field lookup inside an out-of-line method body, out-of-line free function definitions, free-function references, and local shadow expected-empty behavior.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 7 Guided Review gate. Accepted review feedback strengthened references coverage for out-of-line C++ base and derived methods, including typed receiver call sites. The final fixture uses separate markers for C++ references ranges at qualified out-of-line definitions, while definition lookups continue to assert method-name ranges. Focused C++ LSP, formatting, and diff checks pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 8 and added the JavaScript CommonJS/object fixture. The initial fixture covers class `this` fields, constructed and factory-returned receivers, object-literal methods, CommonJS destructured imports, unrelated same-name object members, hover, and unsupported type-definition behavior.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 8 Guided Review gate. Accepted review feedback strengthened factory-returned object coverage from a class-instance factory to an object-literal factory, exposing and fixing a JavaScript get-definition gap for locals initialized by call expressions whose callees have materialized returned-object surfaces. Focused JavaScript LSP, JavaScript get-definition, formatting, and diff checks pass.

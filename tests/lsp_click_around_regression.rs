@@ -1355,3 +1355,171 @@ void run() {
 
     assert_timing_summary("milestone_7_cpp_typed_receivers", &timings, 14);
 }
+
+#[test]
+fn milestone_8_javascript_commonjs_object_click_around() {
+    let fixture = ClickFixture::new("milestone_8_javascript_commonjs_objects")
+        .file(
+            "lib.js",
+            r#"class <widget_decl>Widget {
+  constructor(name) {
+    this.<widget_label_decl>label = name;
+  }
+
+  <widget_render_decl>render() {
+    return this.<this_label_read>label;
+  }
+}
+
+function <make_widget_decl>makeWidget() {
+  return new Widget("factory");
+}
+
+function <make_toolbox_decl>makeToolbox() {
+  return {
+    <factory_format_decl>format(value) {
+      return value.label;
+    },
+  };
+}
+
+const tools = {
+  <tools_format_decl>format(value) {
+    return value.label;
+  },
+  <tools_reset_decl>reset() {
+    return "tools";
+  },
+};
+
+const other = {
+  <other_format_decl>format(value) {
+    return value.label;
+  },
+};
+
+module.exports = { Widget, makeWidget, makeToolbox, tools, other };
+"#,
+        )
+        .file(
+            "app.js",
+            r#"const { Widget, makeWidget, makeToolbox, tools, other } = require("./lib");
+
+function run(getUnknown) {
+  const widget = new Widget("direct");
+  widget.<widget_render_call>render();
+  widget.<widget_label_read>label;
+
+  const factoryWidget = <make_widget_call>makeWidget();
+  factoryWidget.<factory_render_call>render();
+
+  const toolbox = <make_toolbox_call>makeToolbox();
+  toolbox.<factory_format_call>format(widget);
+
+  tools.<tools_format_call>format(widget);
+  other.<other_format_call>format(widget);
+
+  const unknown = getUnknown();
+  unknown.<unknown_format_call>format(widget);
+}
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "class instance method resolves from constructed receiver",
+                "widget_render_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["widget_render_decl"]),
+            ),
+            ClickCase::new(
+                "class this field read resolves to constructor assignment",
+                "this_label_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["widget_label_decl"]),
+            ),
+            ClickCase::new(
+                "constructed receiver field read resolves to class field",
+                "widget_label_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["widget_label_decl"]),
+            ),
+            ClickCase::new(
+                "CommonJS imported factory resolves to exported function",
+                "make_widget_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["make_widget_decl"]),
+            ),
+            ClickCase::new(
+                "factory-returned object receiver resolves to class method",
+                "factory_render_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["widget_render_decl"]),
+            ),
+            ClickCase::new(
+                "factory-returned object literal method resolves to materialized method",
+                "factory_format_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["factory_format_decl"]),
+            ),
+            ClickCase::new(
+                "object literal method resolves through CommonJS import",
+                "tools_format_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["tools_format_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name object method resolves to unrelated declaration",
+                "other_format_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_format_decl"]),
+            ),
+            ClickCase::new(
+                "unknown receiver same-name method stays unresolved",
+                "unknown_format_call",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "class method references include constructed and factory receivers",
+                "widget_render_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["widget_render_call", "factory_render_call"]),
+            ),
+            ClickCase::new(
+                "class field references include this and constructed receiver reads",
+                "widget_label_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["this_label_read", "widget_label_read"]),
+            ),
+            ClickCase::new(
+                "object literal method references include imported call only",
+                "tools_format_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["tools_format_call"]),
+            ),
+            ClickCase::new(
+                "hover on class method call describes render",
+                "widget_render_call",
+                ClickOperation::Hover,
+                ClickExpectation::HoverContains("render"),
+            ),
+            ClickCase::new(
+                "JavaScript type definition is unsupported for values",
+                "widget_render_call",
+                ClickOperation::TypeDefinition,
+                ClickExpectation::Empty,
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_8_javascript_commonjs_objects", &timings, 14);
+}

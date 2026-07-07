@@ -6235,6 +6235,54 @@ function run() {
 }
 
 #[test]
+fn javascript_commonjs_factory_returned_object_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "lib.js",
+            r#"
+function makeToolbox() {
+  return {
+    format(value) {
+      return value.label;
+    },
+  };
+}
+
+module.exports = { makeToolbox };
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+const { makeToolbox } = require("./lib");
+
+function run(widget) {
+  const toolbox = makeToolbox();
+  return toolbox.format(widget);
+}
+"#,
+        )
+        .build();
+
+    let line = "  return toolbox.format(widget);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":6,"column":{}}}]}}"#,
+            column_of(line, "format")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "makeToolbox.format",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "lib.js", "{value}");
+}
+
+#[test]
 fn javascript_same_file_object_literal_property_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
