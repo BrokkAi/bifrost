@@ -43,7 +43,7 @@ impl ScalaAnalyzer {
 
     #[allow(dead_code)]
     fn collect_type_relations(&self) -> Vec<TypeRelation> {
-        let types = ScalaProjectTypes::build(self);
+        let types = self.project_types();
         let traits = self.scala_trait_fqns();
         self.all_declarations()
             .filter(|unit| unit.is_class())
@@ -52,7 +52,7 @@ impl ScalaAnalyzer {
     }
 
     fn resolve_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        let types = ScalaProjectTypes::build(self);
+        let types = self.project_types();
         self.resolve_direct_ancestor_units(code_unit, &types)
     }
 

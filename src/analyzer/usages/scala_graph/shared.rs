@@ -11,11 +11,12 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub(super) struct ScalaEdgeGraph<'a> {
     pub(super) scala: &'a ScalaAnalyzer,
     pub(super) files: Vec<ProjectFile>,
-    pub(super) types: ProjectTypes,
+    pub(super) types: Arc<ProjectTypes>,
     pub(super) override_targets_by_method_fqn: HashMap<String, Vec<String>>,
 }
 
@@ -95,7 +96,7 @@ impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
         let files = analyzed_files_for_language(analyzer, Language::Scala);
-        let types = ProjectTypes::build(scala);
+        let types = scala.project_types();
 
         Some(Self {
             graph: ScalaEdgeGraph {

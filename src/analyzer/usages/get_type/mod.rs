@@ -125,7 +125,7 @@ impl<'a> TypeBatchContext<'a> {
         scala: &crate::analyzer::ScalaAnalyzer,
     ) -> Arc<ScalaProjectTypes> {
         self.scala_project_types
-            .get_or_insert_with(|| Arc::new(ScalaProjectTypes::build(scala)))
+            .get_or_insert_with(|| scala.project_types())
             .clone()
     }
 }

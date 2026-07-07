@@ -121,6 +121,9 @@ pub struct ScalaAnalyzer {
     importable_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     same_package_reference_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
+    /// Analyzer-cached Scala usage/type-resolution support, built once per
+    /// analyzer generation and reset on `update`/`update_all`.
+    project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
@@ -148,6 +151,7 @@ impl ScalaAnalyzer {
             importable_declarations_by_package: Arc::new(OnceLock::new()),
             same_package_reference_index: Arc::new(OnceLock::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
+            project_types: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
     }
@@ -170,6 +174,16 @@ impl ScalaAnalyzer {
 
     pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
         self.inner.usage_facts_index_shared()
+    }
+
+    pub(crate) fn project_types(
+        &self,
+    ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes> {
+        self.project_types
+            .get_or_init(|| {
+                Arc::new(crate::analyzer::usages::scala_graph::ScalaProjectTypes::build(self))
+            })
+            .clone()
     }
 
     pub(crate) fn new_with_config_storage_and_progress(
