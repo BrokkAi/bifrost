@@ -16,7 +16,7 @@ Observable outcomes: all existing usage-graph and get-definition test suites kee
 - [x] (2026-07-07 09:11 CDT) Milestone 1 complete: `DefinitionLookupIndex` now uses adapter-supplied normalization and simple-type naming, stores normalized FQN/type/member keyed maps, and `src/analyzer/usages/receiver_facts.rs` plus its module declaration are deleted.
 - [x] (2026-07-07 09:11 CDT) Milestone 2 complete: `UsageFactsIndex` is built from analyzer state, exposed through `IAnalyzer`, Scala `ProjectTypes` consumes `DefinitionLookupIndex` plus `UsageFactsIndex`, and `src/analyzer/usages/symbol_index.rs` plus its module declaration are deleted.
 - [x] (2026-07-07 10:11 CDT) Milestone 3 complete: added the shared `visible_names` resolver, migrated C# visible type resolution plus forward and inverted usage graph paths to `DefinitionLookupIndex`/`UsageFactsIndex`, replaced C# enclosing-class scans with `ClassRangeIndex`, removed the private C# inverted method/class/return indexes, added the noisy receiver-return regression, and passed the Milestone 3 quality gates.
-- [ ] Milestone 4: migrate the Go query path off the `graph_declarations` linear scans.
+- [x] (2026-07-07 10:24 CDT) Milestone 4 complete: Go query graph construction now builds the same keyed `GoEdgeIndex` facts from its already parsed files, `collect_promoted_receiver_types` uses keyed direct-member and embedded-field maps, constructor-name seeding uses the multi-candidate constructor-return map, the `graph_declarations` helper family is deleted, and the Milestone 4 quality gates passed.
 - [ ] Milestone 5: migrate Python off its linear scans.
 - [ ] Milestone 6: migrate C++ (`VisibilityIndex` keyed lookups, kill the `precise_parent_of` workspace scan, dedupe `split_top_level_commas`).
 - [ ] Milestone 7: replace Java's and PHP's lazy return-type caches with `UsageFactsIndex`.
@@ -41,6 +41,10 @@ Observable outcomes: all existing usage-graph and get-definition test suites kee
   Evidence: `src/analyzer/csharp/declarations.rs::visit_method` creates the function with `CodeUnit::with_signature(..., Some(csharp_parameter_key(...)))` and separately stores `csharp_method_skeleton(...)` through `add_signature_with_metadata`.
 - Observation: The shared `UsageFactsIndex` can resolve ordinary C# same-namespace/import-visible return types, but not every owner-relative nested type because the generic facts builder has package and declaration FQN context, not the declaring owner type context.
   Evidence: C# still needs `resolve_member_type_fq_name(owner, type_text)` to interpret nested owner names such as `Outer.Inner`/`Outer$Inner`; the C# resolver now probes `UsageFactsIndex` first and keeps the existing signature-derived owner-relative resolution as a fallback.
+- Observation: The Milestone 4 Go scan diagnosis was accurate. `graph_declarations` was called by `collect_promoted_receiver_types`, `graph_direct_member_fqns`, `graph_direct_children`, `graph_embedded_field_type_fqns`, and `graph_fqn_exists`; the promoted-receiver walk passed closures that re-entered those helpers per candidate type and embedded edge.
+  Evidence: pre-edit `rg -n "graph_declarations|graph_direct_member_fqns|graph_direct_children|graph_embedded_field_type_fqns|graph_fqn_exists" src/analyzer/usages/go_graph/resolver.rs` showed all five helpers and their promotion call sites; post-edit `grep -rn "graph_declarations" src/analyzer/usages/go_graph/` returns no matches.
+- Observation: No keyed-lookup semantic discrepancy was found in Milestone 4. The direct member, embedded field, package-directory, and constructor-return facts already used by the inverted Go edge path matched the query path's required behavior when scoped to the query graph's parsed files.
+  Evidence: after the migration, the required Go/get-definition suite passed unchanged: `get_definition_test` 376, `go_dead_code_smells` 11, `gopls_goto_definition` 5, `usage_graph_go_test` 11, and `usages_go_graph_test` 39.
 
 ## Decision Log
 
@@ -86,6 +90,9 @@ Observable outcomes: all existing usage-graph and get-definition test suites kee
 - Decision: Keep C# owner-relative return-type derivation as a fallback behind `UsageFactsIndex` probes.
   Rationale: The shared facts index does not know the declaring owner when resolving a return type text, so nested owner-relative C# type names still need the existing structured owner-aware resolver. This fallback is behind keyed member/method lookup and does not reintroduce workspace declaration scans.
   Date/Author: 2026-07-07 / Codex
+- Decision: Share `GoEdgeIndex` with the Go query graph instead of adding Go-specific `UsageFactsIndex` hooks or a third query-only structure.
+  Rationale: `GoEdgeIndex` already contains the Go-specific keyed facts needed by both paths: direct members, embedded-field promotion links, package-directory import resolution, and constructor returns with every distinct candidate preserved. Building it from `GoProjectGraph`'s already parsed files avoids reparsing during queries and keeps Go's first-result constructor interpretation in one place. Generic Go `UsageFactsIndex` hooks would not replace the embedding maps or directory resolver, so they would add another structure without removing meaningful code.
+  Date/Author: 2026-07-07 / Codex
 
 ## Outcomes & Retrospective
 
@@ -96,6 +103,10 @@ Validation on 2026-07-07: `cargo fmt` completed; `BIFROST_SEMANTIC_INDEX=off car
 Milestone 3 is complete in the working tree, with no commits made. The new `src/analyzer/usages/visible_names.rs` resolver implements the Java-style probe order for package/namespace languages: qualified exact FQN, import context, same package, then exact-name global fallback with uniqueness enforced by the context. C# `resolve_visible_type` now enters that driver, while `visible_type_candidates` remains a keyed candidate collector for import analysis. C# forward usage resolution now uses `DefinitionLookupIndex` for receiver type units, fields/properties, owner/member methods, nested type probes, and extension receiver hierarchy roots; `UsageFactsIndex` supplies C# callable and field return facts with the existing owner-aware signature fallback where needed. C# inverted edge building no longer owns `class_units`, `MethodDeclarationIndex`, or `MethodReturnCache`; it uses the same shared indexes as the forward path. `enclosing_declared_type` now uses `ClassRangeIndex`.
 
 Validation on 2026-07-07 for Milestone 3: `cargo fmt` completed; `BIFROST_SEMANTIC_INDEX=off cargo test --test usage_graph_csharp_test --test usages_csharp_graph_test --test roslyn_goto_definition --test usage_graph_scala_test --test usages_scala_graph_test --test get_definition_test` passed (`get_definition_test` 376, `roslyn_goto_definition` 9, `usage_graph_csharp_test` 14, `usage_graph_scala_test` 13, `usages_csharp_graph_test` 38, `usages_scala_graph_test` 38); `cargo clippy --all-targets --all-features -- -D warnings` completed cleanly; `rg -n "get_all_declarations\\(\\)" src/analyzer/usages/csharp_graph` returns no matches.
+
+Milestone 4 is complete in the working tree, with no commits made. `GoProjectGraph` now owns a `GoEdgeIndex` built from the same parsed files used by the query graph, so the query path and inverted edge path consume the same keyed direct-member, embedded-field, package-directory, and constructor-return facts. `collect_promoted_receiver_types` now iterates the scoped type units once and uses keyed promotion lookups through `go_unique_indexed_member_candidate_at_nearest_depth`; owner-constructor seeding now probes `constructor_names_by_return_type`, preserving the multi-candidate constructor-return semantics already present in `GoEdgeIndex`. The `graph_declarations` helper family and its FQN/direct-child scan helpers are deleted.
+
+Validation on 2026-07-07 for Milestone 4: `cargo fmt` completed; `BIFROST_SEMANTIC_INDEX=off cargo test --test usage_graph_go_test --test usages_go_graph_test --test gopls_goto_definition --test go_dead_code_smells --test get_definition_test` passed (`get_definition_test` 376, `go_dead_code_smells` 11, `gopls_goto_definition` 5, `usage_graph_go_test` 11, `usages_go_graph_test` 39); `cargo clippy --all-targets --all-features -- -D warnings` completed cleanly; `grep -rn "graph_declarations" src/analyzer/usages/go_graph/` returns no matches.
 
 ## Context and Orientation
 
@@ -278,3 +289,5 @@ Use `crate::hash::HashMap`/`HashSet` throughout (the repo's standard hasher), ne
 Revision note 2026-07-07 / Codex: Executed only Milestones 1 and 2, updated Progress, Surprises & Discoveries, Decision Log, and Outcomes with implementation findings and validation evidence, and left Milestones 3 through 7 untouched for future work.
 
 Revision note 2026-07-07 / Codex: Executed only Milestone 3, updated Progress, Surprises & Discoveries, Decision Log, and Outcomes with the C# migration details and validation evidence, and left Milestones 4 through 7 untouched for future work.
+
+Revision note 2026-07-07 / Codex: Executed only Milestone 4, updated Progress, Surprises & Discoveries, Decision Log, and Outcomes with the Go query-path migration details and validation evidence, and left Milestones 5 through 7 untouched for future work.

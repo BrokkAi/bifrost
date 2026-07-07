@@ -55,6 +55,7 @@ pub(crate) struct GoProjectGraph {
     /// imports to package names without rescanning every parsed file.
     dir_index: ParentDirIndex,
     module_path: Option<String>,
+    edge_index: GoEdgeIndex,
 }
 
 impl GoProjectGraph {
@@ -266,6 +267,8 @@ fn build_importer_reverse_go(
 pub(crate) struct GoEdgeIndex {
     package_names: HashMap<ProjectFile, String>,
     constructor_return_types: HashMap<String, Vec<String>>,
+    constructor_names_by_return_type: HashMap<String, Vec<String>>,
+    type_units: Vec<CodeUnit>,
     direct_member_fqns: HashMap<String, HashMap<String, Vec<String>>>,
     embedded_field_type_fqns: HashMap<String, Vec<String>>,
     dir_index: ParentDirIndex,
@@ -303,6 +306,17 @@ impl GoEdgeIndex {
 
     pub(super) fn constructor_return_types(&self, callee: &str) -> Option<&Vec<String>> {
         self.constructor_return_types.get(callee)
+    }
+
+    pub(super) fn constructor_names_for_return_type(&self, return_type_fqn: &str) -> &[String] {
+        self.constructor_names_by_return_type
+            .get(return_type_fqn)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn type_units(&self) -> impl Iterator<Item = &CodeUnit> {
+        self.type_units.iter()
     }
 
     pub(super) fn direct_member_fqns(&self, owner_fqn: &str, member: &str) -> &[String] {
@@ -354,12 +368,28 @@ pub(crate) fn build_go_edge_index(
     if parsed_files.is_empty() {
         return None;
     }
+    let parsed_refs: Vec<_> = parsed_files
+        .iter()
+        .map(|(file, parsed)| (file.clone(), parsed))
+        .collect();
+    Some(build_go_edge_index_from_parsed(
+        analyzer,
+        &parsed_refs,
+        module_path,
+    ))
+}
+
+fn build_go_edge_index_from_parsed(
+    analyzer: &GoAnalyzer,
+    parsed_files: &[(ProjectFile, &ParsedFile)],
+    module_path: Option<String>,
+) -> GoEdgeIndex {
     let package_names: HashMap<ProjectFile, String> = parsed_files
         .iter()
         .map(|(file, parsed)| (file.clone(), parsed.package_name.clone()))
         .collect();
     let mut constructor_return_types: HashMap<String, Vec<String>> = HashMap::default();
-    for (file, parsed) in &parsed_files {
+    for (file, parsed) in parsed_files {
         let package_fqn = canonical_go_package_name(file, &parsed.package_name);
         for (function, owner) in
             collect_constructor_returns(parsed.tree.root_node(), &parsed.source)
@@ -374,54 +404,79 @@ pub(crate) fn build_go_edge_index(
         return_types.sort();
         return_types.dedup();
     }
+    let constructor_names_by_return_type =
+        collect_constructor_names_by_return_type(&constructor_return_types);
 
     let dir_index = build_parent_dir_index(package_names.keys());
     let indexed_files: Vec<ProjectFile> =
         parsed_files.iter().map(|(file, _)| file.clone()).collect();
-    let type_fqns = collect_go_type_fqns(analyzer, &indexed_files);
-    let direct_member_fqns = collect_go_direct_member_fqns(analyzer, &indexed_files);
+    let declaration_facts = collect_go_declaration_facts(analyzer, &indexed_files);
     let embedded_field_type_fqns = collect_go_embedded_field_type_fqns(
         analyzer,
-        &parsed_files,
+        parsed_files,
         &package_names,
         &dir_index,
         module_path.as_deref(),
-        &type_fqns,
+        &declaration_facts.type_fqns,
     );
 
-    Some(GoEdgeIndex {
+    GoEdgeIndex {
         package_names,
         constructor_return_types,
-        direct_member_fqns,
+        constructor_names_by_return_type,
+        type_units: declaration_facts.type_units,
+        direct_member_fqns: declaration_facts.direct_member_fqns,
         embedded_field_type_fqns,
         dir_index,
         module_path,
-    })
+    }
 }
 
-fn collect_go_type_fqns(analyzer: &GoAnalyzer, files: &[ProjectFile]) -> HashSet<String> {
-    let mut type_fqns = HashSet::default();
-    for file in files {
-        for unit in analyzer.declarations(file) {
-            if unit.is_class() {
-                type_fqns.insert(unit.fq_name());
-            }
+fn collect_constructor_names_by_return_type(
+    constructor_return_types: &HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<String>> {
+    let mut by_return_type: HashMap<String, Vec<String>> = HashMap::default();
+    for (callee, return_types) in constructor_return_types {
+        let Some((_, name)) = callee.rsplit_once('.') else {
+            continue;
+        };
+        for return_type in return_types {
+            by_return_type
+                .entry(return_type.clone())
+                .or_default()
+                .push(name.to_string());
         }
     }
-    type_fqns
+    for names in by_return_type.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+    by_return_type
 }
 
-fn collect_go_direct_member_fqns(
+struct GoDeclarationFacts {
+    type_fqns: HashSet<String>,
+    type_units: Vec<CodeUnit>,
+    direct_member_fqns: HashMap<String, HashMap<String, Vec<String>>>,
+}
+
+fn collect_go_declaration_facts(
     analyzer: &GoAnalyzer,
     files: &[ProjectFile],
-) -> HashMap<String, HashMap<String, Vec<String>>> {
+) -> GoDeclarationFacts {
+    let mut type_fqns = HashSet::default();
+    let mut type_units = Vec::new();
     let mut members: HashMap<String, HashMap<String, Vec<String>>> = HashMap::default();
     for file in files {
         for unit in analyzer.declarations(file) {
+            let fqn = unit.fq_name();
+            if unit.is_class() {
+                type_fqns.insert(fqn.clone());
+                type_units.push(unit.clone());
+            }
             if !(unit.is_function() || unit.is_field()) {
                 continue;
             }
-            let fqn = unit.fq_name();
             let Some((owner, member)) = fqn.rsplit_once('.') else {
                 continue;
             };
@@ -433,12 +488,16 @@ fn collect_go_direct_member_fqns(
                 .push(fqn);
         }
     }
-    members
+    GoDeclarationFacts {
+        type_fqns,
+        type_units,
+        direct_member_fqns: members,
+    }
 }
 
 fn collect_go_embedded_field_type_fqns(
     analyzer: &GoAnalyzer,
-    parsed_files: &[(ProjectFile, ParsedFile)],
+    parsed_files: &[(ProjectFile, &ParsedFile)],
     package_names: &HashMap<ProjectFile, String>,
     dir_index: &ParentDirIndex,
     module_path: Option<&str>,
@@ -729,6 +788,11 @@ pub(super) fn build_go_graph(
     }
 
     let dir_index = build_parent_dir_index(parsed.keys());
+    let parsed_refs: Vec<_> = parsed
+        .iter()
+        .map(|(file, parsed)| (file.clone(), parsed.as_ref()))
+        .collect();
+    let edge_index = build_go_edge_index_from_parsed(analyzer, &parsed_refs, module_path.clone());
 
     let mut exports_by_file = HashMap::default();
     let mut binders_by_file = HashMap::default();
@@ -754,6 +818,7 @@ pub(super) fn build_go_graph(
         importer_reverse,
         dir_index,
         module_path,
+        edge_index,
     }
 }
 
@@ -954,7 +1019,6 @@ impl TargetSpec {
             .as_ref()
             .map(|owner| {
                 collect_compatible_receiver_types(
-                    analyzer,
                     graph,
                     target,
                     target.source(),
@@ -1023,7 +1087,6 @@ impl TargetSpec {
 }
 
 fn collect_compatible_receiver_types(
-    analyzer: &GoAnalyzer,
     graph: &GoProjectGraph,
     target: &CodeUnit,
     owner_source: &ProjectFile,
@@ -1054,25 +1117,24 @@ fn collect_compatible_receiver_types(
             }
         }
     }
-    collect_promoted_receiver_types(analyzer, graph, target, method, &mut receivers);
+    collect_promoted_receiver_types(graph, target, method, &mut receivers);
     receivers
 }
 
 fn collect_promoted_receiver_types(
-    analyzer: &GoAnalyzer,
     graph: &GoProjectGraph,
     target: &CodeUnit,
     member: &str,
     receivers: &mut BTreeSet<(ProjectFile, String)>,
 ) {
     let target_fqn = target.fq_name();
-    for unit in graph_declarations(analyzer, graph) {
-        if !unit.is_class() || unit.fq_name() == target_fqn {
+    for unit in graph.edge_index.type_units() {
+        if unit.fq_name() == target_fqn {
             continue;
         }
         let direct =
-            |owner: &str, member: &str| graph_direct_member_fqns(analyzer, graph, owner, member);
-        let embedded = |owner: &str| graph_embedded_field_type_fqns(analyzer, graph, owner);
+            |owner: &str, member: &str| graph.edge_index.direct_member_fqns(owner, member).to_vec();
+        let embedded = |owner: &str| graph.edge_index.embedded_field_type_fqns(owner).to_vec();
         if matches!(
             go_unique_indexed_member_candidate_at_nearest_depth(
                 &unit.fq_name(),
@@ -1085,101 +1147,6 @@ fn collect_promoted_receiver_types(
             receivers.insert((unit.source().clone(), unit.short_name().to_string()));
         }
     }
-}
-
-fn graph_declarations(analyzer: &GoAnalyzer, graph: &GoProjectGraph) -> Vec<CodeUnit> {
-    let mut units = Vec::new();
-    for file in graph.parsed.keys() {
-        units.extend(analyzer.declarations(file).cloned());
-    }
-    units
-}
-
-fn graph_direct_member_fqns(
-    analyzer: &GoAnalyzer,
-    graph: &GoProjectGraph,
-    owner_fqn: &str,
-    member: &str,
-) -> Vec<String> {
-    let member_fqn = format!("{owner_fqn}.{member}");
-    graph_declarations(analyzer, graph)
-        .into_iter()
-        .filter(|unit| (unit.is_function() || unit.is_field()) && unit.fq_name() == member_fqn)
-        .map(|unit| unit.fq_name())
-        .collect()
-}
-
-fn graph_direct_children(
-    analyzer: &GoAnalyzer,
-    graph: &GoProjectGraph,
-    owner_fqn: &str,
-) -> Vec<CodeUnit> {
-    let prefix = format!("{owner_fqn}.");
-    graph_declarations(analyzer, graph)
-        .into_iter()
-        .filter(|unit| {
-            unit.fq_name()
-                .strip_prefix(&prefix)
-                .is_some_and(|suffix| !suffix.contains('.'))
-        })
-        .collect()
-}
-
-fn graph_embedded_field_type_fqns(
-    analyzer: &GoAnalyzer,
-    graph: &GoProjectGraph,
-    owner_fqn: &str,
-) -> Vec<String> {
-    graph_direct_children(analyzer, graph, owner_fqn)
-        .into_iter()
-        .filter_map(|field| {
-            let parsed = graph.parsed_file(field.source())?;
-            let type_text = go_embedded_field_unit_type_text(analyzer, &field, Some(parsed))?;
-            go_resolve_graph_field_type_fqn(analyzer, graph, owner_fqn, field.source(), &type_text)
-        })
-        .collect()
-}
-
-fn go_resolve_graph_field_type_fqn(
-    analyzer: &GoAnalyzer,
-    graph: &GoProjectGraph,
-    owner_fqn: &str,
-    field_file: &ProjectFile,
-    type_text: &str,
-) -> Option<String> {
-    if let Some(fqn) =
-        go_resolve_graph_qualified_type_from_file(analyzer, graph, field_file, type_text)
-    {
-        return Some(fqn);
-    }
-    let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
-    let name = go_simple_type_name(type_text)?;
-    let fqn = format!("{package}.{name}");
-    graph_fqn_exists(analyzer, graph, &fqn).then_some(fqn)
-}
-
-fn go_resolve_graph_qualified_type_from_file(
-    analyzer: &GoAnalyzer,
-    graph: &GoProjectGraph,
-    file: &ProjectFile,
-    type_text: &str,
-) -> Option<String> {
-    let (Some(qualifier), name) = go_type_name_parts(type_text)? else {
-        return None;
-    };
-    let (namespaces, _) = graph.namespace_packages(analyzer, file);
-    namespaces.get(qualifier).and_then(|packages| {
-        packages.iter().find_map(|package| {
-            let fqn = format!("{package}.{name}");
-            graph_fqn_exists(analyzer, graph, &fqn).then_some(fqn)
-        })
-    })
-}
-
-fn graph_fqn_exists(analyzer: &GoAnalyzer, graph: &GoProjectGraph, fqn: &str) -> bool {
-    graph_declarations(analyzer, graph)
-        .iter()
-        .any(|unit| unit.fq_name() == fqn)
 }
 
 fn target_method_signature(
@@ -1485,49 +1452,16 @@ fn collect_owner_constructor_names(
     owner: &str,
     owner_source: &ProjectFile,
 ) -> HashSet<String> {
-    let mut names = HashSet::default();
-    // A Go package is a single directory, so scope the scan to the owner source's
-    // directory via the prebuilt index rather than walking every parsed file — the
-    // bulk `usage_graph` path resolves many targets over the whole workspace and the
-    // surrounding code keeps that linear by construction.
-    let parent = owner_source.parent().to_string_lossy().replace('\\', "/");
-    let Some(package_files) = graph.dir_index.get(&parent) else {
-        return names;
+    let Some(package) = graph.package_name_of(owner_source) else {
+        return HashSet::default();
     };
-    for file in package_files {
-        if !same_go_package(graph, file, owner_source) {
-            continue;
-        }
-        let Some(parsed) = graph.parsed_file(file) else {
-            continue;
-        };
-        let root = parsed.tree.root_node();
-        let source = parsed.source.as_str();
-        let mut cursor = root.walk();
-        for child in root.named_children(&mut cursor) {
-            if child.kind() != "function_declaration" {
-                continue;
-            }
-            let (Some(name_node), Some(result)) = (
-                child.child_by_field_name("name"),
-                child.child_by_field_name("result"),
-            ) else {
-                continue;
-            };
-            if result_names_owner_type(result, source, owner) {
-                names.insert(node_text(name_node, source).to_string());
-            }
-        }
-    }
-    names
-}
-
-/// Whether the `result` node of a function declaration names the owner type as its
-/// (first) return value. Handles a bare type, a pointer type, and the common
-/// `(Owner, error)` tuple idiom by inspecting the first component.
-fn result_names_owner_type(result: Node<'_>, source: &str, owner: &str) -> bool {
-    let names_owner = |ty: &TypeRef| ty.qualifier.is_none() && ty.name.as_deref() == Some(owner);
-    first_result_type_ref(result, source).is_some_and(|ty| names_owner(&ty))
+    let owner_fqn = format!("{package}.{owner}");
+    graph
+        .edge_index
+        .constructor_names_for_return_type(&owner_fqn)
+        .iter()
+        .cloned()
+        .collect()
 }
 
 fn first_result_type_ref(result: Node<'_>, source: &str) -> Option<TypeRef> {
