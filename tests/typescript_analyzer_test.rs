@@ -53,6 +53,183 @@ fn definition_in_file(
 }
 
 #[test]
+fn typescript_materializes_exported_factory_object_surface() {
+    let (project, analyzer) = ts_inline_analyzer(&[(
+        "tool.ts",
+        r#"
+            export const ReadTool = Tool.define({
+                execute(): boolean {
+                    return true;
+                },
+                metadata: { name: 'read' },
+                [dynamicKey]() {}
+            });
+        "#,
+    )]);
+    let file = project.file("tool.ts");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "ReadTool",
+    )));
+    assert!(declarations.contains(&CodeUnit::with_signature(
+        file.clone(),
+        CodeUnitType::Function,
+        "",
+        "ReadTool.execute",
+        None,
+        true,
+    )));
+    assert!(declarations.contains(&CodeUnit::with_signature(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "ReadTool.metadata",
+        None,
+        true,
+    )));
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.short_name() != "ReadTool.dynamicKey")
+    );
+}
+
+#[test]
+fn typescript_materializes_named_exported_returned_object_surface() {
+    let (project, analyzer) = ts_inline_analyzer(&[(
+        "factory.ts",
+        r#"
+            const factory = () => ({
+                run(): void {},
+                label: 'x'
+            });
+            export { factory };
+        "#,
+    )]);
+    let file = project.file("factory.ts");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Function,
+        "",
+        "factory",
+    )));
+    assert!(declarations.contains(&CodeUnit::with_signature(
+        file.clone(),
+        CodeUnitType::Function,
+        "",
+        "factory.run",
+        None,
+        true,
+    )));
+    assert!(declarations.contains(&CodeUnit::with_signature(
+        file,
+        CodeUnitType::Field,
+        "",
+        "factory.label",
+        None,
+        true,
+    )));
+}
+
+#[test]
+fn typescript_preserves_non_surface_top_level_field_names() {
+    let (project, analyzer) = ts_inline_analyzer(&[(
+        "module.ts",
+        r#"
+            const local = makeThing({ run(): void {} });
+            export const PI = 3.14;
+            export type Shape = { run(): void };
+            export const DataOnly = Tool.define({
+                label: 'x'
+            });
+        "#,
+    )]);
+    let file = project.file("module.ts");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.short_name() != "local" && unit.short_name() != "local.run")
+    );
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "module.ts.local",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "module.ts.PI",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "module.ts.Shape",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "DataOnly",
+    )));
+    assert!(declarations.contains(&CodeUnit::with_signature(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "DataOnly.label",
+        None,
+        true,
+    )));
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| !(unit.short_name() == "PI" || unit.short_name() == "Shape"))
+    );
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| !(unit.short_name() == "DataOnly.label" && unit.is_function()))
+    );
+}
+
+#[test]
+fn typescript_local_non_shape_preserving_define_function_blocks_surface_members() {
+    let (project, analyzer) = ts_inline_analyzer(&[(
+        "tool.ts",
+        r#"
+            function defineThing<T>(definition: T) {
+                return { wrapped: definition };
+            }
+            export const Tool = defineThing({ run(): void {} });
+        "#,
+    )]);
+    let file = project.file("tool.ts");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "tool.ts.Tool",
+    )));
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.short_name() != "Tool.run")
+    );
+}
+
+#[test]
 fn typescript_type_hierarchy_resolves_same_file_class_extends() {
     let (_project, analyzer) =
         ts_inline_analyzer(&[("models.ts", "class Base {}\nclass Child extends Base {}\n")]);
@@ -764,6 +941,11 @@ fn test_call_argument_object_literal_does_not_index_variable_member_definitions(
         declarations
             .iter()
             .all(|unit| unit.fq_name() != "tool.ts.listTools.handler")
+    );
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "listTools.handler")
     );
     assert!(
         !analyzer

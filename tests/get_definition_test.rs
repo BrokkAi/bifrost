@@ -5700,7 +5700,7 @@ export function render() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "classNames.ts.providerListClasses.itemEnabledDot",
+        result["definitions"][0]["fqn"], "providerListClasses.itemEnabledDot",
         "{value}"
     );
     assert_eq!(
@@ -5749,7 +5749,7 @@ export function Item({ provider }: Props) {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "provider.ts.ProviderSchema.isEnabled",
+        result["definitions"][0]["fqn"], "ProviderSchema.isEnabled",
         "{value}"
     );
 }
@@ -6091,7 +6091,7 @@ export function run() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "tool.ts.listTools.handler",
+        result["definitions"][0]["fqn"], "listTools.handler",
         "{value}"
     );
     assert_eq!(result["definitions"][0]["start_line"], 10, "{value}");
@@ -6425,7 +6425,7 @@ helpers.formatTask({ label: "direct" });
     let library_result = &library_value["results"][0];
     assert_eq!(library_result["status"], "resolved", "{library_value}");
     assert_eq!(
-        library_result["definitions"][0]["fqn"], "library.js.helpers.formatTask",
+        library_result["definitions"][0]["fqn"], "helpers.formatTask",
         "{library_value}"
     );
 
@@ -6440,7 +6440,7 @@ helpers.formatTask({ label: "direct" });
     let consumer_result = &consumer_value["results"][0];
     assert_eq!(consumer_result["status"], "resolved", "{consumer_value}");
     assert_eq!(
-        consumer_result["definitions"][0]["fqn"], "library.js.helpers.formatTask",
+        consumer_result["definitions"][0]["fqn"], "helpers.formatTask",
         "{consumer_value}"
     );
 }

@@ -50,6 +50,224 @@ fn definition_in_file(
 }
 
 #[test]
+fn javascript_materializes_exported_factory_object_surface() {
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "tool.js",
+        r#"
+            export const ReadTool = Tool.define({
+                execute() {
+                    return true;
+                },
+                metadata: { name: 'read' },
+                [dynamicKey]() {}
+            });
+        "#,
+    )]);
+    let file = project.file("tool.js");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "ReadTool",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Function,
+        "",
+        "ReadTool.execute",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "ReadTool.metadata",
+    )));
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.short_name() != "ReadTool.dynamicKey")
+    );
+    assert!(
+        analyzer
+            .get_skeleton(&definition_in_file(&analyzer, &file, "ReadTool"))
+            .unwrap()
+            .contains("execute")
+    );
+}
+
+#[test]
+fn javascript_materializes_commonjs_exported_object_root() {
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "context.js",
+        r#"
+            const proto = {
+                inspect() {
+                    return this;
+                },
+                status: 200
+            };
+            module.exports = proto;
+        "#,
+    )]);
+    let file = project.file("context.js");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "proto",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Function,
+        "",
+        "proto.inspect",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file,
+        CodeUnitType::Field,
+        "",
+        "proto.status",
+    )));
+}
+
+#[test]
+fn javascript_does_not_promote_commonjs_member_reexport_root() {
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "context.js",
+        r#"
+            const internals = {
+                public() {},
+                secret() {}
+            };
+            exports.public = internals.public;
+        "#,
+    )]);
+    let file = project.file("context.js");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.iter().all(|unit| {
+        unit.short_name() != "internals"
+            && unit.short_name() != "internals.public"
+            && unit.short_name() != "internals.secret"
+    }));
+}
+
+#[test]
+fn javascript_materializes_returned_object_members_under_enclosing_factory() {
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "directive.js",
+        r#"
+            function selectDirective() {
+                return {
+                    compile() {},
+                    controller: function() {}
+                };
+            }
+
+            const factory = () => ({
+                run() {},
+                label: 'x'
+            });
+            export { factory };
+        "#,
+    )]);
+    let file = project.file("directive.js");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Function,
+        "",
+        "selectDirective.compile",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Function,
+        "",
+        "selectDirective.controller",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Function,
+        "",
+        "factory.run",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file,
+        CodeUnitType::Field,
+        "",
+        "factory.label",
+    )));
+}
+
+#[test]
+fn javascript_does_not_materialize_unexported_call_or_scalar_surfaces() {
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "module.js",
+        r#"
+            const local = makeThing({ run() {} });
+            export const PI = 3.14;
+        "#,
+    )]);
+    let file = project.file("module.js");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.short_name() != "local" && unit.short_name() != "local.run")
+    );
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "module.js.local",
+    )));
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "module.js.PI",
+    )));
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| !(unit.short_name() == "PI" && unit.source() == &file))
+    );
+}
+
+#[test]
+fn javascript_local_non_shape_preserving_define_function_blocks_surface_members() {
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "tool.js",
+        r#"
+            function defineThing(definition) {
+                return { wrapped: definition };
+            }
+            export const Tool = defineThing({ run() {} });
+        "#,
+    )]);
+    let file = project.file("tool.js");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "",
+        "tool.js.Tool",
+    )));
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.short_name() != "Tool.run")
+    );
+}
+
+#[test]
 fn javascript_type_hierarchy_resolves_same_file_extends() {
     let (_project, analyzer) =
         js_inline_analyzer(&[("models.js", "class Base {}\nclass Child extends Base {}\n")]);
@@ -834,8 +1052,8 @@ obj.helper = function helper() {};
         "prototype assignment should remain declared: {names:?}"
     );
     assert!(
-        names.contains(&"request.accepts".to_string()),
-        "CommonJS-exported local object member should remain declared: {names:?}"
+        !names.contains(&"request.accepts".to_string()),
+        "CommonJS member re-export should not promote the whole local object: {names:?}"
     );
     assert!(
         names.contains(&"req.route".to_string()),

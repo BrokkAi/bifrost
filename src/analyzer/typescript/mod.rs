@@ -34,6 +34,7 @@ use crate::analyzer::js_ts::imports::{
 };
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
 #[derive(Debug, Clone, Default)]
 pub struct TypescriptAdapter;
@@ -92,6 +93,7 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(String::new());
         let module = module_code_unit(file);
         let mut module_has_imports = false;
+        let exported_roots = ts_es_named_exported_roots(root, source);
 
         for index in 0..root.named_child_count() {
             let Some(child) = root.named_child(index) else {
@@ -115,7 +117,9 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
                         parsed.imports.extend(imports);
                     }
                 }
-                "export_statement" => visit_ts_export(file, source, child, None, &mut parsed),
+                "export_statement" => {
+                    visit_ts_export(file, source, child, None, &mut parsed, &exported_roots)
+                }
                 "ambient_declaration" => {
                     visit_ts_ambient_declarations(file, source, child, None, &mut parsed, false);
                 }
@@ -142,7 +146,15 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
                             parsed.imports.extend(imports);
                         }
                     }
-                    visit_ts_value(file, source, child, None, &mut parsed, false);
+                    visit_ts_value(
+                        file,
+                        source,
+                        child,
+                        None,
+                        &mut parsed,
+                        false,
+                        &exported_roots,
+                    );
                 }
                 _ => {}
             }
@@ -848,7 +860,15 @@ fn visit_ts_ambient_declarations(
             visit_ts_function(file, source, definition, parent, parsed, exported);
         }
         "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
-            visit_ts_value(file, source, definition, parent, parsed, exported);
+            visit_ts_value(
+                file,
+                source,
+                definition,
+                parent,
+                parsed,
+                exported,
+                &HashSet::default(),
+            );
         }
         _ => {}
     }
@@ -867,6 +887,7 @@ fn visit_ts_export(
     node: Node<'_>,
     parent: Option<&CodeUnit>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    exported_roots: &HashSet<String>,
 ) {
     if let Some(declaration) = node.child_by_field_name("declaration") {
         match declaration.kind() {
@@ -905,7 +926,7 @@ fn visit_ts_export(
                 }
             }
             "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
-                visit_ts_value(file, source, node, parent, parsed, true);
+                visit_ts_value(file, source, node, parent, parsed, true, exported_roots);
             }
             _ => {}
         }
@@ -1201,6 +1222,7 @@ fn visit_ts_value(
     parent: Option<&CodeUnit>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
     exported: bool,
+    exported_roots: &HashSet<String>,
 ) {
     let definition = if node.kind() == "export_statement" {
         node.child_by_field_name("declaration").unwrap_or(node)
@@ -1261,15 +1283,23 @@ fn visit_ts_value(
         let is_function = value
             .map(|value| value.kind() == "arrow_function")
             .unwrap_or(false);
+        let module_surface = parent.is_none()
+            && (exported || exported_roots.contains(&name))
+            && value.is_some_and(|value| {
+                ts_exported_surface_object_literal_value(child, value, source).is_some()
+            });
         let kind = if is_function {
             crate::analyzer::CodeUnitType::Function
         } else {
             crate::analyzer::CodeUnitType::Field
         };
         let short_name = if kind == crate::analyzer::CodeUnitType::Field {
-            parent
-                .map(|parent| format!("{}.{}", parent.short_name(), name))
-                .unwrap_or_else(|| {
+            if let Some(parent) = parent {
+                format!("{}.{}", parent.short_name(), name)
+            } else if module_surface {
+                name.clone()
+            } else {
+                {
                     format!(
                         "{}.{}",
                         file.rel_path()
@@ -1278,7 +1308,8 @@ fn visit_ts_value(
                             .unwrap_or("module"),
                         name
                     )
-                })
+                }
+            }
         } else {
             parent
                 .map(|parent| format!("{}.{}", parent.short_name(), name))
@@ -1318,7 +1349,11 @@ fn visit_ts_value(
         }
         if !is_function
             && let Some(value) = value
-            && let Some(object) = ts_indexable_object_literal_value(child, value, source)
+            && let Some(object) = if module_surface {
+                ts_exported_surface_object_literal_value(child, value, source)
+            } else {
+                ts_indexable_object_literal_value(child, value, source)
+            }
         {
             visit_ts_object_literal_properties(
                 file, source, object, &code_unit, &top_level, parsed,
@@ -1367,16 +1402,37 @@ fn ts_indexable_object_literal_value<'tree>(
     })
 }
 
+fn ts_exported_surface_object_literal_value<'tree>(
+    declarator: Node<'tree>,
+    value: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    ts_object_literal_value(value).or_else(|| {
+        (value.kind() == "call_expression")
+            .then(|| ts_surface_call_object_argument(declarator, value, source))
+            .flatten()
+    })
+}
+
 fn ts_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "object" => Some(node),
-        "as_expression" | "satisfies_expression" | "type_assertion" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find_map(ts_object_literal_value)
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "object" => return Some(node),
+            "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "type_assertion" => {
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => None,
     }
+    None
 }
 
 fn ts_shape_preserving_call_object_argument<'tree>(
@@ -1404,10 +1460,8 @@ fn ts_call_preserves_object_argument_shape(
     if argument_index == 0 && ts_call_is_schema_object_builder(call, source) {
         return true;
     }
-    let Some(callee_name) = ts_call_identifier_name(call, source) else {
-        return false;
-    };
-    ts_source_function_preserves_parameter_shape(anchor, source, &callee_name, argument_index)
+    ts_call_object_argument_shape_preservation(anchor, call, source, argument_index)
+        == TsShapePreservation::Preserves
 }
 
 /// Recognizes a schema-builder call whose first object-literal argument defines the value's
@@ -1440,13 +1494,87 @@ fn ts_source_function_preserves_parameter_shape(
     source: &str,
     function_name: &str,
     parameter_index: usize,
-) -> bool {
+) -> TsShapePreservation {
     let root = ts_root_node(anchor);
     let mut functions = Vec::new();
     ts_collect_function_nodes(root, source, function_name, &mut functions);
-    functions.into_iter().any(|function| {
+    if functions.is_empty() {
+        return TsShapePreservation::Unknown;
+    }
+    if functions.into_iter().any(|function| {
         ts_function_node_preserves_parameter_shape(function, source, parameter_index)
-    })
+    }) {
+        TsShapePreservation::Preserves
+    } else {
+        TsShapePreservation::DoesNotPreserve
+    }
+}
+
+fn ts_surface_call_object_argument<'tree>(
+    anchor: Node<'tree>,
+    call: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .enumerate()
+        .find_map(|(index, argument)| {
+            let object = ts_object_literal_value(argument)?;
+            ts_surface_call_preserves_object_argument_shape(anchor, call, source, index)
+                .then_some(object)
+        })
+}
+
+fn ts_surface_call_preserves_object_argument_shape(
+    anchor: Node<'_>,
+    call: Node<'_>,
+    source: &str,
+    argument_index: usize,
+) -> bool {
+    if argument_index == 0 && ts_call_is_schema_object_builder(call, source) {
+        return true;
+    }
+    match ts_call_object_argument_shape_preservation(anchor, call, source, argument_index) {
+        TsShapePreservation::Preserves => true,
+        TsShapePreservation::DoesNotPreserve => false,
+        TsShapePreservation::Unknown => ts_call_has_likely_surface_factory_name(call, source),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TsShapePreservation {
+    Preserves,
+    DoesNotPreserve,
+    Unknown,
+}
+
+fn ts_call_object_argument_shape_preservation(
+    anchor: Node<'_>,
+    call: Node<'_>,
+    source: &str,
+    argument_index: usize,
+) -> TsShapePreservation {
+    let Some(callee_name) = ts_call_identifier_name(call, source) else {
+        return TsShapePreservation::Unknown;
+    };
+    ts_source_function_preserves_parameter_shape(anchor, source, &callee_name, argument_index)
+}
+
+fn ts_call_has_likely_surface_factory_name(call: Node<'_>, source: &str) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let name = match function.kind() {
+        "identifier" | "property_identifier" => node_text(function, source).trim(),
+        "member_expression" => function
+            .child_by_field_name("property")
+            .map(|property| node_text(property, source).trim())
+            .unwrap_or(""),
+        _ => "",
+    };
+    name == "define" || name.starts_with("define") || name == "object"
 }
 
 fn ts_root_node(mut node: Node<'_>) -> Node<'_> {
@@ -1462,28 +1590,27 @@ fn ts_collect_function_nodes<'tree>(
     function_name: &str,
     out: &mut Vec<Node<'tree>>,
 ) {
-    if node.kind() == "function_declaration"
-        && node
-            .child_by_field_name("name")
-            .is_some_and(|name| node_text(name, source).trim() == function_name)
-    {
-        out.push(node);
-        return;
-    }
-    if node.kind() == "variable_declarator"
-        && node
-            .child_by_field_name("name")
-            .is_some_and(|name| node_text(name, source).trim() == function_name)
-        && let Some(value) = node.child_by_field_name("value")
-        && matches!(value.kind(), "arrow_function" | "function_expression")
-    {
-        out.push(value);
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        ts_collect_function_nodes(child, source, function_name, out);
-    }
+    walk_named_tree_preorder(node, true, |node| {
+        if node.kind() == "function_declaration"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, source).trim() == function_name)
+        {
+            out.push(node);
+            return WalkControl::SkipChildren;
+        }
+        if node.kind() == "variable_declarator"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, source).trim() == function_name)
+            && let Some(value) = node.child_by_field_name("value")
+            && matches!(value.kind(), "arrow_function" | "function_expression")
+        {
+            out.push(value);
+            return WalkControl::SkipChildren;
+        }
+        WalkControl::Continue
+    });
 }
 
 fn ts_function_node_preserves_parameter_shape(
@@ -1549,32 +1676,42 @@ fn ts_function_returns_parameter_shape(
     source: &str,
     parameter_name: &str,
 ) -> bool {
-    if node.id() != root_id
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-        )
-    {
-        return false;
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "interface_declaration"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            if node
+                .named_children(&mut cursor)
+                .next()
+                .is_some_and(|expression| {
+                    ts_expression_preserves_parameter_shape(expression, source, parameter_name)
+                })
+            {
+                return true;
+            }
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
     }
-    if node.kind() == "return_statement" {
-        let mut cursor = node.walk();
-        return node
-            .named_children(&mut cursor)
-            .next()
-            .is_some_and(|expression| {
-                ts_expression_preserves_parameter_shape(expression, source, parameter_name)
-            });
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| ts_function_returns_parameter_shape(child, root_id, source, parameter_name))
+    false
 }
 
 fn ts_expression_preserves_parameter_shape(
@@ -1604,14 +1741,20 @@ fn ts_expression_preserves_parameter_shape(
 }
 
 fn ts_object_shape_expression(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "as_expression" | "satisfies_expression" | "type_assertion" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find_map(ts_object_shape_expression)
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "as_expression" | "satisfies_expression" | "type_assertion" => {
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            _ => return Some(node),
         }
-        _ => Some(node),
     }
+    None
 }
 
 fn visit_ts_return_object_literal_properties(
@@ -1634,42 +1777,46 @@ fn collect_ts_return_object_literals<'tree>(
     root_id: usize,
     out: &mut Vec<Node<'tree>>,
 ) {
-    if node.id() != root_id
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-        )
-    {
-        return;
-    }
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "interface_declaration"
+            )
+        {
+            continue;
+        }
 
-    if node.kind() == "return_statement" {
-        let mut cursor = node.walk();
-        if let Some(object) = node
-            .named_children(&mut cursor)
-            .find_map(ts_object_literal_value)
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            if let Some(object) = node
+                .named_children(&mut cursor)
+                .find_map(ts_object_literal_value)
+            {
+                out.push(object);
+            }
+            continue;
+        }
+
+        if node.kind() == "arrow_function"
+            && let Some(body) = node.child_by_field_name("body")
+            && let Some(object) = ts_object_literal_value(body)
         {
             out.push(object);
         }
-        return;
-    }
 
-    if node.kind() == "arrow_function"
-        && let Some(body) = node.child_by_field_name("body")
-        && let Some(object) = ts_object_literal_value(body)
-    {
-        out.push(object);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_ts_return_object_literals(child, root_id, out);
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
     }
 }
 
@@ -1688,9 +1835,14 @@ fn visit_ts_object_literal_properties(
         let Some(name) = ts_object_literal_property_name(child, source) else {
             continue;
         };
+        let kind = if ts_object_literal_property_is_function(child) {
+            crate::analyzer::CodeUnitType::Function
+        } else {
+            crate::analyzer::CodeUnitType::Field
+        };
         let code_unit = CodeUnit::with_signature(
             file.clone(),
-            crate::analyzer::CodeUnitType::Field,
+            kind,
             "",
             format!("{}.{}", parent.short_name(), name),
             None,
@@ -1727,6 +1879,62 @@ pub(in crate::analyzer) fn ts_object_literal_property_name(
         .trim_matches('\'')
         .to_string();
     (!name.is_empty()).then_some(name)
+}
+
+fn ts_object_literal_property_is_function(node: Node<'_>) -> bool {
+    node.kind() == "method_definition"
+        || node
+            .child_by_field_name("value")
+            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+}
+
+fn ts_es_named_exported_roots(root: Node<'_>, source: &str) -> HashSet<String> {
+    let mut roots = HashSet::default();
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        if child.kind() != "export_statement" || child.child_by_field_name("source").is_some() {
+            continue;
+        }
+        let mut cursor = child.walk();
+        for export_child in child.named_children(&mut cursor) {
+            collect_ts_export_clause_roots(export_child, source, &mut roots);
+        }
+    }
+    roots
+}
+
+fn collect_ts_export_clause_roots(node: Node<'_>, source: &str, roots: &mut HashSet<String>) {
+    match node.kind() {
+        "export_clause" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_ts_export_clause_roots(child, source, roots);
+            }
+        }
+        "export_specifier" => {
+            let name = node
+                .child_by_field_name("name")
+                .or_else(|| node.named_child(0));
+            if let Some(name) = name {
+                collect_ts_export_identifier(name, source, roots);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_ts_export_identifier(node: Node<'_>, source: &str, roots: &mut HashSet<String>) {
+    if matches!(
+        node.kind(),
+        "identifier" | "property_identifier" | "shorthand_property_identifier" | "type_identifier"
+    ) {
+        let name = node_text(node, source).trim();
+        if !name.is_empty() {
+            roots.insert(name.to_string());
+        }
+    }
 }
 
 fn visit_ts_method(

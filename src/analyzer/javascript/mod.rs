@@ -81,6 +81,7 @@ impl LanguageAdapter for JavascriptAdapter {
         let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(String::new());
         let module = module_code_unit(file);
         let mut module_has_imports = false;
+        let exported_roots = js_exported_binding_roots(root, source);
 
         for index in 0..root.named_child_count() {
             let Some(child) = root.named_child(index) else {
@@ -121,7 +122,15 @@ impl LanguageAdapter for JavascriptAdapter {
                         parsed.import_statements.push(raw);
                         parsed.imports.extend(imports);
                     }
-                    visit_js_variable_statement(file, source, child, None, &mut parsed, false);
+                    visit_js_variable_statement(
+                        file,
+                        source,
+                        child,
+                        None,
+                        &mut parsed,
+                        false,
+                        &exported_roots,
+                    );
                 }
                 _ => {}
             }
@@ -790,7 +799,15 @@ fn visit_js_export(
                 }
             }
             "lexical_declaration" | "variable_declaration" => {
-                visit_js_variable_statement(file, source, node, None, parsed, true);
+                visit_js_variable_statement(
+                    file,
+                    source,
+                    node,
+                    None,
+                    parsed,
+                    true,
+                    &HashSet::default(),
+                );
             }
             _ => {}
         }
@@ -855,6 +872,9 @@ fn visit_js_default_export_function(
     parsed.add_signature_with_metadata(
         code_unit.clone(),
         js_signature_metadata(signature, function, source, &parameter_text),
+    );
+    visit_js_return_object_literal_properties(
+        file, source, function, &code_unit, &code_unit, parsed,
     );
     code_unit
 }
@@ -1014,12 +1034,15 @@ fn visit_js_function(
         range_node,
         source,
         parent.cloned(),
-        Some(top_level),
+        Some(top_level.clone()),
     );
     let (signature, parameter_text) = js_function_signature(definition, source, name, exported);
     parsed.add_signature_with_metadata(
         code_unit.clone(),
         js_signature_metadata(signature, definition, source, &parameter_text),
+    );
+    visit_js_return_object_literal_properties(
+        file, source, definition, &code_unit, &top_level, parsed,
     );
     Some(code_unit)
 }
@@ -1189,6 +1212,7 @@ fn visit_js_variable_statement(
     parent: Option<&CodeUnit>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
     exported: bool,
+    exported_roots: &HashSet<String>,
 ) {
     let definition = if node.kind() == "export_statement" {
         node.child_by_field_name("declaration").unwrap_or(node)
@@ -1214,15 +1238,21 @@ fn visit_js_variable_statement(
         let is_function = value
             .map(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
             .unwrap_or(false);
+        let module_surface = parent.is_none()
+            && (exported || exported_roots.contains(name))
+            && value.is_some_and(|value| js_initializer_has_surface_shape(value, source));
         let kind = if is_function {
             crate::analyzer::CodeUnitType::Function
         } else {
             crate::analyzer::CodeUnitType::Field
         };
         let short_name = if kind == crate::analyzer::CodeUnitType::Field {
-            parent
-                .map(|parent| format!("{}.{}", parent.short_name(), name))
-                .unwrap_or_else(|| {
+            if let Some(parent) = parent {
+                format!("{}.{}", parent.short_name(), name)
+            } else if module_surface {
+                name.to_string()
+            } else {
+                {
                     format!(
                         "{}.{}",
                         file.rel_path()
@@ -1231,7 +1261,8 @@ fn visit_js_variable_statement(
                             .unwrap_or("module"),
                         name
                     )
-                })
+                }
+            }
         } else {
             parent
                 .map(|parent| format!("{}.{}", parent.short_name(), name))
@@ -1258,6 +1289,11 @@ fn visit_js_variable_statement(
             } else {
                 parsed.add_signature(code_unit.clone(), signature);
             }
+            if let Some(value) = value {
+                visit_js_return_object_literal_properties(
+                    file, source, value, &code_unit, &top_level, parsed,
+                );
+            }
         } else {
             parsed.add_signature(
                 code_unit.clone(),
@@ -1266,9 +1302,11 @@ fn visit_js_variable_statement(
         }
         if !is_function
             && let Some(value) = value
-            && value.kind() == "object"
+            && let Some(object) = js_indexable_object_literal_value(value, source, module_surface)
         {
-            visit_js_object_literal_properties(file, source, value, &code_unit, &top_level, parsed);
+            visit_js_object_literal_properties(
+                file, source, object, &code_unit, &top_level, parsed,
+            );
         }
     }
 }
@@ -1362,6 +1400,378 @@ fn js_object_literal_property_name(node: Node<'_>, source: &str) -> Option<Strin
         .trim_matches('\'')
         .to_string();
     (!name.is_empty()).then_some(name)
+}
+
+fn js_exported_binding_roots(root: Node<'_>, source: &str) -> HashSet<String> {
+    let mut roots = js_commonjs_exported_roots(root, source);
+    roots.extend(js_es_named_exported_roots(root, source));
+    roots
+}
+
+fn js_es_named_exported_roots(root: Node<'_>, source: &str) -> HashSet<String> {
+    let mut roots = HashSet::default();
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        if child.kind() != "export_statement" || child.child_by_field_name("source").is_some() {
+            continue;
+        }
+        let mut cursor = child.walk();
+        for export_child in child.named_children(&mut cursor) {
+            collect_js_export_clause_roots(export_child, source, &mut roots);
+        }
+    }
+    roots
+}
+
+fn collect_js_export_clause_roots(node: Node<'_>, source: &str, roots: &mut HashSet<String>) {
+    match node.kind() {
+        "export_clause" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_js_export_clause_roots(child, source, roots);
+            }
+        }
+        "export_specifier" => {
+            let name = node
+                .child_by_field_name("name")
+                .or_else(|| node.named_child(0));
+            if let Some(name) = name {
+                collect_js_export_identifier(name, source, roots);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_js_export_identifier(node: Node<'_>, source: &str, roots: &mut HashSet<String>) {
+    if matches!(
+        node.kind(),
+        "identifier" | "property_identifier" | "shorthand_property_identifier"
+    ) {
+        let name = node_text(node, source).trim();
+        if !name.is_empty() {
+            roots.insert(name.to_string());
+        }
+    }
+}
+
+fn js_indexable_object_literal_value<'tree>(
+    value: Node<'tree>,
+    source: &str,
+    include_factory_call: bool,
+) -> Option<Node<'tree>> {
+    js_object_literal_value(value).or_else(|| {
+        include_factory_call
+            .then(|| js_surface_call_object_argument(value, source))
+            .flatten()
+    })
+}
+
+fn js_initializer_has_surface_shape(value: Node<'_>, source: &str) -> bool {
+    js_indexable_object_literal_value(value, source, true).is_some()
+}
+
+fn js_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "object" => return Some(node),
+            "parenthesized_expression" => {
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn js_surface_call_object_argument<'tree>(call: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .enumerate()
+        .find_map(|(index, argument)| {
+            let object = js_object_literal_value(argument)?;
+            js_call_preserves_object_argument_shape(call, source, index).then_some(object)
+        })
+}
+
+fn js_call_preserves_object_argument_shape(
+    call: Node<'_>,
+    source: &str,
+    argument_index: usize,
+) -> bool {
+    match js_call_object_argument_shape_preservation(call, source, argument_index) {
+        JsShapePreservation::Preserves => true,
+        JsShapePreservation::DoesNotPreserve => false,
+        JsShapePreservation::Unknown => js_call_has_likely_surface_factory_name(call, source),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsShapePreservation {
+    Preserves,
+    DoesNotPreserve,
+    Unknown,
+}
+
+fn js_call_object_argument_shape_preservation(
+    call: Node<'_>,
+    source: &str,
+    argument_index: usize,
+) -> JsShapePreservation {
+    let Some(callee_name) = js_call_identifier_name(call, source) else {
+        return JsShapePreservation::Unknown;
+    };
+    js_source_function_preserves_parameter_shape(call, source, &callee_name, argument_index)
+}
+
+fn js_call_has_likely_surface_factory_name(call: Node<'_>, source: &str) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let name = match function.kind() {
+        "identifier" | "property_identifier" => node_text(function, source).trim(),
+        "member_expression" => function
+            .child_by_field_name("property")
+            .map(|property| node_text(property, source).trim())
+            .unwrap_or(""),
+        _ => "",
+    };
+    name == "define" || name.starts_with("define") || name == "object"
+}
+
+fn js_call_identifier_name(call: Node<'_>, source: &str) -> Option<String> {
+    let function = call.child_by_field_name("function")?;
+    matches!(function.kind(), "identifier" | "property_identifier")
+        .then(|| node_text(function, source).trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn js_source_function_preserves_parameter_shape(
+    anchor: Node<'_>,
+    source: &str,
+    function_name: &str,
+    parameter_index: usize,
+) -> JsShapePreservation {
+    let root = js_root_node(anchor);
+    let mut functions = Vec::new();
+    js_collect_function_nodes(root, source, function_name, &mut functions);
+    if functions.is_empty() {
+        return JsShapePreservation::Unknown;
+    }
+    if functions.into_iter().any(|function| {
+        js_function_node_preserves_parameter_shape(function, source, parameter_index)
+    }) {
+        JsShapePreservation::Preserves
+    } else {
+        JsShapePreservation::DoesNotPreserve
+    }
+}
+
+fn js_root_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        node = parent;
+    }
+    node
+}
+
+fn js_collect_function_nodes<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    function_name: &str,
+    out: &mut Vec<Node<'tree>>,
+) {
+    walk_named_tree_preorder(node, true, |node| {
+        if node.kind() == "function_declaration"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, source).trim() == function_name)
+        {
+            out.push(node);
+            return WalkControl::SkipChildren;
+        }
+        if node.kind() == "variable_declarator"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, source).trim() == function_name)
+            && let Some(value) = node.child_by_field_name("value")
+            && matches!(value.kind(), "arrow_function" | "function_expression")
+        {
+            out.push(value);
+            return WalkControl::SkipChildren;
+        }
+        WalkControl::Continue
+    });
+}
+
+fn js_function_node_preserves_parameter_shape(
+    function: Node<'_>,
+    source: &str,
+    parameter_index: usize,
+) -> bool {
+    let Some(parameter_name) = js_function_parameter_name(function, source, parameter_index) else {
+        return false;
+    };
+    if function.kind() == "arrow_function"
+        && let Some(body) = function.child_by_field_name("body")
+        && js_expression_preserves_parameter_shape(body, source, &parameter_name)
+    {
+        return true;
+    }
+    js_function_returns_parameter_shape(function, function.id(), source, &parameter_name)
+}
+
+fn js_function_parameter_name(
+    function: Node<'_>,
+    source: &str,
+    parameter_index: usize,
+) -> Option<String> {
+    let parameters = function.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter_map(js_parameter_label_node)
+        .nth(parameter_index)
+        .map(|name| node_text(name, source).trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn js_function_returns_parameter_shape(
+    node: Node<'_>,
+    root_id: usize,
+    source: &str,
+    parameter_name: &str,
+) -> bool {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "class"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            if node
+                .named_children(&mut cursor)
+                .next()
+                .is_some_and(|expression| {
+                    js_expression_preserves_parameter_shape(expression, source, parameter_name)
+                })
+            {
+                return true;
+            }
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
+fn js_expression_preserves_parameter_shape(
+    expression: Node<'_>,
+    source: &str,
+    parameter_name: &str,
+) -> bool {
+    if matches!(expression.kind(), "identifier" | "property_identifier")
+        && node_text(expression, source).trim() == parameter_name
+    {
+        return true;
+    }
+    if expression.kind() != "object" {
+        return false;
+    }
+    let mut cursor = expression.walk();
+    expression.named_children(&mut cursor).any(|child| {
+        child.kind() == "spread_element"
+            && child
+                .named_child(0)
+                .is_some_and(|spread| node_text(spread, source).trim() == parameter_name)
+    })
+}
+
+fn visit_js_return_object_literal_properties(
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let mut objects = Vec::new();
+    collect_js_return_object_literals(function, function.id(), &mut objects);
+    for object in objects {
+        visit_js_object_literal_properties(file, source, object, parent, top_level, parsed);
+    }
+}
+
+fn collect_js_return_object_literals<'tree>(
+    node: Node<'tree>,
+    root_id: usize,
+    out: &mut Vec<Node<'tree>>,
+) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "class"
+            )
+        {
+            continue;
+        }
+
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            if let Some(object) = node
+                .named_children(&mut cursor)
+                .find_map(js_object_literal_value)
+            {
+                out.push(object);
+            }
+            continue;
+        }
+
+        if node.kind() == "arrow_function"
+            && let Some(body) = node.child_by_field_name("body")
+            && let Some(object) = js_object_literal_value(body)
+        {
+            out.push(object);
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
 }
 
 fn js_signature_metadata(
@@ -1738,17 +2148,20 @@ fn visit_js_assignment_expression(
             code_unit.clone(),
             js_signature_metadata(signature, value, source, &parameter_text),
         );
+        visit_js_return_object_literal_properties(
+            file, source, value, &code_unit, &code_unit, parsed,
+        );
     } else {
         parsed.add_signature(code_unit.clone(), signature);
     }
     if !value_is_function
         && let Some(value) = value
-        && value.kind() == "object"
+        && let Some(object) = js_indexable_object_literal_value(value, source, true)
     {
         visit_js_object_literal_properties_for_surface(
             file,
             source,
-            value,
+            object,
             &code_unit,
             &code_unit,
             parsed,
@@ -1779,8 +2192,11 @@ fn js_commonjs_export_assignment_name(
     value: Option<Node<'_>>,
     source: &str,
 ) -> Option<String> {
-    if !value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
-    {
+    let exposes_surface = value.is_some_and(|value| {
+        matches!(value.kind(), "arrow_function" | "function_expression")
+            || js_initializer_has_surface_shape(value, source)
+    });
+    if !exposes_surface {
         return None;
     }
     let property = js_commonjs_export_assignment_property(left, source)?;
@@ -1878,15 +2294,34 @@ fn js_commonjs_exported_roots(root: Node<'_>, source: &str) -> HashSet<String> {
     walk_named_tree_preorder(root, true, |node| {
         if node.kind() == "assignment_expression"
             && let Some(left) = node.child_by_field_name("left")
-            && js_is_commonjs_export_assignment_target(left, source)
+            && js_is_commonjs_root_or_property_export_assignment_target(left, source)
             && let Some(right) = node.child_by_field_name("right")
-            && let Some(root) = js_member_expression_root_identifier(right, source)
+            && let Some(root) = js_commonjs_exported_root_identifier(right, source)
         {
             roots.insert(root.to_string());
         }
         WalkControl::Continue
     });
     roots
+}
+
+fn js_commonjs_exported_root_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if matches!(node.kind(), "identifier" | "property_identifier") {
+        let text = node_text(node, source).trim();
+        (!text.is_empty()).then_some(text)
+    } else {
+        None
+    }
+}
+
+fn js_is_commonjs_root_export_assignment_target(node: Node<'_>, source: &str) -> bool {
+    let text = node_text(node, source).trim();
+    text == "exports" || text == "module.exports"
+}
+
+fn js_is_commonjs_root_or_property_export_assignment_target(node: Node<'_>, source: &str) -> bool {
+    js_is_commonjs_root_export_assignment_target(node, source)
+        || js_commonjs_export_assignment_property(node, source).is_some()
 }
 
 fn js_is_commonjs_export_assignment_target(node: Node<'_>, source: &str) -> bool {
