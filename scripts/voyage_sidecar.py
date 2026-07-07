@@ -15,11 +15,16 @@ fd 1 is redirected to stderr so library logging can't corrupt the protocol; fram
 to a dup'd copy of the real stdout.
 
 Attention is fused: weights and the Qwen block forward path come from HF, but the
-sidecar registers a custom attention implementation. CUDA uses native GQA; MPS uses
-explicit repeated K/V plus query blocking for long sequences, because PyTorch's
-full-prompt MPS SDPA path otherwise materializes/caches large score tensors. SDPA
-only fuses in fp16/bf16, so we run bf16 on CUDA and fp16 on Apple Metal (MPS); CPU
-falls back to fp32 (math kernel).
+sidecar registers a custom attention implementation. K/V are explicitly repeated to
+full head count on every backend before SDPA. This matters on CUDA: with an additive
+padding mask, `enable_gqa=True` makes both the flash and mem-efficient kernels
+ineligible, so SDPA silently falls back to the math kernel, which materializes the
+full (batch, heads, seq, seq) score tensor — tens of GB at 8k tokens, paging to host
+memory under WSL and running ~100x slower. Repeated K/V with the mask keeps the
+mem-efficient kernel eligible. MPS additionally blocks queries for long sequences,
+because PyTorch's full-prompt MPS SDPA path otherwise materializes/caches large
+score tensors. SDPA only fuses in fp16/bf16, so we run bf16 on CUDA and fp16 on
+Apple Metal (MPS); CPU falls back to fp32 (math kernel).
 
 Run the sidecar:   uv run scripts/voyage_sidecar.py
 Self-test parity:  uv run scripts/voyage_sidecar.py --selftest
@@ -122,7 +127,15 @@ def bifrost_attention_forward(
         raise RuntimeError("voyage sidecar attention is inference-only; dropout must be zero")
     scaling = scaling if scaling is not None else getattr(module, "scaling", None)
 
-    if query.device.type == "cuda":
+    # Repeat K/V to full head count on every backend. Never pass enable_gqa: with an
+    # additive mask it disqualifies flash AND mem-efficient, silently dropping CUDA to
+    # the math kernel (full seq x seq scores; ~100x slower and tens of GB at 8k tokens).
+    if hasattr(module, "num_key_value_groups"):
+        key = repeat_kv(key, module.num_key_value_groups)
+        value = repeat_kv(value, module.num_key_value_groups)
+    if query.device.type == "mps":
+        attn_output = _mps_blocked_sdpa(query, key, value, attention_mask, scaling)
+    else:
         attn_output = F.scaled_dot_product_attention(
             query,
             key,
@@ -131,24 +144,7 @@ def bifrost_attention_forward(
             dropout_p=0.0,
             scale=scaling,
             is_causal=False,
-            enable_gqa=hasattr(module, "num_key_value_groups"),
         )
-    else:
-        if hasattr(module, "num_key_value_groups"):
-            key = repeat_kv(key, module.num_key_value_groups)
-            value = repeat_kv(value, module.num_key_value_groups)
-        if query.device.type == "mps":
-            attn_output = _mps_blocked_sdpa(query, key, value, attention_mask, scaling)
-        else:
-            attn_output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                scale=scaling,
-                is_causal=False,
-            )
 
     return attn_output.transpose(1, 2).contiguous(), None
 
@@ -290,6 +286,36 @@ class Embedder:
             self._max_b = max(self._max_b, b)
 
 
+def start_parent_watchdog() -> None:
+    """Exit as soon as the parent's stdin pipe goes away, even mid model load.
+
+    The sidecar's process group (led by `uv run`) survives the parent dying without
+    running destructors (SIGKILL, process exit with the indexer thread parked).
+    Without this, an orphan finishes a minutes-long model load or forward holding
+    GPU memory, then dies on BrokenPipeError at the next protocol write.
+    POLLHUP/POLLERR on stdin is the only reliable parent-death signal here: `uv run`
+    stays alive as our direct parent, so getppid() never changes. Kill the whole
+    group, not just this process — `uv` does not reliably exit when its child dies,
+    and a lingering launcher would leak one process per respawn.
+    """
+    if os.name != "posix":
+        return
+    import select
+    import signal
+    import threading
+
+    def watch() -> None:
+        poller = select.poll()
+        poller.register(0, 0)  # eventmask 0: only POLLHUP/POLLERR/POLLNVAL, no POLLIN wakeups
+        while True:
+            for _fd, event in poller.poll(2000):
+                if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                    log("parent pipe closed; killing process group")
+                    os.killpg(0, signal.SIGKILL)
+
+    threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
+
+
 def _read_exact(stream, n: int) -> bytes | None:
     buf = b""
     while len(buf) < n:
@@ -306,7 +332,13 @@ def serve(emb: Embedder) -> None:
     stdin = sys.stdin.buffer
 
     def send(payload: bytes) -> None:
-        os.write(proto_fd, struct.pack("<I", len(payload)) + payload)
+        try:
+            os.write(proto_fd, struct.pack("<I", len(payload)) + payload)
+        except BrokenPipeError:
+            log("protocol pipe closed; killing process group")
+            import signal
+
+            os.killpg(0, signal.SIGKILL)
 
     send(json.dumps({"ready": True, "dim": OUT_DIM}).encode())
     log("ready")
@@ -346,8 +378,10 @@ def selftest(emb: Embedder) -> None:
 
 
 if __name__ == "__main__":
-    e = Embedder()
     if "--selftest" in sys.argv:
-        selftest(e)
+        selftest(Embedder())
     else:
-        serve(e)
+        # Watchdog first: the parent can die during the (potentially minutes-long)
+        # model load below, and only serve() would otherwise notice via stdin EOF.
+        start_parent_watchdog()
+        serve(Embedder())
