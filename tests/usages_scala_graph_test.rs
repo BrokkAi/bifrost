@@ -989,7 +989,105 @@ object App:
 }
 
 #[test]
-fn scala_graph_does_not_pick_between_ambiguous_extension_methods() {
+fn scala_graph_extension_usage_excludes_direct_member_call() {
+    let workflow_source = r#"
+package app
+
+final case class User(slug: String)
+
+object Syntax:
+  extension (u: User)
+    def slug: String = "extension"
+
+object Workflow:
+  import Syntax.*
+  def run(u: User): String = u.slug
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("app/Workflow.scala", workflow_source)]);
+    let target = definition(&analyzer, "app.Syntax$.slug");
+    let hits = scala_hits(&analyzer, &target, &["app/Workflow.scala"]);
+
+    assert_no_hit_line(&hits, line_of(workflow_source, "u.slug"));
+}
+
+#[test]
+fn scala_graph_extension_usage_requires_matching_receiver_type() {
+    let workflow_source = r#"
+package app
+
+object Syntax:
+  extension (s: String)
+    def slug: String = s.toLowerCase
+
+object Workflow:
+  import Syntax.*
+  def run(i: Int): String = i.slug
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("app/Workflow.scala", workflow_source)]);
+    let target = definition(&analyzer, "app.Syntax$.slug");
+    let hits = scala_hits(&analyzer, &target, &["app/Workflow.scala"]);
+
+    assert_no_hit_line(&hits, line_of(workflow_source, "i.slug"));
+}
+
+#[test]
+fn scala_graph_extension_receiver_type_uses_declaration_context() {
+    let syntax_source = r#"
+package ext
+
+final case class User(name: String)
+
+object Syntax:
+  extension (u: User)
+    def slug: String = u.name.toLowerCase
+"#;
+    let app_source = r#"
+package app
+
+final case class User(name: String)
+
+object Workflow:
+  import ext.Syntax.*
+  def run(u: User): String = u.slug
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("ext/Syntax.scala", syntax_source),
+        ("app/Workflow.scala", app_source),
+    ]);
+    let target = definition(&analyzer, "ext.Syntax$.slug");
+    let hits = scala_hits(&analyzer, &target, &["app/Workflow.scala"]);
+
+    assert_no_hit_line(&hits, line_of(app_source, "u.slug"));
+}
+
+#[test]
+fn scala_graph_extension_usage_survives_inapplicable_direct_member() {
+    let workflow_source = r#"
+package app
+
+final case class User(name: String):
+  def slug(): String = name
+
+object Syntax:
+  extension (u: User)
+    def slug(i: Int): String = u.name + i.toString
+
+object Workflow:
+  import Syntax.*
+  def run(u: User): String = u.slug(1)
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("app/Workflow.scala", workflow_source)]);
+    let target = definition(&analyzer, "app.Syntax$.slug");
+    let hits = scala_hits(&analyzer, &target, &["app/Workflow.scala"]);
+
+    assert_hit_line(&hits, line_of(workflow_source, "u.slug(1)"));
+}
+
+#[test]
+fn scala_graph_returns_all_matching_ambiguous_extension_methods() {
     let app_source = r#"
 package app
 
@@ -1022,10 +1120,13 @@ object SyntaxB:
         ),
         ("app/App.scala", app_source),
     ]);
-    let target = definition(&analyzer, "app.SyntaxA$.slug");
-    let hits = scala_hits(&analyzer, &target, &["app/App.scala"]);
+    let target_a = definition(&analyzer, "app.SyntaxA$.slug");
+    let hits_a = scala_hits(&analyzer, &target_a, &["app/App.scala"]);
+    let target_b = definition(&analyzer, "app.SyntaxB$.slug");
+    let hits_b = scala_hits(&analyzer, &target_b, &["app/App.scala"]);
 
-    assert_no_hit_line(&hits, line_of(app_source, "\"Hello World\".slug"));
+    assert_hit_line(&hits_a, line_of(app_source, "\"Hello World\".slug"));
+    assert_hit_line(&hits_b, line_of(app_source, "\"Hello World\".slug"));
 }
 
 #[test]

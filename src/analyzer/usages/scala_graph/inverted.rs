@@ -21,7 +21,10 @@
 //! `$`-encoded object). Receivers needing return-type inference (method chains)
 //! are an unhandled recall gap, not a wrong edge.
 
-use super::resolver::{package_name_of, scala_display_name, scala_normalized_fq_name};
+use super::resolver::{
+    package_name_of, resolved_extension_receiver_type, scala_builtin_type_name, scala_display_name,
+    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_normalized_fq_name,
+};
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{call_arity_for_reference, node_text, parenthesized_arity, scala_import_path};
 use crate::analyzer::CodeUnit;
@@ -109,7 +112,9 @@ impl ProjectTypes {
                     .push(ExtensionMethod {
                         fqn,
                         owner_fqn,
-                        receiver_type: signature.and_then(extension_receiver_type),
+                        receiver_type: signature.and_then(|signature| {
+                            resolved_extension_receiver_type(scala, unit, signature)
+                        }),
                     });
             }
         }
@@ -400,7 +405,7 @@ fn method_arities_compatible(method: &MemberMethod, ancestor: &MemberMethod) -> 
 
 fn method_call_arity_matches(method_arity: Option<usize>, call_arity: Option<usize>) -> bool {
     let Some(method_arity) = method_arity else {
-        return true;
+        return call_arity.is_none();
     };
     match call_arity {
         Some(call_arity) => call_arity == method_arity,
@@ -452,15 +457,6 @@ fn return_type_fqn(
 
 fn scala_member_name(fqn: &str) -> &str {
     fqn.rsplit('.').next().unwrap_or(fqn)
-}
-
-fn extension_receiver_type(signature: &str) -> Option<String> {
-    let trimmed = signature.strip_prefix("extension ")?.trim_start();
-    let parameters = trimmed.strip_prefix('(')?.split_once(')')?.0;
-    let parameter = parameters.split(',').next()?.trim();
-    let (_, type_text) = parameter.split_once(':')?;
-    let receiver_type = type_text.trim();
-    (!receiver_type.is_empty()).then(|| receiver_type.to_string())
 }
 
 /// The leading simple name of a (possibly generic/qualified) type text.
@@ -629,20 +625,29 @@ fn record_reference(
                             .types
                             .method_targets_for_owner_member(&owner, name, call_arity);
                         if targets.is_empty() {
-                            for target in ctx.types.inherited_method_targets_for_owner_member(
+                            let inherited = ctx.types.inherited_method_targets_for_owner_member(
                                 ctx.scala, &owner, name, call_arity,
-                            ) {
-                                ctx.record(target, field);
+                            );
+                            if inherited.is_empty() {
+                                for extension in
+                                    visible_extensions(ctx.resolver, name, Some(&owner))
+                                {
+                                    ctx.record(extension.fqn, field);
+                                }
+                            } else {
+                                for target in inherited {
+                                    ctx.record(target, field);
+                                }
                             }
                         } else {
                             for target in targets {
                                 ctx.record(target, field);
                             }
                         }
-                    } else if let Some(extension) =
-                        unique_visible_extension(ctx.resolver, name, None)
-                    {
-                        ctx.record(extension.fqn, field);
+                    } else {
+                        for extension in visible_extensions(ctx.resolver, name, None) {
+                            ctx.record(extension.fqn, field);
+                        }
                     }
                 }
                 // `method(..)` — unqualified, attributes to the enclosing class.
@@ -724,7 +729,7 @@ fn receiver_type_fqn(
                         .flatten()
                 })
         }
-        _ => None,
+        kind => scala_literal_type_name(kind).map(str::to_string),
     }
 }
 
@@ -824,9 +829,9 @@ fn seed_parameter(
     if binding_name.is_empty() {
         return;
     }
-    let resolved = parameter
-        .child_by_field_name("type")
-        .and_then(|type_node| ctx.resolver.resolve(node_text(type_node, ctx.source)));
+    let resolved = parameter.child_by_field_name("type").and_then(|type_node| {
+        resolve_receiver_type(ctx.resolver, node_text(type_node, ctx.source))
+    });
     seed_typed(binding_name, resolved, bindings);
 }
 
@@ -839,7 +844,7 @@ fn seed_value_definition(
     // or a call with a declared factory return.
     let resolved = node
         .child_by_field_name("type")
-        .and_then(|type_node| ctx.resolver.resolve(node_text(type_node, ctx.source)))
+        .and_then(|type_node| resolve_receiver_type(ctx.resolver, node_text(type_node, ctx.source)))
         .or_else(|| {
             node.child_by_field_name("value")
                 .and_then(|value| constructed_type(value, ctx))
@@ -923,7 +928,8 @@ fn collect_factory_return_types(
                 if let Some(owner) = owner.as_ref()
                     && let Some(name) = node.child_by_field_name("name")
                     && let Some(return_type) = node.child_by_field_name("return_type")
-                    && let Some(return_fqn) = resolver.resolve(node_text(return_type, source))
+                    && let Some(return_fqn) =
+                        resolve_receiver_type(resolver, node_text(return_type, source))
                 {
                     returns
                         .entry(format!("{owner}.{}", node_text(name, source)))
@@ -979,11 +985,17 @@ fn seed_typed(name: &str, resolved: Option<String>, bindings: &mut LocalInferenc
     }
 }
 
-fn unique_visible_extension(
+fn resolve_receiver_type(resolver: &NameResolver, type_text: &str) -> Option<String> {
+    resolver
+        .resolve(type_text)
+        .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+}
+
+fn visible_extensions(
     resolver: &NameResolver,
     member: &str,
     receiver_owner: Option<&str>,
-) -> Option<ExtensionMethod> {
+) -> Vec<ExtensionMethod> {
     let mut matches = Vec::new();
     for method in resolver.visible_extension_methods(member) {
         if extension_receiver_matches(resolver, method, receiver_owner) {
@@ -992,7 +1004,7 @@ fn unique_visible_extension(
     }
     matches.sort_by(|left, right| left.fqn.cmp(&right.fqn));
     matches.dedup_by(|left, right| left.fqn == right.fqn);
-    (matches.len() == 1).then(|| matches.remove(0))
+    matches
 }
 
 fn extension_receiver_matches(
@@ -1000,14 +1012,15 @@ fn extension_receiver_matches(
     method: &ExtensionMethod,
     receiver_owner: Option<&str>,
 ) -> bool {
-    let (Some(receiver_owner), Some(receiver_type)) =
-        (receiver_owner, method.receiver_type.as_ref())
-    else {
-        return true;
-    };
-    resolver
-        .resolve(receiver_type)
-        .is_none_or(|extension_receiver| extension_receiver == receiver_owner)
+    scala_extension_receiver_matches_resolved(
+        method.receiver_type.as_deref(),
+        receiver_owner,
+        |type_text| {
+            resolver
+                .resolve(type_text)
+                .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+        },
+    )
 }
 
 fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {

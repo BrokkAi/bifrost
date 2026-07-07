@@ -23,6 +23,7 @@ pub(super) struct TargetSpec {
     pub(super) member_name: String,
     pub(super) target_fq_name: String,
     pub(super) owner_fq_name: Option<String>,
+    pub(super) extension_receiver_type: Option<String>,
     family_owner_fq_names: HashSet<String>,
     receiver_owner_fq_names: HashSet<String>,
     pub(super) arity: Option<usize>,
@@ -42,6 +43,7 @@ impl TargetSpec {
                 member_name: owner_name.clone(),
                 target_fq_name: scala_normalized_fq_name(&target.fq_name()),
                 owner_fq_name: Some(scala_normalized_fq_name(&target.fq_name())),
+                extension_receiver_type: None,
                 family_owner_fq_names: HashSet::from_iter([scala_normalized_fq_name(
                     &target.fq_name(),
                 )]),
@@ -69,10 +71,13 @@ impl TargetSpec {
                 .first()
                 .and_then(|sig| signature_arity(sig))
         });
-        let is_extension_method = target
+        let signature = target
             .signature()
-            .or_else(|| scala.signatures(target).first().map(String::as_str))
-            .is_some_and(|signature| signature.starts_with("extension "));
+            .or_else(|| scala.signatures(target).first().map(String::as_str));
+        let is_extension_method =
+            signature.is_some_and(|signature| signature.starts_with("extension "));
+        let extension_receiver_type = signature
+            .and_then(|signature| resolved_extension_receiver_type(scala, target, signature));
         let member_name = if kind == TargetKind::Constructor {
             owner_name.clone()?
         } else {
@@ -95,6 +100,7 @@ impl TargetSpec {
             owner_fq_name: owner
                 .as_ref()
                 .map(|owner| scala_normalized_fq_name(&owner.fq_name())),
+            extension_receiver_type,
             owner,
             family_owners: member_owners.family_owners,
             receiver_owners: member_owners.receiver_owners,
@@ -342,7 +348,166 @@ fn return_type_base(return_type: &str) -> &str {
         .unwrap_or(return_type)
 }
 
-pub(super) fn method_arity_matches(
+pub(in crate::analyzer::usages) fn scala_builtin_type_name(
+    type_text: &str,
+) -> Option<&'static str> {
+    let simple = scala_simple_type_name(type_text)?;
+    match simple {
+        "String" => Some("String"),
+        "Int" => Some("Int"),
+        "Long" => Some("Long"),
+        "Double" => Some("Double"),
+        "Float" => Some("Float"),
+        "Boolean" => Some("Boolean"),
+        "Char" => Some("Char"),
+        "Byte" => Some("Byte"),
+        "Short" => Some("Short"),
+        "Unit" => Some("Unit"),
+        _ => None,
+    }
+}
+
+pub(in crate::analyzer::usages) fn scala_literal_type_name(kind: &str) -> Option<&'static str> {
+    match kind {
+        "string" | "string_literal" | "interpolated_string_expression" => Some("String"),
+        "integer_literal" => Some("Int"),
+        "floating_point_literal" => Some("Double"),
+        "boolean_literal" | "true" | "false" => Some("Boolean"),
+        "character_literal" => Some("Char"),
+        _ => None,
+    }
+}
+
+pub(in crate::analyzer::usages) fn scala_extension_receiver_matches_resolved(
+    extension_receiver_type: Option<&str>,
+    receiver_owner: Option<&str>,
+    _resolve_type: impl FnMut(&str) -> Option<String>,
+) -> bool {
+    let Some(extension_receiver_type) = extension_receiver_type else {
+        return true;
+    };
+    let Some(receiver_owner) = receiver_owner else {
+        return false;
+    };
+    scala_builtin_type_name(extension_receiver_type).is_some_and(|extension_receiver| {
+        scala_normalized_fq_name(extension_receiver) == scala_normalized_fq_name(receiver_owner)
+    }) || scala_normalized_fq_name(extension_receiver_type)
+        == scala_normalized_fq_name(receiver_owner)
+}
+
+pub(in crate::analyzer::usages) fn extension_receiver_type(signature: &str) -> Option<String> {
+    let trimmed = signature.strip_prefix("extension ")?.trim_start();
+    let parameters = trimmed.strip_prefix('(')?.split_once(')')?.0;
+    let parameter = parameters.split(',').next()?.trim();
+    let (_, type_text) = parameter.split_once(':')?;
+    let receiver_type = type_text.trim();
+    (!receiver_type.is_empty()).then(|| receiver_type.to_string())
+}
+
+pub(in crate::analyzer::usages) fn resolved_extension_receiver_type(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    signature: &str,
+) -> Option<String> {
+    extension_receiver_type(signature).map(|receiver_type| {
+        scala_resolve_declared_type(scala, unit.source(), unit.package_name(), &receiver_type)
+            .unwrap_or(receiver_type)
+    })
+}
+
+pub(in crate::analyzer::usages) fn scala_resolve_declared_type(
+    scala: &ScalaAnalyzer,
+    file: &ProjectFile,
+    package_name: &str,
+    type_text: &str,
+) -> Option<String> {
+    if let Some(builtin) = scala_builtin_type_name(type_text) {
+        return Some(builtin.to_string());
+    }
+    let base = scala_type_base(type_text)?;
+    let simple = scala_simple_type_name(base)?;
+
+    for import in scala.import_info_of(file) {
+        let Some(path) = scala_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard {
+            for package in import_candidate_fq_names(&path, package_name) {
+                if let Some(fqn) = scala_declared_type_in_package(scala, &package, simple) {
+                    return Some(fqn);
+                }
+            }
+            continue;
+        }
+
+        let local_name = import
+            .identifier
+            .as_deref()
+            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path));
+        if local_name != simple {
+            continue;
+        }
+        for candidate in import_candidate_fq_names(&path, package_name) {
+            if let Some(fqn) = scala_declared_type_fqn(scala, &candidate) {
+                return Some(fqn);
+            }
+        }
+    }
+
+    if let Some(fqn) = scala_declared_type_in_package(scala, package_name, simple) {
+        return Some(fqn);
+    }
+    if base.contains('.') {
+        for candidate in import_candidate_fq_names(base, package_name) {
+            if let Some(fqn) = scala_declared_type_fqn(scala, &candidate) {
+                return Some(fqn);
+            }
+        }
+    }
+    scala_declared_type_fqn(scala, base)
+}
+
+fn scala_declared_type_in_package(
+    scala: &ScalaAnalyzer,
+    package_name: &str,
+    simple: &str,
+) -> Option<String> {
+    scala
+        .all_declarations()
+        .filter(|unit| unit.is_class())
+        .find(|unit| unit.package_name() == package_name && scala_display_name(unit) == simple)
+        .map(|unit| unit.fq_name())
+}
+
+fn scala_declared_type_fqn(scala: &ScalaAnalyzer, fqn: &str) -> Option<String> {
+    let normalized = scala_normalized_fq_name(fqn);
+    scala
+        .all_declarations()
+        .filter(|unit| unit.is_class())
+        .find(|unit| scala_normalized_fq_name(&unit.fq_name()) == normalized)
+        .map(|unit| unit.fq_name())
+}
+
+fn scala_type_base(type_text: &str) -> Option<&str> {
+    type_text
+        .trim()
+        .split(['[', '(', '{', ' ', '<'])
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+fn scala_simple_type_name(type_text: &str) -> Option<&str> {
+    type_text
+        .trim()
+        .split(['[', '(', '{', ' ', '<'])
+        .next()
+        .and_then(|base| base.rsplit('.').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+pub(in crate::analyzer::usages) fn method_arity_matches(
     scala: &ScalaAnalyzer,
     unit: &CodeUnit,
     target_arity: Option<usize>,
@@ -350,10 +515,16 @@ pub(super) fn method_arity_matches(
     let Some(target_arity) = target_arity else {
         return true;
     };
+    method_signature_arity(scala, unit).is_none_or(|arity| arity == target_arity)
+}
+
+pub(in crate::analyzer::usages) fn method_signature_arity(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+) -> Option<usize> {
     unit.signature()
         .or_else(|| scala.signatures(unit).first().map(String::as_str))
         .and_then(signature_arity)
-        .is_none_or(|arity| arity == target_arity)
 }
 
 fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {

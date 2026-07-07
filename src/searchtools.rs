@@ -1557,7 +1557,10 @@ fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Def
         start_line: range.start_line,
         end_line: range.end_line,
         kind: code_unit_kind_name(unit.kind()).to_string(),
-        signature: unit.signature().map(str::to_string),
+        signature: unit
+            .signature()
+            .map(str::to_string)
+            .or_else(|| analyzer.signatures(unit).first().cloned()),
         language: language_name(language_for_target(unit)),
     })
 }

@@ -1,4 +1,6 @@
 use super::*;
+use crate::analyzer::usages::scala_graph::method_signature_arity;
+use crate::analyzer::usages::scala_graph::syntax::call_arity_for_reference;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 
 pub(crate) enum ScalaTypeLookupResolution {
@@ -718,7 +720,14 @@ fn resolve_scala_field(
             field.start_byte(),
             &owner,
         );
-        let candidates = scala_member_candidate_units(ctx, &owner, member, include_companion);
+        let call_arity = call_arity_for_reference(field_node);
+        let candidates = scala_applicable_member_candidate_units(
+            ctx,
+            &owner,
+            member,
+            include_companion,
+            call_arity,
+        );
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -824,6 +833,38 @@ fn scala_member_candidate_units(
     )
 }
 
+fn scala_applicable_member_candidate_units(
+    ctx: ScalaLookupCtx<'_>,
+    owner_fqn: &str,
+    member: &str,
+    include_companion: bool,
+    call_arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    scala_member_candidate_units(ctx, owner_fqn, member, include_companion)
+        .into_iter()
+        .filter(|unit| scala_member_candidate_applies(ctx, unit, call_arity))
+        .collect()
+}
+
+fn scala_member_candidate_applies(
+    ctx: ScalaLookupCtx<'_>,
+    unit: &CodeUnit,
+    call_arity: Option<usize>,
+) -> bool {
+    if unit.is_field() {
+        return true;
+    }
+    if !unit.is_function() {
+        return false;
+    }
+    match call_arity {
+        Some(call_arity) => {
+            method_signature_arity(ctx.scala, unit).is_some_and(|arity| arity == call_arity)
+        }
+        None => method_signature_arity(ctx.scala, unit).is_none_or(|arity| arity == 0),
+    }
+}
+
 fn scala_extension_candidates(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -859,11 +900,7 @@ fn scala_extension_candidate_units(
     }
     sort_units(&mut candidates);
     candidates.dedup();
-    if candidates.len() == 1 {
-        candidates
-    } else {
-        Vec::new()
-    }
+    candidates
 }
 
 fn scala_extension_receiver_matches(
@@ -871,14 +908,11 @@ fn scala_extension_receiver_matches(
     extension_receiver_type: Option<&str>,
     receiver_owner: Option<&str>,
 ) -> bool {
-    let (Some(receiver_owner), Some(extension_receiver_type)) =
-        (receiver_owner, extension_receiver_type)
-    else {
-        return true;
-    };
-    resolver
-        .resolve(extension_receiver_type)
-        .is_none_or(|extension_receiver| extension_receiver == receiver_owner)
+    scala_extension_receiver_matches_resolved(
+        extension_receiver_type,
+        receiver_owner,
+        |type_text| resolver.resolve(type_text),
+    )
 }
 
 fn scala_member_candidate_units_with_seen(
@@ -1192,7 +1226,7 @@ fn scala_receiver_type_fqn(
             let name = scala_first_type_name(receiver, ctx.source)?;
             resolver.resolve(name)
         }
-        _ => None,
+        kind => scala_literal_type_name(kind).map(str::to_string),
     }
 }
 
@@ -1278,7 +1312,7 @@ fn scala_enclosing_class_parameter_type(
                 }
                 return parameter.child_by_field_name("type").and_then(|type_node| {
                     let type_text = scala_node_text(type_node, ctx.source);
-                    scala_resolve_visible_type_annotation(ctx, resolver, type_text)
+                    scala_resolve_receiver_type_annotation(ctx, resolver, type_text)
                 });
             }
             return None;
@@ -1418,6 +1452,15 @@ fn scala_resolve_visible_type_annotation(
     scala_package_name_of(ctx.scala, ctx.file)
         .and_then(|package| scala_existing_package_type_fqn(ctx.analyzer, &package, type_text))
         .or(resolved)
+}
+
+fn scala_resolve_receiver_type_annotation(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    type_text: &str,
+) -> Option<String> {
+    scala_resolve_visible_type_annotation(ctx, resolver, type_text)
+        .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
 }
 
 fn scala_type_annotation_has_explicit_import(ctx: ScalaLookupCtx<'_>, type_text: &str) -> bool {
@@ -1612,7 +1655,7 @@ fn scala_seed_parameter(
         .filter(|type_node| type_node.end_byte() <= cutoff_start)
         .and_then(|type_node| {
             let type_text = scala_node_text(type_node, ctx.source);
-            scala_resolve_visible_type_annotation(ctx, resolver, type_text)
+            scala_resolve_receiver_type_annotation(ctx, resolver, type_text)
         });
     scala_seed_typed(binding_name, resolved, false, bindings);
 }
@@ -1629,7 +1672,7 @@ fn scala_seed_value_definition(
         .child_by_field_name("type")
         .filter(|type_node| type_node.end_byte() <= cutoff_start)
         .and_then(|type_node| {
-            scala_resolve_visible_type_annotation(
+            scala_resolve_receiver_type_annotation(
                 ctx,
                 resolver,
                 scala_node_text(type_node, ctx.source),
