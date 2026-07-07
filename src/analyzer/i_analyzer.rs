@@ -440,6 +440,7 @@ pub trait IAnalyzer: Send + Sync + Any {
 
         for separator in [".", "$", "::", "->"] {
             if let Some(index) = fq_name.rfind(separator)
+                && index + separator.len() < fq_name.len()
                 && last_index.map(|current| index > current).unwrap_or(true)
             {
                 last_index = Some(index);
