@@ -1,9 +1,10 @@
 use super::*;
 use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::usages::php_graph::syntax::{
-    assignment_parts, declared_field_type_fq_name, is_local_scope as php_is_local_scope,
-    object_creation_type as php_object_creation_type, seed_parameter_types,
-    static_member_parts as php_static_member_parts, variable_identifier as php_variable_identifier,
+    assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
+    is_local_scope as php_is_local_scope, object_creation_type as php_object_creation_type,
+    seed_parameter_types, static_member_parts as php_static_member_parts,
+    variable_identifier as php_variable_identifier,
 };
 
 pub(super) fn resolve_php(
@@ -638,6 +639,9 @@ fn php_declared_callable_return_type_fqn(
     support: &DefinitionLookupIndex,
     callable_fqn: &str,
 ) -> Option<String> {
+    if let Some(return_type) = php.usage_facts_index().callable_return_type(callable_fqn) {
+        return Some(return_type.to_string());
+    }
     let mut definitions = support
         .fqn(callable_fqn)
         .into_iter()
@@ -646,54 +650,7 @@ fn php_declared_callable_return_type_fqn(
     if definitions.next().is_some() {
         return None;
     }
-    php_declared_return_type_fqn(php, &callable)
-}
-
-fn php_declared_return_type_fqn(php: &PhpAnalyzer, callable: &CodeUnit) -> Option<String> {
-    let source = callable.source().read_to_string().ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let declaration = php_callable_declaration_node(php, callable, tree.root_node())?;
-    let return_type = declaration.child_by_field_name("return_type")?;
-    let raw = php_node_text(return_type, &source).trim();
-    if matches!(raw, "self" | "static") {
-        return php.parent_of(callable).map(|owner| owner.fq_name());
-    }
-    resolve_php_type(
-        raw,
-        &php.file_context_from_source(callable.source(), &source),
-    )
-}
-
-fn php_callable_declaration_node<'tree>(
-    php: &PhpAnalyzer,
-    callable: &CodeUnit,
-    root: Node<'tree>,
-) -> Option<Node<'tree>> {
-    let ranges = php.ranges(callable);
-    let start = ranges.iter().map(|range| range.start_byte).min()?;
-    let end = ranges.iter().map(|range| range.end_byte).max()?;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "function_definition" | "method_declaration")
-            && node.start_byte() >= start
-            && node.end_byte() <= end
-        {
-            return Some(node);
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index)
-                && child.end_byte() >= start
-                && child.start_byte() <= end
-            {
-                stack.push(child);
-            }
-        }
-    }
-    None
+    declared_callable_return_type_fq_name(php, php, &callable)
 }
 
 fn php_is_in_object_creation(node: Node<'_>) -> bool {

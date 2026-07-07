@@ -74,7 +74,8 @@ pub use php::{
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 pub(crate) use php::{
-    PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+    PhpFileContext, php_signature_return_type_text, resolve_php_constant, resolve_php_function,
+    resolve_php_type,
 };
 pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, MultiRootProject, OverlayProject,
