@@ -89,6 +89,11 @@ impl CsScan<'_, '_> {
         self.collector
             .record(callee, node.start_byte(), node.end_byte());
     }
+
+    fn record_unproven(&mut self, name: &str, node: Node<'_>) {
+        self.collector
+            .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
 }
 
 const SCOPE_NODES: &[&str] = &[
@@ -161,6 +166,8 @@ fn record_reference(
             }
             if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
                 ctx.record(format!("{owner}.{name}"), name_node);
+            } else {
+                ctx.record_unproven(name, name_node);
             }
         }
         _ => {}

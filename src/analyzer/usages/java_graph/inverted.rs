@@ -101,6 +101,11 @@ impl JavaScan<'_, '_> {
         self.collector
             .record(callee, node.start_byte(), node.end_byte());
     }
+
+    fn record_unproven(&mut self, name: &str, node: Node<'_>) {
+        self.collector
+            .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
 }
 
 const SCOPE_NODES: &[&str] = &[
@@ -176,6 +181,8 @@ fn record_reference(
             }
             if let Some(owner) = method_owner_fqn(node, ctx, bindings) {
                 ctx.record(format!("{owner}.{name}"), name_node);
+            } else {
+                ctx.record_unproven(name, name_node);
             }
         }
         "field_access" => {
@@ -190,6 +197,8 @@ fn record_reference(
                 && let Some(owner) = receiver_type_fqn(object, ctx, bindings)
             {
                 ctx.record(format!("{owner}.{field}"), field_node);
+            } else if !field.is_empty() {
+                ctx.record_unproven(field, field_node);
             }
         }
         _ => {}

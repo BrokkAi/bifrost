@@ -131,6 +131,41 @@ fn recurse(n: u32) {
 }
 
 #[test]
+fn rust_bulk_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+fn activate() {}
+
+trait Runner {}
+
+fn execute(value: Box<dyn Runner>) {
+    value.activate();
+}
+"#,
+    )]);
+    let run = rust_definition(&analyzer, "service.activate");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["src/service.rs".to_string()],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "trait-object receiver should make bulk evidence inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("| `function` | `service.activate`"),
+        "unproven-only bulk evidence must not report the target as dead: {report}"
+    );
+}
+
+#[test]
 fn rust_dead_code_smell_skips_truncated_usage_candidates() {
     let mut files = vec![(
         "src/helpers.rs".to_string(),

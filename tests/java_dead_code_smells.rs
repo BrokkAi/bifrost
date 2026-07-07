@@ -154,6 +154,45 @@ class Service {
 }
 
 #[test]
+fn java_bulk_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/Service.java",
+        r#"
+package com.example;
+
+class Target {
+    void run() {}
+}
+
+class Consumer {
+    void execute(Object value) {
+        value.run();
+    }
+}
+"#,
+    )]);
+    let run = java_definition(&analyzer, "com.example.Target.run");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["com/example/Service.java".to_string()],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "untyped receiver should make bulk evidence inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("| `function` | `com.example.Target.run`"),
+        "unproven-only bulk evidence must not report the target as dead: {report}"
+    );
+}
+
+#[test]
 fn java_dead_code_smell_honors_usage_candidate_file_cap() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

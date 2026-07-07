@@ -117,6 +117,11 @@ impl RustScan<'_, '_> {
         self.collector
             .record(callee, node.start_byte(), node.end_byte());
     }
+
+    fn record_unproven(&mut self, name: &str, node: Node<'_>) {
+        self.collector
+            .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
 }
 
 #[derive(Default)]
@@ -249,6 +254,8 @@ fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[Scop
     }
     if let Some(owner) = receiver_type(scopes, receiver_name) {
         ctx.record(format!("{owner}.{method_name}"), field);
+    } else {
+        ctx.record_unproven(method_name, field);
     }
 }
 

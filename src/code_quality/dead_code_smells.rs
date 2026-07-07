@@ -839,6 +839,13 @@ fn analyze_rust_candidates_with_usage_graph(
                 ));
                 return None;
             }
+            if usage.total == 0 && usage.unproven_inbound > 0 {
+                skipped.push(format!(
+                    "`{candidate_fqn}`: {} structurally matching usage site(s) could not be proven or disproven; evidence is inconclusive",
+                    usage.unproven_inbound
+                ));
+                return None;
+            }
             rust_graph_finding(
                 analyzer,
                 rust,
@@ -853,6 +860,7 @@ fn analyze_rust_candidates_with_usage_graph(
 #[derive(Clone, Debug, Default)]
 struct GraphIncomingUsage {
     total: usize,
+    unproven_inbound: usize,
     callers: BTreeMap<String, usize>,
 }
 
@@ -868,6 +876,12 @@ fn incoming_usage_by_callee(
         let usage = incoming.entry(callee.to_string()).or_default();
         usage.total += weight;
         usage.callers.entry(caller.to_string()).or_insert(weight);
+    }
+    for (callee, total) in &edges.unproven_inbound {
+        incoming
+            .entry(callee.to_string())
+            .or_default()
+            .unproven_inbound += total;
     }
     incoming
 }
@@ -1165,6 +1179,13 @@ where
                 skipped.push(format!(
                     "`{candidate_fqn}`: too many workspace inbound call sites ({}, limit {usage_cap}); evidence is inconclusive",
                     usage.total
+                ));
+                return None;
+            }
+            if usage.total == 0 && usage.unproven_inbound > 0 {
+                skipped.push(format!(
+                    "`{candidate_fqn}`: {} structurally matching usage site(s) could not be proven or disproven; evidence is inconclusive",
+                    usage.unproven_inbound
                 ));
                 return None;
             }

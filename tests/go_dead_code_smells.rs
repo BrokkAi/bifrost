@@ -172,6 +172,43 @@ func helper() int {
 }
 
 #[test]
+fn go_bulk_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "target.go",
+        r#"
+package main
+
+type Target struct{}
+
+func (Target) Run() {}
+
+func execute(value any) {
+    value.Run()
+}
+"#,
+    )]);
+    let run = definition(&analyzer, "example.com/app.Target.Run");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["target.go".to_string()],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "`any` receiver should make bulk evidence inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("| `function` | `example.com/app.Target.Run`"),
+        "unproven-only bulk evidence must not report the target as dead: {report}"
+    );
+}
+
+#[test]
 fn go_runtime_and_test_entry_points_are_not_dead_code_candidates() {
     let (_project, analyzer) = go_analyzer_with_files(&[
         (

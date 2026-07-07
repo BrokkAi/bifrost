@@ -89,6 +89,11 @@ impl CppScan<'_, '_> {
         self.collector
             .record(callee, node.start_byte(), node.end_byte());
     }
+
+    fn record_unproven(&mut self, name: &str, node: Node<'_>) {
+        self.collector
+            .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
 }
 
 const SCOPE_NODES: &[&str] = &[
@@ -202,6 +207,8 @@ fn record_call(
             }
             if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
                 ctx.record(format!("{owner}.{name}"), field);
+            } else {
+                ctx.record_unproven(name, field);
             }
         }
         // A bare `m(..)` is either a free function or an unqualified member call on

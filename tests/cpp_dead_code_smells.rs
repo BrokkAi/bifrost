@@ -151,6 +151,40 @@ static void wrapper() { leaf(); }
 }
 
 #[test]
+fn cpp_bulk_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "service.cpp",
+        r#"
+static void run() {}
+
+void execute() {
+    auto value = make_target();
+    value.run();
+}
+"#,
+    )]);
+    let run = function_definition(&analyzer, "run");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.cpp".to_string()],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "auto receiver with unknown initializer should make bulk evidence inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("| `function` | `run`"),
+        "unproven-only bulk evidence must not report the target as dead: {report}"
+    );
+}
+
+#[test]
 fn cpp_dead_code_smell_bulk_scores_namespaced_free_function() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[(
         "service.cpp",

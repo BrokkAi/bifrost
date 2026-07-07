@@ -221,6 +221,8 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             std::collections::BTreeMap::new();
         let mut truncated: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
+        let mut unproven_inbound: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
 
         for language in [Language::TypeScript, Language::JavaScript] {
             if analyzed_files_for_language(analyzer, language).is_empty() {
@@ -233,6 +235,9 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             for (callee, total) in result.truncated {
                 *truncated.entry(callee).or_insert(0) += total;
             }
+            for (callee, total) in result.unproven_inbound {
+                *unproven_inbound.entry(callee).or_insert(0) += total;
+            }
         }
 
         // TS and JS are distinct files, so per-language sites for a shared edge key
@@ -241,7 +246,11 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             sites.sort();
         }
 
-        UsageEdges { edges, truncated }
+        UsageEdges {
+            edges,
+            truncated,
+            unproven_inbound,
+        }
     }
 }
 

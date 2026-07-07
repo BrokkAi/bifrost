@@ -208,6 +208,15 @@ impl FileScan<'_, '_> {
             .record(callee, node.start_byte(), node.end_byte());
     }
 
+    fn record_unproven(&mut self, name: &str, node: Node<'_>) {
+        self.collector
+            .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
+
+    fn has_node(&self, node: &String) -> bool {
+        self.collector.contains_node(node)
+    }
+
     fn record_with_caller(&mut self, caller: String, callee: String, node: Node<'_>) {
         self.collector
             .record_with_caller(caller, callee, node.start_byte(), node.end_byte());
@@ -365,11 +374,16 @@ fn scan_selector(
 
     // Member call: the qualifier is a local whose type we inferred.
     let receiver = receiver_symbol_from_qualifier(&qualifier);
-    if let Some(types) = locals.resolve_symbol(receiver).as_precise() {
+    let receiver_resolution = locals.resolve_symbol(receiver);
+    if let Some(types) = receiver_resolution.as_precise() {
         let callees: Vec<String> = types
             .iter()
             .flat_map(|type_fqn| ctx.member_callees(type_fqn, &field))
             .collect();
+        if callees.is_empty() && types.iter().all(|type_fqn| !ctx.has_node(type_fqn)) {
+            ctx.record_unproven(&field, field_node);
+            return;
+        }
         for callee in callees {
             ctx.record(callee, field_node);
         }
@@ -389,6 +403,8 @@ fn scan_selector(
         for callee in callees {
             ctx.record(callee, field_node);
         }
+    } else if receiver_resolution.is_ambiguous() || locals.is_shadowed(receiver) {
+        ctx.record_unproven(&field, field_node);
     }
 }
 

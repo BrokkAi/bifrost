@@ -105,11 +105,17 @@ pub(crate) struct CallSite {
 pub(crate) trait NodeKey: Clone + Ord + Hash {
     /// The node key for a declaration.
     fn from_unit(unit: &CodeUnit) -> Self;
+    /// The fqn component used for terminal-name matching.
+    fn fqn(&self) -> &str;
 }
 
 impl NodeKey for String {
     fn from_unit(unit: &CodeUnit) -> Self {
         unit.fq_name()
+    }
+
+    fn fqn(&self) -> &str {
+        self
     }
 }
 
@@ -131,6 +137,10 @@ impl NodeKey for UsageNodeKey {
     fn from_unit(unit: &CodeUnit) -> Self {
         UsageNodeKey::new(unit.source().clone(), unit.fq_name())
     }
+
+    fn fqn(&self) -> &str {
+        &self.fqn
+    }
 }
 
 /// Aggregated result of an inverted edge build, keyed by node-key type `K`.
@@ -140,6 +150,9 @@ pub(crate) struct UsageEdges<K = String> {
     pub(crate) edges: BTreeMap<(K, K), Vec<CallSite>>,
     /// Callees past the call-site cap: `callee -> total call sites`.
     pub(crate) truncated: BTreeMap<K, usize>,
+    /// Per-callee count of structurally matching call/member sites whose receiver
+    /// could not be resolved to a proven edge.
+    pub(crate) unproven_inbound: BTreeMap<K, usize>,
 }
 
 // Hand-written so the bound is `K: Ord` (BTreeMap), not `K: Default` that
@@ -149,6 +162,7 @@ impl<K: Ord> Default for UsageEdges<K> {
         Self {
             edges: BTreeMap::new(),
             truncated: BTreeMap::new(),
+            unproven_inbound: BTreeMap::new(),
         }
     }
 }
@@ -192,6 +206,8 @@ pub(crate) struct PerFileEdges<K = String> {
     edge_lines: BTreeMap<(K, K), HashSet<usize>>,
     /// `callee -> distinct call-site offsets` (for the cap).
     callsites: BTreeMap<K, HashSet<usize>>,
+    /// `callee -> distinct unresolved structural member offsets`.
+    unproven_inbound: BTreeMap<K, HashSet<usize>>,
 }
 
 impl<K: Ord> Default for PerFileEdges<K> {
@@ -200,6 +216,7 @@ impl<K: Ord> Default for PerFileEdges<K> {
             path: String::new(),
             edge_lines: BTreeMap::new(),
             callsites: BTreeMap::new(),
+            unproven_inbound: BTreeMap::new(),
         }
     }
 }
@@ -242,6 +259,7 @@ pub(crate) fn build_file_declarations<K: NodeKey>(
 pub(crate) struct EdgeCollector<'a, K = String> {
     line_starts: &'a [usize],
     nodes: &'a HashSet<K>,
+    nodes_by_terminal: HashMap<String, Vec<K>>,
     declarations: FileDeclarations<K>,
     out: PerFileEdges<K>,
 }
@@ -252,9 +270,17 @@ impl<'a, K: NodeKey> EdgeCollector<'a, K> {
         nodes: &'a HashSet<K>,
         declarations: FileDeclarations<K>,
     ) -> Self {
+        let mut nodes_by_terminal: HashMap<String, Vec<K>> = HashMap::default();
+        for node in nodes {
+            nodes_by_terminal
+                .entry(node_terminal(node))
+                .or_default()
+                .push(node.clone());
+        }
         Self {
             line_starts,
             nodes,
+            nodes_by_terminal,
             declarations,
             out: PerFileEdges::default(),
         }
@@ -323,9 +349,47 @@ impl<'a, K: NodeKey> EdgeCollector<'a, K> {
             .insert(line);
     }
 
+    pub(crate) fn contains_node(&self, node: &K) -> bool {
+        self.nodes.contains(node)
+    }
+
+    /// Record that a structured call/member site with terminal member `name`
+    /// matched requested nodes but could not be resolved to a proven callee.
+    pub(crate) fn record_unproven_name(&mut self, name: &str, start: usize, end: usize) {
+        let Some(candidates) = self.nodes_by_terminal.get(name) else {
+            return;
+        };
+        let Some(caller) = self.enclosing(start, end).cloned() else {
+            return;
+        };
+        for callee in candidates {
+            if &caller == callee {
+                continue;
+            }
+            if self
+                .declarations
+                .definitions
+                .get(callee)
+                .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
+            {
+                continue;
+            }
+            self.out
+                .unproven_inbound
+                .entry(callee.clone())
+                .or_default()
+                .insert(start);
+        }
+    }
+
     pub(crate) fn finish(self) -> PerFileEdges<K> {
         self.out
     }
+}
+
+fn node_terminal<K: NodeKey>(node: &K) -> String {
+    let fqn = node.fqn();
+    fqn.rsplit('.').next().unwrap_or(fqn).to_string()
 }
 
 /// Drive a whole-workspace inverted edge build over `files` in parallel, where each
@@ -458,6 +522,7 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
     // same line number appearing in two files (e.g. a partial class) and undercount.
     let mut edge_sites: BTreeMap<(K, K), Vec<CallSite>> = BTreeMap::new();
     let mut callsites: BTreeMap<K, usize> = BTreeMap::new();
+    let mut unproven_inbound: BTreeMap<K, usize> = BTreeMap::new();
     for file in per_file {
         for (key, lines) in file.edge_lines {
             let sites = edge_sites.entry(key).or_default();
@@ -468,6 +533,9 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
         }
         for (callee, sites) in file.callsites {
             *callsites.entry(callee).or_insert(0) += sites.len();
+        }
+        for (callee, sites) in file.unproven_inbound {
+            *unproven_inbound.entry(callee).or_insert(0) += sites.len();
         }
     }
 
@@ -485,7 +553,11 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
         })
         .collect();
 
-    UsageEdges { edges, truncated }
+    UsageEdges {
+        edges,
+        truncated,
+        unproven_inbound,
+    }
 }
 
 pub(crate) fn merge_weights_and_cap<K: NodeKey>(

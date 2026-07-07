@@ -653,6 +653,45 @@ namespace App {
 }
 
 #[test]
+fn csharp_bulk_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[(
+        "Service.cs",
+        r#"
+namespace App {
+    class Target {
+        void Run() {}
+    }
+
+    class Consumer {
+        void Execute(dynamic value) {
+            value.Run();
+        }
+    }
+}
+"#,
+    )]);
+    let run = member_function(&analyzer, "App.Target", "Run");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["Service.cs".to_string()],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "dynamic receiver should make bulk evidence inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("| `function` | `App.Target.Run`"),
+        "unproven-only bulk evidence must not report the target as dead: {report}"
+    );
+}
+
+#[test]
 fn csharp_unproven_usage_evidence_is_inconclusive_not_dead() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
