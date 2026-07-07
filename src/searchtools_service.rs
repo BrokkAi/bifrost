@@ -427,9 +427,7 @@ impl SearchToolsService {
                 usage_graph(workspace.analyzer(), params)
             }),
             "search_ast" => {
-                let query = crate::analyzer::structural::AstQuery::from_json(&arguments)
-                    .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
-                let output = crate::analyzer::structural::execute(snapshot.analyzer(), &query);
+                let output = Self::search_ast_output_for_snapshot(&snapshot, arguments)?;
                 let rendered_text = output.render_text();
                 let structured = serde_json::to_value(&output).map_err(|err| {
                     SearchToolsServiceError::internal(format!(
@@ -541,6 +539,27 @@ impl SearchToolsService {
                 "Unknown tool: {name}"
             ))),
         }
+    }
+
+    pub fn search_ast_output(
+        &self,
+        arguments: Value,
+    ) -> Result<crate::analyzer::structural::SearchAstOutput, SearchToolsServiceError> {
+        let arguments = self.normalize_arguments_for_current_workspace("search_ast", arguments)?;
+        let snapshot = self.snapshot_for_query()?;
+        Self::search_ast_output_for_snapshot(&snapshot, arguments)
+    }
+
+    fn search_ast_output_for_snapshot(
+        snapshot: &WorkspaceAnalyzer,
+        arguments: Value,
+    ) -> Result<crate::analyzer::structural::SearchAstOutput, SearchToolsServiceError> {
+        let query = crate::analyzer::structural::AstQuery::from_json(&arguments)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        Ok(crate::analyzer::structural::execute(
+            snapshot.analyzer(),
+            &query,
+        ))
     }
 
     pub fn active_workspace_root(&self) -> PathBuf {

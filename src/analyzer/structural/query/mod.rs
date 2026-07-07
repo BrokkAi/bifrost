@@ -12,6 +12,7 @@ mod decode;
 mod features;
 mod ir;
 mod json;
+pub mod sexp;
 
 pub use ir::{
     AstQuery, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,

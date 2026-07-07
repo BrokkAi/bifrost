@@ -2,6 +2,9 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+#[path = "../search_ast_repl.rs"]
+mod search_ast_repl;
+
 use brokk_bifrost::ToolOutput;
 use brokk_bifrost::lsp::run_lsp_stdio_server;
 use brokk_bifrost::mcp_common::{McpRenderOptions, run_stdio_server};
@@ -11,6 +14,7 @@ use brokk_bifrost::mcp_registry::{
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
+use search_ast_repl::run_search_ast_repl;
 use serde_json::{Value, json};
 
 fn main() -> ExitCode {
@@ -30,6 +34,7 @@ fn run() -> Result<(), String> {
     let mut root_explicit = false;
     let mut mcp_mode: Option<String> = None;
     let mut run_lsp = false;
+    let mut run_repl = false;
     let mut tool_name: Option<String> = None;
     let mut tool_args = json!({});
     let mut tool_sources = Vec::new();
@@ -52,6 +57,9 @@ fn run() -> Result<(), String> {
             }
             "--lsp" => {
                 run_lsp = true;
+            }
+            "--repl" => {
+                run_repl = true;
             }
             // DEPRECATED: superseded by `--mcp <toolsets>` and `--lsp`. Kept as a
             // backwards-compatible alias and intentionally undocumented in --help.
@@ -113,8 +121,8 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(tool_name) = tool_name {
-        if run_lsp || mcp_mode.is_some() {
-            return Err("--tool cannot be combined with --mcp or --lsp".to_string());
+        if run_lsp || run_repl || mcp_mode.is_some() {
+            return Err("--tool cannot be combined with --mcp, --lsp, or --repl".to_string());
         }
         return run_tool(root, &tool_name, tool_args, &tool_sources, render_options);
     }
@@ -127,6 +135,10 @@ fn run() -> Result<(), String> {
         return Err("--lsp cannot be combined with --mcp".to_string());
     }
 
+    if run_repl && (run_lsp || mcp_mode.is_some()) {
+        return Err("--repl cannot be combined with --mcp or --lsp".to_string());
+    }
+
     if !root_explicit {
         eprintln!(
             "bifrost: no --root supplied, using current directory: {}",
@@ -136,6 +148,10 @@ fn run() -> Result<(), String> {
 
     if run_lsp {
         return run_lsp_stdio_server(root);
+    }
+
+    if run_repl {
+        return run_search_ast_repl(root);
     }
 
     let mode = mcp_mode.as_deref().unwrap_or("searchtools");
@@ -214,6 +230,7 @@ USAGE:
     bifrost                  Run an MCP server over stdio (default: --mcp searchtools)
     bifrost --mcp TOOLSETS     Run an MCP server over stdio (e.g. --mcp core)
     bifrost --lsp              Run a Language Server (LSP) over stdio
+    bifrost --repl             Run an interactive search_ast REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --version | --help [TOOL]
 
@@ -262,6 +279,9 @@ EXAMPLES:
 
     # One-shot: run a single tool and print its JSON result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
+
+    # Human search_ast exploration with S-expressions, completion, docs, and history:
+    bifrost --root /path/to/project --repl
 
     # One-shot against a subset workspace built from a directory and a glob:
     bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
