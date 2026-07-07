@@ -863,12 +863,29 @@ impl Visibility {
     }
 }
 
-fn import_candidate_fq_names(path: &str, package_name: &str) -> HashSet<String> {
+pub(in crate::analyzer::usages) fn import_candidate_fq_names(
+    path: &str,
+    package_name: &str,
+) -> HashSet<String> {
     let mut candidates = HashSet::from_iter([path.to_string()]);
     if !package_name.is_empty() && !path.starts_with(&format!("{package_name}.")) {
         candidates.insert(format!("{package_name}.{path}"));
     }
     candidates
+}
+
+pub(in crate::analyzer::usages) fn import_candidate_owner_fq_names(
+    path: &str,
+    package_name: &str,
+) -> HashSet<String> {
+    let mut owners = HashSet::default();
+    for candidate in import_candidate_fq_names(path, package_name) {
+        owners.insert(candidate.clone());
+        if !candidate.ends_with('$') {
+            owners.insert(format!("{candidate}$"));
+        }
+    }
+    owners
 }
 
 fn object_member_fq_name(fq_name: &str) -> String {

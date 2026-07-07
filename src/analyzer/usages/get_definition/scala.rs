@@ -128,6 +128,9 @@ pub(super) fn resolve_scala(
                     return candidates_outcome(candidates);
                 }
             }
+            if let Some(imported_member) = scala_wildcard_imported_member_outcome(ctx, text, None) {
+                return imported_member;
+            }
             if scala_import_boundary_for_name(scala, context.support, file, text) {
                 return boundary(format!(
                     "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
@@ -533,6 +536,13 @@ fn resolve_scala_call(
                     return candidates_outcome(candidates);
                 }
             }
+            if let Some(imported_member) = scala_wildcard_imported_member_outcome(
+                ctx,
+                name,
+                call_arity_for_reference(function),
+            ) {
+                return imported_member;
+            }
             if let Some(owner_fqn) = resolver.resolve(name) {
                 // A call `Foo(..)` resolves to the companion object's `apply` when
                 // one exists. `name` may resolve to the class `Foo` or the companion
@@ -913,6 +923,51 @@ fn scala_extension_receiver_matches(
         receiver_owner,
         |type_text| resolver.resolve(type_text),
     )
+}
+
+fn scala_wildcard_imported_member_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    member: &str,
+    call_arity: Option<usize>,
+) -> Option<DefinitionLookupOutcome> {
+    let file_package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
+    let mut contributing_imports = 0_usize;
+    let mut candidates = Vec::new();
+    for import in ctx.scala.import_info_of(ctx.file) {
+        if !import.is_wildcard {
+            continue;
+        }
+        let Some(path) = scala_import_path(import) else {
+            continue;
+        };
+        let mut import_candidates = Vec::new();
+        for owner_fqn in import_candidate_owner_fq_names(&path, &file_package) {
+            import_candidates.extend(
+                ctx.support
+                    .fqn_direct_children(&owner_fqn)
+                    .into_iter()
+                    .filter(|unit| unit.identifier() == member)
+                    .filter(|unit| scala_member_candidate_applies(ctx, unit, call_arity)),
+            );
+        }
+        if !import_candidates.is_empty() {
+            contributing_imports += 1;
+            candidates.extend(import_candidates);
+        }
+        if contributing_imports > 1 {
+            return Some(no_definition(
+                "ambiguous_scala_wildcard_import",
+                format!("Scala wildcard imports expose multiple `{member}` definitions"),
+            ));
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.is_empty() {
+        None
+    } else {
+        Some(candidates_outcome(candidates))
+    }
 }
 
 fn scala_member_candidate_units_with_seen(

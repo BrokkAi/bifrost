@@ -578,3 +578,181 @@ function consume(Notifier $notifier, EmailNotifier $mail): void {
 
     assert_timing_summary("milestone_3_php_interface_traits", &timings, 11);
 }
+
+#[test]
+fn milestone_4_scala_extension_trait_click_around() {
+    let fixture = ClickFixture::new("milestone_4_scala_extensions_traits")
+        .file(
+            "src/main/scala/support/Helpers.scala",
+            r#"package support
+
+def <helper_decl>helper(): Int = 1
+"#,
+        )
+        .file(
+            "src/main/scala/other/Helpers.scala",
+            r#"package other
+
+def <other_helper_decl>helper(): Int = 2
+"#,
+        )
+        .file(
+            "src/main/scala/example/Workflow.scala",
+            r#"package example
+
+import support.*
+
+final case class User(<user_slug_decl>slug: String)
+
+<logging_trait_range>trait <logging_trait_decl>Logging:
+  def <logging_info_decl>info(msg: String): Unit = ()
+
+trait Primary:
+  def <primary_id_decl>id: String = "primary"
+
+trait Secondary:
+  def <secondary_id_decl>id: String = "secondary"
+
+<service_range>class <service_decl>Service extends Logging
+
+class OtherService:
+  def <other_info_decl>info(msg: String): Unit = ()
+
+class ConflictService extends Primary with Secondary
+
+object Syntax:
+  extension (value: String)
+    def <string_slug_decl>slug: String = value.toLowerCase
+
+object Workflow:
+  import Syntax.*
+
+  def <local_helper_decl>localHelper(): Int = 3
+
+  def run(service: Service, other: OtherService, conflict: ConflictService, user: User, i: Int): Unit =
+    val fromWildcard = <helper_call>helper()
+    val local = <local_helper_call>localHelper()
+    service.<service_info_call>info("started")
+    other.<other_info_call>info("ignored")
+    val extensionSlug = "Hello World".<string_slug_call>slug
+    val directSlug = user.<direct_slug_call>slug
+    val receiverMismatch = i.<mismatch_slug_call>slug
+    val ambiguous = conflict.<ambiguous_id_call>id
+"#,
+        )
+        .file(
+            "src/main/scala/example/AmbiguousImports.scala",
+            r#"package example
+
+import support.*
+import other.*
+
+object AmbiguousImports:
+  val value = <ambiguous_helper_call>helper()
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "wildcard imported helper resolves to top-level function",
+                "helper_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["helper_decl"]),
+            ),
+            ClickCase::new(
+                "enclosing member takes precedence over wildcard import",
+                "local_helper_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["local_helper_decl"]),
+            ),
+            ClickCase::new(
+                "ambiguous wildcard imported helper returns empty definition",
+                "ambiguous_helper_call",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "same-package relative wildcard import exposes extension method",
+                "string_slug_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["string_slug_decl"]),
+            ),
+            ClickCase::new(
+                "direct member takes precedence over imported extension method",
+                "direct_slug_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["user_slug_decl"]),
+            ),
+            ClickCase::new(
+                "receiver mismatch does not select visible extension method",
+                "mismatch_slug_call",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "conflicting inherited trait members return empty definition",
+                "ambiguous_id_call",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "trait default method resolves through inherited receiver",
+                "service_info_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["logging_info_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name method resolves to unrelated declaration",
+                "other_info_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_info_decl"]),
+            ),
+            ClickCase::new(
+                "extension method references include only matching string receiver",
+                "string_slug_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["string_slug_call"]),
+            ),
+            ClickCase::new(
+                "trait default references include inherited receiver call only",
+                "logging_info_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["service_info_call"]),
+            ),
+            ClickCase::new(
+                "wildcard imported helper references include helper call",
+                "helper_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["helper_call"]),
+            ),
+            ClickCase::new(
+                "trait type implementation finds extending class",
+                "logging_trait_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["service_decl"]),
+            ),
+            ClickCase::new(
+                "service supertypes include logging trait",
+                "service_decl",
+                ClickOperation::TypeHierarchySupertypes,
+                ClickExpectation::Locations(&["logging_trait_range"]),
+            ),
+            ClickCase::new(
+                "logging trait subtypes include service",
+                "logging_trait_decl",
+                ClickOperation::TypeHierarchySubtypes,
+                ClickExpectation::Locations(&["service_range"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_4_scala_extensions_traits", &timings, 15);
+}

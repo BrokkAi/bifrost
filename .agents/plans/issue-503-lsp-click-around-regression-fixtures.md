@@ -18,7 +18,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T10:08Z) Milestone 1: added the Go embedded-promotion click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted coverage findings and the exposed Go graph reference bug, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T10:25Z) Milestone 2: added the Rust trait/impl click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted coverage findings and the exposed Rust default-method / associated-type definition gaps, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T10:35Z) Milestone 3: added the PHP interface/trait click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted reference coverage findings and the exposed PHP factory/interface receiver graph gaps, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 4: Scala click-around fixture.
+- [x] (2026-07-07T10:52Z) Milestone 4: added the Scala extension/trait click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted wildcard-import precedence/ambiguity findings, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 5: Java click-around fixture.
 - [ ] Milestone 6: C# click-around fixture.
 - [ ] Milestone 7: C++ click-around fixture.
@@ -50,6 +50,12 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 
 - Observation: The PHP fixture exposed asymmetric behavior between definition and references for interface-typed and factory-returned receivers.
   Evidence: `textDocument/definition` resolved `$notifier->notify()` to the interface method and, after the PHP definition fix, `$factory->notify()` to the concrete method, but references from `Notifier::notify` initially omitted both call sites. Review strengthened the exact references expectation, leading to PHP graph fixes for interface receiver matching and free-function factory return seeding.
+
+- Observation: The Scala fixture exposed that `textDocument/definition` did not resolve an unqualified top-level member reached through a package wildcard import, even though the references graph already modeled wildcard-imported members.
+  Evidence: The first Scala fixture run returned `null` for `helper()` under `import support.*`. The Scala definition resolver now checks wildcard import metadata and the declaration index's direct children before falling through to unresolved callable handling.
+
+- Observation: The first Scala wildcard-import definition fix introduced two review-visible semantic risks: wildcard members could outrank enclosing members, and multiple wildcard imports exposing the same direct member could return multiple go-to-definition targets.
+  Evidence: Brokk Guided Review flagged both risks. The final fixture includes `localHelper()` proving enclosing-member precedence and `AmbiguousImports.helper()` proving ambiguous package wildcard imports return empty.
 
 ## Decision Log
 
@@ -85,6 +91,14 @@ The work is test-first. Production analyzer changes are allowed only when a new 
   Rationale: In the PHP milestone, definition proved that interface-typed and factory-returned receiver calls had precise targets. Excluding those calls from exact references would have locked in an editor-visible inconsistency. The PHP graph now mirrors the structured receiver inference used by definition for these cases.
   Date/Author: 2026-07-07 / Codex.
 
+- Decision: Cover Scala wildcard imports with a package wildcard top-level function in the LSP fixture, and leave object wildcard member import asymmetry outside this milestone.
+  Rationale: Existing lower-level Scala graph coverage already covers object wildcard member imports. The LSP milestone needs a stable wildcard-import click case while keeping the main Scala 3 fixture focused on extensions, precedence, inherited trait defaults, ambiguity, and hierarchy.
+  Date/Author: 2026-07-07 / Codex.
+
+- Decision: Resolve Scala package-wildcard direct members only after explicit member imports and enclosing/source-ancestor members, and return no definition when more than one wildcard import contributes a matching direct member.
+  Rationale: This keeps get-definition aligned with Scala lookup precedence and the graph resolver's ambiguity model. The helper uses shared Scala import candidate construction instead of a get-definition-only copy.
+  Date/Author: 2026-07-07 / Codex.
+
 ## Outcomes & Retrospective
 
 Milestone 0 is complete. The repository now has a reusable LSP click fixture helper, parser coverage for marker edge cases, a Java smoke fixture for definition/references/empty-result behavior, and timing capture. No production analyzer code was changed.
@@ -102,6 +116,10 @@ Milestone 2 Brokk Guided Review outcome: security/correctness and devops found n
 Milestone 3 is complete. The PHP fixture now covers interface-typed receiver definitions, concrete receiver definitions, factory-returned receiver definitions, trait methods imported by class `use`, in-class trait method calls, unrelated same-name methods, interface references including implementation declarations and typed/factory/interface receiver calls, trait method references, and implementation lookup for interface methods and types.
 
 Milestone 3 Brokk Guided Review outcome: devops found no issues. Security/correctness, senior-dev, duplication, and architecture all found that the interface method reference expectation undercounted `interface_notify_call` and/or `factory_notify_call`. Accepted fixes strengthened the exact reference expectation, added free-function factory return seeding to PHP get-definition and the PHP graph scanner, and changed PHP graph receiver matching so interface-typed receivers count as references to the interface method. Focused PHP LSP, PHP graph, PHP go-to-definition, formatting, and diff checks pass.
+
+Milestone 4 is complete. The Scala fixture now covers package wildcard imports, same-package relative wildcard extension imports, direct-member precedence over extensions, receiver mismatch, conflicting inherited trait-member ambiguity, trait default inheritance, unrelated same-name methods, references, implementation, and type hierarchy supertypes/subtypes.
+
+Milestone 4 Brokk Guided Review outcome: devops found no issues. Security/correctness and architecture found that the first wildcard-import definition helper returned definitions for ambiguous wildcard imports; senior-dev found that it also ran before enclosing-member lookup; duplication found import-candidate construction drift. Accepted fixes moved wildcard direct-member lookup behind higher-precedence scopes, return no definition when multiple wildcard imports contribute matches, reuse a shared Scala graph import-candidate helper, and add LSP click cases for local precedence and ambiguous package wildcard imports. Focused Scala LSP, Scala get-definition, Scala graph, formatting, and diff checks pass.
 
 ## Timing Log
 
@@ -140,6 +158,15 @@ Milestone 3 Brokk Guided Review outcome: devops found no issues. Security/correc
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_3_php --features nlp -- --nocapture` passed in 5.81s real time after recompiling the PHP graph changes; test execution took 4.27s. Additional focused checks for PHP interface receiver graph coverage and `phpactor_goto_definition` passed.
   - Click cases added: 11.
   - Slowest fixture/operation: `milestone_3_php_interface_traits`, case `interface-typed receiver resolves to interface method`, marker `interface_notify_call`, operation `definition`, 43 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 4: Scala
+  - Language: Scala.
+  - Start: 2026-07-07T10:35Z.
+  - End: 2026-07-07T10:52Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_4_scala --features nlp -- --nocapture` passed in 5.54s real time after recompiling the changed test and Scala definition resolver; test execution took 3.24s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_4_scala --features nlp -- --nocapture` passed in 18.02s real time after formatting/recompilation; test execution took 3.64s. Additional focused checks `get_definition_test scala_` and `usages_scala_graph_test scala_graph_` passed.
+  - Click cases added: 15.
+  - Slowest fixture/operation: `milestone_4_scala_extensions_traits`, case `wildcard imported helper resolves to top-level function`, marker `helper_call`, operation `definition`, 59 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
