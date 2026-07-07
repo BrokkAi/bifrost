@@ -1154,6 +1154,134 @@ func (w Worker) Run(value int) int {
     );
 }
 
+#[test]
+fn go_graph_strategy_finds_imported_interface_method_calls_through_struct_fields() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "registry/app/pkg/base/base.go",
+            r#"
+package base
+
+type LocalBase interface {
+    MoveTempFileAndCreateArtifact(ctx string) error
+}
+
+type localBase struct{}
+
+func NewLocalBase() LocalBase {
+    return &localBase{}
+}
+
+func (l *localBase) MoveTempFileAndCreateArtifact(ctx string) error {
+    return nil
+}
+"#,
+        ),
+        (
+            "registry/app/pkg/npm/local.go",
+            r#"
+package npm
+
+import "example.com/app/registry/app/pkg/base"
+
+type Client struct {
+    localBase base.LocalBase
+}
+
+func (c *Client) Publish(ctx string) error {
+    return c.localBase.MoveTempFileAndCreateArtifact(ctx)
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(
+        &analyzer,
+        "example.com/app/registry/app/pkg/base.LocalBase.MoveTempFileAndCreateArtifact",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("imported interface field method usage should resolve");
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected imported interface field hit: {hits:?}"
+    );
+    assert!(hits.iter().all(|hit| {
+        hit.file == project.file("registry/app/pkg/npm/local.go")
+            && hit
+                .snippet
+                .contains("c.localBase.MoveTempFileAndCreateArtifact")
+    }));
+}
+
+#[test]
+fn go_graph_strategy_finds_unexported_impl_method_calls_through_imported_interface_fields() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "registry/app/pkg/base/base.go",
+            r#"
+package base
+
+type LocalBase interface {
+    MoveTempFileAndCreateArtifact(ctx string) error
+}
+
+type localBase struct{}
+
+func NewLocalBase() LocalBase {
+    return &localBase{}
+}
+
+func (l *localBase) MoveTempFileAndCreateArtifact(ctx string) error {
+    return nil
+}
+"#,
+        ),
+        (
+            "registry/app/pkg/npm/local.go",
+            r#"
+package npm
+
+import "example.com/app/registry/app/pkg/base"
+
+type Client struct {
+    localBase base.LocalBase
+}
+
+func (c *Client) Publish(ctx string) error {
+    return c.localBase.MoveTempFileAndCreateArtifact(ctx)
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(
+        &analyzer,
+        "example.com/app/registry/app/pkg/base.localBase.MoveTempFileAndCreateArtifact",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("unexported implementation method usage through imported interface field should resolve");
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected imported interface field hit: {hits:?}"
+    );
+    assert!(hits.iter().all(|hit| {
+        hit.file == project.file("registry/app/pkg/npm/local.go")
+            && hit
+                .snippet
+                .contains("c.localBase.MoveTempFileAndCreateArtifact")
+    }));
+}
+
 // Regression for #232: a value-receiver method called on a local that is bound to
 // a constructor's return value (`service := NewService()`) must resolve on the
 // graph path. Before the constructor-return seeding it returned zero hits and the

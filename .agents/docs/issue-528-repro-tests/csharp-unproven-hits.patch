@@ -1,0 +1,119 @@
+diff --git a/tests/usages_csharp_graph_test.rs b/tests/usages_csharp_graph_test.rs
+index 05c9de2..29e47f5 100644
+--- a/tests/usages_csharp_graph_test.rs
++++ b/tests/usages_csharp_graph_test.rs
+@@ -2023,3 +2023,114 @@ public sealed class Consumer
+         "typed external receiver should resolve to EventRecord.Name: {hits:#?}"
+     );
+ }
++
++#[test]
++fn csharp_graph_should_find_extension_method_on_primitive_long_receiver() {
++    let (project, analyzer) = csharp_analyzer_with_files(&[
++        (
++            "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
++            r#"
++namespace NzbDrone.Common.Extensions
++{
++    public static class NumberExtensions
++    {
++        public static string SizeSuffix(this long bytes)
++        {
++            if (bytes < 0) { return "-" + SizeSuffix(-bytes); }
++            return bytes.ToString();
++        }
++    }
++}
++"#,
++        ),
++        (
++            "src/NzbDrone.Core/Consumer.cs",
++            r#"
++using NzbDrone.Common.Extensions;
++
++namespace NzbDrone.Core
++{
++    public class Consumer
++    {
++        public string Render(long size)
++        {
++            return size.SizeSuffix();
++        }
++    }
++}
++"#,
++        ),
++    ]);
++
++    let size_suffix = member_function(
++        &analyzer,
++        "NzbDrone.Common.Extensions.NumberExtensions",
++        "SizeSuffix",
++    );
++    let hits = graph_hits(&analyzer, &size_suffix);
++
++    assert!(
++        hits.iter().any(|hit| {
++            hit.file == project.file("src/NzbDrone.Core/Consumer.cs")
++                && hit.snippet.contains("size.SizeSuffix()")
++        }),
++        "long receiver extension call should resolve to NumberExtensions.SizeSuffix: {hits:#?}"
++    );
++}
++
++#[test]
++fn csharp_scan_usages_target_anchor_should_find_primitive_extension_receiver_usage() {
++    let (project, _analyzer) = csharp_analyzer_with_files(&[
++        (
++            "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
++            r#"
++namespace NzbDrone.Common.Extensions
++{
++    public static class NumberExtensions
++    {
++        public static string SizeSuffix(this long bytes)
++        {
++            if (bytes < 0) { return "-" + SizeSuffix(-bytes); }
++            return bytes.ToString();
++        }
++    }
++}
++"#,
++        ),
++        (
++            "src/NzbDrone.Core/Consumer.cs",
++            r#"
++using NzbDrone.Common.Extensions;
++
++namespace NzbDrone.Core
++{
++    public class Consumer
++    {
++        public string Render(long size)
++        {
++            return size.SizeSuffix();
++        }
++    }
++}
++"#,
++        ),
++    ]);
++
++    let result = call_search_tool_json(
++        project.root(),
++        "scan_usages",
++        &json!({
++            "targets": [{
++                "path": "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
++                "line": 6
++            }]
++        })
++        .to_string(),
++    );
++
++    assert_eq!(0, result["failures"].as_array().map_or(0, Vec::len), "{result}");
++    assert!(
++        result["summary"]["total_hits"].as_u64().unwrap_or_default() > 0,
++        "definition-site target selector should recover primitive extension usage: {result}"
++    );
++}

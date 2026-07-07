@@ -1001,7 +1001,7 @@ pub(super) struct TargetSpec {
     top_level_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     owner_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     compatible_receiver_types: BTreeSet<(ProjectFile, String)>,
-    field_owner_direct_names: HashMap<String, HashSet<String>>,
+    field_owner_direct_names: HashMap<ProjectFile, HashMap<String, HashSet<String>>>,
     owner_constructor_names: HashSet<String>,
 }
 
@@ -1312,22 +1312,16 @@ fn normalized_type_text(node: Node<'_>, source: &str) -> String {
 fn collect_field_owner_direct_names(
     graph: &GoProjectGraph,
     compatible_receiver_types: &BTreeSet<(ProjectFile, String)>,
-) -> HashMap<String, HashSet<String>> {
-    let mut by_owner = HashMap::default();
-    let Some((anchor_file, _)) = compatible_receiver_types.first() else {
-        return by_owner;
-    };
-    let parent = anchor_file.parent().to_string_lossy().replace('\\', "/");
-    let Some(package_files) = graph.dir_index.get(&parent) else {
-        return by_owner;
-    };
-    for type_file in package_files {
-        if !same_go_package(graph, anchor_file, type_file) {
-            continue;
-        }
+) -> HashMap<ProjectFile, HashMap<String, HashSet<String>>> {
+    let mut by_file = HashMap::default();
+    if compatible_receiver_types.is_empty() {
+        return by_file;
+    }
+    for type_file in graph.parsed.keys() {
         let Some(parsed) = graph.parsed_file(type_file) else {
             continue;
         };
+        let mut by_owner = HashMap::default();
         let mut cursor = parsed.tree.root_node().walk();
         for child in parsed.tree.root_node().named_children(&mut cursor) {
             if child.kind() != "type_declaration" {
@@ -1342,8 +1336,11 @@ fn collect_field_owner_direct_names(
                 &mut by_owner,
             );
         }
+        if !by_owner.is_empty() {
+            by_file.insert(type_file.clone(), by_owner);
+        }
     }
-    by_owner
+    by_file
 }
 
 fn collect_struct_fields_with_compatible_types(
@@ -1376,7 +1373,7 @@ fn collect_struct_fields_with_compatible_types(
                     compatible_receiver_types,
                 );
                 if !fields.is_empty() {
-                    by_owner.insert(owner, fields);
+                    by_owner.entry(owner).or_default().extend(fields);
                 }
             }
             "type_spec_list" => collect_struct_fields_with_compatible_types(
@@ -1432,14 +1429,41 @@ fn type_ref_matches_compatible_receiver(
     let Some(name) = ty.name.as_deref() else {
         return false;
     };
-    if ty.qualifier.is_none() {
-        return compatible_receiver_types
+    match ty.qualifier.as_deref() {
+        None => compatible_receiver_types
             .iter()
             .any(|(receiver_file, receiver)| {
                 receiver == name && same_go_package(graph, type_file, receiver_file)
-            });
+            }),
+        Some(qualifier) => compatible_receiver_types
+            .iter()
+            .filter(|(_, receiver)| receiver == name)
+            .any(|(receiver_file, receiver)| {
+                let seeds = receiver_type_seeds(graph, receiver_file, receiver);
+                graph
+                    .matching_edges_for_importer(type_file, &seeds)
+                    .into_iter()
+                    .any(|edge| {
+                        edge.local_name == qualifier
+                            && matches!(
+                                edge.kind,
+                                ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_)
+                            )
+                    })
+            }),
     }
-    false
+}
+
+fn receiver_type_seeds(
+    graph: &GoProjectGraph,
+    receiver_file: &ProjectFile,
+    receiver: &str,
+) -> BTreeSet<(ProjectFile, String)> {
+    let mut seeds = graph.seeds_for_target(receiver_file, receiver);
+    if seeds.is_empty() {
+        seeds.insert((receiver_file.clone(), receiver.to_string()));
+    }
+    seeds
 }
 
 /// Names of package-level functions in the owner type's package whose first result
@@ -1633,6 +1657,7 @@ pub(super) struct ScanBindings {
     owner_namespace_names: HashSet<String>,
     owner_namespace_type_names: HashMap<String, HashSet<String>>,
     field_owner_direct_names: HashMap<String, HashSet<String>>,
+    field_owner_namespace_names: HashMap<String, HashMap<String, HashSet<String>>>,
 }
 
 impl ScanBindings {
@@ -1689,11 +1714,30 @@ impl ScanBindings {
                 }
             }
         }
-        let field_owner_direct_names = if same_go_package(graph, file, spec.target.source()) {
-            spec.field_owner_direct_names.clone()
-        } else {
-            HashMap::default()
-        };
+        let mut field_owner_direct_names = HashMap::default();
+        let mut field_owner_namespace_names: HashMap<String, HashMap<String, HashSet<String>>> =
+            HashMap::default();
+        for (owner_file, owner_fields) in &spec.field_owner_direct_names {
+            if same_go_package(graph, file, owner_file) {
+                merge_field_owner_names(&mut field_owner_direct_names, owner_fields);
+            }
+            for (owner, fields) in owner_fields {
+                let seeds = receiver_type_seeds(graph, owner_file, owner);
+                for edge in graph.matching_edges_for_importer(file, &seeds) {
+                    if matches!(
+                        edge.kind,
+                        ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_)
+                    ) {
+                        field_owner_namespace_names
+                            .entry(edge.local_name)
+                            .or_default()
+                            .entry(owner.clone())
+                            .or_default()
+                            .extend(fields.iter().cloned());
+                    }
+                }
+            }
+        }
 
         Self {
             direct_names,
@@ -1702,6 +1746,7 @@ impl ScanBindings {
             owner_namespace_names,
             owner_namespace_type_names,
             field_owner_direct_names,
+            field_owner_namespace_names,
         }
     }
 
@@ -1741,15 +1786,39 @@ impl ScanBindings {
         if self.matches_owner_type(ty) {
             tokens.push(crate::analyzer::usages::go_graph::extractor::OWNER_TOKEN.to_string());
         }
-        if ty.qualifier.is_none()
-            && let Some(name) = ty.name.as_deref()
-            && let Some(fields) = self.field_owner_direct_names.get(name)
-        {
-            tokens.extend(fields.iter().map(|field| field_owner_token(field)));
+        if let Some(name) = ty.name.as_deref() {
+            match ty.qualifier.as_deref() {
+                None => {
+                    if let Some(fields) = self.field_owner_direct_names.get(name) {
+                        tokens.extend(fields.iter().map(|field| field_owner_token(field)));
+                    }
+                }
+                Some(qualifier) => {
+                    if let Some(fields) = self
+                        .field_owner_namespace_names
+                        .get(qualifier)
+                        .and_then(|owners| owners.get(name))
+                    {
+                        tokens.extend(fields.iter().map(|field| field_owner_token(field)));
+                    }
+                }
+            }
         }
         tokens.sort();
         tokens.dedup();
         tokens
+    }
+}
+
+fn merge_field_owner_names(
+    target: &mut HashMap<String, HashSet<String>>,
+    source: &HashMap<String, HashSet<String>>,
+) {
+    for (owner, fields) in source {
+        target
+            .entry(owner.clone())
+            .or_default()
+            .extend(fields.iter().cloned());
     }
 }
 
