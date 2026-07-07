@@ -1164,3 +1164,194 @@ public class Workflow
 
     assert_timing_summary("milestone_6_csharp_partial_interfaces", &timings, 17);
 }
+
+#[test]
+fn milestone_7_cpp_typed_receivers_out_of_line_click_around() {
+    let fixture = ClickFixture::new("milestone_7_cpp_typed_receivers")
+        .file(
+            "include/model.h",
+            r#"#pragma once
+
+namespace core {
+
+struct Base {
+    int <base_id_decl>id;
+    void <base_tick_decl>tick();
+};
+
+struct Derived : Base {
+    int <derived_id_decl>id;
+    void <derived_tick_decl>tick();
+    void <derived_helper_decl>helper();
+};
+
+struct Other {
+    int <other_id_decl>id;
+    void <other_tick_decl>tick();
+};
+
+Derived <make_derived_decl>makeDerived();
+
+}
+"#,
+        )
+        .file(
+            "src/model.cpp",
+            r#"#include "model.h"
+
+namespace core {
+
+void <base_tick_out_of_line_ref>Base::<base_tick_def>tick() {}
+
+void <derived_tick_out_of_line_ref>Derived::<derived_tick_def>tick() {}
+
+void Derived::<derived_helper_def>helper() {
+    <bare_id_in_member>id = 1;
+}
+
+void Other::<other_tick_def>tick() {}
+
+Derived <make_derived_def>makeDerived() { return Derived{}; }
+
+}
+"#,
+        )
+        .file(
+            "src/app.cpp",
+            r#"#include "model.h"
+
+using core::Base;
+using core::Derived;
+using core::Other;
+
+void run() {
+    Derived d;
+    d.<derived_tick_call>tick();
+    d.<derived_id_read>id = 2;
+
+    Base b;
+    b.<base_tick_call>tick();
+    b.<base_id_read>id = 3;
+
+    Base* bp = &d;
+    bp-><base_ptr_tick_call>tick();
+
+    Other other;
+    other.<other_tick_call>tick();
+    other.<other_id_read>id = 4;
+
+    Derived made = <make_derived_qualified_call>core::<make_derived_call>makeDerived();
+    made.<made_tick_call>tick();
+
+    int id = 0;
+    <local_id_read>id++;
+}
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "derived receiver resolves to out-of-line method",
+                "derived_tick_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["derived_tick_decl", "derived_tick_def"]),
+            ),
+            ClickCase::new(
+                "base receiver resolves to base out-of-line method",
+                "base_tick_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["base_tick_decl", "base_tick_def"]),
+            ),
+            ClickCase::new(
+                "base pointer receiver resolves to base method",
+                "base_ptr_tick_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["base_tick_decl", "base_tick_def"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name method resolves to unrelated owner",
+                "other_tick_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_tick_decl", "other_tick_def"]),
+            ),
+            ClickCase::new(
+                "derived field shadows base field for derived receiver",
+                "derived_id_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["derived_id_decl"]),
+            ),
+            ClickCase::new(
+                "base field remains available for base receiver",
+                "base_id_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["base_id_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name field resolves to unrelated owner",
+                "other_id_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_id_decl"]),
+            ),
+            ClickCase::new(
+                "bare member field in out-of-line method resolves to class field",
+                "bare_id_in_member",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["derived_id_decl"]),
+            ),
+            ClickCase::new(
+                "factory call resolves to out-of-line free function",
+                "make_derived_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["make_derived_decl", "make_derived_def"]),
+            ),
+            ClickCase::new(
+                "typed factory result receiver resolves to derived method",
+                "made_tick_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["derived_tick_decl", "derived_tick_def"]),
+            ),
+            ClickCase::new(
+                "free function declaration references call site",
+                "make_derived_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["make_derived_qualified_call", "make_derived_def"]),
+            ),
+            ClickCase::new(
+                "derived method declaration references out-of-line definition and typed calls",
+                "derived_tick_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&[
+                    "derived_tick_out_of_line_ref",
+                    "derived_tick_call",
+                    "made_tick_call",
+                ]),
+            ),
+            ClickCase::new(
+                "base method declaration references out-of-line definition and base-typed calls",
+                "base_tick_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&[
+                    "base_tick_out_of_line_ref",
+                    "base_tick_call",
+                    "base_ptr_tick_call",
+                ]),
+            ),
+            ClickCase::new(
+                "local value shadow does not resolve as member field",
+                "local_id_read",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_7_cpp_typed_receivers", &timings, 14);
+}

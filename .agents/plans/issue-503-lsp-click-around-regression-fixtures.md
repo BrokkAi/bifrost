@@ -21,7 +21,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T10:52Z) Milestone 4: added the Scala extension/trait click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted wildcard-import precedence/ambiguity findings, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:03Z) Milestone 5: added the Java interface/implementation/hierarchy click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted wildcard/override coverage findings and the exposed Java method-family reference gap, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:21Z) Milestone 6: added the C# partial/interface click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted syntax/ambiguity/coverage findings, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 7: C++ click-around fixture.
+- [x] (2026-07-07T11:28Z) Milestone 7: added the C++ typed-receiver/out-of-line click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted method-reference coverage finding, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 8: JavaScript click-around fixture.
 - [ ] Milestone 9: TypeScript click-around fixture.
 - [ ] Milestone 10: Python click-around fixture.
@@ -65,6 +65,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 
 - Observation: The first C# definition fix was too broad in two review-visible ways: bare same-owner lookup could treat a named argument label as a member reference, and object initializer labels could resolve through ambiguous imported type owners.
   Evidence: Brokk Guided Review flagged `Configure(Name: value)` inside a class with a `Name` property and `using Alpha; using Beta; new Widget { Name = "x" }` as concrete failure shapes. The final C# regressions assert both return no definition, object initializer syntax detection is shared with the C# graph scanner, and initializer definition now requires exactly one visible owner.
+
+- Observation: C++ out-of-line method references report the definition range at the qualified owner start rather than at the method-name token used by go-to-definition.
+  Evidence: Strengthening the C++ fixture with `Derived::tick` and `Base::tick` references initially failed because references returned the `Derived`/`Base` range in `Derived::tick` and `Base::tick`; the final fixture uses separate reference markers for those LSP ranges while retaining method-name markers for definition lookup.
 
 ## Decision Log
 
@@ -150,6 +153,10 @@ Milestone 6 is complete. The C# fixture now covers partial class properties, obj
 
 Milestone 6 Brokk Guided Review outcome: security/correctness, security, and devops found no blocking issues. Senior-dev and duplication found that same-owner fallback was too broad for named argument labels, inherited override implementation coverage was missing, object-initializer syntax logic was duplicated, and test helper JSON was manually formatted. Architecture found that object initializer definition should not resolve through ambiguous visible type candidates. Accepted fixes add syntax-guarded same-owner lookup, exact-1 owner handling for initializer labels, shared object-initializer label detection with the C# graph scanner, a negative named-argument regression, a negative ambiguous-initializer regression, structured JSON test payloads, and an inherited override implementation LSP click. The suggestion to make C# interface-method references include concrete implementation calls was not adopted for the reason recorded in the Decision Log. Focused C# LSP, C# definition regressions, C# get-definition, object-initializer graph, formatting, and diff checks pass.
 
+Milestone 7 is complete. The C++ fixture now covers typed value and pointer receiver method definitions, base/derived field shadowing, unrelated same-name method and field owners, bare member field lookup inside an out-of-line method body, out-of-line free function definitions, free-function references, out-of-line base/derived method references, and local shadow expected-empty behavior.
+
+Milestone 7 Brokk Guided Review outcome: security, duplication, devops, and architecture found no blocking issues. Senior-dev found that references coverage was too narrow because only the free-function relation was asserted. Accepted fixes add exact references coverage for both derived and base out-of-line methods, including typed value and pointer receiver call sites. C++ field declaration references currently return empty on this LSP path, so field coverage stays focused on precise definition and shadowing behavior in this milestone. Focused C++ LSP, formatting, and diff checks pass.
+
 ## Timing Log
 
 - Milestone 0: Harness and Timing Infrastructure
@@ -214,6 +221,15 @@ Milestone 6 Brokk Guided Review outcome: security/correctness, security, and dev
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_6_csharp --features nlp -- --nocapture` passed in 30.39s real time after waiting on the build lock and recompiling; test execution took 4.38s. Additional focused checks `usages_csharp_graph_test csharp_definition`, `get_definition_test csharp_`, and `usages_csharp_graph_test csharp_graph_object_initializer` passed.
   - Click cases added: 17 LSP click cases plus 2 lower-level C# definition regressions.
   - Slowest fixture/operation: `milestone_6_csharp_partial_interfaces`, case `interface-typed receiver resolves to interface method`, marker `interface_handle_call`, operation `definition`, 40 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 7: C++
+  - Language: C++.
+  - Start: 2026-07-07T11:22Z.
+  - End: 2026-07-07T11:28Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_7_cpp --features nlp -- --nocapture` passed in 6.71s real time after recompiling the changed test; test execution took 3.27s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_7_cpp --features nlp -- --nocapture` passed in 5.24s real time after recompiling the changed test; test execution took 3.18s. `cargo fmt --check` and `git diff --check` also passed.
+  - Click cases added: 14.
+  - Slowest fixture/operation: `milestone_7_cpp_typed_receivers`, case `derived receiver resolves to out-of-line method`, marker `derived_tick_call`, operation `definition`, 53 ms before review and 45 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -302,3 +318,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 5 Guided Review gate.
 Revision note, 2026-07-07 / Codex: Started Milestone 6 and added the C# partial/interface click-around fixture. The pre-review focused C# filter passes, covering partial class properties, object initializer labels, self and typed receiver property references, interface implementations, inherited overrides, unrelated same-name members, type definition for partial types, implementation lookup, and type hierarchy supertypes/subtypes.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 6 Guided Review gate. Accepted review findings narrowed same-owner C# definition lookup to reference-like identifiers, made object initializer labels require one unambiguous visible owner, shared initializer-label syntax detection with the C# graph scanner, added named-argument and ambiguous-initializer regressions, and added inherited override implementation coverage. Focused C# LSP, C# definition, C# get-definition, object-initializer graph, formatting, and diff checks pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 7 and added the C++ typed receiver/out-of-line fixture. The pre-review focused C++ filter passes, covering typed value and pointer receiver method definitions, field definitions with base/derived shadowing, unrelated same-name method and field owners, bare member field lookup inside an out-of-line method body, out-of-line free function definitions, free-function references, and local shadow expected-empty behavior.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 7 Guided Review gate. Accepted review feedback strengthened references coverage for out-of-line C++ base and derived methods, including typed receiver call sites. The final fixture uses separate markers for C++ references ranges at qualified out-of-line definitions, while definition lookups continue to assert method-name ranges. Focused C++ LSP, formatting, and diff checks pass.
