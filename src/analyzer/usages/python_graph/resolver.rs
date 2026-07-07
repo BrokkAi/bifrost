@@ -97,10 +97,37 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
             if !target_self_file {
                 return None;
             }
+            resolve_indexed_receiver_type(analyzer, file, raw_type)
+        })
+}
+
+fn resolve_indexed_receiver_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    raw_type: &str,
+) -> Option<CodeUnit> {
+    let index = analyzer.definition_lookup_index();
+    module_fqn_for_file(analyzer, file)
+        .into_iter()
+        .flat_map(|module| index.types_in_package(&module, raw_type).iter())
+        .chain(index.by_fqn(raw_type).iter())
+        .chain(index.by_normalized_fqn(raw_type).iter())
+        .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
+        .cloned()
+}
+
+fn module_fqn_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<String> {
+    analyzer
+        .get_declarations(file)
+        .into_iter()
+        .find(|code_unit| code_unit.is_module())
+        .map(|code_unit| code_unit.fq_name())
+        .or_else(|| {
             analyzer
-                .get_all_declarations()
+                .get_declarations(file)
                 .into_iter()
-                .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
+                .find(|code_unit| !code_unit.package_name().is_empty())
+                .map(|code_unit| code_unit.package_name().to_string())
         })
 }
 
