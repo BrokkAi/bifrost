@@ -399,7 +399,7 @@ fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-fn enclosing_declared_type(
+pub(super) fn enclosing_declared_type(
     node: Node<'_>,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
@@ -614,8 +614,8 @@ fn resolve_type_fq_name(
     reference: &str,
 ) -> Option<String> {
     let normalized = normalize_type_text(reference);
-    if is_csharp_string_type(&normalized) {
-        return Some(normalized);
+    if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
+        return Some(canonical.to_string());
     }
     if let Some(target) = csharp.resolve_visible_type(file, &normalized) {
         return Some(target.fq_name());
@@ -623,8 +623,34 @@ fn resolve_type_fq_name(
     class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name())
 }
 
-fn is_csharp_string_type(reference: &str) -> bool {
-    reference == "string"
+pub(super) fn type_identity_matches(left: &str, right: &str) -> bool {
+    left == right
+        || canonical_builtin_type_identity(left).is_some_and(|left| {
+            canonical_builtin_type_identity(right).is_some_and(|right| left == right)
+        })
+}
+
+fn canonical_builtin_type_identity(reference: &str) -> Option<&'static str> {
+    match reference.strip_prefix("global::").unwrap_or(reference) {
+        "bool" | "System.Boolean" => Some("System.Boolean"),
+        "byte" | "System.Byte" => Some("System.Byte"),
+        "sbyte" | "System.SByte" => Some("System.SByte"),
+        "char" | "System.Char" => Some("System.Char"),
+        "decimal" | "System.Decimal" => Some("System.Decimal"),
+        "double" | "System.Double" => Some("System.Double"),
+        "float" | "System.Single" => Some("System.Single"),
+        "int" | "System.Int32" => Some("System.Int32"),
+        "uint" | "System.UInt32" => Some("System.UInt32"),
+        "nint" | "System.IntPtr" => Some("System.IntPtr"),
+        "nuint" | "System.UIntPtr" => Some("System.UIntPtr"),
+        "long" | "System.Int64" => Some("System.Int64"),
+        "ulong" | "System.UInt64" => Some("System.UInt64"),
+        "short" | "System.Int16" => Some("System.Int16"),
+        "ushort" | "System.UInt16" => Some("System.UInt16"),
+        "string" | "System.String" => Some("System.String"),
+        "object" | "System.Object" => Some("System.Object"),
+        _ => None,
+    }
 }
 
 pub(in crate::analyzer::usages) fn is_extension_method(
@@ -674,13 +700,19 @@ fn reference_matches_target_fq_name(reference: &str, target: &CodeUnit) -> bool 
 }
 
 pub(super) fn normalize_type_text(reference: &str) -> String {
-    let trimmed = reference.trim();
-    let without_nullable = trimmed.trim_end_matches('?').trim();
-    let without_arrays = without_nullable.trim_end_matches("[]").trim();
-    without_arrays
+    let mut normalized = reference.trim();
+    loop {
+        let without_nullable = normalized.trim_end_matches('?').trim();
+        let without_arrays = without_nullable.trim_end_matches("[]").trim();
+        if without_arrays == normalized {
+            break;
+        }
+        normalized = without_arrays;
+    }
+    normalized
         .split('<')
         .next()
-        .unwrap_or(without_arrays)
+        .unwrap_or(normalized)
         .trim()
         .to_string()
 }

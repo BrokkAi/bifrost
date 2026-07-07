@@ -21,7 +21,7 @@ The user-level directive shaping this plan: fix causes at the level of the gener
 - [x] (2026-07-07) Root causes for all three modes confirmed with failing repro tests (see Context; patches in `.agents/docs/issue-528-repro-tests/`).
 - [x] (2026-07-07) The shared-usage-index refactor merged into master (`9de316e`) after root-causing; all root-cause anchors re-verified present on merged master (line shifts only — Go `resolver.rs:1426` and `:1692`, C# `resolver.rs:611/:626`; Rust and hint sites unchanged).
 - [x] (2026-07-07 16:34Z) Stage 1 (Go receiver-fact contract): qualified field types resolve through import edges; field-owner facts cross packages.
-- [ ] Stage 2 (C# type-identity contract): canonical builtin-type table replaces the `string` special case; unqualified same-class calls get structural proof.
+- [x] (2026-07-07 16:42Z) Stage 2 (C# type-identity contract): canonical builtin-type table replaces the `string` special case; unqualified same-class calls get structural proof.
 - [ ] Stage 3 (Rust seeding contract): local-declaration scan seeds + impl-target canonicalization.
 - [ ] Stage 4 (proof-tier result model): `UsageProof` tier, unproven sites through `FuzzyResult::Success`, `verified_absent` in scan_usages summaries; C#/Go/Rust emit unproven candidates.
 - [ ] Stage 5 (hint contract): hints context-derived; location-anchored queries never re-suggest `targets`.
@@ -35,6 +35,10 @@ The user-level directive shaping this plan: fix causes at the level of the gener
   Evidence: Before the fix, `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_go_graph_test -- imported_interface` ran 2 tests and both failed with `expected imported interface field hit: {}`. After the fix, the same command ran 2 tests and both passed.
 - Observation: `src/analyzer/usages/go_graph/inverted.rs` did not contain the forward resolver's qualifier rejection for type references; its `FileScan::type_tokens` already resolves `qualified_type` and `selector_expression` qualifiers through `GoEdgeIndex::namespace_packages`.
   Evidence: Stage 1 inspection found `type_tokens` mapping `Some(qualifier)` through `alias_packages` to canonical package prefixes before building `{package}.{name}` tokens, so no inverted-edge change was needed for this stage.
+- Observation: Stage 2's two C# primitive receiver repro tests still failed on merged master before the fix, then both passed after builtin type identity canonicalization.
+  Evidence: Before the fix, `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_csharp_graph_test -- primitive` ran 2 tests and both failed, one with `No relevant usages found for symbol: NzbDrone.Common.Extensions.NumberExtensions.SizeSuffix` and one with `CSharpUsageGraphStrategy: no proven structured hits`. After the fix, the same command ran 2 tests and both passed.
+- Observation: Adding `object` to the builtin table changed two existing C# tests from unsafe-inference failures to successful empty results, because `object` receivers are now known `System.Object` nonmatches rather than untyped receivers.
+  Evidence: The first full `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_csharp_graph_test` run after Stage 2 implementation failed only `csharp_graph_fails_when_inner_block_shadows_typed_receiver` and `csharp_graph_avoids_unrelated_same_name_symbols_and_fails_on_unsupported_receivers`; both old assertions expected `FuzzyResult::Failure`. Updating them to assert empty success yielded 48/48 passing tests.
 
 (Add entries as implementation proceeds.)
 
@@ -69,6 +73,15 @@ The user-level directive shaping this plan: fix causes at the level of the gener
   Date/Author: 2026-07-07 / Codex.
 - Decision (D10): `type_ref_matches_compatible_receiver` now resolves package-qualified field types by matching the qualifier against namespace import edges for compatible receiver-type seeds, with a direct `(file, type)` seed fallback only when the existing export-seed helper cannot produce a seed.
   Rationale: the receiver-fact contract should be independent of textual package-name matching and should reuse the Go import graph that already understands package clauses, aliases, module paths, and local workspace resolution.
+  Date/Author: 2026-07-07 / Codex.
+- Decision (D11): C# builtin type identities canonicalize to their CLR `System.*` names in the usages pipeline; for example `long` and `System.Int64` both become `System.Int64`, and `string` and `System.String` both become `System.String`.
+  Rationale: a single canonical spelling keeps receiver bindings, extension-method target receiver types, and receiver-target matching on one equality contract. The table remains in `src/analyzer/usages/csharp_graph/resolver.rs`; `CSharpAnalyzer::resolve_visible_type` was not widened because builtins have no project `CodeUnit`.
+  Date/Author: 2026-07-07 / Codex.
+- Decision (D12): Same-class unqualified method invocations are proven only when the AST enclosing type resolves to the target owner's same `CodeUnit` and the invocation argument count matches the target arity.
+  Rationale: this proves ordinary `Run();` calls inside the declaring class without claiming cross-class `using static` imports, and it preserves the existing self-hit filter for recursive calls inside the target method body.
+  Date/Author: 2026-07-07 / Codex.
+- Decision (D13): Update the old unqualified-call fallback test to assert the new proven hit, and update two `object` receiver tests to assert successful empty results rather than fallback.
+  Rationale: the unqualified-call test documented the old Stage 1 behavior and is superseded by Stage 2's same-class proof. The `object` tests changed because builtin canonicalization turns `object` into a known `System.Object` receiver, which can safely disprove `Target.Run`/`Alpha.Target.Run` instead of forcing an unsafe-inference failure.
   Date/Author: 2026-07-07 / Codex.
 
 ## Outcomes & Retrospective
@@ -229,3 +242,5 @@ In `src/searchtools.rs`: `usage_failure_hint` takes the query's anchoring contex
 Revision note (2026-07-07, Claude): initial plan authored from the verified root-cause investigation of issue #528 items 1-3 and the design discussion with Jonathan settling the proven/unproven/failure taxonomy. A first draft of this file wrongly pre-filled the living sections with hypothetical completed-stage entries; this revision resets Progress/Surprises/Outcomes to the true pre-implementation state and re-anchors code references after the shared-usage-index refactor merge (`9de316e`).
 
 Revision note (2026-07-07, Codex): Stage 1 implementation completed and the living sections were updated with the failed-before/passed-after Go repro evidence, the `inverted.rs` inspection result, and the import-edge field-owner fact decisions.
+
+Revision note (2026-07-07, Codex): Stage 2 implementation completed and the living sections were updated with failed-before/passed-after C# primitive receiver evidence, the builtin `object` test expectation changes, and decisions for canonical builtin type identity plus same-class unqualified call proof.

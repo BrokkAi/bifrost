@@ -1,10 +1,11 @@
 use crate::analyzer::csharp_normalize_full_name;
 use crate::analyzer::usages::csharp_graph::hits::push_hit;
 use crate::analyzer::usages::csharp_graph::resolver::{
-    TargetKind, TargetSpec, argument_count, binding_scope_node, expression_resolves_to_type,
-    first_type_child, is_type_reference_node, member_name_is_locally_bound, node_text,
-    normalize_type_text, object_initializer_for_label, receiver_targets_owner, reference_type_text,
-    resolves_to_target, same_node, seed_visible_bindings_at, unqualified_member_resolves_to_owner,
+    TargetKind, TargetSpec, argument_count, binding_scope_node, enclosing_declared_type,
+    expression_resolves_to_type, first_type_child, is_type_reference_node,
+    member_name_is_locally_bound, node_text, normalize_type_text, object_initializer_for_label,
+    receiver_targets_owner, reference_type_text, resolves_to_target, same_node,
+    seed_visible_bindings_at, type_identity_matches, unqualified_member_resolves_to_owner,
 };
 use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -264,7 +265,7 @@ fn extension_receiver_type_matches(
     let Some(extension_receiver_type) = extension_receiver_type else {
         return false;
     };
-    if receiver_type == extension_receiver_type {
+    if type_identity_matches(receiver_type, extension_receiver_type) {
         return true;
     }
     let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
@@ -314,7 +315,11 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .parent()
                 .is_some_and(|parent| parent.kind() == "invocation_expression") =>
         {
-            *ctx.saw_unproven_match = true;
+            if unqualified_method_call_resolves_to_owner(node, ctx) {
+                push_hit(node, ctx);
+            } else {
+                *ctx.saw_unproven_match = true;
+            }
         }
         TargetKind::Field if !is_type_reference_node(node) => {
             // `nameof(Field)` is a compile-time string, not a member reference.
@@ -364,6 +369,24 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         _ => {}
     }
+}
+
+fn unqualified_method_call_resolves_to_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(invocation) = node.parent() else {
+        return false;
+    };
+    if invocation.kind() != "invocation_expression" {
+        return false;
+    }
+    if ctx
+        .spec
+        .method_arity
+        .is_some_and(|arity| argument_count(invocation, ctx.source) != arity)
+    {
+        return false;
+    }
+    enclosing_declared_type(node, ctx.csharp, ctx.file, ctx.source)
+        .is_some_and(|enclosing| enclosing == ctx.spec.owner)
 }
 
 enum LabelOwnerResolution {

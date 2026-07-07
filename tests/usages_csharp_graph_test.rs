@@ -920,7 +920,7 @@ namespace App {
 }
 
 #[test]
-fn csharp_graph_fails_when_inner_block_shadows_typed_receiver() {
+fn csharp_graph_skips_inner_builtin_shadow_of_typed_receiver() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
             "Domain/Target.cs",
@@ -954,9 +954,12 @@ namespace App {
         1000,
     );
 
+    let hits = result
+        .into_either()
+        .expect("builtin object shadow should be a known nonmatching receiver");
     assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "an inner unresolved declaration should shadow the typed receiver conservatively"
+        hits.is_empty(),
+        "inner object local should disprove, not prove, the Target.Run receiver"
     );
 }
 
@@ -1000,8 +1003,8 @@ namespace App {
 }
 
 #[test]
-fn csharp_graph_fails_on_unqualified_member_calls_for_fallback() {
-    let (_project, analyzer) = csharp_analyzer_with_files(&[(
+fn csharp_graph_finds_unqualified_same_class_member_calls() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
         "Domain/Target.cs",
         r#"
 namespace Domain {
@@ -1024,10 +1027,13 @@ namespace Domain {
         1000,
     );
 
-    assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "unqualified member calls are unsupported in v1 and should fall back"
-    );
+    let hits = result
+        .into_either()
+        .unwrap_or_else(|err| panic!("same-class unqualified call should resolve: {err}"));
+    assert_eq!(1, hits.len());
+    assert!(hits.iter().any(|hit| {
+        hit.file == project.file("Domain/Target.cs") && hit.snippet.contains("Run();")
+    }));
 }
 
 #[test]
@@ -1371,7 +1377,7 @@ namespace App {
 }
 
 #[test]
-fn csharp_graph_avoids_unrelated_same_name_symbols_and_fails_on_unsupported_receivers() {
+fn csharp_graph_avoids_unrelated_same_name_symbols_and_builtin_nonmatching_receivers() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
             "Alpha/Target.cs",
@@ -1423,9 +1429,12 @@ namespace App {
         &candidates,
         1000,
     );
+    let alpha_run_hits = alpha_run_result
+        .into_either()
+        .expect("builtin object receiver should be a known nonmatch");
     assert!(
-        matches!(alpha_run_result, FuzzyResult::Failure { .. }),
-        "unsupported same-name member receiver should fail so UsageFinder can fall back"
+        alpha_run_hits.is_empty(),
+        "Beta.Target and object receivers should not count as Alpha.Target.Run usages"
     );
 }
 
@@ -2021,5 +2030,120 @@ public sealed class Consumer
             hit.file == project.file("src/Consumers.cs") && hit.snippet.contains("record.Name")
         }),
         "typed external receiver should resolve to EventRecord.Name: {hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_graph_should_find_extension_method_on_primitive_long_receiver() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
+            r#"
+namespace NzbDrone.Common.Extensions
+{
+    public static class NumberExtensions
+    {
+        public static string SizeSuffix(this long bytes)
+        {
+            if (bytes < 0) { return "-" + SizeSuffix(-bytes); }
+            return bytes.ToString();
+        }
+    }
+}
+"#,
+        ),
+        (
+            "src/NzbDrone.Core/Consumer.cs",
+            r#"
+using NzbDrone.Common.Extensions;
+
+namespace NzbDrone.Core
+{
+    public class Consumer
+    {
+        public string Render(long size)
+        {
+            return size.SizeSuffix();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let size_suffix = member_function(
+        &analyzer,
+        "NzbDrone.Common.Extensions.NumberExtensions",
+        "SizeSuffix",
+    );
+    let hits = graph_hits(&analyzer, &size_suffix);
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/NzbDrone.Core/Consumer.cs")
+                && hit.snippet.contains("size.SizeSuffix()")
+        }),
+        "long receiver extension call should resolve to NumberExtensions.SizeSuffix: {hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_scan_usages_target_anchor_should_find_primitive_extension_receiver_usage() {
+    let (project, _analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
+            r#"
+namespace NzbDrone.Common.Extensions
+{
+    public static class NumberExtensions
+    {
+        public static string SizeSuffix(this long bytes)
+        {
+            if (bytes < 0) { return "-" + SizeSuffix(-bytes); }
+            return bytes.ToString();
+        }
+    }
+}
+"#,
+        ),
+        (
+            "src/NzbDrone.Core/Consumer.cs",
+            r#"
+using NzbDrone.Common.Extensions;
+
+namespace NzbDrone.Core
+{
+    public class Consumer
+    {
+        public string Render(long size)
+        {
+            return size.SizeSuffix();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let result = call_search_tool_json(
+        project.root(),
+        "scan_usages",
+        &json!({
+            "targets": [{
+                "path": "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
+                "line": 6
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        0,
+        result["failures"].as_array().map_or(0, Vec::len),
+        "{result}"
+    );
+    assert!(
+        result["summary"]["total_hits"].as_u64().unwrap_or_default() > 0,
+        "definition-site target selector should recover primitive extension usage: {result}"
     );
 }
