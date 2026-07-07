@@ -55,6 +55,14 @@ export default defineConfig({
             { label: 'Helix', slug: 'helix' },
           ],
         },
+        {
+          label: 'Code Querying',
+          items: [
+            { label: 'Overview', slug: 'code-querying' },
+            { label: 'Rune Query Language', slug: 'search-ast-repl' },
+            { label: 'JSON AstQuery', slug: 'search-ast-json' },
+          ],
+        },
       ],
     }),
   ],

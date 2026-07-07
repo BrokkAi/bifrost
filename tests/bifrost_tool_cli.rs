@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use git2::{Repository, Signature};
 use serde_json::Value;
@@ -92,10 +93,11 @@ fn search_ast_repl_accepts_piped_sexp_commands() {
         .spawn()
         .expect("spawn bifrost --repl");
     {
-        let stdin = child.stdin.as_mut().expect("stdin");
+        let mut stdin = child.stdin.take().expect("stdin");
         stdin
             .write_all(
-                br#"(class :name "A")
+                br#"(class
+  :name "A")
 :validate
 :json
 :run
@@ -104,7 +106,7 @@ fn search_ast_repl_accepts_piped_sexp_commands() {
             )
             .expect("write repl input");
     }
-    let output = child.wait_with_output().expect("wait for repl");
+    let output = wait_with_output(child, Duration::from_secs(30));
 
     assert!(
         output.status.success(),
@@ -118,6 +120,26 @@ fn search_ast_repl_accepts_piped_sexp_commands() {
     assert!(stdout.contains("  kind: class"), "{stdout}");
     assert!(stdout.contains("  symbol: A"), "{stdout}");
     assert!(stdout.contains("  code: `public class A {"), "{stdout}");
+}
+
+fn wait_with_output(mut child: std::process::Child, timeout: Duration) -> std::process::Output {
+    let started = Instant::now();
+    loop {
+        match child.try_wait().expect("poll child") {
+            Some(_) => return child.wait_with_output().expect("wait for child output"),
+            None if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("wait after killing child");
+                panic!(
+                    "child timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
+                    timeout,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 #[test]
@@ -494,7 +516,7 @@ fn tool_cannot_be_combined_with_mcp() {
     assert!(!output.status.success(), "status should fail");
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
-        stderr.contains("--tool cannot be combined with --mcp or --lsp"),
+        stderr.contains("--tool cannot be combined with --mcp, --lsp, or --repl"),
         "{stderr}"
     );
 }

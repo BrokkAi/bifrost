@@ -222,6 +222,16 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             insert_unique(&mut query, "limit", number_value(&items[1], "limit")?)?;
             Ok(Some(Value::Object(query)))
         }
+        "result-detail" | "result_detail" => {
+            expect_len(items, 3, head)?;
+            let mut query = query_object(&items[2])?;
+            insert_unique(
+                &mut query,
+                "result_detail",
+                Value::String(result_detail_arg(&items[1])?),
+            )?;
+            Ok(Some(Value::Object(query)))
+        }
         "inside" | "not-inside" => {
             expect_len(items, 3, head)?;
             let mut query = query_object(&items[2])?;
@@ -340,11 +350,6 @@ fn insert_keyword(object: &mut Map<String, Value>, key: &str, value: &Expr) -> R
         "not-kind" | "not_kind" => insert_unique(object, "not_kind", kind_value(value)?),
         "has" => insert_unique(object, "has", pattern_to_json(value)?),
         "not-has" | "not_has" => insert_unique(object, "not_has", pattern_to_json(value)?),
-        "result-detail" | "result_detail" => insert_unique(
-            object,
-            "result_detail",
-            Value::String(result_detail_arg(value)?),
-        ),
         role_label => {
             let Some(role) = Role::from_label(role_label) else {
                 return Err(format!("unknown pattern field `:{key}`"));
@@ -554,6 +559,27 @@ mod tests {
                 "limit": 25,
                 "match": { "kind": "call", "callee": { "name": "eval" } }
             }))
+        );
+    }
+
+    #[test]
+    fn structural_query_sexp_lowers_result_detail_wrapper() {
+        assert_eq!(
+            canonical(r#"(result-detail full (call :callee (name "eval")))"#),
+            canonical_json(json!({
+                "result_detail": "full",
+                "match": { "kind": "call", "callee": { "name": "eval" } }
+            }))
+        );
+    }
+
+    #[test]
+    fn structural_query_sexp_rejects_result_detail_as_pattern_field() {
+        let error =
+            AstQuery::from_sexp(r#"(call :callee (name "eval") :result-detail full)"#).unwrap_err();
+        assert!(
+            error.contains("unknown pattern field `:result-detail`"),
+            "{error}"
         );
     }
 

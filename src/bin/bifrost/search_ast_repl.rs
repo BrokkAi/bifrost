@@ -1,5 +1,4 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
-use brokk_bifrost::analyzer::structural::query::sexp::sexp_to_json;
 use brokk_bifrost::analyzer::structural::{
     AstQuery, Pattern, SearchAstMatch, SearchAstOutput, StringPredicate,
 };
@@ -79,6 +78,10 @@ const FORMS: &[MetadataEntry] = &[
     MetadataEntry::new("where", "Wrapper: (where \"src/**/*.py\" query)."),
     MetadataEntry::new("language", "Wrapper: (language python query)."),
     MetadataEntry::new("limit", "Wrapper: (limit 25 query)."),
+    MetadataEntry::new(
+        "result-detail",
+        "Wrapper: (result-detail full query), choosing compact or full output.",
+    ),
     MetadataEntry::new("inside", "Wrapper: (inside container query)."),
     MetadataEntry::new("not-inside", "Wrapper: (not-inside container query)."),
 ];
@@ -198,7 +201,10 @@ impl ReplSession {
                 self.current_query = Some(value.clone());
                 (ReplFlow::Continue, loaded_query_text(&value))
             }
-            Err(error) => (ReplFlow::Continue, format!("error: {error}")),
+            Err(error) => (
+                ReplFlow::Continue,
+                format!("error: {}", sanitize_terminal_text(&error)),
+            ),
         }
     }
 
@@ -230,7 +236,11 @@ impl ReplSession {
                 },
                 None => (
                     ReplFlow::Continue,
-                    format!("unknown example `{}`\n\n{}", rest.trim(), examples_text()),
+                    format!(
+                        "unknown example `{}`\n\n{}",
+                        sanitize_terminal_text(rest.trim()),
+                        examples_text()
+                    ),
                 ),
             },
             ":kinds" => (ReplFlow::Continue, kinds_text()),
@@ -243,7 +253,10 @@ impl ReplSession {
             ":validate" => match self.current_query.as_ref() {
                 Some(value) => match AstQuery::from_json(value) {
                     Ok(_) => (ReplFlow::Continue, "Query is valid.".to_string()),
-                    Err(error) => (ReplFlow::Continue, format!("error: {error}")),
+                    Err(error) => (
+                        ReplFlow::Continue,
+                        format!("error: {}", sanitize_terminal_text(&error.to_string())),
+                    ),
                 },
                 None => (ReplFlow::Continue, "No current query.".to_string()),
             },
@@ -265,7 +278,11 @@ impl ReplSession {
             ":quit" | ":exit" => (ReplFlow::Quit, "bye".to_string()),
             other => (
                 ReplFlow::Continue,
-                format!("unknown command `{other}`\n\n{}", help_text()),
+                format!(
+                    "unknown command `{}`\n\n{}",
+                    sanitize_terminal_text(other),
+                    help_text()
+                ),
             ),
         }
     }
@@ -281,15 +298,38 @@ pub fn run_search_ast_repl(root: PathBuf) -> Result<(), String> {
     let canonical_root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
-    let service = SearchToolsService::new_without_semantic_index(canonical_root)?;
+    let mut service = LazySearchService::new(canonical_root);
     if io::stdin().is_terminal() {
-        run_interactive(&service)
+        run_interactive(&mut service)
     } else {
-        run_scripted(&service)
+        run_scripted(&mut service)
     }
 }
 
-fn run_interactive(service: &SearchToolsService) -> Result<(), String> {
+struct LazySearchService {
+    root: PathBuf,
+    service: Option<SearchToolsService>,
+}
+
+impl LazySearchService {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            service: None,
+        }
+    }
+
+    fn get_or_init(&mut self) -> Result<&SearchToolsService, String> {
+        if self.service.is_none() {
+            self.service = Some(SearchToolsService::new_without_semantic_index(
+                self.root.clone(),
+            )?);
+        }
+        Ok(self.service.as_ref().expect("service initialized"))
+    }
+}
+
+fn run_interactive(service: &mut LazySearchService) -> Result<(), String> {
     let mut line_editor = configured_reedline();
     let prompt = DefaultPrompt::default();
     let mut session = ReplSession::with_color(should_colorize_repl());
@@ -299,7 +339,7 @@ fn run_interactive(service: &SearchToolsService) -> Result<(), String> {
         match line_editor.read_line(&prompt) {
             Ok(Signal::Success(line)) => {
                 ctrl_c_quit.reset();
-                let (flow, output) = session.process_line(&line, Some(service));
+                let (flow, output) = process_line_with_lazy_service(&mut session, &line, service)?;
                 if !output.is_empty() {
                     println!("{output}");
                 }
@@ -322,13 +362,17 @@ fn run_interactive(service: &SearchToolsService) -> Result<(), String> {
     }
 }
 
-fn run_scripted(service: &SearchToolsService) -> Result<(), String> {
+fn run_scripted(service: &mut LazySearchService) -> Result<(), String> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut session = ReplSession::new();
+    let mut pending_query = String::new();
     for line in stdin.lock().lines() {
         let line = line.map_err(|err| format!("Failed to read REPL input: {err}"))?;
-        let (flow, output) = session.process_line(&line, Some(service));
+        let Some(input) = accumulate_scripted_input(&mut pending_query, &line) else {
+            continue;
+        };
+        let (flow, output) = process_line_with_lazy_service(&mut session, &input, service)?;
         if !output.is_empty() {
             writeln!(stdout, "{output}").map_err(|err| format!("Failed to write output: {err}"))?;
         }
@@ -336,7 +380,45 @@ fn run_scripted(service: &SearchToolsService) -> Result<(), String> {
             break;
         }
     }
+    if !pending_query.trim().is_empty() {
+        let (flow, output) =
+            process_line_with_lazy_service(&mut session, pending_query.trim(), service)?;
+        if !output.is_empty() {
+            writeln!(stdout, "{output}").map_err(|err| format!("Failed to write output: {err}"))?;
+        }
+        if flow == ReplFlow::Quit {
+            return Ok(());
+        }
+    }
     Ok(())
+}
+
+fn process_line_with_lazy_service(
+    session: &mut ReplSession,
+    line: &str,
+    service: &mut LazySearchService,
+) -> Result<(ReplFlow, String), String> {
+    if line.trim_start().starts_with(":run") {
+        let service = service.get_or_init()?;
+        Ok(session.process_line(line, Some(service)))
+    } else {
+        Ok(session.process_line(line, None))
+    }
+}
+
+fn accumulate_scripted_input(pending_query: &mut String, line: &str) -> Option<String> {
+    if pending_query.is_empty() && line.trim_start().starts_with(':') {
+        return Some(line.to_string());
+    }
+    if !pending_query.is_empty() {
+        pending_query.push('\n');
+    }
+    pending_query.push_str(line);
+    if balanced_delimiters(pending_query) {
+        Some(std::mem::take(pending_query))
+    } else {
+        None
+    }
 }
 
 fn configured_reedline() -> Reedline {
@@ -411,14 +493,15 @@ fn ensure_private_history_file(path: &PathBuf) -> io::Result<()> {
 }
 
 fn parse_query_input(line: &str) -> Result<Value, String> {
-    let value = if line.trim_start().starts_with('{') {
-        serde_json::from_str(line).map_err(|error| format!("invalid JSON query: {error}"))?
+    if line.trim_start().starts_with('{') {
+        let value =
+            serde_json::from_str(line).map_err(|error| format!("invalid JSON query: {error}"))?;
+        AstQuery::from_json(&value)
+            .map(|query| query.to_canonical_json())
+            .map_err(|error| error.to_string())
     } else {
-        sexp_to_json(line)?
-    };
-    AstQuery::from_json(&value)
-        .map(|query| query.to_canonical_json())
-        .map_err(|error| error.to_string())
+        AstQuery::from_sexp(line).map(|query| query.to_canonical_json())
+    }
 }
 
 fn should_colorize_repl() -> bool {
@@ -431,7 +514,7 @@ fn loaded_query_text(value: &Value) -> String {
             "Loaded {}.\nUse :run to execute it, or :json to inspect canonical JSON.",
             query_summary_text(&query)
         ),
-        Err(error) => format!("error: {error}"),
+        Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
     }
 }
 
@@ -439,7 +522,7 @@ fn canonical_json_text(value: &Value) -> String {
     match AstQuery::from_json(value) {
         Ok(query) => serde_json::to_string_pretty(&query.to_canonical_json())
             .unwrap_or_else(|error| format!("error: failed to render canonical JSON: {error}")),
-        Err(error) => format!("error: {error}"),
+        Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
     }
 }
 
@@ -449,7 +532,7 @@ fn query_summary_text(query: &AstQuery) -> String {
         let globs = query
             .where_globs
             .iter()
-            .map(|glob| format!("\"{}\"", glob.as_str()))
+            .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
             .collect::<Vec<_>>()
             .join(", ");
         parts.push(format!("where {globs}"));
@@ -495,7 +578,7 @@ fn pattern_summary(pattern: &Pattern) -> String {
         parts.push(predicate_summary("text", predicate));
     }
     if let Some(capture) = &pattern.capture {
-        parts.push(format!("capture \"{capture}\""));
+        parts.push(format!("capture \"{}\"", sanitize_terminal_text(capture)));
     }
     if !pattern.not_kinds.is_empty() {
         parts.push(format!(
@@ -513,15 +596,19 @@ fn pattern_summary(pattern: &Pattern) -> String {
 
 fn predicate_summary(field: &str, predicate: &StringPredicate) -> String {
     match predicate {
-        StringPredicate::Exact(value) => format!("{field} \"{value}\""),
-        StringPredicate::Regex(regex) => format!("{field} /{}/", regex.as_str()),
+        StringPredicate::Exact(value) => {
+            format!("{field} \"{}\"", sanitize_terminal_text(value))
+        }
+        StringPredicate::Regex(regex) => {
+            format!("{field} /{}/", sanitize_terminal_text(regex.as_str()))
+        }
     }
 }
 
 fn run_query(service: &SearchToolsService, value: &Value, use_color: bool) -> String {
     match service.search_ast_output(value.clone()) {
         Ok(output) => render_search_ast_repl_output(&output, use_color),
-        Err(error) => format!("error: {error}"),
+        Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
     }
 }
 
@@ -530,16 +617,7 @@ fn render_search_ast_repl_output(output: &SearchAstOutput, use_color: bool) -> S
     if output.matches.is_empty() {
         out.push_str("No structural matches.\n");
     } else {
-        out.push_str(&format!(
-            "{} match{}{}\n",
-            output.matches.len(),
-            if output.matches.len() == 1 { "" } else { "es" },
-            if output.truncated {
-                " (truncated; refine the query or raise limit)"
-            } else {
-                ""
-            },
-        ));
+        out.push_str(&format!("{}\n", output.match_count_line()));
         for matched in &output.matches {
             out.push('\n');
             render_search_ast_match(&mut out, matched, use_color);
@@ -560,11 +638,7 @@ fn render_search_ast_match(out: &mut String, matched: &SearchAstMatch, use_color
     let path = sanitize_terminal_text(&matched.path);
     let kind = sanitize_terminal_text(matched.kind);
     let text = sanitize_terminal_text(&matched.text);
-    let lines = if matched.start_line == matched.end_line {
-        matched.start_line.to_string()
-    } else {
-        format!("{}-{}", matched.start_line, matched.end_line)
-    };
+    let lines = matched.line_span_label();
 
     out.push_str(&format!(
         "{}:{}\n",
@@ -912,6 +986,17 @@ mod tests {
     }
 
     #[test]
+    fn search_ast_repl_sanitizes_loaded_query_summary() {
+        let mut session = ReplSession::new();
+        let (_flow, output) =
+            session.process_line(r#"(function :name "\u001b]52;c;secret\u0007")"#, None);
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+        assert!(!output.contains('\u{07}'), "{output:?}");
+        assert!(output.contains("\\x1b"), "{output}");
+        assert!(output.contains("\\x07"), "{output}");
+    }
+
+    #[test]
     fn search_ast_repl_validates_current_query() {
         let mut session = ReplSession::new();
         session.process_line(r#"(call :callee (name "eval"))"#, None);
@@ -969,6 +1054,20 @@ mod tests {
             validator.validate(r#"(call :callee (name "eval"))"#),
             ValidationResult::Complete
         ));
+    }
+
+    #[test]
+    fn search_ast_repl_accumulates_scripted_multiline_queries() {
+        let mut pending = String::new();
+        assert_eq!(accumulate_scripted_input(&mut pending, "(class"), None);
+        assert_eq!(
+            accumulate_scripted_input(&mut pending, r#"  :name "A")"#),
+            Some("(class\n  :name \"A\")".to_string())
+        );
+        assert_eq!(
+            accumulate_scripted_input(&mut pending, ":validate"),
+            Some(":validate".to_string())
+        );
     }
 
     #[test]

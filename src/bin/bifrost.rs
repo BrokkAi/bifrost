@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[path = "../search_ast_repl.rs"]
+#[path = "bifrost/search_ast_repl.rs"]
 mod search_ast_repl;
 
 use brokk_bifrost::ToolOutput;
