@@ -647,13 +647,6 @@ fn analyze_candidate(
         .into_iter()
         .filter(|hit| hit.enclosing != *candidate)
         .collect();
-    if language == Language::Scala && candidate.is_field() && non_self_hits.is_empty() {
-        skipped.push(format!(
-            "`{}`: Scala field usage evidence was inconclusive; precise field reads are not reported as dead code in this bulk slice",
-            candidate.fq_name()
-        ));
-        return None;
-    }
     if non_self_hits.len() > 1 {
         return None;
     }
@@ -665,6 +658,13 @@ fn analyze_candidate(
         .iter()
         .filter(|hit| is_external_usage(analyzer, &defining_owner, hit))
         .collect();
+    if language == Language::Scala && candidate.is_field() && external_hits.is_empty() {
+        skipped.push(format!(
+            "`{}`: Scala field usage evidence was inconclusive; precise field reads are not reported as dead code in this bulk slice",
+            candidate.fq_name()
+        ));
+        return None;
+    }
 
     let declaration_lines = span_lines(&range);
     let score = if non_self_hits.is_empty() {

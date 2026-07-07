@@ -939,6 +939,9 @@ fn record_receiver_member(
     property_text: &str,
     ctx: &mut TsScan<'_, '_>,
 ) -> bool {
+    if object.kind() == "this" {
+        return true;
+    }
     match ctx.receiver_provider.resolve_member_targets(
         object,
         property_text,
@@ -965,6 +968,9 @@ fn record_scoped_receiver_member(
     property_text: &str,
     ctx: &mut ScopedTsScan<'_, '_>,
 ) -> bool {
+    if object.kind() == "this" {
+        return true;
+    }
     match ctx.receiver_provider.resolve_member_targets(
         object,
         property_text,

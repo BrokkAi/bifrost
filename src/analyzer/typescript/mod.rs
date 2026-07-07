@@ -296,6 +296,13 @@ impl TypescriptAnalyzer {
         let imports = self.inner.import_statements(code_unit.source());
         (!imports.is_empty()).then(|| imports.join("\n"))
     }
+
+    fn type_alias_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        self.inner
+            .is_type_alias(code_unit)
+            .then(|| self.inner.signatures_of(code_unit).first().cloned())
+            .flatten()
+    }
 }
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
@@ -652,10 +659,12 @@ impl IAnalyzer for TypescriptAnalyzer {
     }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.module_import_skeleton(code_unit)
+            .or_else(|| self.type_alias_skeleton(code_unit))
             .or_else(|| self.inner.get_skeleton(code_unit))
     }
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
         self.module_import_skeleton(code_unit)
+            .or_else(|| self.type_alias_skeleton(code_unit))
             .or_else(|| self.inner.get_skeleton_header(code_unit))
     }
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
