@@ -64,6 +64,7 @@ where
                 alias_packages,
                 dot_packages,
                 index,
+                member_callee_cache: HashMap::default(),
                 collector,
             };
             let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -78,6 +79,7 @@ struct FileScan<'a, 'b> {
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
     index: &'a GoEdgeIndex,
+    member_callee_cache: HashMap<(String, String), Vec<String>>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -183,6 +185,20 @@ impl FileScan<'_, '_> {
             .constructor_return_types(callee)
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn member_callees(&mut self, owner_fqn: &str, member: &str) -> Vec<String> {
+        let key = (owner_fqn.to_string(), member.to_string());
+        if let Some(callees) = self.member_callee_cache.get(&key) {
+            return callees.clone();
+        }
+        let callees: Vec<String> = self
+            .index
+            .unique_member_fqn(owner_fqn, member)
+            .into_iter()
+            .collect();
+        self.member_callee_cache.insert(key, callees.clone());
+        callees
     }
 
     /// Hand a resolved reference to the shared collector, which applies the
@@ -352,7 +368,7 @@ fn scan_selector(
     if let Some(types) = locals.resolve_symbol(receiver).as_precise() {
         let callees: Vec<String> = types
             .iter()
-            .map(|type_fqn| format!("{type_fqn}.{field}"))
+            .flat_map(|type_fqn| ctx.member_callees(type_fqn, &field))
             .collect();
         for callee in callees {
             ctx.record(callee, field_node);

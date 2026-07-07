@@ -21,6 +21,7 @@ use adapter::GoAdapter;
 use cache::GoMemoCaches;
 use declarations::determine_go_package_name;
 use tests::detect_go_test_assertion_smells;
+use tree_sitter::Node;
 
 #[derive(Clone)]
 pub struct GoAnalyzer {
@@ -144,6 +145,11 @@ impl GoAnalyzer {
         modules.dedup();
         modules
     }
+}
+
+pub(crate) fn go_field_declaration_is_embedded(node: Node<'_>) -> bool {
+    node.child_by_field_name("name")
+        .is_none_or(|name| name.kind() == "type_identifier")
 }
 
 impl TypeAliasProvider for GoAnalyzer {

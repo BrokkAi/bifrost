@@ -7630,6 +7630,197 @@ func (br *Buf) Lock() {
 }
 
 #[test]
+fn go_explicit_outer_field_shadows_promoted_field() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Base struct {
+    ID string
+}
+
+type Service struct {
+    Base
+    ID int
+}
+
+func use(s Service) {
+    _ = s.ID
+}
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "use",
+                "context": "_ = s.ID",
+                "target": "ID"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app.Service.ID",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_shallower_promoted_field_wins_over_deeper_field() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type C struct {
+    ID string
+}
+
+type B struct {
+    C
+}
+
+type A struct {
+    ID string
+}
+
+type Service struct {
+    A
+    B
+}
+
+func use(s Service) {
+    _ = s.ID
+}
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "use",
+                "context": "_ = s.ID",
+                "target": "ID"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app.A.ID",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_shared_promoted_field_paths_are_ambiguous() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Shared struct {
+    ID string
+}
+
+type Left struct {
+    Shared
+}
+
+type Right struct {
+    Shared
+}
+
+type Model struct {
+    Left
+    Right
+}
+
+func use(model Model) {
+    _ = model.ID
+}
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "use",
+                "context": "_ = model.ID",
+                "target": "ID"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "ambiguous_definition",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_named_same_name_field_does_not_promote_nested_field() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type NamedBase struct {
+    Hidden string
+}
+
+type Wrapper struct {
+    NamedBase NamedBase
+}
+
+func use(wrapper Wrapper) {
+    _ = wrapper.Hidden
+}
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "use",
+                "context": "_ = wrapper.Hidden",
+                "target": "Hidden"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn go_local_binding_shadows_dot_imported_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

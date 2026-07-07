@@ -1,5 +1,6 @@
 use super::GoAnalyzer;
 use super::declarations::{determine_go_package_name, go_node_text};
+use super::go_field_declaration_is_embedded;
 use super::imports::extract_go_import_path;
 use crate::analyzer::type_relations::{MethodKey, MethodSet};
 #[cfg(test)]
@@ -925,7 +926,7 @@ fn embedded_type_refs(node: Node<'_>) -> impl Iterator<Item = EmbeddedTypeRef<'_
 }
 
 fn collect_embedded_field<'tree>(field: Node<'tree>, embedded: &mut Vec<EmbeddedTypeRef<'tree>>) {
-    if is_embedded_field(field)
+    if go_field_declaration_is_embedded(field)
         && let Some(ty) = field.child_by_field_name("type")
     {
         embedded.push(EmbeddedTypeRef {
@@ -933,11 +934,6 @@ fn collect_embedded_field<'tree>(field: Node<'tree>, embedded: &mut Vec<Embedded
             pointer: is_pointer_embedded_field(field, ty),
         });
     }
-}
-
-fn is_embedded_field(node: Node<'_>) -> bool {
-    node.child_by_field_name("name")
-        .is_none_or(|name| name.kind() == "type_identifier")
 }
 
 fn is_pointer_embedded_field(field: Node<'_>, ty: Node<'_>) -> bool {

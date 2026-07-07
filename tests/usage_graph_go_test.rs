@@ -149,6 +149,178 @@ func caller() {
 }
 
 #[test]
+fn embedded_promoted_methods_resolve_with_go_precedence_and_ambiguity() {
+    let project = InlineTestProject::with_language(brokk_bifrost::Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "service.go",
+            r#"
+package app
+
+type Base struct{}
+func (Base) Run() {}
+
+type Service struct {
+    Base
+}
+func (Service) Run() {}
+
+func readOuter(service Service) {
+    service.Run()
+}
+
+type C struct{}
+func (C) Ping() {}
+
+type B struct {
+    C
+}
+
+type A struct{}
+func (A) Ping() {}
+
+type Wrapper struct {
+    A
+    B
+}
+
+func readShallow(wrapper Wrapper) {
+    wrapper.Ping()
+}
+
+type Audit struct{}
+func (Audit) Record() {}
+
+type Worker struct {
+    Audit
+}
+
+func readPromotedMethod(worker Worker) {
+    worker.Record()
+}
+
+type Shared struct{}
+func (Shared) Touch() {}
+
+type PathA struct {
+    Shared
+}
+
+type PathB struct {
+    Shared
+}
+
+type SharedAmbiguous struct {
+    PathA
+    PathB
+}
+
+func runSharedAmbiguous(value SharedAmbiguous) {
+    value.Touch()
+}
+
+type MLeft struct{}
+func (MLeft) Run() {}
+
+type MRight struct{}
+func (MRight) Run() {}
+
+type MethodAmbiguous struct {
+    MLeft
+    MRight
+}
+
+func runAmbiguous(value MethodAmbiguous) {
+    value.Run()
+}
+
+type NamedBase struct{}
+func (NamedBase) Hidden() {}
+
+type NamedWrapper struct {
+    NamedBase NamedBase
+}
+
+func runNamedWrapper(value NamedWrapper) {
+    value.Hidden()
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &graph,
+            "example.com/app.readOuter",
+            "example.com/app.Service.Run"
+        ),
+        "outer direct method should win: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(
+            &graph,
+            "example.com/app.readOuter",
+            "example.com/app.Base.Run"
+        ),
+        "outer direct method must not also count as Base.Run: {}",
+        graph["edges"]
+    );
+    assert!(
+        has_edge(
+            &graph,
+            "example.com/app.readShallow",
+            "example.com/app.A.Ping"
+        ),
+        "shallower promoted method should win: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(
+            &graph,
+            "example.com/app.readShallow",
+            "example.com/app.C.Ping"
+        ),
+        "deeper promoted method must not count when shallower method exists: {}",
+        graph["edges"]
+    );
+    assert!(
+        has_edge(
+            &graph,
+            "example.com/app.readPromotedMethod",
+            "example.com/app.Audit.Record"
+        ),
+        "unique promoted method should resolve to canonical owner: {}",
+        graph["edges"]
+    );
+
+    for (from, to) in [
+        (
+            "example.com/app.runSharedAmbiguous",
+            "example.com/app.Shared.Touch",
+        ),
+        ("example.com/app.runAmbiguous", "example.com/app.MLeft.Run"),
+        ("example.com/app.runAmbiguous", "example.com/app.MRight.Run"),
+    ] {
+        assert!(
+            !has_edge(&graph, from, to),
+            "ambiguous promoted selector must not emit {from} -> {to}: {}",
+            graph["edges"]
+        );
+    }
+    assert!(
+        !has_edge(
+            &graph,
+            "example.com/app.runNamedWrapper",
+            "example.com/app.NamedBase.Hidden"
+        ),
+        "named same-name fields must not be treated as embedded promotions: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
 fn unsupported_interface_factory_receiver_emits_no_partial_edge() {
     let project = InlineTestProject::with_language(brokk_bifrost::Language::Go)
         .file("go.mod", "module example.com/app\n\ngo 1.22\n")
