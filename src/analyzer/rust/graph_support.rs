@@ -11,7 +11,7 @@ use super::declarations::rust_package_name;
 use super::imports::{
     resolve_rust_module_path_with_crate, rust_crate_root_package, split_rust_import_module_and_name,
 };
-use super::lexical_scope::{insert_rust_import_binding, parse_rust_tree};
+use super::lexical_scope::{insert_rust_import_binding, parse_rust_tree, visible_import_binder_at};
 
 /// Per-file reference-resolution context for Rust — the one primitive both usage
 /// paths share. Holds the binder-derived maps a reference resolves through, built
@@ -504,6 +504,54 @@ impl RustAnalyzer {
             .collect()
     }
 
+    pub(crate) fn rust_trait_member_implementations(
+        &self,
+        trait_member: &CodeUnit,
+    ) -> Option<Vec<CodeUnit>> {
+        let trait_owner = self.parent_of(trait_member)?;
+        if !self.is_rust_trait_declaration(&trait_owner) {
+            return None;
+        }
+        let member_kind = rust_trait_member_kind(self, trait_member)?;
+        let member_name = trait_member.identifier();
+
+        let mut implementations = Vec::new();
+        let mut seen = HashSet::default();
+        for file in self.get_analyzed_files() {
+            let Ok(source) = self.inner.project().read_source(&file) else {
+                continue;
+            };
+            let Some(tree) = parse_rust_tree(&source) else {
+                continue;
+            };
+            for impl_item in named_descendants_of_kind(tree.root_node(), "impl_item") {
+                let Some((trait_ref, _implementer)) = trait_impl_parts(impl_item, &source) else {
+                    continue;
+                };
+                let binder = visible_import_binder_at(&source, impl_item.start_byte());
+                if !trait_reference_matches(self, &trait_owner, &file, &trait_ref, &binder) {
+                    continue;
+                }
+                for member_node in
+                    rust_impl_member_nodes(impl_item, &source, member_name, member_kind)
+                {
+                    let Some(candidate) = self.rust_declaration_for_exact_node(
+                        &file,
+                        member_node,
+                        member_name,
+                        member_kind,
+                    ) else {
+                        continue;
+                    };
+                    if seen.insert(candidate.clone()) {
+                        implementations.push(candidate);
+                    }
+                }
+            }
+        }
+        Some(implementations)
+    }
+
     pub(crate) fn is_rust_trait_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "trait_item")
     }
@@ -607,6 +655,81 @@ impl RustAnalyzer {
             .map(|node| predicate(node, &source))
             .unwrap_or(false)
     }
+
+    fn rust_declaration_for_exact_node(
+        &self,
+        file: &ProjectFile,
+        node: Node<'_>,
+        member_name: &str,
+        member_kind: RustTraitMemberKind,
+    ) -> Option<CodeUnit> {
+        self.declarations(file)
+            .filter(|unit| unit.identifier() == member_name)
+            .filter(|unit| rust_code_unit_kind_matches(unit, member_kind))
+            .find(|unit| {
+                self.ranges(unit).iter().any(|range| {
+                    range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
+                })
+            })
+            .cloned()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RustTraitMemberKind {
+    AssociatedType,
+    Method,
+}
+
+fn rust_trait_member_kind(
+    analyzer: &RustAnalyzer,
+    trait_member: &CodeUnit,
+) -> Option<RustTraitMemberKind> {
+    if trait_member.is_function() {
+        return Some(RustTraitMemberKind::Method);
+    }
+    if trait_member.is_field() && analyzer.is_type_alias(trait_member) {
+        return Some(RustTraitMemberKind::AssociatedType);
+    }
+    None
+}
+
+fn rust_code_unit_kind_matches(code_unit: &CodeUnit, member_kind: RustTraitMemberKind) -> bool {
+    match member_kind {
+        RustTraitMemberKind::AssociatedType => code_unit.is_field(),
+        RustTraitMemberKind::Method => code_unit.is_function(),
+    }
+}
+
+fn rust_impl_member_nodes<'tree>(
+    impl_item: Node<'tree>,
+    source: &'tree str,
+    member_name: &str,
+    member_kind: RustTraitMemberKind,
+) -> Vec<Node<'tree>> {
+    let Some(body) = impl_item.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter(|child| rust_impl_member_node_matches(*child, source, member_name, member_kind))
+        .collect()
+}
+
+fn rust_impl_member_node_matches(
+    node: Node<'_>,
+    source: &str,
+    member_name: &str,
+    member_kind: RustTraitMemberKind,
+) -> bool {
+    let expected_kind = match member_kind {
+        RustTraitMemberKind::AssociatedType => "type_item",
+        RustTraitMemberKind::Method => "function_item",
+    };
+    node.kind() == expected_kind
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text(name, source) == member_name)
 }
 
 fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
