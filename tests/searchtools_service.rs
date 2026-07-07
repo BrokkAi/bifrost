@@ -2465,6 +2465,63 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
 }
 
 #[test]
+fn scan_usages_location_target_selects_js_object_literal_method() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "library.js",
+            "const helpers = {\n  formatTask(task) {\n    return task.label;\n  },\n  render() {\n    return helpers.formatTask(this);\n  },\n};\nexport { helpers };\n",
+        )
+        .file(
+            "consumer.js",
+            "import { helpers } from './library.js';\n\nexport function run(directTask) {\n  return helpers.formatTask(directTask);\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"targets":[{"path":"library.js","line":2,"column":3}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, array_len(&value, "ambiguous"), "payload: {value}");
+    assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
+    assert_eq!(0, array_len(&value, "not_found"), "payload: {value}");
+    assert_eq!(
+        "library.js#library.js.helpers.formatTask", value["usages"][0]["symbol"],
+        "{value}"
+    );
+    assert_eq!(2, value["usages"][0]["total_hits"], "{value}");
+
+    let files = value["usages"][0]["files"].as_array().unwrap();
+    assert!(
+        files.iter().any(|file| {
+            file["path"] == "library.js"
+                && file["hits"].as_array().unwrap().iter().any(|hit| {
+                    hit["snippet"]
+                        .as_str()
+                        .is_some_and(|snippet| snippet.contains("helpers.formatTask(this)"))
+                })
+        }),
+        "payload: {value}"
+    );
+    assert!(
+        files.iter().any(|file| {
+            file["path"] == "consumer.js"
+                && file["hits"].as_array().unwrap().iter().any(|hit| {
+                    hit["snippet"]
+                        .as_str()
+                        .is_some_and(|snippet| snippet.contains("helpers.formatTask(directTask)"))
+                })
+        }),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_location_target_does_not_select_nested_same_line_member() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

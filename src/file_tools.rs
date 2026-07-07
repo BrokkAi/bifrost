@@ -646,15 +646,7 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFile
 }
 
 fn code_unit_kind_label(code_unit: &crate::analyzer::CodeUnit) -> String {
-    use crate::analyzer::CodeUnitType;
-    match code_unit.kind() {
-        CodeUnitType::Class => "class".to_string(),
-        CodeUnitType::Function => "function".to_string(),
-        CodeUnitType::Field => "field".to_string(),
-        CodeUnitType::Module => "module".to_string(),
-        CodeUnitType::Macro => "macro".to_string(),
-        CodeUnitType::FileScope => "file scope".to_string(),
-    }
+    code_unit.kind().display_lowercase().to_string()
 }
 
 fn compile_regexes(patterns: &[String], case_insensitive: bool) -> (Vec<Regex>, Vec<String>) {

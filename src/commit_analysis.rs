@@ -896,14 +896,7 @@ fn language_for_path(path: &Path) -> String {
 }
 
 fn kind_name(kind: CodeUnitType) -> &'static str {
-    match kind {
-        CodeUnitType::Class => "class",
-        CodeUnitType::Function => "function",
-        CodeUnitType::Field => "field",
-        CodeUnitType::Module => "module",
-        CodeUnitType::Macro => "macro",
-        CodeUnitType::FileScope => "file scope",
-    }
+    kind.display_lowercase()
 }
 
 fn is_test_like_path(path: &str) -> bool {

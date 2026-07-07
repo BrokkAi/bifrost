@@ -14,9 +14,7 @@ use crate::analyzer::usages::get_definition::{
     resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
-use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, Language, Project, Range, WorkspaceAnalyzer,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, Range, WorkspaceAnalyzer};
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
@@ -285,7 +283,7 @@ fn nearest_call_hierarchy_unit(analyzer: &dyn IAnalyzer, mut unit: CodeUnit) -> 
 }
 
 fn is_call_hierarchy_unit(unit: &CodeUnit) -> bool {
-    matches!(unit.kind(), CodeUnitType::Class | CodeUnitType::Function) && !unit.is_synthetic()
+    (unit.is_class() || unit.is_callable()) && !unit.is_synthetic()
 }
 
 fn caller_for_hit(analyzer: &dyn IAnalyzer, hit: &UsageHit) -> Option<CodeUnit> {

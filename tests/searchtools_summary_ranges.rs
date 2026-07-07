@@ -562,6 +562,34 @@ fn js_file_summaries_skip_synthetic_module_import_entries() {
 }
 
 #[test]
+fn js_object_literal_method_summary_reports_method_kind() {
+    let project = common::InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "library.js",
+            "const helpers = {\n  formatTask(task) {\n    return task.label;\n  },\n};\nexport { helpers };\n",
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["library.js.helpers.formatTask".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert_eq!(1, result.summaries.len());
+    let element = result.summaries[0]
+        .elements
+        .iter()
+        .find(|element| element.symbol == "library.js.helpers.formatTask")
+        .expect("object-literal method summary element");
+    assert_eq!("method", element.kind, "{element:?}");
+    assert_eq!(2, element.start_line, "{element:?}");
+}
+
+#[test]
 fn ts_file_summaries_skip_synthetic_module_import_entries() {
     let project = common::InlineTestProject::with_language(Language::TypeScript)
         .file(
