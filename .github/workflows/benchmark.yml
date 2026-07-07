@@ -3,6 +3,16 @@ name: Benchmark
 on:
   schedule:
     - cron: '17 9 * * *'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/benchmark.yml'
+      - 'benchmark/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
   workflow_dispatch:
     inputs:
       repo:
@@ -153,7 +163,7 @@ jobs:
 
       - name: Prepare Slack payload
         id: slack_payload
-        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != ''
+        if: always() && github.event_name != 'pull_request' && env.SLACK_DAILY_PERF_WEBHOOK_URL != ''
         continue-on-error: true
         shell: bash
         run: |
