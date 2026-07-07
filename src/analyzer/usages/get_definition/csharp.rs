@@ -139,6 +139,11 @@ pub(super) fn resolve_csharp(
                 let reference = csharp_reference_type_text(identifier, source);
                 return csharp_type_outcome(csharp, support, file, &reference);
             }
+            if let Some(outcome) = csharp_object_initializer_label_outcome(
+                analyzer, csharp, support, file, source, identifier,
+            ) {
+                return outcome;
+            }
             let bindings = csharp_bindings_before_scoped(
                 csharp,
                 file,
@@ -147,6 +152,15 @@ pub(super) fn resolve_csharp(
                 identifier.start_byte(),
             );
             if !bindings.is_shadowed(text) {
+                if csharp_is_unqualified_member_reference(identifier)
+                    && let Some(owner) =
+                        csharp_enclosing_class(analyzer, file, identifier.start_byte())
+                {
+                    let outcome = csharp_member_outcome(analyzer, support, vec![owner], text, None);
+                    if outcome.status != DefinitionLookupStatus::NoDefinition {
+                        return outcome;
+                    }
+                }
                 let outcome = csharp_type_outcome(csharp, support, file, text);
                 if outcome.status != DefinitionLookupStatus::NoDefinition {
                     return outcome;
@@ -703,6 +717,66 @@ fn csharp_member_outcome(
     no_definition(
         "no_indexed_definition",
         format!("C# member `{member}` is not indexed as a definition"),
+    )
+}
+
+fn csharp_object_initializer_label_outcome(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    label: Node<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    let initializer = csharp_object_initializer_for_label(label)?;
+    let object_creation = initializer.parent()?;
+    if object_creation.kind() != "object_creation_expression" {
+        return None;
+    }
+    let type_node = object_creation
+        .child_by_field_name("type")
+        .or_else(|| csharp_first_type_child(object_creation))?;
+    let type_name = csharp_node_text(type_node, source);
+    let mut owners = csharp_logical_visible_type_candidates(csharp, file, type_name);
+    if owners.len() != 1 {
+        return None;
+    }
+    let owner = owners.remove(0);
+    Some(csharp_member_outcome(
+        analyzer,
+        support,
+        vec![owner],
+        csharp_node_text(label, source),
+        None,
+    ))
+}
+
+fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() == "member_access_expression"
+        && csharp_member_access_name(parent) == Some(node)
+    {
+        return false;
+    }
+    if matches!(parent.kind(), "argument" | "attribute_argument")
+        && parent.child_by_field_name("name") == Some(node)
+    {
+        return false;
+    }
+    !matches!(
+        parent.kind(),
+        "class_declaration"
+            | "interface_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "record_struct_declaration"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "property_declaration"
+            | "variable_declarator"
+            | "using_directive"
     )
 }
 

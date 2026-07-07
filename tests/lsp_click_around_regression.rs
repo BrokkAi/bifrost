@@ -949,3 +949,218 @@ class AmbiguousImports {
 
     assert_timing_summary("milestone_5_java_interfaces_hierarchy", &timings, 14);
 }
+
+#[test]
+fn milestone_6_csharp_partial_interface_click_around() {
+    let fixture = ClickFixture::new("milestone_6_csharp_partial_interfaces")
+        .file(
+            "Contracts/IHandler.cs",
+            r#"namespace Contracts;
+
+<handler_iface_range>public interface <handler_iface_decl>IHandler
+{
+    void <interface_handle_decl>Handle(string message);
+}
+"#,
+        )
+        .file(
+            "Domain/BaseHandler.cs",
+            r#"namespace Domain;
+
+<base_handler_range>public class <base_handler_decl>BaseHandler
+{
+    public virtual void <base_reset_decl>Reset() {}
+}
+"#,
+        )
+        .file(
+            "Domain/ConsoleHandler.cs",
+            r#"using Contracts;
+
+namespace Domain;
+
+<console_handler_range>public class <console_handler_decl>ConsoleHandler : BaseHandler, IHandler
+{
+    public void <console_handle_decl>Handle(string message) {}
+
+    public override void <console_reset_decl>Reset() {}
+}
+"#,
+        )
+        .file(
+            "Domain/OtherHandler.cs",
+            r#"namespace Domain;
+
+public class OtherHandler
+{
+    public void <other_handle_decl>Handle(string message) {}
+    public void <other_reset_decl>Reset() {}
+}
+"#,
+        )
+        .file(
+            "Domain/EventRecord.Part1.cs",
+            r#"namespace Domain;
+
+public partial class <event_record_range><event_record_decl>EventRecord
+{
+    public string <event_name_decl>Name { get; set; }
+}
+"#,
+        )
+        .file(
+            "Domain/EventRecord.Part2.cs",
+            r#"namespace Domain;
+
+public partial class <event_record_part2_decl>EventRecord
+{
+    public void Rename(string value)
+    {
+        <self_name_write>Name = value;
+    }
+}
+"#,
+        )
+        .file(
+            "App/Workflow.cs",
+            r#"using Contracts;
+using Domain;
+
+namespace App;
+
+public class Workflow
+{
+    public void Run(IHandler handler, ConsoleHandler console, BaseHandler baseHandler, OtherHandler other)
+    {
+        handler.<interface_handle_call>Handle("via interface");
+        console.<console_handle_call>Handle("via concrete");
+        baseHandler.<base_reset_call>Reset();
+        console.<console_reset_call>Reset();
+        other.<other_handle_call>Handle("unrelated");
+        other.<other_reset_call>Reset();
+
+        EventRecord <record_local>record = new EventRecord { <initializer_name_label>Name = "created" };
+        var copy = record.<record_name_read>Name;
+    }
+}
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "interface-typed receiver resolves to interface method",
+                "interface_handle_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["interface_handle_decl"]),
+            ),
+            ClickCase::new(
+                "concrete receiver resolves to implementation method",
+                "console_handle_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["console_handle_decl"]),
+            ),
+            ClickCase::new(
+                "base receiver resolves to base virtual method",
+                "base_reset_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["base_reset_decl"]),
+            ),
+            ClickCase::new(
+                "derived receiver resolves to override method",
+                "console_reset_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["console_reset_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name method resolves to unrelated declaration",
+                "other_handle_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_handle_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name inherited method resolves to unrelated declaration",
+                "other_reset_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_reset_decl"]),
+            ),
+            ClickCase::new(
+                "object initializer label resolves to partial property",
+                "initializer_name_label",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["event_name_decl"]),
+            ),
+            ClickCase::new(
+                "partial self property write resolves to property declaration",
+                "self_name_write",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["event_name_decl"]),
+            ),
+            ClickCase::new(
+                "typed receiver property read resolves to partial property",
+                "record_name_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["event_name_decl"]),
+            ),
+            ClickCase::new(
+                "record local type definition resolves to EventRecord",
+                "record_local",
+                ClickOperation::TypeDefinition,
+                ClickExpectation::Locations(&["event_record_decl", "event_record_part2_decl"]),
+            ),
+            ClickCase::new(
+                "interface method references include interface-typed call",
+                "interface_handle_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["interface_handle_call"]),
+            ),
+            ClickCase::new(
+                "partial property references include initializer and reads",
+                "event_name_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&[
+                    "self_name_write",
+                    "initializer_name_label",
+                    "record_name_read",
+                ]),
+            ),
+            ClickCase::new(
+                "interface method implementation finds concrete implementation",
+                "interface_handle_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["console_handle_decl"]),
+            ),
+            ClickCase::new(
+                "base method implementation finds inherited override",
+                "base_reset_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["console_reset_decl"]),
+            ),
+            ClickCase::new(
+                "interface type implementation finds implementing class",
+                "handler_iface_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["console_handler_decl"]),
+            ),
+            ClickCase::new(
+                "ConsoleHandler supertypes include base class and interface",
+                "console_handler_decl",
+                ClickOperation::TypeHierarchySupertypes,
+                ClickExpectation::Locations(&["base_handler_range", "handler_iface_range"]),
+            ),
+            ClickCase::new(
+                "IHandler subtypes include ConsoleHandler",
+                "handler_iface_decl",
+                ClickOperation::TypeHierarchySubtypes,
+                ClickExpectation::Locations(&["console_handler_range"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_6_csharp_partial_interfaces", &timings, 17);
+}

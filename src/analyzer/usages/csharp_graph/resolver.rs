@@ -891,6 +891,24 @@ pub(in crate::analyzer::usages) fn argument_count(node: Node<'_>, _source: &str)
     count_named_children_of_kind(arguments, "argument")
 }
 
+pub(in crate::analyzer::usages) fn object_initializer_for_label(
+    node: Node<'_>,
+) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    if parent.kind() != "assignment_expression" {
+        return None;
+    }
+    if parent.child_by_field_name("left") != Some(node) && parent.named_child(0) != Some(node) {
+        return None;
+    }
+    let initializer = parent.parent()?;
+    matches!(
+        initializer.kind(),
+        "initializer_expression" | "object_initializer_expression"
+    )
+    .then_some(initializer)
+}
+
 fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)

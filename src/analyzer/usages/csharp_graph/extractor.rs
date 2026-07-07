@@ -2,8 +2,8 @@ use crate::analyzer::usages::csharp_graph::hits::push_hit;
 use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, argument_count, binding_scope_node, expression_resolves_to_type,
     first_type_child, is_type_reference_node, member_name_is_locally_bound, node_text,
-    normalize_type_text, receiver_targets_owner, reference_type_text, resolves_to_target,
-    same_node, seed_visible_bindings_at, unqualified_member_resolves_to_owner,
+    normalize_type_text, object_initializer_for_label, receiver_targets_owner, reference_type_text,
+    resolves_to_target, same_node, seed_visible_bindings_at, unqualified_member_resolves_to_owner,
 };
 use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -416,22 +416,6 @@ fn object_initializer_label_owner_resolution(
             LabelOwnerResolution::Unknown
         }
     }
-}
-
-fn object_initializer_for_label(node: Node<'_>) -> Option<Node<'_>> {
-    let parent = node.parent()?;
-    if parent.kind() != "assignment_expression" {
-        return None;
-    }
-    if parent.child_by_field_name("left") != Some(node) && parent.named_child(0) != Some(node) {
-        return None;
-    }
-    let initializer = parent.parent()?;
-    matches!(
-        initializer.kind(),
-        "initializer_expression" | "object_initializer_expression"
-    )
-    .then_some(initializer)
 }
 
 /// Whether `node` is the argument of a `nameof(...)` expression.

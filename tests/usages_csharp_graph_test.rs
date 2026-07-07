@@ -1,8 +1,14 @@
 mod common;
 
 use brokk_bifrost::usages::{CSharpUsageGraphStrategy, FuzzyResult, UsageAnalyzer, UsageFinder};
-use brokk_bifrost::{CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language};
+use brokk_bifrost::{
+    CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, SearchToolsService,
+};
 use common::InlineTestProject;
+use serde_json::{Value, json};
+use std::sync::{LazyLock, Mutex};
+
+static CSHARP_LOOKUP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn csharp_analyzer_with_files(
     files: &[(&str, &str)],
@@ -107,6 +113,28 @@ fn count_signature_parameters(signature: &str) -> usize {
         return 0;
     }
     inner.split(", ").count()
+}
+
+fn definition_lookup(
+    root: &std::path::Path,
+    path: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> Value {
+    let _guard = CSHARP_LOOKUP_LOCK.lock().expect("lookup lock poisoned");
+    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
+        .expect("failed to build searchtools service");
+    let request = json!({
+        "references": [{
+            "path": path,
+            "start_byte": start_byte,
+            "end_byte": end_byte,
+        }]
+    });
+    let payload = service
+        .call_tool_json("get_definition_by_location", &request.to_string())
+        .expect("get_definition_by_location call failed");
+    serde_json::from_str(&payload).expect("get_definition_by_location returned invalid JSON")
 }
 
 fn graph_hits(
@@ -1799,6 +1827,142 @@ public sealed class Dto {
             .all(|hit| hit.file == project.file("src/Service.cs")),
         "{dto_hits:#?}"
     );
+}
+
+#[test]
+fn csharp_definition_resolves_object_initializer_label_to_property() {
+    let (project, _analyzer) = csharp_analyzer_with_files(&[(
+        "src/Service.cs",
+        r#"namespace Example;
+
+public sealed class Repository {
+    public string Last { get; set; } = "";
+}
+
+public sealed class Consumer {
+    public Repository Build() {
+        return new Repository { Last = "x" };
+    }
+}
+"#,
+    )]);
+
+    let source = project.file("src/Service.cs").read_to_string().unwrap();
+    let start = source.find("Last = \"x\"").expect("initializer label");
+    let value = definition_lookup(project.root(), "src/Service.cs", start, start + 4);
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Example.Repository.Last",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_definition_resolves_unqualified_partial_property_member() {
+    let (project, _analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/EventRecord.Part1.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord {
+    public string Name { get; set; } = "";
+}
+"#,
+        ),
+        (
+            "src/EventRecord.Part2.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord {
+    public void Rename(string value) {
+        Name = value;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let source = project
+        .file("src/EventRecord.Part2.cs")
+        .read_to_string()
+        .unwrap();
+    let start = source.find("Name = value").expect("property write");
+    let value = definition_lookup(project.root(), "src/EventRecord.Part2.cs", start, start + 4);
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Demo.EventRecord.Name",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_definition_does_not_resolve_named_argument_label_as_member() {
+    let (project, _analyzer) = csharp_analyzer_with_files(&[(
+        "src/Consumer.cs",
+        r#"namespace Demo;
+
+public sealed class Consumer {
+    public string Name { get; set; } = "";
+
+    public void Run(string value) {
+        Configure(Name: value);
+    }
+
+    private void Configure(string Name) {}
+}
+"#,
+    )]);
+
+    let source = project.file("src/Consumer.cs").read_to_string().unwrap();
+    let start = source.find("Name: value").expect("named argument label");
+    let value = definition_lookup(project.root(), "src/Consumer.cs", start, start + 4);
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn csharp_definition_does_not_resolve_ambiguous_object_initializer_label() {
+    let (project, _analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Alpha.cs",
+            r#"namespace Alpha;
+
+public sealed class Widget {
+    public string Name { get; set; } = "";
+}
+"#,
+        ),
+        (
+            "src/Beta.cs",
+            r#"namespace Beta;
+
+public sealed class Widget {
+    public string Name { get; set; } = "";
+}
+"#,
+        ),
+        (
+            "src/Consumer.cs",
+            r#"using Alpha;
+using Beta;
+
+namespace Demo;
+public sealed class Consumer {
+    public object Build() {
+        return new Widget { Name = "x" };
+    }
+}
+"#,
+        ),
+    ]);
+
+    let source = project.file("src/Consumer.cs").read_to_string().unwrap();
+    let start = source.find("Name = \"x\"").expect("initializer label");
+    let value = definition_lookup(project.root(), "src/Consumer.cs", start, start + 4);
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]
