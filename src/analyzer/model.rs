@@ -26,6 +26,20 @@ pub enum Language {
 }
 
 impl Language {
+    pub const ANALYZABLE: [Self; 11] = [
+        Language::Java,
+        Language::Go,
+        Language::Cpp,
+        Language::JavaScript,
+        Language::TypeScript,
+        Language::Python,
+        Language::Rust,
+        Language::Php,
+        Language::Scala,
+        Language::CSharp,
+        Language::Ruby,
+    ];
+
     pub fn config_label(self) -> &'static str {
         match self {
             Language::None => "none",
@@ -62,19 +76,7 @@ impl Language {
 
     pub fn from_extension(extension: &str) -> Self {
         let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
-        for language in [
-            Language::Java,
-            Language::Go,
-            Language::Cpp,
-            Language::JavaScript,
-            Language::TypeScript,
-            Language::Python,
-            Language::Rust,
-            Language::Php,
-            Language::Scala,
-            Language::CSharp,
-            Language::Ruby,
-        ] {
+        for language in Self::ANALYZABLE {
             if language.extensions().contains(&normalized.as_str()) {
                 return language;
             }
@@ -88,19 +90,7 @@ impl Language {
             .trim_start_matches('.')
             .to_ascii_lowercase()
             .replace(['_', '-'], "");
-        for language in [
-            Language::Java,
-            Language::Go,
-            Language::Cpp,
-            Language::JavaScript,
-            Language::TypeScript,
-            Language::Python,
-            Language::Rust,
-            Language::Php,
-            Language::Scala,
-            Language::CSharp,
-            Language::Ruby,
-        ] {
+        for language in Self::ANALYZABLE {
             if normalized == language.config_label()
                 || language.extensions().contains(&normalized.as_str())
             {

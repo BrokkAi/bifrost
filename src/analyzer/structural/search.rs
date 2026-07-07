@@ -444,6 +444,19 @@ fn snippet(text: &str) -> String {
 }
 
 impl SearchAstOutput {
+    pub fn match_count_line(&self) -> String {
+        format!(
+            "{} match{}{}",
+            self.matches.len(),
+            if self.matches.len() == 1 { "" } else { "es" },
+            if self.truncated {
+                " (truncated; refine the query or raise limit)"
+            } else {
+                ""
+            },
+        )
+    }
+
     /// Human/agent-readable rendering following SearchTools conventions:
     /// structured JSON stays canonical, this is the display form.
     pub fn render_text(&self) -> String {
@@ -451,23 +464,10 @@ impl SearchAstOutput {
         if self.matches.is_empty() {
             out.push_str("No structural matches.\n");
         } else {
-            out.push_str(&format!(
-                "{} match{}{}\n",
-                self.matches.len(),
-                if self.matches.len() == 1 { "" } else { "es" },
-                if self.truncated {
-                    " (truncated; refine the query or raise limit)"
-                } else {
-                    ""
-                },
-            ));
+            out.push_str(&format!("{}\n", self.match_count_line()));
             for m in &self.matches {
                 out.push('\n');
-                let lines = if m.start_line == m.end_line {
-                    format!("{}", m.start_line)
-                } else {
-                    format!("{}-{}", m.start_line, m.end_line)
-                };
+                let lines = m.line_span_label();
                 out.push_str(&format!("{}:{} [{}] `{}`", m.path, lines, m.kind, m.text));
                 if let Some(enclosing) = &m.enclosing_symbol {
                     out.push_str(&format!(" in {enclosing}"));
@@ -485,6 +485,16 @@ impl SearchAstOutput {
             out.push_str(&format!("note: {}\n", diagnostic.message));
         }
         out
+    }
+}
+
+impl SearchAstMatch {
+    pub fn line_span_label(&self) -> String {
+        if self.start_line == self.end_line {
+            self.start_line.to_string()
+        } else {
+            format!("{}-{}", self.start_line, self.end_line)
+        }
     }
 }
 
