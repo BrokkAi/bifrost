@@ -5,7 +5,7 @@ use crate::analyzer::{
     DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
     ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range, SemanticDiagnostic,
     SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
+    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
 };
 use std::any::Any;
 use std::cmp::Ordering;
@@ -49,6 +49,10 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
         static EMPTY: OnceLock<DefinitionLookupIndex> = OnceLock::new();
         EMPTY.get_or_init(DefinitionLookupIndex::default)
+    }
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        static EMPTY: OnceLock<UsageFactsIndex> = OnceLock::new();
+        EMPTY.get_or_init(UsageFactsIndex::default)
     }
     fn direct_children<'a>(
         &'a self,

@@ -1235,6 +1235,9 @@ fn scala_imported_member_return_type(
     _resolver: &ScalaNameResolver,
     member_fqn: &str,
 ) -> Option<String> {
+    if let Some(return_type) = ctx.types.member_return_type(member_fqn) {
+        return Some(return_type);
+    }
     let unit = ctx
         .support
         .fqn(member_fqn)

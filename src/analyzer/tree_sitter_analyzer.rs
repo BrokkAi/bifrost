@@ -2,7 +2,7 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::persistence::{self, AnalyzerStorage};
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, DefinitionLookupIndex, ImportInfo,
-    Language, Project, ProjectFile, Range, SignatureMetadata,
+    Language, Project, ProjectFile, Range, SignatureMetadata, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
@@ -84,6 +84,22 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn file_extension(&self) -> &'static str;
     fn normalize_full_name(&self, fq_name: &str) -> String {
         fq_name.to_string()
+    }
+    fn simple_type_name(&self, unit: &CodeUnit) -> String {
+        unit.identifier().to_string()
+    }
+    fn callable_arity(
+        &self,
+        _signature: &str,
+        metadata: Option<&SignatureMetadata>,
+    ) -> Option<usize> {
+        metadata.map(|metadata| metadata.parameters().len())
+    }
+    fn callable_return_type_text<'a>(&self, _signature: &'a str) -> Option<&'a str> {
+        None
+    }
+    fn preferred_type_candidate<'a>(&self, candidates: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
+        candidates.first()
     }
     fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
         false
@@ -186,6 +202,7 @@ struct AnalyzerState {
     files: HashMap<ProjectFile, FileState>,
     definitions: HashMap<String, Vec<CodeUnit>>,
     definition_lookup_index: DefinitionLookupIndex,
+    usage_facts_index: UsageFactsIndex,
     // Child lists are canonicalized once while building immutable analyzer
     // state. `direct_children` intentionally exposes this deduped, source-
     // ordered contract; callers only reorder when they need a presentation-
@@ -928,7 +945,11 @@ where
         for state in files.values() {
             for declaration in &state.declarations {
                 if !declaration.is_file_scope() {
-                    definition_lookup_index.insert(declaration);
+                    definition_lookup_index.insert(
+                        declaration,
+                        &|fq_name| adapter.normalize_full_name(fq_name),
+                        &|unit| adapter.simple_type_name(unit),
+                    );
                     definitions
                         .entry(adapter.normalize_full_name(&declaration.fq_name()))
                         .or_default()
@@ -942,7 +963,11 @@ where
                 }
             }
             for lookup_unit in &state.definition_lookup_units {
-                definition_lookup_index.insert(lookup_unit);
+                definition_lookup_index.insert(
+                    lookup_unit,
+                    &|fq_name| adapter.normalize_full_name(fq_name),
+                    &|unit| adapter.simple_type_name(unit),
+                );
             }
 
             for (parent, descendants) in &state.children {
@@ -1010,11 +1035,29 @@ where
         }
 
         let _ = project;
+        let usage_facts_index = UsageFactsIndex::build_from_declarations(
+            &definition_lookup_index,
+            files.values().flat_map(|state| state.declarations.iter()),
+            |unit| {
+                unit.signature().map(str::to_string).or_else(|| {
+                    signatures
+                        .get(unit)
+                        .and_then(|entries| entries.first().cloned())
+                })
+            },
+            |unit| {
+                signature_metadata
+                    .get(unit)
+                    .and_then(|entries| entries.first().cloned())
+            },
+            adapter,
+        );
 
         AnalyzerState {
             files,
             definitions,
             definition_lookup_index,
+            usage_facts_index,
             children,
             module_children,
             ranges,
@@ -1415,6 +1458,10 @@ where
 
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
         &self.state.definition_lookup_index
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        &self.state.usage_facts_index
     }
 
     fn direct_children<'a>(

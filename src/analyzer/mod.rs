@@ -29,6 +29,7 @@ pub(crate) mod symbol_lookup;
 pub(crate) mod tree_sitter_analyzer;
 pub(crate) mod type_relations;
 mod typescript;
+mod usage_facts;
 pub mod usages;
 mod workspace;
 
@@ -80,9 +81,11 @@ pub use python::PythonAnalyzer;
 pub use ruby::RubyAnalyzer;
 pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
+pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
 };
 pub use typescript::TypescriptAnalyzer;
+pub(crate) use usage_facts::UsageFactsIndex;
 pub use workspace::{EmptyAnalyzer, WorkspaceAnalyzer};

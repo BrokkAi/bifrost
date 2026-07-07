@@ -22,20 +22,17 @@
 //! are an unhandled recall gap, not a wrong edge.
 
 use super::resolver::{
-    package_name_of, resolved_extension_receiver_type, scala_builtin_type_name, scala_display_name,
+    package_name_of, resolved_extension_receiver_type, scala_builtin_type_name,
     scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_normalized_fq_name,
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{call_arity_for_reference, node_text, parenthesized_arity, scala_import_path};
-use crate::analyzer::CodeUnit;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::symbol_index::{
-    MemberDecl, TypeDecl, WorkspaceSymbolIndex, WorkspaceSymbolIndexBuilder,
-};
+use crate::analyzer::{CodeUnit, DefinitionLookupIndex, UsageFactsIndex};
 use crate::analyzer::{
     IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
 };
@@ -45,28 +42,15 @@ use tree_sitter::Node;
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
 pub(crate) struct ProjectTypes {
-    index: WorkspaceSymbolIndex,
+    index: DefinitionLookupIndex,
+    facts: UsageFactsIndex,
     extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>>,
 }
 
 impl ProjectTypes {
     pub(crate) fn build(scala: &ScalaAnalyzer) -> Self {
-        let mut builder = WorkspaceSymbolIndexBuilder::new();
-        let mut type_decls = Vec::new();
         let mut extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>> =
             HashMap::default();
-        for unit in scala.all_declarations().filter(|unit| unit.is_class()) {
-            let fqn = unit.fq_name();
-            let decl = TypeDecl::new(
-                unit.package_name().to_string(),
-                scala_display_name(unit),
-                fqn.clone(),
-                scala_normalized_fq_name(&fqn),
-            );
-            builder.add_type(decl.clone());
-            type_decls.push(decl);
-        }
-        let type_index = WorkspaceSymbolIndex::from_declarations(type_decls, Vec::new());
         for unit in scala
             .all_declarations()
             .filter(|unit| unit.is_function() || unit.is_field())
@@ -75,39 +59,6 @@ impl ProjectTypes {
             let signature = unit
                 .signature()
                 .or_else(|| scala.signatures(unit).first().map(String::as_str));
-            let return_type_fqn =
-                signature
-                    .and_then(signature_return_type)
-                    .and_then(|return_type| {
-                        return_type_fqn(return_type, unit.package_name(), &type_index)
-                    });
-            if unit.is_function()
-                && let Some(owner_fqn) = owner_fqn(unit)
-            {
-                builder.add_member(MemberDecl::new(
-                    fqn.clone(),
-                    scala_normalized_fq_name(&fqn),
-                    owner_fqn.clone(),
-                    scala_normalized_fq_name(&owner_fqn),
-                    unit.identifier().to_string(),
-                    signature.and_then(member_signature_arity),
-                    return_type_fqn,
-                    true,
-                ));
-            } else if unit.is_field()
-                && let Some(owner_fqn) = owner_fqn(unit)
-            {
-                builder.add_member(MemberDecl::new(
-                    fqn.clone(),
-                    scala_normalized_fq_name(&fqn),
-                    owner_fqn.clone(),
-                    scala_normalized_fq_name(&owner_fqn),
-                    unit.identifier().to_string(),
-                    None,
-                    return_type_fqn,
-                    false,
-                ));
-            }
             if signature.is_some_and(|signature| signature.starts_with("extension "))
                 && let Some(owner_fqn) = owner_fqn(unit)
             {
@@ -124,7 +75,8 @@ impl ProjectTypes {
             }
         }
         Self {
-            index: builder.build(),
+            index: scala.definition_lookup_index().clone(),
+            facts: scala.usage_facts_index().clone(),
             extension_methods_by_name,
         }
     }
@@ -140,9 +92,15 @@ impl ProjectTypes {
             .members_for_owner_name(owner_fqn, &normalized_owner, member)
             .iter()
             .filter(|method| {
-                method.is_function && method_call_arity_matches(method.arity, call_arity)
+                method.is_function()
+                    && method_call_arity_matches(
+                        self.facts
+                            .fact_for_declaration(method)
+                            .and_then(|facts| facts.arity),
+                        call_arity,
+                    )
             })
-            .map(|method| method.fqn.clone())
+            .map(|method| method.fq_name())
             .collect()
     }
 
@@ -165,8 +123,8 @@ impl ProjectTypes {
         Vec::new()
     }
 
-    fn member_return_type(&self, member_fqn: &str) -> Option<String> {
-        self.index
+    pub(crate) fn member_return_type(&self, member_fqn: &str) -> Option<String> {
+        self.facts
             .callable_return_type(member_fqn)
             .map(str::to_string)
     }
@@ -178,30 +136,50 @@ impl ProjectTypes {
         call_arity: Option<usize>,
     ) -> Option<String> {
         let normalized_owner = scala_normalized_fq_name(owner_fqn);
-        let mut returns = self
+        let members = self
             .index
-            .members_for_owner_name(owner_fqn, &normalized_owner, member)
+            .members_for_owner_name(owner_fqn, &normalized_owner, member);
+        let mut returns = members
             .iter()
             .filter(|method| {
-                method.is_function && method_call_arity_matches(method.arity, call_arity)
+                method.is_function()
+                    && method_call_arity_matches(
+                        self.facts
+                            .fact_for_declaration(method)
+                            .and_then(|facts| facts.arity),
+                        call_arity,
+                    )
             })
-            .filter_map(|method| method.return_type_fqn.clone());
+            .filter_map(|method| {
+                self.facts
+                    .fact_for_declaration(method)
+                    .and_then(|facts| facts.return_type_fqn.clone())
+            });
         let first = returns.next()?;
         returns
             .all(|return_type| return_type == first)
             .then_some(first)
     }
 
-    fn package_types(&self) -> impl Iterator<Item = (&(String, String), &TypeDecl)> {
-        self.index.package_types()
+    fn package_types(&self) -> impl Iterator<Item = (&(String, String), &CodeUnit)> {
+        self.index
+            .package_types()
+            .filter_map(|(key, units)| preferred_scala_type(units).map(|unit| (key, unit)))
     }
 
-    fn type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&TypeDecl> {
-        self.index.type_by_normalized_fqn(normalized_fqn)
+    fn type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&CodeUnit> {
+        let candidates = self.index.by_normalized_fqn(normalized_fqn);
+        candidates
+            .iter()
+            .find(|unit| unit.is_class() && !unit.short_name().ends_with('$'))
+            .or_else(|| candidates.iter().find(|unit| unit.is_class()))
     }
 
-    fn member_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&MemberDecl> {
-        self.index.member_by_normalized_fqn(normalized_fqn)
+    fn member_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&CodeUnit> {
+        self.index
+            .by_normalized_fqn(normalized_fqn)
+            .iter()
+            .find(|unit| unit.is_function() || unit.is_field())
     }
 }
 
@@ -234,7 +212,7 @@ impl NameResolver {
         if let Some(package) = package_name_of(scala, file) {
             for ((decl_package, simple), decl) in types.package_types() {
                 if *decl_package == package {
-                    names.insert(simple.clone(), decl.fqn.clone());
+                    names.insert(simple.clone(), decl.fq_name());
                 }
             }
         }
@@ -249,7 +227,7 @@ impl NameResolver {
                 // `import pkg._` exposes every type in `pkg` by simple name.
                 for ((decl_package, simple), decl) in types.package_types() {
                     if package_candidates.contains(decl_package) {
-                        names.insert(simple.clone(), decl.fqn.clone());
+                        names.insert(simple.clone(), decl.fq_name());
                     }
                 }
                 let normalized_paths = import_candidate_normalized_paths(&path, &file_package);
@@ -275,7 +253,7 @@ impl NameResolver {
                     .identifier
                     .clone()
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
-                names.insert(local_name, decl.fqn.clone());
+                names.insert(local_name, decl.fq_name());
                 continue;
             }
             if let Some(member) = normalized_paths
@@ -286,15 +264,16 @@ impl NameResolver {
                     .identifier
                     .clone()
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
-                member_names.insert(local_name.clone(), member.fqn.clone());
+                let member_fqn = member.fq_name();
+                member_names.insert(local_name.clone(), member_fqn.clone());
                 if let Some(methods) = types
                     .extension_methods_by_name
-                    .get(scala_member_name(&member.fqn))
+                    .get(scala_member_name(&member_fqn))
                 {
                     visible_extensions.entry(local_name).or_default().extend(
                         methods
                             .iter()
-                            .filter(|method| method.fqn == member.fqn)
+                            .filter(|method| method.fqn == member_fqn)
                             .cloned(),
                     );
                 }
@@ -352,16 +331,28 @@ fn owner_fqn(unit: &CodeUnit) -> Option<String> {
     })
 }
 
+fn preferred_scala_type(units: &[CodeUnit]) -> Option<&CodeUnit> {
+    units
+        .iter()
+        .find(|unit| !unit.short_name().ends_with('$'))
+        .or_else(|| units.first())
+}
+
 pub(super) fn build_method_override_targets(
     scala: &ScalaAnalyzer,
     types: &ProjectTypes,
 ) -> HashMap<String, Vec<String>> {
     let mut override_targets: HashMap<String, Vec<String>> = HashMap::default();
-    for method in types.index.members().filter(|member| member.is_function) {
-        let Some(owner) = scala
-            .definitions(&method.owner_fqn)
-            .find(|unit| unit.is_class())
-        else {
+    for method in scala.all_declarations().filter(|unit| unit.is_function()) {
+        let method_fqn = method.fq_name();
+        let method_arity = types
+            .facts
+            .fact_for_declaration(method)
+            .and_then(|facts| facts.arity);
+        let Some(owner_fqn) = owner_fqn(method) else {
+            continue;
+        };
+        let Some(owner) = scala.definitions(&owner_fqn).find(|unit| unit.is_class()) else {
             continue;
         };
         let mut targets = Vec::new();
@@ -380,27 +371,33 @@ pub(super) fn build_method_override_targets(
                     .members_for_owner_name(
                         &ancestor_owner,
                         &normalized_ancestor_owner,
-                        &method.name,
+                        method.identifier(),
                     )
                     .iter()
                     .filter(|ancestor_method| {
-                        ancestor_method.is_function
-                            && method_arities_compatible(method, ancestor_method)
+                        ancestor_method.is_function()
+                            && method_arities_compatible(
+                                method_arity,
+                                types
+                                    .facts
+                                    .fact_for_declaration(ancestor_method)
+                                    .and_then(|facts| facts.arity),
+                            )
                     })
-                    .map(|ancestor_method| ancestor_method.fqn.clone()),
+                    .map(|ancestor_method| ancestor_method.fq_name()),
             );
         }
         targets.sort();
         targets.dedup();
         if !targets.is_empty() {
-            override_targets.insert(method_key(&method.fqn, method.arity), targets);
+            override_targets.insert(method_key(&method_fqn, method_arity), targets);
         }
     }
     override_targets
 }
 
-fn method_arities_compatible(method: &MemberDecl, ancestor: &MemberDecl) -> bool {
-    method.arity.is_none() || ancestor.arity.is_none() || method.arity == ancestor.arity
+fn method_arities_compatible(method: Option<usize>, ancestor: Option<usize>) -> bool {
+    method.is_none() || ancestor.is_none() || method == ancestor
 }
 
 fn method_call_arity_matches(method_arity: Option<usize>, call_arity: Option<usize>) -> bool {
@@ -418,42 +415,6 @@ fn method_key(fqn: &str, arity: Option<usize>) -> String {
         Some(arity) => format!("{fqn}#{arity}"),
         None => fqn.to_string(),
     }
-}
-
-fn member_signature_arity(signature: &str) -> Option<usize> {
-    if let Some(extension_signature) = signature.strip_prefix("extension ") {
-        let after_receiver = extension_signature.split_once(')')?.1.trim_start();
-        return after_receiver
-            .find('(')
-            .and_then(|open| parenthesized_arity(&after_receiver[open..]))
-            .or(Some(0));
-    }
-    let open = signature.find('(')?;
-    parenthesized_arity(&signature[open..])
-}
-
-fn signature_return_type(signature: &str) -> Option<&str> {
-    let (_, after_colon) = signature.rsplit_once(':')?;
-    let end = after_colon.find(['=', '{']).unwrap_or(after_colon.len());
-    let return_type = after_colon[..end].trim();
-    (!return_type.is_empty()).then_some(return_type)
-}
-
-fn return_type_fqn(
-    return_type: &str,
-    package_name: &str,
-    type_index: &WorkspaceSymbolIndex,
-) -> Option<String> {
-    let base = return_type
-        .split(['[', '(', '{', ' '])
-        .next()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())?;
-    type_index
-        .type_by_package_simple(package_name, base)
-        .or_else(|| type_index.type_by_fqn(base))
-        .or_else(|| type_index.type_by_normalized_fqn(&scala_normalized_fq_name(base)))
-        .map(|decl| decl.fqn.clone())
 }
 
 fn scala_member_name(fqn: &str) -> &str {
