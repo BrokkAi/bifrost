@@ -2,6 +2,7 @@ mod common;
 
 use common::lsp_client::{LspServer, uri_for};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -1935,6 +1936,225 @@ fn bifrost_lsp_server_implementation_works_from_go_interface_method() {
     assert_eq!(
         locations[0]["range"]["start"]["line"], 8,
         "expected Worker.Run declaration from interface method lookup: {response}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn bifrost_lsp_server_rust_trait_method_implementation_finds_impl_methods() {
+    let source = r#"pub trait Runner {
+    fn run() -> String;
+}
+
+pub struct LocalRunner;
+pub struct RemoteRunner;
+
+impl Runner for LocalRunner {
+    fn run() -> String {
+        String::new()
+    }
+}
+
+impl Runner for RemoteRunner {
+    fn run() -> String {
+        String::new()
+    }
+}
+"#;
+    assert_lsp_implementation_start_lines(
+        &[("lib.rs", source)],
+        "lib.rs",
+        "    fn ",
+        &[
+            ("lib.rs", "impl Runner for LocalRunner {\n"),
+            ("lib.rs", "impl Runner for RemoteRunner {\n"),
+        ],
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_rust_trait_associated_type_implementation_finds_impl_types() {
+    let source = r#"pub trait Runner {
+    type Output;
+}
+
+pub struct LocalRunner;
+pub struct RemoteRunner;
+
+impl Runner for LocalRunner {
+    type Output = String;
+}
+
+impl Runner for RemoteRunner {
+    type Output = Vec<u8>;
+}
+"#;
+    assert_lsp_implementation_start_lines(
+        &[("lib.rs", source)],
+        "lib.rs",
+        "    type ",
+        &[
+            ("lib.rs", "impl Runner for LocalRunner {\n"),
+            ("lib.rs", "impl Runner for RemoteRunner {\n"),
+        ],
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_rust_trait_method_implementation_excludes_unrelated_inherent_method() {
+    let source = r#"pub trait Runner {
+    fn run() -> String;
+}
+
+pub struct LocalRunner;
+pub struct Unrelated;
+
+impl Runner for LocalRunner {
+    fn run() -> String {
+        String::new()
+    }
+}
+
+impl Unrelated {
+    fn run() -> String {
+        String::new()
+    }
+}
+"#;
+    assert_lsp_implementation_start_lines(
+        &[("lib.rs", source)],
+        "lib.rs",
+        "    fn ",
+        &[("lib.rs", "impl Runner for LocalRunner {\n")],
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_rust_trait_method_implementation_excludes_same_type_inherent_method() {
+    let source = r#"pub trait Runner {
+    fn run() -> String;
+}
+
+pub struct LocalRunner;
+
+impl LocalRunner {
+    fn run() -> String {
+        String::new()
+    }
+}
+
+impl Runner for LocalRunner {
+    fn run() -> String {
+        String::new()
+    }
+}
+"#;
+    assert_lsp_implementation_start_lines(
+        &[("lib.rs", source)],
+        "lib.rs",
+        "    fn ",
+        &[("lib.rs", "impl Runner for LocalRunner {\n")],
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_rust_trait_method_implementation_finds_cross_file_impl_method() {
+    let contracts = "pub trait Runner {\n    fn run() -> String;\n}\n";
+    let service = r#"use crate::contracts::Runner;
+
+pub struct LocalRunner;
+
+impl Runner for LocalRunner {
+    fn run() -> String {
+        String::new()
+    }
+}
+"#;
+    let lib = "pub mod contracts;\npub mod service;\n";
+    assert_lsp_implementation_start_lines(
+        &[
+            ("lib.rs", lib),
+            ("contracts.rs", contracts),
+            ("service.rs", service),
+        ],
+        "contracts.rs",
+        "    fn ",
+        &[("service.rs", "impl Runner for LocalRunner {\n")],
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_implementation_rejects_java_field_declaration() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Fields.java");
+    let source = "class Base {\n  int value;\n}\nclass Child extends Base {\n  int value;\n}\n";
+    fs::write(&file_path, source).expect("write Java field fixture");
+
+    let mut server = LspServer::start(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "  int ");
+    let response = implementation_response(&mut server, &file_uri, line, character);
+    assert!(
+        response["result"].is_null(),
+        "Java field declarations must not resolve implementations, got {response}"
+    );
+
+    server.shutdown();
+}
+
+fn assert_lsp_implementation_start_lines(
+    files: &[(&str, &str)],
+    cursor_path: &str,
+    cursor_needle: &str,
+    expected: &[(&str, &str)],
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    for (path, source) in files {
+        let file_path = root.join(path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        fs::write(file_path, source).expect("write implementation fixture");
+    }
+
+    let mut server = LspServer::start(&root);
+    let cursor_source = files
+        .iter()
+        .find_map(|(path, source)| (*path == cursor_path).then_some(*source))
+        .unwrap_or_else(|| panic!("missing cursor file {cursor_path}"));
+    let file_uri = uri_for(&root.join(cursor_path));
+    let (line, character) = position_after(cursor_source, cursor_needle);
+    let response = implementation_response(&mut server, &file_uri, line, character);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected implementation locations, got {response}"));
+    let actual: BTreeSet<_> = locations
+        .iter()
+        .map(|location| {
+            (
+                location["uri"].as_str().expect("location uri").to_string(),
+                location["range"]["start"]["line"]
+                    .as_u64()
+                    .expect("location start line"),
+            )
+        })
+        .collect();
+    let expected: BTreeSet<_> = expected
+        .iter()
+        .map(|(path, needle)| {
+            let source = files
+                .iter()
+                .find_map(|(candidate, source)| (*candidate == *path).then_some(*source))
+                .unwrap_or_else(|| panic!("missing expected file {path}"));
+            (uri_for(&root.join(path)), position_after(source, needle).0)
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "unexpected implementation locations: {response}"
     );
 
     server.shutdown();

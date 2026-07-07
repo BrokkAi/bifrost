@@ -323,9 +323,10 @@ fn visit_rust_function(
         return None;
     }
 
-    let signature = node
-        .child_by_field_name("parameters")
-        .map(|parameters| rust_node_text(parameters, source).trim().to_string());
+    let signature = rust_impl_member_identity_signature(node, source).or_else(|| {
+        node.child_by_field_name("parameters")
+            .map(|parameters| rust_node_text(parameters, source).trim().to_string())
+    });
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
@@ -657,11 +658,13 @@ fn visit_rust_field(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| format!("_module_.{name}"));
-    let code_unit = CodeUnit::new(
+    let code_unit = CodeUnit::with_signature(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
         package_name.to_string(),
         short_name,
+        rust_impl_member_identity_signature(node, source),
+        false,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -697,11 +700,13 @@ fn visit_rust_alias(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::new(
+    let code_unit = CodeUnit::with_signature(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
         package_name.to_string(),
         short_name,
+        rust_impl_member_identity_signature(node, source),
+        false,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -790,6 +795,37 @@ fn rust_function_signature(node: Node<'_>, source: &str) -> String {
     } else {
         format!("{header} {{ ... }}")
     }
+}
+
+fn rust_impl_member_identity_signature(node: Node<'_>, source: &str) -> Option<String> {
+    let impl_item = enclosing_rust_impl_item(node)?;
+    let type_text = impl_item
+        .child_by_field_name("type")
+        .map(|node| rust_node_text(node, source).trim())?;
+    let item_signature = match node.kind() {
+        "function_item" | "function_signature_item" => rust_function_signature(node, source),
+        "type_item" | "associated_type" => rust_node_text(node, source).trim().to_string(),
+        _ => return None,
+    };
+    if let Some(trait_node) = impl_item.child_by_field_name("trait") {
+        let trait_text = rust_node_text(trait_node, source).trim();
+        Some(format!(
+            "impl {trait_text} for {type_text}::{item_signature}"
+        ))
+    } else {
+        Some(format!("impl {type_text}::{item_signature}"))
+    }
+}
+
+fn enclosing_rust_impl_item(node: Node<'_>) -> Option<Node<'_>> {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if candidate.kind() == "impl_item" {
+            return Some(candidate);
+        }
+        parent = candidate.parent();
+    }
+    None
 }
 
 fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {

@@ -17,7 +17,17 @@ pub(crate) struct TypeTarget {
 
 pub(crate) enum ImplementationTargetKind {
     Type,
-    Method { name: String },
+    Member {
+        declaration: Option<CodeUnit>,
+        name: String,
+        kind: ImplementationMemberKind,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ImplementationMemberKind {
+    Field,
+    Method,
 }
 
 #[derive(Clone, Copy)]
@@ -45,6 +55,16 @@ pub(crate) fn resolve_type_target(
             implementation_kind: ImplementationTargetKind::Type,
         });
     }
+    if matches!(eligibility, TypeTargetEligibility::Implementation)
+        && let Some(member_target) = selected_implementation_member_declaration(
+            workspace.analyzer(),
+            &file,
+            &content,
+            &cursor_range,
+        )
+    {
+        return Some(member_target);
+    }
     let outcomes = get_type::resolve_type_batch(
         workspace.analyzer(),
         vec![TypeLookupRequest {
@@ -61,8 +81,10 @@ pub(crate) fn resolve_type_target(
         return None;
     }
     let implementation_kind = match &outcome.target_kind {
-        TypeLookupTargetKind::MemberOwner { member_name } => ImplementationTargetKind::Method {
+        TypeLookupTargetKind::MemberOwner { member_name } => ImplementationTargetKind::Member {
+            declaration: None,
             name: member_name.clone(),
+            kind: ImplementationMemberKind::Method,
         },
         _ => ImplementationTargetKind::Type,
     };
@@ -106,5 +128,31 @@ fn selected_type_declaration(
 ) -> Option<CodeUnit> {
     selected_code_unit_declaration_at_cursor(analyzer, file, content, cursor_range, |code_unit| {
         code_unit.is_class()
+    })
+}
+
+fn selected_implementation_member_declaration(
+    analyzer: &dyn IAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+    content: &str,
+    cursor_range: &ByteRange,
+) -> Option<TypeTarget> {
+    let member =
+        selected_code_unit_declaration_at_cursor(analyzer, file, content, cursor_range, |unit| {
+            unit.is_function() || unit.is_field()
+        })?;
+    let owner = analyzer.parent_of(&member)?;
+    let kind = if member.is_function() {
+        ImplementationMemberKind::Method
+    } else {
+        ImplementationMemberKind::Field
+    };
+    Some(TypeTarget {
+        units: vec![owner],
+        implementation_kind: ImplementationTargetKind::Member {
+            declaration: Some(member.clone()),
+            name: member.identifier().to_string(),
+            kind,
+        },
     })
 }
