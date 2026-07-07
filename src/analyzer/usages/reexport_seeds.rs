@@ -101,8 +101,10 @@ pub(crate) fn export_local_matches_target(
     target_name: &str,
     owner_seed_allowed: bool,
 ) -> bool {
-    if target_name.contains('.') && !owner_seed_allowed {
-        local_name == target_name || module_qualified_member_matches(local_name, target_name)
+    if target_name.contains('.') {
+        local_name == target_name
+            || module_qualified_member_matches(local_name, target_name)
+            || (owner_seed_allowed && local_name == target_short)
     } else {
         local_name == target_short
     }
