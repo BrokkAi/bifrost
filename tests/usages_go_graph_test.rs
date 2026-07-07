@@ -678,6 +678,212 @@ func Run() {
 }
 
 #[test]
+fn go_graph_strategy_respects_go_embedded_promotion_precedence_and_ambiguity() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "example/promotion.go",
+        r#"
+package example
+
+type Base struct {
+    ID string
+}
+
+type Service struct {
+    Base
+    ID int
+}
+
+func readOuter(service Service) int {
+    return service.ID
+}
+
+type C struct {
+    Code string
+}
+
+type B struct {
+    C
+}
+
+type A struct {
+    Code string
+}
+
+type Wrapper struct {
+    A
+    B
+}
+
+func readShallow(wrapper Wrapper) string {
+    return wrapper.Code
+}
+
+type Left struct {
+    Name string
+}
+
+type Right struct {
+    Name string
+}
+
+type Ambiguous struct {
+    Left
+    Right
+}
+
+func readAmbiguous(value Ambiguous) string {
+    return value.Name
+}
+
+type Shared struct {
+    Token string
+}
+
+type PathA struct {
+    Shared
+}
+
+type PathB struct {
+    Shared
+}
+
+type SharedAmbiguous struct {
+    PathA
+    PathB
+}
+
+func readSharedAmbiguous(value SharedAmbiguous) string {
+    return value.Token
+}
+
+type MLeft struct{}
+func (MLeft) Run() {}
+
+type MRight struct{}
+func (MRight) Run() {}
+
+type MethodAmbiguous struct {
+    MLeft
+    MRight
+}
+
+func runAmbiguous(value MethodAmbiguous) {
+    value.Run()
+}
+
+type NamedBase struct {
+    Hidden string
+}
+
+type NamedWrapper struct {
+    NamedBase NamedBase
+}
+
+func readNamedWrapper(value NamedWrapper) string {
+    return value.Hidden
+}
+"#,
+    )]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let base_id = definition(&analyzer, "example.com/app/example.Base.ID");
+    let base_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&base_id), &candidates, 1000)
+        .into_either()
+        .expect("base ID query should succeed");
+    assert!(
+        base_hits.is_empty(),
+        "outer direct ID must shadow promoted Base.ID: {base_hits:?}"
+    );
+
+    let service_id = definition(&analyzer, "example.com/app/example.Service.ID");
+    let service_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&service_id),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("service ID query should succeed");
+    assert_eq!(1, service_hits.len(), "service ID hits: {service_hits:?}");
+    assert!(
+        service_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("return service.ID")),
+        "direct outer ID should count: {service_hits:?}"
+    );
+
+    let deep_code = definition(&analyzer, "example.com/app/example.C.Code");
+    let deep_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&deep_code),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("deep code query should succeed");
+    assert!(
+        deep_hits.is_empty(),
+        "shallower A.Code must shadow deeper C.Code: {deep_hits:?}"
+    );
+
+    let shallow_code = definition(&analyzer, "example.com/app/example.A.Code");
+    let shallow_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&shallow_code),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("shallow code query should succeed");
+    assert_eq!(1, shallow_hits.len(), "shallow code hits: {shallow_hits:?}");
+    assert!(
+        shallow_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("return wrapper.Code")),
+        "shallower promoted field should count: {shallow_hits:?}"
+    );
+
+    for fqn in [
+        "example.com/app/example.Left.Name",
+        "example.com/app/example.Right.Name",
+        "example.com/app/example.Shared.Token",
+        "example.com/app/example.MLeft.Run",
+        "example.com/app/example.MRight.Run",
+    ] {
+        let target = definition(&analyzer, fqn);
+        let hits = strategy
+            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+            .into_either()
+            .unwrap_or_else(|err| panic!("{fqn} query should succeed: {err}"));
+        assert!(
+            hits.is_empty(),
+            "ambiguous promoted selector must not count for {fqn}: {hits:?}"
+        );
+    }
+
+    let named_hidden = definition(&analyzer, "example.com/app/example.NamedBase.Hidden");
+    let named_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&named_hidden),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("named hidden query should succeed");
+    assert!(
+        named_hits.is_empty(),
+        "named same-name fields must not promote nested fields: {named_hits:?}"
+    );
+}
+
+#[test]
 fn go_graph_strategy_seeds_members_from_pointer_params_constructors_and_alias_chains() {
     let (_project, analyzer) = go_analyzer_with_files(&[
         (

@@ -14,9 +14,10 @@ use crate::analyzer::usages::csharp_graph::{
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
-    GoProjectGraph, build_workspace_go_graph, default_go_import_local_name, extract_go_import_path,
-    go_indexed_member_candidates_at_nearest_depth, go_simple_type_name, go_type_name_parts,
-    preparse_go_files, resolve_go_reference,
+    GoIndexedMemberLookup, GoProjectGraph, build_workspace_go_graph, default_go_import_local_name,
+    extract_go_import_path, go_embedded_field_unit_type_text, go_simple_type_name,
+    go_type_name_parts, go_unique_indexed_member_candidate_at_nearest_depth, preparse_go_files,
+    resolve_go_reference,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::java_graph::java_signature_arity;
@@ -582,6 +583,14 @@ fn boundary(message: String) -> DefinitionLookupOutcome {
 
 fn no_definition(kind: impl Into<String>, message: impl Into<String>) -> DefinitionLookupOutcome {
     diagnostic_outcome(DefinitionLookupStatus::NoDefinition, kind, message)
+}
+
+fn ambiguous_definition(message: impl Into<String>) -> DefinitionLookupOutcome {
+    diagnostic_outcome(
+        DefinitionLookupStatus::Ambiguous,
+        "ambiguous_definition",
+        message,
+    )
 }
 
 fn diagnostic_outcome(

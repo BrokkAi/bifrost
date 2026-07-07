@@ -300,16 +300,18 @@ fn resolve_go_local_selector_chain(
             })?;
     let mut deepest_workspace_field = None;
     for (index, member) in segments[1..].iter().enumerate() {
-        let candidates = go_indexed_field_candidates(analyzer, support, &owner_fqn, member);
-        if !candidates.is_empty() {
-            deepest_workspace_field = Some(candidates.clone());
+        let lookup = go_indexed_field_lookup(analyzer, support, &owner_fqn, member);
+        if let GoIndexedMemberLookup::Unique(candidate) = &lookup {
+            deepest_workspace_field = Some(vec![candidate.clone()]);
         }
         if index == segments.len() - 2 {
-            return if candidates.is_empty() {
-                deepest_workspace_field
-                    .map(|candidates| go_partial_selector_chain_outcome(candidates, member))
-            } else {
-                Some(candidates_outcome(candidates))
+            return match lookup {
+                GoIndexedMemberLookup::Unique(candidate) => {
+                    Some(candidates_outcome(vec![candidate]))
+                }
+                GoIndexedMemberLookup::Ambiguous => Some(go_ambiguous_selector_outcome(member)),
+                GoIndexedMemberLookup::Missing => deepest_workspace_field
+                    .map(|candidates| go_partial_selector_chain_outcome(candidates, member)),
             };
         }
         let Some(next_owner) = go_indexed_field_type_fqn(analyzer, support, &owner_fqn, member)
@@ -320,6 +322,12 @@ fn resolve_go_local_selector_chain(
         owner_fqn = next_owner;
     }
     None
+}
+
+fn go_ambiguous_selector_outcome(member: &str) -> DefinitionLookupOutcome {
+    ambiguous_definition(format!(
+        "`{member}` resolves to multiple Go embedded members at the nearest promotion depth"
+    ))
 }
 
 /// The base (leftmost operand) node of the selector chain covering the cursor —
@@ -1167,29 +1175,24 @@ fn go_indexed_field_type(
     owner_fqn: &str,
     field: &str,
 ) -> Option<(ProjectFile, String)> {
-    let mut candidates = go_indexed_field_candidates(analyzer, support, owner_fqn, field);
-    (candidates.len() == 1).then(|| {
-        let field_unit = candidates.remove(0);
-        go_field_unit_type_text(analyzer, &field_unit, field)
-            .map(|type_text| (field_unit.source().clone(), type_text))
-    })?
+    match go_indexed_field_lookup(analyzer, support, owner_fqn, field) {
+        GoIndexedMemberLookup::Unique(field_unit) => {
+            go_field_unit_type_text(analyzer, &field_unit, field)
+                .map(|type_text| (field_unit.source().clone(), type_text))
+        }
+        GoIndexedMemberLookup::Missing | GoIndexedMemberLookup::Ambiguous => None,
+    }
 }
 
-fn go_indexed_field_candidates(
+fn go_indexed_field_lookup(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner_fqn: &str,
     field: &str,
-) -> Vec<CodeUnit> {
+) -> GoIndexedMemberLookup<CodeUnit> {
     let direct = |owner_fqn: &str, field: &str| support.fqn(&format!("{owner_fqn}.{field}"));
     let embedded = |owner_fqn: &str| go_embedded_field_types(analyzer, support, owner_fqn);
-    go_indexed_member_candidates_at_nearest_depth(owner_fqn, field, &direct, &embedded)
-        .map(|(_, mut candidates)| {
-            sort_units(&mut candidates);
-            candidates.dedup();
-            candidates
-        })
-        .unwrap_or_default()
+    go_unique_indexed_member_candidate_at_nearest_depth(owner_fqn, field, &direct, &embedded)
 }
 
 fn go_embedded_field_types(
@@ -1201,18 +1204,8 @@ fn go_embedded_field_types(
         .fqn_direct_children(owner_fqn)
         .into_iter()
         .filter_map(|field| {
-            let field_name = field.identifier().to_string();
-            let type_text = go_field_unit_type_text(analyzer, &field, &field_name)?;
-            let simple = go_simple_type_name(&type_text)?;
-            (simple == field_name).then(|| {
-                go_resolve_go_field_type_fqn(
-                    analyzer,
-                    support,
-                    owner_fqn,
-                    field.source(),
-                    &type_text,
-                )
-            })?
+            let type_text = go_embedded_field_unit_type_text(analyzer, &field, None)?;
+            go_resolve_go_field_type_fqn(analyzer, support, owner_fqn, field.source(), &type_text)
         })
         .collect()
 }

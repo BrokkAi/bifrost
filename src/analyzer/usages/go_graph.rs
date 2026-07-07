@@ -25,8 +25,9 @@ use std::collections::BTreeSet;
 
 pub(in crate::analyzer::usages) use resolver::extract_go_import_path;
 pub(crate) use resolver::{
-    default_go_import_local_name, go_indexed_member_candidates_at_nearest_depth,
-    go_simple_type_name, go_type_name_parts, resolve_go_import_namespaces,
+    GoIndexedMemberLookup, default_go_import_local_name, go_embedded_field_unit_type_text,
+    go_simple_type_name, go_type_name_parts, go_unique_indexed_member_candidate_at_nearest_depth,
+    resolve_go_import_namespaces,
 };
 
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
@@ -95,7 +96,7 @@ impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
         }
         // A tree-free resolution index; the per-file walk re-parses on demand and
         // drops each tree, so the whole-workspace build retains no syntax trees.
-        let index = build_go_edge_index(&files)?;
+        let index = build_go_edge_index(go, &files)?;
         Some(Self { go, index })
     }
 

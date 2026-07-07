@@ -1,3 +1,4 @@
+use crate::analyzer::go::go_field_declaration_is_embedded;
 use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_path};
 use crate::analyzer::usages::common::language_for_file;
 pub(super) use crate::analyzer::usages::common::node_text;
@@ -7,7 +8,6 @@ use crate::analyzer::usages::go_graph::extractor::{
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
-use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::usages::reexport_seeds;
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
@@ -253,20 +253,21 @@ fn build_importer_reverse_go(
     reverse
 }
 
-/// Read and tree-sitter parse a single Go file. Returns `None` if the file
-/// cannot be read, the grammar fails to load, or parsing fails.
 /// Tree-free resolution metadata for the whole-workspace inverted edge build:
-/// each file's Go `package` clause name, the parent-dir index, and the module
-/// path. Built by parsing each file once to read its package clause and dropping
-/// the tree, so the edge build holds no syntax trees — they are re-parsed on
-/// demand inside the per-file walk and dropped immediately. Mirrors the JS/TS
-/// [`JsTsUsageIndex`]. The tree-holding [`GoProjectGraph`] still backs the
-/// per-symbol query and `get_definition` paths, which read node text from trees.
+/// package names/import resolution, constructor-return facts, direct members,
+/// and embedded-field promotion links. Built by parsing each file once and then
+/// dropping every tree, so edge scans retain only compact maps; source trees are
+/// re-parsed on demand inside each per-file walk and dropped immediately.
+/// Mirrors the JS/TS [`JsTsUsageIndex`]. The tree-holding [`GoProjectGraph`]
+/// still backs the per-symbol query and `get_definition` paths, which read node
+/// text from trees.
 ///
 /// [`JsTsUsageIndex`]: crate::analyzer::usages::js_ts_graph::JsTsUsageIndex
 pub(crate) struct GoEdgeIndex {
     package_names: HashMap<ProjectFile, String>,
     constructor_return_types: HashMap<String, Vec<String>>,
+    direct_member_fqns: HashMap<String, HashMap<String, Vec<String>>>,
+    embedded_field_type_fqns: HashMap<String, Vec<String>>,
     dir_index: ParentDirIndex,
     module_path: Option<String>,
 }
@@ -303,13 +304,42 @@ impl GoEdgeIndex {
     pub(super) fn constructor_return_types(&self, callee: &str) -> Option<&Vec<String>> {
         self.constructor_return_types.get(callee)
     }
+
+    pub(super) fn direct_member_fqns(&self, owner_fqn: &str, member: &str) -> &[String] {
+        self.direct_member_fqns
+            .get(owner_fqn)
+            .and_then(|members| members.get(member))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(super) fn embedded_field_type_fqns(&self, owner_fqn: &str) -> &[String] {
+        self.embedded_field_type_fqns
+            .get(owner_fqn)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(super) fn unique_member_fqn(&self, owner_fqn: &str, member: &str) -> Option<String> {
+        let direct = |owner: &str, member: &str| self.direct_member_fqns(owner, member).to_vec();
+        let embedded = |owner: &str| self.embedded_field_type_fqns(owner).to_vec();
+        match go_unique_indexed_member_candidate_at_nearest_depth(
+            owner_fqn, member, &direct, &embedded,
+        ) {
+            GoIndexedMemberLookup::Unique(candidate) => Some(candidate),
+            GoIndexedMemberLookup::Missing | GoIndexedMemberLookup::Ambiguous => None,
+        }
+    }
 }
 
-/// Build the tree-free [`GoEdgeIndex`] over `files`: read each Go file's package
-/// clause (parsing then dropping the tree, so peak live trees during the build are
-/// bounded by the rayon worker count), then index parent directories for module
-/// resolution. `None` when there are no Go files.
-pub(crate) fn build_go_edge_index(files: &[ProjectFile]) -> Option<GoEdgeIndex> {
+/// Build the tree-free [`GoEdgeIndex`] over `files`: parse each Go file once to
+/// collect package clauses, constructor-return facts, and embedded-member
+/// promotion metadata, then drop those trees before returning. `None` when there
+/// are no Go files.
+pub(crate) fn build_go_edge_index(
+    analyzer: &GoAnalyzer,
+    files: &[ProjectFile],
+) -> Option<GoEdgeIndex> {
     let go_files: Vec<ProjectFile> = files
         .iter()
         .filter(|file| language_for_file(file) == Language::Go)
@@ -317,18 +347,23 @@ pub(crate) fn build_go_edge_index(files: &[ProjectFile]) -> Option<GoEdgeIndex> 
         .collect();
     let module_path = read_go_module_path(go_files.first()?.root());
 
-    let summaries: Vec<_> = go_files
+    let parsed_files: Vec<_> = go_files
         .par_iter()
-        .filter_map(|file| Some((file.clone(), summarize_go_file(file)?)))
+        .filter_map(|file| Some((file.clone(), parse_go_file(file)?)))
         .collect();
-    let package_names: HashMap<ProjectFile, String> = summaries
+    if parsed_files.is_empty() {
+        return None;
+    }
+    let package_names: HashMap<ProjectFile, String> = parsed_files
         .iter()
-        .map(|(file, summary)| (file.clone(), summary.package_name.clone()))
+        .map(|(file, parsed)| (file.clone(), parsed.package_name.clone()))
         .collect();
     let mut constructor_return_types: HashMap<String, Vec<String>> = HashMap::default();
-    for (file, summary) in &summaries {
-        let package_fqn = canonical_go_package_name(file, &summary.package_name);
-        for (function, owner) in &summary.constructor_returns {
+    for (file, parsed) in &parsed_files {
+        let package_fqn = canonical_go_package_name(file, &parsed.package_name);
+        for (function, owner) in
+            collect_constructor_returns(parsed.tree.root_node(), &parsed.source)
+        {
             constructor_return_types
                 .entry(format!("{package_fqn}.{function}"))
                 .or_default()
@@ -341,30 +376,193 @@ pub(crate) fn build_go_edge_index(files: &[ProjectFile]) -> Option<GoEdgeIndex> 
     }
 
     let dir_index = build_parent_dir_index(package_names.keys());
+    let indexed_files: Vec<ProjectFile> =
+        parsed_files.iter().map(|(file, _)| file.clone()).collect();
+    let type_fqns = collect_go_type_fqns(analyzer, &indexed_files);
+    let direct_member_fqns = collect_go_direct_member_fqns(analyzer, &indexed_files);
+    let embedded_field_type_fqns = collect_go_embedded_field_type_fqns(
+        analyzer,
+        &parsed_files,
+        &package_names,
+        &dir_index,
+        module_path.as_deref(),
+        &type_fqns,
+    );
 
     Some(GoEdgeIndex {
         package_names,
         constructor_return_types,
+        direct_member_fqns,
+        embedded_field_type_fqns,
         dir_index,
         module_path,
     })
 }
 
-struct GoFileSummary {
-    package_name: String,
-    constructor_returns: Vec<(String, String)>,
+fn collect_go_type_fqns(analyzer: &GoAnalyzer, files: &[ProjectFile]) -> HashSet<String> {
+    let mut type_fqns = HashSet::default();
+    for file in files {
+        for unit in analyzer.declarations(file) {
+            if unit.is_class() {
+                type_fqns.insert(unit.fq_name());
+            }
+        }
+    }
+    type_fqns
 }
 
-/// Parse `file` solely to read tree-free edge metadata, dropping the tree before
-/// returning. `None` when the file is unreadable, empty, or unparseable — the same
-/// skip-on-failure contract as the shared `parse_tree_sitter_file` it reuses.
-fn summarize_go_file(file: &ProjectFile) -> Option<GoFileSummary> {
-    let parsed = parse_tree_sitter_file(file, &tree_sitter_go::LANGUAGE.into())?;
-    let root = parsed.tree.root_node();
-    Some(GoFileSummary {
-        package_name: package_name(root, &parsed.source),
-        constructor_returns: collect_constructor_returns(root, &parsed.source),
-    })
+fn collect_go_direct_member_fqns(
+    analyzer: &GoAnalyzer,
+    files: &[ProjectFile],
+) -> HashMap<String, HashMap<String, Vec<String>>> {
+    let mut members: HashMap<String, HashMap<String, Vec<String>>> = HashMap::default();
+    for file in files {
+        for unit in analyzer.declarations(file) {
+            if !(unit.is_function() || unit.is_field()) {
+                continue;
+            }
+            let fqn = unit.fq_name();
+            let Some((owner, member)) = fqn.rsplit_once('.') else {
+                continue;
+            };
+            members
+                .entry(owner.to_string())
+                .or_default()
+                .entry(member.to_string())
+                .or_default()
+                .push(fqn);
+        }
+    }
+    members
+}
+
+fn collect_go_embedded_field_type_fqns(
+    analyzer: &GoAnalyzer,
+    parsed_files: &[(ProjectFile, ParsedFile)],
+    package_names: &HashMap<ProjectFile, String>,
+    dir_index: &ParentDirIndex,
+    module_path: Option<&str>,
+    type_fqns: &HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    let mut embedded_by_owner: HashMap<String, Vec<String>> = HashMap::default();
+    let resolver = GoEdgeTypeResolver {
+        analyzer,
+        package_names,
+        dir_index,
+        module_path,
+        type_fqns,
+    };
+    for (file, parsed) in parsed_files {
+        if !package_names.contains_key(file) {
+            continue;
+        }
+        for field in analyzer.declarations(file).filter(|unit| unit.is_field()) {
+            let Some(type_text) = go_embedded_field_unit_type_text(analyzer, field, Some(parsed))
+            else {
+                continue;
+            };
+            let field_fqn = field.fq_name();
+            let Some((owner_fqn, _)) = field_fqn.rsplit_once('.') else {
+                continue;
+            };
+            let Some(embedded_fqn) =
+                resolver.resolve_field_type_fqn(field.source(), owner_fqn, &type_text)
+            else {
+                continue;
+            };
+            embedded_by_owner
+                .entry(owner_fqn.to_string())
+                .or_default()
+                .push(embedded_fqn);
+        }
+    }
+    embedded_by_owner
+}
+
+pub(crate) fn go_embedded_field_unit_type_text(
+    analyzer: &dyn IAnalyzer,
+    field: &CodeUnit,
+    parsed: Option<&ParsedFile>,
+) -> Option<String> {
+    let parsed_file;
+    let parsed = match parsed {
+        Some(parsed) => parsed,
+        None => {
+            parsed_file = parse_go_file(field.source())?;
+            &parsed_file
+        }
+    };
+    if !go_field_unit_is_embedded(analyzer, field, parsed) {
+        return None;
+    }
+    let field_name = field.identifier().to_string();
+    let type_text = go_field_unit_type_text(analyzer, field, &field_name)?;
+    let simple = go_simple_type_name(&type_text)?;
+    (simple == field_name).then_some(type_text)
+}
+
+fn go_field_unit_is_embedded(
+    analyzer: &dyn IAnalyzer,
+    field: &CodeUnit,
+    parsed: &ParsedFile,
+) -> bool {
+    let Some(range) = analyzer.ranges(field).first() else {
+        return false;
+    };
+    let Some(node) = parsed
+        .tree
+        .root_node()
+        .descendant_for_byte_range(range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    go_enclosing_field_declaration(node).is_some_and(go_field_declaration_is_embedded)
+}
+
+fn go_enclosing_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if node.kind() == "field_declaration" {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+struct GoEdgeTypeResolver<'a> {
+    analyzer: &'a GoAnalyzer,
+    package_names: &'a HashMap<ProjectFile, String>,
+    dir_index: &'a ParentDirIndex,
+    module_path: Option<&'a str>,
+    type_fqns: &'a HashSet<String>,
+}
+
+impl GoEdgeTypeResolver<'_> {
+    fn resolve_field_type_fqn(
+        &self,
+        file: &ProjectFile,
+        owner_fqn: &str,
+        type_text: &str,
+    ) -> Option<String> {
+        if let Some((Some(qualifier), name)) = go_type_name_parts(type_text) {
+            let (namespaces, _) = namespace_packages_from(
+                self.analyzer,
+                file,
+                self.dir_index,
+                self.module_path,
+                |target| self.package_names.get(target).cloned(),
+            );
+            return namespaces.get(qualifier).and_then(|packages| {
+                packages.iter().find_map(|package| {
+                    let fqn = format!("{package}.{name}");
+                    self.type_fqns.contains(&fqn).then_some(fqn)
+                })
+            });
+        }
+        let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
+        let name = go_simple_type_name(type_text)?;
+        let fqn = format!("{package}.{name}");
+        self.type_fqns.contains(&fqn).then_some(fqn)
+    }
 }
 
 fn collect_constructor_returns(root: Node<'_>, source: &str) -> Vec<(String, String)> {
@@ -875,15 +1073,15 @@ fn collect_promoted_receiver_types(
         let direct =
             |owner: &str, member: &str| graph_direct_member_fqns(analyzer, graph, owner, member);
         let embedded = |owner: &str| graph_embedded_field_type_fqns(analyzer, graph, owner);
-        let Some((_, candidates)) = go_indexed_member_candidates_at_nearest_depth(
-            &unit.fq_name(),
-            member,
-            &direct,
-            &embedded,
-        ) else {
-            continue;
-        };
-        if candidates.iter().any(|candidate| candidate == &target_fqn) {
+        if matches!(
+            go_unique_indexed_member_candidate_at_nearest_depth(
+                &unit.fq_name(),
+                member,
+                &direct,
+                &embedded,
+            ),
+            GoIndexedMemberLookup::Unique(candidate) if candidate == target_fqn
+        ) {
             receivers.insert((unit.source().clone(), unit.short_name().to_string()));
         }
     }
@@ -935,18 +1133,9 @@ fn graph_embedded_field_type_fqns(
     graph_direct_children(analyzer, graph, owner_fqn)
         .into_iter()
         .filter_map(|field| {
-            let field_name = field.identifier().to_string();
-            let type_text = go_field_unit_type_text(analyzer, &field, &field_name)?;
-            let simple = go_simple_type_name(&type_text)?;
-            (simple == field_name).then(|| {
-                go_resolve_graph_field_type_fqn(
-                    analyzer,
-                    graph,
-                    owner_fqn,
-                    field.source(),
-                    &type_text,
-                )
-            })?
+            let parsed = graph.parsed_file(field.source())?;
+            let type_text = go_embedded_field_unit_type_text(analyzer, &field, Some(parsed))?;
+            go_resolve_graph_field_type_fqn(analyzer, graph, owner_fqn, field.source(), &type_text)
         })
         .collect()
 }
@@ -1434,6 +1623,31 @@ fn go_indexed_member_candidates_at_nearest_depth_inner<T: Clone>(
     }
 
     (best_depth != usize::MAX).then_some((best_depth, best_candidates))
+}
+
+pub(crate) enum GoIndexedMemberLookup<T> {
+    Missing,
+    Unique(T),
+    Ambiguous,
+}
+
+pub(crate) fn go_unique_indexed_member_candidate_at_nearest_depth<T: Clone>(
+    owner_fqn: &str,
+    member: &str,
+    direct: &impl Fn(&str, &str) -> Vec<T>,
+    embedded: &impl Fn(&str) -> Vec<String>,
+) -> GoIndexedMemberLookup<T> {
+    match go_indexed_member_candidates_at_nearest_depth(owner_fqn, member, direct, embedded) {
+        None => GoIndexedMemberLookup::Missing,
+        Some((_depth, candidates)) if candidates.len() == 1 => {
+            let candidate = candidates
+                .into_iter()
+                .next()
+                .expect("candidate count checked");
+            GoIndexedMemberLookup::Unique(candidate)
+        }
+        Some((_depth, _candidates)) => GoIndexedMemberLookup::Ambiguous,
+    }
 }
 
 fn go_field_unit_type_text(
