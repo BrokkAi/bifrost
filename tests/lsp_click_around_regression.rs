@@ -1860,3 +1860,169 @@ def unknown(thing):
 
     assert_timing_summary("milestone_10_python_alias_property", &timings, 15);
 }
+
+#[test]
+fn milestone_11_ruby_constants_mixins_click_around() {
+    let fixture = ClickFixture::new("milestone_11_ruby_constants_mixins")
+        .file(
+            "lib/billing/invoice.rb",
+            r#"module Billing
+  module Auditable
+    def <auditable_audit_decl>audit
+    end
+  end
+
+  module Formatting
+    module_function
+
+    def <format_total_decl>format_total(value)
+      value.to_s
+    end
+  end
+
+  <record_range>class <record_decl>Record
+    def <record_save_decl>save
+    end
+  end
+
+  <invoice_range>class <invoice_decl>Invoice < Record
+    include Auditable
+
+    <currency_decl>DEFAULT_CURRENCY = "USD"
+
+    def self.<build_decl>build
+      @last_build = Invoice.new
+    end
+  end
+
+  class <other_invoice_decl>OtherInvoice
+    def <other_audit_decl>audit
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "app/report.rb",
+            r#"require_relative "../lib/billing/invoice"
+
+module Reports
+  class InvoiceReport
+    def render
+      Billing::Invoice::<currency_ref>DEFAULT_CURRENCY
+      invoice = Billing::Invoice.<build_call>build
+      invoice.<audit_call>audit
+      invoice.<save_call>save
+      Billing::Formatting.<format_call>format_total(10)
+
+      other = Billing::OtherInvoice.new
+      other.<other_audit_call>audit
+      unknown.<unknown_audit_call>audit
+    end
+  end
+end
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "namespaced class constant resolves to constant assignment",
+                "currency_ref",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["currency_decl"]),
+            ),
+            ClickCase::new(
+                "constructed receiver factory resolves class method",
+                "build_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["build_decl"]),
+            ),
+            ClickCase::new(
+                "constructed receiver resolves included mixin method",
+                "audit_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["auditable_audit_decl"]),
+            ),
+            ClickCase::new(
+                "constructed receiver resolves inherited method",
+                "save_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["record_save_decl"]),
+            ),
+            ClickCase::new(
+                "module function call resolves to module method",
+                "format_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["format_total_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name method resolves to unrelated owner",
+                "other_audit_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_audit_decl"]),
+            ),
+            ClickCase::new(
+                "unknown receiver does not guess same-name method",
+                "unknown_audit_call",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "constant references include namespaced constant use",
+                "currency_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["currency_ref"]),
+            ),
+            ClickCase::new(
+                "class method references include factory call",
+                "build_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["build_call"]),
+            ),
+            ClickCase::new(
+                "mixin method references include constructed receiver call",
+                "auditable_audit_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["audit_call"]),
+            ),
+            ClickCase::new(
+                "inherited method references include constructed receiver call",
+                "record_save_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["save_call"]),
+            ),
+            ClickCase::new(
+                "module function references include qualified module call",
+                "format_total_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["format_call"]),
+            ),
+            ClickCase::new(
+                "Invoice supertypes include Record",
+                "invoice_decl",
+                ClickOperation::TypeHierarchySupertypes,
+                ClickExpectation::Locations(&["record_range"]),
+            ),
+            ClickCase::new(
+                "Record subtypes include Invoice",
+                "record_decl",
+                ClickOperation::TypeHierarchySubtypes,
+                ClickExpectation::Locations(&["invoice_range"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_11_ruby_constants_mixins", &timings, 14);
+}

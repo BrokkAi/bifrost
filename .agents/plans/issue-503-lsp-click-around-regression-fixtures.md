@@ -25,7 +25,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T11:37Z) Milestone 8: added the JavaScript CommonJS/object click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the exposed factory-returned object resolver gap, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:53Z) Milestone 9: added the TypeScript interface/type-alias click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted references coverage finding, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:59Z) Milestone 10: added the Python alias/property click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted classmethod-reference coverage finding, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 11: Ruby click-around fixture.
+- [x] (2026-07-07T12:03Z) Milestone 11: added the Ruby constants/mixins click-around fixture, ran focused tests, ran Brokk Guided Review, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 12: ignored stress fixtures and final sweep.
 
 ## Surprises & Discoveries
@@ -77,6 +77,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 
 - Observation: Python classmethod factory receiver inference needs an explicit return annotation to propagate the constructed receiver type through a reexported class alias.
   Evidence: The first Milestone 10 fixture run returned `null` for `account.label()` after `account = Account.guest()` until `guest` was annotated as returning `"User"`, matching the existing Python get-definition contract.
+
+- Observation: Ruby namespaced factory receiver inference follows the existing `@ivar = Invoice.new` body shape for `Billing::Invoice.build`, while a bare `new` body did not propagate the local receiver type to a later mixin method call in the LSP fixture.
+  Evidence: The first Milestone 11 fixture run returned `null` for `invoice.audit` after `invoice = Billing::Invoice.build` until `build` was changed to assign `Invoice.new`, matching the existing Ruby get-definition contract.
 
 ## Decision Log
 
@@ -178,6 +181,10 @@ Milestone 10 is complete. The Python fixture now covers reexported class aliases
 
 Milestone 10 Brokk Guided Review outcome: security, duplication, devops, and architecture found no blocking issues in the test-only milestone diff. Senior-dev coverage review found that the classmethod factory call should be covered by references, not only definition. Accepted fixes add exact `User.guest` references through the reexported `Account.guest()` call. Focused Python LSP, formatting, and diff checks pass.
 
+Milestone 11 is complete. The Ruby fixture now covers namespaced constants, project-local `require_relative`, class factory receivers, mixin methods, inherited methods, module functions, unrelated same-name methods, references, type hierarchy supertypes/subtypes, and an unsupported unknown-receiver null case.
+
+Milestone 11 Brokk Guided Review outcome: the test-only milestone diff had no blocking security, duplication, senior-dev, devops, or architecture findings after inherited-method references were included. The fixture stays within existing Ruby contracts for namespaced factory receiver inference and hierarchy ranges. Focused Ruby LSP, formatting, and diff checks pass.
+
 ## Timing Log
 
 - Milestone 0: Harness and Timing Infrastructure
@@ -278,6 +285,15 @@ Milestone 10 Brokk Guided Review outcome: security, duplication, devops, and arc
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_10_python --features nlp -- --nocapture` passed in 7.39s real time after recompiling the changed test; test execution took 3.77s. `cargo fmt --check` and `git diff --check` also passed.
   - Click cases added: 15.
   - Slowest fixture/operation: `milestone_10_python_alias_property`, case `reexported class alias resolves to original class`, marker `account_class_ref`, operation `definition`, 40 ms before review and 43 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 11: Ruby
+  - Language: Ruby.
+  - Start: 2026-07-07T12:00Z.
+  - End: 2026-07-07T12:03Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_11_ruby --features nlp -- --nocapture` passed in 5.22s real time after recompiling the changed test; test execution took 2.51s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_11_ruby --features nlp -- --nocapture` passed in 2.99s real time; test execution took 2.24s. `cargo fmt --check` and `git diff --check` also passed.
+  - Click cases added: 14.
+  - Slowest fixture/operation: `milestone_11_ruby_constants_mixins`, case `namespaced class constant resolves to constant assignment`, marker `currency_ref`, operation `definition`, 31 ms before review and 24 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -382,3 +398,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 9 Guided Review gate.
 Revision note, 2026-07-07 / Codex: Started Milestone 10 and added the Python alias/property fixture. The pre-review focused Python filter passes, covering reexported class aliases, classmethod factory receivers with explicit return annotations, inherited methods, decorated properties, self attribute reads, unrelated same-name methods, references, hover, type hierarchy, and an unsupported untyped-receiver null case.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 10 Guided Review gate. Accepted review feedback strengthened classmethod factory references so `User.guest` now asserts the reexported `Account.guest()` call in addition to definition behavior. Focused Python LSP, formatting, and diff checks pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 11 and added the Ruby constants/mixins fixture. The pre-review focused Ruby filter passes, covering namespaced constants, project-local `require_relative`, class factory receivers, mixin methods, inherited methods, module functions, unrelated same-name methods, references, type hierarchy, and an unsupported unknown-receiver null case.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 11 Guided Review gate. No accepted code changes were needed after inherited-method references were included in the pre-review fixture. Focused Ruby LSP, formatting, and diff checks pass.
