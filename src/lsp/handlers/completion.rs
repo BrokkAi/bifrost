@@ -276,6 +276,7 @@ fn map_completion_kind(kind: CodeUnitType) -> CompletionItemKind {
     match kind {
         CodeUnitType::Class => CompletionItemKind::CLASS,
         CodeUnitType::Function => CompletionItemKind::FUNCTION,
+        CodeUnitType::Method => CompletionItemKind::METHOD,
         CodeUnitType::Field => CompletionItemKind::FIELD,
         CodeUnitType::Module => CompletionItemKind::MODULE,
         CodeUnitType::Macro => CompletionItemKind::CONSTANT,

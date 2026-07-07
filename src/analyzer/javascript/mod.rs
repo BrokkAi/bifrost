@@ -1311,13 +1311,14 @@ fn visit_js_variable_statement(
             );
             parsed.add_signature(surface_code_unit.clone(), variable_signature);
             if let Some(object) = indexable_object {
-                visit_js_object_literal_properties(
+                visit_js_object_literal_properties_for_surface(
                     file,
                     source,
                     object,
                     &surface_code_unit,
                     &surface_code_unit,
                     parsed,
+                    JsAssignmentSymbolSurface::DefinitionLookupOnly,
                 );
             }
         }
@@ -1370,11 +1371,7 @@ fn visit_js_object_literal_properties_for_surface(
         let Some(name) = js_object_literal_property_name(child, source) else {
             continue;
         };
-        let kind = if js_object_literal_property_is_function(child) {
-            crate::analyzer::CodeUnitType::Function
-        } else {
-            crate::analyzer::CodeUnitType::Field
-        };
+        let kind = js_object_literal_property_kind(child);
         let code_unit = CodeUnit::new(
             file.clone(),
             kind,
@@ -1399,11 +1396,17 @@ fn visit_js_object_literal_properties_for_surface(
     }
 }
 
-fn js_object_literal_property_is_function(node: Node<'_>) -> bool {
-    node.kind() == "method_definition"
-        || node
-            .child_by_field_name("value")
-            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+fn js_object_literal_property_kind(node: Node<'_>) -> crate::analyzer::CodeUnitType {
+    if node.kind() == "method_definition" {
+        crate::analyzer::CodeUnitType::Method
+    } else if node
+        .child_by_field_name("value")
+        .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+    {
+        crate::analyzer::CodeUnitType::Function
+    } else {
+        crate::analyzer::CodeUnitType::Field
+    }
 }
 
 fn js_object_literal_property_name(node: Node<'_>, source: &str) -> Option<String> {

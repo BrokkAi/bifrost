@@ -189,6 +189,7 @@ pub(crate) fn code_unit_kind_str(kind: CodeUnitType) -> &'static str {
     match kind {
         CodeUnitType::Class => "Class",
         CodeUnitType::Function => "Function",
+        CodeUnitType::Method => "Method",
         CodeUnitType::Field => "Field",
         CodeUnitType::Module => "Module",
         CodeUnitType::Macro => "Macro",
@@ -202,6 +203,7 @@ pub(crate) fn parse_kind(s: &str) -> Option<CodeUnitType> {
     Some(match s {
         "Class" => CodeUnitType::Class,
         "Function" => CodeUnitType::Function,
+        "Method" => CodeUnitType::Method,
         "Field" => CodeUnitType::Field,
         "Module" => CodeUnitType::Module,
         "Macro" => CodeUnitType::Macro,

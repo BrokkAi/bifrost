@@ -848,7 +848,7 @@ pub fn search_symbols(
                 .map(|content| line_count(&content))
                 .unwrap_or(0),
             classes: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Class),
-            functions: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Function),
+            functions: collect_callable_kind_names(analyzer, &code_units),
             fields: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Field),
             modules: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Module),
             macros: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Macro),
@@ -3324,9 +3324,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     let mut overloads_by_node: BTreeMap<(Ecosystem, String, Option<String>), Vec<CodeUnit>> =
         BTreeMap::new();
     for unit in analyzer.all_declarations() {
-        if unit.is_synthetic()
-            || !matches!(unit.kind(), CodeUnitType::Class | CodeUnitType::Function)
-        {
+        if unit.is_synthetic() || !(unit.is_class() || unit.is_callable()) {
             continue;
         }
         let ecosystem = Ecosystem::of(language_for_target(unit));
@@ -4753,9 +4751,24 @@ fn collect_ranked_kind_names(
     code_units: &[RankedSearchCandidate],
     kind: CodeUnitType,
 ) -> Vec<SearchSymbolHit> {
+    collect_ranked_names_by(analyzer, code_units, |unit| unit.kind() == kind)
+}
+
+fn collect_callable_kind_names(
+    analyzer: &dyn IAnalyzer,
+    code_units: &[RankedSearchCandidate],
+) -> Vec<SearchSymbolHit> {
+    collect_ranked_names_by(analyzer, code_units, CodeUnit::is_callable)
+}
+
+fn collect_ranked_names_by(
+    analyzer: &dyn IAnalyzer,
+    code_units: &[RankedSearchCandidate],
+    matches_kind: impl Fn(&CodeUnit) -> bool,
+) -> Vec<SearchSymbolHit> {
     let mut hits: Vec<_> = code_units
         .iter()
-        .filter(|candidate| candidate.code_unit.kind() == kind)
+        .filter(|candidate| matches_kind(&candidate.code_unit))
         .flat_map(|candidate| {
             display_signatures(analyzer, &candidate.code_unit)
                 .into_iter()
@@ -4852,7 +4865,7 @@ fn display_signatures(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Str
 
     let fallback = match code_unit.kind() {
         CodeUnitType::Class => format!("class {}", display_identifier_for_target(code_unit)),
-        CodeUnitType::Function => code_unit
+        CodeUnitType::Function | CodeUnitType::Method => code_unit
             .signature()
             .map(|signature| format!("{}{}", display_identifier_for_target(code_unit), signature))
             .unwrap_or_else(|| format!("{}()", display_identifier_for_target(code_unit))),
@@ -4945,14 +4958,7 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
 }
 
 fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
-    match kind {
-        CodeUnitType::Class => "class",
-        CodeUnitType::Function => "function",
-        CodeUnitType::Field => "field",
-        CodeUnitType::Module => "module",
-        CodeUnitType::Macro => "macro",
-        CodeUnitType::FileScope => "file scope",
-    }
+    kind.display_lowercase()
 }
 
 fn file_preamble(

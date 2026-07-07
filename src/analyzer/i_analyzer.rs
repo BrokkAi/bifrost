@@ -628,6 +628,7 @@ fn all_code_unit_types() -> BTreeSet<CodeUnitType> {
     [
         CodeUnitType::Class,
         CodeUnitType::Function,
+        CodeUnitType::Method,
         CodeUnitType::Field,
         CodeUnitType::Module,
         CodeUnitType::Macro,
@@ -656,6 +657,7 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
     match code_unit.kind() {
         crate::analyzer::CodeUnitType::Class => 0,
         crate::analyzer::CodeUnitType::Function => 1,
+        crate::analyzer::CodeUnitType::Method => 1,
         crate::analyzer::CodeUnitType::Field => 2,
         crate::analyzer::CodeUnitType::Macro => 3,
         crate::analyzer::CodeUnitType::Module => 4,
