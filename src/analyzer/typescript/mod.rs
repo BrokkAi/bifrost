@@ -1296,24 +1296,13 @@ fn visit_ts_value(
         let short_name = if kind == crate::analyzer::CodeUnitType::Field {
             if let Some(parent) = parent {
                 format!("{}.{}", parent.short_name(), name)
-            } else if module_surface {
-                name.clone()
             } else {
-                {
-                    format!(
-                        "{}.{}",
-                        file.rel_path()
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("module"),
-                        name
-                    )
-                }
+                ts_file_scoped_field_name(file, &name)
             }
         } else {
             parent
                 .map(|parent| format!("{}.{}", parent.short_name(), name))
-                .unwrap_or(name)
+                .unwrap_or_else(|| name.clone())
         };
         let code_unit = CodeUnit::new(file.clone(), kind, "", short_name);
         let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
@@ -1325,13 +1314,13 @@ fn visit_ts_value(
             parent.cloned(),
             Some(top_level.clone()),
         );
-        if is_function {
+        let variable_signature = if is_function {
             let signature = ts_variable_function_signature(definition, child, source, exported);
             if let Some(value) = value {
                 parsed.add_signature_with_metadata(
                     code_unit.clone(),
                     SignatureMetadata::with_parameter_labels(
-                        signature,
+                        signature.clone(),
                         ts_parameter_labels(value, source),
                     ),
                 );
@@ -1339,27 +1328,64 @@ fn visit_ts_value(
                     file, source, value, &code_unit, &top_level, parsed,
                 );
             } else {
-                parsed.add_signature(code_unit.clone(), signature);
+                parsed.add_signature(code_unit.clone(), signature.clone());
             }
+            signature
         } else {
-            parsed.add_signature(
-                code_unit.clone(),
-                ts_variable_signature(definition, child, source, exported),
-            );
-        }
-        if !is_function
-            && let Some(value) = value
-            && let Some(object) = if module_surface {
-                ts_exported_surface_object_literal_value(child, value, source)
-            } else {
-                ts_indexable_object_literal_value(child, value, source)
-            }
-        {
+            let signature = ts_variable_signature(definition, child, source, exported);
+            parsed.add_signature(code_unit.clone(), signature.clone());
+            signature
+        };
+        let indexable_object = if !is_function {
+            value.and_then(|value| {
+                if module_surface {
+                    ts_exported_surface_object_literal_value(child, value, source)
+                } else {
+                    ts_indexable_object_literal_value(child, value, source)
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(object) = indexable_object {
             visit_ts_object_literal_properties(
                 file, source, object, &code_unit, &top_level, parsed,
             );
         }
+        if module_surface && kind == crate::analyzer::CodeUnitType::Field && parent.is_none() {
+            let surface_code_unit =
+                CodeUnit::new(file.clone(), crate::analyzer::CodeUnitType::Field, "", name);
+            parsed.add_code_unit(
+                surface_code_unit.clone(),
+                range_node,
+                source,
+                None,
+                Some(surface_code_unit.clone()),
+            );
+            parsed.add_signature(surface_code_unit.clone(), variable_signature);
+            if let Some(object) = indexable_object {
+                visit_ts_object_literal_properties(
+                    file,
+                    source,
+                    object,
+                    &surface_code_unit,
+                    &surface_code_unit,
+                    parsed,
+                );
+            }
+        }
     }
+}
+
+fn ts_file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
+    format!(
+        "{}.{}",
+        file.rel_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("module"),
+        name
+    )
 }
 
 fn visit_ts_type_alias_members(

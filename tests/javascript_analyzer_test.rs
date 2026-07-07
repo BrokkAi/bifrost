@@ -1052,8 +1052,8 @@ obj.helper = function helper() {};
         "prototype assignment should remain declared: {names:?}"
     );
     assert!(
-        !names.contains(&"request.accepts".to_string()),
-        "CommonJS member re-export should not promote the whole local object: {names:?}"
+        names.contains(&"request.accepts".to_string()),
+        "CommonJS member re-export should preserve the targeted member declaration: {names:?}"
     );
     assert!(
         names.contains(&"req.route".to_string()),

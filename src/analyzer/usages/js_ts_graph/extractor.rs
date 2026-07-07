@@ -379,6 +379,15 @@ fn is_target_declaration_binding(name_node: Node<'_>, lhs: &str, ctx: &ScanCtx<'
     {
         return true;
     }
+    if let Some(owner) = ctx.target_owner
+        && ctx
+            .analyzer
+            .ranges(owner)
+            .iter()
+            .any(|owner_range| range_within(&range, owner_range))
+    {
+        return true;
+    }
     let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
         return false;
     };
@@ -760,6 +769,13 @@ pub(super) fn rightmost_jsx_identifier<'a>(
 fn member_object_matches_target(node: Node<'_>, object_text: &str, ctx: &ScanCtx<'_>) -> bool {
     if ctx.target_is_static_member {
         return ctx.binds_target(object_text);
+    }
+
+    if ctx.target_self_file
+        && simple_identifier_text(node, ctx.source).is_some()
+        && ctx.binds_target(object_text)
+    {
+        return true;
     }
 
     if expression_is_target_constructor(node, ctx) {

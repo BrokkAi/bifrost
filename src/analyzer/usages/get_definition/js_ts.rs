@@ -1,5 +1,49 @@
 use super::*;
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsTsAliasCandidateKey {
+    source: ProjectFile,
+    kind: crate::analyzer::CodeUnitType,
+    signature: Option<String>,
+    ranges: Vec<Range>,
+}
+
+fn js_ts_candidates_outcome(
+    analyzer: &dyn IAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> DefinitionLookupOutcome {
+    candidates_outcome(prefer_js_ts_alias_representatives(analyzer, candidates))
+}
+
+fn prefer_js_ts_alias_representatives(
+    analyzer: &dyn IAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    let mut representatives: HashMap<JsTsAliasCandidateKey, CodeUnit> = HashMap::default();
+    for candidate in candidates {
+        let key = JsTsAliasCandidateKey {
+            source: candidate.source().clone(),
+            kind: candidate.kind(),
+            signature: candidate.signature().map(str::to_string),
+            ranges: analyzer.ranges(&candidate).to_vec(),
+        };
+        representatives
+            .entry(key)
+            .and_modify(|current| {
+                if js_ts_alias_preference(&candidate) < js_ts_alias_preference(current) {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    representatives.into_values().collect()
+}
+
+fn js_ts_alias_preference(unit: &CodeUnit) -> (usize, String) {
+    let fq_name = unit.fq_name();
+    (fq_name.matches('.').count(), fq_name)
+}
+
 pub(super) fn resolve_js_ts(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
@@ -22,7 +66,7 @@ pub(super) fn resolve_js_ts(
             analyzer, support, file, source, tree, site, &imports, &aliases,
         );
         if !contextual_members.is_empty() {
-            return candidates_outcome(contextual_members);
+            return js_ts_candidates_outcome(analyzer, contextual_members);
         }
     }
 
@@ -31,7 +75,7 @@ pub(super) fn resolve_js_ts(
     if let Some(members) =
         jsts_construction_receiver_members(analyzer, support, file, language, source, tree, site)
     {
-        return candidates_outcome(members);
+        return js_ts_candidates_outcome(analyzer, members);
     }
 
     if let Some((qualifier, name)) = reference.split_once('.') {
@@ -85,21 +129,24 @@ pub(super) fn resolve_js_ts(
             jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
         };
         if !member_candidates.is_empty() {
-            return candidates_outcome(member_candidates);
+            return js_ts_candidates_outcome(analyzer, member_candidates);
         }
         match jsts_receiver_provider_member_candidates(
             analyzer, support, file, language, source, tree, site, name,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) if !candidates.is_empty() => {
-                return candidates_outcome(if language == Language::TypeScript {
-                    if value_position {
-                        jsts_value_space_candidates(analyzer, candidates)
+                return js_ts_candidates_outcome(
+                    analyzer,
+                    if language == Language::TypeScript {
+                        if value_position {
+                            jsts_value_space_candidates(analyzer, candidates)
+                        } else {
+                            jsts_type_space_candidates(analyzer, candidates)
+                        }
                     } else {
-                        jsts_type_space_candidates(analyzer, candidates)
-                    }
-                } else {
-                    jsts_value_space_candidates(analyzer, candidates)
-                });
+                        jsts_value_space_candidates(analyzer, candidates)
+                    },
+                );
             }
             ReceiverAnalysisOutcome::Ambiguous(_)
             | ReceiverAnalysisOutcome::Unsupported { .. }
@@ -142,7 +189,7 @@ pub(super) fn resolve_js_ts(
             )
         };
         if !new_receiver_member_candidates.is_empty() {
-            return candidates_outcome(new_receiver_member_candidates);
+            return js_ts_candidates_outcome(analyzer, new_receiver_member_candidates);
         }
         let local_receiver_binding = (language == Language::JavaScript)
             .then(|| {
@@ -169,7 +216,7 @@ pub(super) fn resolve_js_ts(
             };
             let scoped = jsts_exact_scoped_dotted_candidates(scoped_lookup);
             if !scoped.is_empty() {
-                return candidates_outcome(scoped);
+                return js_ts_candidates_outcome(analyzer, scoped);
             }
             return no_definition(
                 "no_indexed_definition",
@@ -184,7 +231,7 @@ pub(super) fn resolve_js_ts(
             value_position,
         );
         if !exact_same_file.is_empty() {
-            return candidates_outcome(exact_same_file);
+            return js_ts_candidates_outcome(analyzer, exact_same_file);
         }
         if language == Language::TypeScript {
             let inferred_receivers = ts_local_receiver_owner_candidates(
@@ -205,7 +252,7 @@ pub(super) fn resolve_js_ts(
                 );
             }
             if !inferred_member_candidates.is_empty() {
-                return candidates_outcome(inferred_member_candidates);
+                return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
             }
             if let Some(receiver_type) = ts_global_object_receiver_type(qualifier) {
                 let global_receivers = support
@@ -216,14 +263,14 @@ pub(super) fn resolve_js_ts(
                 let global_member_candidates =
                     ts_member_candidates(analyzer, support, global_receivers, name, value_position);
                 if !global_member_candidates.is_empty() {
-                    return candidates_outcome(global_member_candidates);
+                    return js_ts_candidates_outcome(analyzer, global_member_candidates);
                 }
             }
         }
         let exact_project =
             jsts_exact_dotted_candidates(analyzer, support, file, reference, value_position);
         if !exact_project.is_empty() {
-            return candidates_outcome(exact_project);
+            return js_ts_candidates_outcome(analyzer, exact_project);
         }
         return no_definition(
             "no_indexed_definition",
@@ -258,7 +305,7 @@ pub(super) fn resolve_js_ts(
         same_file = jsts_type_space_candidates(analyzer, same_file);
     }
     if !same_file.is_empty() {
-        return candidates_outcome(same_file);
+        return js_ts_candidates_outcome(analyzer, same_file);
     }
 
     no_definition(
@@ -429,7 +476,7 @@ fn resolve_js_ts_module_binding(
             format!("`{exported_name}` is not indexed in `{module}`"),
         );
     }
-    candidates_outcome(candidates)
+    js_ts_candidates_outcome(analyzer, candidates)
 }
 
 #[allow(clippy::too_many_arguments)]
