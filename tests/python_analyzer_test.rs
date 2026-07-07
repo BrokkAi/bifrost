@@ -370,16 +370,16 @@ fn test_python_duplicate_fields_and_property_filtering() {
         .collect();
     assert_eq!(0, method_var_fields.len());
 
-    let value_getters: Vec<_> = declarations
+    let value_properties: Vec<_> = declarations
         .iter()
-        .filter(|cu| cu.is_function() && cu.fq_name() == "duplictad_fields_test.PropertyTest.value")
+        .filter(|cu| cu.is_field() && cu.fq_name() == "duplictad_fields_test.PropertyTest.value")
         .collect();
-    let name_getters: Vec<_> = declarations
+    let name_properties: Vec<_> = declarations
         .iter()
-        .filter(|cu| cu.is_function() && cu.fq_name() == "duplictad_fields_test.PropertyTest.name")
+        .filter(|cu| cu.is_field() && cu.fq_name() == "duplictad_fields_test.PropertyTest.name")
         .collect();
-    assert_eq!(1, value_getters.len());
-    assert_eq!(1, name_getters.len());
+    assert_eq!(1, value_properties.len());
+    assert_eq!(1, name_properties.len());
 
     assert_eq!(
         1,
@@ -418,32 +418,35 @@ fn test_python_property_setter_filtering() {
     assert_eq!("MplTimeConverter", classes[0].identifier());
 
     let methods: Vec<_> = declarations.iter().filter(|cu| cu.is_function()).collect();
-    assert_eq!(3, methods.len());
-    assert!(
-        methods
-            .iter()
-            .any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.format")
-    );
-    assert!(
-        methods
-            .iter()
-            .any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.value")
-    );
+    assert_eq!(1, methods.len());
     assert!(
         methods
             .iter()
             .any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.regular_method")
     );
+
+    let properties: Vec<_> = declarations.iter().filter(|cu| cu.is_field()).collect();
+    assert_eq!(2, properties.len());
+    assert!(
+        properties
+            .iter()
+            .any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.format")
+    );
+    assert!(
+        properties
+            .iter()
+            .any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.value")
+    );
     assert_eq!(
         1,
-        methods
+        properties
             .iter()
             .filter(|cu| cu.identifier() == "format")
             .count()
     );
     assert_eq!(
         1,
-        methods
+        properties
             .iter()
             .filter(|cu| cu.identifier() == "value")
             .count()
