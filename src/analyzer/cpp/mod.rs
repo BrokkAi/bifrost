@@ -160,6 +160,12 @@ impl CppAnalyzer {
             .map(|token| token.trim_matches(':').to_string())
             .collect()
     }
+
+    pub(crate) fn definition_lookup_index_shared(
+        &self,
+    ) -> Arc<crate::analyzer::DefinitionLookupIndex> {
+        self.inner.definition_lookup_index_shared()
+    }
 }
 
 impl IAnalyzer for CppAnalyzer {

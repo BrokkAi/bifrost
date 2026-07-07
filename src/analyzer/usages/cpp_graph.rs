@@ -5,6 +5,7 @@ mod resolver;
 mod shared;
 
 use crate::analyzer::usages::common::language_for_target;
+pub(in crate::analyzer::usages) use crate::analyzer::usages::cpp_call_match::cpp_split_top_level_commas;
 use crate::analyzer::usages::cpp_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolver};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
@@ -22,7 +23,7 @@ pub(in crate::analyzer::usages) use resolver::{
     cpp_function_return_type_text, cpp_name_for, extract_variable_name,
     first_type_child as cpp_first_type_child, is_declaration_name as cpp_is_declaration_name,
     is_declarator_node as cpp_is_declarator_node, normalize_type_text as normalize_cpp_type_text,
-    signature_arity as cpp_signature_arity, split_top_level_commas as cpp_split_top_level_commas,
+    signature_arity as cpp_signature_arity,
 };
 
 pub(crate) fn build_cpp_usage_edges<F>(
