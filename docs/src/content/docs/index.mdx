@@ -3,10 +3,75 @@ title: Bifrost
 description: Brokk's code-intelligence engine for agents, editors, and large repositories.
 template: splash
 hero:
+  title: Bifrost <span class="hero-byline">by <a href="https://brokk.ai" aria-label="Brokk"><img src="https://brokk.ai/brokk-logo.svg" alt="Brokk" /></a></span>
   tagline: Multi-language static analysis for agents, editors, and large repositories.
   image:
-    alt: Bifrost signal mark
-    file: ../../assets/bifrost-mark.svg
+    html: |
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" class="bifrost-mark" role="img" aria-label="Bifrost pipeline: read, analyze, serve">
+        <defs>
+          <filter id="bmGlow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="2.6" result="b"/>
+            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+
+        <g class="bm-scene-a">
+          <g>
+            <rect class="bm-tok" x="70" y="100" width="30" height="9" rx="1" fill="#26221f" style="animation-delay:-1.59s"/>
+            <rect class="bm-tok" x="104" y="100" width="52" height="9" rx="1" fill="#26221f" style="animation-delay:-1.59s"/>
+            <rect class="bm-tok" x="160" y="100" width="22" height="9" rx="1" fill="#26221f" style="animation-delay:-1.59s"/>
+            <rect class="bm-tok" x="88" y="118" width="40" height="9" rx="1" fill="#26221f" style="animation-delay:-1.13s"/>
+            <rect class="bm-tok" x="132" y="118" width="26" height="9" rx="1" fill="#26221f" style="animation-delay:-1.13s"/>
+            <rect class="bm-tok" x="162" y="118" width="52" height="9" rx="1" fill="#26221f" style="animation-delay:-1.13s"/>
+            <rect class="bm-tok" x="88" y="136" width="24" height="9" rx="1" fill="#26221f" style="animation-delay:-0.67s"/>
+            <rect class="bm-tok" x="116" y="136" width="70" height="9" rx="1" fill="#26221f" style="animation-delay:-0.67s"/>
+            <rect class="bm-tok" x="106" y="154" width="34" height="9" rx="1" fill="#26221f" style="animation-delay:-0.20s"/>
+            <rect class="bm-tok" x="144" y="154" width="48" height="9" rx="1" fill="#26221f" style="animation-delay:-0.20s"/>
+            <rect class="bm-tok" x="196" y="154" width="20" height="9" rx="1" fill="#26221f" style="animation-delay:-0.20s"/>
+            <rect class="bm-tok" x="88" y="172" width="56" height="9" rx="1" fill="#26221f" style="animation-delay:0.26s"/>
+            <rect class="bm-tok" x="148" y="172" width="30" height="9" rx="1" fill="#26221f" style="animation-delay:0.26s"/>
+            <rect class="bm-tok" x="70" y="190" width="28" height="9" rx="1" fill="#26221f" style="animation-delay:0.72s"/>
+            <rect class="bm-tok" x="102" y="190" width="44" height="9" rx="1" fill="#26221f" style="animation-delay:0.72s"/>
+            <rect class="bm-tok" x="150" y="190" width="9" height="9" rx="1" fill="#26221f" style="animation-delay:0.72s"/>
+          </g>
+          <rect class="bm-readscan" x="58" y="92" width="204" height="2" fill="#eb3f33" filter="url(#bmGlow)"/>
+        </g>
+
+        <g class="bm-scene-b">
+          <g transform="translate(14,14) scale(1.12)">
+            <g stroke="#5f5a52" stroke-width="1" opacity="0.4" fill="none">
+              <line x1="40" y1="180" x2="80" y2="120"/><line x1="80" y1="120" x2="120" y2="70"/><line x1="120" y1="70" x2="165" y2="60"/><line x1="165" y1="60" x2="205" y2="95"/><line x1="205" y1="95" x2="225" y2="150"/><line x1="80" y1="120" x2="60" y2="90"/><line x1="60" y1="90" x2="120" y2="70"/><line x1="130" y1="140" x2="120" y2="70"/><line x1="130" y1="140" x2="165" y2="60"/><line x1="130" y1="140" x2="180" y2="190"/><line x1="90" y1="200" x2="40" y2="180"/><line x1="90" y1="200" x2="130" y2="140"/><line x1="180" y1="190" x2="225" y2="150"/><line x1="180" y1="190" x2="205" y2="95"/>
+            </g>
+            <g stroke="#ff6a5f" stroke-width="1.5" fill="none" stroke-dasharray="5 22" filter="url(#bmGlow)">
+              <line class="bm-flow" x1="40" y1="180" x2="80" y2="120" style="animation-delay:0s"/><line class="bm-flow" x1="80" y1="120" x2="120" y2="70" style="animation-delay:-.4s"/><line class="bm-flow" x1="120" y1="70" x2="165" y2="60" style="animation-delay:-.8s"/><line class="bm-flow" x1="165" y1="60" x2="205" y2="95" style="animation-delay:-1.2s"/><line class="bm-flow" x1="205" y1="95" x2="225" y2="150" style="animation-delay:-1.6s"/><line class="bm-flow s" x1="60" y1="90" x2="120" y2="70" style="animation-delay:-.6s"/><line class="bm-flow s" x1="130" y1="140" x2="120" y2="70" style="animation-delay:-1.1s"/><line class="bm-flow s" x1="130" y1="140" x2="165" y2="60" style="animation-delay:-2s"/><line class="bm-flow s" x1="130" y1="140" x2="180" y2="190" style="animation-delay:-1.5s"/><line class="bm-flow s" x1="90" y1="200" x2="130" y2="140" style="animation-delay:-.3s"/><line class="bm-flow" x1="180" y1="190" x2="225" y2="150" style="animation-delay:-1s"/><line class="bm-flow" x1="180" y1="190" x2="205" y2="95" style="animation-delay:-2.1s"/>
+            </g>
+            <g fill="#f2f2f2" filter="url(#bmGlow)">
+              <rect class="bm-node" x="35.5" y="175.5" width="9" height="9" transform="rotate(45 40 180)" style="animation-delay:0s"/><rect class="bm-node" x="75.5" y="115.5" width="9" height="9" transform="rotate(45 80 120)" style="animation-delay:-.5s"/><rect class="bm-node" x="160.5" y="55.5" width="9" height="9" transform="rotate(45 165 60)" style="animation-delay:-1.3s"/><rect class="bm-node" x="200.5" y="90.5" width="9" height="9" transform="rotate(45 205 95)" style="animation-delay:-1.8s"/><rect class="bm-node" x="55.5" y="85.5" width="9" height="9" transform="rotate(45 60 90)" style="animation-delay:-2.2s"/><rect class="bm-node" x="85.5" y="195.5" width="9" height="9" transform="rotate(45 90 200)" style="animation-delay:-.9s"/><rect class="bm-node" x="175.5" y="185.5" width="9" height="9" transform="rotate(45 180 190)" style="animation-delay:-1.6s"/>
+            </g>
+            <g fill="#eb3f33" filter="url(#bmGlow)">
+              <rect class="bm-node f" x="115" y="65" width="10" height="10" transform="rotate(45 120 70)" style="animation-delay:-.7s"/><rect class="bm-node f" x="125" y="135" width="10" height="10" transform="rotate(45 130 140)" style="animation-delay:-1s"/><rect class="bm-node f" x="220" y="145" width="10" height="10" transform="rotate(45 225 150)" style="animation-delay:-1.4s"/>
+            </g>
+            <g class="bm-seeker" transform="translate(130 140)" filter="url(#bmGlow)">
+              <g class="bm-seeker-core">
+                <rect x="-8" y="-8" width="16" height="16" fill="none" stroke="#ff6a5f" stroke-width="2"/>
+                <rect x="-3.5" y="-3.5" width="7" height="7" fill="#ff6a5f"/>
+              </g>
+            </g>
+          </g>
+        </g>
+
+        <g class="bm-scene-c">
+          <rect class="bm-ring" x="125" y="113" width="70" height="70" fill="none" stroke="#eb3f33" stroke-width="1.5" style="animation-delay:0s"/>
+          <rect class="bm-ring" x="125" y="113" width="70" height="70" fill="none" stroke="#ff6a5f" stroke-width="1.5" style="animation-delay:-1.2s"/>
+          <rect class="bm-ring" x="125" y="113" width="70" height="70" fill="none" stroke="#eb3f33" stroke-width="1.5" style="animation-delay:-2.4s"/>
+          <path class="bm-chev" d="M94 121 L110 109 L210 109 L226 121 L210 133 L110 133 Z" fill="#f2f2f2" style="animation-delay:0s"/>
+          <path class="bm-chev" d="M94 148 L110 136 L210 136 L226 148 L210 160 L110 160 Z" fill="#eb3f33" filter="url(#bmGlow)" style="animation-delay:-.7s"/>
+          <path class="bm-chev" d="M94 175 L110 163 L210 163 L226 175 L210 187 L110 187 Z" fill="#f2f2f2" style="animation-delay:-1.4s"/>
+          <g class="bm-stream" style="animation-delay:0s"><rect x="149" y="205" width="8" height="8" transform="rotate(45 153 209)" fill="#ff6a5f"/></g>
+          <g class="bm-stream" style="animation-delay:-.8s"><rect x="157" y="205" width="8" height="8" transform="rotate(45 161 209)" fill="#f2f2f2"/></g>
+          <g class="bm-stream" style="animation-delay:-1.6s"><rect x="165" y="205" width="8" height="8" transform="rotate(45 169 209)" fill="#ff6a5f"/></g>
+        </g>
+      </svg>
   actions:
     - text: Get started
       link: install/
@@ -22,13 +87,6 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 export const version = import.meta.env.PUBLIC_BIFROST_VERSION ?? 'development';
 export const tag = import.meta.env.PUBLIC_BIFROST_TAG ?? '';
 export const releaseUrl = import.meta.env.PUBLIC_BIFROST_RELEASE_URL ?? '';
-
-<p class="brokk-strip">
-  <span>Bifrost by</span>
-  <a href="https://brokk.ai" aria-label="Brokk">
-    <img src="https://brokk.ai/brokk-logo.svg" alt="Brokk" />
-  </a>
-</p>
 
 <CardGrid>
   <Card title="Multi-language analysis" icon="code-branch">

@@ -42,6 +42,35 @@ body {
 
 .hero h1 {
   color: #f4f1ec;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.hero .hero-byline {
+  align-items: center;
+  align-self: center;
+  color: #cbc4b7;
+  display: inline-flex;
+  font-family: var(--sl-font-mono);
+  font-size: clamp(0.78rem, calc(0.65rem + 0.45vw), 1rem);
+  gap: 0.45rem;
+  line-height: 1.2;
+  text-transform: none;
+}
+
+.hero .hero-byline a {
+  display: inline-flex;
+}
+
+.hero .hero-byline img {
+  display: block;
+  height: 1.15em;
+  width: auto;
+}
+
+.hero .hero-byline a:hover img {
+  filter: brightness(1.18);
 }
 
 .hero .tagline {
@@ -51,6 +80,40 @@ body {
 
 .hero .actions {
   gap: 0.75rem 1rem;
+}
+
+.hero > .hero-html {
+  width: min(82vw, 22rem);
+}
+
+@media (max-width: 36rem) {
+  .hero {
+    gap: 0.75rem;
+  }
+
+  .hero > .hero-html {
+    width: min(78vw, 16rem);
+  }
+
+  .hero .stack {
+    gap: 1.25rem;
+  }
+}
+
+@media (min-width: 50rem) {
+  .hero {
+    grid-template-columns: minmax(0, 5fr) minmax(24rem, 5fr);
+    gap: clamp(1rem, 2vw, 2rem);
+    padding-block: clamp(2.5rem, 7vmin, 7rem);
+  }
+
+  .hero > .hero-html {
+    width: min(100%, clamp(30rem, 40vw, 40rem));
+  }
+
+  .hero .hero-byline {
+    align-self: flex-start;
+  }
 }
 
 .version-strip {
@@ -64,32 +127,6 @@ body {
 
 .version-strip a {
   color: #cbc4b7;
-}
-
-.brokk-strip {
-  align-items: center;
-  color: #cbc4b7;
-  display: flex;
-  font-family: var(--sl-font-mono);
-  font-size: 0.9rem;
-  gap: 0.5rem;
-  margin-top: 1rem;
-}
-
-.brokk-strip a {
-  align-items: center;
-  display: inline-flex;
-}
-
-.brokk-strip img {
-  display: block;
-  height: 1.15rem;
-  width: auto;
-}
-
-.brokk-strip a:hover img {
-  filter: brightness(1.18);
-  text-decoration: none;
 }
 
 .card {
@@ -111,4 +148,59 @@ body {
 
 .sl-markdown-content a:not(:where(.not-content *)) {
   color: #ff6a5f;
+}
+
+/* ================= animated pipeline hero mark ================= */
+.bifrost-mark { width: 100%; height: auto; overflow: visible; }
+
+/* --- master timeline: one scene visible at a time (24s loop, 8s each) --- */
+@keyframes bm-sceneA { 0% {opacity:0} 3% {opacity:1} 30% {opacity:1} 33%,100% {opacity:0} }
+@keyframes bm-sceneB { 0%,33% {opacity:0} 36% {opacity:1} 63% {opacity:1} 66%,100% {opacity:0} }
+@keyframes bm-sceneC { 0%,66% {opacity:0} 69% {opacity:1} 96% {opacity:1} 99%,100% {opacity:0} }
+.bm-scene-a { animation: bm-sceneA 24s linear infinite; }
+.bm-scene-b { animation: bm-sceneB 24s linear infinite; }
+.bm-scene-c { animation: bm-sceneC 24s linear infinite; }
+
+/* --- scene A: read / parse --- */
+@keyframes bm-tokLit   { 0%,44%,56%,100% {fill:#26221f} 50% {fill:#eb3f33} }
+@keyframes bm-readscan { 0% {transform:translateY(0);opacity:0} 8% {opacity:1} 92% {opacity:1} 100% {transform:translateY(138px);opacity:0} }
+.bm-tok      { animation: bm-tokLit 5.2s linear infinite; }
+.bm-readscan { animation: bm-readscan 5.2s linear infinite; }
+
+/* --- scene B: analyze / symbol graph --- */
+@keyframes bm-dash  { to { stroke-dashoffset: -216; } }
+@keyframes bm-pulse { 0%,100% {opacity:.38} 50% {opacity:1} }
+@keyframes bm-spin  { from { transform: rotate(45deg); } to { transform: rotate(405deg); } }
+@keyframes bm-seek {
+  0%,100% { transform: translate(130px, 140px); }
+  16%     { transform: translate(120px, 70px); }
+  32%     { transform: translate(165px, 60px); }
+  48%     { transform: translate(205px, 95px); }
+  64%     { transform: translate(180px, 190px); }
+  80%     { transform: translate(80px, 120px); }
+}
+.bm-flow    { animation: bm-dash 4.2s linear infinite; }
+.bm-flow.s  { animation-duration: 5s; }
+.bm-node    { animation: bm-pulse 3.8s ease-in-out infinite; }
+.bm-node.f  { animation-duration: 3.2s; }
+.bm-seeker  { animation: bm-seek 11s cubic-bezier(.45, 0, .25, 1) infinite; }
+.bm-seeker-core {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: bm-spin 12s linear infinite;
+}
+
+/* --- scene C: serve / MCP --- */
+@keyframes bm-ring   { 0% {transform:rotate(45deg) scale(.35);opacity:0} 16% {opacity:.85} 100% {transform:rotate(45deg) scale(1.75);opacity:0} }
+@keyframes bm-chev   { 0%,100% {opacity:.3} 50% {opacity:1} }
+@keyframes bm-stream { 0% {transform:translateY(14px);opacity:0} 22% {opacity:1} 78% {opacity:1} 100% {transform:translateY(-16px);opacity:0} }
+.bm-ring   { transform-box: fill-box; transform-origin: center; animation: bm-ring 5.2s ease-out infinite; }
+.bm-chev   { animation: bm-chev 3s ease-in-out infinite; }
+.bm-stream { animation: bm-stream 3.6s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .bm-scene-a, .bm-scene-c { display: none; }
+  .bm-scene-b { opacity: 1; animation: none; }
+  .bm-flow, .bm-node, .bm-seeker, .bm-seeker-core { animation: none; }
+  .bm-node { opacity: 1; }
 }
