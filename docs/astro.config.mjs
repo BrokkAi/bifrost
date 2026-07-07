@@ -13,7 +13,7 @@ export default defineConfig({
       title: 'Bifrost Docs',
       description: 'Documentation for Brokk Bifrost, the analyzer behind Brokk code intelligence.',
       customCss: ['./src/styles/brokk.css'],
-      favicon: '/favicon.svg',
+      favicon: '/favicon.png',
       editLink: {
         baseUrl: 'https://github.com/BrokkAi/bifrost/edit/master/docs/',
       },
@@ -54,10 +54,6 @@ export default defineConfig({
             { label: 'Neovim', slug: 'neovim' },
             { label: 'Helix', slug: 'helix' },
           ],
-        },
-        {
-          label: 'Release Docs',
-          items: [{ label: 'Versioned Docs', slug: 'releases/versioned-docs' }],
         },
       ],
     }),

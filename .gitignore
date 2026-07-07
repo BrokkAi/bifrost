@@ -20,4 +20,5 @@ bifrost_searchtools/*.so
 
 .mjolnir
 .idea
+.vscode/
 **/.DS_Store
