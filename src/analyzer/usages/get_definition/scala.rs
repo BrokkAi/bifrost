@@ -854,9 +854,15 @@ fn scala_member_candidate_applies(
     if unit.is_field() {
         return true;
     }
-    unit.is_function()
-        && method_signature_arity(ctx.scala, unit)
-            .is_some_and(|arity| arity == call_arity.unwrap_or(0))
+    if !unit.is_function() {
+        return false;
+    }
+    match call_arity {
+        Some(call_arity) => {
+            method_signature_arity(ctx.scala, unit).is_some_and(|arity| arity == call_arity)
+        }
+        None => method_signature_arity(ctx.scala, unit).is_none_or(|arity| arity == 0),
+    }
 }
 
 fn scala_extension_candidates(

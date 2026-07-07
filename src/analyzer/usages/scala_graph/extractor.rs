@@ -803,10 +803,15 @@ fn receiver_member_applies(unit: &CodeUnit, call_arity: Option<usize>, ctx: &Sca
     if unit.is_field() {
         return true;
     }
-    unit.is_function()
-        && ctx.spec.kind == TargetKind::Method
-        && method_signature_arity(ctx.scala, unit)
-            .is_some_and(|arity| arity == call_arity.unwrap_or(0))
+    if !unit.is_function() || ctx.spec.kind != TargetKind::Method {
+        return false;
+    }
+    match call_arity {
+        Some(call_arity) => {
+            method_signature_arity(ctx.scala, unit).is_some_and(|arity| arity == call_arity)
+        }
+        None => method_signature_arity(ctx.scala, unit).is_none_or(|arity| arity == 0),
+    }
 }
 
 fn is_locally_shadowed(ctx: &ScanCtx<'_>, name: &str) -> bool {

@@ -10475,7 +10475,14 @@ fn csharp_ambiguous_using_type_returns_ambiguous() {
     );
 
     assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
-    assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+    let mut fqns = value["results"][0]["definitions"]
+        .as_array()
+        .expect("definitions array")
+        .iter()
+        .map(|definition| definition["fqn"].as_str().expect("definition fqn"))
+        .collect::<Vec<_>>();
+    fqns.sort_unstable();
+    assert_eq!(fqns, ["A.Service", "B.Service"], "{value}");
 }
 
 #[test]
