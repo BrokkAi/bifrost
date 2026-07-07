@@ -24,7 +24,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T11:28Z) Milestone 7: added the C++ typed-receiver/out-of-line click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted method-reference coverage finding, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:37Z) Milestone 8: added the JavaScript CommonJS/object click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the exposed factory-returned object resolver gap, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:53Z) Milestone 9: added the TypeScript interface/type-alias click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted references coverage finding, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 10: Python click-around fixture.
+- [x] (2026-07-07T11:59Z) Milestone 10: added the Python alias/property click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted classmethod-reference coverage finding, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 11: Ruby click-around fixture.
 - [ ] Milestone 12: ignored stress fixtures and final sweep.
 
@@ -74,6 +74,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 
 - Observation: TypeScript LSP references for type-alias object members include typed reads and contextual object literal keys, but not contextual callback parameter member reads in this fixture.
   Evidence: Strengthening `Payload.value` references returned `input.value` in both typed method bodies, the `payload.value` typed local read, and the `value:` contextual object key. It did not return `payload.value` inside the contextual callback parameter, even though definition lookup for that click site is supported.
+
+- Observation: Python classmethod factory receiver inference needs an explicit return annotation to propagate the constructed receiver type through a reexported class alias.
+  Evidence: The first Milestone 10 fixture run returned `null` for `account.label()` after `account = Account.guest()` until `guest` was annotated as returning `"User"`, matching the existing Python get-definition contract.
 
 ## Decision Log
 
@@ -171,6 +174,10 @@ Milestone 9 is complete. The TypeScript fixture now covers interface and impleme
 
 Milestone 9 Brokk Guided Review outcome: architecture found no design blockers, and the accepted coverage finding was that references should exercise TypeScript type-alias members rather than only the interface method. The fixture now asserts exact references for `Payload.value` across typed method bodies, a contextual object literal key, and a typed local read. Static-member references return `null` through the current LSP surface, so that unsupported relation is not locked in as a failing milestone assertion. Focused TypeScript LSP, formatting, and diff checks pass.
 
+Milestone 10 is complete. The Python fixture now covers reexported class aliases, classmethod factory receivers with explicit return annotations, inherited methods, decorated properties, self attribute reads, unrelated same-name methods, references, hover, type hierarchy supertypes/subtypes, and an unsupported untyped-receiver null case.
+
+Milestone 10 Brokk Guided Review outcome: security, duplication, devops, and architecture found no blocking issues in the test-only milestone diff. Senior-dev coverage review found that the classmethod factory call should be covered by references, not only definition. Accepted fixes add exact `User.guest` references through the reexported `Account.guest()` call. Focused Python LSP, formatting, and diff checks pass.
+
 ## Timing Log
 
 - Milestone 0: Harness and Timing Infrastructure
@@ -262,6 +269,15 @@ Milestone 9 Brokk Guided Review outcome: architecture found no design blockers, 
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_9_typescript --features nlp -- --nocapture` passed in 5.40s real time after recompiling the changed test; test execution took 4.46s. `cargo fmt --check` and `git diff --check` also passed.
   - Click cases added: 15.
   - Slowest fixture/operation: `milestone_9_typescript_interfaces`, case `interface typed receiver resolves to interface method`, marker `interface_process_call`, operation `definition`, 38 ms before review and 58 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 10: Python
+  - Language: Python.
+  - Start: 2026-07-07T11:54Z.
+  - End: 2026-07-07T11:59Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_10_python --features nlp -- --nocapture` passed in 10.83s real time after recompiling the changed test; test execution took 6.46s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_10_python --features nlp -- --nocapture` passed in 7.39s real time after recompiling the changed test; test execution took 3.77s. `cargo fmt --check` and `git diff --check` also passed.
+  - Click cases added: 15.
+  - Slowest fixture/operation: `milestone_10_python_alias_property`, case `reexported class alias resolves to original class`, marker `account_class_ref`, operation `definition`, 40 ms before review and 43 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -362,3 +378,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 8 Guided Review gate.
 Revision note, 2026-07-07 / Codex: Started Milestone 9 and added the TypeScript interface/type-alias fixture. The pre-review focused TypeScript filter passes, covering interface and implementation methods, type aliases, static class members, typed receivers, contextual object members, contextual callback parameters, unrelated same-name members, references, implementation lookup, type definition, and type hierarchy.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 9 Guided Review gate. Accepted review feedback strengthened references coverage for the `Payload.value` type-alias member across typed method bodies, contextual object keys, and typed local reads. Focused TypeScript LSP, formatting, and diff checks pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 10 and added the Python alias/property fixture. The pre-review focused Python filter passes, covering reexported class aliases, classmethod factory receivers with explicit return annotations, inherited methods, decorated properties, self attribute reads, unrelated same-name methods, references, hover, type hierarchy, and an unsupported untyped-receiver null case.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 10 Guided Review gate. Accepted review feedback strengthened classmethod factory references so `User.guest` now asserts the reexported `Account.guest()` call in addition to definition behavior. Focused Python LSP, formatting, and diff checks pass.

@@ -1702,3 +1702,161 @@ function run(): void {
 
     assert_timing_summary("milestone_9_typescript_interfaces", &timings, 15);
 }
+
+#[test]
+fn milestone_10_python_alias_property_click_around() {
+    let fixture = ClickFixture::new("milestone_10_python_alias_property")
+        .file(
+            "shop/models.py",
+            r#"<base_user_range>class <base_user_decl>BaseUser:
+    def <base_label_decl>label(self):
+        return "base"
+
+<user_range>class <user_class_decl>User(BaseUser):
+    def __init__(self, name):
+        self.<name_attr_decl>name = name
+
+    @property
+    def <normalized_name_decl>normalized_name(self):
+        return self.<self_name_read>name.lower()
+
+    @classmethod
+    def <guest_decl>guest(cls) -> "User":
+        return cls("guest")
+
+class <other_user_decl>OtherUser:
+    def <other_label_decl>label(self):
+        return "other"
+"#,
+        )
+        .file(
+            "shop/__init__.py",
+            r#"from .models import User as Account
+"#,
+        )
+        .file(
+            "app.py",
+            r#"from shop import Account
+from shop.models import User, OtherUser
+
+def handle(user: User):
+    user.<typed_label_call>label()
+    user.<typed_property_read>normalized_name
+
+def run():
+    account = <account_class_ref>Account.<guest_call>guest()
+    account.<alias_label_call>label()
+    account.<alias_property_read>normalized_name
+
+    other = OtherUser()
+    other.<other_label_call>label()
+
+def unknown(thing):
+    thing.<unknown_label_call>label()
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "reexported class alias resolves to original class",
+                "account_class_ref",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["user_class_decl"]),
+            ),
+            ClickCase::new(
+                "classmethod factory resolves through reexported class alias",
+                "guest_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["guest_decl"]),
+            ),
+            ClickCase::new(
+                "typed receiver resolves inherited method to base declaration",
+                "typed_label_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["base_label_decl"]),
+            ),
+            ClickCase::new(
+                "factory receiver resolves inherited method to base declaration",
+                "alias_label_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["base_label_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name method resolves to unrelated class",
+                "other_label_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_label_decl"]),
+            ),
+            ClickCase::new(
+                "decorated property read on typed receiver resolves to getter",
+                "typed_property_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["normalized_name_decl"]),
+            ),
+            ClickCase::new(
+                "decorated property read on factory receiver resolves to getter",
+                "alias_property_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["normalized_name_decl"]),
+            ),
+            ClickCase::new(
+                "self attribute read resolves to initializer assignment",
+                "self_name_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["name_attr_decl"]),
+            ),
+            ClickCase::new(
+                "untyped receiver does not guess same-name method",
+                "unknown_label_call",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "classmethod references include reexported alias call",
+                "guest_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["guest_call"]),
+            ),
+            ClickCase::new(
+                "inherited method references include typed and factory receiver calls",
+                "base_label_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["typed_label_call", "alias_label_call"]),
+            ),
+            ClickCase::new(
+                "decorated property references include typed and factory receiver reads",
+                "normalized_name_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["typed_property_read", "alias_property_read"]),
+            ),
+            ClickCase::new(
+                "hover on decorated property read describes normalized_name",
+                "alias_property_read",
+                ClickOperation::Hover,
+                ClickExpectation::HoverContains("normalized_name"),
+            ),
+            ClickCase::new(
+                "User supertypes include BaseUser",
+                "user_class_decl",
+                ClickOperation::TypeHierarchySupertypes,
+                ClickExpectation::Locations(&["base_user_range"]),
+            ),
+            ClickCase::new(
+                "BaseUser subtypes include User",
+                "base_user_decl",
+                ClickOperation::TypeHierarchySubtypes,
+                ClickExpectation::Locations(&["user_range"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_10_python_alias_property", &timings, 15);
+}
