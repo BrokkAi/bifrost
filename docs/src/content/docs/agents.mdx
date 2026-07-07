@@ -19,4 +19,8 @@ bifrost://agent-guidance/agents.md
 
 ## Template
 
-<pre><code>{agentsGuidance.trim()}</code></pre>
+Keep project-specific, agent-specific, or user-specific guidance in the existing
+project `AGENTS.md`. The template below contains only the reusable Bifrost
+code-intelligence guidance.
+
+<pre><code>{agentsGuidance.replace(/\n\nKeep project-specific instructions[\s\S]*$/, '').trim()}</code></pre>

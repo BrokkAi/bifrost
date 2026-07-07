@@ -17,6 +17,14 @@ More complex static analysis runs on demand when a tool call needs it. Results c
 
 Bifrost includes analyzers for Java, JavaScript, TypeScript, Rust, Go, Python, C, C++, C#, PHP, Scala, and Ruby.
 
+Bifrost uses Tree-sitter parsers as the common syntax foundation across those
+languages. The parsed trees are adapted into reusable analyzer concepts where
+the structure really is shared, such as declarations, references, scopes, type
+relationships, and call relationships. Where a language's semantics depend on
+its compiler or interpreter model, Bifrost keeps language-specific modelling and
+sub-analysis instead of flattening those rules into a lowest-common-denominator
+abstraction.
+
 ## Main Surfaces
 
 - MCP server: code-navigation tools for AI agents.
