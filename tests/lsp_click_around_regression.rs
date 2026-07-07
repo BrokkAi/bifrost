@@ -1652,12 +1652,15 @@ function run(): void {
                 ClickOperation::References {
                     include_declaration: false,
                 },
-                ClickExpectation::Locations(&[
-                    "input_value_read",
-                    "contextual_value_key",
-                    "payload_value_read",
-                    "other_input_value_read",
-                ]),
+                ClickExpectation::LocationsAllowing(
+                    &[
+                        "input_value_read",
+                        "contextual_value_key",
+                        "payload_value_read",
+                        "other_input_value_read",
+                    ],
+                    &["callback_value_read"],
+                ),
             ),
             ClickCase::new(
                 "interface method references include interface-typed call",
@@ -2025,4 +2028,165 @@ end
     );
 
     assert_timing_summary("milestone_11_ruby_constants_mixins", &timings, 14);
+}
+
+#[test]
+#[ignore = "stress"]
+fn stress_milestone_12_go_embedded_promotion_click_around() {
+    let mut service = String::from(
+        r#"package service
+
+type Base struct {
+    <stress_base_id_decl>ID string
+}
+
+"#,
+    );
+    for index in 0..24 {
+        let embedded = if index == 0 {
+            "Base".to_string()
+        } else {
+            format!("Layer{}", index - 1)
+        };
+        service.push_str(&format!(
+            "type Layer{index} struct {{\n    {embedded}\n}}\n\n"
+        ));
+    }
+    service.push_str(
+        r#"type Worker struct {
+    Layer23
+}
+
+func NewWorker() Worker { return Worker{} }
+"#,
+    );
+
+    let fixture = ClickFixture::new("stress_milestone_12_go_embedded_promotion")
+        .file("go.mod", "module example.com/stress\n\ngo 1.22\n")
+        .file("service/service.go", service)
+        .file(
+            "main.go",
+            r#"package main
+
+import "example.com/stress/service"
+
+func use() {
+    worker := service.NewWorker()
+    _ = worker.<stress_worker_id_read>ID
+}
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "deep promoted field resolves through generated embedding chain",
+                "stress_worker_id_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["stress_base_id_decl"]),
+            ),
+            ClickCase::new(
+                "deep promoted field references include generated call site",
+                "stress_base_id_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["stress_worker_id_read"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("stress_milestone_12_go_embedded_promotion", &timings, 2);
+}
+
+#[test]
+#[ignore = "stress"]
+fn stress_milestone_12_rust_trait_impl_click_around() {
+    let mut service = String::from("use crate::contracts::Worker;\n\n");
+    let mut client_imports = Vec::new();
+    let mut client_body = String::from("use crate::contracts::Worker;\nuse crate::service::{");
+    let mut impl_marker_names = Vec::new();
+    let mut type_decl_marker_names = Vec::new();
+
+    for index in 0..16 {
+        client_imports.push(format!("Job{index}"));
+        impl_marker_names.push(format!("stress_job_{index}_work_impl"));
+        type_decl_marker_names.push(format!("stress_job_{index}_decl"));
+    }
+    client_body.push_str(&client_imports.join(", "));
+    client_body.push_str("};\n\npub fn run() {\n");
+
+    for index in 0..16 {
+        service.push_str(&format!(
+            r#"<stress_job_{index}_range>pub struct <stress_job_{index}_decl>Job{index};
+
+impl Worker for Job{index} {{
+    fn <stress_job_{index}_work_impl>work(&self) -> usize {{
+        {index}
+    }}
+}}
+
+"#
+        ));
+        client_body.push_str(&format!(
+            "    let job_{index}: Job{index} = Job{index};\n    let _ = job_{index}.<stress_job_{index}_work_call>work();\n"
+        ));
+    }
+    client_body.push_str("}\n");
+
+    let impl_marker_refs: Vec<&str> = impl_marker_names.iter().map(String::as_str).collect();
+    let type_decl_marker_refs: Vec<&str> =
+        type_decl_marker_names.iter().map(String::as_str).collect();
+
+    let fixture = ClickFixture::new("stress_milestone_12_rust_trait_impls")
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"stress_click_rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "pub mod contracts;\npub mod service;\npub mod client;\n",
+        )
+        .file(
+            "src/contracts.rs",
+            r#"<stress_worker_trait_range>pub trait <stress_worker_trait_decl>Worker {
+    fn <stress_worker_work_decl>work(&self) -> usize;
+}
+"#,
+        )
+        .file("src/service.rs", service)
+        .file("src/client.rs", client_body);
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "generated typed receiver resolves to concrete impl method",
+                "stress_job_0_work_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["stress_job_0_work_impl"]),
+            ),
+            ClickCase::new(
+                "tail generated typed receiver resolves to concrete impl method",
+                "stress_job_15_work_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["stress_job_15_work_impl"]),
+            ),
+            ClickCase::new(
+                "generated trait method implementation finds all impl methods",
+                "stress_worker_work_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&impl_marker_refs),
+            ),
+            ClickCase::new(
+                "generated trait type implementation finds all implementers",
+                "stress_worker_trait_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&type_decl_marker_refs),
+            ),
+        ],
+    );
+
+    assert_timing_summary("stress_milestone_12_rust_trait_impls", &timings, 4);
 }

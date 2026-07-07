@@ -117,6 +117,7 @@ pub enum ClickOperation {
 #[derive(Debug)]
 pub enum ClickExpectation<'a> {
     Locations(&'a [&'a str]),
+    LocationsAllowing(&'a [&'a str], &'a [&'a str]),
     Empty,
     HoverContains(&'a str),
 }
@@ -283,6 +284,59 @@ fn check_response(
                     fixture.name,
                     case.name,
                     expected,
+                    actual,
+                    timing.elapsed.as_millis()
+                ));
+            }
+        }
+        ClickExpectation::LocationsAllowing(required_markers, optional_markers) => {
+            let actual = location_starts(&response["result"]);
+            let required = required_markers
+                .iter()
+                .map(|marker| {
+                    let expected_marker = fixture.marker(marker);
+                    (
+                        fixture.marker_uri(marker),
+                        expected_marker.line,
+                        expected_marker.character,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let optional = optional_markers
+                .iter()
+                .map(|marker| {
+                    let expected_marker = fixture.marker(marker);
+                    (
+                        fixture.marker_uri(marker),
+                        expected_marker.line,
+                        expected_marker.character,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut allowed = required.clone();
+            allowed.extend(optional);
+            allowed.sort();
+            let mut missing = required
+                .iter()
+                .filter(|expected| !actual.contains(expected))
+                .cloned()
+                .collect::<Vec<_>>();
+            missing.sort();
+            let mut unexpected = actual
+                .iter()
+                .filter(|location| !allowed.contains(location))
+                .cloned()
+                .collect::<Vec<_>>();
+            unexpected.sort();
+            if !missing.is_empty() || !unexpected.is_empty() {
+                return Err(format!(
+                    "fixture {} case {} expected required locations {:?} with optional locations {:?}, missing {:?}, unexpected {:?}, got {:?} after {} ms; response: {response}",
+                    fixture.name,
+                    case.name,
+                    required_markers,
+                    optional_markers,
+                    missing,
+                    unexpected,
                     actual,
                     timing.elapsed.as_millis()
                 ));

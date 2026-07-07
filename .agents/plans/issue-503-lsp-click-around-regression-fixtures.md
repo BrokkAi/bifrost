@@ -26,7 +26,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T11:53Z) Milestone 9: added the TypeScript interface/type-alias click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted references coverage finding, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:59Z) Milestone 10: added the Python alias/property click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted classmethod-reference coverage finding, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T12:03Z) Milestone 11: added the Ruby constants/mixins click-around fixture, ran focused tests, ran Brokk Guided Review, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 12: ignored stress fixtures and final sweep.
+- [x] (2026-07-07T12:09Z) Milestone 12: added ignored Go and Rust stress fixtures, ran Brokk Guided Review, fixed accepted harness/stress coverage findings, ran the final validation sweep, and prepared the milestone commit.
 
 ## Surprises & Discoveries
 
@@ -73,13 +73,16 @@ The work is test-first. Production analyzer changes are allowed only when a new 
   Evidence: Adding `const toolbox = makeToolbox(); toolbox.format(widget);` to the Milestone 8 LSP fixture initially returned `null`. `jsts_local_receiver_value_owner_candidates` now resolves call-expression initializers through the import-aware callee resolver and expands the callee's materialized return surface.
 
 - Observation: TypeScript LSP references for type-alias object members include typed reads and contextual object literal keys, but not contextual callback parameter member reads in this fixture.
-  Evidence: Strengthening `Payload.value` references returned `input.value` in both typed method bodies, the `payload.value` typed local read, and the `value:` contextual object key. It did not return `payload.value` inside the contextual callback parameter, even though definition lookup for that click site is supported.
+  Evidence: Strengthening `Payload.value` references returned `input.value` in both typed method bodies, the `payload.value` typed local read, and the `value:` contextual object key. It did not return `payload.value` inside the contextual callback parameter, even though definition lookup for that click site is supported. The final sweep changed this one assertion to require the proven locations while allowing the callback location as the only optional extra, so future callback-reference support will not fail without allowing arbitrary false positives.
 
 - Observation: Python classmethod factory receiver inference needs an explicit return annotation to propagate the constructed receiver type through a reexported class alias.
   Evidence: The first Milestone 10 fixture run returned `null` for `account.label()` after `account = Account.guest()` until `guest` was annotated as returning `"User"`, matching the existing Python get-definition contract.
 
 - Observation: Ruby namespaced factory receiver inference follows the existing `@ivar = Invoice.new` body shape for `Billing::Invoice.build`, while a bare `new` body did not propagate the local receiver type to a later mixin method call in the LSP fixture.
   Evidence: The first Milestone 11 fixture run returned `null` for `invoice.audit` after `invoice = Billing::Invoice.build` until `build` was changed to assign `Invoice.new`, matching the existing Ruby get-definition contract.
+
+- Observation: Rust `textDocument/implementation` for trait implementer types returns struct name selections, not the whole struct declaration ranges, while Rust trait method implementation returns method-name selections.
+  Evidence: The first Milestone 12 ignored stress run expected generated struct range markers for trait type implementations and failed with locations at each generated `JobN` name. Switching expectations to generated struct-name markers aligned the stress fixture with the existing LSP response shape.
 
 ## Decision Log
 
@@ -184,6 +187,10 @@ Milestone 10 Brokk Guided Review outcome: security, duplication, devops, and arc
 Milestone 11 is complete. The Ruby fixture now covers namespaced constants, project-local `require_relative`, class factory receivers, mixin methods, inherited methods, module functions, unrelated same-name methods, references, type hierarchy supertypes/subtypes, and an unsupported unknown-receiver null case.
 
 Milestone 11 Brokk Guided Review outcome: the test-only milestone diff had no blocking security, duplication, senior-dev, devops, or architecture findings after inherited-method references were included. The fixture stays within existing Ruby contracts for namespaced factory receiver inference and hierarchy ranges. Focused Ruby LSP, formatting, and diff checks pass.
+
+Milestone 12 is complete. The final sweep adds ignored stress fixtures for Go embedded promotion and Rust trait implementation fan-out, plus a strict required-plus-optional location expectation used by the TypeScript `Payload.value` references case.
+
+Milestone 12 Brokk Guided Review outcome: security, duplication, architecture, and devops found no blocking issues. Senior-dev found that a simple subset location helper could hide unrelated false-positive references, that the Rust stress fixture only checked the first generated receiver call, and that final validation still needed the implementation/type-hierarchy LSP filters plus clippy. Accepted fixes replace the subset helper with required-plus-optional exactness, add a tail generated Rust receiver definition case, rerun normal and ignored stress suites, and run the final validation commands. `cargo clippy-no-cuda` initially failed because Homebrew `clippy-driver` was ahead of the rustup toolchain in `PATH`; rerunning with the rustup 1.96.0 toolchain bin first passed.
 
 ## Timing Log
 
@@ -295,6 +302,15 @@ Milestone 11 Brokk Guided Review outcome: the test-only milestone diff had no bl
   - Click cases added: 14.
   - Slowest fixture/operation: `milestone_11_ruby_constants_mixins`, case `namespaced class constant resolves to constant assignment`, marker `currency_ref`, operation `definition`, 31 ms before review and 24 ms after review fixes.
   - Ignored stress runtime: not applicable.
+- Milestone 12: Stress Fixtures and Final Sweep
+  - Language: Go and Rust ignored stress fixtures, plus all normal click-around fixtures.
+  - Start: 2026-07-07T12:04Z.
+  - End: 2026-07-07T12:09Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression --features nlp -- --nocapture` passed in 5.71s real time after recompiling the harness; test execution took 2.39s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression --features nlp -- --nocapture` passed in 4.99s real time after recompiling the stricter harness helper; test execution took 2.10s. Additional final checks passed: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test bifrost_lsp_server implementation --features nlp -- --nocapture` in 3.82s real, `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test bifrost_lsp_server type_hierarchy --features nlp -- --nocapture` in 3.81s real, `cargo fmt --check`, `git diff --check`, and `/usr/bin/time -p env PATH="/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin:$PATH" cargo clippy-no-cuda` in 64.65s real after `cargo clean`.
+  - Click cases added: 6 ignored stress click cases across 2 ignored tests. Normal suite now contains 16 passing non-ignored LSP click/parser tests and 2 ignored stress tests.
+  - Slowest fixture/operation: normal suite `milestone_1_go_embedded_promotion`, case `promoted field resolves through imported factory receiver`, marker `worker_record`, operation `definition`, 57 ms after review fixes. Ignored stress suite `stress_milestone_12_rust_trait_impls`, case `generated typed receiver resolves to concrete impl method`, marker `stress_job_0_work_call`, operation `definition`, 80 ms after review fixes.
+  - Ignored stress runtime: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression --features nlp -- --ignored stress --nocapture` passed in 4.81s real time after waiting on the build lock; test execution took 2.14s.
 
 ## Context and Orientation
 
@@ -402,3 +418,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 10 Guided Review gate
 Revision note, 2026-07-07 / Codex: Started Milestone 11 and added the Ruby constants/mixins fixture. The pre-review focused Ruby filter passes, covering namespaced constants, project-local `require_relative`, class factory receivers, mixin methods, inherited methods, module functions, unrelated same-name methods, references, type hierarchy, and an unsupported unknown-receiver null case.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 11 Guided Review gate. No accepted code changes were needed after inherited-method references were included in the pre-review fixture. Focused Ruby LSP, formatting, and diff checks pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 12 and added ignored stress fixtures for Go embedded promotion and Rust trait implementations. The ignored stress filter and the normal click-around suite pass before review; final LSP implementation/type-hierarchy sweeps are still pending the review gate.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 12 Guided Review gate and final sweep. Accepted review feedback replaced the TypeScript subset location assertion with a stricter required-plus-optional helper, added tail generated Rust receiver definition coverage, and completed normal, ignored stress, implementation, type hierarchy, formatting, diff, and clippy-no-cuda validation. The clippy run required putting the rustup 1.96.0 toolchain bin ahead of Homebrew in PATH so cargo-clippy and clippy-driver matched rustc.
