@@ -432,6 +432,9 @@ fn method_unit_declared_return_type_outcome(
     if units.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
     }
+    if let Some(return_type) = ctx.java.usage_facts_index().callable_return_type(&fqn) {
+        return ReceiverAnalysisOutcome::Precise(vec![return_type.to_string()]);
+    }
     merge_receiver_type_outcomes(
         units
             .into_iter()
@@ -443,6 +446,15 @@ fn method_unit_declared_return_type(
     method: &CodeUnit,
     ctx: &JavaScan<'_, '_>,
 ) -> ReceiverAnalysisOutcome<String> {
+    if let Some(return_type) = ctx
+        .java
+        .usage_facts_index()
+        .fact_for_declaration(method)
+        .and_then(|facts| facts.return_type_fqn.as_deref())
+    {
+        return ReceiverAnalysisOutcome::Precise(vec![return_type.to_string()]);
+    }
+
     let cache_key = (
         method.source().clone(),
         method.fq_name(),

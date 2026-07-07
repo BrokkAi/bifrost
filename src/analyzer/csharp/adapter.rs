@@ -1,8 +1,9 @@
-use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
+use crate::analyzer::{Language, LanguageAdapter, ProjectFile, SignatureMetadata};
 use tree_sitter::{Language as TsLanguage, Tree};
 
 use super::declarations::parse_csharp_file;
 use super::tests::csharp_contains_tests;
+use super::{csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct CSharpAdapter;
@@ -22,6 +23,32 @@ impl LanguageAdapter for CSharpAdapter {
 
     fn file_extension(&self) -> &'static str {
         "cs"
+    }
+
+    fn normalize_full_name(&self, fq_name: &str) -> String {
+        csharp_normalize_full_name(fq_name)
+    }
+
+    fn callable_arity(
+        &self,
+        signature: &str,
+        _metadata: Option<&SignatureMetadata>,
+    ) -> Option<usize> {
+        Some(csharp_signature_arity(Some(signature)))
+    }
+
+    fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {
+        let declaration_head = signature
+            .split(['(', '{', ';', '='])
+            .next()
+            .unwrap_or(signature)
+            .trim_end();
+        let name = declaration_head.split_whitespace().last()?;
+        let return_type = csharp_signature_return_type(signature, name)?;
+        signature.find(&return_type).map(|start| {
+            let end = start + return_type.len();
+            &signature[start..end]
+        })
     }
 
     fn contains_tests(

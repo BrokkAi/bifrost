@@ -15,7 +15,7 @@ use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
     build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
@@ -27,6 +27,87 @@ use std::sync::{Arc, OnceLock};
 use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
 use tests::detect_scala_test_assertion_smells;
+
+pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {
+    fq_name.replace("$.", ".").trim_end_matches('$').to_string()
+}
+
+pub(crate) fn scala_simple_type_name(unit: &CodeUnit) -> String {
+    unit.short_name()
+        .rsplit('.')
+        .next()
+        .unwrap_or(unit.short_name())
+        .trim_end_matches('$')
+        .to_string()
+}
+
+pub(crate) fn scala_signature_return_type(signature: &str) -> Option<&str> {
+    let (_, after_colon) = signature.rsplit_once(':')?;
+    let end = after_colon.find(['=', '{']).unwrap_or(after_colon.len());
+    let return_type = after_colon[..end].trim();
+    (!return_type.is_empty()).then_some(return_type)
+}
+
+pub(crate) fn scala_member_signature_arity(signature: &str) -> Option<usize> {
+    if let Some(extension_signature) = signature.strip_prefix("extension ") {
+        let after_receiver = extension_signature.split_once(')')?.1.trim_start();
+        return after_receiver
+            .find('(')
+            .and_then(|open| scala_parenthesized_arity(&after_receiver[open..]))
+            .or(Some(0));
+    }
+    let open = signature.find('(')?;
+    scala_parenthesized_arity(&signature[open..])
+}
+
+pub(crate) fn scala_balanced_parenthesized_prefix(source: &str) -> Option<&str> {
+    let mut chars = source.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '(' {
+        return None;
+    }
+    let mut depth = 1usize;
+    for (idx, ch) in chars {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&source[1..idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn scala_split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(value[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts.into_iter().filter(|part| !part.is_empty())
+}
+
+pub(crate) fn scala_parenthesized_arity(source: &str) -> Option<usize> {
+    let inner = scala_balanced_parenthesized_prefix(source)?;
+    if inner.trim().is_empty() {
+        return Some(0);
+    }
+    Some(scala_split_top_level_commas(inner).count())
+}
 
 #[derive(Clone)]
 pub struct ScalaAnalyzer {
@@ -77,6 +158,18 @@ impl ScalaAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
         Self::new_with_config_storage(project, config, storage, None)
+    }
+
+    /// Owned handles to the workspace indexes (refcount bumps, not map
+    /// clones), for per-query views held behind `Arc` caches.
+    pub(crate) fn definition_lookup_index_shared(
+        &self,
+    ) -> Arc<crate::analyzer::DefinitionLookupIndex> {
+        self.inner.definition_lookup_index_shared()
+    }
+
+    pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
+        self.inner.usage_facts_index_shared()
     }
 
     pub(crate) fn new_with_config_storage_and_progress(
@@ -202,6 +295,10 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
         self.inner.definition_lookup_index()
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        self.inner.usage_facts_index()
     }
 
     fn direct_children<'a>(

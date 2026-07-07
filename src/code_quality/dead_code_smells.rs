@@ -11,8 +11,8 @@ use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
     CSharpUsageGraphStrategy, CandidateFileProvider, FallbackCandidateProvider, FuzzyResult,
     GoUsageGraphStrategy, JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy,
-    PhpUsageGraphStrategy, RustExportUsageGraphStrategy, ScalaUsageGraphStrategy,
-    TextSearchCandidateProvider, UsageAnalyzer, UsageHit, UsageHitSurface,
+    PhpUsageGraphStrategy, RubyUsageGraphStrategy, RustExportUsageGraphStrategy,
+    ScalaUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit, UsageHitSurface,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::HashSet;
@@ -127,6 +127,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut csharp_candidates: Vec<CodeUnit> = Vec::new();
     let mut cpp_candidates: Vec<CodeUnit> = Vec::new();
     let mut php_candidates: Vec<CodeUnit> = Vec::new();
+    let mut ruby_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_overloaded_fqns: Option<HashSet<String>> = None;
     let mut java_static_imports_present: Option<bool> = None;
     let mut csharp_overloaded_fqns: Option<HashSet<String>> = None;
@@ -156,6 +157,10 @@ pub fn report_dead_code_and_unused_abstraction_smells(
             }
             Language::JavaScript | Language::TypeScript => {
                 jsts_candidates.push(candidate.clone());
+                continue;
+            }
+            Language::Ruby if !candidate.is_field() => {
+                ruby_candidates.push(candidate.clone());
                 continue;
             }
             Language::Go if !candidate.is_field() && !go_implicit_entry_point(candidate) => {
@@ -334,6 +339,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         analyze_php_candidates_with_usage_graph(
             analyzer,
             &php_candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            &mut skipped,
+        )
+        .into_iter()
+        .filter(|finding| finding.score >= threshold),
+    );
+    findings.extend(
+        analyze_ruby_candidates_with_usage_graph(
+            analyzer,
+            &ruby_candidates,
             usage_candidate_file_cap,
             usage_cap,
             &mut skipped,
@@ -577,6 +593,7 @@ fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
             | Language::CSharp
             | Language::Cpp
             | Language::Php
+            | Language::Ruby
     ) && (code_unit.is_function() || code_unit.is_class() || code_unit.is_field())
 }
 
@@ -1019,6 +1036,30 @@ fn analyze_php_candidates_with_usage_graph(
     )
 }
 
+fn analyze_ruby_candidates_with_usage_graph(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    analyze_fqn_candidates_with_usage_graph(
+        FqnBulkGraphRequest {
+            analyzer,
+            language: Language::Ruby,
+            candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            skipped,
+        },
+        |unit| unit.is_function() || unit.is_class(),
+        |nodes| {
+            crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(analyzer, nodes, |_| true)
+        },
+        ruby_graph_finding,
+    )
+}
+
 struct FqnBulkGraphRequest<'a, 's> {
     analyzer: &'a dyn IAnalyzer,
     language: Language,
@@ -1427,6 +1468,23 @@ fn php_graph_finding(
     public_surface_graph_finding(
         analyzer,
         Language::Php,
+        declarations_by_fqn,
+        candidate,
+        usage,
+        true,
+        "public",
+    )
+}
+
+fn ruby_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    public_surface_graph_finding(
+        analyzer,
+        Language::Ruby,
         declarations_by_fqn,
         candidate,
         usage,
@@ -2142,6 +2200,9 @@ fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
     if PhpUsageGraphStrategy::can_handle(candidate) {
         return Some(Box::new(PhpUsageGraphStrategy::new()));
     }
+    if RubyUsageGraphStrategy::can_handle(candidate) {
+        return Some(Box::new(RubyUsageGraphStrategy::new()));
+    }
     None
 }
 
@@ -2161,6 +2222,7 @@ fn language_label(language: Language) -> &'static str {
         Language::CSharp => "C#",
         Language::Cpp => "C++",
         Language::Php => "PHP",
+        Language::Ruby => "Ruby",
         _ => "graph-backed",
     }
 }

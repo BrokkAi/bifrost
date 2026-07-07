@@ -183,6 +183,8 @@ impl MultiAnalyzer {
             delegates
                 .values()
                 .flat_map(|delegate| delegate.analyzer().all_declarations()),
+            str::to_string,
+            |unit| unit.identifier().to_string(),
         );
         Self {
             delegates,

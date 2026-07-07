@@ -648,11 +648,9 @@ fn method_call_may_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     }
     let mut candidates = ctx
         .visibility
-        .visible_units(ctx.file)
-        .filter(|unit| {
-            unit.is_function()
-                && unit.fq_name() == format!("{}.{}", owner.fq_name(), ctx.spec.member_name)
-        })
+        .visible_members_for_owner_name(ctx.file, owner, &ctx.spec.member_name)
+        .into_iter()
+        .filter(|unit| unit.is_function())
         .cloned()
         .collect::<Vec<_>>();
     if let Some(expected) = ctx.spec.method_arity {
@@ -869,11 +867,8 @@ fn global_field_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 fn bare_global_field_uniquely_resolves_to_target(text: &str, ctx: &ScanCtx<'_>) -> bool {
-    let Some(visible) = ctx.visibility.visible_by_file.get(ctx.file) else {
-        return false;
-    };
     let mut matched_target = false;
-    for unit in visible.iter() {
+    for unit in ctx.visibility.visible_identifier_candidates(ctx.file, text) {
         if !unit.is_field() || !name_matches_terminal(unit.identifier(), &ctx.spec.member_name) {
             continue;
         }
@@ -905,14 +900,11 @@ fn global_field_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     cpp_namespace_for(&ctx.spec.target).as_deref() != Some(namespace.as_str())
         && ctx
             .visibility
-            .visible_by_file
-            .get(ctx.file)
-            .is_some_and(|visible| {
-                visible.iter().any(|unit| {
-                    unit.is_field()
-                        && unit.identifier() == ctx.spec.member_name
-                        && cpp_namespace_for(unit).as_deref() == Some(namespace.as_str())
-                })
+            .visible_identifier_candidates(ctx.file, &ctx.spec.member_name)
+            .any(|unit| {
+                unit.is_field()
+                    && unit.identifier() == ctx.spec.member_name
+                    && cpp_namespace_for(unit).as_deref() == Some(namespace.as_str())
             })
 }
 

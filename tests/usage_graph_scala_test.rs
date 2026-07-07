@@ -457,3 +457,68 @@ class Consumer {
         value["edges"]
     );
 }
+
+#[test]
+fn factory_return_types_resolve_through_shared_type_index() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/App.scala",
+            r#"package example
+
+class Service {
+  def run(): Int = 1
+}
+
+class Noise00
+class Noise01
+class Noise02
+class Noise03
+class Noise04
+class Noise05
+class Noise06
+class Noise07
+class Noise08
+class Noise09
+class Noise10
+class Noise11
+class Noise12
+class Noise13
+class Noise14
+class Noise15
+
+object Factory {
+  def makeQualified(): example.Service = new Service()
+  def makeLocal(): Service = new Service()
+}
+
+class Consumer {
+  def viaQualified(): Int = {
+    val service = Factory.makeQualified()
+    service.run()
+  }
+
+  def viaLocal(): Int = {
+    val service = Factory.makeLocal()
+    service.run()
+  }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "example.Consumer.viaQualified",
+            "example.Service.run"
+        ),
+        "fully-qualified factory return type should edge to Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "example.Consumer.viaLocal", "example.Service.run"),
+        "same-package factory return type should edge to Service.run: {}",
+        value["edges"]
+    );
+}

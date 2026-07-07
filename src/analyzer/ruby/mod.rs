@@ -7,11 +7,11 @@ mod mixins;
 mod tests;
 
 use crate::analyzer::js_ts::build_weighted_cache;
-use crate::analyzer::type_relations::TypeRelation;
+use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
-    Language, Project, ProjectFile, SignatureMetadata, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider,
+    Language, Project, ProjectFile, RubyMethodDispatchMode, SignatureMetadata,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -49,6 +49,7 @@ pub struct RubyAnalyzer {
     zeitwerk_reference_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     #[allow(dead_code)]
     mixin_relations: Arc<OnceLock<Vec<TypeRelation>>>,
+    semantic_facts: Arc<OnceLock<RubySemanticFacts>>,
     /// Class/module declarations indexed by their trailing identifier, for
     /// resolving relative (unqualified) supertype references without scanning
     /// every declaration.
@@ -125,6 +126,7 @@ impl RubyAnalyzer {
             zeitwerk_autoload_code_units: Arc::new(OnceLock::new()),
             zeitwerk_reference_files: Arc::new(OnceLock::new()),
             mixin_relations: Arc::new(OnceLock::new()),
+            semantic_facts: Arc::new(OnceLock::new()),
             types_by_identifier: Arc::new(OnceLock::new()),
         }
     }
@@ -134,6 +136,69 @@ impl RubyAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
+    }
+
+    pub(crate) fn semantic_facts(&self) -> &RubySemanticFacts {
+        self.semantic_facts
+            .get_or_init(|| RubySemanticFacts::build(self))
+    }
+
+    pub(crate) fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode {
+        self.inner
+            .ruby_method_dispatch_mode(unit)
+            .unwrap_or(RubyMethodDispatchMode::Instance)
+    }
+}
+
+pub(crate) struct RubySemanticFacts {
+    pub(crate) ancestors: HashMap<String, HashSet<String>>,
+    pub(crate) mixin_included_owners: HashMap<String, Vec<String>>,
+    pub(crate) mixin_prepended_owners: HashMap<String, Vec<String>>,
+    pub(crate) mixin_class_owners: HashMap<String, Vec<String>>,
+}
+
+impl RubySemanticFacts {
+    fn build(ruby: &RubyAnalyzer) -> Self {
+        let mut ancestors = HashMap::default();
+        let mut mixin_included_owners: HashMap<String, Vec<String>> = HashMap::default();
+        let mut mixin_prepended_owners: HashMap<String, Vec<String>> = HashMap::default();
+        let mut mixin_class_owners: HashMap<String, Vec<String>> = HashMap::default();
+
+        for unit in ruby
+            .all_declarations()
+            .filter(|unit| unit.is_class() || unit.is_module())
+        {
+            let direct = ruby
+                .get_direct_ancestors(unit)
+                .into_iter()
+                .map(|ancestor| ancestor.fq_name())
+                .collect();
+            ancestors.insert(unit.fq_name(), direct);
+        }
+
+        for relation in ruby.mixin_relations() {
+            let entry = match relation.kind {
+                TypeRelationKind::MixinInclude => &mut mixin_included_owners,
+                TypeRelationKind::MixinPrepend => &mut mixin_prepended_owners,
+                TypeRelationKind::MixinExtend => &mut mixin_class_owners,
+                _ => continue,
+            };
+            push_ordered_mixin(entry, relation.from.fq_name(), relation.to.fq_name());
+        }
+
+        Self {
+            ancestors,
+            mixin_included_owners,
+            mixin_prepended_owners,
+            mixin_class_owners,
+        }
+    }
+}
+
+fn push_ordered_mixin(index: &mut HashMap<String, Vec<String>>, from: String, to: String) {
+    let owners = index.entry(from).or_default();
+    if !owners.contains(&to) {
+        owners.push(to);
     }
 }
 

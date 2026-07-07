@@ -26,39 +26,11 @@ use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile};
-use crate::hash::{HashMap, HashSet};
-use std::sync::Mutex;
+use crate::analyzer::{
+    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_normalize_full_name,
+};
+use crate::hash::HashSet;
 use tree_sitter::Node;
-
-type MethodReturnCacheKey = (String, String, usize);
-type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, Option<String>>>;
-type MethodDeclarationIndex = HashMap<MethodReturnCacheKey, Vec<CodeUnit>>;
-
-fn csharp_method_declaration_index(
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
-) -> MethodDeclarationIndex {
-    let mut index: MethodDeclarationIndex = HashMap::default();
-    for unit in csharp
-        .get_all_declarations()
-        .into_iter()
-        .filter(|unit| unit.is_function())
-    {
-        let Some(owner) = analyzer.parent_of(&unit) else {
-            continue;
-        };
-        index
-            .entry((
-                owner.fq_name(),
-                unit.identifier().to_string(),
-                signature_arity(unit.signature()),
-            ))
-            .or_default()
-            .push(unit);
-    }
-    index
-}
 
 pub(super) fn build_csharp_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -71,14 +43,6 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_c_sharp::LANGUAGE.into();
-    let class_units: HashMap<String, CodeUnit> = csharp
-        .get_all_declarations()
-        .into_iter()
-        .filter(|unit| unit.is_class())
-        .map(|unit| (unit.fq_name(), unit))
-        .collect();
-    let method_declarations = csharp_method_declaration_index(analyzer, csharp);
-    let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = CsScan {
@@ -87,9 +51,6 @@ where
                 file,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
-                class_units: &class_units,
-                method_declarations: &method_declarations,
-                method_return_cache: &method_return_cache,
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -104,9 +65,6 @@ struct CsScan<'a, 'b> {
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
-    class_units: &'a HashMap<String, CodeUnit>,
-    method_declarations: &'a MethodDeclarationIndex,
-    method_return_cache: &'a MethodReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -410,25 +368,10 @@ fn method_return_type_for_call(
     method_name: &str,
     arity: usize,
 ) -> Option<String> {
-    let cache_key = (owner.fq_name(), method_name.to_string(), arity);
-    if let Some(cached) = ctx
-        .method_return_cache
-        .lock()
-        .expect("csharp return type cache poisoned")
-        .get(&cache_key)
-        .cloned()
-    {
-        return cached;
-    }
     let mut resolved = csharp_method_return_types_for_owner(ctx, owner, method_name, arity);
     resolved.sort();
     resolved.dedup();
-    let resolved = (resolved.len() == 1).then(|| resolved.remove(0));
-    ctx.method_return_cache
-        .lock()
-        .expect("csharp return type cache poisoned")
-        .insert(cache_key, resolved.clone());
-    resolved
+    (resolved.len() == 1).then(|| resolved.remove(0))
 }
 
 fn csharp_method_return_types_for_owner(
@@ -443,18 +386,49 @@ fn csharp_method_return_types_for_owner(
     }
     let mut returns = Vec::new();
     for candidate in owners {
-        if let Some(methods) =
-            ctx.method_declarations
-                .get(&(candidate.fq_name(), method_name.to_string(), arity))
-        {
-            returns.extend(methods.iter().filter_map(|method| {
-                method_unit_return_type_fq_name(ctx.csharp, &candidate, method)
-            }));
-        }
+        returns.extend(
+            ctx.csharp
+                .definition_lookup_index()
+                .members_for_owner_name(
+                    &candidate.fq_name(),
+                    &csharp_normalize_full_name(&candidate.fq_name()),
+                    method_name,
+                )
+                .into_iter()
+                .filter(|method| method.is_function())
+                .filter_map(|method| {
+                    let facts = ctx.csharp.usage_facts_index().fact_for_declaration(method);
+                    let method_arity = facts
+                        .and_then(|facts| facts.arity)
+                        .unwrap_or_else(|| signature_arity(method.signature()));
+                    if method_arity != arity {
+                        return None;
+                    }
+                    facts
+                        .and_then(|facts| facts.return_type_fqn.clone())
+                        .or_else(|| method_unit_return_type_fq_name(ctx.csharp, &candidate, method))
+                }),
+        );
     }
     returns
 }
 
 fn class_unit_for_fqn(ctx: &CsScan<'_, '_>, fqn: &str) -> Option<CodeUnit> {
-    ctx.class_units.get(fqn).cloned()
+    let normalized = csharp_normalize_full_name(fqn);
+    let mut candidates = ctx
+        .csharp
+        .definition_lookup_index()
+        .by_fqn(fqn)
+        .iter()
+        .chain(
+            ctx.csharp
+                .definition_lookup_index()
+                .by_normalized_fqn(&normalized)
+                .iter(),
+        )
+        .filter(|unit| unit.is_class())
+        .cloned()
+        .collect::<Vec<_>>();
+    ctx.csharp.sort_dedup_type_candidates(&mut candidates);
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }

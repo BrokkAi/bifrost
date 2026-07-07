@@ -1,17 +1,18 @@
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::cpp_call_match::{
-    CppArgType, cpp_signature_param_types, normalize_cpp_type_name,
+    CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
-    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
+    CodeUnit, CodeUnitType, CppAnalyzer, DefinitionLookupIndex, IAnalyzer, IncludeTargetIndex,
+    ProjectFile, cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
     resolve_include_targets_with_index,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::hash::Hash;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -162,7 +163,9 @@ impl CppScanBinding {
 }
 
 pub(in crate::analyzer::usages) struct VisibilityIndex {
+    definitions: Arc<DefinitionLookupIndex>,
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+    visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     aliases_by_file: HashMap<ProjectFile, Vec<CppAlias>>,
 }
 
@@ -203,9 +206,12 @@ impl VisibilityIndex {
             );
             visible_by_file.insert(file.clone(), visible);
         }
+        let visible_by_identifier = build_visible_identifier_index(&visible_by_file);
         let aliases_by_file = build_alias_index(&files);
         Self {
+            definitions: cpp.definition_lookup_index_shared(),
             visible_by_file,
+            visible_by_identifier,
             aliases_by_file,
         }
     }
@@ -218,10 +224,18 @@ impl VisibilityIndex {
                 .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
     }
 
-    pub(in crate::analyzer::usages) fn visible_units<'a>(
-        &'a self,
+    fn is_in_visible_closure(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
+        file == target.source()
+            || self
+                .visible_by_file
+                .get(file)
+                .is_some_and(|visible| visible.contains(target))
+    }
+
+    pub(in crate::analyzer::usages) fn visible_units<'b>(
+        &'b self,
         file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    ) -> Box<dyn Iterator<Item = &'b CodeUnit> + 'b> {
         match self.visible_by_file.get(file) {
             Some(visible) => Box::new(visible.iter()),
             None => Box::new(std::iter::empty()),
@@ -234,11 +248,9 @@ impl VisibilityIndex {
         raw_name: &str,
     ) -> Option<CodeUnit> {
         let normalized = normalize_reference_name(raw_name)?;
-        self.visible_by_file
-            .get(file)?
-            .iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class || is_type_alias(unit))
-            .find(|unit| reference_matches_unit(&normalized, unit))
+        self.type_candidates(file, &normalized)
+            .into_iter()
+            .next()
             .cloned()
     }
 
@@ -249,16 +261,15 @@ impl VisibilityIndex {
         raw_name: &str,
     ) -> Option<CodeUnit> {
         let normalized = normalize_reference_name(raw_name)?;
-        let visible = self.visible_by_file.get(visible_from)?;
         if !normalized.contains("::")
             && let Some(namespace) = cpp_namespace_for(declaration)
         {
             for prefix in namespace_prefixes(&namespace) {
                 let qualified = format!("{prefix}::{normalized}");
-                if let Some(unit) = visible
-                    .iter()
-                    .filter(|unit| unit.kind() == CodeUnitType::Class || is_type_alias(unit))
-                    .find(|unit| reference_matches_unit(&qualified, unit))
+                if let Some(unit) = self
+                    .type_candidates(visible_from, &qualified)
+                    .into_iter()
+                    .next()
                 {
                     return Some(unit.clone());
                 }
@@ -352,12 +363,9 @@ impl VisibilityIndex {
         kind: TargetKind,
     ) -> Option<CodeUnit> {
         let normalized = normalize_reference_name(raw_name)?;
-        self.visible_by_file
-            .get(file)?
-            .iter()
-            .find(|unit| {
-                matches_kind_for_lookup(unit, kind) && reference_matches_unit(&normalized, unit)
-            })
+        self.named_candidates_for_normalized(file, &normalized, kind)
+            .into_iter()
+            .next()
             .cloned()
     }
 
@@ -371,13 +379,13 @@ impl VisibilityIndex {
         let Some(normalized) = normalize_reference_name(raw_name) else {
             return false;
         };
-        self.visible_by_file.get(file).is_some_and(|visible| {
-            visible.iter().any(|unit| {
+        self.named_candidates_for_normalized(file, &normalized, kind)
+            .into_iter()
+            .any(|unit| {
                 matches_kind_for_lookup(unit, kind)
                     && reference_matches_unit(&normalized, unit)
                     && same_visible_symbol(unit, target)
             })
-        })
     }
 
     pub(super) fn named_candidates(
@@ -389,13 +397,8 @@ impl VisibilityIndex {
         let Some(normalized) = normalize_reference_name(raw_name) else {
             return Vec::new();
         };
-        self.visible_by_file
-            .get(file)
+        self.named_candidates_for_normalized(file, &normalized, kind)
             .into_iter()
-            .flatten()
-            .filter(|unit| {
-                matches_kind_for_lookup(unit, kind) && reference_matches_unit(&normalized, unit)
-            })
             .cloned()
             .collect()
     }
@@ -411,13 +414,14 @@ impl VisibilityIndex {
             return false;
         };
         normalized.contains("::")
-            && self.visible_by_file.get(file).is_some_and(|visible| {
-                visible.iter().any(|unit| {
+            && self
+                .named_candidates_for_normalized(file, &normalized, kind)
+                .into_iter()
+                .any(|unit| {
                     matches_kind_for_lookup(unit, kind)
                         && reference_matches_unit(&normalized, unit)
                         && !same_visible_symbol(unit, target)
                 })
-            })
     }
 
     pub(super) fn resolve_call_return_binding(
@@ -429,12 +433,10 @@ impl VisibilityIndex {
         lexical_namespace: Option<&str>,
     ) -> Option<CppScanBinding> {
         let normalized = normalize_reference_name(raw_name)?;
-        let visible = self.visible_by_file.get(file)?;
         let mut candidates = Vec::new();
-        for function in visible.iter().filter(|unit| {
-            matches_kind_for_lookup(unit, TargetKind::FreeFunction)
-                && reference_matches_unit(&normalized, unit)
-        }) {
+        for function in
+            self.named_candidates_for_normalized(file, &normalized, TargetKind::FreeFunction)
+        {
             let signature = cpp_function_signature_text(analyzer, function)?;
             if signature_arity(Some(&signature)) == arity {
                 candidates.push(function.clone());
@@ -453,6 +455,168 @@ impl VisibilityIndex {
             }
         }
         unanimous_return_binding(analyzer, self, file, &candidates)
+    }
+
+    pub(super) fn visible_identifier_candidates<'b>(
+        &'b self,
+        file: &ProjectFile,
+        identifier: &str,
+    ) -> impl Iterator<Item = &'b CodeUnit> + 'b {
+        self.visible_by_identifier
+            .get(file)
+            .and_then(|by_name| by_name.get(identifier))
+            .into_iter()
+            .flatten()
+    }
+
+    pub(super) fn visible_members_for_owner_name<'b>(
+        &'b self,
+        file: &ProjectFile,
+        owner: &CodeUnit,
+        name: &str,
+    ) -> Vec<&'b CodeUnit> {
+        self.definitions
+            .members_for_owner_name(&owner.fq_name(), &owner.fq_name(), name)
+            .into_iter()
+            .filter(|unit| self.is_in_visible_closure(file, unit))
+            .collect()
+    }
+
+    fn type_candidates<'b>(&'b self, file: &ProjectFile, normalized: &str) -> Vec<&'b CodeUnit> {
+        let mut candidates = self
+            .candidate_units(file, normalized, TargetKind::Type)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class || is_type_alias(unit))
+            .collect::<Vec<_>>();
+        dedup_unit_refs(&mut candidates);
+        candidates
+    }
+
+    fn named_candidates_for_normalized<'b>(
+        &'b self,
+        file: &ProjectFile,
+        normalized: &str,
+        kind: TargetKind,
+    ) -> Vec<&'b CodeUnit> {
+        let mut candidates = self
+            .candidate_units(file, normalized, kind)
+            .into_iter()
+            .filter(|unit| {
+                matches_kind_for_lookup(unit, kind) && reference_matches_unit(normalized, unit)
+            })
+            .collect::<Vec<_>>();
+        dedup_unit_refs(&mut candidates);
+        candidates
+    }
+
+    fn candidate_units<'b>(
+        &'b self,
+        file: &ProjectFile,
+        normalized: &str,
+        kind: TargetKind,
+    ) -> Vec<&'b CodeUnit> {
+        if normalized.contains("::") {
+            let mut candidates = Vec::new();
+            for fqn in cpp_reference_fqn_candidates(normalized, kind) {
+                candidates.extend(
+                    self.definitions
+                        .by_fqn(&fqn)
+                        .iter()
+                        .filter(|unit| self.is_in_visible_closure(file, unit)),
+                );
+            }
+            return candidates;
+        }
+        self.visible_identifier_candidates(file, normalized)
+            .collect()
+    }
+}
+
+fn build_visible_identifier_index(
+    visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
+) -> HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>> {
+    let mut out = HashMap::default();
+    for (file, visible) in visible_by_file {
+        let mut by_identifier: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        for unit in visible {
+            by_identifier
+                .entry(unit.identifier().to_string())
+                .or_default()
+                .push(unit.clone());
+        }
+        for units in by_identifier.values_mut() {
+            sort_lookup_units(units);
+            units.dedup();
+        }
+        out.insert(file.clone(), by_identifier);
+    }
+    out
+}
+
+fn sort_lookup_units(units: &mut [CodeUnit]) {
+    units.sort_by(|left, right| {
+        left.fq_name()
+            .cmp(&right.fq_name())
+            .then_with(|| left.signature().cmp(&right.signature()))
+            .then_with(|| left.source().cmp(right.source()))
+    });
+}
+
+fn dedup_unit_refs(units: &mut Vec<&CodeUnit>) {
+    let mut deduped = Vec::with_capacity(units.len());
+    for unit in units.drain(..) {
+        if !deduped.contains(&unit) {
+            deduped.push(unit);
+        }
+    }
+    *units = deduped;
+}
+
+fn cpp_reference_fqn_candidates(reference: &str, kind: TargetKind) -> Vec<String> {
+    let parts = reference
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for package_len in 0..parts.len() {
+        let package = parts[..package_len].join("::");
+        let rest = &parts[package_len..];
+        if rest.is_empty() {
+            continue;
+        }
+        match kind {
+            TargetKind::Type | TargetKind::Constructor => {
+                push_cpp_fqn_candidate(&mut candidates, &package, &rest.join("$"));
+                push_cpp_fqn_candidate(&mut candidates, &package, &rest.join("."));
+            }
+            TargetKind::FreeFunction
+            | TargetKind::Method
+            | TargetKind::GlobalField
+            | TargetKind::MemberField => {
+                push_cpp_fqn_candidate(&mut candidates, &package, &rest.join("."));
+                if rest.len() > 1 {
+                    let owner = rest[..rest.len() - 1].join("$");
+                    let short = format!("{}.{}", owner, rest[rest.len() - 1]);
+                    push_cpp_fqn_candidate(&mut candidates, &package, &short);
+                }
+            }
+        }
+    }
+    candidates
+}
+
+fn push_cpp_fqn_candidate(out: &mut Vec<String>, package: &str, short: &str) {
+    let fqn = if package.is_empty() {
+        short.to_string()
+    } else {
+        format!("{package}.{short}")
+    };
+    if !out.contains(&fqn) {
+        out.push(fqn);
     }
 }
 
@@ -538,17 +702,17 @@ fn resolve_static_method_call_return_binding(
     if function.kind() != "qualified_identifier" {
         return None;
     }
-    let scope = function.child_by_field_name("scope")?;
-    let name = function.child_by_field_name("name")?;
-    let owner = visibility.resolve_type(file, node_text(scope, source))?;
-    let method_fqn = format!("{}.{}", owner.fq_name(), node_text(name, source));
+    let qualified = normalize_cpp_reference_text(node_text(function, source));
+    let (owner_text, member_name) = qualified.rsplit_once("::").or_else(|| {
+        let scope = function.child_by_field_name("scope")?;
+        let name = function.child_by_field_name("name")?;
+        Some((node_text(scope, source), node_text(name, source)))
+    })?;
+    let owner = visibility.resolve_type(file, owner_text)?;
     let candidates = visibility
-        .visible_units(file)
-        .filter(|unit| {
-            unit.is_function()
-                && unit.fq_name() == method_fqn
-                && signature_arity(unit.signature()) == arity
-        })
+        .visible_members_for_owner_name(file, &owner, member_name)
+        .into_iter()
+        .filter(|unit| unit.is_function() && signature_arity(unit.signature()) == arity)
         .cloned()
         .collect::<Vec<_>>();
     unanimous_return_binding(analyzer, visibility, file, &candidates)
@@ -575,15 +739,11 @@ fn resolve_field_method_call_return_binding(
     let owners = receiver_resolver(receiver, source);
     let mut candidates = Vec::new();
     for owner in owners {
-        let method_fqn = format!("{}.{}", owner.fq_name(), member_name);
         candidates.extend(
             visibility
-                .visible_units(file)
-                .filter(|unit| {
-                    unit.is_function()
-                        && unit.fq_name() == method_fqn
-                        && signature_arity(unit.signature()) == arity
-                })
+                .visible_members_for_owner_name(file, &owner, member_name)
+                .into_iter()
+                .filter(|unit| unit.is_function() && signature_arity(unit.signature()) == arity)
                 .cloned(),
         );
     }
@@ -795,7 +955,7 @@ pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> u
     if inner.is_empty() || inner == "void" {
         return 0;
     }
-    split_top_level_commas(inner).count()
+    cpp_split_top_level_commas(inner).count()
 }
 
 pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
@@ -833,10 +993,7 @@ pub(super) fn field_initializer_constructs_target(
     };
     let field_name = node_text(name, ctx.source);
     ctx.visibility
-        .visible_by_file
-        .get(ctx.file)
-        .into_iter()
-        .flatten()
+        .visible_identifier_candidates(ctx.file, field_name)
         .filter(|unit| unit.is_field() && unit.identifier() == field_name)
         .any(|unit| field_declares_type(unit, ctx, owner))
 }
@@ -986,65 +1143,6 @@ fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Nod
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)
-}
-
-pub(in crate::analyzer::usages) fn split_top_level_commas(
-    value: &str,
-) -> impl Iterator<Item = &str> {
-    struct TopLevelCommaSplit<'a> {
-        value: &'a str,
-        start: usize,
-        angle: usize,
-        paren: usize,
-        brace: usize,
-        bracket: usize,
-    }
-
-    impl<'a> Iterator for TopLevelCommaSplit<'a> {
-        type Item = &'a str;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.start > self.value.len() {
-                return None;
-            }
-            for (offset, ch) in self.value[self.start..].char_indices() {
-                let absolute = self.start + offset;
-                match ch {
-                    '<' => self.angle += 1,
-                    '>' => self.angle = self.angle.saturating_sub(1),
-                    '(' => self.paren += 1,
-                    ')' => self.paren = self.paren.saturating_sub(1),
-                    '{' => self.brace += 1,
-                    '}' => self.brace = self.brace.saturating_sub(1),
-                    '[' => self.bracket += 1,
-                    ']' => self.bracket = self.bracket.saturating_sub(1),
-                    ',' if self.angle == 0
-                        && self.paren == 0
-                        && self.brace == 0
-                        && self.bracket == 0 =>
-                    {
-                        let item = self.value[self.start..absolute].trim();
-                        self.start = absolute + ch.len_utf8();
-                        return Some(item);
-                    }
-                    _ => {}
-                }
-            }
-            let item = self.value[self.start..].trim();
-            self.start = self.value.len() + 1;
-            Some(item)
-        }
-    }
-
-    TopLevelCommaSplit {
-        value,
-        start: 0,
-        angle: 0,
-        paren: 0,
-        brace: 0,
-        bracket: 0,
-    }
-    .filter(|item| !item.is_empty())
 }
 
 pub(in crate::analyzer::usages) fn extract_variable_name(
@@ -1500,15 +1598,22 @@ pub(super) fn precise_parent_of(
     else {
         return fallback;
     };
+    let owner_fqn = if code_unit.package_name().is_empty() {
+        owner_name.to_string()
+    } else {
+        format!("{}.{}", code_unit.package_name(), owner_name)
+    };
     analyzer
-        .get_all_declarations()
-        .into_iter()
+        .definition_lookup_index()
+        .by_fqn(&owner_fqn)
+        .iter()
         .find(|candidate| {
             candidate.is_class()
                 && candidate.source() == code_unit.source()
                 && candidate.short_name() == owner_name
                 && candidate.package_name() == code_unit.package_name()
         })
+        .cloned()
         .or_else(|| {
             fallback.filter(|parent| {
                 parent.short_name() == owner_name
@@ -1525,12 +1630,18 @@ pub(super) fn visible_owner_from_member_name(
         .short_name()
         .rsplit_once('.')
         .map(|(owner, _)| owner)?;
-    ctx.visibility
-        .visible_by_file
-        .get(ctx.file)?
+    let owner_fqn = if code_unit.package_name().is_empty() {
+        owner_name.to_string()
+    } else {
+        format!("{}.{}", code_unit.package_name(), owner_name)
+    };
+    ctx.analyzer
+        .definition_lookup_index()
+        .by_fqn(&owner_fqn)
         .iter()
         .find(|candidate| {
             candidate.is_class()
+                && ctx.visibility.is_visible(ctx.file, candidate)
                 && candidate.short_name() == owner_name
                 && candidate.package_name() == code_unit.package_name()
         })

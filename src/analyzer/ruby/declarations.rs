@@ -1,7 +1,7 @@
 use super::imports::parse_ruby_require_call;
 use super::*;
-use crate::analyzer::SignatureMetadata;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::{RubyMethodDispatchMode, SignatureMetadata};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Parses Ruby source into a tree-sitter tree, or `None` if parsing fails.
@@ -174,6 +174,10 @@ impl RubyVisitor<'_> {
         );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
+        self.parsed.set_ruby_method_dispatch_mode(
+            code_unit.clone(),
+            ruby_method_dispatch_mode(node, self.source),
+        );
         self.parsed.add_signature_with_metadata(
             code_unit,
             ruby_signature_metadata(first_line(node, self.source), node, self.source),
@@ -394,6 +398,10 @@ impl RubyVisitor<'_> {
             Some(parent.clone()),
             None,
         );
+        self.parsed.set_ruby_method_dispatch_mode(
+            code_unit.clone(),
+            ruby_method_dispatch_mode(signature_node, self.source),
+        );
         self.parsed.add_signature(
             code_unit,
             ruby_node_text(signature_node, self.source)
@@ -468,6 +476,16 @@ fn ruby_method_field_scope(node: Node<'_>) -> RubyFieldScope {
     }
 }
 
+fn ruby_method_dispatch_mode(node: Node<'_>, source: &str) -> RubyMethodDispatchMode {
+    if module_function_applies_to_method(node, source) {
+        RubyMethodDispatchMode::ModuleFunction
+    } else if method_is_singleton_context(node) {
+        RubyMethodDispatchMode::Singleton
+    } else {
+        RubyMethodDispatchMode::Instance
+    }
+}
+
 fn method_is_singleton_context(node: Node<'_>) -> bool {
     if node.kind() == "singleton_method" {
         return true;
@@ -483,6 +501,87 @@ fn method_is_singleton_context(node: Node<'_>) -> bool {
         parent = current.parent();
     }
     false
+}
+
+fn module_function_applies_to_method(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "method" {
+        return false;
+    }
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let method_name = ruby_node_text(name_node, source).trim();
+    let Some(module) = enclosing_module_for_module_function(node) else {
+        return false;
+    };
+    let Some(body) = module.child_by_field_name("body") else {
+        return false;
+    };
+
+    let mut bare_module_function_active = false;
+    let mut stack = vec![body];
+    while let Some(current) = stack.pop() {
+        if current != body
+            && matches!(
+                current.kind(),
+                "class" | "module" | "method" | "singleton_method"
+            )
+        {
+            continue;
+        }
+        if current.kind() == "identifier"
+            && current.start_byte() < node.start_byte()
+            && ruby_node_text(current, source).trim() == "module_function"
+        {
+            bare_module_function_active = true;
+            continue;
+        }
+        if current.kind() == "call"
+            && let Some(method) = current.child_by_field_name("method")
+            && ruby_node_text(method, source).trim() == "module_function"
+        {
+            let mut names = module_function_names(current, source);
+            if names.next().is_none() {
+                if current.start_byte() < node.start_byte() {
+                    bare_module_function_active = true;
+                }
+            } else if module_function_names(current, source).any(|name| name == method_name) {
+                return true;
+            }
+            continue;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    bare_module_function_active
+}
+
+fn enclosing_module_for_module_function(node: Node<'_>) -> Option<Node<'_>> {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        match current.kind() {
+            "module" => return Some(current),
+            "class" => return None,
+            _ => parent = current.parent(),
+        }
+    }
+    None
+}
+
+fn module_function_names<'a>(node: Node<'_>, source: &'a str) -> impl Iterator<Item = String> + 'a {
+    let mut names = Vec::new();
+    if let Some(arguments) = node.child_by_field_name("arguments") {
+        let mut cursor = arguments.walk();
+        for arg in arguments.named_children(&mut cursor) {
+            if let Some(name) = literal_symbol_or_string_name(arg, source) {
+                names.push(name);
+            }
+        }
+    }
+    names.into_iter()
 }
 
 fn assignment_constant_short_name(lexical_segments: &[String], name_path: &RubyNamePath) -> String {

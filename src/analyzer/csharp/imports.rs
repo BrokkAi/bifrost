@@ -221,21 +221,6 @@ pub(super) fn csharp_using_alias_from_node(
     (!target.is_empty()).then_some((alias, target))
 }
 
-pub(super) fn csharp_type_name_matches(unit: &CodeUnit, raw_name: &str) -> bool {
-    let normalized = normalize_csharp_type_name(raw_name);
-    if normalized.is_empty() {
-        return false;
-    }
-    normalized == unit.fq_name()
-        || normalized == unit.fq_name().replace('$', ".")
-        || (normalized.contains('$') && normalized == unit.short_name())
-        || (normalized.contains('.')
-            && unit
-                .fq_name()
-                .strip_suffix(unit.identifier())
-                .is_some_and(|prefix| normalized == format!("{prefix}{}", unit.identifier())))
-}
-
 pub(super) fn normalize_csharp_type_name(raw_name: &str) -> String {
     let without_nullable = raw_name.trim().trim_end_matches('?').trim();
     let without_arrays = without_nullable

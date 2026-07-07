@@ -2,7 +2,8 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::persistence::{self, AnalyzerStorage};
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, DefinitionLookupIndex, ImportInfo,
-    Language, Project, ProjectFile, Range, SignatureMetadata,
+    Language, Project, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
+    UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
@@ -84,6 +85,22 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn file_extension(&self) -> &'static str;
     fn normalize_full_name(&self, fq_name: &str) -> String {
         fq_name.to_string()
+    }
+    fn simple_type_name(&self, unit: &CodeUnit) -> String {
+        unit.identifier().to_string()
+    }
+    fn callable_arity(
+        &self,
+        _signature: &str,
+        metadata: Option<&SignatureMetadata>,
+    ) -> Option<usize> {
+        metadata.map(|metadata| metadata.parameters().len())
+    }
+    fn callable_return_type_text<'a>(&self, _signature: &'a str) -> Option<&'a str> {
+        None
+    }
+    fn preferred_type_candidate<'a>(&self, candidates: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
+        candidates.first()
     }
     fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
         false
@@ -168,6 +185,7 @@ pub(crate) struct FileState {
     pub(crate) type_identifiers: HashSet<String>,
     pub(crate) signatures: HashMap<CodeUnit, Vec<String>>,
     pub(crate) signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
+    pub(crate) ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
     pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
     pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
     pub(crate) type_aliases: HashSet<CodeUnit>,
@@ -185,7 +203,10 @@ pub(crate) struct FileState {
 struct AnalyzerState {
     files: HashMap<ProjectFile, FileState>,
     definitions: HashMap<String, Vec<CodeUnit>>,
-    definition_lookup_index: DefinitionLookupIndex,
+    // Arc so per-query views (e.g. Scala's ProjectTypes) can hold an owned
+    // handle without cloning the workspace-sized maps.
+    definition_lookup_index: Arc<DefinitionLookupIndex>,
+    usage_facts_index: Arc<UsageFactsIndex>,
     // Child lists are canonicalized once while building immutable analyzer
     // state. `direct_children` intentionally exposes this deduped, source-
     // ordered contract; callers only reorder when they need a presentation-
@@ -196,6 +217,7 @@ struct AnalyzerState {
     raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     signatures: HashMap<CodeUnit, Vec<String>>,
     signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
+    ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
     classes_by_package: HashMap<String, Vec<CodeUnit>>,
     #[allow(dead_code)]
     type_aliases: HashSet<CodeUnit>,
@@ -210,6 +232,7 @@ struct IndexCapacities {
     raw_supertypes: usize,
     signatures: usize,
     signature_metadata: usize,
+    ruby_method_dispatch_modes: usize,
     classes_by_package: usize,
     type_aliases: usize,
 }
@@ -226,6 +249,7 @@ pub struct ParsedFile {
     pub type_identifiers: HashSet<String>,
     pub signatures: HashMap<CodeUnit, Vec<String>>,
     pub signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
+    pub ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
     pub type_aliases: HashSet<CodeUnit>,
     ranges: HashMap<CodeUnit, Vec<Range>>,
     children: HashMap<CodeUnit, Vec<CodeUnit>>,
@@ -244,6 +268,7 @@ impl ParsedFile {
             type_identifiers: HashSet::default(),
             signatures: HashMap::default(),
             signature_metadata: HashMap::default(),
+            ruby_method_dispatch_modes: HashMap::default(),
             type_aliases: HashSet::default(),
             ranges: HashMap::default(),
             children: HashMap::default(),
@@ -387,6 +412,14 @@ impl ParsedFile {
         }
     }
 
+    pub fn set_ruby_method_dispatch_mode(
+        &mut self,
+        code_unit: CodeUnit,
+        mode: RubyMethodDispatchMode,
+    ) {
+        self.ruby_method_dispatch_modes.insert(code_unit, mode);
+    }
+
     pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
         self.children.entry(parent).or_default().push(child);
     }
@@ -423,6 +456,7 @@ impl ParsedFile {
         self.raw_supertypes.remove(code_unit);
         self.signatures.remove(code_unit);
         self.signature_metadata.remove(code_unit);
+        self.ruby_method_dispatch_modes.remove(code_unit);
         self.type_aliases.remove(code_unit);
         self.ranges.remove(code_unit);
     }
@@ -688,6 +722,7 @@ where
             type_identifiers: parsed.type_identifiers,
             signatures: parsed.signatures,
             signature_metadata: parsed.signature_metadata,
+            ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
             ranges: parsed.ranges,
             children: parsed.children,
             type_aliases: parsed.type_aliases,
@@ -921,6 +956,9 @@ where
         let mut signatures = map_with_capacity::<CodeUnit, Vec<String>>(capacities.signatures);
         let mut signature_metadata =
             map_with_capacity::<CodeUnit, Vec<SignatureMetadata>>(capacities.signature_metadata);
+        let mut ruby_method_dispatch_modes = map_with_capacity::<CodeUnit, RubyMethodDispatchMode>(
+            capacities.ruby_method_dispatch_modes,
+        );
         let mut classes_by_package =
             map_with_capacity::<String, Vec<CodeUnit>>(capacities.classes_by_package);
         let mut type_aliases = set_with_capacity::<CodeUnit>(capacities.type_aliases);
@@ -928,7 +966,11 @@ where
         for state in files.values() {
             for declaration in &state.declarations {
                 if !declaration.is_file_scope() {
-                    definition_lookup_index.insert(declaration);
+                    definition_lookup_index.insert(
+                        declaration,
+                        &|fq_name| adapter.normalize_full_name(fq_name),
+                        &|unit| adapter.simple_type_name(unit),
+                    );
                     definitions
                         .entry(adapter.normalize_full_name(&declaration.fq_name()))
                         .or_default()
@@ -942,7 +984,11 @@ where
                 }
             }
             for lookup_unit in &state.definition_lookup_units {
-                definition_lookup_index.insert(lookup_unit);
+                definition_lookup_index.insert(
+                    lookup_unit,
+                    &|fq_name| adapter.normalize_full_name(fq_name),
+                    &|unit| adapter.simple_type_name(unit),
+                );
             }
 
             for (parent, descendants) in &state.children {
@@ -977,6 +1023,13 @@ where
                     .extend(metadata.iter().cloned());
             }
 
+            ruby_method_dispatch_modes.extend(
+                state
+                    .ruby_method_dispatch_modes
+                    .iter()
+                    .map(|(unit, mode)| (unit.clone(), *mode)),
+            );
+
             type_aliases.extend(state.type_aliases.iter().cloned());
         }
 
@@ -1010,17 +1063,35 @@ where
         }
 
         let _ = project;
+        let usage_facts_index = UsageFactsIndex::build_from_declarations(
+            &definition_lookup_index,
+            files.values().flat_map(|state| state.declarations.iter()),
+            |unit| {
+                signatures
+                    .get(unit)
+                    .and_then(|entries| entries.first().cloned())
+                    .or_else(|| unit.signature().map(str::to_string))
+            },
+            |unit| {
+                signature_metadata
+                    .get(unit)
+                    .and_then(|entries| entries.first().cloned())
+            },
+            adapter,
+        );
 
         AnalyzerState {
             files,
             definitions,
-            definition_lookup_index,
+            definition_lookup_index: Arc::new(definition_lookup_index),
+            usage_facts_index: Arc::new(usage_facts_index),
             children,
             module_children,
             ranges,
             raw_supertypes,
             signatures,
             signature_metadata,
+            ruby_method_dispatch_modes,
             classes_by_package,
             type_aliases,
         }
@@ -1042,6 +1113,7 @@ where
             capacities.raw_supertypes += state.raw_supertypes.len();
             capacities.signatures += state.signatures.len();
             capacities.signature_metadata += state.signature_metadata.len();
+            capacities.ruby_method_dispatch_modes += state.ruby_method_dispatch_modes.len();
             capacities.type_aliases += state.type_aliases.len();
             class_declarations += state
                 .declarations
@@ -1067,6 +1139,16 @@ where
     pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {
         self.file_state(file)
             .map(|state| state.package_name.as_str())
+    }
+
+    pub(crate) fn ruby_method_dispatch_mode(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> Option<RubyMethodDispatchMode> {
+        self.state
+            .ruby_method_dispatch_modes
+            .get(code_unit)
+            .copied()
     }
 
     pub(crate) fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
@@ -1240,6 +1322,19 @@ where
             .map(|range| range.start_byte)
             .min()
             .unwrap_or(usize::MAX)
+    }
+
+    /// Owned handle to the workspace definition index. A refcount bump, not a
+    /// map clone; used by per-query views that must outlive a borrow of the
+    /// analyzer (e.g. Scala's `ProjectTypes` behind `Arc` caches).
+    pub(crate) fn definition_lookup_index_shared(&self) -> Arc<DefinitionLookupIndex> {
+        Arc::clone(&self.state.definition_lookup_index)
+    }
+
+    /// Owned handle to the derived callable-facts index; see
+    /// [`Self::definition_lookup_index_shared`].
+    pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
+        Arc::clone(&self.state.usage_facts_index)
     }
 }
 
@@ -1415,6 +1510,10 @@ where
 
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
         &self.state.definition_lookup_index
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        &self.state.usage_facts_index
     }
 
     fn direct_children<'a>(

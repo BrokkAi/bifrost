@@ -1,3 +1,4 @@
+use crate::analyzer::csharp_normalize_full_name;
 use crate::analyzer::usages::csharp_graph::hits::push_hit;
 use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, argument_count, binding_scope_node, expression_resolves_to_type,
@@ -269,18 +270,30 @@ fn extension_receiver_type_matches(
     let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
         return false;
     };
-    let Some(receiver_unit) = ctx
+    let mut receiver_units = ctx
         .csharp
-        .get_all_declarations()
-        .into_iter()
-        .find(|unit| unit.is_class() && unit.fq_name() == receiver_type)
-    else {
-        return false;
-    };
-    provider
-        .get_ancestors(&receiver_unit)
+        .definition_lookup_index()
+        .by_fqn(receiver_type)
         .iter()
-        .any(|ancestor| ancestor.fq_name() == extension_receiver_type)
+        .chain(
+            ctx.csharp
+                .definition_lookup_index()
+                .by_normalized_fqn(&csharp_normalize_full_name(receiver_type))
+                .iter(),
+        )
+        .filter(|unit| unit.is_class())
+        .cloned()
+        .collect::<Vec<_>>();
+    ctx.csharp.sort_dedup_type_candidates(&mut receiver_units);
+    if receiver_units.is_empty() {
+        return false;
+    }
+    receiver_units.iter().any(|receiver_unit| {
+        provider
+            .get_ancestors(receiver_unit)
+            .iter()
+            .any(|ancestor| ancestor.fq_name() == extension_receiver_type)
+    })
 }
 
 fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

@@ -290,6 +290,50 @@ public class Consumer {
 }
 
 #[test]
+fn receiver_return_type_chaining_uses_keyed_lookup_with_unrelated_declarations() {
+    let mut unrelated = String::from("namespace Noise;\n");
+    for index in 0..80 {
+        unrelated.push_str(&format!(
+            "public class Unrelated{index} {{ public void Use() {{}} public Unrelated{index} Create() => this; }}\n"
+        ));
+    }
+
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Noise.cs", unrelated)
+        .file(
+            "App.cs",
+            r#"
+namespace App;
+
+public class Product {
+    public void Use() {}
+}
+
+public class Factory {
+    public Product Create() {
+        return new Product();
+    }
+}
+
+public class Consumer {
+    public void Run(Factory factory) {
+        var product = factory.Create();
+        product.Use();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "App.Consumer.Run", "App.Product.Use"),
+        "factory return receiver should resolve through keyed declarations: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn factory_return_resolves_in_callee_namespace() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

@@ -472,14 +472,14 @@ impl ScanCtx<'_> {
         if !self.target.is_class() {
             return false;
         }
+        let owner_fqn = self.target.fq_name();
         self.analyzer
-            .get_all_declarations()
+            .definition_lookup_index()
+            .members_for_owner_name(&owner_fqn, &owner_fqn, attribute)
             .into_iter()
             .any(|unit| {
                 unit.is_function()
-                    && unit.identifier() == attribute
-                    && self.analyzer.parent_of(&unit).as_ref() == Some(self.target)
-                    && python_callable_has_decorator(self.analyzer, &unit, "classmethod")
+                    && python_callable_has_decorator(self.analyzer, unit, "classmethod")
             })
     }
 }
@@ -790,11 +790,12 @@ fn collect_imported_class_method_return_types(
     class_unit: &CodeUnit,
     factory_return_types: &mut HashMap<String, String>,
 ) {
-    for member in analyzer.get_all_declarations() {
+    let owner_fqn = class_unit.fq_name();
+    for member in analyzer
+        .definition_lookup_index()
+        .fqn_direct_children(&owner_fqn)
+    {
         if !member.is_function() {
-            continue;
-        }
-        if analyzer.parent_of(&member).as_ref() != Some(class_unit) {
             continue;
         }
         let Some(return_type) = callable_return_type_name(analyzer, &member) else {

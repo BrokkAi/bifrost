@@ -14,7 +14,7 @@ use crate::analyzer::js_ts::{
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range,
     SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
     build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
@@ -25,6 +25,7 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser};
 
 use adapter::PhpAdapter;
+pub(crate) use adapter::php_signature_return_type_text;
 pub(crate) use aliases::{
     PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
 };
@@ -353,6 +354,10 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
         self.inner.definition_lookup_index()
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        self.inner.usage_facts_index()
     }
 
     fn direct_children<'a>(

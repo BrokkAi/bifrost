@@ -237,8 +237,8 @@ pub fn analyze_commit_at_root(
     let parent_analyzer = build_analyzer(parent_tree.path(), parent_tree.files())?;
     let commit_analyzer = build_analyzer(commit_tree.path(), commit_tree.files())?;
 
-    let before = symbol_index(parent_analyzer.analyzer(), params.include_tests);
-    let after = symbol_index(commit_analyzer.analyzer(), params.include_tests);
+    let before = symbol_snapshot_map(parent_analyzer.analyzer(), params.include_tests);
+    let after = symbol_snapshot_map(commit_analyzer.analyzer(), params.include_tests);
 
     let mut postimage_introduced = Vec::new();
     let mut postimage_edited = Vec::new();
@@ -600,7 +600,7 @@ fn build_analyzer(root: &Path, files: &[PathBuf]) -> Result<WorkspaceAnalyzer, S
     Ok(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()))
 }
 
-fn symbol_index(
+fn symbol_snapshot_map(
     analyzer: &dyn IAnalyzer,
     include_tests: bool,
 ) -> BTreeMap<SymbolKey, SymbolSnapshot> {

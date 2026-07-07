@@ -6,10 +6,10 @@ use super::declarations::{
 use super::imports::parse_import_info;
 use super::tests::java_source_contains_tests;
 use super::*;
-use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::{LanguageAdapter, SignatureMetadata};
 use std::sync::LazyLock;
-use tree_sitter::{Language as TsLanguage, Node, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 /// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
 /// for Java. Mirrors `ai.brokk.analyzer.java.CognitiveComplexityAnalysis`.
@@ -62,6 +62,18 @@ impl LanguageAdapter for JavaAdapter {
 
     fn normalize_full_name(&self, fq_name: &str) -> String {
         normalize_java_full_name(fq_name)
+    }
+
+    fn callable_arity(
+        &self,
+        _signature: &str,
+        metadata: Option<&SignatureMetadata>,
+    ) -> Option<usize> {
+        metadata.map(|metadata| metadata.parameters().len())
+    }
+
+    fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {
+        java_signature_return_type_text(signature)
     }
 
     fn is_anonymous_structure(&self, fq_name: &str) -> bool {
@@ -147,4 +159,48 @@ impl LanguageAdapter for JavaAdapter {
     fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
         Some(&super::structural::JAVA_STRUCTURAL_SPEC)
     }
+}
+
+fn java_signature_return_type_text(signature: &str) -> Option<&str> {
+    let prefix = "class __BifrostSignature { ";
+    let source = format!("{prefix}{signature}; }}");
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source.as_str(), None)?;
+    let declaration = find_signature_declaration(tree.root_node())?;
+    let type_node = declaration.child_by_field_name("type")?;
+    signature_slice(
+        signature,
+        prefix.len(),
+        type_node.start_byte(),
+        type_node.end_byte(),
+    )
+}
+
+fn find_signature_declaration(root: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "method_declaration" | "field_declaration") {
+            return Some(node);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn signature_slice(
+    signature: &str,
+    offset: usize,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<&str> {
+    let start = start_byte.checked_sub(offset)?;
+    let end = end_byte.checked_sub(offset)?;
+    signature.get(start..end).map(str::trim)
 }

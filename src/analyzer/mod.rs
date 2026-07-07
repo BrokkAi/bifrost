@@ -29,6 +29,7 @@ pub(crate) mod symbol_lookup;
 pub(crate) mod tree_sitter_analyzer;
 pub(crate) mod type_relations;
 mod typescript;
+mod usage_facts;
 pub mod usages;
 mod workspace;
 
@@ -49,6 +50,9 @@ pub(crate) use cpp::{
     normalize_cpp_whitespace, resolve_include_targets, resolve_include_targets_with_index,
 };
 pub use csharp::CSharpAnalyzer;
+pub(crate) use csharp::{
+    csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
+};
 pub use definition_lookup_index::DefinitionLookupIndex;
 pub use go::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
@@ -60,8 +64,8 @@ pub use model::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo,
     Language, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata,
-    ParseError, ParseErrorKind, ProjectFile, Range, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, metrics_from_declarations,
+    ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
@@ -70,7 +74,8 @@ pub use php::{
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 pub(crate) use php::{
-    PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+    PhpFileContext, php_signature_return_type_text, resolve_php_constant, resolve_php_function,
+    resolve_php_type,
 };
 pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, MultiRootProject, OverlayProject,
@@ -78,11 +83,14 @@ pub use project::{
 };
 pub use python::PythonAnalyzer;
 pub use ruby::RubyAnalyzer;
+pub(crate) use ruby::RubySemanticFacts;
 pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
+pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
 };
 pub use typescript::TypescriptAnalyzer;
+pub(crate) use usage_facts::UsageFactsIndex;
 pub use workspace::{EmptyAnalyzer, WorkspaceAnalyzer};

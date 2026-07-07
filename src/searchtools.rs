@@ -3539,6 +3539,20 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         );
     }
     {
+        let _scope = profiling::scope("usage_graph::resolve_ruby");
+        let ruby_edges = crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(
+            analyzer,
+            ecosystem_fqns(Ecosystem::Ruby),
+            keep_file,
+        );
+        record_inverted(
+            Ecosystem::Ruby,
+            ruby_edges,
+            &mut edge_sites,
+            &mut truncated_symbols,
+        );
+    }
+    {
         let _scope = profiling::scope("usage_graph::resolve_scala");
         let scala_edges = crate::analyzer::usages::scala_graph::build_scala_usage_edges(
             analyzer,
@@ -5456,6 +5470,7 @@ enum Ecosystem {
     CSharp,
     Cpp,
     Php,
+    Ruby,
     Scala,
     Unknown,
 }
@@ -5471,10 +5486,9 @@ impl Ecosystem {
             Language::CSharp => Self::CSharp,
             Language::Cpp => Self::Cpp,
             Language::Php => Self::Php,
+            Language::Ruby => Self::Ruby,
             Language::Scala => Self::Scala,
-            // Ruby has no dedicated usage-graph ecosystem yet; it is fqn-merged
-            // across files (class reopening) like the non-module-scoped ones.
-            Language::Ruby | Language::None => Self::Unknown,
+            Language::None => Self::Unknown,
         }
     }
 
@@ -5499,6 +5513,7 @@ impl Ecosystem {
             Self::CSharp => "csharp",
             Self::Cpp => "cpp",
             Self::Php => "php",
+            Self::Ruby => "ruby",
             Self::Scala => "scala",
             Self::Unknown => "unknown",
         }

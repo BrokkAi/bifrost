@@ -17,7 +17,7 @@ use crate::analyzer::{
     CommentDensityStats, DeclarationInfo, DeclarationKind, ExceptionHandlingSmell,
     ExceptionSmellWeights, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
     SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -255,6 +255,10 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
         self.inner.definition_lookup_index()
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        self.inner.usage_facts_index()
     }
 
     fn direct_children<'a>(
