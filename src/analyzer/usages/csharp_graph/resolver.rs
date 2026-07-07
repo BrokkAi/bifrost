@@ -1,7 +1,11 @@
 pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 pub(super) use crate::analyzer::usages::common::same_node;
+use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
-use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, resolve_analyzer};
+use crate::analyzer::{
+    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_normalize_full_name,
+    csharp_signature_arity, csharp_signature_return_type, resolve_analyzer,
+};
 use tree_sitter::Node;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,18 +70,7 @@ impl TargetSpec {
 }
 
 pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> usize {
-    let Some(signature) = signature else {
-        return 0;
-    };
-    let inner = signature
-        .strip_prefix('(')
-        .and_then(|rest| rest.strip_suffix(')'))
-        .unwrap_or(signature)
-        .trim();
-    if inner.is_empty() {
-        return 0;
-    }
-    count_top_level_comma_separated(inner)
+    csharp_signature_arity(signature)
 }
 
 pub(in crate::analyzer::usages) fn seed_bindings_before(
@@ -356,11 +349,7 @@ fn receiver_type_units(
         "identifier" => {
             let name = node_text(receiver, source);
             if let Some(target) = first_precise_binding(bindings, name) {
-                return csharp
-                    .get_all_declarations()
-                    .into_iter()
-                    .filter(|unit| unit.is_class() && unit.fq_name() == target)
-                    .collect();
+                return type_declarations_for_fq_name(csharp, &target);
             }
             if bindings.is_shadowed(name) {
                 Vec::new()
@@ -368,12 +357,7 @@ fn receiver_type_units(
                 enclosing_declared_type(receiver, csharp, file, source)
                     .and_then(|owner| member_declared_type_fq_name(csharp, file, &owner, name))
                     .into_iter()
-                    .flat_map(|fq_name| {
-                        csharp
-                            .get_all_declarations()
-                            .into_iter()
-                            .filter(move |unit| unit.is_class() && unit.fq_name() == fq_name)
-                    })
+                    .flat_map(|fq_name| type_declarations_for_fq_name(csharp, &fq_name))
                     .collect()
             }
         }
@@ -422,20 +406,29 @@ fn enclosing_declared_type(
     _source: &str,
 ) -> Option<CodeUnit> {
     let byte = node.start_byte();
-    csharp
-        .get_declarations(file)
-        .into_iter()
+    let class_ranges = ClassRangeIndex::build(csharp, file);
+    let fqn = class_ranges.enclosing(byte)?;
+    class_unit_for_fq_name(csharp, fqn)
+}
+
+fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
+    let mut candidates = type_declarations_for_fq_name(csharp, fqn);
+    csharp.sort_dedup_type_candidates(&mut candidates);
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Vec<CodeUnit> {
+    let index = csharp.definition_lookup_index();
+    let normalized = csharp_normalize_full_name(fqn);
+    let mut candidates = index
+        .by_fqn(fqn)
+        .iter()
+        .chain(index.by_normalized_fqn(&normalized).iter())
         .filter(|unit| unit.is_class())
-        .filter_map(|unit| {
-            csharp
-                .ranges(&unit)
-                .iter()
-                .filter(|range| range.start_byte <= byte && byte < range.end_byte)
-                .map(|range| (range.end_byte - range.start_byte, unit.clone()))
-                .min_by_key(|(len, _)| *len)
-        })
-        .min_by_key(|(len, _)| *len)
-        .map(|(_, unit)| unit)
+        .cloned()
+        .collect::<Vec<_>>();
+    csharp.sort_dedup_type_candidates(&mut candidates);
+    candidates
 }
 
 pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
@@ -446,11 +439,27 @@ pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
 ) -> Option<String> {
     let member_fqn = format!("{}.{}", owner.fq_name(), member_name);
     csharp
-        .get_all_declarations()
+        .definition_lookup_index()
+        .members_for_owner_name(
+            owner.fq_name().as_str(),
+            &csharp_normalize_full_name(&owner.fq_name()),
+            member_name,
+        )
         .into_iter()
         .filter(|unit| unit.is_field() && unit.fq_name() == member_fqn)
-        .filter_map(|unit| member_declared_type(csharp, &unit))
-        .find_map(|type_text| resolve_member_type_fq_name(csharp, file, owner, &type_text))
+        .filter_map(|unit| {
+            let indexed = csharp
+                .usage_facts_index()
+                .fact_for_declaration(unit)
+                .and_then(|facts| facts.return_type_fqn.as_deref())
+                .map(str::to_string);
+            indexed.or_else(|| {
+                member_declared_type(csharp, unit).and_then(|type_text| {
+                    resolve_member_type_fq_name(csharp, file, owner, &type_text)
+                })
+            })
+        })
+        .next()
 }
 
 /// Resolve the type named by a method's declared return type, so a call
@@ -475,13 +484,28 @@ pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
 ) -> Option<String> {
     let method_fqn = format!("{}.{}", owner.fq_name(), method_name);
     let mut resolved = csharp
-        .get_all_declarations()
+        .definition_lookup_index()
+        .members_for_owner_name(
+            owner.fq_name().as_str(),
+            &csharp_normalize_full_name(&owner.fq_name()),
+            method_name,
+        )
         .into_iter()
         .filter(|unit| unit.is_function() && unit.fq_name() == method_fqn)
-        .filter(|unit| arity.is_none_or(|arity| signature_arity(unit.signature()) == arity))
         .filter_map(|unit| {
-            let type_text = method_return_type(csharp, &unit)?;
-            resolve_member_type_fq_name(csharp, unit.source(), owner, &type_text)
+            let facts = csharp.usage_facts_index().fact_for_declaration(unit);
+            let unit_arity = facts
+                .and_then(|facts| facts.arity)
+                .unwrap_or_else(|| signature_arity(unit.signature()));
+            if arity.is_some_and(|arity| unit_arity != arity) {
+                return None;
+            }
+            facts
+                .and_then(|facts| facts.return_type_fqn.clone())
+                .or_else(|| {
+                    let type_text = method_return_type(csharp, unit)?;
+                    resolve_member_type_fq_name(csharp, unit.source(), owner, &type_text)
+                })
         })
         .collect::<Vec<_>>();
     resolved.sort();
@@ -513,10 +537,7 @@ fn resolve_member_type_fq_name(
             owner.short_name()
         )
     };
-    csharp
-        .get_all_declarations()
-        .into_iter()
-        .find(|unit| unit.is_class() && unit.fq_name() == nested_fq_name)
+    class_unit_for_fq_name(csharp, &nested_fq_name)
         .map(|unit| unit.fq_name())
         .or_else(|| resolve_type_fq_name(csharp, file, type_text))
 }
@@ -541,33 +562,7 @@ fn method_return_type(csharp: &CSharpAnalyzer, method: &CodeUnit) -> Option<Stri
 /// Extract the (normalized) type token that precedes `name` in a declaration
 /// signature — the field/parameter type or a method's return type.
 fn type_text_before_name(signature: &str, name: &str) -> Option<String> {
-    let before_name = signature.trim().rsplit_once(name)?.0.trim();
-    let before_name = before_name.trim_end_matches(|ch: char| ch == '?' || ch.is_whitespace());
-    let type_text = before_name
-        .split_whitespace()
-        .rfind(|part| !member_modifier(part))?;
-    let type_text = normalize_type_text(type_text);
-    (!type_text.is_empty()).then_some(type_text)
-}
-
-fn member_modifier(part: &str) -> bool {
-    matches!(
-        part,
-        "public"
-            | "private"
-            | "protected"
-            | "internal"
-            | "static"
-            | "readonly"
-            | "volatile"
-            | "const"
-            | "new"
-            | "virtual"
-            | "override"
-            | "abstract"
-            | "sealed"
-            | "required"
-    )
+    csharp_signature_return_type(signature, name)
 }
 
 fn seed_symbol_for_type(
@@ -625,11 +620,7 @@ fn resolve_type_fq_name(
     if let Some(target) = csharp.resolve_visible_type(file, &normalized) {
         return Some(target.fq_name());
     }
-    csharp
-        .get_all_declarations()
-        .into_iter()
-        .find(|unit| unit.is_class() && reference_matches_target_fq_name(&normalized, unit))
-        .map(|unit| unit.fq_name())
+    class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name())
 }
 
 fn is_csharp_string_type(reference: &str) -> bool {
@@ -896,55 +887,6 @@ fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
     node.named_children(&mut cursor)
         .filter(|child| child.kind() == kind)
         .count()
-}
-
-fn count_top_level_comma_separated(text: &str) -> usize {
-    if text.trim().is_empty() {
-        return 0;
-    }
-
-    let mut count = 1;
-    let mut angle_depth: usize = 0;
-    let mut paren_depth: usize = 0;
-    let mut bracket_depth: usize = 0;
-    let mut brace_depth: usize = 0;
-    let mut string_quote: Option<char> = None;
-    let mut escaped = false;
-
-    for ch in text.chars() {
-        if let Some(quote) = string_quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == quote {
-                string_quote = None;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' | '\'' => string_quote = Some(ch),
-            '<' => angle_depth = angle_depth.saturating_add(1),
-            '>' if angle_depth > 0 => angle_depth -= 1,
-            '(' => paren_depth = paren_depth.saturating_add(1),
-            ')' if paren_depth > 0 => paren_depth -= 1,
-            '[' => bracket_depth = bracket_depth.saturating_add(1),
-            ']' if bracket_depth > 0 => bracket_depth -= 1,
-            '{' => brace_depth = brace_depth.saturating_add(1),
-            '}' if brace_depth > 0 => brace_depth -= 1,
-            ',' if angle_depth == 0
-                && paren_depth == 0
-                && bracket_depth == 0
-                && brace_depth == 0 =>
-            {
-                count += 1;
-            }
-            _ => {}
-        }
-    }
-
-    count
 }
 
 pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {

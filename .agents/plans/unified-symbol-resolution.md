@@ -15,7 +15,7 @@ Observable outcomes: all existing usage-graph and get-definition test suites kee
 - [x] (2026-07-07) ExecPlan drafted from a four-agent survey of all eleven language graph builders.
 - [x] (2026-07-07 09:11 CDT) Milestone 1 complete: `DefinitionLookupIndex` now uses adapter-supplied normalization and simple-type naming, stores normalized FQN/type/member keyed maps, and `src/analyzer/usages/receiver_facts.rs` plus its module declaration are deleted.
 - [x] (2026-07-07 09:11 CDT) Milestone 2 complete: `UsageFactsIndex` is built from analyzer state, exposed through `IAnalyzer`, Scala `ProjectTypes` consumes `DefinitionLookupIndex` plus `UsageFactsIndex`, and `src/analyzer/usages/symbol_index.rs` plus its module declaration are deleted.
-- [ ] Milestone 3: shared visible-name resolver driver; migrate C# (both paths) onto it and the shared indexes.
+- [x] (2026-07-07 10:11 CDT) Milestone 3 complete: added the shared `visible_names` resolver, migrated C# visible type resolution plus forward and inverted usage graph paths to `DefinitionLookupIndex`/`UsageFactsIndex`, replaced C# enclosing-class scans with `ClassRangeIndex`, removed the private C# inverted method/class/return indexes, added the noisy receiver-return regression, and passed the Milestone 3 quality gates.
 - [ ] Milestone 4: migrate the Go query path off the `graph_declarations` linear scans.
 - [ ] Milestone 5: migrate Python off its linear scans.
 - [ ] Milestone 6: migrate C++ (`VisibilityIndex` keyed lookups, kill the `precise_parent_of` workspace scan, dedupe `split_top_level_commas`).
@@ -35,6 +35,12 @@ Observable outcomes: all existing usage-graph and get-definition test suites kee
   Evidence: `src/analyzer/model.rs::SignatureMetadata` has fields `label: String` and `parameters: Vec<ParameterMetadata>` and exposes `label()`/`parameters()` only. Milestone 2 moved Scala's existing signature arity/return helpers into `src/analyzer/scala/mod.rs` and reused them through `ScalaAdapter` rather than adding new ad hoc parsers.
 - Observation: After merging type and member normalized FQN lookups into `DefinitionLookupIndex::by_normalized_fqn`, Scala's `type_by_normalized_fqn` must filter to class units before direct-member import resolution.
   Evidence: the initial Milestone 2 rebase made `import app.ConsoleRenderer.{default => renderer}` seed neither a member nor a type receiver for `renderer.render`; the normalized key `app.ConsoleRenderer.default` correctly contained `app.ConsoleRenderer$.default`, but the type probe consumed the function before the member probe. Filtering `type_by_normalized_fqn` to `is_class()` restored `scala_renamed_member_import_resolves_to_member_definition` and `scala_imported_factory_return_type_uses_factory_scope`.
+- Observation: The Milestone 3 C# scan diagnosis was accurate. The forward path had the listed `get_all_declarations()` scans in `receiver_type_units`, `member_declared_type_fq_name`, `method_return_type_fq_name_for_arity`, `resolve_member_type_fq_name`, `resolve_type_fq_name`, and `extension_receiver_type_matches`, and `enclosing_declared_type` manually scanned `get_declarations(file)` ranges. The inverted path independently built `class_units`, `MethodDeclarationIndex`, and `MethodReturnCache`.
+  Evidence: pre-edit `rg -n "get_all_declarations\\(\\)|MethodDeclarationIndex|MethodReturnCache|class_units" src/analyzer/usages/csharp_graph` showed those anchors in `resolver.rs`, `extractor.rs`, and `inverted.rs`; post-edit `rg -n "get_all_declarations\\(\\)" src/analyzer/usages/csharp_graph` returns no matches.
+- Observation: C# `CodeUnit::signature()` for methods is the parameter key, while the rendered signatures stored in `signatures_of` carry the declared return type. Building `UsageFactsIndex` from the parameter key first would leave C# return facts empty.
+  Evidence: `src/analyzer/csharp/declarations.rs::visit_method` creates the function with `CodeUnit::with_signature(..., Some(csharp_parameter_key(...)))` and separately stores `csharp_method_skeleton(...)` through `add_signature_with_metadata`.
+- Observation: The shared `UsageFactsIndex` can resolve ordinary C# same-namespace/import-visible return types, but not every owner-relative nested type because the generic facts builder has package and declaration FQN context, not the declaring owner type context.
+  Evidence: C# still needs `resolve_member_type_fq_name(owner, type_text)` to interpret nested owner names such as `Outer.Inner`/`Outer$Inner`; the C# resolver now probes `UsageFactsIndex` first and keeps the existing signature-derived owner-relative resolution as a fallback.
 
 ## Decision Log
 
@@ -68,12 +74,28 @@ Observable outcomes: all existing usage-graph and get-definition test suites kee
 - Decision: Let `ProjectTypes` own cloned snapshots of `DefinitionLookupIndex` and `UsageFactsIndex` instead of borrowing them.
   Rationale: existing get-definition/get-type code caches `Arc<ScalaProjectTypes>` without a lifetime parameter. Cloning the immutable analyzer-owned indexes once per resolver construction preserves compatibility and keeps hot-path lookup borrowed inside `ProjectTypes`.
   Date/Author: 2026-07-07 / Codex
+- Decision: Shape `FileImportContext` around imported candidate FQN strings plus a `select_unique` hook instead of the sketch's single `imported_type(simple) -> Option<String>`.
+  Rationale: C# imports include using-namespace expansion, aliases, global usings, partial classes, and same-FQN generic arity distinctions. The shared driver owns the probe order, while `select_unique` lets C# preserve its existing logical-dedup rule for partial declarations and generic arity without cloning in the common path.
+  Date/Author: 2026-07-07 / Codex
+- Decision: Make C# adapter normalization replace nested-type `$` separators with source-spelled `.` for the shared normalized FQN map.
+  Rationale: Existing C# resolution treated `Example.Outer.Inner` and analyzer FQN `Example.Outer$Inner` as the same type. Adapter-level normalization moves that behavior into `DefinitionLookupIndex::by_normalized_fqn` instead of retaining scan-time string matching.
+  Date/Author: 2026-07-07 / Codex
+- Decision: Prefer rendered analyzer signatures over `CodeUnit::signature()` when building `UsageFactsIndex`, with `CodeUnit::signature()` as fallback.
+  Rationale: C# method `CodeUnit::signature()` stores only a parameter key such as `(int)`, so return-type extraction must read the rendered method skeleton stored in `signatures_of`. Scala function units already rely on rendered signatures, so this preserves Scala behavior while enabling C# facts.
+  Date/Author: 2026-07-07 / Codex
+- Decision: Keep C# owner-relative return-type derivation as a fallback behind `UsageFactsIndex` probes.
+  Rationale: The shared facts index does not know the declaring owner when resolving a return type text, so nested owner-relative C# type names still need the existing structured owner-aware resolver. This fallback is behind keyed member/method lookup and does not reintroduce workspace declaration scans.
+  Date/Author: 2026-07-07 / Codex
 
 ## Outcomes & Retrospective
 
 Milestones 1 and 2 are complete in the working tree, with no commits made. `DefinitionLookupIndex` is now the raw analyzer-owned index for exact FQNs, normalized FQNs, package/simple type lookup, and owner/member lookup. `UsageFactsIndex` is the derived callable-facts index and preserves overload entries while collapsing conflicting single-return lookups to ambiguity. Scala now uses those analyzer-owned indexes while keeping its extension-method side table and AST-local `factory_returns` precedence; the guard test `overloaded_factory_receiver_emits_no_partial_edge` passed in the focused suite.
 
 Validation on 2026-07-07: `cargo fmt` completed; `BIFROST_SEMANTIC_INDEX=off cargo test --test usage_graph_scala_test --test usages_scala_graph_test --test intellij_scala_goto_definition --test metals_goto_definition --test get_definition_test --test searchtools_fuzzy_symbol_lookup --test usages_rust_graph_test --test usages_ruby_test` passed (`get_definition_test` 376, `intellij_scala_goto_definition` 2, `metals_goto_definition` 5, `searchtools_fuzzy_symbol_lookup` 21, `usage_graph_scala_test` 13, `usages_ruby_test` 40, `usages_rust_graph_test` 92, `usages_scala_graph_test` 38); `BIFROST_SEMANTIC_INDEX=off cargo test definition_lookup_index` ran the three new `DefinitionLookupIndex` unit tests and passed; `BIFROST_SEMANTIC_INDEX=off cargo test usage_facts` ran the new `UsageFactsIndex` ambiguity test and passed; `cargo clippy --all-targets --all-features -- -D warnings` completed cleanly. `rg -n "symbol_index|receiver_facts" src` returns no matches.
+
+Milestone 3 is complete in the working tree, with no commits made. The new `src/analyzer/usages/visible_names.rs` resolver implements the Java-style probe order for package/namespace languages: qualified exact FQN, import context, same package, then exact-name global fallback with uniqueness enforced by the context. C# `resolve_visible_type` now enters that driver, while `visible_type_candidates` remains a keyed candidate collector for import analysis. C# forward usage resolution now uses `DefinitionLookupIndex` for receiver type units, fields/properties, owner/member methods, nested type probes, and extension receiver hierarchy roots; `UsageFactsIndex` supplies C# callable and field return facts with the existing owner-aware signature fallback where needed. C# inverted edge building no longer owns `class_units`, `MethodDeclarationIndex`, or `MethodReturnCache`; it uses the same shared indexes as the forward path. `enclosing_declared_type` now uses `ClassRangeIndex`.
+
+Validation on 2026-07-07 for Milestone 3: `cargo fmt` completed; `BIFROST_SEMANTIC_INDEX=off cargo test --test usage_graph_csharp_test --test usages_csharp_graph_test --test roslyn_goto_definition --test usage_graph_scala_test --test usages_scala_graph_test --test get_definition_test` passed (`get_definition_test` 376, `roslyn_goto_definition` 9, `usage_graph_csharp_test` 14, `usage_graph_scala_test` 13, `usages_csharp_graph_test` 38, `usages_scala_graph_test` 38); `cargo clippy --all-targets --all-features -- -D warnings` completed cleanly; `rg -n "get_all_declarations\\(\\)" src/analyzer/usages/csharp_graph` returns no matches.
 
 ## Context and Orientation
 
@@ -254,3 +276,5 @@ In `src/analyzer/usages/visible_names.rs`, at the end of Milestone 3: the `FileI
 Use `crate::hash::HashMap`/`HashSet` throughout (the repo's standard hasher), never `BTreeMap` unless ordering is semantically required. Prefer iterators and borrowed returns over cloning in the accessors; these run in hot loops.
 
 Revision note 2026-07-07 / Codex: Executed only Milestones 1 and 2, updated Progress, Surprises & Discoveries, Decision Log, and Outcomes with implementation findings and validation evidence, and left Milestones 3 through 7 untouched for future work.
+
+Revision note 2026-07-07 / Codex: Executed only Milestone 3, updated Progress, Surprises & Discoveries, Decision Log, and Outcomes with the C# migration details and validation evidence, and left Milestones 4 through 7 untouched for future work.

@@ -8,12 +8,14 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::usages::visible_names::{FileImportContext, resolve_visible_type};
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
-    Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
+    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::path_utils::rel_path_string;
 use crate::{CloneSmell, CloneSmellWeights};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use tree_sitter::{Node, Parser};
 use adapter::CSharpAdapter;
 use cache::CSharpMemoCaches;
 use clones::{build_csharp_clone_candidate_data, refine_csharp_clone_similarity};
-use imports::{csharp_type_name_matches, csharp_using_alias_from_import, csharp_using_namespace};
+use imports::{csharp_using_alias_from_import, csharp_using_namespace};
 use tests::detect_csharp_test_assertion_smells;
 
 #[derive(Clone)]
@@ -241,41 +243,245 @@ impl CSharpAnalyzer {
         )
     }
 
+    pub fn resolve_visible_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
+        let ctx = self.file_import_context(file);
+        resolve_visible_type(
+            self.definition_lookup_index(),
+            &ctx,
+            name,
+            &csharp_normalize_full_name,
+            &|_| true,
+        )
+        .cloned()
+    }
+
     fn visible_type_candidates_inner(
         &self,
         file: &ProjectFile,
         name: &str,
         resolve_aliases: bool,
     ) -> Vec<CodeUnit> {
+        let normalized = normalize_csharp_type_fragment(name);
+        if normalized.is_empty() {
+            return Vec::new();
+        }
         if resolve_aliases
-            && let Some(target) = self.using_aliases_of(file).get(name)
-            && target != name
+            && let Some(target) = self.using_aliases_of(file).get(&normalized)
+            && target != &normalized
         {
             return self.visible_type_candidates_inner(file, target, false);
         }
 
-        let mut namespaces = self.using_namespaces_of(file);
-        let file_namespace = self.namespace_of_file(file);
-        if !file_namespace.is_empty() {
-            namespaces.push(file_namespace);
+        let mut candidates = self.type_candidates_by_fqn(&normalized);
+        if !normalized.contains('.') {
+            let mut namespaces = self.using_namespaces_of(file);
+            let file_namespace = self.namespace_of_file(file);
+            if !file_namespace.is_empty() {
+                namespaces.push(file_namespace);
+            }
+            for namespace in namespaces {
+                candidates.extend(
+                    self.definition_lookup_index()
+                        .types_in_package(&namespace, &normalized)
+                        .iter()
+                        .cloned(),
+                );
+            }
         }
+        candidates
+    }
 
-        self.get_all_declarations()
-            .into_iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class)
-            .filter(|unit| {
-                csharp_type_name_matches(unit, name)
-                    || namespaces.iter().any(|namespace| {
-                        unit.package_name() == namespace && unit.identifier() == name
-                    })
-            })
+    fn type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let normalized = csharp_normalize_full_name(fqn);
+        self.definition_lookup_index()
+            .by_fqn(fqn)
+            .iter()
+            .chain(
+                self.definition_lookup_index()
+                    .by_normalized_fqn(&normalized)
+                    .iter(),
+            )
+            .filter(|unit| unit.is_class())
+            .cloned()
             .collect()
     }
 
-    pub fn resolve_visible_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
-        let mut candidates = self.visible_type_candidates(file, name);
-        self.sort_dedup_type_candidates(&mut candidates);
-        (candidates.len() == 1).then(|| candidates.remove(0))
+    fn file_import_context(&self, file: &ProjectFile) -> CSharpFileImportContext<'_> {
+        CSharpFileImportContext {
+            csharp: self,
+            package: self.namespace_of_file(file),
+            namespaces: self.using_namespaces_of(file),
+            aliases: self.using_aliases_of(file),
+        }
+    }
+}
+
+pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
+    fq_name.replace('$', ".")
+}
+
+pub(crate) fn csharp_signature_arity(signature: Option<&str>) -> usize {
+    let Some(signature) = signature else {
+        return 0;
+    };
+    let inner = signature
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')').map(|(inner, _)| inner))
+        .unwrap_or(signature)
+        .trim();
+    if inner.is_empty() {
+        return 0;
+    }
+    count_top_level_comma_separated(inner)
+}
+
+pub(crate) fn csharp_signature_return_type(signature: &str, name: &str) -> Option<String> {
+    type_text_before_name(signature, name)
+}
+
+fn type_text_before_name(signature: &str, name: &str) -> Option<String> {
+    let before_name = signature.trim().rsplit_once(name)?.0.trim();
+    let before_name = before_name.trim_end_matches(|ch: char| ch == '?' || ch.is_whitespace());
+    let type_text = before_name
+        .split_whitespace()
+        .rfind(|part| !member_modifier(part))?;
+    let type_text = normalize_csharp_type_fragment(type_text);
+    (!type_text.is_empty()).then_some(type_text)
+}
+
+fn member_modifier(part: &str) -> bool {
+    matches!(
+        part,
+        "public"
+            | "private"
+            | "protected"
+            | "internal"
+            | "static"
+            | "readonly"
+            | "volatile"
+            | "const"
+            | "new"
+            | "virtual"
+            | "override"
+            | "abstract"
+            | "sealed"
+            | "required"
+    )
+}
+
+fn normalize_csharp_type_fragment(reference: &str) -> String {
+    let trimmed = reference.trim();
+    let without_nullable = trimmed.trim_end_matches('?').trim();
+    let without_arrays = without_nullable.trim_end_matches("[]").trim();
+    without_arrays
+        .split('<')
+        .next()
+        .unwrap_or(without_arrays)
+        .trim()
+        .to_string()
+}
+
+fn count_top_level_comma_separated(text: &str) -> usize {
+    if text.trim().is_empty() {
+        return 0;
+    }
+
+    let mut count = 1;
+    let mut angle_depth: usize = 0;
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+    let mut string_quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in text.chars() {
+        if let Some(quote) = string_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                string_quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => string_quote = Some(ch),
+            '<' => angle_depth = angle_depth.saturating_add(1),
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' if bracket_depth > 0 => bracket_depth -= 1,
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            ',' if angle_depth == 0
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0 =>
+            {
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    count
+}
+
+struct CSharpFileImportContext<'a> {
+    csharp: &'a CSharpAnalyzer,
+    package: String,
+    namespaces: Vec<String>,
+    aliases: HashMap<String, String>,
+}
+
+impl FileImportContext for CSharpFileImportContext<'_> {
+    fn imported_type_names(&self, simple: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(target) = self.aliases.get(simple)
+            && target != simple
+        {
+            names.push(target.clone());
+            if !target.contains('.') {
+                names.extend(
+                    self.namespaces
+                        .iter()
+                        .map(|namespace| format!("{namespace}.{target}")),
+                );
+                if !self.package.is_empty() {
+                    names.push(format!("{}.{target}", self.package));
+                }
+            }
+            return names;
+        }
+        if !simple.contains('.') {
+            names.extend(
+                self.namespaces
+                    .iter()
+                    .map(|namespace| format!("{namespace}.{simple}")),
+            );
+        }
+        names
+    }
+
+    fn package_of_file(&self) -> &str {
+        &self.package
+    }
+
+    fn select_unique<'a>(&self, candidates: Vec<&'a CodeUnit>) -> Option<&'a CodeUnit> {
+        let mut keyed = candidates
+            .into_iter()
+            .map(|unit| {
+                let key = self.csharp.type_declaration_key(unit);
+                let source = rel_path_string(unit.source());
+                (unit, key, source)
+            })
+            .collect::<Vec<_>>();
+        keyed.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
+        keyed.dedup_by(|left, right| left.1 == right.1);
+        (keyed.len() == 1).then(|| keyed[0].0)
     }
 }
 
@@ -364,6 +570,10 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
         self.inner.definition_lookup_index()
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        self.inner.usage_facts_index()
     }
 
     fn direct_children<'a>(

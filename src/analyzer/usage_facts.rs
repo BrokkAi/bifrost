@@ -69,9 +69,11 @@ impl UsageFactsIndex {
             analyzer.definition_lookup_index(),
             analyzer.all_declarations(),
             |unit| {
-                unit.signature()
-                    .map(str::to_string)
-                    .or_else(|| analyzer.signatures(unit).first().cloned())
+                analyzer
+                    .signatures(unit)
+                    .first()
+                    .cloned()
+                    .or_else(|| unit.signature().map(str::to_string))
             },
             |unit| analyzer.signature_metadata(unit).first().cloned(),
             extract,

@@ -1067,11 +1067,10 @@ where
             &definition_lookup_index,
             files.values().flat_map(|state| state.declarations.iter()),
             |unit| {
-                unit.signature().map(str::to_string).or_else(|| {
-                    signatures
-                        .get(unit)
-                        .and_then(|entries| entries.first().cloned())
-                })
+                signatures
+                    .get(unit)
+                    .and_then(|entries| entries.first().cloned())
+                    .or_else(|| unit.signature().map(str::to_string))
             },
             |unit| {
                 signature_metadata

@@ -104,6 +104,10 @@ impl DefinitionLookupIndex {
         self.by_fqn.get(fqn).cloned().unwrap_or_default()
     }
 
+    pub(crate) fn by_fqn(&self, fqn: &str) -> &[CodeUnit] {
+        self.by_fqn.get(fqn).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     pub(crate) fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
         self.direct_children_by_fqn
             .get(fqn)

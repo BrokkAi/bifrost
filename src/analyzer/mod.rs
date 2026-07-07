@@ -50,6 +50,9 @@ pub(crate) use cpp::{
     normalize_cpp_whitespace, resolve_include_targets, resolve_include_targets_with_index,
 };
 pub use csharp::CSharpAnalyzer;
+pub(crate) use csharp::{
+    csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
+};
 pub use definition_lookup_index::DefinitionLookupIndex;
 pub use go::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;

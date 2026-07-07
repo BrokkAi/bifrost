@@ -39,6 +39,7 @@ pub(crate) mod rust_graph;
 pub(crate) mod scala_graph;
 pub(crate) mod target_kind;
 mod traits;
+pub(crate) mod visible_names;
 
 pub use candidates::{
     ExplicitCandidateProvider, FallbackCandidateProvider, ImportGraphCandidateProvider,
