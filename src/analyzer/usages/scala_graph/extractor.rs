@@ -4,7 +4,9 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::hits::{add_hit, add_import_hit};
 use crate::analyzer::usages::scala_graph::resolver::{
-    TargetKind, TargetSpec, Visibility, package_name_of,
+    TargetKind, TargetSpec, Visibility, method_signature_arity, package_name_of,
+    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
+    scala_normalized_fq_name, scala_resolve_declared_type,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     call_arity_for_reference, has_ancestor_kind, has_member_qualifier, is_assignment_lhs,
@@ -12,7 +14,9 @@ use crate::analyzer::usages::scala_graph::syntax::{
     is_type_like_reference, member_qualifier, member_qualifier_node, node_text,
     parenthesized_arity,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer, TypeHierarchyProvider,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
@@ -51,6 +55,7 @@ pub(super) fn scan_file(
     let file_package = package_name_of(scala, file).unwrap_or_default();
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let mut ctx = ScanCtx {
+        scala,
         analyzer,
         file,
         file_package: &file_package,
@@ -68,6 +73,7 @@ pub(super) fn scan_file(
 }
 
 pub(super) struct ScanCtx<'a> {
+    pub(super) scala: &'a ScalaAnalyzer,
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) file: &'a ProjectFile,
     pub(super) file_package: &'a str,
@@ -379,7 +385,7 @@ fn seed_parameter(parameter: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     let type_name = parameter
         .child_by_field_name("type")
-        .and_then(|type_node| simple_type_name(node_text(type_node, ctx.source).trim()));
+        .map(|type_node| node_text(type_node, ctx.source).trim());
     seed_or_shadow_typed_symbol(name, type_name, None, ctx);
 }
 
@@ -390,7 +396,7 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     };
     let type_name = node
         .child_by_field_name("type")
-        .and_then(|type_node| simple_type_name(node_text(type_node, ctx.source).trim()));
+        .map(|type_node| node_text(type_node, ctx.source).trim());
     let value_name = node
         .child_by_field_name("value")
         .and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
@@ -440,6 +446,21 @@ fn seed_or_shadow_typed_symbol(
     if let Some(owner_fq_name) = visible_owner {
         ctx.bindings
             .seed_symbol(name.to_string(), owner_fq_name.to_string());
+        return;
+    }
+    if let Some(type_name) = type_name
+        && let Some(owner_fq_name) =
+            scala_resolve_declared_type(ctx.scala, ctx.file, ctx.file_package, type_name)
+    {
+        ctx.bindings
+            .seed_symbol(name.to_string(), owner_fq_name.to_string());
+        return;
+    }
+    if let Some(type_name) = type_name
+        && let Some(builtin) = scala_builtin_type_name(type_name)
+    {
+        ctx.bindings
+            .seed_symbol(name.to_string(), builtin.to_string());
         return;
     }
     ctx.bindings.declare_shadow(name.to_string());
@@ -660,7 +681,6 @@ fn extension_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCt
         || text != ctx.spec.member_name
         || !target_is_extension(ctx.spec)
         || !ctx.visibility.direct_member_names.contains(text)
-        || ctx.visibility.ambiguous_direct_member_names.contains(text)
         || !has_member_qualifier(node)
         || !member_call_arity_matches(node, ctx)
     {
@@ -671,22 +691,139 @@ fn extension_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCt
         return false;
     };
     let qualifier = node_text(qualifier_node, ctx.source).trim();
-    if qualifier.is_empty() || is_locally_shadowed(ctx, qualifier) {
+    if qualifier.is_empty() || is_unresolved_local_shadow(ctx, qualifier) {
         return false;
     }
-    extension_receiver_matches(qualifier, ctx)
+    extension_receiver_matches(qualifier_node, call_arity_for_reference(node), ctx)
 }
 
 fn target_is_extension(spec: &TargetSpec) -> bool {
     spec.is_extension_method
 }
 
-fn extension_receiver_matches(qualifier: &str, ctx: &ScanCtx<'_>) -> bool {
-    let _ = (qualifier, ctx);
-    true
+fn extension_receiver_matches(
+    qualifier_node: Node<'_>,
+    call_arity: Option<usize>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    let Some(receiver_owner) = extension_receiver_type(qualifier_node, ctx) else {
+        return false;
+    };
+    if !scala_extension_receiver_matches_resolved(
+        ctx.spec.extension_receiver_type.as_deref(),
+        Some(&receiver_owner),
+        |type_text| {
+            ctx.visibility
+                .owner_fq_name_for(type_text)
+                .map(str::to_string)
+                .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+        },
+    ) {
+        return false;
+    }
+    !receiver_has_member(
+        &receiver_owner,
+        ctx.spec.member_name.as_str(),
+        call_arity,
+        ctx,
+    )
+}
+
+fn extension_receiver_type(receiver: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    match receiver.kind() {
+        "identifier" => {
+            let name = node_text(receiver, ctx.source).trim();
+            if name == "this" {
+                return enclosing_owner_fq_name(receiver, ctx);
+            }
+            ctx.bindings
+                .resolve_symbol(name)
+                .as_precise()
+                .and_then(single_precise_target)
+                .or_else(|| {
+                    (!ctx.bindings.is_shadowed(name))
+                        .then(|| ctx.visibility.owner_fq_name_for(name).map(str::to_string))
+                        .flatten()
+                })
+                .or_else(|| {
+                    (!ctx.bindings.is_shadowed(name))
+                        .then(|| {
+                            ctx.visibility
+                                .receiver_fq_name_for(name)
+                                .map(str::to_string)
+                        })
+                        .flatten()
+                })
+        }
+        kind => scala_literal_type_name(kind).map(str::to_string),
+    }
+}
+
+fn single_precise_target(targets: &HashSet<String>) -> Option<String> {
+    (targets.len() == 1)
+        .then(|| targets.iter().next().cloned())
+        .flatten()
+}
+
+fn receiver_has_member(
+    receiver_owner: &str,
+    member: &str,
+    call_arity: Option<usize>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if receiver_owner == ctx.spec.owner_fq_name.as_deref().unwrap_or_default() {
+        return false;
+    }
+    if receiver_has_direct_member(receiver_owner, member, call_arity, ctx) {
+        return true;
+    }
+    ctx.scala
+        .definitions(receiver_owner)
+        .find(|unit| unit.is_class())
+        .is_some_and(|owner| {
+            ctx.scala.get_ancestors(owner).into_iter().any(|ancestor| {
+                receiver_has_direct_member(&ancestor.fq_name(), member, call_arity, ctx)
+            })
+        })
+}
+
+fn receiver_has_direct_member(
+    receiver_owner: &str,
+    member: &str,
+    call_arity: Option<usize>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    let member_fqn = format!("{}.{}", scala_normalized_fq_name(receiver_owner), member);
+    ctx.analyzer
+        .definitions(&member_fqn)
+        .any(|unit| receiver_member_applies(unit, call_arity, ctx))
+}
+
+fn receiver_member_applies(unit: &CodeUnit, call_arity: Option<usize>, ctx: &ScanCtx<'_>) -> bool {
+    if unit.is_field() {
+        return true;
+    }
+    unit.is_function()
+        && ctx.spec.kind == TargetKind::Method
+        && method_signature_arity(ctx.scala, unit)
+            .is_some_and(|arity| arity == call_arity.unwrap_or(0))
 }
 
 fn is_locally_shadowed(ctx: &ScanCtx<'_>, name: &str) -> bool {
+    if !ctx.bindings.is_shadowed(name) {
+        return false;
+    }
+    !ctx.bindings
+        .resolve_symbol(name)
+        .as_precise()
+        .is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| ctx.spec.owner_fq_matches(target))
+        })
+}
+
+fn is_unresolved_local_shadow(ctx: &ScanCtx<'_>, name: &str) -> bool {
     ctx.bindings.is_shadowed(name) && ctx.bindings.resolve_symbol(name).is_unknown()
 }
 

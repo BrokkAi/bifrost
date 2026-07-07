@@ -55,7 +55,8 @@ use crate::analyzer::usages::ruby_graph::{
 };
 use crate::analyzer::usages::scala_graph::{
     ScalaNameResolver, ScalaProjectTypes, package_name_of as scala_package_name_of,
-    scala_import_path, scala_node_text,
+    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_import_path,
+    scala_literal_type_name, scala_node_text,
 };
 use crate::analyzer::{
     AliasResolver, CSharpAnalyzer, CodeUnit, CppAnalyzer, DefinitionLookupIndex, GoAnalyzer,
@@ -559,11 +560,7 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
     DefinitionLookupOutcome {
         status,
         reference: None,
-        definitions: if status == DefinitionLookupStatus::Resolved {
-            candidates
-        } else {
-            Vec::new()
-        },
+        definitions: candidates,
         diagnostics,
     }
 }

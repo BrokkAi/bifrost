@@ -12784,6 +12784,195 @@ object App:
 }
 
 #[test]
+fn scala_direct_member_beats_visible_extension_method() {
+    let source = r#"
+package app
+
+final case class User(slug: String)
+
+object Syntax:
+  extension (u: User)
+    def slug: String = "extension"
+
+object Workflow:
+  import Syntax.*
+  def run(u: User): String = u.slug
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Workflow.scala", source)
+        .build();
+
+    let slug_start = source.find("u.slug").expect("slug call") + "u.".len();
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            slug_start,
+            slug_start + "slug".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.User.slug", "{value}");
+}
+
+#[test]
+fn scala_extension_receiver_type_mismatch_returns_no_definition() {
+    let source = r#"
+package app
+
+object Syntax:
+  extension (s: String)
+    def slug: String = s.toLowerCase
+
+object Workflow:
+  import Syntax.*
+  def run(i: Int): String = i.slug
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Workflow.scala", source)
+        .build();
+
+    let slug_start = source.find("i.slug").expect("slug call") + "i.".len();
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            slug_start,
+            slug_start + "slug".len()
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_extension_receiver_type_resolves_in_extension_declaration_context() {
+    let syntax_source = r#"
+package ext
+
+final case class User(name: String)
+
+object Syntax:
+  extension (u: User)
+    def slug: String = u.name.toLowerCase
+"#;
+    let app_source = r#"
+package app
+
+final case class User(name: String)
+
+object Workflow:
+  import ext.Syntax.*
+  def run(u: User): String = u.slug
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("ext/Syntax.scala", syntax_source)
+        .file("app/Workflow.scala", app_source)
+        .build();
+
+    let slug_start = app_source.find("u.slug").expect("slug call") + "u.".len();
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            slug_start,
+            slug_start + "slug".len()
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_extension_call_wins_when_direct_member_arity_does_not_apply() {
+    let source = r#"
+package app
+
+final case class User(name: String):
+  def slug(): String = name
+
+object Syntax:
+  extension (u: User)
+    def slug(i: Int): String = u.name + i.toString
+
+object Workflow:
+  import Syntax.*
+  def run(u: User): String = u.slug(1)
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Workflow.scala", source)
+        .build();
+
+    let slug_start = source.find("u.slug").expect("slug call") + "u.".len();
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            slug_start,
+            slug_start + "slug".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Syntax$.slug",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_ambiguous_extension_methods_return_candidate_definitions() {
+    let source = r#"
+package app
+
+object SyntaxA:
+  extension (s: String)
+    def slug: String = s.toLowerCase
+
+object SyntaxB:
+  extension (s: String)
+    def slug: String = s.reverse
+
+object Workflow:
+  import SyntaxA.*
+  import SyntaxB.*
+  def run(s: String): String = s.slug
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Workflow.scala", source)
+        .build();
+
+    let slug_start = source.find("s.slug").expect("slug call") + "s.".len();
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            slug_start,
+            slug_start + "slug".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions array");
+    let fqns: Vec<_> = definitions
+        .iter()
+        .map(|definition| definition["fqn"].as_str().expect("definition fqn"))
+        .collect();
+    assert!(fqns.contains(&"app.SyntaxA$.slug"), "{value}");
+    assert!(fqns.contains(&"app.SyntaxB$.slug"), "{value}");
+    assert!(
+        definitions.iter().all(|definition| definition["signature"]
+            .as_str()
+            .is_some_and(|signature| signature.starts_with("extension (s: String) def slug"))),
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_unqualified_inherited_helper_call_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
