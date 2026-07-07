@@ -697,6 +697,23 @@ func readOuter(service Service) int {
     return service.ID
 }
 
+type BaseWrapper struct {
+    Base
+}
+
+func NewBaseWrapper() BaseWrapper {
+    return BaseWrapper{}
+}
+
+func readBaseWrapper(wrapper BaseWrapper) string {
+    return wrapper.ID
+}
+
+func readBaseWrapperFactory() string {
+    wrapper := NewBaseWrapper()
+    return wrapper.ID
+}
+
 type C struct {
     Code string
 }
@@ -793,8 +810,17 @@ func readNamedWrapper(value NamedWrapper) string {
         .find_usages(&analyzer, std::slice::from_ref(&base_id), &candidates, 1000)
         .into_either()
         .expect("base ID query should succeed");
+    assert_eq!(2, base_hits.len(), "base ID hits: {base_hits:?}");
     assert!(
-        base_hits.is_empty(),
+        base_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("return wrapper.ID")),
+        "non-shadowed promoted Base.ID should count: {base_hits:?}"
+    );
+    assert!(
+        !base_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("return service.ID")),
         "outer direct ID must shadow promoted Base.ID: {base_hits:?}"
     );
 
@@ -880,6 +906,78 @@ func readNamedWrapper(value NamedWrapper) string {
     assert!(
         named_hits.is_empty(),
         "named same-name fields must not promote nested fields: {named_hits:?}"
+    );
+}
+
+#[test]
+fn go_graph_strategy_respects_imported_embedded_field_promotion_precedence() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "service/audit.go",
+            r#"
+package service
+
+type AuditLog struct {
+    ID string
+}
+
+type Base struct {
+    ID string
+}
+
+type Wrapper struct {
+    Base
+}
+
+type Service struct {
+    Base
+    ID string
+}
+
+type Worker struct {
+    AuditLog
+    Wrapper
+}
+
+func NewWorker() *Worker { return &Worker{} }
+func NewService() *Service { return &Service{} }
+"#,
+        ),
+        (
+            "main.go",
+            r#"
+package main
+
+import "example.com/app/service"
+
+func use() {
+    worker := service.NewWorker()
+    _ = worker.ID
+
+    wrapper := service.Wrapper{}
+    _ = wrapper.ID
+
+    svc := service.NewService()
+    _ = svc.ID
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let base_id = definition(&analyzer, "example.com/app/service.Base.ID");
+    let base_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&base_id), &candidates, 1000)
+        .into_either()
+        .expect("base ID query should succeed");
+    assert_eq!(1, base_hits.len(), "base ID hits: {base_hits:?}");
+    assert!(
+        base_hits
+            .iter()
+            .any(|hit| hit.file == project.file("main.go") && hit.snippet.contains("wrapper.ID")),
+        "only non-shadowed wrapper.ID should count for Base.ID: {base_hits:?}"
     );
 }
 

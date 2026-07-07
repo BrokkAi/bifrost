@@ -15,7 +15,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T00:00Z) Fetched remote refs and confirmed the current branch is `503-lsp-style-click-around-regression-fixtures-for-relation-heavy-lookups` with a clean worktree before edits.
 - [x] (2026-07-07T00:00Z) Created this ExecPlan and began Milestone 0 harness implementation.
 - [x] (2026-07-07T09:51Z) Milestone 0: added the shared marker/timing harness, added the Java smoke fixture, ran focused tests, ran Brokk Guided Review, fixed accepted findings, reran focused tests, updated timings, and prepared the milestone commit.
-- [ ] Milestone 1: Go click-around fixture.
+- [x] (2026-07-07T10:08Z) Milestone 1: added the Go embedded-promotion click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted coverage findings and the exposed Go graph reference bug, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 2: Rust click-around fixture.
 - [ ] Milestone 3: PHP click-around fixture.
 - [ ] Milestone 4: Scala click-around fixture.
@@ -42,6 +42,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - Observation: The harness must use UTF-16 character offsets, not Unicode scalar counts, because LSP positions are UTF-16.
   Evidence: Brokk Guided Review flagged this, and `common::lsp_click::tests::milestone_0_marker_parser_counts_utf16_columns` now covers a supplementary emoji before a marker.
 
+- Observation: The Go LSP fixture exposed a cross-package reference overmatch for promoted embedded fields. Querying `service.Base.ID` through the LSP references path returned `worker.ID` and `svc.ID` even though definition lookup correctly resolved those selectors to `AuditLog.ID` and `Service.ID`.
+  Evidence: The review-added LSP case `base field references include only semantically valid promoted use` failed with three locations. The lower-level regression `go_graph_strategy_respects_imported_embedded_field_promotion_precedence` reproduced the same three hits in the Go usage graph before the fix.
+
 ## Decision Log
 
 - Decision: Add the click-around harness under `tests/common/lsp_click.rs` instead of expanding `tests/bifrost_lsp_server.rs`.
@@ -64,11 +67,19 @@ The work is test-first. Production analyzer changes are allowed only when a new 
   Rationale: Extra or duplicate LSP destinations are editor-visible regressions. The weaker contains-only behavior would let false positives through the click-around suite.
   Date/Author: 2026-07-07 / Codex.
 
+- Decision: For Go qualified receiver inference, require both the imported package qualifier and the compatible receiver type name to match.
+  Rationale: The previous predicate treated any `service.X` expression as the target owner once `service` was the imported owner package. That incorrectly seeded locals from `service.NewWorker()` and `service.NewService()` while resolving references for `Base.ID`. Carrying a per-namespace receiver-name map preserves structured import matching without source-text fallbacks.
+  Date/Author: 2026-07-07 / Codex.
+
 ## Outcomes & Retrospective
 
 Milestone 0 is complete. The repository now has a reusable LSP click fixture helper, parser coverage for marker edge cases, a Java smoke fixture for definition/references/empty-result behavior, and timing capture. No production analyzer code was changed.
 
 Milestone 0 Brokk Guided Review outcome: security found path traversal risk in fixture paths; senior-dev, duplication, architecture, and devops found overlapping issues around caret marker corruption, generic syntax collision, exactness of location assertions, UTF-16 column accounting, and hierarchy prepare panics bypassing normal shutdown. Accepted fixes validate fixture paths, require underscores in inline markers, fix caret marker line stripping, count UTF-16 columns, assert exact location lists, avoid `prepare_hierarchy` panics inside relation operations, and preserve LSP shutdown before assertion panics. The InlineTestProject reuse suggestion was not adopted for the reason recorded in the Decision Log.
+
+Milestone 1 is complete. The Go fixture now covers imported factory receiver typing, embedded field and method promotion, explicit field shadowing, same-depth ambiguity returning empty, shallower-vs-deeper promotion, canonical embedded-member references, and promoted base-field references that exclude unrelated same-name selectors.
+
+Milestone 1 Brokk Guided Review outcome: security, duplication, devops, and architecture found no blocking issues. Senior-dev found two coverage gaps in the Go milestone: the fixture did not directly test shallower-vs-deeper promotion for `worker.ID`, and it did not assert that references for `Base.ID` excluded shadowed selectors. Both were accepted. Adding the second case exposed the Go usage graph bug recorded above; the fix narrows qualified receiver inference using structured import/type data, and the lower-level graph regression plus the LSP fixture now pass.
 
 ## Timing Log
 
@@ -80,6 +91,15 @@ Milestone 0 Brokk Guided Review outcome: security found path traversal risk in f
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_0 --features nlp -- --nocapture` passed in 7.07s real time after recompiling the changed helper; test execution took 3.29s.
   - Click cases added: 3 LSP click cases plus 4 marker/path parser regression tests.
   - Slowest fixture/operation: `milestone_0_java_smoke`, case `call resolves to declaration`, marker `call_target`, operation `definition`, 35 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 1: Go
+  - Language: Go.
+  - Start: 2026-07-07T09:51Z.
+  - End: 2026-07-07T10:08Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_1_go --features nlp -- --nocapture` passed in 8.26s real time after recompiling the changed test; test execution took 3.54s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_1_go --features nlp -- --nocapture` passed in 6.04s real time after recompiling the Go resolver; test execution took 3.94s. Additional focused graph checks `go_graph_strategy_respects_imported_embedded_field_promotion_precedence` and `go_graph_strategy_respects_go_embedded_promotion_precedence_and_ambiguity` passed.
+  - Click cases added: 10 LSP click cases plus 1 lower-level Go usage graph regression.
+  - Slowest fixture/operation: `milestone_1_go_embedded_promotion`, case `promoted field resolves through imported factory receiver`, marker `worker_record`, operation `definition`, 76 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -148,3 +168,7 @@ Revision note, 2026-07-07 / Codex: Created the plan and started Milestone 0 with
 Revision note, 2026-07-07 / Codex: Milestone 0 pre-review implementation and focused validation are complete. The smoke fixture passed definition, references, and expected-empty definition assertions. Brokk Guided Review is the next gate before any commit.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 0 Guided Review gate. Accepted findings were fixed with path validation, safer marker parsing, UTF-16 columns, exact location assertions, non-panicking hierarchy prepare handling, and parser regression tests. `cargo fmt --check`, `git diff --check`, and focused Milestone 0 tests pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 1 and added the Go embedded-promotion click-around fixture. The pre-review focused Go filter passed, covering imported factory receiver typing, promoted field and method definition, deeper promoted field lookup, explicit field shadowing, same-depth ambiguity returning empty, and declaration-to-reference lookup for the canonical embedded field.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 1 Guided Review gate. Accepted review findings expanded the Go fixture to cover shallower-vs-deeper promotion and exact `Base.ID` references. That exposed a structured Go graph bug where qualified receiver inference matched any imported package member by qualifier alone. The fix carries namespace-to-compatible-receiver-name bindings, and focused Go LSP and graph tests now pass.

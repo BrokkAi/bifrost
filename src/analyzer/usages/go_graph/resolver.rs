@@ -985,7 +985,6 @@ impl TargetSpec {
                 receiver_file,
             ));
         }
-
         Self {
             target: target.clone(),
             identifier,
@@ -1698,6 +1697,7 @@ pub(super) struct ScanBindings {
     pub(super) namespace_names: HashSet<String>,
     owner_direct_names: HashSet<String>,
     owner_namespace_names: HashSet<String>,
+    owner_namespace_type_names: HashMap<String, HashSet<String>>,
     field_owner_direct_names: HashMap<String, HashSet<String>>,
 }
 
@@ -1737,9 +1737,22 @@ impl ScanBindings {
                 }
             }
         }
+        let mut owner_namespace_type_names: HashMap<String, HashSet<String>> = HashMap::default();
         for (receiver_file, receiver) in &spec.compatible_receiver_types {
             if same_go_package(graph, file, receiver_file) {
                 owner_direct_names.insert(receiver.clone());
+            }
+            let receiver_seeds = graph.seeds_for_target(receiver_file, receiver);
+            for edge in graph.matching_edges_for_importer(file, &receiver_seeds) {
+                if matches!(
+                    edge.kind,
+                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_)
+                ) {
+                    owner_namespace_type_names
+                        .entry(edge.local_name)
+                        .or_default()
+                        .insert(receiver.clone());
+                }
             }
         }
         let field_owner_direct_names = if same_go_package(graph, file, spec.target.source()) {
@@ -1753,6 +1766,7 @@ impl ScanBindings {
             namespace_names,
             owner_direct_names,
             owner_namespace_names,
+            owner_namespace_type_names,
             field_owner_direct_names,
         }
     }
@@ -1781,9 +1795,11 @@ impl ScanBindings {
         if ty.qualifier.is_none() && self.owner_direct_names.contains(owner) {
             return true;
         }
-        ty.qualifier
-            .as_ref()
-            .is_some_and(|qualifier| self.owner_namespace_names.contains(qualifier))
+        ty.qualifier.as_ref().is_some_and(|qualifier| {
+            self.owner_namespace_type_names
+                .get(qualifier)
+                .is_some_and(|owners| owners.contains(owner))
+        })
     }
 
     pub(super) fn receiver_tokens_for_type(&self, ty: &TypeRef) -> Vec<String> {
