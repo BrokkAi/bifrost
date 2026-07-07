@@ -1214,9 +1214,8 @@ fn register_module_exports_object(node: Node<'_>, source: &str, index: &mut Expo
                 let Some(exported_name) = property_name_text(key, source) else {
                     continue;
                 };
-                let Some(local_name) = local_export_name(value, source) else {
-                    continue;
-                };
+                let local_name =
+                    local_export_name(value, source).unwrap_or_else(|| exported_name.clone());
                 index
                     .exports_by_name
                     .insert(exported_name, ExportEntry::Local { local_name });
@@ -1234,6 +1233,12 @@ fn local_export_name(node: Node<'_>, source: &str) -> Option<String> {
         return Some(name);
     }
     member_expression_name(node, source)
+}
+
+fn default_export_local_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| local_export_name(child, source))
 }
 
 fn exported_function_name(node: Node<'_>, exported_name: &str) -> Option<String> {
@@ -1394,10 +1399,10 @@ fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex)
                 }
             }
             _ if is_default => {
-                index.exports_by_name.insert(
-                    "default".to_string(),
-                    ExportEntry::Default { local_name: None },
-                );
+                let local_name = local_export_name(declaration, source);
+                index
+                    .exports_by_name
+                    .insert("default".to_string(), ExportEntry::Default { local_name });
             }
             _ => {}
         }
@@ -1406,10 +1411,10 @@ fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex)
 
     if is_default {
         // `export default expr;` with no declaration child — anonymous default.
-        index.exports_by_name.insert(
-            "default".to_string(),
-            ExportEntry::Default { local_name: None },
-        );
+        let local_name = default_export_local_name(node, source);
+        index
+            .exports_by_name
+            .insert("default".to_string(), ExportEntry::Default { local_name });
     }
 }
 

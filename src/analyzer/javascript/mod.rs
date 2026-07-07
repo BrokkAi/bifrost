@@ -1396,6 +1396,32 @@ fn visit_js_object_literal_properties_for_surface(
     }
 }
 
+fn visit_js_module_exports_object_literal_properties(
+    file: &ProjectFile,
+    source: &str,
+    object: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    for index in 0..object.named_child_count() {
+        let Some(child) = object.named_child(index) else {
+            continue;
+        };
+        let Some(name) = js_object_literal_property_name(child, source) else {
+            continue;
+        };
+        let kind = js_object_literal_property_kind(child);
+        let code_unit = CodeUnit::new(file.clone(), kind, "", name);
+        parsed.add_code_unit(
+            code_unit.clone(),
+            child,
+            source,
+            None,
+            Some(code_unit.clone()),
+        );
+        parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
+    }
+}
+
 fn js_object_literal_property_kind(node: Node<'_>) -> crate::analyzer::CodeUnitType {
     if node.kind() == "method_definition" {
         crate::analyzer::CodeUnitType::Method
@@ -2159,6 +2185,13 @@ fn visit_js_assignment_expression(
         return;
     };
     let value = node.child_by_field_name("right");
+    if js_is_commonjs_root_export_assignment_target(left, source)
+        && let Some(value) = value
+        && let Some(object) = js_object_literal_value(value)
+    {
+        visit_js_module_exports_object_literal_properties(file, source, object, parsed);
+        return;
+    }
     let value_is_function =
         value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
     let Some(target) = js_commonjs_export_assignment_name(left, value, source)

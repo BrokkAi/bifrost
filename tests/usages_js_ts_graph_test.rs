@@ -944,6 +944,94 @@ helpers.formatTask({ label: "direct" });
 }
 
 #[test]
+fn js_default_exported_object_literal_member_resolves_default_import_usage() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lang/en.js",
+            r#"
+const messages = {
+  malformedRegistryResponse: "Malformed registry response",
+  requestRetry: "Retrying request",
+};
+
+export default messages;
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"
+import en from "./lang/en.js";
+
+export function render() {
+  return en.malformedRegistryResponse;
+}
+"#,
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lang/en.js"), |cu| {
+        cu.short_name()
+            .ends_with(".messages.malformedRegistryResponse")
+            && cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("consumer.js")
+                && hit.snippet.contains("en.malformedRegistryResponse")
+        }),
+        "expected default-imported object member usage, got {hits:?}"
+    );
+}
+
+#[test]
+fn js_commonjs_module_exports_object_literal_member_resolves_required_module_usage() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lang/en.js",
+            r#"
+module.exports = {
+  malformedRegistryResponse: "Malformed registry response",
+  requestRetry: "Retrying request",
+};
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"
+const en = require("./lang/en");
+
+function render() {
+  return en.malformedRegistryResponse;
+}
+"#,
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lang/en.js"), |cu| {
+        cu.identifier() == "malformedRegistryResponse" && cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("consumer.js")
+                && hit.snippet.contains("en.malformedRegistryResponse")
+        }),
+        "expected CommonJS required object member usage, got {hits:?}"
+    );
+}
+
+#[test]
 fn ts_receiver_shadowing_and_unknown_sources_do_not_count() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file("a.ts", "export class Foo { bar() {} }\n")
