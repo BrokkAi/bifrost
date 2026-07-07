@@ -1,14 +1,9 @@
 mod common;
 
 use brokk_bifrost::usages::{CSharpUsageGraphStrategy, FuzzyResult, UsageAnalyzer, UsageFinder};
-use brokk_bifrost::{
-    CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, SearchToolsService,
-};
-use common::InlineTestProject;
+use brokk_bifrost::{CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language};
+use common::{InlineTestProject, call_search_tool_json};
 use serde_json::{Value, json};
-use std::sync::{LazyLock, Mutex};
-
-static CSHARP_LOOKUP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn csharp_analyzer_with_files(
     files: &[(&str, &str)],
@@ -121,9 +116,6 @@ fn definition_lookup(
     start_byte: usize,
     end_byte: usize,
 ) -> Value {
-    let _guard = CSHARP_LOOKUP_LOCK.lock().expect("lookup lock poisoned");
-    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
-        .expect("failed to build searchtools service");
     let request = json!({
         "references": [{
             "path": path,
@@ -131,10 +123,7 @@ fn definition_lookup(
             "end_byte": end_byte,
         }]
     });
-    let payload = service
-        .call_tool_json("get_definition_by_location", &request.to_string())
-        .expect("get_definition_by_location call failed");
-    serde_json::from_str(&payload).expect("get_definition_by_location returned invalid JSON")
+    call_search_tool_json(root, "get_definition_by_location", &request.to_string())
 }
 
 fn graph_hits(

@@ -18,7 +18,8 @@ pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
     pub(super) kind: TargetKind,
     pub(super) owner: CodeUnit,
-    pub(super) accepted_owner_fq_names: HashSet<String>,
+    pub(super) receiver_owner_fq_names: HashSet<String>,
+    pub(super) declaration_owner_fq_names: HashSet<String>,
     pub(super) member_name: String,
     pub(super) method_arity: Option<usize>,
 }
@@ -31,7 +32,8 @@ impl TargetSpec {
                 target: target.clone(),
                 kind: TargetKind::Type,
                 owner: target.clone(),
-                accepted_owner_fq_names: [fq_name].into_iter().collect(),
+                receiver_owner_fq_names: [fq_name.clone()].into_iter().collect(),
+                declaration_owner_fq_names: [fq_name].into_iter().collect(),
                 member_name: target.identifier().to_string(),
                 method_arity: None,
             });
@@ -46,13 +48,13 @@ impl TargetSpec {
             TargetKind::Method
         };
 
-        let accepted_owner_fq_names =
-            accepted_owner_fq_names_for_target(analyzer, target, &owner, kind);
+        let owner_sets = target_owner_sets(analyzer, target, &owner, kind);
 
         Some(Self {
             target: target.clone(),
             kind,
-            accepted_owner_fq_names,
+            receiver_owner_fq_names: owner_sets.receiver,
+            declaration_owner_fq_names: owner_sets.declarations,
             member_name: target.identifier().to_string(),
             method_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
                 .then(|| signature_arity(target.signature())),
@@ -61,43 +63,71 @@ impl TargetSpec {
     }
 }
 
-fn accepted_owner_fq_names_for_target(
+struct TargetOwnerSets {
+    receiver: HashSet<String>,
+    declarations: HashSet<String>,
+}
+
+fn target_owner_sets(
     analyzer: &JavaAnalyzer,
     target: &CodeUnit,
     owner: &CodeUnit,
     kind: TargetKind,
-) -> HashSet<String> {
-    let mut accepted = HashSet::from_iter([owner.fq_name()]);
+) -> TargetOwnerSets {
+    let mut receiver = HashSet::from_iter([owner.fq_name()]);
+    let mut declarations = HashSet::from_iter([owner.fq_name()]);
     if kind != TargetKind::Method {
-        return accepted;
+        return TargetOwnerSets {
+            receiver,
+            declarations,
+        };
     }
-    let target_arity = signature_arity(target.signature());
     let Some(provider) = analyzer.type_hierarchy_provider() else {
-        return accepted;
+        return TargetOwnerSets {
+            receiver,
+            declarations,
+        };
     };
 
-    for related_owner in provider
-        .get_descendants(owner)
-        .into_iter()
-        .chain(provider.get_ancestors(owner))
-    {
-        if java_owner_declares_matching_method(analyzer, &related_owner, target, target_arity) {
-            accepted.insert(related_owner.fq_name());
+    for descendant in provider.get_descendants(owner) {
+        if java_owner_declares_matching_method(analyzer, &descendant, target) {
+            receiver.insert(descendant.fq_name());
+            declarations.insert(descendant.fq_name());
         }
     }
-    accepted
+    for ancestor in provider.get_ancestors(owner) {
+        if java_owner_declares_matching_method(analyzer, &ancestor, target) {
+            declarations.insert(ancestor.fq_name());
+        }
+    }
+    TargetOwnerSets {
+        receiver,
+        declarations,
+    }
 }
 
 fn java_owner_declares_matching_method(
     analyzer: &JavaAnalyzer,
     owner: &CodeUnit,
     target: &CodeUnit,
-    target_arity: usize,
 ) -> bool {
     analyzer
         .get_definitions(&format!("{}.{}", owner.fq_name(), target.identifier()))
         .into_iter()
-        .any(|unit| unit.is_function() && signature_arity(unit.signature()) == target_arity)
+        .any(|unit| unit.is_function() && java_method_signatures_match(target, &unit))
+}
+
+pub(super) fn java_method_signatures_match(target: &CodeUnit, candidate: &CodeUnit) -> bool {
+    match (target.signature(), candidate.signature()) {
+        (Some(target), Some(candidate)) => {
+            normalize_java_signature(target) == normalize_java_signature(candidate)
+        }
+        _ => signature_arity(target.signature()) == signature_arity(candidate.signature()),
+    }
+}
+
+fn normalize_java_signature(signature: &str) -> String {
+    signature.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> usize {
@@ -140,13 +170,13 @@ pub(super) fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>)
                 .is_some_and(|targets| {
                     targets
                         .iter()
-                        .any(|target| ctx.spec.accepted_owner_fq_names.contains(target))
+                        .any(|target| ctx.spec.receiver_owner_fq_names.contains(target))
                 })
         }
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
             resolve_type_from_node(receiver, ctx).is_some_and(|resolved| {
                 ctx.spec
-                    .accepted_owner_fq_names
+                    .receiver_owner_fq_names
                     .contains(&resolved.fq_name())
             })
         }
@@ -155,7 +185,7 @@ pub(super) fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>)
             .and_then(|type_node| resolve_type_from_node(type_node, ctx))
             .is_some_and(|resolved| {
                 ctx.spec
-                    .accepted_owner_fq_names
+                    .receiver_owner_fq_names
                     .contains(&resolved.fq_name())
             }),
         "this" => {
@@ -222,7 +252,7 @@ fn owner_matches_target_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
     let Some(owner) = context.owner.as_ref() else {
         return false;
     };
-    if ctx.spec.accepted_owner_fq_names.contains(&owner.fq_name()) {
+    if ctx.spec.receiver_owner_fq_names.contains(&owner.fq_name()) {
         return true;
     }
     ctx.analyzer

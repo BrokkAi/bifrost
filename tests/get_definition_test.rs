@@ -1,40 +1,19 @@
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
-use common::InlineTestProject;
+use brokk_bifrost::Language;
+use common::{InlineTestProject, call_search_tool_json};
 use serde_json::{Value, json};
-use std::sync::{LazyLock, Mutex};
-
-static LOOKUP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn lookup(root: &std::path::Path, args: &str) -> Value {
-    let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
-    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
-        .expect("failed to build searchtools service");
-    let payload = service
-        .call_tool_json("get_definition_by_location", args)
-        .expect("get_definition_by_location call failed");
-    serde_json::from_str(&payload).expect("get_definition_by_location returned invalid JSON")
+    call_search_tool_json(root, "get_definition_by_location", args)
 }
 
 fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
-    let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
-    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
-        .expect("failed to build searchtools service");
-    let payload = service
-        .call_tool_json("get_definition_by_reference", args)
-        .expect("get_definition_by_reference call failed");
-    serde_json::from_str(&payload).expect("get_definition_by_reference returned invalid JSON")
+    call_search_tool_json(root, "get_definition_by_reference", args)
 }
 
 fn lookup_type(root: &std::path::Path, args: &str) -> Value {
-    let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
-    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
-        .expect("failed to build searchtools service");
-    let payload = service
-        .call_tool_json("get_type_by_location", args)
-        .expect("get_type_by_location call failed");
-    serde_json::from_str(&payload).expect("get_type_by_location returned invalid JSON")
+    call_search_tool_json(root, "get_type_by_location", args)
 }
 
 fn column_of(line: &str, needle: &str) -> usize {
@@ -10687,6 +10666,48 @@ fn csharp_local_function_shadow_returns_no_definition() {
         &format!(
             r#"{{"references":[{{"path":"App.cs","line":1,"column":{}}}]}}"#,
             column_of(line, "Run();")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn csharp_parameter_declaration_name_does_not_resolve_to_member() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            "class App { string Name { get; set; } void Run(string Name) { } }\n",
+        )
+        .build();
+
+    let line = "class App { string Name { get; set; } void Run(string Name) { } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Name) {")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn csharp_local_function_declaration_name_does_not_resolve_to_member() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            "class App { void Name() {} void Run() { void Name() {} } }\n",
+        )
+        .build();
+
+    let line = "class App { void Name() {} void Run() { void Name() {} } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Name() {} }")
         ),
     );
 

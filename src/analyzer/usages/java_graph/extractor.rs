@@ -2,8 +2,8 @@ use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::java_graph::hits;
 use crate::analyzer::usages::java_graph::resolver::{
     TargetKind, TargetSpec, argument_list_arity, has_proven_static_import, infer_type_from_value,
-    is_declaration_name, is_ignored_type_context, node_text, receiver_matches_target,
-    resolve_type_from_node, same_owner_context, seed_class_binding,
+    is_declaration_name, is_ignored_type_context, java_method_signatures_match, node_text,
+    receiver_matches_target, resolve_type_from_node, same_owner_context, seed_class_binding,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -189,7 +189,7 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if let Some(resolved) = resolved_type.as_ref()
             && ctx
                 .spec
-                .accepted_owner_fq_names
+                .receiver_owner_fq_names
                 .contains(&resolved.fq_name())
         {
             ctx.bindings
@@ -214,7 +214,7 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(resolved) = resolved
         && ctx
             .spec
-            .accepted_owner_fq_names
+            .receiver_owner_fq_names
             .contains(&resolved.fq_name())
     {
         ctx.bindings
@@ -345,11 +345,6 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if declaration.kind() != "method_declaration" {
         return;
     }
-    if let Some(expected_arity) = ctx.spec.method_arity
-        && argument_list_arity(declaration) != expected_arity
-    {
-        return;
-    }
     let context = hits::enclosing_context(declaration, ctx);
     let Some(owner) = context.owner.as_ref() else {
         return;
@@ -357,7 +352,21 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if owner == &ctx.spec.owner {
         return;
     }
-    if ctx.spec.accepted_owner_fq_names.contains(&owner.fq_name()) {
+    if !ctx
+        .spec
+        .declaration_owner_fq_names
+        .contains(&owner.fq_name())
+    {
+        return;
+    }
+    let matching_declaration = ctx
+        .analyzer
+        .get_definitions(&format!("{}.{}", owner.fq_name(), ctx.spec.member_name))
+        .into_iter()
+        .any(|candidate| {
+            candidate.is_function() && java_method_signatures_match(&ctx.spec.target, &candidate)
+        });
+    if matching_declaration {
         hits::push_hit(node, ctx);
     }
 }

@@ -773,8 +773,10 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
             | "record_declaration"
             | "record_struct_declaration"
             | "method_declaration"
+            | "local_function_statement"
             | "constructor_declaration"
             | "property_declaration"
+            | "parameter"
             | "variable_declarator"
             | "using_directive"
     )

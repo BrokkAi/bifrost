@@ -4,10 +4,15 @@ pub mod lsp_client;
 pub mod usage_graph;
 
 use brokk_bifrost::{
-    CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, RubyAnalyzer, TestProject,
+    CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, RubyAnalyzer, SearchToolsService,
+    TestProject,
 };
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
+
+static SEARCH_TOOL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[allow(unused_imports)]
 pub use inline_project::{BuiltInlineTestProject, InlineTestProject};
@@ -137,6 +142,18 @@ pub fn assert_linewise_eq(expected: &str, actual: &str) {
         normalize_nonempty_lines(expected),
         normalize_nonempty_lines(actual)
     );
+}
+
+#[allow(dead_code)]
+pub fn call_search_tool_json(root: &Path, tool: &str, args: &str) -> Value {
+    let _guard = SEARCH_TOOL_LOCK.lock().expect("search tool lock poisoned");
+    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
+        .unwrap_or_else(|err| panic!("failed to build searchtools service for {tool}: {err}"));
+    let payload = service
+        .call_tool_json(tool, args)
+        .unwrap_or_else(|err| panic!("{tool} call failed: {err}"));
+    serde_json::from_str(&payload)
+        .unwrap_or_else(|err| panic!("{tool} returned invalid JSON: {err}"))
 }
 
 #[allow(dead_code)]

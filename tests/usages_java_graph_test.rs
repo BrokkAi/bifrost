@@ -555,6 +555,94 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_keeps_concrete_override_receiver_proof_narrow() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Service.java",
+            "package com.example; public interface Service { void run(String arg); }\n",
+        ),
+        (
+            "com/example/ServiceImpl.java",
+            r#"
+package com.example;
+
+public class ServiceImpl implements Service {
+    @Override
+    public void run(String arg) {}
+}
+"#,
+        ),
+        (
+            "com/example/Base.java",
+            r#"
+package com.example;
+
+public abstract class Base implements Service {
+    public abstract void run(Object arg);
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    void call(Service service, ServiceImpl impl, Base base) {
+        service.run("x");
+        impl.run("x");
+        base.run(new Object());
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let interface_target = analyzer
+        .get_definitions("com.example.Service.run")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String)"))
+        .expect("missing interface method");
+    let concrete_target = analyzer
+        .get_definitions("com.example.ServiceImpl.run")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String)"))
+        .expect("missing concrete method");
+
+    let interface_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&interface_target),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&interface_hits, "void run(String arg)");
+    assert_hit_contains(&interface_hits, "service.run(\"x\")");
+    assert_hit_contains(&interface_hits, "impl.run(\"x\")");
+    assert_no_hit_contains(&interface_hits, "void run(Object arg)");
+    assert!(
+        interface_hits.iter().all(|hit| hit.line != 8),
+        "base.run(Object) should not be an interface run(String) usage: {interface_hits:#?}"
+    );
+
+    let concrete_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&concrete_target),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&concrete_hits, "impl.run(\"x\")");
+    assert!(
+        concrete_hits.iter().all(|hit| hit.line != 6),
+        "interface-typed receiver should not prove a concrete implementation usage: {concrete_hits:#?}"
+    );
+    assert!(
+        concrete_hits.iter().all(|hit| hit.line != 8),
+        "base.run(Object) should not be a concrete run(String) usage: {concrete_hits:#?}"
+    );
+}
+
+#[test]
 fn java_graph_strategy_respects_candidate_files() {
     let (project, analyzer) = java_analyzer_with_files(&[
         (
