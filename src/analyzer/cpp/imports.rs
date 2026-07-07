@@ -14,7 +14,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
         let mut resolved = HashSet::default();
         let include_targets = self.include_target_index();
         for path in quoted_include_paths(self.inner.import_statements(file)) {
-            for target in resolve_include_targets_with_index(file, &path, include_targets) {
+            for target in resolve_direct_include_targets_with_index(file, &path, include_targets) {
                 resolved.extend(self.inner.top_level_declarations(&target).cloned());
             }
         }
@@ -168,8 +168,9 @@ impl IncludeTargetIndex {
         let mut matched = HashSet::default();
         let mut resolved = Vec::new();
         if include_path.is_absolute() {
-            if let Ok(rel_path) = include_path.strip_prefix(source_file.root()) {
-                self.extend_rel_path(rel_path, &mut matched, &mut resolved);
+            if let Some(rel_path) = project_relative_include_path(source_file.root(), include_path)
+            {
+                self.extend_rel_path(&rel_path, &mut matched, &mut resolved);
             }
             return resolved;
         }
@@ -291,6 +292,14 @@ pub(crate) fn resolve_include_targets_with_index(
     }
     candidates.extend(include_targets.resolve_unique_fallback(include));
     candidates
+}
+
+pub(crate) fn resolve_direct_include_targets_with_index(
+    source_file: &ProjectFile,
+    include: &str,
+    include_targets: &IncludeTargetIndex,
+) -> Vec<ProjectFile> {
+    include_targets.resolve_direct(source_file, include)
 }
 
 fn project_relative_include_path(project_root: &Path, include_path: &Path) -> Option<PathBuf> {
