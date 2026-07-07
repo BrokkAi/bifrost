@@ -1406,6 +1406,9 @@ fn visit_js_module_exports_object_literal_properties(
         let Some(child) = object.named_child(index) else {
             continue;
         };
+        if js_module_exports_property_is_reference(child) {
+            continue;
+        }
         let Some(name) = js_object_literal_property_name(child, source) else {
             continue;
         };
@@ -1419,6 +1422,22 @@ fn visit_js_module_exports_object_literal_properties(
             Some(code_unit.clone()),
         );
         parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
+    }
+}
+
+/// Whether a `module.exports = { ... }` property re-exports an existing local
+/// declaration (shorthand `{ makeWidget }` or `{ name: localBinding }`) rather
+/// than defining a value in place. Reference properties must not become
+/// declarations of their own: the export index already maps them to the real
+/// local declaration, and a duplicate top-level CodeUnit at the export site
+/// makes definition lookup for the exported name ambiguous.
+fn js_module_exports_property_is_reference(node: Node<'_>) -> bool {
+    match node.kind() {
+        "shorthand_property_identifier" => true,
+        "pair" => node
+            .child_by_field_name("value")
+            .is_some_and(|value| matches!(value.kind(), "identifier" | "member_expression")),
+        _ => false,
     }
 }
 
