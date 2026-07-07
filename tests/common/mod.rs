@@ -1,4 +1,5 @@
 mod inline_project;
+pub mod lsp_click;
 pub mod lsp_client;
 pub mod usage_graph;
 
