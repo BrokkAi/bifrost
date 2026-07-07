@@ -1163,7 +1163,7 @@ end
 }
 
 #[test]
-fn public_send_with_explicit_receiver_does_not_fallback_to_top_level_method() {
+fn public_send_with_explicit_receiver_returns_unproven_not_top_level_hit() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app/report.rb",
         r#"
@@ -1183,16 +1183,29 @@ end
     )]);
 
     let target = definition(&analyzer, "save");
-    let query = UsageFinder::new().query(&analyzer, &[target], 100, 100);
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 100, 100);
 
     assert!(
-        matches!(query.result, FuzzyResult::Failure { .. }),
-        "explicit public_send receiver must not resolve through top-level fallback: {:?}",
-        query.result
+        query.graph_failure.is_none(),
+        "unproven explicit receiver should not be a graph failure: {:?}",
+        query.graph_failure
     );
-    let diagnostic = query.graph_failure.expect("graph failure diagnostic");
-    assert_eq!("RubyUsageGraphStrategy", diagnostic.strategy);
-    assert_eq!("unsafe_inference", diagnostic.reason_kind);
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!(
+            "expected success with unproven sites, got {:?}",
+            query.result
+        );
+    };
+    assert!(
+        hits_by_overload.values().all(|hits| hits.is_empty()),
+        "explicit public_send receiver must not resolve through top-level fallback: {hits_by_overload:#?}"
+    );
+    assert_eq!(Some(&1), unproven_total_by_overload.get(&target));
 }
 
 #[test]
@@ -1235,7 +1248,7 @@ end
 }
 
 #[test]
-fn recursive_factory_receiver_fails_closed_for_usages() {
+fn recursive_factory_receiver_returns_unproven_without_inventing_hit() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app.rb",
         r#"class Thing
@@ -1256,12 +1269,28 @@ end
     )]);
 
     let audit = definition(&analyzer, "Thing.audit");
-    let query = UsageFinder::new().query(&analyzer, &[audit], 100, 100);
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&audit), 100, 100);
     assert!(
-        matches!(query.result, FuzzyResult::Failure { .. }),
-        "recursive factory inference should not invent a hit: {:?}",
-        query.result
+        query.graph_failure.is_none(),
+        "unproven recursive factory receiver should not be a graph failure: {:?}",
+        query.graph_failure
     );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!(
+            "expected success with unproven sites, got {:?}",
+            query.result
+        );
+    };
+    assert!(
+        hits_by_overload.values().all(|hits| hits.is_empty()),
+        "recursive factory inference should not invent a proven hit: {hits_by_overload:#?}"
+    );
+    assert_eq!(Some(&1), unproven_total_by_overload.get(&audit));
 }
 
 #[test]
@@ -1440,7 +1469,7 @@ end
 }
 
 #[test]
-fn reports_unsafe_inference_for_only_dynamic_or_untyped_same_name_calls() {
+fn reports_unproven_sites_for_only_dynamic_or_untyped_same_name_calls() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app/user.rb",
         r#"
@@ -1459,16 +1488,26 @@ end
     )]);
 
     let target = definition(&analyzer, "User.save");
-    let query = UsageFinder::new().query(&analyzer, &[target], 100, 100);
-    let diagnostic = query.graph_failure.expect("graph failure diagnostic");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 100, 100);
 
-    assert_eq!("RubyUsageGraphStrategy", diagnostic.strategy);
-    assert_eq!("unsafe_inference", diagnostic.reason_kind);
     assert!(
-        matches!(query.result, FuzzyResult::Failure { .. }),
-        "expected failure, got {:?}",
-        query.result
+        query.graph_failure.is_none(),
+        "unproven Ruby calls should not be a graph failure: {:?}",
+        query.graph_failure
     );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!(
+            "expected success with unproven sites, got {:?}",
+            query.result
+        );
+    };
+    assert!(hits_by_overload.values().all(|hits| hits.is_empty()));
+    assert_eq!(Some(&2), unproven_total_by_overload.get(&target));
 }
 
 #[test]

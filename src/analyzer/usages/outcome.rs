@@ -57,7 +57,6 @@ pub(crate) enum GraphFailureReason {
     MissingAnalyzerCapability(&'static str),
     UnsupportedTargetShape(&'static str),
     NoGraphSeed(&'static str),
-    UnsafeInference(&'static str),
 }
 
 impl GraphFailureReason {
@@ -67,7 +66,6 @@ impl GraphFailureReason {
             GraphFailureReason::MissingAnalyzerCapability(_) => "missing_analyzer_capability",
             GraphFailureReason::UnsupportedTargetShape(_) => "unsupported_target_shape",
             GraphFailureReason::NoGraphSeed(_) => "no_graph_seed",
-            GraphFailureReason::UnsafeInference(_) => "unsafe_inference",
         }
     }
 
@@ -76,8 +74,7 @@ impl GraphFailureReason {
             GraphFailureReason::UnsupportedTargetLanguage(message)
             | GraphFailureReason::MissingAnalyzerCapability(message)
             | GraphFailureReason::UnsupportedTargetShape(message)
-            | GraphFailureReason::NoGraphSeed(message)
-            | GraphFailureReason::UnsafeInference(message) => message,
+            | GraphFailureReason::NoGraphSeed(message) => message,
         };
         format!("{strategy}: {detail}")
     }

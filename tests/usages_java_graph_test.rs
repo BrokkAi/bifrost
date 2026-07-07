@@ -96,6 +96,38 @@ fn assert_no_hit_line(hits: &[UsageHit], line: usize) {
     );
 }
 
+fn assert_success_counts(
+    result: FuzzyResult,
+    target: &CodeUnit,
+    proven_count: usize,
+    unproven_count: usize,
+) {
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = result
+    else {
+        panic!("expected success, got {result:?}");
+    };
+    assert_eq!(
+        proven_count,
+        hits_by_overload
+            .get(target)
+            .map(|hits| hits.len())
+            .unwrap_or_default(),
+        "proven hits: {hits_by_overload:#?}"
+    );
+    assert_eq!(
+        unproven_count,
+        unproven_total_by_overload
+            .get(target)
+            .copied()
+            .unwrap_or_default(),
+        "unproven hits: {unproven_total_by_overload:#?}"
+    );
+}
+
 fn line_of(source: &str, needle: &str) -> usize {
     source
         .lines()
@@ -717,10 +749,7 @@ public class Consumer {
         &candidates,
         1000,
     );
-    assert!(
-        result.into_either().is_err(),
-        "unproven shadowed call should fall back"
-    );
+    assert_success_counts(result, &method_target, 0, 1);
 }
 
 #[test]
@@ -1122,10 +1151,7 @@ public class Consumer {
         &candidates,
         1000,
     );
-    assert!(
-        result.into_either().is_err(),
-        "ambiguous static import should fall back instead of proving a hit"
-    );
+    assert_success_counts(result, &method_target, 0, 1);
 }
 
 #[test]

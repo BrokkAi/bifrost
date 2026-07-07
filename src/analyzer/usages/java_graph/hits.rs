@@ -42,6 +42,29 @@ pub(super) fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
 }
 
+pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let start = node.start_byte();
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+        return;
+    };
+    if enclosing == ctx.spec.target {
+        return;
+    }
+    let end = node.end_byte();
+    ctx.unproven_hits.insert(
+        usage_hit(
+            ctx.file,
+            line_idx,
+            start,
+            end,
+            enclosing,
+            snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+        )
+        .into_unproven(),
+    );
+}
+
 pub(super) fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingContext {
     let key = (node.start_byte(), node.end_byte());
     if let Some(cached) = ctx.enclosing_cache.get(&key) {

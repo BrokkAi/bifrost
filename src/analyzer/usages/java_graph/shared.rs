@@ -51,13 +51,13 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         }
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut saw_unproven_match = false;
+        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut raw_match_count = 0usize;
         let mut limit_exceeded = false;
         let mut state = ScanState {
             max_usages,
             hits: &mut hits,
-            saw_unproven_match: &mut saw_unproven_match,
+            unproven_hits: &mut unproven_hits,
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
@@ -69,21 +69,6 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         }
         scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state);
 
-        if hits.is_empty() && saw_unproven_match {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsafeInference("no proven structured hits"),
-                "JavaUsageGraphStrategy",
-            );
-        }
-
-        if hits.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::success(
-                target.clone(),
-                BTreeSet::new(),
-            ));
-        }
-
         if limit_exceeded || hits.len() > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
@@ -93,7 +78,11 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             });
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+            target.clone(),
+            hits,
+            unproven_hits,
+        ))
     }
 }
 

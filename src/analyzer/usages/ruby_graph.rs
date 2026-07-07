@@ -2,8 +2,8 @@
 //!
 //! Ruby remains dynamic, so this strategy only emits graph hits when parser and
 //! analyzer facts prove the target. Same-name calls with unknown receivers are
-//! tracked as unsafe inference and surfaced through the existing query-level
-//! graph diagnostic when no structured hits were found.
+//! returned in the unproven usage tier so callers can treat them as
+//! inconclusive evidence instead of query failure.
 
 mod extractor;
 mod hits;
@@ -34,7 +34,7 @@ use crate::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
 
 use self::extractor::{RubyFileScan, language_for_file};
-use self::resolver::{RubyTargetKind, RubyTargetSpec};
+use self::resolver::RubyTargetSpec;
 use self::shared::RubyEdgeResolver;
 
 const STRATEGY: &str = "RubyUsageGraphStrategy";
@@ -104,7 +104,7 @@ impl RubyUsageGraphStrategy {
         );
 
         let mut hits = BTreeSet::new();
-        let mut saw_unproven_match = false;
+        let mut unproven_hits = BTreeSet::new();
         for file in &scan_files {
             if language_for_file(file) != Language::Ruby {
                 continue;
@@ -127,7 +127,7 @@ impl RubyUsageGraphStrategy {
                 visible_files,
                 spec: &spec,
                 hits: &mut hits,
-                saw_unproven_match: &mut saw_unproven_match,
+                unproven_hits: &mut unproven_hits,
             };
             scan.scan(tree.root_node());
         }
@@ -136,14 +136,10 @@ impl RubyUsageGraphStrategy {
             .into_iter()
             .filter(|hit| hit.enclosing != spec.target)
             .collect();
-
-        if hits.is_empty() && saw_unproven_match && spec.kind == RubyTargetKind::Method {
-            return GraphUsageOutcome::fallback_safe(
-                spec.target.fq_name(),
-                GraphFailureReason::UnsafeInference("no proven structured hits"),
-                STRATEGY,
-            );
-        }
+        let unproven_hits: BTreeSet<_> = unproven_hits
+            .into_iter()
+            .filter(|hit| hit.enclosing != spec.target)
+            .collect();
 
         if hits.len() > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
@@ -154,7 +150,11 @@ impl RubyUsageGraphStrategy {
             });
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success(spec.target.clone(), hits))
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+            spec.target.clone(),
+            hits,
+            unproven_hits,
+        ))
     }
 }
 

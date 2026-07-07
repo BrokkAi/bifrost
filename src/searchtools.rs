@@ -2592,14 +2592,6 @@ fn usage_failure_hint(
     }
 
     match (reason_kind, location_selected) {
-        ("unsafe_inference", true) => Some(
-            "The selected definition still cannot be proven safely by this language backend; narrow `paths` to likely callers or inspect the definition and candidate call sites directly."
-                .to_string(),
-        ),
-        ("unsafe_inference", false) => Some(
-            "Re-call scan_usages with a location-anchored `targets` selector for the definition site, e.g. `targets: [{\"path\":\"...\",\"line\":...,\"column\":...}]`."
-                .to_string(),
-        ),
         ("no_graph_seed", true) => Some(
             "No export seed was resolved for this selected definition. Use search_symbols or get_symbol_sources to choose an exported declaration, or narrow `paths` to likely callers."
                 .to_string(),

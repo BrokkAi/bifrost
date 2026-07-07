@@ -20,6 +20,32 @@ pub(super) fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit_with_options(node, ctx, true, false);
 }
 
+pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if is_inside_target_declaration(node, ctx) || is_member_field_declaration_context(node, ctx) {
+        return;
+    }
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+        return;
+    };
+    if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
+        return;
+    }
+    ctx.unproven_hits.insert(
+        usage_hit(
+            ctx.file,
+            line_idx,
+            start,
+            end,
+            enclosing,
+            snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+        )
+        .into_unproven(),
+    );
+}
+
 fn push_hit_with_options(
     node: Node<'_>,
     ctx: &mut ScanCtx<'_>,

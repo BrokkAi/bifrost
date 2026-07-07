@@ -16,7 +16,7 @@ use tree_sitter::{Node, Parser};
 pub(super) struct ScanState<'a> {
     pub(super) max_usages: usize,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) saw_unproven_match: &'a mut bool,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) raw_match_count: &'a mut usize,
     pub(super) limit_exceeded: &'a mut bool,
 }
@@ -30,7 +30,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) spec: &'a TargetSpec,
     pub(super) bindings: &'a mut LocalInferenceEngine<String>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) saw_unproven_match: &'a mut bool,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) raw_match_count: &'a mut usize,
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
@@ -78,7 +78,7 @@ pub(super) fn scan_file(
         spec,
         bindings: &mut bindings,
         hits: state.hits,
-        saw_unproven_match: state.saw_unproven_match,
+        unproven_hits: state.unproven_hits,
         raw_match_count: state.raw_match_count,
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
@@ -331,7 +331,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if receiver_matches {
         hits::push_hit(name_node, ctx);
     } else {
-        *ctx.saw_unproven_match = true;
+        hits::push_unproven_hit(name_node, ctx);
     }
 }
 
@@ -383,7 +383,7 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             if receiver_matches_target(object, ctx) {
                 hits::push_hit(field_node, ctx);
             } else {
-                *ctx.saw_unproven_match = true;
+                hits::push_unproven_hit(field_node, ctx);
             }
         }
         return;

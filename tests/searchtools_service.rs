@@ -2259,7 +2259,7 @@ fn scan_usages_mcp_call_resolves_ruby_public_send_symbol_dispatch() {
 }
 
 #[test]
-fn scan_usages_mcp_call_surfaces_ruby_unsafe_inference() {
+fn scan_usages_mcp_call_surfaces_ruby_unproven_sites() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(
             "app/user.rb",
@@ -2289,79 +2289,136 @@ end
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_scan_usages_failure(
-        &value,
-        "User.save",
-        "RubyUsageGraphStrategy",
-        "unsafe_inference",
-    );
-    assert_scan_usages_failure_hint(
-        &value,
-        "Re-call scan_usages with a location-anchored `targets` selector for the definition site, e.g. `targets: [{\"path\":\"...\",\"line\":...,\"column\":...}]`.",
+    assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
+    assert_eq!(0, array_len(&value, "not_found"), "payload: {value}");
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    assert_eq!("User.save", usages[0]["symbol"]);
+    assert_eq!(0, usages[0]["total_hits"], "payload: {value}");
+    assert_eq!(2, usages[0]["unproven_hits"], "payload: {value}");
+    assert!(
+        usages[0]["unproven_files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()),
+        "unproven sites must be rendered: {value}"
     );
 }
 
 #[test]
-fn scan_usages_target_recall_does_not_repeat_targets_hint() {
-    let project = InlineTestProject::with_language(Language::Ruby)
+fn scan_usages_location_failure_does_not_repeat_targets_hint() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
-            "app/user.rb",
+            "lib/request.js",
             r#"
-class User
-  def save
-  end
-end
+var req = exports = module.exports = {};
 
-class App
-  def run(obj)
-    obj.save
-    send(:save)
-  end
-end
+req.accepts = function acceptsMethod(type) {
+  return type;
+};
 "#,
         )
         .build();
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
 
-    let first_payload = service
+    let payload = service
         .call_tool_json(
             "scan_usages",
-            r#"{"symbols":["User.save"],"include_tests":true}"#,
+            r#"{"targets":[{"path":"lib/request.js","line":4,"column":5}],"include_tests":true}"#,
         )
         .unwrap();
-    let first: Value = serde_json::from_str(&first_payload).unwrap();
-    assert_scan_usages_failure(
-        &first,
-        "User.save",
-        "RubyUsageGraphStrategy",
-        "unsafe_inference",
-    );
-    let first_hint = first["failures"][0]["hint"].as_str().unwrap();
-    assert!(
-        first_hint.contains("`targets` selector"),
-        "payload: {first}"
-    );
-
-    let recalled_payload = service
-        .call_tool_json(
-            "scan_usages",
-            r#"{"targets":[{"path":"app/user.rb","line":3}],"include_tests":true}"#,
-        )
-        .unwrap();
-    let recalled: Value = serde_json::from_str(&recalled_payload).unwrap();
+    let recalled: Value = serde_json::from_str(&payload).unwrap();
     assert_scan_usages_failure(
         &recalled,
-        "User.save",
-        "RubyUsageGraphStrategy",
-        "unsafe_inference",
+        "lib/request.js#req.accepts",
+        "JsTsExportUsageGraphStrategy",
+        "no_graph_seed",
     );
     let recalled_hint = recalled["failures"][0]["hint"].as_str().unwrap();
-    assert_ne!(first_hint, recalled_hint, "payload: {recalled}");
     assert!(
         !recalled_hint.contains("targets"),
         "anchored re-call must not suggest another targets re-call: {recalled}"
     );
+}
+
+#[test]
+fn scan_usages_reports_java_untyped_receiver_as_unproven() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Target.java",
+            r#"
+public class Target {
+    public void save() {}
+}
+"#,
+        )
+        .file(
+            "Caller.java",
+            r#"
+public class Caller {
+    public void run(Object obj) {
+        obj.save();
+    }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Target.save"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    assert_eq!("Target.save", usages[0]["symbol"]);
+    assert_eq!(0, usages[0]["total_hits"], "payload: {value}");
+    assert_eq!(1, usages[0]["unproven_hits"], "payload: {value}");
+}
+
+#[test]
+fn scan_usages_reports_cpp_template_receiver_as_unproven() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.cpp",
+            r#"
+struct Target {
+    void save(int value) {}
+};
+
+template <typename T>
+void call(T value) {
+    value.save(1);
+}
+
+void entry(Target target) {
+    call(target);
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Target.save"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    assert_eq!(0, usages[0]["total_hits"], "payload: {value}");
+    assert_eq!(1, usages[0]["unproven_hits"], "payload: {value}");
 }
 
 #[test]

@@ -51,13 +51,13 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         let visibility = VisibilityIndex::build(self.cpp, analyzer, &files);
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut saw_unproven_match = false;
+        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut raw_match_count = 0usize;
         let mut limit_exceeded = false;
         let mut state = ScanState {
             max_usages,
             hits: &mut hits,
-            saw_unproven_match: &mut saw_unproven_match,
+            unproven_hits: &mut unproven_hits,
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
@@ -67,14 +67,6 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             if *state.limit_exceeded {
                 break;
             }
-        }
-
-        if saw_unproven_match {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsafeInference("no proven structured hits"),
-                "CppUsageGraphStrategy",
-            );
         }
 
         let external_hit_count = hits
@@ -90,7 +82,11 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             });
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+            target.clone(),
+            hits,
+            unproven_hits,
+        ))
     }
 }
 

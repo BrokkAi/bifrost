@@ -453,6 +453,38 @@ fn assert_no_hit_contains(hits: &[HitSummary], snippet: &str) {
     );
 }
 
+fn assert_success_counts(
+    result: FuzzyResult,
+    target: &CodeUnit,
+    proven_count: usize,
+    unproven_count: usize,
+) {
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = result
+    else {
+        panic!("expected success, got {result:?}");
+    };
+    assert_eq!(
+        proven_count,
+        hits_by_overload
+            .get(target)
+            .map(|hits| hits.len())
+            .unwrap_or_default(),
+        "proven hits: {hits_by_overload:#?}"
+    );
+    assert_eq!(
+        unproven_count,
+        unproven_total_by_overload
+            .get(target)
+            .copied()
+            .unwrap_or_default(),
+        "unproven hits: {unproven_total_by_overload:#?}"
+    );
+}
+
 #[test]
 fn usage_finder_routes_cpp_targets_through_graph_strategy() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
@@ -1053,10 +1085,7 @@ void call(Target& target) {
         &candidates,
         1000,
     );
-    assert!(
-        result.into_either().is_err(),
-        "unproven same-name receiver should force fallback"
-    );
+    assert_success_counts(result, &target, 0, 1);
 }
 
 #[test]
@@ -1691,13 +1720,11 @@ fn cpp_graph_v2_guardrails_cover_limits_fallback_zero_hits_and_extensions() {
         .with_file_filter(|file| file.rel_path().to_string_lossy() == "fallback.cpp")
         .query(&analyzer, std::slice::from_ref(&run), 1000, 1000);
     assert!(
-        fallback_query.graph_failure.is_some(),
-        "UsageFinder should surface graph failure diagnostics"
+        fallback_query.graph_failure.is_none(),
+        "unproven C++ sites should not be graph failures: {:?}",
+        fallback_query.graph_failure
     );
-    assert!(
-        matches!(fallback_query.result, FuzzyResult::Failure { .. }),
-        "UsageFinder should not use regex fallback for graph failure cases"
-    );
+    assert_success_counts(fallback_query.result, &run, 0, 1);
 }
 
 #[test]
@@ -2184,10 +2211,7 @@ void ambiguous(Target& target, Other& other) {
         &ambiguous_candidates,
         1000,
     );
-    assert!(
-        ambiguous_result.into_either().is_err(),
-        "ambiguous local same-name declarations should force graph failure"
-    );
+    assert_success_counts(ambiguous_result, &run, 0, 1);
 }
 
 #[test]
@@ -2251,7 +2275,7 @@ void call() {
 }
 
 #[test]
-fn cpp_graph_review_fails_on_mixed_proven_and_unproven_member_matches() {
+fn cpp_graph_review_returns_mixed_proven_and_unproven_member_matches() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         ("target.h", "struct Target { void run(); };\n"),
         (
@@ -2278,10 +2302,7 @@ void call(Target& target) {
         &candidates,
         1000,
     );
-    assert!(
-        result.into_either().is_err(),
-        "mixed proven and unproven receiver matches should fall back"
-    );
+    assert_success_counts(result, &target, 1, 1);
 }
 
 #[test]
@@ -2935,8 +2956,5 @@ int main() {
         &candidates,
         1000,
     );
-    assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "unresolved namespace alias should remain unproven, got {result:?}"
-    );
+    assert_success_counts(result, &build_service, 0, 1);
 }

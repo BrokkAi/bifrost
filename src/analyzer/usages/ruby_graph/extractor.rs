@@ -9,7 +9,7 @@ use crate::hash::HashSet;
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
-use super::hits::record_usage_hit;
+use super::hits::{record_unproven_usage_hit, record_usage_hit};
 use super::resolver::{
     ExplicitReceiverLookup, FactoryInferenceFrame, FactoryInferenceKey, FactoryMethodOutcome,
     ReceiverMode, ReceiverType, RubyMethodLookupMode, RubySemanticIndex, RubyTargetKind,
@@ -29,7 +29,7 @@ pub(super) struct RubyFileScan<'a> {
     pub(super) visible_files: HashSet<ProjectFile>,
     pub(super) spec: &'a RubyTargetSpec,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) saw_unproven_match: &'a mut bool,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl RubyFileScan<'_> {
@@ -297,7 +297,7 @@ impl RubyWalkState<'_, '_> {
         match self.enclosing_receiver() {
             Some(receiver) => self.record_bare_method_hit_for_receiver(&receiver, node),
             None => {
-                *self.scan.saw_unproven_match = true;
+                self.record_unproven_hit(node);
             }
         }
     }
@@ -334,7 +334,7 @@ impl RubyWalkState<'_, '_> {
             None => self.enclosing_receiver(),
         };
         let Some(receiver) = receiver else {
-            *self.scan.saw_unproven_match = true;
+            self.record_unproven_hit(hit_node);
             return;
         };
         match (receiver_node, explicit_receiver_lookup) {
@@ -352,7 +352,7 @@ impl RubyWalkState<'_, '_> {
         }) {
             self.record_hit(hit_node);
         } else if candidates.is_empty() {
-            *self.scan.saw_unproven_match = true;
+            self.record_unproven_hit(hit_node);
         }
     }
 
@@ -397,6 +397,17 @@ impl RubyWalkState<'_, '_> {
             self.scan.source,
             self.scan.line_starts,
             self.scan.hits,
+            node,
+        );
+    }
+
+    fn record_unproven_hit(&mut self, node: Node<'_>) {
+        record_unproven_usage_hit(
+            self.scan.analyzer,
+            self.scan.file,
+            self.scan.source,
+            self.scan.line_starts,
+            self.scan.unproven_hits,
             node,
         );
     }

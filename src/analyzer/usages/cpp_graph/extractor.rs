@@ -5,7 +5,7 @@ use crate::analyzer::usages::cpp_call_match::{
 };
 use crate::analyzer::usages::cpp_graph::hits::{
     enclosing_context, is_member_field_declaration_context, push_definition_hit, push_hit,
-    push_self_receiver_hit,
+    push_self_receiver_hit, push_unproven_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -19,7 +19,7 @@ use tree_sitter::{Node, Parser};
 pub(super) struct ScanState<'a> {
     pub(super) max_usages: usize,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) saw_unproven_match: &'a mut bool,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) raw_match_count: &'a mut usize,
     pub(super) limit_exceeded: &'a mut bool,
 }
@@ -33,7 +33,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) spec: &'a TargetSpec,
     pub(super) bindings: LocalInferenceEngine<CppScanBinding>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) saw_unproven_match: &'a mut bool,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) raw_match_count: &'a mut usize,
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
@@ -82,7 +82,7 @@ pub(super) fn scan_file(
         spec,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         hits: state.hits,
-        saw_unproven_match: state.saw_unproven_match,
+        unproven_hits: state.unproven_hits,
         raw_match_count: state.raw_match_count,
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
@@ -291,7 +291,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         push_hit(hit_node, ctx);
     } else if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(hit_node, ctx);
     }
 }
 
@@ -351,7 +351,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.visibility.resolves_to_type(ctx.file, text, owner) {
         push_hit(type_node, ctx);
     } else {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(type_node, ctx);
     }
 }
 
@@ -402,7 +402,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         // An explicitly namespace-qualified call to a different namespace (e.g. `other::run()` when
         // the target is `ns::run`) is a proven non-match, not an unresolved reference.
     } else {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(function, ctx);
     }
 }
 
@@ -511,7 +511,7 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
     ) {
         // A qualified reference proven to a different namespace is not a match.
     } else {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(node, ctx);
     }
 }
 
@@ -571,7 +571,7 @@ fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'
     {
         // A definition in another explicit namespace is a proven non-match.
     } else {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(function, ctx);
     }
 }
 
@@ -601,7 +601,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 push_hit(operator, ctx);
             }
         } else if !receiver_has_known_non_target(receiver, ctx) {
-            *ctx.saw_unproven_match = true;
+            push_unproven_hit(operator, ctx);
         }
         return;
     }
@@ -635,7 +635,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else if !receiver_has_known_non_target(function, ctx)
         && !known_non_target_owner_context(function, ctx)
     {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(function_terminal_node(function), ctx);
     }
 }
 
@@ -718,7 +718,7 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         // A method definition for another visible owner is a proven non-match.
     } else {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(function, ctx);
     }
 }
 
@@ -839,7 +839,7 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         push_hit(node, ctx);
     } else if global_field_is_known_non_target(node, ctx) {
     } else {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(node, ctx);
     }
 }
 
@@ -920,7 +920,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if receiver_matches_target(node, ctx) {
             push_hit(field, ctx);
         } else if !receiver_has_known_non_target(node, ctx) {
-            *ctx.saw_unproven_match = true;
+            push_unproven_hit(field, ctx);
         }
         return;
     }
@@ -961,7 +961,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else if text.contains("::") {
         // Explicitly qualified fields that do not match the target owner are known non-targets.
     } else if !known_non_target_owner_context(node, ctx) {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(node, ctx);
     }
 }
 
