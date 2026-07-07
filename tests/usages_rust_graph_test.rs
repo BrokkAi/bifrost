@@ -166,6 +166,114 @@ fn parse_other(value: &str) -> Option<bool> {
 }
 
 #[test]
+fn rust_graph_strategy_finds_private_member_usages_without_export_seed() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "mod tracker;\nmod consumer;\n"),
+        (
+            "src/tracker.rs",
+            r#"
+struct RequestTracker;
+
+impl RequestTracker {
+    fn run_request(&self) {}
+}
+"#,
+        ),
+        (
+            "src/consumer.rs",
+            r#"
+use crate::tracker::RequestTracker;
+
+fn drive(tracker: RequestTracker) {
+    tracker.run_request();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/tracker.rs"),
+        "RequestTracker",
+        "run_request",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = match result {
+        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+            .into_values()
+            .flat_map(BTreeSet::into_iter)
+            .collect::<BTreeSet<_>>(),
+        other => panic!("expected private member usage success, got {other:#?}"),
+    };
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/consumer.rs")
+                && hit.snippet.contains("tracker.run_request")),
+        "expected private member call in consumer.rs: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_finds_imported_type_impl_target_usages_without_export_seed() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod ast;\npub mod utils;\n"),
+        ("src/ast.rs", "pub struct StorageField;\n"),
+        ("src/utils/mod.rs", "pub mod language;\n"),
+        (
+            "src/utils/language.rs",
+            r#"
+use crate::ast::StorageField;
+
+pub trait Format {
+    fn format(&self);
+}
+
+impl Format for StorageField {
+    fn format(&self) {}
+}
+
+pub fn render(field: StorageField) {
+    field.format();
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "utils.language.StorageField");
+    assert_eq!(project.file("src/utils/language.rs"), *target.source());
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = match result {
+        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+            .into_values()
+            .flat_map(BTreeSet::into_iter)
+            .collect::<BTreeSet<_>>(),
+        other => panic!("expected imported type impl target usage success, got {other:#?}"),
+    };
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/utils/language.rs")
+                && hit.snippet.contains("StorageField")
+        }),
+        "expected local imported type references in language.rs: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_pub_cfg_test_async_function_calls() {
     let (_project, analyzer) = rust_analyzer_with_files(&[(
         "src/db.rs",
@@ -548,20 +656,16 @@ fn run() {
 }
 
 #[test]
-fn private_unseeded_rust_target_falls_back_to_no_graph_hits() {
+fn private_unseeded_rust_target_scans_to_empty_success() {
     let (_project, analyzer) = rust_analyzer_with_files(&[("src/service.rs", "struct Service;\n")]);
     let target = definition(&analyzer, "service.Service");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    match brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
-        &analyzer,
-        std::slice::from_ref(&target),
-        &candidates,
-        1000,
-    ) {
-        FuzzyResult::Failure { .. } => {}
-        other => panic!("expected Failure for private unseeded target, got {other:?}"),
-    }
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("private local target scan success");
+    assert!(hits.is_empty(), "expected empty local scan: {hits:#?}");
 }
 
 #[test]
@@ -1699,7 +1803,7 @@ fn run(x: Foo) {
 }
 
 #[test]
-fn rust_graph_strategy_does_not_resolve_public_member_on_private_owner() {
+fn rust_graph_strategy_finds_in_crate_member_usages_on_private_owner() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "src/service.rs",
@@ -1731,7 +1835,7 @@ fn run(x: Foo) {
             1000,
         )
         .into_either();
-    assert!(hits.is_err() || hits.expect("private owner member").is_empty());
+    assert_eq!(1, hits.expect("private owner member local scan").len());
 }
 
 #[test]
@@ -1915,13 +2019,19 @@ fn rust_graph_strategy_does_not_seed_pub_self_exports() {
     let (_project, analyzer) =
         rust_analyzer_with_files(&[("src/service.rs", "pub(self) struct Hidden;\n")]);
     let target = definition(&analyzer, "service.Hidden");
-    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
-        &analyzer,
-        std::slice::from_ref(&target),
-        &analyzer.get_analyzed_files().into_iter().collect(),
-        1000,
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("pub(self) local declaration scan success");
+    assert!(
+        hits.is_empty(),
+        "pub(self) item has no references: {hits:#?}"
     );
-    assert!(matches!(hits, FuzzyResult::Failure { .. }));
 }
 
 #[test]
@@ -2003,10 +2113,14 @@ fn run() {
             .expect("commented pub visibility success")
             .len()
     );
-    assert!(matches!(
-        strategy.find_usages(&analyzer, std::slice::from_ref(&private), &candidates, 1000),
-        FuzzyResult::Failure { .. }
-    ));
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&private), &candidates, 1000)
+            .into_either()
+            .expect("private local declaration scan success")
+            .len()
+    );
 }
 
 #[test]
@@ -2073,9 +2187,13 @@ fn run() {
         &analyzer.get_analyzed_files().into_iter().collect(),
         1000,
     );
+    let hits = result
+        .into_either()
+        .expect("pub(self) local declaration scan success");
     assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "pub(self) use must not expose Foo as a public barrel reexport"
+        hits.iter().all(|hit| hit.file
+            != ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs")),
+        "pub(self) use must not expose Foo as a public barrel reexport: {hits:#?}"
     );
 }
 
@@ -2270,10 +2388,14 @@ fn run() {
             .expect("glob Foo success")
             .len()
     );
-    assert!(matches!(
-        strategy.find_usages(&analyzer, std::slice::from_ref(&hidden), &candidates, 1000),
-        FuzzyResult::Failure { .. }
-    ));
+    let hidden_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&hidden), &candidates, 1000)
+        .into_either()
+        .expect("private glob local declaration scan success");
+    assert!(
+        hidden_hits.is_empty(),
+        "glob imports only bind public exports: {hidden_hits:#?}"
+    );
 }
 
 #[test]
@@ -2455,7 +2577,14 @@ fn run() {
         &analyzer.get_analyzed_files().into_iter().collect(),
         1000,
     );
-    assert!(matches!(result, FuzzyResult::Failure { .. }));
+    let hits = result
+        .into_either()
+        .expect("private item behind reexport local scan success");
+    assert!(
+        hits.iter().all(|hit| hit.file
+            != ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs")),
+        "private item is not exposed as a public barrel reexport: {hits:#?}"
+    );
 }
 
 #[test]
@@ -3118,7 +3247,7 @@ fn rust_graph_strategy_records_external_frontier_for_unresolved_glob_reexport() 
 }
 
 #[test]
-fn rust_graph_strategy_does_not_resolve_private_inline_module_externally() {
+fn rust_graph_strategy_finds_private_inline_module_usages_via_named_import() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         (
             "src/lib.rs",
@@ -3147,7 +3276,13 @@ fn run() {
         &analyzer.get_analyzed_files().into_iter().collect(),
         1000,
     );
-    assert!(matches!(result, FuzzyResult::Failure { .. }));
+    assert_eq!(
+        1,
+        result
+            .into_either()
+            .expect("private inline module local scan success")
+            .len()
+    );
 }
 
 #[test]
@@ -3188,7 +3323,7 @@ fn run() {
 }
 
 #[test]
-fn rust_graph_strategy_inline_module_exports_only_public_contents() {
+fn rust_graph_strategy_finds_public_and_private_inline_module_usages() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         (
             "src/lib.rs",
@@ -3225,10 +3360,14 @@ fn run() {
             .expect("public inline item success")
             .len()
     );
-    assert!(matches!(
-        strategy.find_usages(&analyzer, std::slice::from_ref(&hidden), &candidates, 1000),
-        FuzzyResult::Failure { .. }
-    ));
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&hidden), &candidates, 1000)
+            .into_either()
+            .expect("private inline local declaration scan success")
+            .len()
+    );
 }
 
 // Regression for #233: references that reach the crate's public API only through a

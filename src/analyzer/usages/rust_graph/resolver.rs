@@ -3,7 +3,20 @@ use crate::analyzer::{
     CodeUnit, DefinitionLookupIndex, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
     TypeHierarchyProvider,
 };
+use crate::hash::HashSet;
 use std::collections::BTreeSet;
+use tree_sitter::Parser;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RustGraphSeedKind {
+    Export,
+    LocalDeclaration,
+}
+
+pub(super) struct RustGraphSeeds {
+    pub(super) seeds: BTreeSet<(ProjectFile, String)>,
+    pub(super) kind: RustGraphSeedKind,
+}
 
 pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     target.is_function()
@@ -215,7 +228,47 @@ fn trait_visible_at_call_site(
         ))
 }
 
-pub(super) fn infer_graph_seeds(
+pub(super) fn canonical_usage_target(rust: &RustAnalyzer, target: &CodeUnit) -> CodeUnit {
+    canonical_imported_impl_target(rust, target).unwrap_or_else(|| target.clone())
+}
+
+pub(super) fn local_impl_target_importer_files(
+    rust: &RustAnalyzer,
+    target: &CodeUnit,
+) -> HashSet<ProjectFile> {
+    let Some(resolved_fqn) = imported_impl_target_fqn(rust, target) else {
+        return HashSet::default();
+    };
+    if rust.definitions(&resolved_fqn).next().is_some() {
+        return HashSet::default();
+    }
+
+    rust.get_analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            rust.reference_context_of(file)
+                .bare_names_resolving_to(&resolved_fqn)
+                .contains(target.identifier())
+        })
+        .collect()
+}
+
+pub(super) fn infer_graph_seeds(analyzer: &RustAnalyzer, target: &CodeUnit) -> RustGraphSeeds {
+    let seeds = infer_export_graph_seeds(analyzer, target);
+    if !seeds.is_empty() {
+        return RustGraphSeeds {
+            seeds,
+            kind: RustGraphSeedKind::Export,
+        };
+    }
+
+    RustGraphSeeds {
+        seeds: local_declaration_graph_seeds(analyzer, target),
+        kind: RustGraphSeedKind::LocalDeclaration,
+    }
+}
+
+fn infer_export_graph_seeds(
     analyzer: &RustAnalyzer,
     target: &CodeUnit,
 ) -> BTreeSet<(ProjectFile, String)> {
@@ -257,6 +310,76 @@ pub(super) fn infer_graph_seeds(
     }
 
     seeds
+}
+
+fn local_declaration_graph_seeds(
+    analyzer: &RustAnalyzer,
+    target: &CodeUnit,
+) -> BTreeSet<(ProjectFile, String)> {
+    let seed_target = if is_member_target(analyzer, target) {
+        analyzer.parent_of(target)
+    } else {
+        Some(target.clone())
+    };
+    let Some(seed_target) = seed_target else {
+        return BTreeSet::new();
+    };
+    if !is_local_declaration(analyzer, &seed_target) {
+        return BTreeSet::new();
+    }
+    [(
+        seed_target.source().clone(),
+        seed_target.identifier().to_string(),
+    )]
+    .into_iter()
+    .collect()
+}
+
+fn is_local_declaration(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
+    analyzer
+        .declarations(target.source())
+        .any(|declaration| declaration == target)
+}
+
+fn canonical_imported_impl_target(rust: &RustAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
+    let resolved_fqn = imported_impl_target_fqn(rust, target)?;
+    let mut definitions = rust
+        .definitions(&resolved_fqn)
+        .filter(|definition| *definition != target);
+    let first = definitions.next()?.clone();
+    definitions.next().is_none().then_some(first)
+}
+
+fn imported_impl_target_fqn(rust: &RustAnalyzer, target: &CodeUnit) -> Option<String> {
+    if !target.is_class() || rust.parent_of(target).is_some() || !is_impl_target_unit(rust, target)
+    {
+        return None;
+    }
+    let refs = rust.reference_context_of(target.source());
+    let resolved = refs.resolve_bare(target.identifier())?;
+    (resolved != target.fq_name()).then(|| resolved.to_string())
+}
+
+fn is_impl_target_unit(rust: &RustAnalyzer, target: &CodeUnit) -> bool {
+    let Ok(source) = target.source().read_to_string() else {
+        return false;
+    };
+    let Some(range) = rust.ranges(target).first() else {
+        return false;
+    };
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return false;
+    };
+    tree.root_node()
+        .descendant_for_byte_range(range.start_byte, range.end_byte)
+        .is_some_and(|node| node.kind() == "impl_item")
 }
 
 fn infer_export_names(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTreeSet<String> {

@@ -22,7 +22,7 @@ The user-level directive shaping this plan: fix causes at the level of the gener
 - [x] (2026-07-07) The shared-usage-index refactor merged into master (`9de316e`) after root-causing; all root-cause anchors re-verified present on merged master (line shifts only — Go `resolver.rs:1426` and `:1692`, C# `resolver.rs:611/:626`; Rust and hint sites unchanged).
 - [x] (2026-07-07 16:34Z) Stage 1 (Go receiver-fact contract): qualified field types resolve through import edges; field-owner facts cross packages.
 - [x] (2026-07-07 16:42Z) Stage 2 (C# type-identity contract): canonical builtin-type table replaces the `string` special case; unqualified same-class calls get structural proof.
-- [ ] Stage 3 (Rust seeding contract): local-declaration scan seeds + impl-target canonicalization.
+- [x] (2026-07-07 16:55Z) Stage 3 (Rust seeding contract): local-declaration scan seeds + impl-target canonicalization.
 - [ ] Stage 4 (proof-tier result model): `UsageProof` tier, unproven sites through `FuzzyResult::Success`, `verified_absent` in scan_usages summaries; C#/Go/Rust emit unproven candidates.
 - [ ] Stage 5 (hint contract): hints context-derived; location-anchored queries never re-suggest `targets`.
 - [ ] Final full-workspace gate (fmt, clippy all-features, full test suite incl. `--features nlp,python`); retrospective.
@@ -39,6 +39,12 @@ The user-level directive shaping this plan: fix causes at the level of the gener
   Evidence: Before the fix, `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_csharp_graph_test -- primitive` ran 2 tests and both failed, one with `No relevant usages found for symbol: NzbDrone.Common.Extensions.NumberExtensions.SizeSuffix` and one with `CSharpUsageGraphStrategy: no proven structured hits`. After the fix, the same command ran 2 tests and both passed.
 - Observation: Adding `object` to the builtin table changed two existing C# tests from unsafe-inference failures to successful empty results, because `object` receivers are now known `System.Object` nonmatches rather than untyped receivers.
   Evidence: The first full `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_csharp_graph_test` run after Stage 2 implementation failed only `csharp_graph_fails_when_inner_block_shadows_typed_receiver` and `csharp_graph_avoids_unrelated_same_name_symbols_and_fails_on_unsupported_receivers`; both old assertions expected `FuzzyResult::Failure`. Updating them to assert empty success yielded 48/48 passing tests.
+- Observation: Stage 3's two Rust no-export-seed repro tests still failed on merged master before the fix, then both passed after local-declaration seeding and impl-target canonicalization.
+  Evidence: Before the fix, `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_rust_graph_test -- without_export_seed` ran 2 tests and both failed with `RustExportUsageGraphStrategy: no export seed resolved`. After the fix, the same command ran 2 tests and both passed.
+- Observation: `RustAnalyzer::usage_importers` already tracks ordinary `use crate::...` edges for non-exported definitions because `build_importer_reverse` keys named and namespace import edges by the resolved target file from `ImportBinder` / `resolve_module_files`, without checking the target file's export index. Glob imports remain export-bounded because a glob is lowered to one named edge per exported name of the target file.
+  Evidence: Inspection of `src/analyzer/rust/usage_index.rs` found `build_importer_reverse` inserting `RustImportEdge` values for `ImportKind::Named` and `ImportKind::Namespace` directly after module resolution; only the `ImportKind::Glob` branch iterates `exports_by_file[target_file].exports_by_name`.
+- Observation: The first full Rust usage suite after Stage 3 implementation exposed nine tests that encoded the old policy that private or `pub(self)` local declarations were unscannable graph targets.
+  Evidence: `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_rust_graph_test` initially reported 89 passed and 9 failed. The failures were `private_unseeded_rust_target_falls_back_to_no_graph_hits`, `rust_graph_strategy_does_not_resolve_public_member_on_private_owner`, `rust_graph_strategy_does_not_seed_pub_self_exports`, `rust_graph_strategy_reads_visibility_from_tree_sitter_nodes`, `rust_graph_strategy_does_not_treat_self_reexport_as_public_barrel`, `rust_graph_strategy_resolves_bounded_glob_imports_for_public_exports_only`, `rust_graph_strategy_does_not_resolve_private_item_behind_barrel_reexport`, `rust_graph_strategy_does_not_resolve_private_inline_module_externally`, and `rust_graph_strategy_inline_module_exports_only_public_contents`. Updating those expectations yielded 98/98 passing tests.
 
 (Add entries as implementation proceeds.)
 
@@ -83,10 +89,20 @@ The user-level directive shaping this plan: fix causes at the level of the gener
 - Decision (D13): Update the old unqualified-call fallback test to assert the new proven hit, and update two `object` receiver tests to assert successful empty results rather than fallback.
   Rationale: the unqualified-call test documented the old Stage 1 behavior and is superseded by Stage 2's same-class proof. The `object` tests changed because builtin canonicalization turns `object` into a known `System.Object` receiver, which can safely disprove `Target.Run`/`Alpha.Target.Run` instead of forcing an unsafe-inference failure.
   Date/Author: 2026-07-07 / Codex.
+- Decision (D14): Rust seed inference now returns the seed kind as well as the seed set: export seeds are still inferred first and keep their existing visibility narrowing, and local-declaration seeds are added only when export inference returns empty.
+  Rationale: this implements D8 without changing the public export fast path. The member visibility gate still suppresses private members reached through export seeds, but it no longer suppresses members reached through local-declaration seeds.
+  Date/Author: 2026-07-07 / Codex.
+- Decision (D15): Synthetic Rust impl-target CodeUnits are canonicalized only when the target is a class CodeUnit whose declaration range is an `impl_item` and the file's `RustReferenceContext` resolves the impl target name to a different in-workspace declaration.
+  Rationale: this keeps ordinary same-file type declarations from being rewritten, uses tree-sitter ranges and the reference context rather than parsing path text, and lets queries such as `utils.language.StorageField` run against the real `ast.StorageField` identity.
+  Date/Author: 2026-07-07 / Codex.
+- Decision (D16): Update nine Rust tests that asserted the old conflation between "not exported" and "not scannable".
+  Rationale: `private_unseeded_rust_target_falls_back_to_no_graph_hits` is now `private_unseeded_rust_target_scans_to_empty_success` because a real local declaration with no references is a completed empty scan, not `NoGraphSeed`. `rust_graph_strategy_does_not_resolve_public_member_on_private_owner`, `rust_graph_strategy_reads_visibility_from_tree_sitter_nodes`, `rust_graph_strategy_does_not_resolve_private_inline_module_externally`, and `rust_graph_strategy_inline_module_exports_only_public_contents` now assert true local hits because named imports structurally identify those private in-crate declarations. `rust_graph_strategy_does_not_seed_pub_self_exports`, `rust_graph_strategy_resolves_bounded_glob_imports_for_public_exports_only`, `rust_graph_strategy_does_not_treat_self_reexport_as_public_barrel`, and `rust_graph_strategy_does_not_resolve_private_item_behind_barrel_reexport` now assert successful empty scans or no external main-file hit, preserving the public-surface/export-boundary behavior while accepting that the local declaration target is scannable.
+  Date/Author: 2026-07-07 / Codex.
+  Amendment: three of those tests kept "does_not_resolve"/"exports_only" names while newly asserting found hits; renamed during review to `rust_graph_strategy_finds_in_crate_member_usages_on_private_owner`, `rust_graph_strategy_finds_private_inline_module_usages_via_named_import`, and `rust_graph_strategy_finds_public_and_private_inline_module_usages` so names match asserted behavior. (2026-07-07 / Claude.)
 
 ## Outcomes & Retrospective
 
-(To be written at stage boundaries and completion.)
+- Stage 3 outcome (2026-07-07 / Codex): Rust scan seeding no longer treats export reachability as the gate for all graph scans. Private local declarations and imported impl-target identities now scan when the analyzer has declaration, import-binder, and reference-context evidence for candidate files. The requested quality gates passed: `cargo fmt`; `cargo clippy --all-targets --all-features -- -D warnings`; `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_rust_graph_test` (98 passed); `usage_graph_rust_test` (19 passed); `usage_graph_identity_test` (5 passed); `cross_language_self_usages` (13 passed); and `usage_graph_test` (16 passed).
 
 ## Context and Orientation
 
@@ -244,3 +260,5 @@ Revision note (2026-07-07, Claude): initial plan authored from the verified root
 Revision note (2026-07-07, Codex): Stage 1 implementation completed and the living sections were updated with the failed-before/passed-after Go repro evidence, the `inverted.rs` inspection result, and the import-edge field-owner fact decisions.
 
 Revision note (2026-07-07, Codex): Stage 2 implementation completed and the living sections were updated with failed-before/passed-after C# primitive receiver evidence, the builtin `object` test expectation changes, and decisions for canonical builtin type identity plus same-class unqualified call proof.
+
+Revision note (2026-07-07, Codex): Stage 3 implementation completed and the living sections were updated with failed-before/passed-after Rust no-export-seed evidence, the `usage_importers` inspection result, the local-declaration seed and impl-target canonicalization decisions, and the Rust test expectation changes required by the new scannability contract.
