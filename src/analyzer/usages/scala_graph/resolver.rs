@@ -472,20 +472,39 @@ fn scala_declared_type_in_package(
     package_name: &str,
     simple: &str,
 ) -> Option<String> {
-    scala
-        .all_declarations()
-        .filter(|unit| unit.is_class())
-        .find(|unit| unit.package_name() == package_name && scala_display_name(unit) == simple)
-        .map(|unit| unit.fq_name())
+    preferred_scala_type(
+        scala
+            .definition_lookup_index()
+            .types_in_package(package_name, simple),
+    )
+    .map(|unit| unit.fq_name())
 }
 
 fn scala_declared_type_fqn(scala: &ScalaAnalyzer, fqn: &str) -> Option<String> {
     let normalized = scala_normalized_fq_name(fqn);
-    scala
-        .all_declarations()
-        .filter(|unit| unit.is_class())
-        .find(|unit| scala_normalized_fq_name(&unit.fq_name()) == normalized)
-        .map(|unit| unit.fq_name())
+    preferred_scala_type(
+        scala
+            .definition_lookup_index()
+            .by_normalized_fqn(&normalized)
+            .iter()
+            .filter(|unit| unit.is_class()),
+    )
+    .map(|unit| unit.fq_name())
+}
+
+pub(super) fn preferred_scala_type<'a>(
+    units: impl IntoIterator<Item = &'a CodeUnit>,
+) -> Option<&'a CodeUnit> {
+    let mut first = None;
+    for unit in units {
+        if first.is_none() {
+            first = Some(unit);
+        }
+        if !unit.short_name().ends_with('$') {
+            return Some(unit);
+        }
+    }
+    first
 }
 
 fn scala_type_base(type_text: &str) -> Option<&str> {

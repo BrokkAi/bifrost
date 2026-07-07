@@ -21,7 +21,7 @@ use std::io;
 /// Bincode envelope version. Bumped when the wire format changes in a way
 /// that cannot be deserialized by older readers; persisted rows tagged with
 /// an unknown version are treated as dirty and re-analyzed.
-pub(crate) const PAYLOAD_VERSION: u32 = 4;
+pub(crate) const PAYLOAD_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct PersistedCodeUnit {
@@ -71,6 +71,7 @@ struct PersistedFileState {
     signatures: Vec<(PersistedCodeUnit, Vec<String>)>,
     signature_metadata: Vec<(PersistedCodeUnit, Vec<SignatureMetadata>)>,
     ruby_method_dispatch_modes: Vec<(PersistedCodeUnit, RubyMethodDispatchMode)>,
+    scala_traits: Vec<PersistedCodeUnit>,
     ranges: Vec<(PersistedCodeUnit, Vec<Range>)>,
     children: Vec<(PersistedCodeUnit, Vec<PersistedCodeUnit>)>,
     type_aliases: Vec<PersistedCodeUnit>,
@@ -120,6 +121,11 @@ impl PersistedFileState {
                 .ruby_method_dispatch_modes
                 .iter()
                 .map(|(unit, mode)| (PersistedCodeUnit::from_code_unit(unit), *mode))
+                .collect(),
+            scala_traits: state
+                .scala_traits
+                .iter()
+                .map(PersistedCodeUnit::from_code_unit)
                 .collect(),
             ranges: state
                 .ranges
@@ -190,6 +196,11 @@ impl PersistedFileState {
             ruby_method_dispatch_modes.insert(unit.into_code_unit(source), mode);
         }
 
+        let mut scala_traits = set_with_capacity(self.scala_traits.len());
+        for unit in self.scala_traits {
+            scala_traits.insert(unit.into_code_unit(source));
+        }
+
         let mut ranges = map_with_capacity(self.ranges.len());
         for (unit, file_ranges) in self.ranges {
             ranges.insert(unit.into_code_unit(source), file_ranges);
@@ -225,6 +236,7 @@ impl PersistedFileState {
             ruby_method_dispatch_modes,
             ranges,
             children,
+            scala_traits,
             type_aliases,
             contains_tests: self.contains_tests,
             // `parse_errors` is not part of the persisted payload — the

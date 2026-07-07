@@ -12705,6 +12705,30 @@ fn scala_same_package_type_resolves_to_definition() {
 }
 
 #[test]
+fn scala_imported_type_prefers_plain_class_over_companion_object_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("lib/Foo.scala", "package lib\nclass Foo\nobject Foo\n")
+        .file(
+            "app/Consumer.scala",
+            "package app\nimport lib.Foo\nclass Consumer { val value: Foo = new Foo() }\n",
+        )
+        .build();
+
+    let line = "class Consumer { val value: Foo = new Foo() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "Foo")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Foo", "{value}");
+}
+
+#[test]
 fn scala_constructor_call_resolves_to_primary_constructor_identity() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

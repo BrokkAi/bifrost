@@ -22,8 +22,9 @@
 //! are an unhandled recall gap, not a wrong edge.
 
 use super::resolver::{
-    package_name_of, resolved_extension_receiver_type, scala_builtin_type_name,
-    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_normalized_fq_name,
+    package_name_of, preferred_scala_type, resolved_extension_receiver_type,
+    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
+    scala_normalized_fq_name,
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{call_arity_for_reference, node_text, parenthesized_arity, scala_import_path};
@@ -45,11 +46,24 @@ use tree_sitter::Node;
 pub(crate) struct ProjectTypes {
     index: Arc<DefinitionLookupIndex>,
     facts: Arc<UsageFactsIndex>,
+    package_types_by_package: HashMap<String, Vec<(String, CodeUnit)>>,
     extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>>,
 }
 
 impl ProjectTypes {
     pub(crate) fn build(scala: &ScalaAnalyzer) -> Self {
+        let index = scala.definition_lookup_index_shared();
+        let mut package_types_by_package: HashMap<String, Vec<(String, CodeUnit)>> =
+            HashMap::default();
+        for ((package, simple), units) in index.package_types() {
+            if let Some(unit) = preferred_scala_type(units) {
+                package_types_by_package
+                    .entry(package.clone())
+                    .or_default()
+                    .push((simple.clone(), unit.clone()));
+            }
+        }
+
         let mut extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>> =
             HashMap::default();
         for unit in scala
@@ -76,8 +90,9 @@ impl ProjectTypes {
             }
         }
         Self {
-            index: scala.definition_lookup_index_shared(),
+            index,
             facts: scala.usage_facts_index_shared(),
+            package_types_by_package,
             extension_methods_by_name,
         }
     }
@@ -162,18 +177,20 @@ impl ProjectTypes {
             .then_some(first)
     }
 
-    fn package_types(&self) -> impl Iterator<Item = (&(String, String), &CodeUnit)> {
-        self.index
-            .package_types()
-            .filter_map(|(key, units)| preferred_scala_type(units).map(|unit| (key, unit)))
+    fn package_types_in(&self, package: &str) -> &[(String, CodeUnit)] {
+        self.package_types_by_package
+            .get(package)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     fn type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&CodeUnit> {
-        let candidates = self.index.by_normalized_fqn(normalized_fqn);
-        candidates
-            .iter()
-            .find(|unit| unit.is_class() && !unit.short_name().ends_with('$'))
-            .or_else(|| candidates.iter().find(|unit| unit.is_class()))
+        preferred_scala_type(
+            self.index
+                .by_normalized_fqn(normalized_fqn)
+                .iter()
+                .filter(|unit| unit.is_class()),
+        )
     }
 
     fn member_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&CodeUnit> {
@@ -211,10 +228,8 @@ impl NameResolver {
 
         // Types in the file's own package are reachable by simple name.
         if let Some(package) = package_name_of(scala, file) {
-            for ((decl_package, simple), decl) in types.package_types() {
-                if *decl_package == package {
-                    names.insert(simple.clone(), decl.fq_name());
-                }
+            for (simple, decl) in types.package_types_in(&package) {
+                names.insert(simple.clone(), decl.fq_name());
             }
         }
         let file_package = package_name_of(scala, file).unwrap_or_default();
@@ -226,8 +241,8 @@ impl NameResolver {
             if import.is_wildcard {
                 let package_candidates = import_candidate_paths(&path, &file_package);
                 // `import pkg._` exposes every type in `pkg` by simple name.
-                for ((decl_package, simple), decl) in types.package_types() {
-                    if package_candidates.contains(decl_package) {
+                for decl_package in &package_candidates {
+                    for (simple, decl) in types.package_types_in(decl_package) {
                         names.insert(simple.clone(), decl.fq_name());
                     }
                 }
@@ -330,13 +345,6 @@ fn owner_fqn(unit: &CodeUnit) -> Option<String> {
     } else {
         format!("{}.{}", unit.package_name(), owner_short)
     })
-}
-
-fn preferred_scala_type(units: &[CodeUnit]) -> Option<&CodeUnit> {
-    units
-        .iter()
-        .find(|unit| !unit.short_name().ends_with('$'))
-        .or_else(|| units.first())
 }
 
 pub(super) fn build_method_override_targets(

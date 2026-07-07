@@ -3,6 +3,7 @@ mod clones;
 mod declarations;
 mod hierarchy;
 pub(crate) mod imports;
+mod supertypes;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};

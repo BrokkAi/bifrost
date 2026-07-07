@@ -119,6 +119,42 @@ class Worker extends Base with Audited with Logged with Metered
 }
 
 #[test]
+fn scala_recorded_supertypes_drive_mixed_class_and_trait_descendants() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "Types.scala",
+        r#"
+package app
+class Base
+trait Runnable
+trait Audited extends Runnable
+class Worker extends Base with Audited
+"#,
+    )]);
+
+    let worker = definition(&analyzer, "app.Worker");
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        BTreeSet::from(["app.Audited".to_string(), "app.Base".to_string()])
+    );
+
+    let audited = definition(&analyzer, "app.Audited");
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&audited)),
+        BTreeSet::from(["app.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&audited)),
+        BTreeSet::from(["app.Worker".to_string()])
+    );
+
+    let runnable = definition(&analyzer, "app.Runnable");
+    assert_eq!(
+        fq_names(analyzer.get_descendants(&runnable)),
+        BTreeSet::from(["app.Audited".to_string(), "app.Worker".to_string()])
+    );
+}
+
+#[test]
 fn scala_object_resolves_trait_parents() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "Types.scala",

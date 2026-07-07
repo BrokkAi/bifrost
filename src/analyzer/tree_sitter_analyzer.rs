@@ -188,6 +188,7 @@ pub(crate) struct FileState {
     pub(crate) ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
     pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
     pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
+    pub(crate) scala_traits: HashSet<CodeUnit>,
     pub(crate) type_aliases: HashSet<CodeUnit>,
     pub(crate) contains_tests: bool,
     /// Tree-sitter parse errors captured during `analyze_file`. The LSP
@@ -218,6 +219,7 @@ struct AnalyzerState {
     signatures: HashMap<CodeUnit, Vec<String>>,
     signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
     ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
+    scala_traits: HashSet<CodeUnit>,
     classes_by_package: HashMap<String, Vec<CodeUnit>>,
     #[allow(dead_code)]
     type_aliases: HashSet<CodeUnit>,
@@ -233,6 +235,7 @@ struct IndexCapacities {
     signatures: usize,
     signature_metadata: usize,
     ruby_method_dispatch_modes: usize,
+    scala_traits: usize,
     classes_by_package: usize,
     type_aliases: usize,
 }
@@ -250,6 +253,7 @@ pub struct ParsedFile {
     pub signatures: HashMap<CodeUnit, Vec<String>>,
     pub signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
     pub ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
+    pub scala_traits: HashSet<CodeUnit>,
     pub type_aliases: HashSet<CodeUnit>,
     ranges: HashMap<CodeUnit, Vec<Range>>,
     children: HashMap<CodeUnit, Vec<CodeUnit>>,
@@ -269,6 +273,7 @@ impl ParsedFile {
             signatures: HashMap::default(),
             signature_metadata: HashMap::default(),
             ruby_method_dispatch_modes: HashMap::default(),
+            scala_traits: HashSet::default(),
             type_aliases: HashSet::default(),
             ranges: HashMap::default(),
             children: HashMap::default(),
@@ -420,6 +425,10 @@ impl ParsedFile {
         self.ruby_method_dispatch_modes.insert(code_unit, mode);
     }
 
+    pub fn set_scala_trait(&mut self, code_unit: CodeUnit) {
+        self.scala_traits.insert(code_unit);
+    }
+
     pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
         self.children.entry(parent).or_default().push(child);
     }
@@ -457,6 +466,7 @@ impl ParsedFile {
         self.signatures.remove(code_unit);
         self.signature_metadata.remove(code_unit);
         self.ruby_method_dispatch_modes.remove(code_unit);
+        self.scala_traits.remove(code_unit);
         self.type_aliases.remove(code_unit);
         self.ranges.remove(code_unit);
     }
@@ -725,6 +735,7 @@ where
             ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
             ranges: parsed.ranges,
             children: parsed.children,
+            scala_traits: parsed.scala_traits,
             type_aliases: parsed.type_aliases,
             contains_tests,
             parse_errors: Some(parse_errors),
@@ -959,6 +970,7 @@ where
         let mut ruby_method_dispatch_modes = map_with_capacity::<CodeUnit, RubyMethodDispatchMode>(
             capacities.ruby_method_dispatch_modes,
         );
+        let mut scala_traits = set_with_capacity::<CodeUnit>(capacities.scala_traits);
         let mut classes_by_package =
             map_with_capacity::<String, Vec<CodeUnit>>(capacities.classes_by_package);
         let mut type_aliases = set_with_capacity::<CodeUnit>(capacities.type_aliases);
@@ -1030,6 +1042,7 @@ where
                     .map(|(unit, mode)| (unit.clone(), *mode)),
             );
 
+            scala_traits.extend(state.scala_traits.iter().cloned());
             type_aliases.extend(state.type_aliases.iter().cloned());
         }
 
@@ -1092,6 +1105,7 @@ where
             signatures,
             signature_metadata,
             ruby_method_dispatch_modes,
+            scala_traits,
             classes_by_package,
             type_aliases,
         }
@@ -1114,6 +1128,7 @@ where
             capacities.signatures += state.signatures.len();
             capacities.signature_metadata += state.signature_metadata.len();
             capacities.ruby_method_dispatch_modes += state.ruby_method_dispatch_modes.len();
+            capacities.scala_traits += state.scala_traits.len();
             capacities.type_aliases += state.type_aliases.len();
             class_declarations += state
                 .declarations
@@ -1167,6 +1182,17 @@ where
                     .and_then(|state| state.raw_supertypes.get(code_unit).map(Vec::as_slice))
             })
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn is_scala_trait(&self, code_unit: &CodeUnit) -> bool {
+        self.state.scala_traits.contains(code_unit)
+            || self
+                .file_state(code_unit.source())
+                .is_some_and(|state| state.scala_traits.contains(code_unit))
+    }
+
+    pub(crate) fn scala_traits<'a>(&'a self) -> impl Iterator<Item = &'a CodeUnit> + 'a {
+        self.state.scala_traits.iter()
     }
 
     pub(crate) fn type_identifiers_of(&self, file: &ProjectFile) -> Option<&HashSet<String>> {

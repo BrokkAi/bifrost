@@ -2,6 +2,7 @@ use crate::analyzer::{CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, Si
 use tree_sitter::{Node, Tree};
 
 use super::imports::parse_scala_import_infos;
+use super::supertypes::extract_scala_supertypes;
 
 pub(super) fn parse_scala_file(
     file: &ProjectFile,
@@ -160,6 +161,14 @@ impl<'a> ScalaVisitor<'a> {
             .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
         self.parsed
             .add_signature(code_unit.clone(), scala_type_signature(node, self.source));
+        let raw_supertypes = extract_scala_supertypes(node, self.source);
+        if !raw_supertypes.is_empty() {
+            self.parsed
+                .set_raw_supertypes(code_unit.clone(), raw_supertypes);
+        }
+        if node.kind() == "trait_definition" {
+            self.parsed.set_scala_trait(code_unit.clone());
+        }
 
         if node.kind() == "class_definition"
             && node.child_by_field_name("class_parameters").is_some()
