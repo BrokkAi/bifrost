@@ -33,6 +33,9 @@ use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::symbol_index::{
+    MemberDecl, TypeDecl, WorkspaceSymbolIndex, WorkspaceSymbolIndexBuilder,
+};
 use crate::analyzer::{
     IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
 };
@@ -42,66 +45,68 @@ use tree_sitter::Node;
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
 pub(crate) struct ProjectTypes {
-    /// `(package, source_name) -> fqn` — a type reachable by simple name from a
-    /// file in the same package (or via a wildcard import of that package).
-    by_package: HashMap<(String, String), String>,
-    /// `normalized_fqn -> fqn` — resolve a non-wildcard import path (whose text is
-    /// `$`-free) to the analyzer's own `$`-encoded fqn.
-    by_normalized_fqn: HashMap<String, String>,
-    /// `normalized_member_fqn -> member_fqn` for `import Owner.member` paths.
-    by_normalized_member_fqn: HashMap<String, String>,
-    methods_by_owner_member: HashMap<(String, String), Vec<MemberMethod>>,
-    member_return_types: HashMap<String, String>,
+    index: WorkspaceSymbolIndex,
     extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>>,
 }
 
 impl ProjectTypes {
     pub(crate) fn build(scala: &ScalaAnalyzer) -> Self {
-        let mut by_package = HashMap::default();
-        let mut by_normalized_fqn = HashMap::default();
-        let mut by_normalized_member_fqn = HashMap::default();
-        let mut methods_by_owner_member: HashMap<(String, String), Vec<MemberMethod>> =
-            HashMap::default();
-        let mut member_return_types = HashMap::default();
+        let mut builder = WorkspaceSymbolIndexBuilder::new();
+        let mut type_decls = Vec::new();
         let mut extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>> =
             HashMap::default();
         for unit in scala.all_declarations().filter(|unit| unit.is_class()) {
             let fqn = unit.fq_name();
-            insert_package_type(
-                &mut by_package,
+            let decl = TypeDecl::new(
                 unit.package_name().to_string(),
                 scala_display_name(unit),
                 fqn.clone(),
+                scala_normalized_fq_name(&fqn),
             );
-            by_normalized_fqn.insert(scala_normalized_fq_name(&fqn), fqn);
+            builder.add_type(decl.clone());
+            type_decls.push(decl);
         }
+        let type_index = WorkspaceSymbolIndex::from_declarations(type_decls, Vec::new());
         for unit in scala
             .all_declarations()
             .filter(|unit| unit.is_function() || unit.is_field())
         {
             let fqn = unit.fq_name();
-            by_normalized_member_fqn.insert(scala_normalized_fq_name(&fqn), fqn.clone());
             let signature = unit
                 .signature()
                 .or_else(|| scala.signatures(unit).first().map(String::as_str));
-            if let Some(return_type) = signature.and_then(signature_return_type)
-                && let Some(return_fqn) =
-                    return_type_fqn(return_type, unit.package_name(), &by_package)
-            {
-                member_return_types.insert(fqn.clone(), return_fqn);
-            }
+            let return_type_fqn =
+                signature
+                    .and_then(signature_return_type)
+                    .and_then(|return_type| {
+                        return_type_fqn(return_type, unit.package_name(), &type_index)
+                    });
             if unit.is_function()
                 && let Some(owner_fqn) = owner_fqn(unit)
             {
-                methods_by_owner_member
-                    .entry((owner_fqn.clone(), unit.identifier().to_string()))
-                    .or_default()
-                    .push(MemberMethod {
-                        fqn: fqn.clone(),
-                        owner_fqn,
-                        name: unit.identifier().to_string(),
-                        arity: signature.and_then(member_signature_arity),
-                    });
+                builder.add_member(MemberDecl::new(
+                    fqn.clone(),
+                    scala_normalized_fq_name(&fqn),
+                    owner_fqn.clone(),
+                    scala_normalized_fq_name(&owner_fqn),
+                    unit.identifier().to_string(),
+                    signature.and_then(member_signature_arity),
+                    return_type_fqn,
+                    true,
+                ));
+            } else if unit.is_field()
+                && let Some(owner_fqn) = owner_fqn(unit)
+            {
+                builder.add_member(MemberDecl::new(
+                    fqn.clone(),
+                    scala_normalized_fq_name(&fqn),
+                    owner_fqn.clone(),
+                    scala_normalized_fq_name(&owner_fqn),
+                    unit.identifier().to_string(),
+                    None,
+                    return_type_fqn,
+                    false,
+                ));
             }
             if signature.is_some_and(|signature| signature.starts_with("extension "))
                 && let Some(owner_fqn) = owner_fqn(unit)
@@ -119,11 +124,7 @@ impl ProjectTypes {
             }
         }
         Self {
-            by_package,
-            by_normalized_fqn,
-            by_normalized_member_fqn,
-            methods_by_owner_member,
-            member_return_types,
+            index: builder.build(),
             extension_methods_by_name,
         }
     }
@@ -135,32 +136,14 @@ impl ProjectTypes {
         call_arity: Option<usize>,
     ) -> Vec<String> {
         let normalized_owner = scala_normalized_fq_name(owner_fqn);
-        if let Some(methods) = self
-            .methods_by_owner_member
-            .get(&(owner_fqn.to_string(), member.to_string()))
-        {
-            return methods
-                .iter()
-                .filter(|method| method_call_arity_matches(method.arity, call_arity))
-                .map(|method| method.fqn.clone())
-                .collect();
-        }
-        if let Some(methods) = self
-            .methods_by_owner_member
+        self.index
+            .members_for_owner_name(owner_fqn, &normalized_owner, member)
             .iter()
-            .find(|((candidate_owner, candidate_member), _)| {
-                scala_normalized_fq_name(candidate_owner) == normalized_owner
-                    && candidate_member == member
+            .filter(|method| {
+                method.is_function && method_call_arity_matches(method.arity, call_arity)
             })
-            .map(|(_, methods)| methods)
-        {
-            return methods
-                .iter()
-                .filter(|method| method_call_arity_matches(method.arity, call_arity))
-                .map(|method| method.fqn.clone())
-                .collect();
-        }
-        Vec::new()
+            .map(|method| method.fqn.clone())
+            .collect()
     }
 
     fn inherited_method_targets_for_owner_member(
@@ -183,25 +166,43 @@ impl ProjectTypes {
     }
 
     fn member_return_type(&self, member_fqn: &str) -> Option<String> {
-        self.member_return_types.get(member_fqn).cloned()
+        self.index
+            .callable_return_type(member_fqn)
+            .map(str::to_string)
     }
-}
 
-fn insert_package_type(
-    by_package: &mut HashMap<(String, String), String>,
-    package: String,
-    simple: String,
-    fqn: String,
-) {
-    let key = (package, simple);
-    if fqn.ends_with('$')
-        && by_package
-            .get(&key)
-            .is_some_and(|existing| !existing.ends_with('$'))
-    {
-        return;
+    fn member_return_type_for_owner_member(
+        &self,
+        owner_fqn: &str,
+        member: &str,
+        call_arity: Option<usize>,
+    ) -> Option<String> {
+        let normalized_owner = scala_normalized_fq_name(owner_fqn);
+        let mut returns = self
+            .index
+            .members_for_owner_name(owner_fqn, &normalized_owner, member)
+            .iter()
+            .filter(|method| {
+                method.is_function && method_call_arity_matches(method.arity, call_arity)
+            })
+            .filter_map(|method| method.return_type_fqn.clone());
+        let first = returns.next()?;
+        returns
+            .all(|return_type| return_type == first)
+            .then_some(first)
     }
-    by_package.insert(key, fqn);
+
+    fn package_types(&self) -> impl Iterator<Item = (&(String, String), &TypeDecl)> {
+        self.index.package_types()
+    }
+
+    fn type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&TypeDecl> {
+        self.index.type_by_normalized_fqn(normalized_fqn)
+    }
+
+    fn member_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&MemberDecl> {
+        self.index.member_by_normalized_fqn(normalized_fqn)
+    }
 }
 
 #[derive(Clone)]
@@ -209,14 +210,6 @@ pub(crate) struct ExtensionMethod {
     pub(crate) fqn: String,
     pub(crate) owner_fqn: String,
     pub(crate) receiver_type: Option<String>,
-}
-
-#[derive(Clone)]
-struct MemberMethod {
-    fqn: String,
-    owner_fqn: String,
-    name: String,
-    arity: Option<usize>,
 }
 
 /// Per-file map from a source-visible type/object name to the analyzer's fqn,
@@ -239,9 +232,9 @@ impl NameResolver {
 
         // Types in the file's own package are reachable by simple name.
         if let Some(package) = package_name_of(scala, file) {
-            for ((decl_package, simple), fqn) in &types.by_package {
+            for ((decl_package, simple), decl) in types.package_types() {
                 if *decl_package == package {
-                    names.insert(simple.clone(), fqn.clone());
+                    names.insert(simple.clone(), decl.fqn.clone());
                 }
             }
         }
@@ -254,9 +247,9 @@ impl NameResolver {
             if import.is_wildcard {
                 let package_candidates = import_candidate_paths(&path, &file_package);
                 // `import pkg._` exposes every type in `pkg` by simple name.
-                for ((decl_package, simple), fqn) in &types.by_package {
+                for ((decl_package, simple), decl) in types.package_types() {
                     if package_candidates.contains(decl_package) {
-                        names.insert(simple.clone(), fqn.clone());
+                        names.insert(simple.clone(), decl.fqn.clone());
                     }
                 }
                 let normalized_paths = import_candidate_normalized_paths(&path, &file_package);
@@ -274,31 +267,36 @@ impl NameResolver {
             }
             // `import pkg.Type [as Alias]` binds the (possibly renamed) local name.
             let normalized_paths = import_candidate_normalized_paths(&path, &file_package);
-            if let Some(fqn) = normalized_paths
+            if let Some(decl) = normalized_paths
                 .iter()
-                .find_map(|normalized| types.by_normalized_fqn.get(normalized))
+                .find_map(|normalized| types.type_by_normalized_fqn(normalized))
             {
                 let local_name = import
                     .identifier
                     .clone()
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
-                names.insert(local_name, fqn.clone());
+                names.insert(local_name, decl.fqn.clone());
                 continue;
             }
-            if let Some(fqn) = normalized_paths
+            if let Some(member) = normalized_paths
                 .iter()
-                .find_map(|normalized| types.by_normalized_member_fqn.get(normalized))
+                .find_map(|normalized| types.member_by_normalized_fqn(normalized))
             {
                 let local_name = import
                     .identifier
                     .clone()
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
-                member_names.insert(local_name.clone(), fqn.clone());
-                if let Some(methods) = types.extension_methods_by_name.get(scala_member_name(fqn)) {
-                    visible_extensions
-                        .entry(local_name)
-                        .or_default()
-                        .extend(methods.iter().filter(|method| method.fqn == *fqn).cloned());
+                member_names.insert(local_name.clone(), member.fqn.clone());
+                if let Some(methods) = types
+                    .extension_methods_by_name
+                    .get(scala_member_name(&member.fqn))
+                {
+                    visible_extensions.entry(local_name).or_default().extend(
+                        methods
+                            .iter()
+                            .filter(|method| method.fqn == member.fqn)
+                            .cloned(),
+                    );
                 }
             }
         }
@@ -359,47 +357,49 @@ pub(super) fn build_method_override_targets(
     types: &ProjectTypes,
 ) -> HashMap<String, Vec<String>> {
     let mut override_targets: HashMap<String, Vec<String>> = HashMap::default();
-    for methods in types.methods_by_owner_member.values() {
-        for method in methods {
-            let Some(owner) = scala
-                .definitions(&method.owner_fqn)
-                .find(|unit| unit.is_class())
-            else {
+    for method in types.index.members().filter(|member| member.is_function) {
+        let Some(owner) = scala
+            .definitions(&method.owner_fqn)
+            .find(|unit| unit.is_class())
+        else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        for ancestor in scala.get_ancestors(owner) {
+            if !scala.is_scala_trait_declaration(&ancestor) {
                 continue;
-            };
-            let mut targets = Vec::new();
-            for ancestor in scala.get_ancestors(owner) {
-                if !scala.is_scala_trait_declaration(&ancestor) {
-                    continue;
-                }
-                if let Some(ancestor_methods) = types
-                    .methods_by_owner_member
-                    .get(&(ancestor.fq_name(), method.name.clone()))
-                {
-                    targets.extend(
-                        ancestor_methods
-                            .iter()
-                            .filter(|ancestor_method| {
-                                method_arities_compatible(method, ancestor_method)
-                            })
-                            .map(|ancestor_method| ancestor_method.fqn.clone()),
-                    );
-                }
-                if !targets.is_empty() {
-                    break;
-                }
             }
-            targets.sort();
-            targets.dedup();
             if !targets.is_empty() {
-                override_targets.insert(method_key(&method.fqn, method.arity), targets);
+                break;
             }
+            let ancestor_owner = ancestor.fq_name();
+            let normalized_ancestor_owner = scala_normalized_fq_name(&ancestor_owner);
+            targets.extend(
+                types
+                    .index
+                    .members_for_owner_name(
+                        &ancestor_owner,
+                        &normalized_ancestor_owner,
+                        &method.name,
+                    )
+                    .iter()
+                    .filter(|ancestor_method| {
+                        ancestor_method.is_function
+                            && method_arities_compatible(method, ancestor_method)
+                    })
+                    .map(|ancestor_method| ancestor_method.fqn.clone()),
+            );
+        }
+        targets.sort();
+        targets.dedup();
+        if !targets.is_empty() {
+            override_targets.insert(method_key(&method.fqn, method.arity), targets);
         }
     }
     override_targets
 }
 
-fn method_arities_compatible(method: &MemberMethod, ancestor: &MemberMethod) -> bool {
+fn method_arities_compatible(method: &MemberDecl, ancestor: &MemberDecl) -> bool {
     method.arity.is_none() || ancestor.arity.is_none() || method.arity == ancestor.arity
 }
 
@@ -442,17 +442,18 @@ fn signature_return_type(signature: &str) -> Option<&str> {
 fn return_type_fqn(
     return_type: &str,
     package_name: &str,
-    by_package: &HashMap<(String, String), String>,
+    type_index: &WorkspaceSymbolIndex,
 ) -> Option<String> {
     let base = return_type
         .split(['[', '(', '{', ' '])
         .next()
         .map(str::trim)
         .filter(|name| !name.is_empty())?;
-    by_package
-        .get(&(package_name.to_string(), base.to_string()))
-        .cloned()
-        .or_else(|| by_package.values().find(|fqn| *fqn == base).cloned())
+    type_index
+        .type_by_package_simple(package_name, base)
+        .or_else(|| type_index.type_by_fqn(base))
+        .or_else(|| type_index.type_by_normalized_fqn(&scala_normalized_fq_name(base)))
+        .map(|decl| decl.fqn.clone())
 }
 
 fn scala_member_name(fqn: &str) -> &str {
@@ -888,16 +889,24 @@ fn call_result_type(
             let field = function.child_by_field_name("field")?;
             let owner = receiver_type_fqn(receiver, ctx, bindings)?;
             let method = node_text(field, ctx.source);
-            ctx.factory_returns
-                .get(&format!("{owner}.{method}"))
-                .and_then(single_factory_return)
+            let call_arity = call_arity_for_reference(field);
+            let method_fqn = format!("{owner}.{method}");
+            if let Some(returns) = ctx.factory_returns.get(&method_fqn) {
+                return single_factory_return(returns);
+            }
+            ctx.types
+                .member_return_type_for_owner_member(&owner, method, call_arity)
         }
         "identifier" => {
             let method = node_text(function, ctx.source);
             let owner = ctx.enclosing_class(function.start_byte())?;
-            ctx.factory_returns
-                .get(&format!("{owner}.{method}"))
-                .and_then(single_factory_return)
+            let call_arity = call_arity_for_reference(function);
+            let method_fqn = format!("{owner}.{method}");
+            if let Some(returns) = ctx.factory_returns.get(&method_fqn) {
+                return single_factory_return(returns);
+            }
+            ctx.types
+                .member_return_type_for_owner_member(owner, method, call_arity)
         }
         _ => None,
     }
