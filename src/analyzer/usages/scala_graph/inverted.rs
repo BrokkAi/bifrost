@@ -38,62 +38,34 @@ use crate::analyzer::{
     IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
+
+type PackageTypeEntries = Arc<Vec<(String, CodeUnit)>>;
+type ExtensionOwnerMemberKey = (String, String);
+type ExtensionMethodEntries = Arc<Vec<ExtensionMethod>>;
+type OverrideTargetEntries = Arc<Vec<String>>;
 
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
 pub(crate) struct ProjectTypes {
     index: Arc<DefinitionLookupIndex>,
     facts: Arc<UsageFactsIndex>,
-    package_types_by_package: HashMap<String, Vec<(String, CodeUnit)>>,
-    extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>>,
+    package_types_by_package: Mutex<HashMap<String, PackageTypeEntries>>,
+    extension_methods_by_owner_member:
+        Mutex<HashMap<ExtensionOwnerMemberKey, ExtensionMethodEntries>>,
+    override_targets_by_method: Mutex<HashMap<String, OverrideTargetEntries>>,
 }
 
 impl ProjectTypes {
     pub(crate) fn build(scala: &ScalaAnalyzer) -> Self {
         let index = scala.definition_lookup_index_shared();
-        let mut package_types_by_package: HashMap<String, Vec<(String, CodeUnit)>> =
-            HashMap::default();
-        for ((package, simple), units) in index.package_types() {
-            if let Some(unit) = preferred_scala_type(units) {
-                package_types_by_package
-                    .entry(package.clone())
-                    .or_default()
-                    .push((simple.clone(), unit.clone()));
-            }
-        }
-
-        let mut extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>> =
-            HashMap::default();
-        for unit in scala
-            .all_declarations()
-            .filter(|unit| unit.is_function() || unit.is_field())
-        {
-            let fqn = unit.fq_name();
-            let signature = unit
-                .signature()
-                .or_else(|| scala.signatures(unit).first().map(String::as_str));
-            if signature.is_some_and(|signature| signature.starts_with("extension "))
-                && let Some(owner_fqn) = owner_fqn(unit)
-            {
-                extension_methods_by_name
-                    .entry(unit.identifier().to_string())
-                    .or_default()
-                    .push(ExtensionMethod {
-                        fqn,
-                        owner_fqn,
-                        receiver_type: signature.and_then(|signature| {
-                            resolved_extension_receiver_type(scala, unit, signature)
-                        }),
-                    });
-            }
-        }
         Self {
             index,
             facts: scala.usage_facts_index_shared(),
-            package_types_by_package,
-            extension_methods_by_name,
+            package_types_by_package: Mutex::new(HashMap::default()),
+            extension_methods_by_owner_member: Mutex::new(HashMap::default()),
+            override_targets_by_method: Mutex::new(HashMap::default()),
         }
     }
 
@@ -177,11 +149,31 @@ impl ProjectTypes {
             .then_some(first)
     }
 
-    fn package_types_in(&self, package: &str) -> &[(String, CodeUnit)] {
-        self.package_types_by_package
+    fn package_types_in(&self, package: &str) -> PackageTypeEntries {
+        if let Some(types) = self
+            .package_types_by_package
+            .lock()
+            .expect("package type cache poisoned")
             .get(package)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .cloned()
+        {
+            return types;
+        }
+
+        let mut values = Vec::new();
+        for ((candidate_package, simple), units) in self.index.package_types() {
+            if candidate_package == package
+                && let Some(unit) = preferred_scala_type(units)
+            {
+                values.push((simple.clone(), unit.clone()));
+            }
+        }
+        let values = Arc::new(values);
+        self.package_types_by_package
+            .lock()
+            .expect("package type cache poisoned")
+            .insert(package.to_string(), values.clone());
+        values
     }
 
     fn type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&CodeUnit> {
@@ -199,12 +191,138 @@ impl ProjectTypes {
             .iter()
             .find(|unit| unit.is_function() || unit.is_field())
     }
+
+    fn direct_extension_method(
+        &self,
+        scala: &ScalaAnalyzer,
+        normalized_fqn: &str,
+    ) -> Vec<ExtensionMethod> {
+        self.index
+            .by_normalized_fqn(normalized_fqn)
+            .iter()
+            .filter(|unit| unit.is_function() || unit.is_field())
+            .filter_map(|unit| self.extension_method_for_unit(scala, unit))
+            .collect()
+    }
+
+    fn extension_methods_for_owner_member(
+        &self,
+        scala: &ScalaAnalyzer,
+        normalized_owner_fqn: &str,
+        member: &str,
+    ) -> ExtensionMethodEntries {
+        let key = (normalized_owner_fqn.to_string(), member.to_string());
+        if let Some(methods) = self
+            .extension_methods_by_owner_member
+            .lock()
+            .expect("extension method cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return methods;
+        }
+
+        let mut methods = self
+            .index
+            .members_for_owner_name(normalized_owner_fqn, normalized_owner_fqn, member)
+            .into_iter()
+            .filter(|unit| unit.is_function() || unit.is_field())
+            .filter_map(|unit| self.extension_method_for_unit(scala, unit))
+            .collect::<Vec<_>>();
+        methods.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+        methods.dedup_by(|left, right| left.fqn == right.fqn);
+        let methods = Arc::new(methods);
+        self.extension_methods_by_owner_member
+            .lock()
+            .expect("extension method cache poisoned")
+            .insert(key, methods.clone());
+        methods
+    }
+
+    fn extension_method_for_unit(
+        &self,
+        scala: &ScalaAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<ExtensionMethod> {
+        let signature = unit
+            .signature()
+            .or_else(|| scala.signatures(unit).first().map(String::as_str))?;
+        if !signature.starts_with("extension ") {
+            return None;
+        }
+        let _ = owner_fqn(unit)?;
+        Some(ExtensionMethod {
+            fqn: unit.fq_name(),
+            receiver_type: resolved_extension_receiver_type(scala, unit, signature),
+        })
+    }
+
+    fn override_targets_for_method(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner_fqn: &str,
+        method_fqn: &str,
+        method_name: &str,
+        method_arity: Option<usize>,
+    ) -> OverrideTargetEntries {
+        let key = method_key(method_fqn, method_arity);
+        if let Some(targets) = self
+            .override_targets_by_method
+            .lock()
+            .expect("override target cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return targets;
+        }
+
+        let mut targets = Vec::new();
+        if let Some(owner) = scala.definitions(owner_fqn).find(|unit| unit.is_class()) {
+            for ancestor in scala.get_ancestors(owner) {
+                if !scala.is_scala_trait_declaration(&ancestor) {
+                    continue;
+                }
+                if !targets.is_empty() {
+                    break;
+                }
+                let ancestor_owner = ancestor.fq_name();
+                let normalized_ancestor_owner = scala_normalized_fq_name(&ancestor_owner);
+                targets.extend(
+                    self.index
+                        .members_for_owner_name(
+                            &ancestor_owner,
+                            &normalized_ancestor_owner,
+                            method_name,
+                        )
+                        .iter()
+                        .filter(|ancestor_method| {
+                            ancestor_method.is_function()
+                                && method_arities_compatible(
+                                    method_arity,
+                                    self.facts
+                                        .fact_for_declaration(ancestor_method)
+                                        .and_then(|facts| facts.arity),
+                                )
+                        })
+                        .map(|ancestor_method| ancestor_method.fq_name()),
+                );
+            }
+            targets.sort();
+            targets.dedup();
+        }
+
+        let targets = Arc::new(targets);
+        self.override_targets_by_method
+            .lock()
+            .expect("override target cache poisoned")
+            .insert(key, targets.clone());
+        targets
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct ExtensionMethod {
     pub(crate) fqn: String,
-    pub(crate) owner_fqn: String,
     pub(crate) receiver_type: Option<String>,
 }
 
@@ -213,7 +331,8 @@ pub(crate) struct ExtensionMethod {
 pub(crate) struct NameResolver {
     names: HashMap<String, String>,
     member_names: HashMap<String, String>,
-    visible_extensions: HashMap<String, Vec<ExtensionMethod>>,
+    direct_extension_methods: HashMap<String, Vec<ExtensionMethod>>,
+    wildcard_extension_owners: Vec<String>,
 }
 
 impl NameResolver {
@@ -224,11 +343,13 @@ impl NameResolver {
     ) -> Self {
         let mut names = HashMap::default();
         let mut member_names = HashMap::default();
-        let mut visible_extensions: HashMap<String, Vec<ExtensionMethod>> = HashMap::default();
+        let mut direct_extension_methods: HashMap<String, Vec<ExtensionMethod>> =
+            HashMap::default();
+        let mut wildcard_extension_owners = Vec::new();
 
         // Types in the file's own package are reachable by simple name.
         if let Some(package) = package_name_of(scala, file) {
-            for (simple, decl) in types.package_types_in(&package) {
+            for (simple, decl) in types.package_types_in(&package).iter() {
                 names.insert(simple.clone(), decl.fq_name());
             }
         }
@@ -242,21 +363,12 @@ impl NameResolver {
                 let package_candidates = import_candidate_paths(&path, &file_package);
                 // `import pkg._` exposes every type in `pkg` by simple name.
                 for decl_package in &package_candidates {
-                    for (simple, decl) in types.package_types_in(decl_package) {
+                    for (simple, decl) in types.package_types_in(decl_package).iter() {
                         names.insert(simple.clone(), decl.fq_name());
                     }
                 }
-                let normalized_paths = import_candidate_normalized_paths(&path, &file_package);
-                for methods in types.extension_methods_by_name.values() {
-                    for method in methods {
-                        if normalized_paths.contains(&scala_normalized_fq_name(&method.owner_fqn)) {
-                            visible_extensions
-                                .entry(scala_member_name(&method.fqn).to_string())
-                                .or_default()
-                                .push(method.clone());
-                        }
-                    }
-                }
+                wildcard_extension_owners
+                    .extend(import_candidate_normalized_paths(&path, &file_package));
                 continue;
             }
             // `import pkg.Type [as Alias]` binds the (possibly renamed) local name.
@@ -282,24 +394,30 @@ impl NameResolver {
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
                 let member_fqn = member.fq_name();
                 member_names.insert(local_name.clone(), member_fqn.clone());
-                if let Some(methods) = types
-                    .extension_methods_by_name
-                    .get(scala_member_name(&member_fqn))
+                for method in normalized_paths
+                    .iter()
+                    .flat_map(|normalized| types.direct_extension_method(scala, normalized))
                 {
-                    visible_extensions.entry(local_name).or_default().extend(
-                        methods
-                            .iter()
-                            .filter(|method| method.fqn == member_fqn)
-                            .cloned(),
-                    );
+                    direct_extension_methods
+                        .entry(local_name.clone())
+                        .or_default()
+                        .push(method);
                 }
             }
+        }
+
+        wildcard_extension_owners.sort();
+        wildcard_extension_owners.dedup();
+        for methods in direct_extension_methods.values_mut() {
+            methods.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+            methods.dedup_by(|left, right| left.fqn == right.fqn);
         }
 
         Self {
             names,
             member_names,
-            visible_extensions,
+            direct_extension_methods,
+            wildcard_extension_owners,
         }
     }
 
@@ -315,11 +433,36 @@ impl NameResolver {
         self.member_names.get(simple).cloned()
     }
 
-    pub(crate) fn visible_extension_methods(&self, member: &str) -> &[ExtensionMethod] {
-        self.visible_extensions
+    pub(crate) fn visible_extension_methods(
+        &self,
+        scala: &ScalaAnalyzer,
+        types: &ProjectTypes,
+        member: &str,
+    ) -> Vec<ExtensionMethod> {
+        let mut methods = Vec::new();
+        methods.extend(self.direct_extension_methods(member).iter().cloned());
+        for owner in self.wildcard_extension_owners() {
+            methods.extend(
+                types
+                    .extension_methods_for_owner_member(scala, owner, member)
+                    .iter()
+                    .cloned(),
+            );
+        }
+        methods.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+        methods.dedup_by(|left, right| left.fqn == right.fqn);
+        methods
+    }
+
+    fn direct_extension_methods(&self, member: &str) -> &[ExtensionMethod] {
+        self.direct_extension_methods
             .get(member)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    fn wildcard_extension_owners(&self) -> &[String] {
+        &self.wildcard_extension_owners
     }
 }
 
@@ -347,64 +490,6 @@ fn owner_fqn(unit: &CodeUnit) -> Option<String> {
     })
 }
 
-pub(super) fn build_method_override_targets(
-    scala: &ScalaAnalyzer,
-    types: &ProjectTypes,
-) -> HashMap<String, Vec<String>> {
-    let mut override_targets: HashMap<String, Vec<String>> = HashMap::default();
-    for method in scala.all_declarations().filter(|unit| unit.is_function()) {
-        let method_fqn = method.fq_name();
-        let method_arity = types
-            .facts
-            .fact_for_declaration(method)
-            .and_then(|facts| facts.arity);
-        let Some(owner_fqn) = owner_fqn(method) else {
-            continue;
-        };
-        let Some(owner) = scala.definitions(&owner_fqn).find(|unit| unit.is_class()) else {
-            continue;
-        };
-        let mut targets = Vec::new();
-        for ancestor in scala.get_ancestors(owner) {
-            if !scala.is_scala_trait_declaration(&ancestor) {
-                continue;
-            }
-            if !targets.is_empty() {
-                break;
-            }
-            let ancestor_owner = ancestor.fq_name();
-            let normalized_ancestor_owner = scala_normalized_fq_name(&ancestor_owner);
-            targets.extend(
-                types
-                    .index
-                    .members_for_owner_name(
-                        &ancestor_owner,
-                        &normalized_ancestor_owner,
-                        method.identifier(),
-                    )
-                    .iter()
-                    .filter(|ancestor_method| {
-                        ancestor_method.is_function()
-                            && method_arities_compatible(
-                                method_arity,
-                                types
-                                    .facts
-                                    .fact_for_declaration(ancestor_method)
-                                    .and_then(|facts| facts.arity),
-                            )
-                    })
-                    .map(|ancestor_method| ancestor_method.fq_name()),
-            );
-        }
-        targets.sort();
-        targets.dedup();
-        if !targets.is_empty() {
-            override_targets.insert(method_key(&method_fqn, method_arity), targets);
-        }
-    }
-    override_targets
-}
-
 fn method_arities_compatible(method: Option<usize>, ancestor: Option<usize>) -> bool {
     method.is_none() || ancestor.is_none() || method == ancestor
 }
@@ -424,10 +509,6 @@ fn method_key(fqn: &str, arity: Option<usize>) -> String {
         Some(arity) => format!("{fqn}#{arity}"),
         None => fqn.to_string(),
     }
-}
-
-fn scala_member_name(fqn: &str) -> &str {
-    fqn.rsplit('.').next().unwrap_or(fqn)
 }
 
 /// The leading simple name of a (possibly generic/qualified) type text.
@@ -465,7 +546,6 @@ where
                 source: parsed.source.as_str(),
                 resolver: &resolver,
                 types: &graph.types,
-                override_targets_by_method_fqn: &graph.override_targets_by_method_fqn,
                 factory_returns,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 collector,
@@ -481,7 +561,6 @@ struct ScalaScan<'a, 'b> {
     source: &'a str,
     resolver: &'a NameResolver,
     types: &'a ProjectTypes,
-    override_targets_by_method_fqn: &'a HashMap<String, Vec<String>>,
     factory_returns: HashMap<String, HashSet<String>>,
     class_ranges: ClassRangeIndex,
     collector: &'a mut EdgeCollector<'b>,
@@ -600,9 +679,7 @@ fn record_reference(
                                 ctx.scala, &owner, name, call_arity,
                             );
                             if inherited.is_empty() {
-                                for extension in
-                                    visible_extensions(ctx.resolver, name, Some(&owner))
-                                {
+                                for extension in visible_extensions(ctx, name, Some(&owner)) {
                                     ctx.record(extension.fqn, field);
                                 }
                             } else {
@@ -616,7 +693,7 @@ fn record_reference(
                             }
                         }
                     } else {
-                        for extension in visible_extensions(ctx.resolver, name, None) {
+                        for extension in visible_extensions(ctx, name, None) {
                             ctx.record(extension.fqn, field);
                         }
                     }
@@ -734,12 +811,13 @@ fn record_override_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
         return;
     };
     let method_fqn = format!("{owner}.{name}");
-    let Some(targets) = ctx.override_targets_by_method_fqn.get(&method_key(
+    let targets = ctx.types.override_targets_for_method(
+        ctx.scala,
+        owner,
         &method_fqn,
+        name,
         function_definition_arity(node, ctx.source),
-    )) else {
-        return;
-    };
+    );
     for target in targets.iter().cloned() {
         ctx.record_with_caller(method_fqn.clone(), target, name_node);
     }
@@ -971,14 +1049,17 @@ fn resolve_receiver_type(resolver: &NameResolver, type_text: &str) -> Option<Str
 }
 
 fn visible_extensions(
-    resolver: &NameResolver,
+    ctx: &ScalaScan<'_, '_>,
     member: &str,
     receiver_owner: Option<&str>,
 ) -> Vec<ExtensionMethod> {
     let mut matches = Vec::new();
-    for method in resolver.visible_extension_methods(member) {
-        if extension_receiver_matches(resolver, method, receiver_owner) {
-            matches.push(method.clone());
+    for method in ctx
+        .resolver
+        .visible_extension_methods(ctx.scala, ctx.types, member)
+    {
+        if extension_receiver_matches(ctx.resolver, &method, receiver_owner) {
+            matches.push(method);
         }
     }
     matches.sort_by(|left, right| left.fqn.cmp(&right.fqn));

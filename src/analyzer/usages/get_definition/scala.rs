@@ -898,7 +898,7 @@ fn scala_extension_candidate_units(
     receiver_owner: Option<&str>,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
-    for method in resolver.visible_extension_methods(member) {
+    for method in resolver.visible_extension_methods(ctx.scala, ctx.types, member) {
         if !scala_extension_receiver_matches(
             resolver,
             method.receiver_type.as_deref(),

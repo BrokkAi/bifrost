@@ -206,6 +206,51 @@ class Ignored {
 }
 
 #[test]
+fn path_filter_resolves_imported_extension_methods() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Syntax.scala",
+            r#"package app
+
+object Syntax:
+  extension (value: String)
+    def slug(): String = value.toLowerCase
+"#,
+        )
+        .file(
+            "app/Kept.scala",
+            r#"package app
+
+object Kept:
+  import Syntax.*
+  def call(): String = "Hello World".slug()
+"#,
+        )
+        .file(
+            "app/Ignored.scala",
+            r#"package app
+
+object Ignored:
+  import Syntax.*
+  def call(): String = "Goodbye".slug()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), r#"{"paths":["app/Kept.scala"]}"#);
+    assert!(
+        has_edge(&value, "app.Kept$.call", "app.Syntax$.slug"),
+        "path-filtered Scala graph should resolve extension methods imported by scanned files: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Ignored$.call", "app.Syntax$.slug"),
+        "path-filtered Scala graph must not emit extension edges from ignored callers: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scoped_usage_graph_skips_unrelated_invalid_scala_callers() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
