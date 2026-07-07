@@ -14,7 +14,8 @@
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use tokenizers::Tokenizer;
 
@@ -23,7 +24,9 @@ use super::engine::{Embedder, ScheduledEmbedder, fingerprint_for, resolve_embed_
 const OUT_DIM: usize = 512;
 const SCRIPT_ENV: &str = "BIFROST_SIDECAR_SCRIPT";
 const DEVICES_ENV: &str = "BIFROST_SIDECAR_DEVICES";
+const READY_TIMEOUT_ENV: &str = "BIFROST_SIDECAR_READY_TIMEOUT_SECS";
 const DEFAULT_SCRIPT: &str = "scripts/voyage_sidecar.py";
+const DEFAULT_READY_TIMEOUT_SECS: u64 = 900;
 
 /// One sidecar child process bound to one device.
 struct SidecarProc {
@@ -192,6 +195,28 @@ fn script_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SCRIPT))
 }
 
+fn ready_timeout() -> Duration {
+    let secs = std::env::var(READY_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_READY_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn kill_sidecar_pid(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
 /// Spawn one sidecar pinned to `device` (a CUDA_VISIBLE_DEVICES value) and wait for its
 /// ready frame.
 fn spawn_sidecar(
@@ -199,7 +224,16 @@ fn spawn_sidecar(
     tokenizer: Arc<Tokenizer>,
     label: String,
 ) -> Result<SingleSidecar, String> {
-    let script = script_path();
+    spawn_sidecar_with_timeout(device, tokenizer, label, script_path(), ready_timeout())
+}
+
+fn spawn_sidecar_with_timeout(
+    device: &str,
+    tokenizer: Arc<Tokenizer>,
+    label: String,
+    script: PathBuf,
+    timeout: Duration,
+) -> Result<SingleSidecar, String> {
     let mut cmd = Command::new("uv");
     cmd.arg("run").arg(&script);
     cmd.env("CUDA_VISIBLE_DEVICES", device);
@@ -222,14 +256,47 @@ fn spawn_sidecar(
         stdin,
         stdout: BufReader::new(stdout),
     };
+    let pid = proc.child.id();
 
     // First frame is the ready handshake (blocks through model load).
-    let ready = proc.read_frame()?;
-    let info: serde_json::Value =
-        serde_json::from_slice(&ready).map_err(|e| format!("sidecar ready frame: {e}"))?;
-    if info.get("ready").and_then(|v| v.as_bool()) != Some(true) {
-        return Err(format!("sidecar did not report ready: {info}"));
-    }
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("bifrost-sidecar-ready".to_string())
+        .spawn(move || {
+            let result = proc.read_frame().and_then(|ready| {
+                let info: serde_json::Value = serde_json::from_slice(&ready)
+                    .map_err(|e| format!("sidecar ready frame: {e}"))?;
+                if info.get("ready").and_then(|v| v.as_bool()) != Some(true) {
+                    return Err(format!("sidecar did not report ready: {info}"));
+                }
+                Ok(proc)
+            });
+            tx.send(result).ok();
+        })
+        .map_err(|err| format!("spawn sidecar ready thread: {err}"))?;
+    let proc = match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            handle
+                .join()
+                .map_err(|_| "sidecar ready thread panicked".to_string())?;
+            result?
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            kill_sidecar_pid(pid);
+            let _ = handle.join();
+            return Err(format!(
+                "sidecar ({}, pid {pid}) did not become ready within {}s",
+                script.display(),
+                timeout.as_secs()
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            handle
+                .join()
+                .map_err(|_| "sidecar ready thread panicked".to_string())?;
+            return Err("sidecar ready thread exited without reporting readiness".to_string());
+        }
+    };
     Ok(SingleSidecar {
         proc: Mutex::new(proc),
         tokenizer,
@@ -249,7 +316,9 @@ pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
     let mut workers: Vec<Arc<dyn Embedder>> = Vec::with_capacity(devices.len());
     for device in &devices {
         let worker = spawn_sidecar(device, tokenizer.clone(), label.clone())?;
-        let _ = worker.embed_passages(&["warmup"]);
+        worker
+            .embed_passages(&["warmup"])
+            .map_err(|err| format!("sidecar warmup failed on device '{device}': {err}"))?;
         workers.push(Arc::new(worker));
     }
     eprintln!(
@@ -257,4 +326,59 @@ pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
         workers.len()
     );
     Ok(Arc::new(ScheduledEmbedder::new(workers)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn empty_tokenizer() -> Arc<Tokenizer> {
+        Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default()))
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn timeout_pid(message: &str) -> i32 {
+        let (_, after_pid) = message
+            .split_once("pid ")
+            .expect("timeout error includes pid");
+        let (pid, _) = after_pid
+            .split_once(')')
+            .expect("timeout error terminates pid");
+        pid.parse().expect("pid is numeric")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_sidecar_times_out_and_reaps_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("sleep_sidecar.py");
+        let mut file = std::fs::File::create(&script).unwrap();
+        writeln!(file, "import time").unwrap();
+        writeln!(file, "time.sleep(60)").unwrap();
+
+        let result = spawn_sidecar_with_timeout(
+            "",
+            empty_tokenizer(),
+            "test-sidecar".to_string(),
+            script,
+            Duration::from_secs(1),
+        );
+        let err = match result {
+            Ok(_) => panic!("sleeping sidecar should hit ready timeout"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("did not become ready within 1s"),
+            "unexpected timeout error: {err}"
+        );
+        let pid = timeout_pid(&err);
+        assert!(!process_exists(pid), "timed-out sidecar child still exists");
+    }
 }

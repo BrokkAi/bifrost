@@ -1107,6 +1107,8 @@ class SemanticSearchStatus:
     indexed_chunks: int
     pending_batches: int
     phase: str
+    materialized_files: int
+    materialize_total_files: int
 
     @classmethod
     def from_dict(cls, data: dict) -> SemanticSearchStatus:
@@ -1114,6 +1116,8 @@ class SemanticSearchStatus:
             indexed_chunks=int(data["indexed_chunks"]),
             pending_batches=int(data["pending_batches"]),
             phase=str(data["phase"]),
+            materialized_files=int(data["materialized_files"]),
+            materialize_total_files=int(data["materialize_total_files"]),
         )
 
 

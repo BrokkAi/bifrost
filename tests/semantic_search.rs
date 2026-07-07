@@ -136,6 +136,38 @@ impl EngineProvider for BlockingEngineProvider {
     }
 }
 
+struct PanickingEmbedder;
+
+impl Embedder for PanickingEmbedder {
+    fn dim(&self) -> usize {
+        1
+    }
+
+    fn embed_passages(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        panic!("synthetic embed panic");
+    }
+
+    fn embed_query(&self, _text: &str) -> Result<Vec<f32>, String> {
+        Ok(vec![1.0])
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+
+    fn fingerprint(&self) -> String {
+        "semantic-search-panicking-test-embedder:v1".to_string()
+    }
+}
+
+struct PanickingEngineProvider;
+
+impl EngineProvider for PanickingEngineProvider {
+    fn embedder(&self) -> Result<Arc<dyn Embedder>, String> {
+        Ok(Arc::new(PanickingEmbedder))
+    }
+}
+
 #[test]
 fn semantic_search_returns_constituent_rankings() {
     let dir = tempfile::tempdir().unwrap();
@@ -325,6 +357,48 @@ fn semantic_index_status_counts_indexed_and_waiting_files() {
     );
     assert_eq!(status.pending_batches, 0);
     assert_eq!(status.phase, "ready");
+    assert!(
+        status.materialized_files > 0,
+        "materialized files: {}",
+        status.materialized_files
+    );
+    assert_eq!(
+        status.materialized_files, status.materialize_total_files,
+        "successful build should complete every materialization target"
+    );
+    indexer.close();
+}
+
+#[test]
+fn semantic_index_worker_panic_surfaces_as_failed_status() {
+    let dir = tempfile::tempdir().unwrap();
+    write_java(
+        dir.path(),
+        "Greeter.java",
+        "public class Greeter {\n  public String greet(String name) { return name; }\n}\n",
+    );
+    init_git(dir.path());
+    let snapshot = snapshot_for(dir.path());
+    let indexer = SemanticIndexer::start_with_provider(
+        dir.path().to_path_buf(),
+        snapshot.clone(),
+        PanickingEngineProvider,
+    );
+
+    let err = indexer
+        .wait_ready(Duration::from_secs(30))
+        .expect_err("panic should become a structured indexer failure");
+    assert!(
+        err.contains("panicked"),
+        "error should describe the worker panic, got: {err}"
+    );
+    assert!(
+        !err.contains("still building"),
+        "panic path should not hit readiness timeout: {err}"
+    );
+    let status = indexer.status(&snapshot);
+    assert_eq!(status.phase, "failed");
+    assert_eq!(status.pending_batches, 0);
     indexer.close();
 }
 

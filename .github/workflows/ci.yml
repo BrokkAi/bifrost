@@ -124,6 +124,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets ${{ matrix.cargo-flags }} --target ${{ matrix.target }} -- -D warnings
 
+      - name: Install uv
+        if: matrix.can-test
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.12'
+
       - name: cargo test
         if: matrix.can-test
         run: cargo test --target ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}

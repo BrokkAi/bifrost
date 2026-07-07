@@ -10,6 +10,7 @@
 //! queued deltas) have been applied.
 
 use std::collections::{BTreeSet, HashMap};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -83,6 +84,8 @@ struct Shared {
     cond: Condvar,
     closed: AtomicBool,
     pending: AtomicU64,
+    files_total: AtomicU64,
+    files_done: AtomicU64,
     store: OnceLock<Arc<SemanticStore>>,
     embedder: OnceLock<Arc<dyn Embedder>>,
 }
@@ -109,6 +112,8 @@ pub struct SemanticIndexStatus {
     pub indexed_chunks: usize,
     pub pending_batches: u64,
     pub phase: String,
+    pub materialized_files: u64,
+    pub materialize_total_files: u64,
 }
 
 impl SemanticIndexer {
@@ -126,6 +131,8 @@ impl SemanticIndexer {
             cond: Condvar::new(),
             closed: AtomicBool::new(false),
             pending: AtomicU64::new(1),
+            files_total: AtomicU64::new(0),
+            files_done: AtomicU64::new(0),
             store: OnceLock::new(),
             embedder: OnceLock::new(),
         });
@@ -136,7 +143,21 @@ impl SemanticIndexer {
         let worker_active = active.clone();
         let join = std::thread::Builder::new()
             .name("bifrost-semantic-indexer".to_string())
-            .spawn(move || worker_loop(worker_shared, worker_active, workspace_root, provider, rx))
+            .spawn(move || {
+                let panic_shared = worker_shared.clone();
+                let result = catch_unwind(AssertUnwindSafe(move || {
+                    worker_loop(worker_shared, worker_active, workspace_root, provider, rx);
+                }));
+                if let Err(payload) = result {
+                    fail_indexer(
+                        &panic_shared,
+                        format!(
+                            "indexer worker panicked: {}",
+                            panic_payload_message(payload.as_ref())
+                        ),
+                    );
+                }
+            })
             .expect("spawn semantic indexer thread");
         Arc::new(Self {
             shared,
@@ -256,6 +277,8 @@ impl SemanticIndexer {
             indexed_chunks,
             pending_batches: self.shared.pending.load(Ordering::SeqCst),
             phase: phase_label,
+            materialized_files: self.shared.files_done.load(Ordering::SeqCst),
+            materialize_total_files: self.shared.files_total.load(Ordering::SeqCst),
         }
     }
 
@@ -317,6 +340,28 @@ fn decrement_pending(shared: &Shared) {
         });
 }
 
+fn fail_indexer(shared: &Shared, message: String) {
+    if shared.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    *shared
+        .phase
+        .lock()
+        .expect("semantic indexer mutex poisoned") = Phase::Failed(message);
+    shared.pending.store(0, Ordering::SeqCst);
+    shared.cond.notify_all();
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 fn worker_loop(
     shared: Arc<Shared>,
     active: Arc<RwLock<Option<ActiveIndex>>>,
@@ -325,15 +370,7 @@ fn worker_loop(
     rx: Receiver<IndexerMsg>,
 ) {
     let fail = |shared: &Shared, message: String| {
-        if shared.closed.load(Ordering::SeqCst) {
-            return;
-        }
-        *shared
-            .phase
-            .lock()
-            .expect("semantic indexer mutex poisoned") = Phase::Failed(message);
-        shared.pending.store(0, Ordering::SeqCst);
-        shared.cond.notify_all();
+        fail_indexer(shared, message);
     };
 
     let Some(repo) = gitcache::discover(&workspace_root) else {
@@ -533,6 +570,9 @@ fn materialize_missing(
     if targets.is_empty() {
         return Ok(());
     }
+    shared
+        .files_total
+        .fetch_add(targets.len() as u64, Ordering::SeqCst);
 
     // 3-stage pipeline so the GPU never starves: a producer thread runs CPU chunk
     // extraction, an embed thread runs the GPU forward + compose, and this thread is the
@@ -569,12 +609,16 @@ fn materialize_missing(
 
         let mut consumed: BuildResult = Ok(());
         for embedded in rx_embed {
+            let blob_count = embedded.blob_count();
             if let Err(err) = check_cancelled(shared)
                 .and_then(|()| write_group(store, embedded).map_err(BuildError::Failed))
             {
                 consumed = Err(err);
                 break;
             }
+            shared
+                .files_done
+                .fetch_add(blob_count as u64, Ordering::SeqCst);
         }
         let embedded_res = embed_stage.join().expect("embed thread panicked");
         let produced = producer.join().expect("extract thread panicked");

@@ -165,6 +165,12 @@ pub struct EmbeddedGroup {
     composed_items: Vec<(Key, Vec<f32>)>,
 }
 
+impl EmbeddedGroup {
+    pub fn blob_count(&self) -> usize {
+        self.pending_blobs.len()
+    }
+}
+
 /// Embed + compose (phases 2-3) then persist (phase 4), in one call. The pipelined
 /// indexer splits these into [`embed_group`] and [`write_group`]; this is the simple
 /// path used by `materialize_blobs`.
