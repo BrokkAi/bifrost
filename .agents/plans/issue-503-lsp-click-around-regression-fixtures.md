@@ -23,7 +23,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T11:21Z) Milestone 6: added the C# partial/interface click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted syntax/ambiguity/coverage findings, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:28Z) Milestone 7: added the C++ typed-receiver/out-of-line click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted method-reference coverage finding, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T11:37Z) Milestone 8: added the JavaScript CommonJS/object click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the exposed factory-returned object resolver gap, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 9: TypeScript click-around fixture.
+- [x] (2026-07-07T11:53Z) Milestone 9: added the TypeScript interface/type-alias click-around fixture, ran focused tests, ran Brokk Guided Review, fixed the accepted references coverage finding, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 10: Python click-around fixture.
 - [ ] Milestone 11: Ruby click-around fixture.
 - [ ] Milestone 12: ignored stress fixtures and final sweep.
@@ -71,6 +71,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 
 - Observation: JavaScript declaration collection materialized returned object members such as `makeToolbox.format`, but definition lookup did not infer that a local initialized from `makeToolbox()` had that returned-object surface.
   Evidence: Adding `const toolbox = makeToolbox(); toolbox.format(widget);` to the Milestone 8 LSP fixture initially returned `null`. `jsts_local_receiver_value_owner_candidates` now resolves call-expression initializers through the import-aware callee resolver and expands the callee's materialized return surface.
+
+- Observation: TypeScript LSP references for type-alias object members include typed reads and contextual object literal keys, but not contextual callback parameter member reads in this fixture.
+  Evidence: Strengthening `Payload.value` references returned `input.value` in both typed method bodies, the `payload.value` typed local read, and the `value:` contextual object key. It did not return `payload.value` inside the contextual callback parameter, even though definition lookup for that click site is supported.
 
 ## Decision Log
 
@@ -164,6 +167,10 @@ Milestone 8 is complete. The JavaScript fixture now covers class `this` fields, 
 
 Milestone 8 Brokk Guided Review outcome: security, duplication, devops, and architecture found no blocking issues. Senior-dev coverage review found that factory-returned objects should be covered with an object-literal factory, not only a factory returning a class instance. Accepting that feedback exposed the JavaScript get-definition gap recorded above; the fix reuses structured imports, CodeUnits, and materialized returned-object surfaces. Focused JavaScript LSP, focused JavaScript get-definition, formatting, and diff checks pass.
 
+Milestone 9 is complete. The TypeScript fixture now covers interface and implementation methods, type aliases, static class members, typed receivers, contextual object members, contextual callback parameter definition, unrelated same-name methods, references, implementation lookup, type definition, and type hierarchy supertypes/subtypes.
+
+Milestone 9 Brokk Guided Review outcome: architecture found no design blockers, and the accepted coverage finding was that references should exercise TypeScript type-alias members rather than only the interface method. The fixture now asserts exact references for `Payload.value` across typed method bodies, a contextual object literal key, and a typed local read. Static-member references return `null` through the current LSP surface, so that unsupported relation is not locked in as a failing milestone assertion. Focused TypeScript LSP, formatting, and diff checks pass.
+
 ## Timing Log
 
 - Milestone 0: Harness and Timing Infrastructure
@@ -246,6 +253,15 @@ Milestone 8 Brokk Guided Review outcome: security, duplication, devops, and arch
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_8_javascript --features nlp -- --nocapture` passed in 30.84s real time after waiting on the build lock and recompiling the JS/TS resolver; test execution took 8.27s. Additional focused check `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test get_definition_test javascript_ --features nlp -- --nocapture` passed in 20.45s real time. `cargo fmt --check` and `git diff --check` also passed.
   - Click cases added: 14 LSP click cases plus 1 lower-level JavaScript definition regression.
   - Slowest fixture/operation: `milestone_8_javascript_commonjs_objects`, case `class instance method resolves from constructed receiver`, marker `widget_render_call`, operation `definition`, 51 ms before review and 37 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 9: TypeScript
+  - Language: TypeScript.
+  - Start: 2026-07-07T11:38Z.
+  - End: 2026-07-07T11:53Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_9_typescript --features nlp -- --nocapture` passed in 5.79s real time after recompiling the changed test; test execution took 3.60s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_9_typescript --features nlp -- --nocapture` passed in 5.40s real time after recompiling the changed test; test execution took 4.46s. `cargo fmt --check` and `git diff --check` also passed.
+  - Click cases added: 15.
+  - Slowest fixture/operation: `milestone_9_typescript_interfaces`, case `interface typed receiver resolves to interface method`, marker `interface_process_call`, operation `definition`, 38 ms before review and 58 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -342,3 +358,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 7 Guided Review gate.
 Revision note, 2026-07-07 / Codex: Started Milestone 8 and added the JavaScript CommonJS/object fixture. The initial fixture covers class `this` fields, constructed and factory-returned receivers, object-literal methods, CommonJS destructured imports, unrelated same-name object members, hover, and unsupported type-definition behavior.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 8 Guided Review gate. Accepted review feedback strengthened factory-returned object coverage from a class-instance factory to an object-literal factory, exposing and fixing a JavaScript get-definition gap for locals initialized by call expressions whose callees have materialized returned-object surfaces. Focused JavaScript LSP, JavaScript get-definition, formatting, and diff checks pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 9 and added the TypeScript interface/type-alias fixture. The pre-review focused TypeScript filter passes, covering interface and implementation methods, type aliases, static class members, typed receivers, contextual object members, contextual callback parameters, unrelated same-name members, references, implementation lookup, type definition, and type hierarchy.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 9 Guided Review gate. Accepted review feedback strengthened references coverage for the `Payload.value` type-alias member across typed method bodies, contextual object keys, and typed local reads. Focused TypeScript LSP, formatting, and diff checks pass.

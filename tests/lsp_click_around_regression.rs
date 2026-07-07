@@ -1523,3 +1523,182 @@ function run(getUnknown) {
 
     assert_timing_summary("milestone_8_javascript_commonjs_objects", &timings, 14);
 }
+
+#[test]
+fn milestone_9_typescript_interfaces_type_alias_click_around() {
+    let fixture = ClickFixture::new("milestone_9_typescript_interfaces")
+        .file(
+            "contracts.ts",
+            r#"<processor_iface_range>export interface <processor_iface_decl>Processor {
+  <interface_process_decl>process(input: Payload): Result;
+}
+
+export interface Result {
+  <result_status_decl>status: string;
+}
+
+export type <payload_alias_decl>Payload = {
+  <payload_value_decl>value: string;
+  meta: {
+    <payload_tag_decl>tag: string;
+  };
+};
+"#,
+        )
+        .file(
+            "service.ts",
+            r#"import { Processor, Payload, Result } from "./contracts";
+
+<file_processor_range>export class <file_processor_decl>FileProcessor implements Processor {
+  <create_static_range>static <create_static_decl>create(): FileProcessor {
+    return new FileProcessor();
+  }
+
+  <file_process_decl>process(input: Payload): Result {
+    return { <result_status_key>status: input.<input_value_read>value };
+  }
+}
+
+export class <other_processor_decl>OtherProcessor {
+  <other_process_decl>process(input: Payload): Result {
+    return { status: input.<other_input_value_read>value };
+  }
+}
+
+export function consumeContext(handler: (payload: Payload) => void): void {
+  handler({ value: "callback", meta: { tag: "ctx" } });
+}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"import { Processor, Payload } from "./contracts";
+import { FileProcessor, OtherProcessor, consumeContext } from "./service";
+
+function run(): void {
+  const <processor_local>processor: Processor = new FileProcessor();
+  processor.<interface_process_call>process({ value: "typed", meta: { tag: "typed" } });
+
+  const concrete: FileProcessor = FileProcessor.<create_static_call>create();
+  concrete.<concrete_process_call>process({ value: "factory", meta: { tag: "factory" } });
+
+  const other = new OtherProcessor();
+  other.<other_process_call>process({ value: "other", meta: { tag: "other" } });
+
+  const payload: Payload = { <contextual_value_key>value: "object", meta: { tag: "object" } };
+  payload.<payload_value_read>value;
+
+  consumeContext((payload) => {
+    payload.<callback_value_read>value;
+  });
+}
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "interface typed receiver resolves to interface method",
+                "interface_process_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["interface_process_decl"]),
+            ),
+            ClickCase::new(
+                "concrete receiver resolves to implementation method",
+                "concrete_process_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["file_process_decl"]),
+            ),
+            ClickCase::new(
+                "static class member resolves to static declaration",
+                "create_static_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["create_static_range"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name method resolves to unrelated declaration",
+                "other_process_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_process_decl"]),
+            ),
+            ClickCase::new(
+                "typed parameter property read resolves to type alias member",
+                "input_value_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["payload_value_decl"]),
+            ),
+            ClickCase::new(
+                "typed local property read resolves to type alias member",
+                "payload_value_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["payload_value_decl"]),
+            ),
+            ClickCase::new(
+                "contextual object value key resolves to type alias member",
+                "contextual_value_key",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["payload_value_decl"]),
+            ),
+            ClickCase::new(
+                "contextual callback parameter member resolves to alias member",
+                "callback_value_read",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["payload_value_decl"]),
+            ),
+            ClickCase::new(
+                "type alias member references include typed and contextual reads",
+                "payload_value_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&[
+                    "input_value_read",
+                    "contextual_value_key",
+                    "payload_value_read",
+                    "other_input_value_read",
+                ]),
+            ),
+            ClickCase::new(
+                "interface method references include interface-typed call",
+                "interface_process_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["interface_process_call"]),
+            ),
+            ClickCase::new(
+                "interface method implementation finds concrete method",
+                "interface_process_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["file_process_decl"]),
+            ),
+            ClickCase::new(
+                "interface type implementation finds implementing class",
+                "processor_iface_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["file_processor_decl"]),
+            ),
+            ClickCase::new(
+                "typed local type definition resolves to interface",
+                "processor_local",
+                ClickOperation::TypeDefinition,
+                ClickExpectation::Locations(&["processor_iface_decl"]),
+            ),
+            ClickCase::new(
+                "FileProcessor supertypes include Processor",
+                "file_processor_decl",
+                ClickOperation::TypeHierarchySupertypes,
+                ClickExpectation::Locations(&["processor_iface_range"]),
+            ),
+            ClickCase::new(
+                "Processor subtypes include FileProcessor",
+                "processor_iface_decl",
+                ClickOperation::TypeHierarchySubtypes,
+                ClickExpectation::Locations(&["file_processor_range"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_9_typescript_interfaces", &timings, 15);
+}
