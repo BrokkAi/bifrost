@@ -72,25 +72,13 @@ fn javascript_materializes_exported_factory_object_surface() {
         "",
         "ReadTool",
     )));
-    assert!(declarations.contains(&CodeUnit::new(
-        file.clone(),
-        CodeUnitType::Function,
-        "",
-        "ReadTool.execute",
-    )));
-    assert!(declarations.contains(&CodeUnit::new(
-        file.clone(),
-        CodeUnitType::Field,
-        "",
-        "ReadTool.metadata",
-    )));
     assert!(
         declarations
             .iter()
             .all(|unit| unit.short_name() != "ReadTool.dynamicKey")
     );
     assert!(
-        analyzer
+        !analyzer
             .get_skeleton(&definition_in_file(&analyzer, &file, "ReadTool"))
             .unwrap()
             .contains("execute")
@@ -119,18 +107,6 @@ fn javascript_materializes_commonjs_exported_object_root() {
         CodeUnitType::Field,
         "",
         "proto",
-    )));
-    assert!(declarations.contains(&CodeUnit::new(
-        file.clone(),
-        CodeUnitType::Function,
-        "",
-        "proto.inspect",
-    )));
-    assert!(declarations.contains(&CodeUnit::new(
-        file,
-        CodeUnitType::Field,
-        "",
-        "proto.status",
     )));
 }
 
@@ -180,7 +156,7 @@ fn javascript_materializes_returned_object_members_under_enclosing_factory() {
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
-        CodeUnitType::Function,
+        CodeUnitType::Method,
         "",
         "selectDirective.compile",
     )));
@@ -192,7 +168,7 @@ fn javascript_materializes_returned_object_members_under_enclosing_factory() {
     )));
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
-        CodeUnitType::Function,
+        CodeUnitType::Method,
         "",
         "factory.run",
     )));

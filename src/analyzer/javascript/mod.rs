@@ -1302,7 +1302,13 @@ fn visit_js_variable_statement(
         if module_surface && kind == crate::analyzer::CodeUnitType::Field && parent.is_none() {
             let surface_code_unit =
                 CodeUnit::new(file.clone(), crate::analyzer::CodeUnitType::Field, "", name);
-            parsed.add_definition_lookup_unit(surface_code_unit.clone(), range_node, source);
+            parsed.add_code_unit(
+                surface_code_unit.clone(),
+                range_node,
+                source,
+                None,
+                Some(surface_code_unit.clone()),
+            );
             parsed.add_signature(surface_code_unit.clone(), variable_signature);
             if let Some(object) = indexable_object {
                 visit_js_object_literal_properties_for_surface(
