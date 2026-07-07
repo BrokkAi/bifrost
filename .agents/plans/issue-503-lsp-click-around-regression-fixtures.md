@@ -19,7 +19,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T10:25Z) Milestone 2: added the Rust trait/impl click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted coverage findings and the exposed Rust default-method / associated-type definition gaps, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T10:35Z) Milestone 3: added the PHP interface/trait click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted reference coverage findings and the exposed PHP factory/interface receiver graph gaps, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T10:52Z) Milestone 4: added the Scala extension/trait click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted wildcard-import precedence/ambiguity findings, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 5: Java click-around fixture.
+- [x] (2026-07-07T11:03Z) Milestone 5: added the Java interface/implementation/hierarchy click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted wildcard/override coverage findings and the exposed Java method-family reference gap, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 6: C# click-around fixture.
 - [ ] Milestone 7: C++ click-around fixture.
 - [ ] Milestone 8: JavaScript click-around fixture.
@@ -56,6 +56,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 
 - Observation: The first Scala wildcard-import definition fix introduced two review-visible semantic risks: wildcard members could outrank enclosing members, and multiple wildcard imports exposing the same direct member could return multiple go-to-definition targets.
   Evidence: Brokk Guided Review flagged both risks. The final fixture includes `localHelper()` proving enclosing-member precedence and `AmbiguousImports.helper()` proving ambiguous package wildcard imports return empty.
+
+- Observation: The Java fixture exposed that interface method references did not include overriding declarations or concrete receiver calls through implementation types.
+  Evidence: Strengthening `Task.run` references to expect `EmailTask.run`, `task.run()`, and `email.run()` initially returned only `task.run()`. The Java usage graph now builds a method-family owner set from type hierarchy descendants/ancestors, matches receiver types against that set, and records related method declarations.
 
 ## Decision Log
 
@@ -99,6 +102,10 @@ The work is test-first. Production analyzer changes are allowed only when a new 
   Rationale: This keeps get-definition aligned with Scala lookup precedence and the graph resolver's ambiguity model. The helper uses shared Scala import candidate construction instead of a get-definition-only copy.
   Date/Author: 2026-07-07 / Codex.
 
+- Decision: Treat Java method references for inherited/interface methods as a method family when structured hierarchy proves the related owner declares the same method name and arity.
+  Rationale: Editor references from an interface or inherited method should include overriding declarations and receiver calls on concrete implementation types, while unrelated same-name methods remain excluded by owner-family and arity checks.
+  Date/Author: 2026-07-07 / Codex.
+
 ## Outcomes & Retrospective
 
 Milestone 0 is complete. The repository now has a reusable LSP click fixture helper, parser coverage for marker edge cases, a Java smoke fixture for definition/references/empty-result behavior, and timing capture. No production analyzer code was changed.
@@ -120,6 +127,10 @@ Milestone 3 Brokk Guided Review outcome: devops found no issues. Security/correc
 Milestone 4 is complete. The Scala fixture now covers package wildcard imports, same-package relative wildcard extension imports, direct-member precedence over extensions, receiver mismatch, conflicting inherited trait-member ambiguity, trait default inheritance, unrelated same-name methods, references, implementation, and type hierarchy supertypes/subtypes.
 
 Milestone 4 Brokk Guided Review outcome: devops found no issues. Security/correctness and architecture found that the first wildcard-import definition helper returned definitions for ambiguous wildcard imports; senior-dev found that it also ran before enclosing-member lookup; duplication found import-candidate construction drift. Accepted fixes moved wildcard direct-member lookup behind higher-precedence scopes, return no definition when multiple wildcard imports contribute matches, reuse a shared Scala graph import-candidate helper, and add LSP click cases for local precedence and ambiguous package wildcard imports. Focused Scala LSP, Scala get-definition, Scala graph, formatting, and diff checks pass.
+
+Milestone 5 is complete. The Java fixture now covers interface and implementation methods, inherited overrides, constructor/class construction, nested types, wildcard import positive and ambiguous-null cases, references, implementation lookup, and type hierarchy supertypes/subtypes.
+
+Milestone 5 Brokk Guided Review outcome: security/correctness, duplication, and devops found no issues. Architecture found that the interface method references case was too weak because it did not cover override declarations or concrete receiver calls. Senior-dev found that the wildcard ambiguity case needed a positive wildcard-import control and that inherited override relations were structurally present but not exercised. Accepted fixes strengthened the fixture, added Java graph regression coverage, and fixed Java usage graph method-family matching for hierarchy-related owners. Focused Java LSP, Java graph, Java definition, Java import/hierarchy, formatting, and diff checks pass.
 
 ## Timing Log
 
@@ -167,6 +178,15 @@ Milestone 4 Brokk Guided Review outcome: devops found no issues. Security/correc
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_4_scala --features nlp -- --nocapture` passed in 18.02s real time after formatting/recompilation; test execution took 3.64s. Additional focused checks `get_definition_test scala_` and `usages_scala_graph_test scala_graph_` passed.
   - Click cases added: 15.
   - Slowest fixture/operation: `milestone_4_scala_extensions_traits`, case `wildcard imported helper resolves to top-level function`, marker `helper_call`, operation `definition`, 59 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 5: Java
+  - Language: Java.
+  - Start: 2026-07-07T10:52Z.
+  - End: 2026-07-07T11:03Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_5_java --features nlp -- --nocapture` passed in 5.57s real time after recompiling the changed test; test execution took 3.20s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_5_java --features nlp -- --nocapture` passed in 5.11s real time after recompiling the Java graph changes; test execution took 3.48s. Additional focused checks `usages_java_graph_test java_graph_strategy_`, `intellij_java_definition`, and `java_imports_and_hierarchy` passed.
+  - Click cases added: 14.
+  - Slowest fixture/operation: `milestone_5_java_interfaces_hierarchy`, case `interface-typed call resolves to interface method`, marker `task_run_call`, operation `definition`, 117 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -247,3 +267,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 2 Guided Review gate.
 Revision note, 2026-07-07 / Codex: Started Milestone 3 and added the PHP interface/trait click-around fixture. The pre-review focused PHP filter passes, covering interface-typed and concrete typed receiver definitions, factory-returned receiver definition, trait methods imported by class `use`, unrelated same-name methods, interface and trait method references, and implementation lookup for interface methods and types.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 3 Guided Review gate. Accepted review findings expanded interface-method references to include the interface-typed call and factory-returned call. The resulting PHP fixes use structured tree-sitter call nodes plus existing PHP type/function resolution and callable return-type helpers; no regex or text fallback was added. Focused PHP LSP, PHP graph, PHP go-to-definition, formatting, and diff checks pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 5 and added the Java interface/implementation/hierarchy click-around fixture. The pre-review focused Java filter passes, covering interface and concrete receiver definitions, inherited base methods, unrelated same-name methods, explicit constructor definitions, nested type definitions, ambiguous wildcard imports returning empty, interface references, implementation lookup, and type hierarchy supertypes/subtypes.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 5 Guided Review gate. Accepted review findings expanded Java wildcard coverage with a positive single-wildcard type case, strengthened interface method references to include override declarations and concrete receiver calls, and added inherited override implementation coverage. The resulting Java graph fix uses structured type hierarchy family owners and receiver facts; no source-text fallback was added. Focused Java LSP, Java graph, Java go-to-definition, Java import/hierarchy, formatting, and diff checks pass.

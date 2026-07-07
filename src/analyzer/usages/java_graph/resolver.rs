@@ -46,16 +46,58 @@ impl TargetSpec {
             TargetKind::Method
         };
 
+        let accepted_owner_fq_names =
+            accepted_owner_fq_names_for_target(analyzer, target, &owner, kind);
+
         Some(Self {
             target: target.clone(),
             kind,
-            accepted_owner_fq_names: [owner.fq_name()].into_iter().collect(),
+            accepted_owner_fq_names,
             member_name: target.identifier().to_string(),
             method_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
                 .then(|| signature_arity(target.signature())),
             owner,
         })
     }
+}
+
+fn accepted_owner_fq_names_for_target(
+    analyzer: &JavaAnalyzer,
+    target: &CodeUnit,
+    owner: &CodeUnit,
+    kind: TargetKind,
+) -> HashSet<String> {
+    let mut accepted = HashSet::from_iter([owner.fq_name()]);
+    if kind != TargetKind::Method {
+        return accepted;
+    }
+    let target_arity = signature_arity(target.signature());
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return accepted;
+    };
+
+    for related_owner in provider
+        .get_descendants(owner)
+        .into_iter()
+        .chain(provider.get_ancestors(owner))
+    {
+        if java_owner_declares_matching_method(analyzer, &related_owner, target, target_arity) {
+            accepted.insert(related_owner.fq_name());
+        }
+    }
+    accepted
+}
+
+fn java_owner_declares_matching_method(
+    analyzer: &JavaAnalyzer,
+    owner: &CodeUnit,
+    target: &CodeUnit,
+    target_arity: usize,
+) -> bool {
+    analyzer
+        .get_definitions(&format!("{}.{}", owner.fq_name(), target.identifier()))
+        .into_iter()
+        .any(|unit| unit.is_function() && signature_arity(unit.signature()) == target_arity)
 }
 
 pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> usize {
@@ -95,15 +137,27 @@ pub(super) fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>)
             ctx.bindings
                 .resolve_symbol(name)
                 .as_precise()
-                .is_some_and(|targets| targets.contains(&ctx.spec.owner.fq_name()))
+                .is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .any(|target| ctx.spec.accepted_owner_fq_names.contains(target))
+                })
         }
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
-            resolve_type_from_node(receiver, ctx).is_some_and(|resolved| resolved == ctx.spec.owner)
+            resolve_type_from_node(receiver, ctx).is_some_and(|resolved| {
+                ctx.spec
+                    .accepted_owner_fq_names
+                    .contains(&resolved.fq_name())
+            })
         }
         "object_creation_expression" => receiver
             .child_by_field_name("type")
             .and_then(|type_node| resolve_type_from_node(type_node, ctx))
-            .is_some_and(|resolved| resolved == ctx.spec.owner),
+            .is_some_and(|resolved| {
+                ctx.spec
+                    .accepted_owner_fq_names
+                    .contains(&resolved.fq_name())
+            }),
         "this" => {
             owner_matches_target_context(receiver, ctx)
                 || anonymous_creation_context_matches_target(receiver, ctx)
@@ -168,7 +222,7 @@ fn owner_matches_target_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
     let Some(owner) = context.owner.as_ref() else {
         return false;
     };
-    if owner == &ctx.spec.owner {
+    if ctx.spec.accepted_owner_fq_names.contains(&owner.fq_name()) {
         return true;
     }
     ctx.analyzer

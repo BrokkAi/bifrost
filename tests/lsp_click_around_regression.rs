@@ -756,3 +756,196 @@ object AmbiguousImports:
 
     assert_timing_summary("milestone_4_scala_extensions_traits", &timings, 15);
 }
+
+#[test]
+fn milestone_5_java_interfaces_hierarchy_click_around() {
+    let fixture = ClickFixture::new("milestone_5_java_interfaces_hierarchy")
+        .file(
+            "src/main/java/api/Task.java",
+            r#"package api;
+
+<task_iface_range>public interface <task_iface_decl>Task {
+    void <task_run_decl>run();
+}
+"#,
+        )
+        .file(
+            "src/main/java/api/BaseTask.java",
+            r#"package api;
+
+<base_task_range>public class <base_task_decl>BaseTask {
+    public void <base_run_decl>run() {}
+}
+"#,
+        )
+        .file(
+            "src/main/java/impl/EmailTask.java",
+            r#"package impl;
+
+import api.BaseTask;
+import api.Task;
+
+<email_task_range>public class <email_task_decl>EmailTask extends BaseTask implements Task {
+    public <email_ctor_decl>EmailTask>() {}
+
+    @Override
+    public void <email_run_decl>run() {}
+
+    public static class <nested_decl>Nested {}
+}
+"#,
+        )
+        .file(
+            "src/main/java/other/OtherTask.java",
+            r#"package other;
+
+public class OtherTask {
+    public void <other_run_decl>run() {}
+}
+"#,
+        )
+        .file(
+            "src/main/java/app/Workflow.java",
+            r#"package app;
+
+import api.BaseTask;
+import api.Task;
+import ambiguous.one.*;
+import impl.EmailTask;
+import other.OtherTask;
+
+public class Workflow {
+    void run(Task task, EmailTask email, BaseTask base, OtherTask other) {
+        task.<task_run_call>run();
+        email.<email_run_call>run();
+        base.<base_run_call>run();
+        other.<other_run_call>run();
+
+        EmailTask constructed = new <constructor_call>EmailTask();
+        EmailTask.<nested_type_use>Nested nested = new EmailTask.Nested();
+        <single_wildcard_type_use>Ambiguous imported = null;
+    }
+}
+"#,
+        )
+        .file(
+            "src/main/java/ambiguous/one/Ambiguous.java",
+            r#"package ambiguous.one;
+
+public class <ambiguous_one_decl>Ambiguous {}
+"#,
+        )
+        .file(
+            "src/main/java/ambiguous/two/Ambiguous.java",
+            r#"package ambiguous.two;
+
+public class <ambiguous_two_decl>Ambiguous {}
+"#,
+        )
+        .file(
+            "src/main/java/app/AmbiguousImports.java",
+            r#"package app;
+
+import ambiguous.one.*;
+import ambiguous.two.*;
+
+class AmbiguousImports {
+    <ambiguous_type_use>Ambiguous value;
+}
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "interface-typed call resolves to interface method",
+                "task_run_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["task_run_decl"]),
+            ),
+            ClickCase::new(
+                "concrete receiver call resolves to override",
+                "email_run_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["email_run_decl"]),
+            ),
+            ClickCase::new(
+                "base receiver call resolves to base method",
+                "base_run_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["base_run_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name method resolves to unrelated declaration",
+                "other_run_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_run_decl"]),
+            ),
+            ClickCase::new(
+                "constructor call resolves to explicit constructor",
+                "constructor_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["email_ctor_decl"]),
+            ),
+            ClickCase::new(
+                "nested type reference resolves to nested class",
+                "nested_type_use",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["nested_decl"]),
+            ),
+            ClickCase::new(
+                "ambiguous wildcard imported type returns empty definition",
+                "ambiguous_type_use",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "single wildcard imported type resolves to imported class",
+                "single_wildcard_type_use",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["ambiguous_one_decl"]),
+            ),
+            ClickCase::new(
+                "interface method references include override and receiver calls",
+                "task_run_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["email_run_decl", "task_run_call", "email_run_call"]),
+            ),
+            ClickCase::new(
+                "interface method implementation finds override",
+                "task_run_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["email_run_decl"]),
+            ),
+            ClickCase::new(
+                "base method implementation finds inherited override",
+                "base_run_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["email_run_decl"]),
+            ),
+            ClickCase::new(
+                "interface type implementation finds implementing class",
+                "task_iface_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["email_task_decl"]),
+            ),
+            ClickCase::new(
+                "EmailTask supertypes include base class and interface",
+                "email_task_decl",
+                ClickOperation::TypeHierarchySupertypes,
+                ClickExpectation::Locations(&["task_iface_range", "base_task_range"]),
+            ),
+            ClickCase::new(
+                "Task subtypes include EmailTask",
+                "task_iface_decl",
+                ClickOperation::TypeHierarchySubtypes,
+                ClickExpectation::Locations(&["email_task_range"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_5_java_interfaces_hierarchy", &timings, 14);
+}

@@ -303,6 +303,10 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if is_declaration_name(node) {
+        maybe_record_method_declaration_hit(node, ctx);
+        return;
+    }
     if node.kind() != "method_invocation" {
         return;
     }
@@ -328,6 +332,33 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         hits::push_hit(name_node, ctx);
     } else {
         *ctx.saw_unproven_match = true;
+    }
+}
+
+fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node_text(node, ctx.source) != ctx.spec.member_name {
+        return;
+    }
+    let Some(declaration) = node.parent() else {
+        return;
+    };
+    if declaration.kind() != "method_declaration" {
+        return;
+    }
+    if let Some(expected_arity) = ctx.spec.method_arity
+        && argument_list_arity(declaration) != expected_arity
+    {
+        return;
+    }
+    let context = hits::enclosing_context(declaration, ctx);
+    let Some(owner) = context.owner.as_ref() else {
+        return;
+    };
+    if owner == &ctx.spec.owner {
+        return;
+    }
+    if ctx.spec.accepted_owner_fq_names.contains(&owner.fq_name()) {
+        hits::push_hit(node, ctx);
     }
 }
 
