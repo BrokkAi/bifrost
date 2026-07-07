@@ -1199,8 +1199,35 @@ function byChild(Child $child): void {
         ),
     ]);
 
-    assert_eq!(1, graph_hits(&analyzer, "App.Target.run").len());
-    assert_eq!(2, graph_hits(&analyzer, "App.Service.run").len());
+    let target_hits = graph_hits(&analyzer, "App.Target.run");
+    assert_eq!(1, target_hits.len(), "{target_hits:#?}");
+    assert!(
+        target_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$child->run()")),
+        "concrete target method should include inherited receiver calls: {target_hits:#?}"
+    );
+
+    let interface_hits = graph_hits(&analyzer, "App.Service.run");
+    assert_eq!(3, interface_hits.len(), "{interface_hits:#?}");
+    assert!(
+        interface_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("public function run")),
+        "interface method should include implementing method declaration: {interface_hits:#?}"
+    );
+    assert!(
+        interface_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$service->run()")),
+        "interface-typed receiver call should reference the interface method: {interface_hits:#?}"
+    );
+    assert!(
+        interface_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$child->run()")),
+        "interface method should include calls through inherited concrete receivers: {interface_hits:#?}"
+    );
 }
 
 #[test]
