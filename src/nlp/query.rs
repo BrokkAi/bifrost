@@ -3,10 +3,12 @@
 //! Returns three independent retrieval signals over function chunks, leaving any
 //! reranking to the caller: an exhaustive vector scan (cosine per fqfn), a
 //! grounded-strings BM25 ranking (per fqfn), and git co-edit relevance (per file)
-//! seeded from the union of the top vector + BM25 files. The file-summary chunk is
-//! not searched directly; it survives only as parent context averaged into the
-//! function-chunk vectors. Constants come from the prototype's dev sweeps
-//! (see `nlp/mod.rs`).
+//! seeded from the union of the top vector + BM25 files. Symbol scores are
+//! normalized within each leg after top-k selection so callers can fuse vector
+//! and BM25 results without raw cosine/BM25 scale mismatch. The file-summary
+//! chunk is not searched directly; it survives only as parent context averaged
+//! into the function-chunk vectors. Constants come from the prototype's dev
+//! sweeps (see `nlp/mod.rs`).
 
 use std::collections::HashMap;
 
@@ -28,9 +30,10 @@ use super::{COEDIT_HALF_LIFE, RRF_K};
 const SCAN_BATCH: usize = 8192;
 const MAX_K: usize = 100;
 const SEMANTIC_SEARCH_READY_TIMEOUT: Duration = Duration::from_secs(1);
-/// Floor for normalized co-edit seed weights; `most_relevant_files` rejects
-/// non-positive weights, and the lowest min-max normalized score is zero.
-const MIN_SEED_WEIGHT: f64 = 0.01;
+/// Floor for min-max normalized retrieval scores. Co-edit seed weights must be
+/// positive for `most_relevant_files`, and callers fusing symbol legs should not
+/// see a selected result collapse to zero.
+const MIN_NORMALIZED_SCORE: f64 = 0.01;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticSearchParams {
@@ -44,6 +47,7 @@ fn default_k() -> usize {
 }
 
 /// A function chunk ranked by one retrieval leg, keyed by fully-qualified name.
+/// `score` is min-max normalized within this leg's returned top-k window.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RankedSymbol {
     pub fqfn: String,
@@ -162,20 +166,22 @@ pub fn semantic_search(
                 .or_insert(*score);
         }
     }
-    let vector_ranked = top_ranked_symbols(&vector_by_symbol, k);
+    let mut vector_ranked = top_ranked_symbols(&vector_by_symbol, k);
+    normalize_ranked_symbol_scores(&mut vector_ranked);
 
     // 2. Grounded-strings BM25 over the in-memory active corpus.
     let bm25_scores = bm25_symbol_candidates(analyzer, active, query, k).unwrap_or_else(|err| {
         notes.push(format!("bm25 retrieval skipped: {err}"));
         Vec::new()
     });
-    let bm25_ranked: Vec<RankedSymbol> = bm25_scores
+    let mut bm25_ranked: Vec<RankedSymbol> = bm25_scores
         .iter()
         .map(|(fqfn, score)| RankedSymbol {
             fqfn: fqfn.clone(),
             score: *score as f32,
         })
         .collect();
+    normalize_ranked_symbol_scores(&mut bm25_ranked);
 
     // 3. Co-edit relevance, seeded by the union of the top vector + BM25 files.
     //    Seeds carry their own-leg normalized weight (summed when a file is in both
@@ -248,6 +254,31 @@ fn top_ranked_symbols(scores: &HashMap<String, f32>, k: usize) -> Vec<RankedSymb
     ranked
 }
 
+/// Normalize an already-ranked symbol leg to `[MIN_NORMALIZED_SCORE, 1.0]`.
+/// Single-element and all-equal legs are maximally informative by rank alone.
+fn normalize_ranked_symbol_scores(ranked: &mut [RankedSymbol]) {
+    if ranked.is_empty() {
+        return;
+    }
+    let max = ranked
+        .iter()
+        .map(|row| row.score as f64)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min = ranked
+        .iter()
+        .map(|row| row.score as f64)
+        .fold(f64::INFINITY, f64::min);
+    let span = max - min;
+    for row in ranked {
+        row.score = if span > f64::EPSILON {
+            (MIN_NORMALIZED_SCORE + (1.0 - MIN_NORMALIZED_SCORE) * (row.score as f64 - min) / span)
+                as f32
+        } else {
+            1.0
+        };
+    }
+}
+
 /// Roll per-symbol scores up to their files, keeping the max chunk score per file.
 fn aggregate_symbols_to_files<'a>(
     scored: impl Iterator<Item = (&'a str, f32)>,
@@ -289,7 +320,7 @@ fn build_seeds(
 }
 
 /// Top-`m` files by score, min-max normalized within the selection to
-/// `[MIN_SEED_WEIGHT, 1.0]`. A single-element (or all-equal) leg yields weight 1.0.
+/// `[MIN_NORMALIZED_SCORE, 1.0]`. A single-element (or all-equal) leg yields weight 1.0.
 fn normalized_top(files: &HashMap<String, f32>, m: usize) -> Vec<(String, f64)> {
     let mut ranked: Vec<(String, f32)> = files
         .iter()
@@ -311,7 +342,7 @@ fn normalized_top(files: &HashMap<String, f32>, m: usize) -> Vec<(String, f64)> 
         .into_iter()
         .map(|(path, score)| {
             let weight = if span > f64::EPSILON {
-                MIN_SEED_WEIGHT + (1.0 - MIN_SEED_WEIGHT) * (score as f64 - min) / span
+                MIN_NORMALIZED_SCORE + (1.0 - MIN_NORMALIZED_SCORE) * (score as f64 - min) / span
             } else {
                 1.0
             };
@@ -362,8 +393,8 @@ mod tests {
         assert!((top[0].1 - 1.0).abs() < 1e-9);
         // The lowest of the selected files gets the epsilon floor, never zero,
         // so `most_relevant_files`' positive-weight validation passes.
-        assert!((top[2].1 - MIN_SEED_WEIGHT).abs() < 1e-9);
-        assert!(top.iter().all(|(_, w)| *w >= MIN_SEED_WEIGHT));
+        assert!((top[2].1 - MIN_NORMALIZED_SCORE).abs() < 1e-9);
+        assert!(top.iter().all(|(_, w)| *w >= MIN_NORMALIZED_SCORE));
     }
 
     #[test]
@@ -394,6 +425,52 @@ mod tests {
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].fqfn, "a.bar");
         assert_eq!(ranked[1].fqfn, "a.baz");
+    }
+
+    #[test]
+    fn normalize_ranked_symbol_scores_maps_leg_to_common_scale() {
+        let mut ranked = vec![
+            RankedSymbol {
+                fqfn: "bm25.top".to_string(),
+                score: 30.0,
+            },
+            RankedSymbol {
+                fqfn: "bm25.middle".to_string(),
+                score: 10.0,
+            },
+            RankedSymbol {
+                fqfn: "bm25.bottom".to_string(),
+                score: 5.0,
+            },
+        ];
+        normalize_ranked_symbol_scores(&mut ranked);
+
+        assert_eq!(ranked[0].fqfn, "bm25.top");
+        assert!((ranked[0].score - 1.0).abs() < 1e-6);
+        assert!((ranked[2].score as f64 - MIN_NORMALIZED_SCORE).abs() < 1e-6);
+        assert!(ranked.windows(2).all(|pair| pair[0].score >= pair[1].score));
+        assert!(
+            ranked
+                .iter()
+                .all(|row| row.score >= MIN_NORMALIZED_SCORE as f32 && row.score <= 1.0)
+        );
+    }
+
+    #[test]
+    fn normalize_ranked_symbol_scores_all_equal_scores_are_full_weight() {
+        let mut ranked = vec![
+            RankedSymbol {
+                fqfn: "a.one".to_string(),
+                score: 0.42,
+            },
+            RankedSymbol {
+                fqfn: "a.two".to_string(),
+                score: 0.42,
+            },
+        ];
+        normalize_ranked_symbol_scores(&mut ranked);
+
+        assert!(ranked.iter().all(|row| row.score == 1.0));
     }
 
     #[test]

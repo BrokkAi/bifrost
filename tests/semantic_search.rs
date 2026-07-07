@@ -18,6 +18,15 @@ fn all_legs_empty(result: &SemanticSearchResult) -> bool {
         && result.coedit_ranked.is_empty()
 }
 
+fn assert_normalized_symbol_scores(scores: impl IntoIterator<Item = f32>) {
+    for score in scores {
+        assert!(
+            (0.01..=1.0).contains(&score),
+            "symbol score should be normalized for caller-side fusion, got {score}"
+        );
+    }
+}
+
 fn write_java(dir: &Path, name: &str, body: &str) {
     std::fs::write(dir.join(name), body).unwrap();
 }
@@ -175,6 +184,18 @@ fn semantic_search_returns_constituent_rankings() {
             .any(|row| row.fqfn.contains("loadConfig")),
         "bm25 leg surfaces the loadConfig symbol: {:?}",
         result.bm25_ranked
+    );
+    assert_normalized_symbol_scores(result.vector_ranked.iter().map(|row| row.score));
+    assert_normalized_symbol_scores(result.bm25_ranked.iter().map(|row| row.score));
+    assert_eq!(
+        result.vector_ranked.first().map(|row| row.score),
+        Some(1.0),
+        "top vector result should normalize to 1.0"
+    );
+    assert_eq!(
+        result.bm25_ranked.first().map(|row| row.score),
+        Some(1.0),
+        "top bm25 result should normalize to 1.0"
     );
     indexer.close();
 }
