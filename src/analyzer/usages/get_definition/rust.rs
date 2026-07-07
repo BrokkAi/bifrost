@@ -30,6 +30,13 @@ pub(super) fn resolve_rust(
     {
         return outcome;
     }
+    if let Some(tree) = tree
+        && let Some(candidates) =
+            rust_self_scoped_associated_type_candidates(analyzer, file, source, tree, site)
+        && !candidates.is_empty()
+    {
+        return candidates_outcome(candidates);
+    }
     // `Self` (as a type) denotes the lexically enclosing impl's type — the Rust
     // form of the `LexicalEnclosingType` receiver origin. Name-based resolution
     // (`resolve_bare` / `resolve_scoped`) has no notion of `Self`, so resolve it
@@ -67,6 +74,26 @@ pub(super) fn resolve_rust(
                             | ReceiverAnalysisOutcome::Unsupported { .. }
                             | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
                         };
+                }
+                if candidates.is_empty() {
+                    let refs = rust.reference_context_of(file);
+                    candidates = match crate::analyzer::usages::rust_graph::resolve_trait_associated_item_matching(
+                        rust,
+                        support,
+                        &refs,
+                        file,
+                        &self_type,
+                        name,
+                        CodeUnit::is_field,
+                    ) {
+                        ReceiverAnalysisOutcome::Precise(resolved) => {
+                            rust_member_candidates(resolved, RustMemberKind::Field)
+                        }
+                        ReceiverAnalysisOutcome::Ambiguous(_)
+                        | ReceiverAnalysisOutcome::Unknown
+                        | ReceiverAnalysisOutcome::Unsupported { .. }
+                        | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+                    };
                 }
                 candidates
             }
@@ -202,6 +229,55 @@ fn rust_enclosing_named_associated_type(
     let mut current = Some(node);
     while let Some(candidate) = current {
         if matches!(candidate.kind(), "associated_type" | "type_item")
+            && let Some(name) = candidate.child_by_field_name("name")
+            && name.start_byte() <= focus_start_byte
+            && focus_end_byte <= name.end_byte()
+        {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn rust_self_scoped_associated_type_candidates(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<Vec<CodeUnit>> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let scoped = rust_enclosing_scoped_type_identifier_name(
+        node,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
+    let path = scoped.child_by_field_name("path")?;
+    if rust_node_text(path, source).trim() != "Self" {
+        return None;
+    }
+    let name = scoped.child_by_field_name("name")?;
+    let name = rust_node_text(name, source).trim();
+    let associated_type = resolve_in_enclosing_scopes(
+        analyzer,
+        file,
+        name,
+        site.focus_start_byte,
+        CodeUnit::is_field,
+    )?;
+    Some(vec![associated_type])
+}
+
+fn rust_enclosing_scoped_type_identifier_name(
+    node: Node<'_>,
+    focus_start_byte: usize,
+    focus_end_byte: usize,
+) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "scoped_type_identifier"
             && let Some(name) = candidate.child_by_field_name("name")
             && name.start_byte() <= focus_start_byte
             && focus_end_byte <= name.end_byte()
@@ -365,6 +441,27 @@ fn resolve_rust_field(
             support.fqn(&format!("{owner}.{member}")),
             rust_field_expression_member_kind(field_expression),
         );
+        if candidates.is_empty()
+            && rust_field_expression_member_kind(field_expression) == RustMemberKind::Function
+            && let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer)
+        {
+            let refs = rust.reference_context_of(file);
+            let trait_candidates =
+                match crate::analyzer::usages::rust_graph::resolve_trait_associated_item(
+                    rust, support, &refs, file, &owner, member,
+                ) {
+                    ReceiverAnalysisOutcome::Precise(resolved) => {
+                        rust_member_candidates(resolved, RustMemberKind::Function)
+                    }
+                    ReceiverAnalysisOutcome::Ambiguous(_)
+                    | ReceiverAnalysisOutcome::Unknown
+                    | ReceiverAnalysisOutcome::Unsupported { .. }
+                    | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+                };
+            if !trait_candidates.is_empty() {
+                return Some(candidates_outcome(trait_candidates));
+            }
+        }
         return if candidates.is_empty() {
             Some(no_definition(
                 "no_indexed_definition",
@@ -489,7 +586,7 @@ fn rust_enclosing_field_expression(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RustMemberKind {
     Field,
     Function,

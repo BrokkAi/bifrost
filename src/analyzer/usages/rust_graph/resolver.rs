@@ -132,6 +132,26 @@ pub(crate) fn resolve_trait_associated_item(
     owner_fqn: &str,
     method_name: &str,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
+    resolve_trait_associated_item_matching(
+        rust,
+        support,
+        refs,
+        file,
+        owner_fqn,
+        method_name,
+        CodeUnit::is_function,
+    )
+}
+
+pub(crate) fn resolve_trait_associated_item_matching(
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    owner_fqn: &str,
+    item_name: &str,
+    item_matches: fn(&CodeUnit) -> bool,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
     let owner = match ReceiverAnalysisOutcome::single_precise_or_ambiguous(
         support
             .fqn(owner_fqn)
@@ -161,8 +181,8 @@ pub(crate) fn resolve_trait_associated_item(
                     .fqn_direct_children(&trait_unit.fq_name())
                     .into_iter()
                     .filter(move |candidate| {
-                        candidate.is_function()
-                            && candidate.identifier() == method_name
+                        item_matches(candidate)
+                            && candidate.identifier() == item_name
                             && rust
                                 .parent_of(candidate)
                                 .as_ref()

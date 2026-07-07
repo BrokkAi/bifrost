@@ -16,7 +16,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T00:00Z) Created this ExecPlan and began Milestone 0 harness implementation.
 - [x] (2026-07-07T09:51Z) Milestone 0: added the shared marker/timing harness, added the Java smoke fixture, ran focused tests, ran Brokk Guided Review, fixed accepted findings, reran focused tests, updated timings, and prepared the milestone commit.
 - [x] (2026-07-07T10:08Z) Milestone 1: added the Go embedded-promotion click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted coverage findings and the exposed Go graph reference bug, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 2: Rust click-around fixture.
+- [x] (2026-07-07T10:25Z) Milestone 2: added the Rust trait/impl click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted coverage findings and the exposed Rust default-method / associated-type definition gaps, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 3: PHP click-around fixture.
 - [ ] Milestone 4: Scala click-around fixture.
 - [ ] Milestone 5: Java click-around fixture.
@@ -45,6 +45,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - Observation: The Go LSP fixture exposed a cross-package reference overmatch for promoted embedded fields. Querying `service.Base.ID` through the LSP references path returned `worker.ID` and `svc.ID` even though definition lookup correctly resolved those selectors to `AuditLog.ID` and `Service.ID`.
   Evidence: The review-added LSP case `base field references include only semantically valid promoted use` failed with three locations. The lower-level regression `go_graph_strategy_respects_imported_embedded_field_promotion_precedence` reproduced the same three hits in the Go usage graph before the fix.
 
+- Observation: The Rust LSP fixture initially documented default trait method calls and `Self::Output` associated-type uses as expected-empty results, but review correctly treated both as relation-heavy sites with structured targets available in the fixture.
+  Evidence: Changing `file.describe()` to expect `Worker.describe` and `Self::Output` to expect `Worker.Output` exposed definition gaps. The Rust resolver now resolves typed receiver calls to default trait methods when no concrete impl method exists, and resolves `Self::Output` inside a trait method through the enclosing trait scope.
+
 ## Decision Log
 
 - Decision: Add the click-around harness under `tests/common/lsp_click.rs` instead of expanding `tests/bifrost_lsp_server.rs`.
@@ -71,6 +74,10 @@ The work is test-first. Production analyzer changes are allowed only when a new 
   Rationale: The previous predicate treated any `service.X` expression as the target owner once `service` was the imported owner package. That incorrectly seeded locals from `service.NewWorker()` and `service.NewService()` while resolving references for `Base.ID`. Carrying a per-namespace receiver-name map preserves structured import matching without source-text fallbacks.
   Date/Author: 2026-07-07 / Codex.
 
+- Decision: Treat expected-empty LSP cases as negative coverage only when the target is intentionally ambiguous or unsupported by the language surface, not when a precise structured target is present in the fixture.
+  Rationale: Review found that expected-empty assertions for Rust default trait methods and associated types would have locked in fixable analyzer gaps while still claiming milestone coverage. The fixture now asserts the intended structured definitions and keeps unsupported or ambiguous cases for later milestones explicit.
+  Date/Author: 2026-07-07 / Codex.
+
 ## Outcomes & Retrospective
 
 Milestone 0 is complete. The repository now has a reusable LSP click fixture helper, parser coverage for marker edge cases, a Java smoke fixture for definition/references/empty-result behavior, and timing capture. No production analyzer code was changed.
@@ -80,6 +87,10 @@ Milestone 0 Brokk Guided Review outcome: security found path traversal risk in f
 Milestone 1 is complete. The Go fixture now covers imported factory receiver typing, embedded field and method promotion, explicit field shadowing, same-depth ambiguity returning empty, shallower-vs-deeper promotion, canonical embedded-member references, and promoted base-field references that exclude unrelated same-name selectors.
 
 Milestone 1 Brokk Guided Review outcome: security, duplication, devops, and architecture found no blocking issues. Senior-dev found two coverage gaps in the Go milestone: the fixture did not directly test shallower-vs-deeper promotion for `worker.ID`, and it did not assert that references for `Base.ID` excluded shadowed selectors. Both were accepted. Adding the second case exposed the Go usage graph bug recorded above; the fix narrows qualified receiver inference using structured import/type data, and the lower-level graph regression plus the LSP fixture now pass.
+
+Milestone 2 is complete. The Rust fixture now covers typed trait-method calls resolving to concrete impl methods, explicit trait-path UFCS resolving to the trait method, default trait methods resolving through implemented traits, unrelated same-name inherent methods, trait method references, trait method implementation lookup, trait type implementation lookup, type definition from a type annotation, type hierarchy supertypes/subtypes, associated type use resolution, and associated type implementation lookup.
+
+Milestone 2 Brokk Guided Review outcome: security/correctness and devops found no issues. Duplication found repeated timing-summary boilerplate and weak associated-type coverage; senior-dev and architecture found that expected-empty default-method and associated-type cases hid precise structured relations. Accepted fixes add a local timing summary helper, assert the intended default trait method and `Self::Output` definitions, add `textDocument/implementation` coverage for the trait associated type, and fix Rust definition resolution with structured trait-associated lookup. Adjacent Rust go-to-definition and type-hierarchy suites pass.
 
 ## Timing Log
 
@@ -100,6 +111,15 @@ Milestone 1 Brokk Guided Review outcome: security, duplication, devops, and arch
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_1_go --features nlp -- --nocapture` passed in 6.04s real time after recompiling the Go resolver; test execution took 3.94s. Additional focused graph checks `go_graph_strategy_respects_imported_embedded_field_promotion_precedence` and `go_graph_strategy_respects_go_embedded_promotion_precedence_and_ambiguity` passed.
   - Click cases added: 10 LSP click cases plus 1 lower-level Go usage graph regression.
   - Slowest fixture/operation: `milestone_1_go_embedded_promotion`, case `promoted field resolves through imported factory receiver`, marker `worker_record`, operation `definition`, 76 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 2: Rust
+  - Language: Rust.
+  - Start: 2026-07-07T10:08Z.
+  - End: 2026-07-07T10:25Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_2_rust --features nlp -- --nocapture` passed in 11.40s real time after recompiling the changed test; test execution took 6.89s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_2_rust --features nlp -- --nocapture` passed in 4.87s real time after recompilation was warm; test execution took 4.36s. Additional focused checks `rust_analyzer_goto_definition` and `rust_type_hierarchy_test` passed.
+  - Click cases added: 14.
+  - Slowest fixture/operation: `milestone_2_rust_trait_impls`, case `trait method call resolves to concrete impl declaration`, marker `file_work_call`, operation `definition`, 54 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -172,3 +192,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 0 Guided Review gate.
 Revision note, 2026-07-07 / Codex: Started Milestone 1 and added the Go embedded-promotion click-around fixture. The pre-review focused Go filter passed, covering imported factory receiver typing, promoted field and method definition, deeper promoted field lookup, explicit field shadowing, same-depth ambiguity returning empty, and declaration-to-reference lookup for the canonical embedded field.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 1 Guided Review gate. Accepted review findings expanded the Go fixture to cover shallower-vs-deeper promotion and exact `Base.ID` references. That exposed a structured Go graph bug where qualified receiver inference matched any imported package member by qualifier alone. The fix carries namespace-to-compatible-receiver-name bindings, and focused Go LSP and graph tests now pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 2 and added the Rust trait/impl click-around fixture. The pre-review focused Rust filter passes, covering typed trait-method calls resolving to concrete impl methods, explicit trait-path UFCS resolving to the trait method, default trait method and associated-type unsupported definition boundaries, unrelated inherent same-name method definition, trait method references, implementation lookup, type definition from a type annotation, and type hierarchy supertypes/subtypes.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 2 Guided Review gate. Accepted review findings strengthened default trait method and associated-type expectations instead of allowing expected-empty placeholders. The resulting resolver fixes use structured Rust trait/type-scope data: typed receiver calls can fall through to visible default trait methods, and `Self::Output` in a trait method resolves through the enclosing trait scope. Focused Rust LSP, Rust go-to-definition, Rust type-hierarchy, formatting, and diff checks pass.

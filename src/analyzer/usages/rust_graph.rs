@@ -23,7 +23,10 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, 
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
-pub(crate) use resolver::{resolve_scoped_associated_item, resolve_trait_associated_item};
+pub(crate) use resolver::{
+    resolve_scoped_associated_item, resolve_trait_associated_item,
+    resolve_trait_associated_item_matching,
+};
 
 /// Build the whole Rust `caller -> callee` edge set in a single inverted pass
 /// over the workspace (see [`inverted`]). Returns `None` when there are no Rust
