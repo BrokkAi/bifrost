@@ -5,8 +5,68 @@ template: splash
 hero:
   tagline: Multi-language static analysis for agents, editors, and large repositories.
   image:
-    alt: Bifrost signal mark
-    file: ../../assets/bifrost-mark.svg
+    html: |
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" class="bifrost-mark" role="img" aria-label="Bifrost symbol graph">
+        <defs>
+          <filter id="bmGlow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="2.6" result="b"/>
+            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        <g transform="translate(14,14) scale(1.12)">
+          <g stroke="#5f5a52" stroke-width="1" opacity="0.4" fill="none">
+            <line x1="40" y1="180" x2="80" y2="120"/>
+            <line x1="80" y1="120" x2="120" y2="70"/>
+            <line x1="120" y1="70" x2="165" y2="60"/>
+            <line x1="165" y1="60" x2="205" y2="95"/>
+            <line x1="205" y1="95" x2="225" y2="150"/>
+            <line x1="80" y1="120" x2="60" y2="90"/>
+            <line x1="60" y1="90" x2="120" y2="70"/>
+            <line x1="130" y1="140" x2="120" y2="70"/>
+            <line x1="130" y1="140" x2="165" y2="60"/>
+            <line x1="130" y1="140" x2="180" y2="190"/>
+            <line x1="90" y1="200" x2="40" y2="180"/>
+            <line x1="90" y1="200" x2="130" y2="140"/>
+            <line x1="180" y1="190" x2="225" y2="150"/>
+            <line x1="180" y1="190" x2="205" y2="95"/>
+          </g>
+          <g stroke="#ff6a5f" stroke-width="1.5" fill="none" stroke-dasharray="5 22" filter="url(#bmGlow)">
+            <line class="flow"   x1="40"  y1="180" x2="80"  y2="120" style="animation-delay:0s"/>
+            <line class="flow"   x1="80"  y1="120" x2="120" y2="70"  style="animation-delay:-.4s"/>
+            <line class="flow"   x1="120" y1="70"  x2="165" y2="60"  style="animation-delay:-.8s"/>
+            <line class="flow"   x1="165" y1="60"  x2="205" y2="95"  style="animation-delay:-1.2s"/>
+            <line class="flow"   x1="205" y1="95"  x2="225" y2="150" style="animation-delay:-1.6s"/>
+            <line class="flow s" x1="60"  y1="90"  x2="120" y2="70"  style="animation-delay:-.6s"/>
+            <line class="flow s" x1="130" y1="140" x2="120" y2="70"  style="animation-delay:-1.1s"/>
+            <line class="flow s" x1="130" y1="140" x2="165" y2="60"  style="animation-delay:-2s"/>
+            <line class="flow s" x1="130" y1="140" x2="180" y2="190" style="animation-delay:-1.5s"/>
+            <line class="flow s" x1="90"  y1="200" x2="130" y2="140" style="animation-delay:-.3s"/>
+            <line class="flow"   x1="180" y1="190" x2="225" y2="150" style="animation-delay:-1s"/>
+            <line class="flow"   x1="180" y1="190" x2="205" y2="95"  style="animation-delay:-2.1s"/>
+          </g>
+          <g fill="#f2f2f2" filter="url(#bmGlow)">
+            <rect class="node" x="35.5"  y="175.5" width="9" height="9" transform="rotate(45 40 180)"  style="animation-delay:0s"/>
+            <rect class="node" x="75.5"  y="115.5" width="9" height="9" transform="rotate(45 80 120)"  style="animation-delay:-.5s"/>
+            <rect class="node" x="160.5" y="55.5"  width="9" height="9" transform="rotate(45 165 60)"  style="animation-delay:-1.3s"/>
+            <rect class="node" x="200.5" y="90.5"  width="9" height="9" transform="rotate(45 205 95)"  style="animation-delay:-1.8s"/>
+            <rect class="node" x="55.5"  y="85.5"  width="9" height="9" transform="rotate(45 60 90)"   style="animation-delay:-2.2s"/>
+            <rect class="node" x="85.5"  y="195.5" width="9" height="9" transform="rotate(45 90 200)"  style="animation-delay:-.9s"/>
+            <rect class="node" x="175.5" y="185.5" width="9" height="9" transform="rotate(45 180 190)" style="animation-delay:-1.6s"/>
+          </g>
+          <g fill="#eb3f33" filter="url(#bmGlow)">
+            <rect class="node f" x="115" y="65"  width="10" height="10" transform="rotate(45 120 70)"  style="animation-delay:-.7s"/>
+            <rect class="node f center-node" x="125" y="135" width="10" height="10" transform="rotate(45 130 140)" style="animation-delay:-1s"/>
+            <rect class="node f" x="220" y="145" width="10" height="10" transform="rotate(45 225 150)" style="animation-delay:-1.4s"/>
+          </g>
+          <g class="seeker" transform="translate(130 140)" filter="url(#bmGlow)">
+            <g class="seeker-core">
+              <rect x="-8" y="-8" width="16" height="16" fill="none" stroke="#ff6a5f" stroke-width="2"/>
+              <rect x="-3.5" y="-3.5" width="7" height="7" fill="#ff6a5f"/>
+            </g>
+          </g>
+          <rect class="scan" x="0" y="0" width="2.5" height="260" fill="#eb3f33" filter="url(#bmGlow)"/>
+        </g>
+      </svg>
   actions:
     - text: Get started
       link: install/

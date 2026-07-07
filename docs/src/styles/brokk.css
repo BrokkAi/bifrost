@@ -112,3 +112,47 @@ body {
 .sl-markdown-content a:not(:where(.not-content *)) {
   color: #ff6a5f;
 }
+
+/* ---- animated hero symbol-graph mark ---- */
+@keyframes bm-dash  { to { stroke-dashoffset: -216; } }
+@keyframes bm-pulse { 0%, 100% { opacity: .38; } 50% { opacity: 1; } }
+@keyframes bm-spin  { from { transform: rotate(45deg); } to { transform: rotate(405deg); } }
+@keyframes bm-scan {
+  0%   { transform: translateX(-8px); opacity: 0; }
+  14%  { opacity: 1; }
+  86%  { opacity: 1; }
+  100% { transform: translateX(268px); opacity: 0; }
+}
+@keyframes bm-seek {
+  0%, 100% { transform: translate(130px, 140px); }
+  16%      { transform: translate(120px, 70px); }
+  32%      { transform: translate(165px, 60px); }
+  48%      { transform: translate(205px, 95px); }
+  64%      { transform: translate(180px, 190px); }
+  80%      { transform: translate(80px, 120px); }
+}
+
+.bifrost-mark { width: 100%; height: auto; overflow: visible; }
+.bifrost-mark .flow  { animation: bm-dash 2.8s linear infinite; }
+.bifrost-mark .flow.s { animation-duration: 3.4s; }
+.bifrost-mark .node  { animation: bm-pulse 2.6s ease-in-out infinite; }
+.bifrost-mark .node.f { animation-duration: 2.2s; }
+.bifrost-mark .scan  { animation: bm-scan 3.6s ease-in-out infinite alternate; }
+.bifrost-mark .seeker {
+  animation: bm-seek 8s cubic-bezier(.45, 0, .25, 1) infinite;
+}
+.bifrost-mark .seeker-core {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: bm-spin 9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bifrost-mark .flow,
+  .bifrost-mark .node,
+  .bifrost-mark .scan,
+  .bifrost-mark .seeker,
+  .bifrost-mark .seeker-core { animation: none; }
+  .bifrost-mark .node { opacity: 1; }
+  .bifrost-mark .scan { opacity: 0; }
+}
