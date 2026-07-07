@@ -506,6 +506,19 @@ fn assignment_receiver_type(
     match node.kind() {
         "object_creation_expression" => object_creation_type(node)
             .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx)),
+        "function_call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            let raw = qualified_candidate_text(function, source);
+            let callable_fqn = resolve_php_function(&raw, ctx)?;
+            let mut definitions = analyzer
+                .definitions(&callable_fqn)
+                .filter(|unit| unit.is_function());
+            let callable = definitions.next()?;
+            if definitions.next().is_some() {
+                return None;
+            }
+            declared_callable_return_type_fq_name(php, analyzer, callable)
+        }
         "scoped_call_expression" => {
             let (scope, name) = static_member_parts(node)?;
             let owner = resolve_php_type(node_text(scope, source), ctx)?;

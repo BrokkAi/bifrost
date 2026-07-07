@@ -17,7 +17,7 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 - [x] (2026-07-07T09:51Z) Milestone 0: added the shared marker/timing harness, added the Java smoke fixture, ran focused tests, ran Brokk Guided Review, fixed accepted findings, reran focused tests, updated timings, and prepared the milestone commit.
 - [x] (2026-07-07T10:08Z) Milestone 1: added the Go embedded-promotion click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted coverage findings and the exposed Go graph reference bug, reran focused tests, and prepared the milestone commit.
 - [x] (2026-07-07T10:25Z) Milestone 2: added the Rust trait/impl click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted coverage findings and the exposed Rust default-method / associated-type definition gaps, reran focused tests, and prepared the milestone commit.
-- [ ] Milestone 3: PHP click-around fixture.
+- [x] (2026-07-07T10:35Z) Milestone 3: added the PHP interface/trait click-around fixture, ran focused tests, ran Brokk Guided Review, fixed accepted reference coverage findings and the exposed PHP factory/interface receiver graph gaps, reran focused tests, and prepared the milestone commit.
 - [ ] Milestone 4: Scala click-around fixture.
 - [ ] Milestone 5: Java click-around fixture.
 - [ ] Milestone 6: C# click-around fixture.
@@ -47,6 +47,9 @@ The work is test-first. Production analyzer changes are allowed only when a new 
 
 - Observation: The Rust LSP fixture initially documented default trait method calls and `Self::Output` associated-type uses as expected-empty results, but review correctly treated both as relation-heavy sites with structured targets available in the fixture.
   Evidence: Changing `file.describe()` to expect `Worker.describe` and `Self::Output` to expect `Worker.Output` exposed definition gaps. The Rust resolver now resolves typed receiver calls to default trait methods when no concrete impl method exists, and resolves `Self::Output` inside a trait method through the enclosing trait scope.
+
+- Observation: The PHP fixture exposed asymmetric behavior between definition and references for interface-typed and factory-returned receivers.
+  Evidence: `textDocument/definition` resolved `$notifier->notify()` to the interface method and, after the PHP definition fix, `$factory->notify()` to the concrete method, but references from `Notifier::notify` initially omitted both call sites. Review strengthened the exact references expectation, leading to PHP graph fixes for interface receiver matching and free-function factory return seeding.
 
 ## Decision Log
 
@@ -78,6 +81,10 @@ The work is test-first. Production analyzer changes are allowed only when a new 
   Rationale: Review found that expected-empty assertions for Rust default trait methods and associated types would have locked in fixable analyzer gaps while still claiming milestone coverage. The fixture now asserts the intended structured definitions and keeps unsupported or ambiguous cases for later milestones explicit.
   Date/Author: 2026-07-07 / Codex.
 
+- Decision: Keep LSP definition and references inverse expectations aligned when a click site has a precise structured target.
+  Rationale: In the PHP milestone, definition proved that interface-typed and factory-returned receiver calls had precise targets. Excluding those calls from exact references would have locked in an editor-visible inconsistency. The PHP graph now mirrors the structured receiver inference used by definition for these cases.
+  Date/Author: 2026-07-07 / Codex.
+
 ## Outcomes & Retrospective
 
 Milestone 0 is complete. The repository now has a reusable LSP click fixture helper, parser coverage for marker edge cases, a Java smoke fixture for definition/references/empty-result behavior, and timing capture. No production analyzer code was changed.
@@ -91,6 +98,10 @@ Milestone 1 Brokk Guided Review outcome: security, duplication, devops, and arch
 Milestone 2 is complete. The Rust fixture now covers typed trait-method calls resolving to concrete impl methods, explicit trait-path UFCS resolving to the trait method, default trait methods resolving through implemented traits, unrelated same-name inherent methods, trait method references, trait method implementation lookup, trait type implementation lookup, type definition from a type annotation, type hierarchy supertypes/subtypes, associated type use resolution, and associated type implementation lookup.
 
 Milestone 2 Brokk Guided Review outcome: security/correctness and devops found no issues. Duplication found repeated timing-summary boilerplate and weak associated-type coverage; senior-dev and architecture found that expected-empty default-method and associated-type cases hid precise structured relations. Accepted fixes add a local timing summary helper, assert the intended default trait method and `Self::Output` definitions, add `textDocument/implementation` coverage for the trait associated type, and fix Rust definition resolution with structured trait-associated lookup. Adjacent Rust go-to-definition and type-hierarchy suites pass.
+
+Milestone 3 is complete. The PHP fixture now covers interface-typed receiver definitions, concrete receiver definitions, factory-returned receiver definitions, trait methods imported by class `use`, in-class trait method calls, unrelated same-name methods, interface references including implementation declarations and typed/factory/interface receiver calls, trait method references, and implementation lookup for interface methods and types.
+
+Milestone 3 Brokk Guided Review outcome: devops found no issues. Security/correctness, senior-dev, duplication, and architecture all found that the interface method reference expectation undercounted `interface_notify_call` and/or `factory_notify_call`. Accepted fixes strengthened the exact reference expectation, added free-function factory return seeding to PHP get-definition and the PHP graph scanner, and changed PHP graph receiver matching so interface-typed receivers count as references to the interface method. Focused PHP LSP, PHP graph, PHP go-to-definition, formatting, and diff checks pass.
 
 ## Timing Log
 
@@ -120,6 +131,15 @@ Milestone 2 Brokk Guided Review outcome: security/correctness and devops found n
   - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_2_rust --features nlp -- --nocapture` passed in 4.87s real time after recompilation was warm; test execution took 4.36s. Additional focused checks `rust_analyzer_goto_definition` and `rust_type_hierarchy_test` passed.
   - Click cases added: 14.
   - Slowest fixture/operation: `milestone_2_rust_trait_impls`, case `trait method call resolves to concrete impl declaration`, marker `file_work_call`, operation `definition`, 54 ms after review fixes.
+  - Ignored stress runtime: not applicable.
+- Milestone 3: PHP
+  - Language: PHP.
+  - Start: 2026-07-07T10:25Z.
+  - End: 2026-07-07T10:35Z.
+  - Focused test before review: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_3_php --features nlp -- --nocapture` passed in 5.95s real time after recompiling the changed test; test execution took 3.37s.
+  - Focused test after review fixes: `/usr/bin/time -p env BIFROST_SEMANTIC_INDEX=off cargo test --test lsp_click_around_regression milestone_3_php --features nlp -- --nocapture` passed in 5.81s real time after recompiling the PHP graph changes; test execution took 4.27s. Additional focused checks for PHP interface receiver graph coverage and `phpactor_goto_definition` passed.
+  - Click cases added: 11.
+  - Slowest fixture/operation: `milestone_3_php_interface_traits`, case `interface-typed receiver resolves to interface method`, marker `interface_notify_call`, operation `definition`, 43 ms after review fixes.
   - Ignored stress runtime: not applicable.
 
 ## Context and Orientation
@@ -196,3 +216,7 @@ Revision note, 2026-07-07 / Codex: Completed the Milestone 1 Guided Review gate.
 Revision note, 2026-07-07 / Codex: Started Milestone 2 and added the Rust trait/impl click-around fixture. The pre-review focused Rust filter passes, covering typed trait-method calls resolving to concrete impl methods, explicit trait-path UFCS resolving to the trait method, default trait method and associated-type unsupported definition boundaries, unrelated inherent same-name method definition, trait method references, implementation lookup, type definition from a type annotation, and type hierarchy supertypes/subtypes.
 
 Revision note, 2026-07-07 / Codex: Completed the Milestone 2 Guided Review gate. Accepted review findings strengthened default trait method and associated-type expectations instead of allowing expected-empty placeholders. The resulting resolver fixes use structured Rust trait/type-scope data: typed receiver calls can fall through to visible default trait methods, and `Self::Output` in a trait method resolves through the enclosing trait scope. Focused Rust LSP, Rust go-to-definition, Rust type-hierarchy, formatting, and diff checks pass.
+
+Revision note, 2026-07-07 / Codex: Started Milestone 3 and added the PHP interface/trait click-around fixture. The pre-review focused PHP filter passes, covering interface-typed and concrete typed receiver definitions, factory-returned receiver definition, trait methods imported by class `use`, unrelated same-name methods, interface and trait method references, and implementation lookup for interface methods and types.
+
+Revision note, 2026-07-07 / Codex: Completed the Milestone 3 Guided Review gate. Accepted review findings expanded interface-method references to include the interface-typed call and factory-returned call. The resulting PHP fixes use structured tree-sitter call nodes plus existing PHP type/function resolution and callable return-type helpers; no regex or text fallback was added. Focused PHP LSP, PHP graph, PHP go-to-definition, formatting, and diff checks pass.

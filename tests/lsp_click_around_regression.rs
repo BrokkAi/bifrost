@@ -399,3 +399,182 @@ fn run() {
 
     assert_timing_summary("milestone_2_rust_trait_impls", &timings, 14);
 }
+
+#[test]
+fn milestone_3_php_interface_trait_click_around() {
+    let fixture = ClickFixture::new("milestone_3_php_interface_traits")
+        .file(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .file(
+            "src/Contracts/Notifier.php",
+            r#"<?php
+namespace App\Contracts;
+
+interface <notifier_interface_decl>Notifier {
+    public function <interface_notify_decl>notify(string $message): void;
+}
+"#,
+        )
+        .file(
+            "src/Support/LogsEvents.php",
+            r#"<?php
+namespace App\Support;
+
+trait LogsEvents {
+    public function <trait_record_decl>record(string $message): string {
+        return $message;
+    }
+}
+"#,
+        )
+        .file(
+            "src/Service/EmailNotifier.php",
+            r#"<?php
+namespace App\Service;
+
+use App\Contracts\Notifier;
+use App\Support\LogsEvents;
+
+class <email_notifier_decl>EmailNotifier implements Notifier {
+    use LogsEvents;
+
+    public function <email_notify_decl>notify(string $message): void {
+        $this-><this_record_call>record($message);
+    }
+}
+"#,
+        )
+        .file(
+            "src/Factory.php",
+            r#"<?php
+namespace App;
+
+use App\Service\EmailNotifier;
+
+function makeNotifier(): EmailNotifier {
+    return new EmailNotifier();
+}
+"#,
+        )
+        .file(
+            "src/Other/OtherNotifier.php",
+            r#"<?php
+namespace App\Other;
+
+class <other_notifier_decl>OtherNotifier {
+    public function <other_notify_decl>notify(string $message): void {}
+    public function <other_record_decl>record(string $message): string {
+        return $message;
+    }
+}
+"#,
+        )
+        .file(
+            "src/Consumer.php",
+            r#"<?php
+namespace App;
+
+use App\Contracts\Notifier;
+use App\Service\EmailNotifier;
+use App\Other\OtherNotifier;
+
+function consume(Notifier $notifier, EmailNotifier $mail): void {
+    $notifier-><interface_notify_call>notify("contract");
+    $mail-><mail_notify_call>notify("concrete");
+    $mail-><mail_record_call>record("logged");
+
+    $factory = makeNotifier();
+    $factory-><factory_notify_call>notify("factory");
+
+    $other = new OtherNotifier();
+    $other-><other_notify_call>notify("other");
+    $other-><other_record_call>record("unrelated");
+}
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "interface-typed receiver resolves to interface method",
+                "interface_notify_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["interface_notify_decl"]),
+            ),
+            ClickCase::new(
+                "concrete typed receiver resolves to implementation method",
+                "mail_notify_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["email_notify_decl"]),
+            ),
+            ClickCase::new(
+                "factory-returned receiver resolves to implementation method",
+                "factory_notify_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["email_notify_decl"]),
+            ),
+            ClickCase::new(
+                "trait method imported by use resolves through using class",
+                "mail_record_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["trait_record_decl"]),
+            ),
+            ClickCase::new(
+                "in-class trait method call resolves to trait method",
+                "this_record_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["trait_record_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name concrete method resolves to unrelated declaration",
+                "other_notify_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_notify_decl"]),
+            ),
+            ClickCase::new(
+                "unrelated same-name trait-like method resolves to unrelated declaration",
+                "other_record_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["other_record_decl"]),
+            ),
+            ClickCase::new(
+                "interface method references include implementations and typed concrete calls",
+                "interface_notify_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&[
+                    "email_notify_decl",
+                    "interface_notify_call",
+                    "mail_notify_call",
+                    "factory_notify_call",
+                ]),
+            ),
+            ClickCase::new(
+                "trait method references include using class calls only",
+                "trait_record_decl",
+                ClickOperation::References {
+                    include_declaration: false,
+                },
+                ClickExpectation::Locations(&["this_record_call", "mail_record_call"]),
+            ),
+            ClickCase::new(
+                "interface method implementation finds concrete method",
+                "interface_notify_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["email_notify_decl"]),
+            ),
+            ClickCase::new(
+                "interface type implementation finds implementing class",
+                "notifier_interface_decl",
+                ClickOperation::Implementation,
+                ClickExpectation::Locations(&["email_notifier_decl"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("milestone_3_php_interface_traits", &timings, 11);
+}

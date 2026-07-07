@@ -617,6 +617,12 @@ fn php_assignment_receiver_fqn(
     match right.kind() {
         "object_creation_expression" => php_object_creation_type(right)
             .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
+        "function_call_expression" => {
+            let function = right.child_by_field_name("function")?;
+            let raw = php_qualified_candidate_text(function, source);
+            let callable_fqn = resolve_php_function(&raw, ctx)?;
+            php_declared_callable_return_type_fqn(php, support, &callable_fqn)
+        }
         "scoped_call_expression" => {
             let (scope, name) = php_static_member_parts(right)?;
             let owner = php_static_scope_fqn(php, support, scope, source, ctx, class_ranges)?;

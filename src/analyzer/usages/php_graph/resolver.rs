@@ -152,7 +152,7 @@ pub(super) fn receiver_type_matches(
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
     if receiver_fq_name == owner {
-        return !hierarchy.owner_is_interface;
+        return true;
     }
     hierarchy.is_subtype(receiver_fq_name, owner)
 }

@@ -1409,7 +1409,7 @@ $other->record("unrelated");
 }
 
 #[test]
-fn php_graph_keeps_interface_typed_receiver_unproven() {
+fn php_graph_resolves_interface_typed_receiver_to_interface_method() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
             "Service.php",
@@ -1431,11 +1431,17 @@ function consume(Service $service): void {
         ),
     ]);
 
-    assert!(graph_hits(&analyzer, "App.Service.run").is_empty());
+    let hits = graph_hits(&analyzer, "App.Service.run");
+    assert_eq!(1, hits.len(), "{hits:#?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("$service->run()")),
+        "interface-typed receiver should reference the interface method: {hits:#?}"
+    );
 }
 
 #[test]
-fn php_graph_keeps_attributed_interface_typed_receiver_unproven() {
+fn php_graph_resolves_attributed_interface_typed_receiver_to_interface_method() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
             "Service.php",
@@ -1458,7 +1464,13 @@ function consume(Service $service): void {
         ),
     ]);
 
-    assert!(graph_hits(&analyzer, "App.Service.run").is_empty());
+    let hits = graph_hits(&analyzer, "App.Service.run");
+    assert_eq!(1, hits.len(), "{hits:#?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("$service->run()")),
+        "attributed interface-typed receiver should reference the interface method: {hits:#?}"
+    );
 }
 
 #[test]
