@@ -1448,6 +1448,158 @@ object App {
 }
 
 #[test]
+fn scala_graph_trait_default_method_matches_inherited_receiver() {
+    let workflow_source = r#"
+package example
+
+trait Logging {
+  def info(msg: String): Unit = ()
+}
+
+class Service extends Logging
+
+class OtherService {
+  def info(msg: String): Unit = ()
+}
+
+class Workflow {
+  def inherited(service: Service): Unit = service.info("started")
+  def unrelated(other: OtherService): Unit = other.info("ignored")
+}
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("example/Workflow.scala", workflow_source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let info = definition(&analyzer, "example.Logging.info");
+    let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&info),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&hits, line_of(workflow_source, "service.info"));
+    assert_no_hit_in_enclosing(&hits, "example.Workflow.unrelated");
+}
+
+#[test]
+fn scala_graph_trait_val_matches_inherited_receiver() {
+    let workflow_source = r#"
+package example
+
+trait Identified {
+  val id: String = "x"
+}
+
+class Service extends Identified
+
+class OtherService {
+  val id: String = "other"
+}
+
+class Workflow {
+  def inherited(service: Service): String = service.id
+  def unrelated(other: OtherService): String = other.id
+}
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("example/Workflow.scala", workflow_source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let id = definition(&analyzer, "example.Identified.id");
+    let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&id),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&hits, line_of(workflow_source, "service.id"));
+    assert_no_hit_in_enclosing(&hits, "example.Workflow.unrelated");
+}
+
+#[test]
+fn scala_graph_trait_method_does_not_claim_receiver_overridden_by_val() {
+    let workflow_source = r#"
+package example
+
+trait Identified {
+  def id: String = "base"
+}
+
+class Service extends Identified {
+  override val id: String = "service"
+}
+
+class Workflow {
+  def concrete(service: Service): String = service.id
+}
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("example/Workflow.scala", workflow_source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let trait_id = definition(&analyzer, "example.Identified.id");
+    let service_id = definition(&analyzer, "example.Service.id");
+
+    let trait_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&trait_id),
+        &candidates,
+        1000,
+    ));
+    let service_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&service_id),
+        &candidates,
+        1000,
+    ));
+
+    assert_no_hit_in_enclosing(&trait_hits, "example.Workflow.concrete");
+    assert_hit_line(&service_hits, line_of(workflow_source, "service.id"));
+}
+
+#[test]
+fn scala_graph_trait_member_conflict_does_not_guess_inherited_receiver() {
+    let workflow_source = r#"
+package example
+
+trait Primary {
+  def id: String = "primary"
+}
+
+trait Secondary {
+  def id: String = "secondary"
+}
+
+class Service extends Primary with Secondary
+
+class Workflow {
+  def ambiguous(service: Service): String = service.id
+}
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("example/Workflow.scala", workflow_source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let primary_id = definition(&analyzer, "example.Primary.id");
+    let secondary_id = definition(&analyzer, "example.Secondary.id");
+
+    let primary_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&primary_id),
+        &candidates,
+        1000,
+    ));
+    let secondary_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&secondary_id),
+        &candidates,
+        1000,
+    ));
+
+    assert_no_hit_in_enclosing(&primary_hits, "example.Workflow.ambiguous");
+    assert_no_hit_in_enclosing(&secondary_hits, "example.Workflow.ambiguous");
+}
+
+#[test]
 fn scala_graph_keeps_class_methods_exact_owner() {
     let source = r#"
 package exact

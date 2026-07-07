@@ -436,7 +436,7 @@ fn seed_or_shadow_typed_symbol(
 ) {
     let visible_owner = type_name
         .or(value_name)
-        .and_then(|name| ctx.visibility.owner_fq_name_for(name));
+        .and_then(|name| ctx.visibility.receiver_type_fq_name_for(name));
     if let Some(owner_fq_name) = visible_owner {
         ctx.bindings
             .seed_symbol(name.to_string(), owner_fq_name.to_string());
@@ -651,8 +651,8 @@ fn owner_qualified_this_matches(qualifier_node: Node<'_>, ctx: &ScanCtx<'_>) -> 
         return false;
     };
     ctx.visibility
-        .owner_fq_name_for(owner_name.trim().trim_end_matches('$'))
-        .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name))
+        .receiver_type_fq_name_for(owner_name.trim().trim_end_matches('$'))
+        .is_some_and(|owner_fq_name| ctx.spec.receiver_owner_fq_matches(owner_fq_name))
 }
 
 fn extension_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
@@ -703,17 +703,17 @@ fn receiver_binding_matches(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) 
         .is_some_and(|targets| {
             targets
                 .iter()
-                .any(|target| ctx.spec.owner_fq_matches(target))
+                .any(|target| ctx.spec.receiver_owner_fq_matches(target))
         })
         || ctx
             .visibility
             .receiver_fq_name_for(qualifier)
-            .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name))
+            .is_some_and(|owner_fq_name| ctx.spec.receiver_owner_fq_matches(owner_fq_name))
 }
 
 fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     enclosing_owner_fq_name(node, ctx)
-        .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name.as_str()))
+        .is_some_and(|owner_fq_name| ctx.spec.receiver_owner_fq_matches(owner_fq_name.as_str()))
 }
 
 fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {

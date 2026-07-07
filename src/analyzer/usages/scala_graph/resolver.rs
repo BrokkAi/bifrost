@@ -19,10 +19,12 @@ pub(super) struct TargetSpec {
     pub(super) owner: Option<CodeUnit>,
     pub(super) owner_name: Option<String>,
     pub(super) family_owners: Vec<CodeUnit>,
+    pub(super) receiver_owners: Vec<CodeUnit>,
     pub(super) member_name: String,
     pub(super) target_fq_name: String,
     pub(super) owner_fq_name: Option<String>,
     family_owner_fq_names: HashSet<String>,
+    receiver_owner_fq_names: HashSet<String>,
     pub(super) arity: Option<usize>,
     pub(super) is_extension_method: bool,
 }
@@ -36,10 +38,14 @@ impl TargetSpec {
                 kind: TargetKind::Type,
                 owner: Some(target.clone()),
                 family_owners: vec![target.clone()],
+                receiver_owners: vec![target.clone()],
                 member_name: owner_name.clone(),
                 target_fq_name: scala_normalized_fq_name(&target.fq_name()),
                 owner_fq_name: Some(scala_normalized_fq_name(&target.fq_name())),
                 family_owner_fq_names: HashSet::from_iter([scala_normalized_fq_name(
+                    &target.fq_name(),
+                )]),
+                receiver_owner_fq_names: HashSet::from_iter([scala_normalized_fq_name(
                     &target.fq_name(),
                 )]),
                 owner_name: Some(owner_name),
@@ -72,8 +78,14 @@ impl TargetSpec {
         } else {
             target.identifier().to_string()
         };
-        let family_owners = method_family_owners(scala, &owner, kind, &member_name, arity);
-        let family_owner_fq_names = family_owners
+        let member_owners = trait_member_owners(scala, &owner, kind, &member_name, arity);
+        let family_owner_fq_names = member_owners
+            .family_owners
+            .iter()
+            .map(|owner| scala_normalized_fq_name(&owner.fq_name()))
+            .collect();
+        let receiver_owner_fq_names = member_owners
+            .receiver_owners
             .iter()
             .map(|owner| scala_normalized_fq_name(&owner.fq_name()))
             .collect();
@@ -84,11 +96,13 @@ impl TargetSpec {
                 .as_ref()
                 .map(|owner| scala_normalized_fq_name(&owner.fq_name())),
             owner,
-            family_owners,
+            family_owners: member_owners.family_owners,
+            receiver_owners: member_owners.receiver_owners,
             owner_name,
             kind,
             member_name,
             family_owner_fq_names,
+            receiver_owner_fq_names,
             arity,
             is_extension_method,
         })
@@ -99,6 +113,11 @@ impl TargetSpec {
             .contains(&scala_normalized_fq_name(owner_fq_name))
     }
 
+    pub(super) fn receiver_owner_fq_matches(&self, owner_fq_name: &str) -> bool {
+        self.receiver_owner_fq_names
+            .contains(&scala_normalized_fq_name(owner_fq_name))
+    }
+
     pub(super) fn related_override_owner_fq_matches(&self, owner_fq_name: &str) -> bool {
         let normalized = scala_normalized_fq_name(owner_fq_name);
         self.owner_fq_name.as_deref() != Some(normalized.as_str())
@@ -106,41 +125,180 @@ impl TargetSpec {
     }
 }
 
-fn method_family_owners(
+struct TraitMemberOwners {
+    family_owners: Vec<CodeUnit>,
+    receiver_owners: Vec<CodeUnit>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InheritedMemberState {
+    Related,
+    Blocked,
+    None,
+}
+
+enum DirectMemberState {
+    RelatedOverride,
+    BlockingDeclaration,
+    None,
+}
+
+fn trait_member_owners(
     scala: &ScalaAnalyzer,
     owner: &Option<CodeUnit>,
     kind: TargetKind,
     member_name: &str,
     arity: Option<usize>,
-) -> Vec<CodeUnit> {
+) -> TraitMemberOwners {
     let Some(owner) = owner else {
-        return Vec::new();
+        return TraitMemberOwners {
+            family_owners: Vec::new(),
+            receiver_owners: Vec::new(),
+        };
     };
-    let mut owners = vec![owner.clone()];
-    if kind != TargetKind::Method || !scala.is_scala_trait_declaration(owner) {
-        return owners;
+    let mut family_owners = vec![owner.clone()];
+    let mut receiver_owners = vec![owner.clone()];
+    if !matches!(kind, TargetKind::Method | TargetKind::Field)
+        || !scala.is_scala_trait_declaration(owner)
+    {
+        return TraitMemberOwners {
+            family_owners,
+            receiver_owners,
+        };
     }
     let mut seen = HashSet::from_iter([scala_normalized_fq_name(&owner.fq_name())]);
+    let mut related_owner_fq_names = seen.clone();
+    let mut inherited_state_by_owner = HashMap::from_iter([(
+        scala_normalized_fq_name(&owner.fq_name()),
+        InheritedMemberState::Related,
+    )]);
     for descendant in scala.get_descendants(owner) {
-        if !seen.insert(scala_normalized_fq_name(&descendant.fq_name())) {
+        let descendant_fq_name = scala_normalized_fq_name(&descendant.fq_name());
+        if !seen.insert(descendant_fq_name.clone()) {
             continue;
         }
-        if owner_defines_compatible_method(scala, &descendant, member_name, arity) {
-            owners.push(descendant);
+        match direct_member_state(scala, &descendant, kind, member_name, arity) {
+            DirectMemberState::RelatedOverride => {
+                related_owner_fq_names.insert(descendant_fq_name.clone());
+                inherited_state_by_owner.insert(descendant_fq_name, InheritedMemberState::Related);
+                family_owners.push(descendant.clone());
+                receiver_owners.push(descendant);
+            }
+            DirectMemberState::BlockingDeclaration => {
+                inherited_state_by_owner.insert(descendant_fq_name, InheritedMemberState::Blocked);
+            }
+            DirectMemberState::None => {
+                let state = inherited_member_state_from_ancestors(
+                    scala,
+                    &descendant,
+                    kind,
+                    member_name,
+                    arity,
+                    &related_owner_fq_names,
+                    &inherited_state_by_owner,
+                );
+                inherited_state_by_owner.insert(descendant_fq_name, state);
+                if state == InheritedMemberState::Related {
+                    receiver_owners.push(descendant);
+                }
+            }
         }
     }
-    owners
+    TraitMemberOwners {
+        family_owners,
+        receiver_owners,
+    }
 }
 
-fn owner_defines_compatible_method(
+fn inherited_member_state_from_ancestors(
+    scala: &ScalaAnalyzer,
+    descendant: &CodeUnit,
+    kind: TargetKind,
+    member_name: &str,
+    arity: Option<usize>,
+    related_owner_fq_names: &HashSet<String>,
+    inherited_state_by_owner: &HashMap<String, InheritedMemberState>,
+) -> InheritedMemberState {
+    let mut related_matches = HashSet::default();
+    let mut has_blocking_match = false;
+    for ancestor in scala.get_direct_ancestors(descendant) {
+        let ancestor_fq_name = scala_normalized_fq_name(&ancestor.fq_name());
+        if owner_declares_matching_member(scala, &ancestor, kind, member_name, arity) {
+            if related_owner_fq_names.contains(&ancestor_fq_name) {
+                related_matches.insert(ancestor_fq_name);
+            } else {
+                has_blocking_match = true;
+            }
+            continue;
+        }
+
+        match inherited_state_by_owner.get(&ancestor_fq_name) {
+            Some(InheritedMemberState::Related) => {
+                related_matches.insert(ancestor_fq_name);
+            }
+            Some(InheritedMemberState::Blocked) => has_blocking_match = true,
+            Some(InheritedMemberState::None) | None => {}
+        }
+    }
+    if has_blocking_match || related_matches.len() > 1 {
+        return InheritedMemberState::Blocked;
+    }
+    if related_matches.len() == 1 {
+        InheritedMemberState::Related
+    } else {
+        InheritedMemberState::None
+    }
+}
+
+fn direct_member_state(
     scala: &ScalaAnalyzer,
     owner: &CodeUnit,
+    kind: TargetKind,
+    member_name: &str,
+    arity: Option<usize>,
+) -> DirectMemberState {
+    if kind == TargetKind::Method
+        && scala
+            .definitions(&format!("{}.{}", owner.fq_name(), member_name))
+            .any(|unit| unit.is_function() && method_arity_matches(scala, unit, arity))
+    {
+        return DirectMemberState::RelatedOverride;
+    }
+    if owner_declares_matching_member(scala, owner, kind, member_name, arity) {
+        DirectMemberState::BlockingDeclaration
+    } else {
+        DirectMemberState::None
+    }
+}
+
+fn owner_declares_matching_member(
+    scala: &ScalaAnalyzer,
+    owner: &CodeUnit,
+    kind: TargetKind,
     member_name: &str,
     arity: Option<usize>,
 ) -> bool {
     scala
         .definitions(&format!("{}.{}", owner.fq_name(), member_name))
-        .any(|unit| unit.is_function() && method_arity_matches(scala, unit, arity))
+        .any(|unit| member_matches_target_kind(scala, unit, kind, arity))
+}
+
+fn member_matches_target_kind(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    kind: TargetKind,
+    arity: Option<usize>,
+) -> bool {
+    match kind {
+        TargetKind::Method => {
+            (unit.is_function() && method_arity_matches(scala, unit, arity))
+                || (unit.is_field() && arity.is_none_or(|arity| arity == 0))
+        }
+        TargetKind::Field => {
+            unit.is_field() || (unit.is_function() && method_arity_matches(scala, unit, Some(0)))
+        }
+        TargetKind::Type | TargetKind::Constructor => false,
+    }
 }
 
 fn imported_factory_return_owner(
@@ -152,7 +310,7 @@ fn imported_factory_return_owner(
         .signature()
         .or_else(|| scala.signatures(unit).first().map(String::as_str))?;
     let return_type = signature_return_type(signature)?;
-    spec.family_owners.iter().find_map(|owner| {
+    spec.receiver_owners.iter().find_map(|owner| {
         return_type_matches_owner(return_type, unit.package_name(), owner)
             .then(|| scala_normalized_fq_name(&owner.fq_name()))
     })
@@ -229,6 +387,7 @@ pub(super) struct Visibility {
     pub(super) type_names: HashSet<String>,
     pub(super) owner_names: HashSet<String>,
     owner_name_to_fq_name: HashMap<String, String>,
+    receiver_type_name_to_fq_name: HashMap<String, String>,
     receiver_name_to_fq_name: HashMap<String, String>,
     pub(super) direct_member_names: HashSet<String>,
     pub(super) ambiguous_direct_member_names: HashSet<String>,
@@ -240,6 +399,7 @@ impl Visibility {
             type_names: HashSet::default(),
             owner_names: HashSet::default(),
             owner_name_to_fq_name: HashMap::default(),
+            receiver_type_name_to_fq_name: HashMap::default(),
             receiver_name_to_fq_name: HashMap::default(),
             direct_member_names: HashSet::default(),
             ambiguous_direct_member_names: ambiguous_wildcard_members(scala, file, spec),
@@ -279,6 +439,14 @@ impl Visibility {
                 );
             }
         }
+        for owner in &spec.receiver_owners {
+            if file == owner.source() || file_package.as_deref() == Some(owner.package_name()) {
+                visibility.add_receiver_type_name(
+                    scala_display_name(owner),
+                    scala_normalized_fq_name(&owner.fq_name()),
+                );
+            }
+        }
 
         let file_package = file_package.unwrap_or_default();
         for import in scala.import_info_of(file) {
@@ -294,6 +462,12 @@ impl Visibility {
             .map(String::as_str)
     }
 
+    pub(super) fn receiver_type_fq_name_for(&self, owner_name: &str) -> Option<&str> {
+        self.receiver_type_name_to_fq_name
+            .get(owner_name)
+            .map(String::as_str)
+    }
+
     pub(super) fn receiver_fq_name_for(&self, receiver_name: &str) -> Option<&str> {
         self.receiver_name_to_fq_name
             .get(receiver_name)
@@ -303,6 +477,11 @@ impl Visibility {
     fn add_owner_name(&mut self, owner_name: String, owner_fq_name: String) {
         self.owner_names.insert(owner_name.clone());
         self.owner_name_to_fq_name
+            .insert(owner_name, scala_normalized_fq_name(&owner_fq_name));
+    }
+
+    fn add_receiver_type_name(&mut self, owner_name: String, owner_fq_name: String) {
+        self.receiver_type_name_to_fq_name
             .insert(owner_name, scala_normalized_fq_name(&owner_fq_name));
     }
 
@@ -325,6 +504,7 @@ impl Visibility {
         }
         self.direct_member_names.extend(names.direct_member_names);
         self.apply_family_owner_import(import, spec, file_package);
+        self.apply_receiver_owner_import(import, spec, file_package);
         self.apply_imported_factory_receiver(scala, import, spec, file_package);
     }
 
@@ -358,6 +538,40 @@ impl Visibility {
                     .clone()
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
                 self.add_owner_name(local_name, owner_fq_name);
+            }
+        }
+    }
+
+    fn apply_receiver_owner_import(
+        &mut self,
+        import: &ImportInfo,
+        spec: &TargetSpec,
+        file_package: &str,
+    ) {
+        let Some(path) = scala_import_path(import) else {
+            return;
+        };
+        if import.is_wildcard {
+            let candidates = import_candidate_fq_names(&path, file_package);
+            for owner in &spec.receiver_owners {
+                if candidates.contains(owner.package_name()) {
+                    self.add_receiver_type_name(
+                        scala_display_name(owner),
+                        scala_normalized_fq_name(&owner.fq_name()),
+                    );
+                }
+            }
+            return;
+        }
+        let normalized = scala_normalized_fq_name(&path);
+        for owner in &spec.receiver_owners {
+            let owner_fq_name = scala_normalized_fq_name(&owner.fq_name());
+            if normalized == owner_fq_name {
+                let local_name = import
+                    .identifier
+                    .clone()
+                    .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
+                self.add_receiver_type_name(local_name, owner_fq_name);
             }
         }
     }

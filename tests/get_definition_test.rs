@@ -12826,6 +12826,123 @@ object Api extends RestHelper {
 }
 
 #[test]
+fn scala_trait_default_method_resolves_through_concrete_receiver() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\ntrait Logging { def info(msg: String): Unit = () }\nclass Service extends Logging\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(service: Service): Unit = service.info(\"started\") }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(service: Service): Unit = service.info(\"started\") }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "info")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Logging.info",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_trait_val_resolves_through_concrete_receiver() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\ntrait Identified { val id: String = \"x\" }\nclass Service extends Identified\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(service: Service): String = service.id }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(service: Service): String = service.id }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "id")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Identified.id",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_trait_method_override_prefers_concrete_receiver_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\ntrait Logging { def info(msg: String): Unit = () }\nclass Service extends Logging { override def info(msg: String): Unit = () }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(service: Service): Unit = service.info(\"started\") }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(service: Service): Unit = service.info(\"started\") }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "info")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Service.info",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_trait_method_overridden_by_val_prefers_concrete_receiver_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\ntrait Identified { def id: String = \"base\" }\nclass Service extends Identified { override val id: String = \"service\" }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(service: Service): String = service.id }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(service: Service): String = service.id }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "id")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Service.id", "{value}");
+}
+
+#[test]
 fn scala_instance_member_prefers_inherited_member_over_companion_object() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
