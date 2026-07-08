@@ -103,7 +103,7 @@ fn run_query_with_files(files: &[(&str, &str)], query: serde_json::Value) -> Sea
 }
 
 #[test]
-fn remaining_languages_report_missing_structural_adapters_before_issue_527_rollout() {
+fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollout() {
     let output = run_query_with_files(
         &[
             (
@@ -129,7 +129,12 @@ fn remaining_languages_report_missing_structural_adapters_before_issue_527_rollo
         json!({ "match": { "kind": "call", "callee": { "name": "audit" } } }),
     );
 
-    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+    let rows: Vec<_> = output
+        .matches
+        .iter()
+        .map(|m| (m.language, m.path.as_str(), m.text.as_str()))
+        .collect();
+    assert_eq!(rows, vec![("go", "go/app.go", "audit()")]);
 
     let diagnostics: BTreeSet<_> = output
         .diagnostics
@@ -139,10 +144,6 @@ fn remaining_languages_report_missing_structural_adapters_before_issue_527_rollo
     assert_eq!(
         diagnostics,
         BTreeSet::from([
-            (
-                "go",
-                "no structural adapter for go yet; its files were not searched",
-            ),
             (
                 "cpp",
                 "no structural adapter for cpp yet; its files were not searched",
@@ -168,6 +169,202 @@ fn remaining_languages_report_missing_structural_adapters_before_issue_527_rollo
                 "no structural adapter for ruby yet; its files were not searched",
             ),
         ])
+    );
+}
+
+#[test]
+fn go_structural_adapter_matches_normalized_shapes() {
+    const GO_APP: &str = r#"
+package app
+
+import (
+    "fmt"
+    "net/http"
+)
+
+type Service struct {
+    Name string
+}
+
+type Alias = Service
+
+const password = "hunter2"
+var retries, attempts = 3, 4
+var callback = func(value string) string {
+    return value
+}
+
+func audit(code string) string {
+    fmt.Println(code)
+    service := Service{Name: "primary"}
+    service.Name = "updated"
+    return code
+}
+
+func (s Service) Run(code string) {
+    audit(code)
+}
+"#;
+
+    let audit = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit" },
+                "args": [{ "capture": "code" }]
+            }
+        }),
+    );
+    assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
+    assert_eq!(audit.matches.len(), 1);
+    assert_eq!(audit.matches[0].text, "audit(code)");
+    assert_eq!(audit.matches[0].captures[0].text, "code");
+
+    let assignment = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "password" },
+                "right": { "kind": "string_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        assignment.diagnostics.is_empty(),
+        "{:?}",
+        assignment.diagnostics
+    );
+    assert_eq!(assignment.matches.len(), 1);
+    assert_eq!(assignment.matches[0].text, r#"password = "hunter2""#);
+    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+
+    let multi_assignment = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "attempts" },
+                "right": { "text": { "regex": "^4$" }, "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        multi_assignment.diagnostics.is_empty(),
+        "{:?}",
+        multi_assignment.diagnostics
+    );
+    assert_eq!(multi_assignment.matches.len(), 1);
+    assert_eq!(multi_assignment.matches[0].text, "retries, attempts = 3, 4");
+    assert_eq!(multi_assignment.matches[0].captures[0].text, "4");
+
+    let field_access = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": {
+                "kind": "field_access",
+                "object": { "name": "service" },
+                "field": { "name": "Name" }
+            }
+        }),
+    );
+    assert!(
+        field_access.diagnostics.is_empty(),
+        "{:?}",
+        field_access.diagnostics
+    );
+    assert_eq!(field_access.matches.len(), 1);
+    assert_eq!(field_access.matches[0].text, "service.Name");
+
+    let import = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": { "kind": "import", "module": { "name": "net/http" } }
+        }),
+    );
+    assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
+    assert_eq!(import.matches.len(), 1);
+    assert_eq!(import.matches[0].text, "import (…");
+
+    let declarations = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": { "kind": "declaration", "name": { "regex": "^(Service|Alias|audit|Run)$" } }
+        }),
+    );
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    let declaration_rows: Vec<_> = declarations
+        .matches
+        .iter()
+        .map(|m| (m.kind, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        declaration_rows,
+        vec![
+            ("class", "Service struct {…"),
+            ("declaration", "Alias = Service"),
+            ("function", "func audit(code string) string {…"),
+            ("method", "func (s Service) Run(code string) {…"),
+        ]
+    );
+
+    let type_identifier = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": { "kind": "identifier", "name": "Alias" }
+        }),
+    );
+    assert!(
+        type_identifier.diagnostics.is_empty(),
+        "{:?}",
+        type_identifier.diagnostics
+    );
+    assert!(
+        type_identifier.matches.iter().any(|m| m.text == "Alias"),
+        "expected Alias type identifier match: {:?}",
+        type_identifier.matches
+    );
+
+    let lambda = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": { "kind": "lambda", "has": { "kind": "return" } }
+        }),
+    );
+    assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
+    assert_eq!(lambda.matches.len(), 1);
+    assert_eq!(lambda.matches[0].text, "func(value string) string {…");
+
+    let unsupported = run_query_with_files(
+        &[("go/app.go", GO_APP)],
+        json!({
+            "languages": ["go"],
+            "match": {
+                "kind": "call",
+                "kwargs": { "shell": { "kind": "boolean_literal" } }
+            }
+        }),
+    );
+    assert!(
+        unsupported
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "go" && diagnostic.message.contains("kwargs")),
+        "expected go kwargs diagnostic: {:?}",
+        unsupported.diagnostics
     );
 }
 

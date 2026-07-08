@@ -12,7 +12,7 @@ The observable behavior is that a mixed-language inline project containing all e
 
 - [x] (2026-07-08 00:00Z) Initial ExecPlan created from issue #527 and the user's milestone/review/commit requirements.
 - [x] (2026-07-08 00:16Z) Baseline milestone: added `remaining_languages_report_missing_structural_adapters_before_issue_527_rollout`, proving current unsupported-adapter diagnostics for Go, C++, Rust, PHP, Scala, C#, and Ruby. Focused and structural regression checks passed; Brokk guided review across security, duplication, senior-dev, devops, and architecture perspectives reported no findings.
-- [ ] Go milestone: implement and register Go structural search; add focused tests; run checks, Brokk guided review, accepted fixes, rerun checks, and commit.
+- [x] (2026-07-08 10:35Z) Go milestone: implemented and registered Go structural search, added focused coverage, ran checks, completed Brokk guided review, fixed accepted findings, reran checks, and prepared the milestone commit.
 - [ ] C++ milestone: implement and register C++ structural search; add focused tests; run checks, Brokk guided review, accepted fixes, rerun checks, and commit.
 - [ ] Rust milestone: implement and register Rust structural search; add focused tests; run checks, Brokk guided review, accepted fixes, rerun checks, and commit.
 - [ ] PHP milestone: implement and register PHP structural search; add focused tests; run checks, Brokk guided review, accepted fixes, rerun checks, and commit.
@@ -25,6 +25,9 @@ The observable behavior is that a mixed-language inline project containing all e
 
 - Observation: `cargo clippy-no-cuda` can pick a mismatched Homebrew `cargo-clippy` / `clippy-driver` when `/opt/homebrew/bin` wins over the rustup toolchain for those binaries while `cargo` and `rustc` come from `/Users/dave/.cargo/bin`. The symptom is repeated `E0514` "found crate compiled by an incompatible version of rustc" for many dependencies, even after `cargo clean`.
   Evidence: `which cargo` and `which rustc` resolved through `/Users/dave/.local/bin` to rustup, while `which cargo-clippy` and `which clippy-driver` resolved to `/opt/homebrew/bin`. Rerunning as `PATH=/Users/dave/.cargo/bin:$PATH cargo clippy-no-cuda` completed successfully.
+
+- Observation: Go's structural fact for a `type_spec` starts at the named spec (`Service struct { ... }`), not the enclosing `type` keyword. Grouped import declarations and multi-value assignment/declaration nodes likewise use wrapper nodes whose useful role targets live in repeated child specs or expression lists.
+  Evidence: The Go milestone review found the initial adapter only exposed the first import spec and the first expression-list item. The final adapter walks every `import_spec`, every `name` field occurrence, and every expression-list item through tree-sitter nodes/fields.
 
 ## Decision Log
 
@@ -43,6 +46,8 @@ The observable behavior is that a mixed-language inline project containing all e
 ## Outcomes & Retrospective
 
 - Baseline milestone outcome (2026-07-08 / Codex): The current unsupported language set is now captured in `tests/structural_search_cross_language.rs`. The test builds a real inferred-language workspace for Go, C++, Rust, PHP, Scala, C#, and Ruby, runs a shared `audit` call query, asserts there are no matches, and asserts the seven exact unsupported-adapter diagnostics. This gives each language milestone a concrete diagnostic to remove. Verification passed with `BIFROST_SEMANTIC_INDEX=off cargo test --test structural_search_cross_language remaining_languages_report_missing_structural_adapters_before_issue_527_rollout -- --nocapture`, `BIFROST_SEMANTIC_INDEX=off cargo test structural --lib`, `BIFROST_SEMANTIC_INDEX=off cargo test --test structural_search_python --test structural_search_planner --test structural_search_cross_language`, `cargo fmt --check`, and `PATH=/Users/dave/.cargo/bin:$PATH cargo clippy-no-cuda`. Brokk guided review found no issues and required no fixes.
+
+- Go milestone outcome (2026-07-08 / Codex): Go now exposes a `StructuralSpec` through `GoAdapter::structural_spec()` and `GoAnalyzer::structural_search_providers()`. The adapter covers calls with callee/receiver/args, assignments with all structured left/right list entries, field access, grouped imports with module names, declarations including type aliases, function literals as lambdas, identifiers including `type_identifier`, literals, returns, conditionals, loops, and explicit unsupported diagnostics for kwargs/decorators. Brokk guided review found substantive gaps in grouped imports, multi-value assignments/declarations, type aliases, and type identifiers; all accepted findings were fixed and covered by focused assertions. The devops review also noted that the new `src/analyzer/go/structural.rs` file must be explicitly staged, which is part of the milestone commit. Verification passed after fixes with `BIFROST_SEMANTIC_INDEX=off cargo test --test structural_search_cross_language go_structural_adapter_matches_normalized_shapes -- --nocapture`, `BIFROST_SEMANTIC_INDEX=off cargo test --test structural_search_cross_language remaining_languages_report_missing_structural_adapters_during_issue_527_rollout -- --nocapture`, `BIFROST_SEMANTIC_INDEX=off cargo test structural --lib`, `BIFROST_SEMANTIC_INDEX=off cargo test --test structural_search_python --test structural_search_planner --test structural_search_cross_language`, `cargo fmt --check`, and `PATH=/Users/dave/.cargo/bin:$PATH cargo clippy-no-cuda`.
 
 ## Context and Orientation
 
@@ -190,3 +195,5 @@ Use only existing dependencies: `tree_sitter`, the language grammar crates alrea
 Revision note, 2026-07-08: Initial plan created to make issue #527 executable with one reviewed, committed milestone per missing language, matching the user's explicit commit-after-each-milestone requirement.
 
 Revision note, 2026-07-08: Updated after the baseline milestone to record the new unsupported-adapter diagnostic test, passing validation commands, guided-review result, and the local clippy toolchain-path discovery.
+
+Revision note, 2026-07-08: Updated after the Go milestone to record the new adapter coverage, accepted guided-review findings, rerun validation commands, and Go grammar-shape discovery.

@@ -53,4 +53,8 @@ impl LanguageAdapter for GoAdapter {
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_go_file(file, source, tree)
     }
+
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::GO_STRUCTURAL_SPEC)
+    }
 }
