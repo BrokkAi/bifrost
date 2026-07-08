@@ -5,6 +5,11 @@ description: Use the Bifrost VS Code extension for editor navigation.
 
 Install the extension from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=Brokk.bifrost-vscode).
 
+Requirements:
+
+- VS Code 1.90 or newer.
+- A supported platform for extension-managed Bifrost binary downloads, or a `bifrost` binary available through one of the launch modes below.
+
 The extension source lives in `editors/vscode`. It starts Bifrost with:
 
 ```bash
@@ -51,4 +56,25 @@ Launch mode behavior:
 | `args` | Command arguments. Supports `{file}`, `{relativeFile}`, `{workspaceRoot}`, and `{language}` placeholders. |
 | `cwd` | Working directory for the formatter. Relative paths are resolved against the workspace root and support placeholders. |
 
-The extension also includes commands for MCP setup, including a copyable MCP configuration for the current workspace.
+## MCP Setup
+
+Run `Bifrost: Open MCP Setup` from the Command Palette to choose a setup action: copy generic `mcp.json`, copy a Codex CLI command, copy a Claude Code command, or open the Bifrost MCP docs. `Bifrost: Copy MCP Config` remains available when you only want the generic JSON entry.
+
+These commands are manual. The extension does not open MCP setup on activation, does not mutate external host configuration, and does not prompt again after dismissal.
+
+The MCP setup commands use the same binary resolution settings as the language server where practical: a configured `bifrost.serverPath`, the extension-managed binary, a local development build, or `bifrost` on `PATH`.
+
+The copied entry uses the current workspace root and starts a separate Bifrost MCP process:
+
+```json
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "/path/to/bifrost",
+      "args": ["--root", "/path/to/workspace", "--mcp", "searchtools"]
+    }
+  }
+}
+```
+
+Do not point MCP hosts at the VS Code LSP process. The extension and MCP hosts should launch separate stdio processes from the same Bifrost binary or release.

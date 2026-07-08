@@ -28,16 +28,4 @@ Clients can also pass Bifrost-specific `initializationOptions`:
 
 ## CLI Tooling
 
-For terminal checks and scripts, use one-shot tool mode instead of starting an LSP session:
-
-```bash
-bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
-```
-
-Limit one-shot workspace construction with `--sources` when the query only needs part of a repository:
-
-```bash
-bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
-```
-
-Tool mode prints JSON and exits. Use `bifrost --help` to list available modes and toolsets, or `bifrost --help <tool>` for a specific tool's parameters.
+For terminal checks and scripts, use [one-shot CLI tool mode](../cli/) instead of starting an LSP session.
