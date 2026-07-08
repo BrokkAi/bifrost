@@ -1,11 +1,11 @@
 use lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams};
 
+use crate::analyzer::declaration_range::code_unit_declaration_name_range;
 use crate::analyzer::usages::UsageHit;
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::{
-    broad_symbol::{broad_symbol_target_at_position, code_unit_declaration_name_range},
-    usage_hits::usage_hits_for_candidates_in_file,
+    broad_symbol::broad_symbol_target_at_position, usage_hits::usage_hits_for_candidates_in_file,
     util::identifier_selection_range,
 };
 

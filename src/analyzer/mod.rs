@@ -7,6 +7,7 @@ pub(crate) mod common;
 mod config;
 mod cpp;
 mod csharp;
+pub(crate) mod declaration_range;
 mod definition_lookup_index;
 mod go;
 mod i_analyzer;

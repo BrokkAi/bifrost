@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::declaration_range::code_unit_declaration_name_range;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
-use crate::lsp::handlers::broad_symbol::code_unit_declaration_name_range;
 #[cfg(test)]
 use crate::text_utils::identifier_at_offset;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
