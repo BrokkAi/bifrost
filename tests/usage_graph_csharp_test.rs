@@ -1,8 +1,8 @@
 mod common;
 
 use brokk_bifrost::Language;
-use common::InlineTestProject;
 use common::usage_graph::{assert_every_edge_endpoint_is_a_node, has_edge, usage_graph_at};
+use common::{InlineTestProject, csharp_nested_partial_cacheinfo_project};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -116,6 +116,60 @@ fn nested_class_unqualified_calls_attribute_to_the_nested_fqn() {
             "Example.Outer$Inner.Helper"
         ),
         "expected Outer$Inner.Compute -> Outer$Inner.Helper: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn nested_partial_type_references_edge_to_nested_type() {
+    let project = csharp_nested_partial_cacheinfo_project().build();
+
+    let value = usage_graph_at(project.root(), "{}");
+
+    assert!(
+        has_edge(
+            &value,
+            "Dapper.SqlMapper.GetCacheInfo",
+            "Dapper.SqlMapper$CacheInfo"
+        ),
+        "bare nested type references in a partial sibling file should edge to CacheInfo: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn nested_type_references_do_not_edge_through_type_parameter_shadow() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Mapper.CacheInfo.cs",
+            r#"
+namespace Dapper {
+    public static partial class SqlMapper {
+        private sealed class CacheInfo {}
+    }
+}
+"#,
+        )
+        .file(
+            "Mapper.cs",
+            r#"
+namespace Dapper {
+    public static partial class SqlMapper {
+        private static CacheInfo M<CacheInfo>(CacheInfo value) {
+            CacheInfo? local = value;
+            return default;
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+
+    assert!(
+        !has_edge(&value, "Dapper.SqlMapper.M", "Dapper.SqlMapper$CacheInfo"),
+        "type parameter CacheInfo should shadow the nested type in usage_graph: {}",
         value["edges"]
     );
 }
