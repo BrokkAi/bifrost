@@ -103,7 +103,7 @@ fn run_query_with_files(files: &[(&str, &str)], query: serde_json::Value) -> Sea
 }
 
 #[test]
-fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollout() {
+fn remaining_languages_search_without_unsupported_adapter_diagnostics_during_issue_527_rollout() {
     let output = run_query_with_files(
         &[
             (
@@ -124,7 +124,7 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
                 "csharp/App.cs",
                 "class App { void audit() {} void run() { audit(); } }\n",
             ),
-            ("ruby/app.rb", "def audit; end\ndef run; audit; end\n"),
+            ("ruby/app.rb", "def audit; end\ndef run; audit(); end\n"),
         ],
         json!({ "match": { "kind": "call", "callee": { "name": "audit" } } }),
     );
@@ -141,6 +141,7 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
             ("csharp", "csharp/App.cs", "audit()"),
             ("go", "go/app.go", "audit()"),
             ("php", "php/app.php", "audit()"),
+            ("ruby", "ruby/app.rb", "audit()"),
             ("rust", "rust/lib.rs", "audit()"),
             ("scala", "scala/App.scala", "audit()"),
         ]
@@ -151,13 +152,7 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
         .iter()
         .map(|diagnostic| (diagnostic.language, diagnostic.message.as_str()))
         .collect();
-    assert_eq!(
-        diagnostics,
-        BTreeSet::from([(
-            "ruby",
-            "no structural adapter for ruby yet; its files were not searched",
-        ),])
-    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
 }
 
 #[test]
@@ -2145,6 +2140,322 @@ class AppEntry {
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
     assert_eq!(lambda.matches.len(), 1);
     assert_eq!(lambda.matches[0].text, "value => {…");
+}
+
+#[test]
+fn ruby_structural_adapter_matches_normalized_shapes() {
+    const RUBY_APP: &str = r#"
+require "app/support"
+require "plugins/#{tenant}"
+
+module App
+  class Service
+    LIMIT = -3
+
+    def run(code)
+      audit(code)
+      audit_named(code: code)
+      password = "hunter2"
+      flag = true
+      callback = ->(value) {
+        return value
+      }
+      klass = App::Service
+      code.to_s
+    end
+
+    def self.audit(code)
+      code
+    end
+  end
+end
+
+class App::External
+end
+
+def helper
+  service = App::Service.new("primary")
+  service.run("input")
+  loader.require("plugin")
+end
+"#;
+
+    let audit = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit" },
+                "args": [{ "name": "code", "capture": "code" }]
+            }
+        }),
+    );
+    assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
+    assert_eq!(audit.matches.len(), 1);
+    assert_eq!(audit.matches[0].text, "audit(code)");
+    assert_eq!(audit.matches[0].captures[0].text, "code");
+
+    let method_call = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service" }
+            }
+        }),
+    );
+    assert!(
+        method_call.diagnostics.is_empty(),
+        "{:?}",
+        method_call.diagnostics
+    );
+    assert_eq!(method_call.matches.len(), 1);
+    assert_eq!(method_call.matches[0].text, r#"service.run("input")"#);
+
+    let named_argument = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit_named" },
+                "kwargs": {
+                    "code": { "name": "code", "capture": "code" }
+                }
+            }
+        }),
+    );
+    assert!(
+        named_argument.diagnostics.is_empty(),
+        "{:?}",
+        named_argument.diagnostics
+    );
+    assert_eq!(named_argument.matches.len(), 1);
+    assert_eq!(named_argument.matches[0].text, "audit_named(code: code)");
+    assert_eq!(named_argument.matches[0].captures[0].text, "code");
+
+    let assignment = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "password" },
+                "right": { "kind": "string_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        assignment.diagnostics.is_empty(),
+        "{:?}",
+        assignment.diagnostics
+    );
+    assert_eq!(assignment.matches.len(), 1);
+    assert_eq!(assignment.matches[0].text, r#"password = "hunter2""#);
+    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+
+    let signed_numeric = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "LIMIT" },
+                "right": { "kind": "numeric_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        signed_numeric.diagnostics.is_empty(),
+        "{:?}",
+        signed_numeric.diagnostics
+    );
+    assert_eq!(signed_numeric.matches.len(), 1);
+    assert_eq!(signed_numeric.matches[0].text, "LIMIT = -3");
+    assert_eq!(signed_numeric.matches[0].captures[0].text, "-3");
+
+    let boolean_literal = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": { "kind": "boolean_literal", "text": { "regex": "^true$" } }
+        }),
+    );
+    assert!(
+        boolean_literal.diagnostics.is_empty(),
+        "{:?}",
+        boolean_literal.diagnostics
+    );
+    assert_eq!(boolean_literal.matches.len(), 1);
+    assert_eq!(boolean_literal.matches[0].text, "true");
+
+    let field_access = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "field_access",
+                "object": { "name": "App" },
+                "field": { "name": "Service" }
+            }
+        }),
+    );
+    assert!(
+        field_access.diagnostics.is_empty(),
+        "{:?}",
+        field_access.diagnostics
+    );
+    assert_eq!(field_access.matches.len(), 2);
+    assert!(
+        field_access
+            .matches
+            .iter()
+            .all(|m| m.text == "App::Service")
+    );
+
+    let import = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": { "kind": "import", "module": { "name": "app/support" } }
+        }),
+    );
+    assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
+    assert_eq!(import.matches.len(), 1);
+    assert_eq!(import.matches[0].text, r#"require "app/support""#);
+
+    let dynamic_import_module = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": { "kind": "import", "module": { "name": "plugins/" } }
+        }),
+    );
+    assert!(
+        dynamic_import_module.diagnostics.is_empty(),
+        "{:?}",
+        dynamic_import_module.diagnostics
+    );
+    assert!(
+        dynamic_import_module.matches.is_empty(),
+        "dynamic require module names should not be exposed as precise module roles: {dynamic_import_module:?}"
+    );
+
+    let receiver_require_call = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "require" },
+                "receiver": { "name": "loader" }
+            }
+        }),
+    );
+    assert!(
+        receiver_require_call.diagnostics.is_empty(),
+        "{:?}",
+        receiver_require_call.diagnostics
+    );
+    assert_eq!(receiver_require_call.matches.len(), 1);
+    assert_eq!(
+        receiver_require_call.matches[0].text,
+        r#"loader.require("plugin")"#
+    );
+
+    let receiver_require_is_not_import = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": { "kind": "import", "module": { "name": "plugin" } }
+        }),
+    );
+    assert!(
+        receiver_require_is_not_import.diagnostics.is_empty(),
+        "{:?}",
+        receiver_require_is_not_import.diagnostics
+    );
+    assert!(
+        receiver_require_is_not_import.matches.is_empty(),
+        "receiver require calls should not be classified as imports: {receiver_require_is_not_import:?}"
+    );
+
+    let qualified_class = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": { "kind": "class", "name": "External" }
+        }),
+    );
+    assert!(
+        qualified_class.diagnostics.is_empty(),
+        "{:?}",
+        qualified_class.diagnostics
+    );
+    assert_eq!(qualified_class.matches.len(), 1);
+    assert_eq!(qualified_class.matches[0].text, "class App::External…");
+
+    let declarations = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": { "kind": "declaration", "name": { "regex": "^(App|Service|run|audit|helper)$" } }
+        }),
+    );
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    let declaration_rows: Vec<_> = declarations
+        .matches
+        .iter()
+        .map(|m| (m.kind, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        declaration_rows,
+        vec![
+            ("class", "module App…"),
+            ("class", "class Service…"),
+            ("method", "def run(code)…"),
+            ("method", "def self.audit(code)…"),
+            ("function", "def helper…"),
+        ]
+    );
+
+    let lambda = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": { "kind": "lambda", "has": { "kind": "return" } }
+        }),
+    );
+    assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
+    assert_eq!(lambda.matches.len(), 1);
+    assert_eq!(lambda.matches[0].text, "->(value) {…");
+
+    let unsupported_decorator = run_query_with_files(
+        &[("ruby/app.rb", RUBY_APP)],
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "class",
+                "decorators": [{ "name": "Route" }]
+            }
+        }),
+    );
+    assert!(
+        unsupported_decorator
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "ruby"
+                && diagnostic.message.contains("decorators")),
+        "expected ruby decorator diagnostic: {:?}",
+        unsupported_decorator.diagnostics
+    );
 }
 
 #[test]

@@ -4,6 +4,7 @@ mod declarations;
 mod hierarchy;
 mod imports;
 mod mixins;
+mod structural;
 mod tests;
 
 use crate::analyzer::js_ts::build_weighted_cache;
@@ -231,6 +232,12 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
         self.inner.definition_lookup_index()
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
     }
 
     fn direct_children<'a>(
