@@ -4,7 +4,7 @@
 mod common;
 
 use brokk_bifrost::analyzer::structural::{AstQuery, SearchAstOutput, execute};
-use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
+use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 use common::InlineTestProject;
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -153,6 +153,114 @@ fn remaining_languages_search_without_unsupported_adapter_diagnostics_during_iss
         .map(|diagnostic| (diagnostic.language, diagnostic.message.as_str()))
         .collect();
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnostics() {
+    let cases = [
+        (
+            "java",
+            "java/App.java",
+            "class App { void audit() {} void run() { audit(); } }\n",
+            "audit()",
+        ),
+        (
+            "go",
+            "go/app.go",
+            "package app\n\nfunc audit() {}\nfunc run() { audit() }\n",
+            "audit()",
+        ),
+        (
+            "cpp",
+            "cpp/app.cpp",
+            "void audit() {}\nvoid run() { audit(); }\n",
+            "audit()",
+        ),
+        (
+            "javascript",
+            "javascript/app.js",
+            "function audit() {}\nfunction run() { audit(); }\n",
+            "audit()",
+        ),
+        (
+            "typescript",
+            "typescript/app.ts",
+            "function audit(): void {}\nfunction run(): void { audit(); }\n",
+            "audit()",
+        ),
+        (
+            "python",
+            "python/app.py",
+            "def audit():\n    pass\n\ndef run():\n    audit()\n",
+            "audit()",
+        ),
+        (
+            "rust",
+            "rust/lib.rs",
+            "fn audit() {}\nfn run() { audit(); }\n",
+            "audit()",
+        ),
+        (
+            "php",
+            "php/app.php",
+            "<?php\nfunction audit() {}\nfunction run() { audit(); }\n",
+            "audit()",
+        ),
+        (
+            "scala",
+            "scala/App.scala",
+            "object App { def audit(): Unit = (); def run(): Unit = audit() }\n",
+            "audit()",
+        ),
+        (
+            "csharp",
+            "csharp/App.cs",
+            "class App { void audit() {} void run() { audit(); } }\n",
+            "audit()",
+        ),
+        (
+            "ruby",
+            "ruby/app.rb",
+            "def audit; end\ndef run; audit(); end\n",
+            "audit()",
+        ),
+    ];
+    let files: Vec<_> = cases
+        .iter()
+        .map(|(_, path, source, _)| (*path, *source))
+        .collect();
+    let output = run_query_with_files(
+        &files,
+        json!({ "match": { "kind": "call", "callee": { "name": "audit" } } }),
+    );
+
+    assert!(
+        output.diagnostics.is_empty(),
+        "all analyzable languages should have structural adapters: {:?}",
+        output.diagnostics
+    );
+    assert_eq!(output.matches.len(), Language::ANALYZABLE.len());
+
+    let expected_languages: BTreeSet<_> = Language::ANALYZABLE
+        .iter()
+        .map(|language| language.config_label())
+        .collect();
+    let case_languages: BTreeSet<_> = cases.iter().map(|(language, _, _, _)| *language).collect();
+    assert_eq!(case_languages, expected_languages);
+
+    let actual_languages: BTreeSet<_> = output.matches.iter().map(|mat| mat.language).collect();
+    assert_eq!(actual_languages, expected_languages);
+
+    let expected_rows: BTreeSet<_> = cases
+        .iter()
+        .map(|(language, path, _, text)| (*language, *path, *text))
+        .collect();
+    let rows: BTreeSet<_> = output
+        .matches
+        .iter()
+        .map(|mat| (mat.language, mat.path.as_str(), mat.text.as_str()))
+        .collect();
+    assert_eq!(rows, expected_rows);
 }
 
 #[test]
