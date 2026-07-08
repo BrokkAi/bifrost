@@ -492,7 +492,7 @@ fn scala_declared_type_fqn(scala: &ScalaAnalyzer, fqn: &str) -> Option<String> {
     .map(|unit| unit.fq_name())
 }
 
-pub(super) fn preferred_scala_type<'a>(
+pub(in crate::analyzer::usages) fn preferred_scala_type<'a>(
     units: impl IntoIterator<Item = &'a CodeUnit>,
 ) -> Option<&'a CodeUnit> {
     let mut first = None;

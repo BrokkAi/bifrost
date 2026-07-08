@@ -51,9 +51,7 @@ pub(super) fn resolve_scala(
     let Some(tree) = tree else {
         return no_definition("scala_parse_failed", "Scala source could not be parsed");
     };
-    let types = context.scala_project_types(scala);
     let support = context.support;
-    let resolver = ScalaNameResolver::for_file(scala, file, types.as_ref());
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -72,6 +70,14 @@ pub(super) fn resolve_scala(
         );
     }
 
+    if let Some(outcome) =
+        resolve_scala_bare_apply_fast_path(scala, analyzer, support, file, source, root, node)
+    {
+        return outcome;
+    }
+
+    let types = context.scala_project_types(scala);
+    let resolver = ScalaNameResolver::for_file(scala, file, types.as_ref());
     let ctx = ScalaLookupCtx {
         scala,
         analyzer,
@@ -150,6 +156,149 @@ pub(super) fn resolve_scala(
             ),
         ),
     }
+}
+
+fn resolve_scala_bare_apply_fast_path(
+    scala: &ScalaAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    let Some(ScalaReferenceNode::Call(call)) = scala_reference_node(node) else {
+        return None;
+    };
+    let function = call.child_by_field_name("function")?;
+    if !matches!(function.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+    let name = scala_node_text(function, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let call_arity = call_arity_for_reference(function);
+    if scala_active_path_declares_name_before(root, source, name, function.start_byte())
+        || scala_enclosing_member_shadows_bare_call(
+            analyzer,
+            support,
+            file,
+            function.start_byte(),
+            name,
+        )
+        || scala_imported_member_shadows_bare_call(scala, support, file, name, call_arity)
+    {
+        return None;
+    }
+
+    let owner_fqn = scala_fast_visible_type_fqn(scala, support, file, name)?;
+    Some(scala_apply_or_type_outcome(support, &owner_fqn, name))
+}
+
+fn scala_apply_or_type_outcome(
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    reference: &str,
+) -> DefinitionLookupOutcome {
+    let companion_base = owner_fqn.trim_end_matches('$');
+    let mut apply_candidates = support.fqn(&format!("{companion_base}$.apply"));
+    if apply_candidates.is_empty() {
+        apply_candidates = support.fqn(&format!("{owner_fqn}.apply"));
+    }
+    if !apply_candidates.is_empty() {
+        return candidates_outcome(apply_candidates);
+    }
+    scala_fqn_outcome(support, owner_fqn, reference)
+}
+
+fn scala_fast_visible_type_fqn(
+    scala: &ScalaAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    name: &str,
+) -> Option<String> {
+    let file_package = scala_package_name_of(scala, file).unwrap_or_default();
+    let mut visible = scala_fast_type_in_package(support, &file_package, name);
+
+    for import in scala.import_info_of(file) {
+        let Some(path) = scala_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard {
+            let wildcard = scala_fast_wildcard_type_fqn(support, &path, &file_package, name)?;
+            if let Some(fqn) = wildcard {
+                visible = Some(fqn);
+            }
+            continue;
+        }
+
+        let local_name = import
+            .identifier
+            .as_deref()
+            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
+        if local_name != name {
+            continue;
+        }
+        visible = Some(scala_fast_unique_type_fqn_for_path(
+            support,
+            &path,
+            &file_package,
+        )?);
+    }
+
+    visible
+}
+
+fn scala_fast_type_in_package(
+    support: &DefinitionLookupIndex,
+    package: &str,
+    name: &str,
+) -> Option<String> {
+    preferred_scala_type(support.types_in_package(package, name)).map(|unit| unit.fq_name())
+}
+
+fn scala_fast_wildcard_type_fqn(
+    support: &DefinitionLookupIndex,
+    path: &str,
+    file_package: &str,
+    name: &str,
+) -> Option<Option<String>> {
+    let mut candidates = Vec::new();
+    for package in import_candidate_fq_names(path, file_package) {
+        if let Some(fqn) = scala_fast_type_in_package(support, &package, name) {
+            candidates.push(fqn);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    match candidates.len() {
+        0 => Some(None),
+        1 => candidates.pop().map(Some),
+        _ => None,
+    }
+}
+
+fn scala_fast_unique_type_fqn_for_path(
+    support: &DefinitionLookupIndex,
+    path: &str,
+    file_package: &str,
+) -> Option<String> {
+    let mut candidates = Vec::new();
+    for candidate in import_candidate_fq_names(path, file_package) {
+        let normalized = scala_normalized_fq_name(&candidate);
+        if let Some(unit) = preferred_scala_type(
+            support
+                .by_normalized_fqn(&normalized)
+                .iter()
+                .filter(|unit| unit.is_class()),
+        ) {
+            candidates.push(unit.fq_name());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 fn scala_type_lookup_node_fqn(
@@ -861,6 +1010,14 @@ fn scala_member_candidate_applies(
     unit: &CodeUnit,
     call_arity: Option<usize>,
 ) -> bool {
+    scala_member_unit_applies(ctx.scala, unit, call_arity)
+}
+
+fn scala_member_unit_applies(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    call_arity: Option<usize>,
+) -> bool {
     if unit.is_field() {
         return true;
     }
@@ -869,9 +1026,9 @@ fn scala_member_candidate_applies(
     }
     match call_arity {
         Some(call_arity) => {
-            method_signature_arity(ctx.scala, unit).is_some_and(|arity| arity == call_arity)
+            method_signature_arity(scala, unit).is_some_and(|arity| arity == call_arity)
         }
-        None => method_signature_arity(ctx.scala, unit).is_none_or(|arity| arity == 0),
+        None => method_signature_arity(scala, unit).is_none_or(|arity| arity == 0),
     }
 }
 
@@ -1380,6 +1537,67 @@ fn scala_enclosing_class_parameter_type(
     None
 }
 
+fn scala_active_path_declares_name_before(
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+    cutoff_start: usize,
+) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= cutoff_start {
+            continue;
+        }
+        let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
+        let contains_cutoff = node.start_byte() <= cutoff_start && cutoff_start < node.end_byte();
+        if enters_scope && !contains_cutoff {
+            if node.kind() == "function_definition"
+                && scala_node_declares_name_before(node, source, name, 0, cutoff_start)
+            {
+                return true;
+            }
+            continue;
+        }
+
+        match node.kind() {
+            "class_definition" | "function_definition" => {
+                if scala_parameters_declare_name_before(node, source, name, cutoff_start) {
+                    return true;
+                }
+            }
+            "val_definition" | "var_definition"
+                if !scala_is_direct_member_value_definition(node)
+                    && scala_node_declares_name_before(node, source, name, 0, cutoff_start) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node
+            .named_children(&mut cursor)
+            .take_while(|child| child.start_byte() < cutoff_start)
+            .collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    false
+}
+
+fn scala_parameters_declare_name_before(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+    cutoff_start: usize,
+) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "parameters" | "class_parameters"))
+        .filter(|child| child.start_byte() < cutoff_start)
+        .any(|child| scala_node_declares_name_before(child, source, name, 0, cutoff_start))
+}
+
 fn scala_active_path_declares_name_after(
     node: Node<'_>,
     source: &str,
@@ -1601,6 +1819,100 @@ fn scala_enclosing_class(
         .enclosing(byte)?
         .to_string();
     analyzer.definitions(&fqn).next().cloned()
+}
+
+fn scala_enclosing_member_shadows_bare_call(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    byte: usize,
+    name: &str,
+) -> bool {
+    let Some(owner) = scala_enclosing_class(analyzer, file, byte) else {
+        return false;
+    };
+    if owner.identifier().trim_end_matches('$') == name {
+        return false;
+    }
+    if scala_owner_declares_member(support, &owner, name) {
+        return true;
+    }
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return false;
+    };
+    let mut seen = HashSet::default();
+    let mut stack = provider.get_direct_ancestors(&owner);
+    while let Some(ancestor) = stack.pop() {
+        if !seen.insert(ancestor.fq_name()) {
+            continue;
+        }
+        if scala_owner_declares_member(support, &ancestor, name) {
+            return true;
+        }
+        stack.extend(provider.get_direct_ancestors(&ancestor));
+    }
+    false
+}
+
+fn scala_owner_declares_member(
+    support: &DefinitionLookupIndex,
+    owner: &CodeUnit,
+    name: &str,
+) -> bool {
+    let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
+    support
+        .members_for_owner_name(&owner.fq_name(), &normalized_owner, name)
+        .into_iter()
+        .any(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
+}
+
+fn scala_imported_member_shadows_bare_call(
+    scala: &ScalaAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    name: &str,
+    call_arity: Option<usize>,
+) -> bool {
+    let file_package = scala_package_name_of(scala, file).unwrap_or_default();
+    for import in scala.import_info_of(file) {
+        let Some(path) = scala_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard {
+            for owner_fqn in import_candidate_owner_fq_names(&path, &file_package) {
+                if support
+                    .fqn_direct_children(&owner_fqn)
+                    .into_iter()
+                    .any(|unit| {
+                        unit.identifier() == name
+                            && scala_member_unit_applies(scala, &unit, call_arity)
+                    })
+                {
+                    return true;
+                }
+            }
+            continue;
+        }
+
+        let local_name = import
+            .identifier
+            .as_deref()
+            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
+        if local_name != name {
+            continue;
+        }
+        for candidate in import_candidate_fq_names(&path, &file_package) {
+            let normalized = scala_normalized_fq_name(&candidate);
+            if support
+                .by_normalized_fqn(&normalized)
+                .iter()
+                .any(|unit| unit.is_function() || unit.is_field())
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 const SCALA_SCOPE_NODES: &[&str] = &[
