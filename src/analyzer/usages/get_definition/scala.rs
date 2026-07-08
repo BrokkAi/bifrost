@@ -192,7 +192,7 @@ fn resolve_scala_bare_apply_fast_path(
         return None;
     }
 
-    let owner_fqn = scala_fast_visible_type_fqn(scala, support, file, name)?;
+    let owner_fqn = scala_visible_type_fqn_from_index(scala, support, file, name)?;
     Some(scala_apply_or_type_outcome(support, &owner_fqn, name))
 }
 
@@ -210,95 +210,6 @@ fn scala_apply_or_type_outcome(
         return candidates_outcome(apply_candidates);
     }
     scala_fqn_outcome(support, owner_fqn, reference)
-}
-
-fn scala_fast_visible_type_fqn(
-    scala: &ScalaAnalyzer,
-    support: &DefinitionLookupIndex,
-    file: &ProjectFile,
-    name: &str,
-) -> Option<String> {
-    let file_package = scala_package_name_of(scala, file).unwrap_or_default();
-    let mut visible = scala_fast_type_in_package(support, &file_package, name);
-
-    for import in scala.import_info_of(file) {
-        let Some(path) = scala_import_path(import) else {
-            continue;
-        };
-        if import.is_wildcard {
-            let wildcard = scala_fast_wildcard_type_fqn(support, &path, &file_package, name)?;
-            if let Some(fqn) = wildcard {
-                visible = Some(fqn);
-            }
-            continue;
-        }
-
-        let local_name = import
-            .identifier
-            .as_deref()
-            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
-        if local_name != name {
-            continue;
-        }
-        visible = Some(scala_fast_unique_type_fqn_for_path(
-            support,
-            &path,
-            &file_package,
-        )?);
-    }
-
-    visible
-}
-
-fn scala_fast_type_in_package(
-    support: &DefinitionLookupIndex,
-    package: &str,
-    name: &str,
-) -> Option<String> {
-    preferred_scala_type(support.types_in_package(package, name)).map(|unit| unit.fq_name())
-}
-
-fn scala_fast_wildcard_type_fqn(
-    support: &DefinitionLookupIndex,
-    path: &str,
-    file_package: &str,
-    name: &str,
-) -> Option<Option<String>> {
-    let mut candidates = Vec::new();
-    for package in import_candidate_fq_names(path, file_package) {
-        if let Some(fqn) = scala_fast_type_in_package(support, &package, name) {
-            candidates.push(fqn);
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    match candidates.len() {
-        0 => Some(None),
-        1 => candidates.pop().map(Some),
-        _ => None,
-    }
-}
-
-fn scala_fast_unique_type_fqn_for_path(
-    support: &DefinitionLookupIndex,
-    path: &str,
-    file_package: &str,
-) -> Option<String> {
-    let mut candidates = Vec::new();
-    for candidate in import_candidate_fq_names(path, file_package) {
-        let normalized = scala_normalized_fq_name(&candidate);
-        if let Some(unit) = preferred_scala_type(
-            support
-                .by_normalized_fqn(&normalized)
-                .iter()
-                .filter(|unit| unit.is_class()),
-        ) {
-            candidates.push(unit.fq_name());
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 fn scala_type_lookup_node_fqn(
@@ -693,20 +604,7 @@ fn resolve_scala_call(
                 return imported_member;
             }
             if let Some(owner_fqn) = resolver.resolve(name) {
-                // A call `Foo(..)` resolves to the companion object's `apply` when
-                // one exists. `name` may resolve to the class `Foo` or the companion
-                // object `Foo$` — they share a simple name, so `resolve` picks one
-                // arbitrarily — so reconstruct the companion object fqn (`Foo$`) and
-                // prefer its `apply` deterministically, regardless of which resolved.
-                let companion_base = owner_fqn.trim_end_matches('$');
-                let mut apply_candidates = ctx.support.fqn(&format!("{companion_base}$.apply"));
-                if apply_candidates.is_empty() {
-                    apply_candidates = ctx.support.fqn(&format!("{owner_fqn}.apply"));
-                }
-                if !apply_candidates.is_empty() {
-                    return candidates_outcome(apply_candidates);
-                }
-                return scala_fqn_outcome(ctx.support, &owner_fqn, name);
+                return scala_apply_or_type_outcome(ctx.support, &owner_fqn, name);
             }
             if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name) {
                 return boundary(format!(
@@ -1138,9 +1036,7 @@ fn scala_member_candidate_units_with_seen(
         return Vec::new();
     }
 
-    let mut candidates = ctx.support.fqn(&format!("{owner_fqn}.{member}"));
-    sort_units(&mut candidates);
-    candidates.dedup();
+    let candidates = scala_direct_member_candidate_units(ctx.support, owner_fqn, member);
     if !candidates.is_empty() {
         return candidates;
     }
@@ -1181,6 +1077,17 @@ fn scala_member_candidate_units_with_seen(
     }
 
     scala_owner_source_ancestor_member_units(ctx, owner_fqn, member, seen_owner_fqns)
+}
+
+fn scala_direct_member_candidate_units(
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = support.fqn(&format!("{owner_fqn}.{member}"));
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 fn scala_owner_source_ancestor_member_units(
@@ -1859,9 +1766,7 @@ fn scala_owner_declares_member(
     owner: &CodeUnit,
     name: &str,
 ) -> bool {
-    let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
-    support
-        .members_for_owner_name(&owner.fq_name(), &normalized_owner, name)
+    scala_direct_member_candidate_units(support, &owner.fq_name(), name)
         .into_iter()
         .any(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
 }

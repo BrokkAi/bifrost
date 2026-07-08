@@ -1,7 +1,7 @@
 use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, scala_import_path};
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile, ScalaAnalyzer,
-    TypeHierarchyProvider,
+    CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
+    ScalaAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -905,6 +905,95 @@ pub(in crate::analyzer::usages) fn import_candidate_owner_fq_names(
         }
     }
     owners
+}
+
+pub(in crate::analyzer::usages) fn scala_visible_type_fqn_from_index(
+    scala: &ScalaAnalyzer,
+    index: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    name: &str,
+) -> Option<String> {
+    let file_package = package_name_of(scala, file).unwrap_or_default();
+    let mut visible = scala_type_in_index_package(index, &file_package, name);
+
+    for import in scala.import_info_of(file) {
+        let Some(path) = scala_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard {
+            let wildcard = scala_wildcard_type_fqn_from_index(index, &path, &file_package, name)?;
+            if let Some(fqn) = wildcard {
+                visible = Some(fqn);
+            }
+            continue;
+        }
+
+        let local_name = import
+            .identifier
+            .as_deref()
+            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
+        if local_name != name {
+            continue;
+        }
+        visible = Some(scala_unique_type_fqn_for_index_path(
+            index,
+            &path,
+            &file_package,
+        )?);
+    }
+
+    visible
+}
+
+fn scala_type_in_index_package(
+    index: &DefinitionLookupIndex,
+    package: &str,
+    name: &str,
+) -> Option<String> {
+    preferred_scala_type(index.types_in_package(package, name)).map(|unit| unit.fq_name())
+}
+
+fn scala_wildcard_type_fqn_from_index(
+    index: &DefinitionLookupIndex,
+    path: &str,
+    file_package: &str,
+    name: &str,
+) -> Option<Option<String>> {
+    let mut candidates = Vec::new();
+    for package in import_candidate_fq_names(path, file_package) {
+        if let Some(fqn) = scala_type_in_index_package(index, &package, name) {
+            candidates.push(fqn);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    match candidates.len() {
+        0 => Some(None),
+        1 => candidates.pop().map(Some),
+        _ => None,
+    }
+}
+
+fn scala_unique_type_fqn_for_index_path(
+    index: &DefinitionLookupIndex,
+    path: &str,
+    file_package: &str,
+) -> Option<String> {
+    let mut candidates = Vec::new();
+    for candidate in import_candidate_fq_names(path, file_package) {
+        let normalized = scala_normalized_fq_name(&candidate);
+        if let Some(unit) = preferred_scala_type(
+            index
+                .by_normalized_fqn(&normalized)
+                .iter()
+                .filter(|unit| unit.is_class()),
+        ) {
+            candidates.push(unit.fq_name());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 fn object_member_fq_name(fq_name: &str) -> String {
