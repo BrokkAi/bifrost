@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The user-visible proof is behavioral parity. Running the import and hierarchy te
 
 ## Progress
 
-- [x] (2026-03-30 18:11Z) Read `.agent/PLANS.md`, inspected Bifrost and Brokk capability support, and confirmed parity-first scope.
+- [x] (2026-03-30 18:11Z) Read `.agents/PLANS.md`, inspected Bifrost and Brokk capability support, and confirmed parity-first scope.
 - [x] (2026-03-30 18:11Z) Identified the duplicated behaviors worth centralizing: generic reverse-import scans and generic descendant scans.
 - [x] (2026-03-30 18:20Z) Implemented shared capability helpers in `src/analyzer/capabilities.rs` and re-exported them for internal analyzer use.
 - [x] (2026-03-30 18:20Z) Refactored Go, Python, JavaScript, TypeScript, and Rust reverse-import scans to use the shared helper while preserving per-analyzer caches.

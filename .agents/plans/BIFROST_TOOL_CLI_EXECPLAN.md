@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ Today `bifrost` has a merge conflict in `src/bin/bifrost.rs` between the default
 
 ## Progress
 
-- [x] (2026-06-08T16:04:56Z) Read `.agent/PLANS.md`, inspected the dirty worktree, confirmed `src/bin/bifrost.rs` is the only merge-conflicted file, and verified the conflict is between default server startup and an in-progress `--summarize` path.
+- [x] (2026-06-08T16:04:56Z) Read `.agents/PLANS.md`, inspected the dirty worktree, confirmed `src/bin/bifrost.rs` is the only merge-conflicted file, and verified the conflict is between default server startup and an in-progress `--summarize` path.
 - [x] (2026-06-08T16:04:56Z) Inspected `src/mcp_common.rs`, `src/searchtools_service.rs`, `src/mcp_registry.rs`, `README.md`, and the current test suite to confirm that direct tool invocation can reuse `SearchToolsService` and that MCP currently owns the path-normalization logic.
 - [x] (2026-06-08T16:14:44Z) Added `src/tool_arguments.rs`, moved MCP path-normalization logic into the shared helper, and switched `src/mcp_common.rs` to call that helper.
 - [x] (2026-06-08T16:14:44Z) Replaced the conflicted `src/bin/bifrost.rs` contents with a direct `--tool` mode backed by `SearchToolsService`, preserved the current default MCP server behavior, and removed the abandoned `--summarize` path.

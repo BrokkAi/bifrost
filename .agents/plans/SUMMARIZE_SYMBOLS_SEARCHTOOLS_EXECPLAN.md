@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with [`.agent/PLANS.md`](../../.agent/PLANS.md).
+This document must be maintained in accordance with [`.agents/PLANS.md`](../../.agents/PLANS.md).
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ After this change, bifrost will render compact symbol skims with the same recurs
 
 ## Progress
 
-- [x] (2026-04-04T11:40Z) Read `.agent/PLANS.md`, the current Rust analyzer/searchtools surfaces, and Brokk’s `IAnalyzer.java` implementation to scope the port.
+- [x] (2026-04-04T11:40Z) Read `.agents/PLANS.md`, the current Rust analyzer/searchtools surfaces, and Brokk’s `IAnalyzer.java` implementation to scope the port.
 - [x] (2026-04-04T11:49Z) Ported recursive `summarize_symbols` behavior into `src/analyzer/i_analyzer.rs`, including top-level package grouping and nested child rendering.
 - [x] (2026-04-04T11:50Z) Exposed `summarize_symbols` through `src/searchtools.rs`, `src/searchtools_service.rs`, `src/mcp_server.rs`, and the Python client while keeping `skim_files` as a compatibility alias.
 - [x] (2026-04-04T11:55Z) Added and ran focused Rust and Python regression tests for recursion, package grouping, JSON service behavior, MCP exposure, and the Python client entry point.

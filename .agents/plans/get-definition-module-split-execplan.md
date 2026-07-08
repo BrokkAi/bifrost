@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with [.agent/PLANS.md](../../.agent/PLANS.md).
+This document must be maintained in accordance with [.agents/PLANS.md](../../.agents/PLANS.md).
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ After this change, the get-definition resolver remains behaviorally identical, b
 
 ## Progress
 
-- [x] (2026-06-20 00:27Z) Read `.agent/PLANS.md`, inspected `src/analyzer/usages/get_definition.rs`, and mapped the top-level resolver sections by language.
+- [x] (2026-06-20 00:27Z) Read `.agents/PLANS.md`, inspected `src/analyzer/usages/get_definition.rs`, and mapped the top-level resolver sections by language.
 - [x] (2026-06-20 00:40Z) Split `src/analyzer/usages/get_definition.rs` into `src/analyzer/usages/get_definition/{mod.rs,cpp.rs,rust.rs,go.rs,js_ts.rs,scala.rs,java.rs,csharp.rs,python.rs,php.rs}` and rewired the dispatcher and parse helpers through child modules.
 - [x] (2026-06-20 00:48Z) Ran `cargo fmt`, `cargo check`, and `cargo clippy --all-targets --all-features -- -D warnings` successfully after fixing shared dotted-reference helpers needed by both Rust and Go.
 

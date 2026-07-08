@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 
 ## Progress
 
-- [x] (2026-06-04T10:15Z) Read issue `#170`, `.agent/PLANS.md`, and the current worktree state. The worktree is detached at `HEAD`, so there is no branch-specific rebase target for this planning pass.
+- [x] (2026-06-04T10:15Z) Read issue `#170`, `.agents/PLANS.md`, and the current worktree state. The worktree is detached at `HEAD`, so there is no branch-specific rebase target for this planning pass.
 - [x] (2026-06-04T10:25Z) Confirmed the core local seams the harness should reuse: `src/analyzer/workspace.rs` provides `WorkspaceAnalyzer::build*`, `src/searchtools_service.rs` is the in-process tool dispatcher, `src/mcp_common.rs` owns the MCP stdio request/response loop, and `tests/bifrost_mcp_server.rs` already contains a minimal JSON-RPC helper for real `tools/call` traffic.
 - [x] (2026-06-04T10:35Z) Confirmed there is no existing benchmark harness in this repository. Current workflows are `ci.yml`, `release.yml`, and `publish-crate.yml`; there is no scheduled perf workflow yet.
 - [x] (2026-06-04T10:45Z) Compared the local code with sibling precedent. Brokk's `TreeSitterRepoRunner` is much larger and JVM-specific, while SlopCop's TOML benchmark manifest demonstrates the right style for a checked-in pinned corpus manifest.

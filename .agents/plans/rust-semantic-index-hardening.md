@@ -1,6 +1,6 @@
 # Rust Semantic Index Hardening
 
-This ExecPlan is a living document. It follows `.agent/PLANS.md`, the canonical instructions for ExecPlans in this repository.
+This ExecPlan is a living document. It follows `.agents/PLANS.md`, the canonical instructions for ExecPlans in this repository.
 
 ## Purpose / Big Picture
 
@@ -8,7 +8,7 @@ The semantic indexer should never look permanently hung when the worker has actu
 
 ## Progress
 
-- [x] (2026-07-07 00:00Z) Read `.agent/PLANS.md`, `src/nlp/indexer.rs`, `src/nlp/voyage_sidecar.rs`, `src/searchtools_service.rs`, `bifrost_searchtools/models.py`, and existing semantic tests.
+- [x] (2026-07-07 00:00Z) Read `.agents/PLANS.md`, `src/nlp/indexer.rs`, `src/nlp/voyage_sidecar.rs`, `src/searchtools_service.rs`, `bifrost_searchtools/models.py`, and existing semantic tests.
 - [x] (2026-07-07 00:00Z) Add panic-to-failed handling around `worker_loop` and a model-free panic test.
 - [x] (2026-07-07 00:00Z) Add sidecar warmup failure and ready-timeout handling with a stub-script test.
 - [x] (2026-07-07 00:00Z) Add materialization progress counters to status, Rust coverage, and Python client fields.

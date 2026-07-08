@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md`. It is self-contained and describes how to change the Rust analyzer API so callers borrow immutable analyzer state instead of repeatedly cloning sorted collections.
+This document follows `.agents/PLANS.md`. It is self-contained and describes how to change the Rust analyzer API so callers borrow immutable analyzer state instead of repeatedly cloning sorted collections.
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ The current Rust port exposes many immutable analyzer collections as owned `Vec`
 
 ## Progress
 
-- [x] (2026-04-23T07:22:28Z) Read `.agent/PLANS.md` and current trait/state layout.
+- [x] (2026-04-23T07:22:28Z) Read `.agents/PLANS.md` and current trait/state layout.
 - [x] (2026-04-23T07:22:28Z) Recorded the implementation strategy and API shape in this ExecPlan.
 - [x] (2026-04-23T07:26:50Z) Converted `IAnalyzer` and `ImportAnalysisProvider` to include borrowed state-view methods while keeping owned adapter methods for compatibility.
 - [x] (2026-04-23T07:26:50Z) Updated `TreeSitterAnalyzer`, language analyzer wrappers, `MultiAnalyzer`, `WorkspaceAnalyzer`, and the searchtools test helper to compile against the borrowed-view API.

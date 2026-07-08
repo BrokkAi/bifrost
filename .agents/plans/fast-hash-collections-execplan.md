@@ -1,6 +1,6 @@
 # Use Fast Hash Collections Internally
 
-This ExecPlan is a living document. It follows `.agent/PLANS.md` and must be kept current as implementation proceeds.
+This ExecPlan is a living document. It follows `.agents/PLANS.md` and must be kept current as implementation proceeds.
 
 ## Purpose / Big Picture
 

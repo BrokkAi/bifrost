@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with [.agent/PLANS.md](../../.agent/PLANS.md).
+This document must be maintained in accordance with [.agents/PLANS.md](../../.agents/PLANS.md).
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ After this change, `most_relevant_files` can accept explicit per-seed weights ag
 
 ## Progress
 
-- [x] (2026-06-10T21:18:00Z) Re-read `AGENTS.md` and `.agent/PLANS.md`, then inspected `src/relevance.rs`, `src/searchtools.rs`, `src/tool_arguments.rs`, `src/mcp_extended.rs`, `src/searchtools_render.rs`, `bifrost_searchtools/client.py`, `bifrost_searchtools/models.py`, and `tests/most_relevant_files.rs`.
+- [x] (2026-06-10T21:18:00Z) Re-read `AGENTS.md` and `.agents/PLANS.md`, then inspected `src/relevance.rs`, `src/searchtools.rs`, `src/tool_arguments.rs`, `src/mcp_extended.rs`, `src/searchtools_render.rs`, `bifrost_searchtools/client.py`, `bifrost_searchtools/models.py`, and `tests/most_relevant_files.rs`.
 - [x] (2026-06-10T21:18:00Z) Confirmed the current gaps: `normalized_seed_weights` is misnamed and silently stacks duplicates, `most_relevant_files` resolves literals without duplicate detection, and `related_files_by_git` still uses uniform per-commit mass while `most_important_project_files` already uses `1/(index+1)`.
 - [x] (2026-06-10T21:59:00Z) Added optional `seed_weights` to `MostRelevantFilesParams`, validated length/positivity/finiteness, changed `most_relevant_files` to return `Result<MostRelevantFilesResult, String>`, and threaded the new parameter through MCP schema, CLI handling, and the Python client/model.
 - [x] (2026-06-10T21:59:00Z) Added duplicate resolved-seed detection after literal resolution, surfaced duplicates through `MostRelevantFilesResult`, and updated text rendering and Python deserialization to show duplicate failures without ranking.

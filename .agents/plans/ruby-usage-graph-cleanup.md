@@ -1,6 +1,6 @@
 # Ruby usage-graph cleanup: modular layout, cached semantics, precomputed dispatch mode, edge path
 
-This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agent/PLANS.md` at the repository root.
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agents/PLANS.md` at the repository root.
 
 This plan is the Ruby follow-up deliberately carved out of `.agents/plans/unified-symbol-resolution.md` (checked in; its Decision Log records why Ruby was excluded there). Ruby's problems are structural rather than "swap a map": one monolithic file, workspace-wide facts rebuilt on every query, a per-candidate file re-parse in the hot path, and a missing whole-workspace edge path that silently excludes Ruby from `usage_graph` and dead-code analysis.
 

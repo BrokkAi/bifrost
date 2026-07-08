@@ -1,12 +1,12 @@
-# Codex Execution Plans (ExecPlans):
+# Code Agent Execution Plans (ExecPlans)
 
-This document describes the requirements for an execution plan ("ExecPlan"), a design document that a coding agent can follow to deliver a working feature or system change. Treat the reader as a complete beginner to this repository: they have only the current working tree and the single ExecPlan file you provide. There is no memory of prior plans and no external context.
+This document describes the requirements for an execution plan ("ExecPlan"), a design document that a code agent or human contributor can follow to deliver a working feature or system change. Treat the reader as a complete beginner to this repository: they have only the current working tree, this instructions file, and the single ExecPlan file you provide. There is no memory of prior plans and no external context.
 
 ## How to use ExecPlans and PLANS.md
 
 When authoring an executable specification (ExecPlan), follow PLANS.md _to the letter_. If it is not in your context, refresh your memory by reading the entire PLANS.md file. Be thorough in reading (and re-reading) source material to produce an accurate specification. When creating a spec, start from the skeleton and flesh it out as you do your research.
 
-This file, `.agent/PLANS.md`, is the canonical rules document for ExecPlans. Store individual ExecPlan files under `.agents/plans/`, not under `.agent/` and not under `docs/`. Store agent-facing notes and runbooks that are not ExecPlans under `.agents/docs/`. Reserve `docs/` for human-readable documentation intended to be rendered or published.
+This file, `.agents/PLANS.md`, is the canonical rules document for ExecPlans. Store individual ExecPlan files under `.agents/plans/`, not under `.agent/` and not under `docs/`. Store agent-facing notes and runbooks that are not ExecPlans under `.agents/docs/`. Reserve `docs/` for human-readable documentation intended to be rendered or published.
 
 When implementing an executable specification (ExecPlan), do not prompt the user for "next steps"; simply proceed to the next milestone. Keep all sections up to date, add or split entries in the list at every stopping point to affirmatively state the progress made and next steps. Resolve ambiguities autonomously, and commit frequently.
 
@@ -26,7 +26,7 @@ NON-NEGOTIABLE REQUIREMENTS:
 
 Purpose and intent come first. Begin by explaining, in a few sentences, why the work matters from a user's perspective: what someone can do after this change that they could not do before, and how to see it working. Then guide the reader through the exact steps to achieve that outcome, including what to edit, what to run, and what they should observe.
 
-The agent executing your plan can list files, read files, search, run the project, and run tests. It does not know any prior context and cannot infer what you meant from earlier milestones. Repeat any assumption you rely on. Do not point to external blogs or docs; if knowledge is required, embed it in the plan itself in your own words. If an ExecPlan builds upon a prior ExecPlan and that file is checked in, incorporate it by reference. If it is not, you must include all relevant context from that plan.
+The agent or contributor executing your plan can list files, read files, search, run the project, and run tests. They do not know any prior context and cannot infer what you meant from earlier milestones. Repeat any assumption you rely on. Do not point to external blogs or docs; if knowledge is required, embed it in the plan itself in your own words. If an ExecPlan builds upon a prior ExecPlan and that file is checked in, incorporate it by reference. If it is not, you must include all relevant context from that plan.
 
 ## Formatting
 

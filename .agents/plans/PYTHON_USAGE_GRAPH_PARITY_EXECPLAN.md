@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 
 ## Progress
 
-- [x] (2026-05-18T11:30Z) Read `.agent/PLANS.md`, `src/usages/graph_core.rs`, `src/usages/python_graph.rs`, `src/usages/finder.rs`, `tests/usages_python_test.rs`, `tests/common/inline_project.rs`, and Brokk’s Python usage-graph strategy/reference-graph tests.
+- [x] (2026-05-18T11:30Z) Read `.agents/PLANS.md`, `src/usages/graph_core.rs`, `src/usages/python_graph.rs`, `src/usages/finder.rs`, `tests/usages_python_test.rs`, `tests/common/inline_project.rs`, and Brokk’s Python usage-graph strategy/reference-graph tests.
 - [x] (2026-05-18T11:30Z) Chose a new repo-root plan name, `PYTHON_USAGE_GRAPH_PARITY_EXECPLAN.md`, because this document is intentionally broader than issue `#74`.
 - [x] (2026-05-18T11:30Z) Captured the current `bifrost` baseline: Python is already routed through `PythonExportUsageGraphStrategy`, but Rust-side coverage is still shallow compared with Brokk’s strategy and reference-graph suites.
 - [x] (2026-05-18T12:05Z) Completed Milestone 1 by expanding the focused Python graph suite for `UsageFinder` routing, `MultiAnalyzer` routing, `TooManyCallsites`, and same-file regex fallback, then fixing `PythonExportUsageGraphStrategy` so it can resolve a `PythonAnalyzer` out of `MultiAnalyzer` instead of silently dropping to regex.
@@ -220,7 +220,7 @@ If a milestone stalls midway, do not skip ahead. Update `Progress` to describe e
 
 Important local references for this plan are:
 
-    .agent/PLANS.md
+    .agents/PLANS.md
     src/usages/graph_core.rs
     src/usages/python_graph.rs
     src/usages/finder.rs

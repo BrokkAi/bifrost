@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md` from the repository root. Any contributor who changes this work must update this file so it remains self-contained and accurate. This plan also follows the repository `AGENTS.md` expectations: keep the branch already checked out, do not create or switch branches, avoid parser-replacing text heuristics, prefer structured analyzer data, run focused validation before expensive checks, run guided review at milestone checkpoints, and commit directly on the current branch between milestones.
+This document follows `.agents/PLANS.md` from the repository root. Any contributor who changes this work must update this file so it remains self-contained and accurate. This plan also follows the repository `AGENTS.md` expectations: keep the branch already checked out, do not create or switch branches, avoid parser-replacing text heuristics, prefer structured analyzer data, run focused validation before expensive checks, run guided review at milestone checkpoints, and commit directly on the current branch between milestones.
 
 ## Purpose / Big Picture
 

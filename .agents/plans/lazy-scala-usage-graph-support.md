@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md` from the repository root. It is self-contained and describes the implementation needed to speed up Scala `usage_graph` calls that pass a `paths` filter without changing the graph edges those calls return.
+This document follows `.agents/PLANS.md` from the repository root. It is self-contained and describes the implementation needed to speed up Scala `usage_graph` calls that pass a `paths` filter without changing the graph edges those calls return.
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ After this change, path-scoped Scala `usage_graph` calls should preserve existin
 
 ## Progress
 
-- [x] (2026-07-07) Read `.agent/PLANS.md` and the relevant Scala usage graph code in `src/analyzer/usages/scala_graph/{shared.rs,inverted.rs}`.
+- [x] (2026-07-07) Read `.agents/PLANS.md` and the relevant Scala usage graph code in `src/analyzer/usages/scala_graph/{shared.rs,inverted.rs}`.
 - [x] (2026-07-07) Confirmed production bottleneck shape: `ScalaEdgeResolver::try_new` calls `scala.project_types()` and `build_method_override_targets(scala, &types)` before path filtering applies.
 - [x] (2026-07-07) Replace eager extension-method discovery with per-file, per-member, per-import owner lookup.
 - [x] (2026-07-07) Replace eager `build_method_override_targets` with a lazy cache queried only for function definitions encountered in scanned files.

@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md` in this repository. It is self-contained so a contributor can restart from only this file and the current working tree.
+This document follows `.agents/PLANS.md` in this repository. It is self-contained so a contributor can restart from only this file and the current working tree.
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ The current `get_definition` tool requires callers to identify a reference by li
 
 ## Progress
 
-- [x] (2026-06-18) Read `.agent/PLANS.md`, inspected the current MCP registry, service dispatch, public response structs, and internal resolver shape.
+- [x] (2026-06-18) Read `.agents/PLANS.md`, inspected the current MCP registry, service dispatch, public response structs, and internal resolver shape.
 - [x] (2026-06-18) Created this ExecPlan before implementation.
 - [x] (2026-06-18) Added public request/response structs and wrapper functions for location and reference modes.
 - [x] (2026-06-18) Updated MCP descriptors and registry construction so `--no-line-numbers` selects the reference tool while normal line-number mode selects the location tool.

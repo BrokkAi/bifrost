@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ After this change, `bifrost` will expose a long-lived machine-facing searchtools
 
 ## Progress
 
-- [x] (2026-03-24 22:32Z) Re-read `.agent/PLANS.md`, inspected the current `bifrost` tree, and confirmed the worktree was clean before starting.
+- [x] (2026-03-24 22:32Z) Re-read `.agents/PLANS.md`, inspected the current `bifrost` tree, and confirmed the worktree was clean before starting.
 - [x] (2026-03-24 22:32Z) Inspected Brokk `SearchTools`, `SearchToolsTest`, `AlmostGrep`, `SummaryFragment`, `UsageFinder`, and `BrokkExternalMcpServer` to lock scope and formatting behavior.
 - [x] (2026-03-24 22:32Z) Locked scope with the user: analyzer-backed tools only; `scanUsages` out of scope; binary name is `bifrost`; summary/source outputs must use original file line numbers rather than Brokk MCP's snippet-local numbering.
 - [x] (2026-03-24 23:18Z) Added filesystem-root project loading, workspace analyzer construction, and the first typed Rust searchtools result layer.

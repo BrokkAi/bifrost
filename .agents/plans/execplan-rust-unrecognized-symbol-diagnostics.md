@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md` in this repository. It is self-contained so a future contributor can continue the implementation without relying on prior chat context.
+This document follows `.agents/PLANS.md` in this repository. It is self-contained so a future contributor can continue the implementation without relying on prior chat context.
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The observable outcome is an LSP diagnostic with source `bifrost-rust` and code 
 
 ## Progress
 
-- [x] (2026-07-01 12:36Z) Created this ExecPlan after reading `.agent/PLANS.md`, inspecting the existing LSP diagnostic hook, and confirming Rust has no `semantic_diagnostics` override yet.
+- [x] (2026-07-01 12:36Z) Created this ExecPlan after reading `.agents/PLANS.md`, inspecting the existing LSP diagnostic hook, and confirming Rust has no `semantic_diagnostics` override yet.
 - [x] (2026-07-01 12:42Z) Added `src/analyzer/rust/diagnostics.rs` and wired `RustAnalyzer::semantic_diagnostics` to the collector.
 - [x] (2026-07-01 12:44Z) Added analyzer tests for unknown references, known local/import/module references, conservative suppression cases, malformed files, and diagnostic caps; added LSP pull, parse-only, and publish diagnostics tests.
 - [x] (2026-07-01 12:48Z) Ran focused tests, formatting, and no-CUDA clippy validation successfully.

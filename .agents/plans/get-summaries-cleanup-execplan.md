@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with [.agent/PLANS.md](../../.agent/PLANS.md).
+This document must be maintained in accordance with [.agents/PLANS.md](../../.agents/PLANS.md).
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The user-visible proof is that Rust tests for `get_summaries` stop expecting `di
 
 ## Progress
 
-- [x] (2026-06-02 15:27Z) Read `.agent/PLANS.md`, inspected the current `searchtools`/service/Python wrapper contract, and confirmed the working tree already contains unrelated edits in the same files.
+- [x] (2026-06-02 15:27Z) Read `.agents/PLANS.md`, inspected the current `searchtools`/service/Python wrapper contract, and confirmed the working tree already contains unrelated edits in the same files.
 - [x] (2026-06-02 15:42Z) Refactored `src/searchtools.rs` so `SummaryResult` no longer contains `directory_symbols` and direct Rust `get_summaries` reports directory targets in `not_found`.
 - [x] (2026-06-02 15:45Z) Added service-only `get_summaries` composition so MCP/Python callers still receive optional `directory_symbols`, including mixed directory plus non-directory calls.
 - [x] (2026-06-02 15:52Z) Updated renderers, README, and focused Rust/Python tests for the split contract.

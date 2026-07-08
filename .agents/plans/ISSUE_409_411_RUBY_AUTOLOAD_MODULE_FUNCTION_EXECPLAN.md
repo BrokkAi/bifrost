@@ -1,6 +1,6 @@
 # Ruby autoload and module-function resolution fixes
 
-This ExecPlan is a living document. It follows `.agent/PLANS.md` and must keep `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` current while work proceeds.
+This ExecPlan is a living document. It follows `.agents/PLANS.md` and must keep `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` current while work proceeds.
 
 ## Purpose / Big Picture
 

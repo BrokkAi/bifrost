@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ After this change, `bifrost` will no longer keep the exported-symbol usage graph
 
 ## Progress
 
-- [x] (2026-05-18T10:20Z) Read issue `#73`, `.agent/PLANS.md`, `src/usages/js_ts_graph.rs`, `src/usages/model.rs`, and the matching Brokk shared-engine classes.
+- [x] (2026-05-18T10:20Z) Read issue `#73`, `.agents/PLANS.md`, `src/usages/js_ts_graph.rs`, `src/usages/model.rs`, and the matching Brokk shared-engine classes.
 - [x] (2026-05-18T10:20Z) Decided to keep this issue scoped to shared graph IR and traversal extraction, while leaving JS/TS-specific AST parsing and hit scanning behind a JS/TS adapter.
 - [x] (2026-05-18T10:31Z) Added `src/usages/graph_core.rs` with shared import-edge IR plus reusable project-graph construction, seed expansion, importer lookup, and importer-edge matching logic.
 - [x] (2026-05-18T10:31Z) Re-layered `JsTsExportUsageGraphStrategy` so `src/usages/js_ts_graph.rs` now builds JS/TS parses and extractors, then delegates graph bookkeeping to the shared core.

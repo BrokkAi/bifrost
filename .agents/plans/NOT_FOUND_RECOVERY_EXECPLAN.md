@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This plan follows `.agent/PLANS.md` in this repository. It is written so a reader with only this working tree can understand and complete the change.
+This plan follows `.agents/PLANS.md` in this repository. It is written so a reader with only this working tree can understand and complete the change.
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The behavior is visible through JSON tool responses and rendered text. For examp
 
 ## Progress
 
-- [x] (2026-07-03T12:47Z) Read `.agent/PLANS.md` and the required commit context: `git show b6c9e02 --stat` and `git show 9305628`.
+- [x] (2026-07-03T12:47Z) Read `.agents/PLANS.md` and the required commit context: `git show b6c9e02 --stat` and `git show 9305628`.
 - [x] (2026-07-03T12:47Z) Grepped source and tests for `not_found`, selector resolution, rendering, and service registration.
 - [x] (2026-07-03T12:47Z) Add `NotFoundInput` and convert the six requested result structs plus helper paths that compute scan usage warnings.
 - [x] (2026-07-03T12:47Z) Preserve anchored-selector vs unresolved-symbol causes through `SelectableDefinitionResolution::NotFound`.
