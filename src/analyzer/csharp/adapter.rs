@@ -25,6 +25,10 @@ impl LanguageAdapter for CSharpAdapter {
         "cs"
     }
 
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::CSHARP_STRUCTURAL_SPEC)
+    }
+
     fn normalize_full_name(&self, fq_name: &str) -> String {
         csharp_normalize_full_name(fq_name)
     }

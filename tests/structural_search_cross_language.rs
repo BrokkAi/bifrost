@@ -138,6 +138,7 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
         rows,
         vec![
             ("cpp", "cpp/app.cpp", "audit()"),
+            ("csharp", "csharp/App.cs", "audit()"),
             ("go", "go/app.go", "audit()"),
             ("php", "php/app.php", "audit()"),
             ("rust", "rust/lib.rs", "audit()"),
@@ -152,16 +153,10 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
         .collect();
     assert_eq!(
         diagnostics,
-        BTreeSet::from([
-            (
-                "csharp",
-                "no structural adapter for csharp yet; its files were not searched",
-            ),
-            (
-                "ruby",
-                "no structural adapter for ruby yet; its files were not searched",
-            ),
-        ])
+        BTreeSet::from([(
+            "ruby",
+            "no structural adapter for ruby yet; its files were not searched",
+        ),])
     );
 }
 
@@ -1719,6 +1714,437 @@ object App {
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
     assert_eq!(lambda.matches.len(), 1);
     assert_eq!(lambda.matches[0].text, "(value: String) => {…");
+}
+
+#[test]
+fn csharp_structural_adapter_matches_normalized_shapes() {
+    const CSHARP_APP: &str = r#"
+using System;
+using App.Support;
+using WriterAlias = App.Support.Writer;
+
+namespace App;
+
+[Route("/run")]
+class Service {
+    public string Name { get; set; } = "primary";
+    private string empty;
+    public const int Limit = -3;
+
+    public Service() {}
+
+    public string Run(string code) {
+        audit(code);
+        AuditNamed(code: code);
+        this.Name = "updated";
+        var formatted = Formatter.Format(code);
+        Func<string, string> callback = value => {
+            return value;
+        };
+        return code;
+    }
+
+    public static string audit(string code) {
+        string password = "hunter2";
+        bool flag = true;
+        return code;
+    }
+
+    public static string AuditNamed(string code) => code;
+    public static string Parse<T>(string value) => value;
+}
+
+class AppEntry {
+    void Main() {
+        var service = new Service();
+        service.Run("input");
+        service?.Run("optional");
+        var optionalName = service?.Name;
+        var parsed = Service.Parse<string>("value");
+    }
+}
+"#;
+
+    let audit = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit" },
+                "args": [{ "name": "code", "capture": "code" }]
+            }
+        }),
+    );
+    assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
+    assert_eq!(audit.matches.len(), 1);
+    assert_eq!(audit.matches[0].text, "audit(code)");
+    assert_eq!(audit.matches[0].captures[0].text, "code");
+
+    let method_call = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "service" },
+                "args": [{ "text": { "regex": "^\"input\"$" } }]
+            }
+        }),
+    );
+    assert!(
+        method_call.diagnostics.is_empty(),
+        "{:?}",
+        method_call.diagnostics
+    );
+    assert_eq!(method_call.matches.len(), 1);
+    assert_eq!(method_call.matches[0].text, r#"service.Run("input")"#);
+
+    let conditional_method_call = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "service" },
+                "args": [{ "text": { "regex": "^\"optional\"$" } }]
+            }
+        }),
+    );
+    assert!(
+        conditional_method_call.diagnostics.is_empty(),
+        "{:?}",
+        conditional_method_call.diagnostics
+    );
+    assert_eq!(conditional_method_call.matches.len(), 1);
+    assert_eq!(
+        conditional_method_call.matches[0].text,
+        r#"service?.Run("optional")"#
+    );
+
+    let static_generic_call = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Parse" },
+                "receiver": { "name": "Service" }
+            }
+        }),
+    );
+    assert!(
+        static_generic_call.diagnostics.is_empty(),
+        "{:?}",
+        static_generic_call.diagnostics
+    );
+    assert_eq!(static_generic_call.matches.len(), 1);
+    assert_eq!(
+        static_generic_call.matches[0].text,
+        r#"Service.Parse<string>("value")"#
+    );
+
+    let object_creation = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "call", "callee": { "name": "Service" } }
+        }),
+    );
+    assert!(
+        object_creation.diagnostics.is_empty(),
+        "{:?}",
+        object_creation.diagnostics
+    );
+    assert_eq!(object_creation.matches.len(), 1);
+    assert_eq!(object_creation.matches[0].text, "new Service()");
+
+    let named_argument = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "AuditNamed" },
+                "kwargs": {
+                    "code": { "name": "code", "capture": "code" }
+                }
+            }
+        }),
+    );
+    assert!(
+        named_argument.diagnostics.is_empty(),
+        "{:?}",
+        named_argument.diagnostics
+    );
+    assert_eq!(named_argument.matches.len(), 1);
+    assert_eq!(named_argument.matches[0].text, "AuditNamed(code: code)");
+    assert_eq!(named_argument.matches[0].captures[0].text, "code");
+
+    let assignment = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "password" },
+                "right": { "kind": "string_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        assignment.diagnostics.is_empty(),
+        "{:?}",
+        assignment.diagnostics
+    );
+    assert_eq!(assignment.matches.len(), 1);
+    assert_eq!(assignment.matches[0].text, r#"password = "hunter2""#);
+    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+
+    let signed_numeric = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "Limit" },
+                "right": { "kind": "numeric_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        signed_numeric.diagnostics.is_empty(),
+        "{:?}",
+        signed_numeric.diagnostics
+    );
+    assert_eq!(signed_numeric.matches.len(), 1);
+    assert_eq!(signed_numeric.matches[0].text, "Limit = -3");
+    assert_eq!(signed_numeric.matches[0].captures[0].text, "-3");
+
+    let uninitialized_field = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "assignment", "left": { "name": "empty" } }
+        }),
+    );
+    assert!(
+        uninitialized_field.diagnostics.is_empty(),
+        "{:?}",
+        uninitialized_field.diagnostics
+    );
+    assert!(
+        uninitialized_field.matches.is_empty(),
+        "unexpected uninitialized field assignment match: {uninitialized_field:?}"
+    );
+
+    let boolean_literal = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "boolean_literal", "text": { "regex": "^true$" } }
+        }),
+    );
+    assert!(
+        boolean_literal.diagnostics.is_empty(),
+        "{:?}",
+        boolean_literal.diagnostics
+    );
+    assert_eq!(boolean_literal.matches.len(), 1);
+    assert_eq!(boolean_literal.matches[0].text, "true");
+
+    let field_access = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "field_access",
+                "object": { "text": { "regex": "^this$" } },
+                "field": { "name": "Name" }
+            }
+        }),
+    );
+    assert!(
+        field_access.diagnostics.is_empty(),
+        "{:?}",
+        field_access.diagnostics
+    );
+    assert_eq!(field_access.matches.len(), 1);
+    assert_eq!(field_access.matches[0].text, "this.Name");
+
+    let conditional_field_access = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "field_access",
+                "object": { "name": "service" },
+                "field": { "name": "Name" }
+            }
+        }),
+    );
+    assert!(
+        conditional_field_access.diagnostics.is_empty(),
+        "{:?}",
+        conditional_field_access.diagnostics
+    );
+    assert_eq!(conditional_field_access.matches.len(), 1);
+    assert_eq!(conditional_field_access.matches[0].text, "service?.Name");
+
+    let system_import = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "import", "module": { "name": "System" } }
+        }),
+    );
+    assert!(
+        system_import.diagnostics.is_empty(),
+        "{:?}",
+        system_import.diagnostics
+    );
+    assert_eq!(system_import.matches.len(), 1);
+    assert_eq!(system_import.matches[0].text, "using System;");
+
+    let import = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "import", "module": { "name": "Support" } }
+        }),
+    );
+    assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
+    assert_eq!(import.matches.len(), 1);
+    assert_eq!(import.matches[0].text, "using App.Support;");
+
+    let full_import = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "import", "module": { "name": "App.Support" } }
+        }),
+    );
+    assert!(
+        full_import.diagnostics.is_empty(),
+        "{:?}",
+        full_import.diagnostics
+    );
+    assert_eq!(full_import.matches.len(), 1);
+    assert_eq!(full_import.matches[0].text, "using App.Support;");
+
+    let aliased_import = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "import", "module": { "name": "WriterAlias" } }
+        }),
+    );
+    assert!(
+        aliased_import.diagnostics.is_empty(),
+        "{:?}",
+        aliased_import.diagnostics
+    );
+    assert_eq!(aliased_import.matches.len(), 1);
+    assert_eq!(
+        aliased_import.matches[0].text,
+        "using WriterAlias = App.Support.Writer;"
+    );
+
+    let alias_target_terminal = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "import", "module": { "name": "Writer" } }
+        }),
+    );
+    assert!(
+        alias_target_terminal.diagnostics.is_empty(),
+        "{:?}",
+        alias_target_terminal.diagnostics
+    );
+    assert!(
+        alias_target_terminal.matches.is_empty(),
+        "unexpected aliased target terminal import match: {alias_target_terminal:?}"
+    );
+
+    let shared_import_prefix = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "import", "module": { "name": "App" } }
+        }),
+    );
+    assert!(
+        shared_import_prefix.diagnostics.is_empty(),
+        "{:?}",
+        shared_import_prefix.diagnostics
+    );
+    assert!(
+        shared_import_prefix.matches.is_empty(),
+        "unexpected shared-prefix import match: {shared_import_prefix:?}"
+    );
+
+    let declarations = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "declaration", "name": { "regex": "^(Service|Run|audit|Name)$" } }
+        }),
+    );
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    let declaration_rows: Vec<_> = declarations
+        .matches
+        .iter()
+        .map(|m| (m.kind, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        declaration_rows,
+        vec![
+            ("class", "[Route(\"/run\")]…"),
+            (
+                "declaration",
+                "public string Name { get; set; } = \"primary\";"
+            ),
+            ("constructor", "public Service() {}"),
+            ("method", "public string Run(string code) {…"),
+            ("method", "public static string audit(string code) {…"),
+        ]
+    );
+
+    let decorated_class = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "class",
+                "decorators": [{ "name": "Route" }]
+            }
+        }),
+    );
+    assert!(
+        decorated_class.diagnostics.is_empty(),
+        "{:?}",
+        decorated_class.diagnostics
+    );
+    assert_eq!(decorated_class.matches.len(), 1);
+    assert_eq!(decorated_class.matches[0].text, "[Route(\"/run\")]…");
+
+    let lambda = run_query_with_files(
+        &[("csharp/App.cs", CSHARP_APP)],
+        json!({
+            "languages": ["csharp"],
+            "match": { "kind": "lambda", "has": { "kind": "return" } }
+        }),
+    );
+    assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
+    assert_eq!(lambda.matches.len(), 1);
+    assert_eq!(lambda.matches[0].text, "value => {…");
 }
 
 #[test]

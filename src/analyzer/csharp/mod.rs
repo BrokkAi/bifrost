@@ -4,6 +4,7 @@ mod clones;
 mod declarations;
 mod hierarchy;
 mod imports;
+mod structural;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
@@ -574,6 +575,12 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
         self.inner.usage_facts_index()
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
     }
 
     fn direct_children<'a>(
