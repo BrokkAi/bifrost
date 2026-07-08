@@ -90,8 +90,7 @@ mod rust;
 mod scala;
 
 pub(crate) use call_sites::{
-    call_reference_ranges, call_signature_context, is_call_reference_range,
-    is_call_reference_range_in_tree,
+    call_reference_ranges, call_signature_context, is_call_reference_range_in_tree,
 };
 pub(crate) use csharp::{CSharpTypeLookupResolution, csharp_type_lookup_resolution};
 pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};

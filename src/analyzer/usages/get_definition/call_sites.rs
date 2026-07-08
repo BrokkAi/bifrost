@@ -24,25 +24,6 @@ pub(crate) fn call_reference_ranges(
     collect_call_reference_ranges(tree.root_node(), language, search_range, limit)
 }
 
-pub(crate) fn is_call_reference_range(
-    file: &ProjectFile,
-    source: &str,
-    start_byte: usize,
-    end_byte: usize,
-) -> bool {
-    let language = language_for_file(file);
-    let Some(tree) = parse_tree_for_language(file, language, source) else {
-        return false;
-    };
-    let Some(node) = tree
-        .root_node()
-        .named_descendant_for_byte_range(start_byte, end_byte)
-    else {
-        return false;
-    };
-    is_call_reference_candidate(node, language)
-}
-
 pub(crate) fn is_call_reference_range_in_tree(
     tree: &Tree,
     language: Language,
