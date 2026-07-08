@@ -139,6 +139,7 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
         vec![
             ("cpp", "cpp/app.cpp", "audit()"),
             ("go", "go/app.go", "audit()"),
+            ("php", "php/app.php", "audit()"),
             ("rust", "rust/lib.rs", "audit()"),
         ]
     );
@@ -151,10 +152,6 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
     assert_eq!(
         diagnostics,
         BTreeSet::from([
-            (
-                "php",
-                "no structural adapter for php yet; its files were not searched",
-            ),
             (
                 "scala",
                 "no structural adapter for scala yet; its files were not searched",
@@ -930,6 +927,411 @@ fn parse<T>(value: &str) -> String {
         ),
         "expected rust kwargs diagnostic: {:?}",
         unsupported.diagnostics
+    );
+}
+
+#[test]
+fn php_structural_adapter_matches_normalized_shapes() {
+    const PHP_APP: &str = r#"<?php
+namespace App;
+
+use App\Support\Formatter;
+use App\Support\{Logger, Writer as WriterAlias};
+
+#[Route('/run')]
+class Service {
+    use Loggable;
+
+    public string $name = "primary";
+    public const LIMIT = -3;
+
+    public function __construct() {}
+
+    public function run(string $code): string {
+        audit($code);
+        audit_named(code: $code);
+        $this->name = "updated";
+        $formatted = Formatter::format($code);
+        $callback = function ($value) {
+            return $value;
+        };
+        return $code;
+    }
+}
+
+function audit(string $code): string {
+    $password = "hunter2";
+    $flag = true;
+    return $code;
+}
+
+function audit_named(string $code): string {
+    return $code;
+}
+
+$service = new Service();
+$limit = Service::LIMIT;
+$service->run("input");
+"#;
+
+    let audit = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit" },
+                "args": [{ "name": "code", "capture": "code" }]
+            }
+        }),
+    );
+    assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
+    assert_eq!(audit.matches.len(), 1);
+    assert_eq!(audit.matches[0].text, "audit($code)");
+    assert_eq!(audit.matches[0].captures[0].text, "$code");
+
+    let method_call = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service" }
+            }
+        }),
+    );
+    assert!(
+        method_call.diagnostics.is_empty(),
+        "{:?}",
+        method_call.diagnostics
+    );
+    assert_eq!(method_call.matches.len(), 1);
+    assert_eq!(method_call.matches[0].text, r#"$service->run("input")"#);
+
+    let scoped_call = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "format" },
+                "receiver": { "name": "Formatter" }
+            }
+        }),
+    );
+    assert!(
+        scoped_call.diagnostics.is_empty(),
+        "{:?}",
+        scoped_call.diagnostics
+    );
+    assert_eq!(scoped_call.matches.len(), 1);
+    assert_eq!(scoped_call.matches[0].text, "Formatter::format($code)");
+
+    let object_creation = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "call", "callee": { "name": "Service" } }
+        }),
+    );
+    assert!(
+        object_creation.diagnostics.is_empty(),
+        "{:?}",
+        object_creation.diagnostics
+    );
+    assert_eq!(object_creation.matches.len(), 1);
+    assert_eq!(object_creation.matches[0].text, "new Service()");
+
+    let named_argument = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit_named" },
+                "kwargs": {
+                    "code": { "name": "code", "capture": "code" }
+                }
+            }
+        }),
+    );
+    assert!(
+        named_argument.diagnostics.is_empty(),
+        "{:?}",
+        named_argument.diagnostics
+    );
+    assert_eq!(named_argument.matches.len(), 1);
+    assert_eq!(named_argument.matches[0].text, "audit_named(code: $code)");
+    assert_eq!(named_argument.matches[0].captures[0].text, "$code");
+
+    let assignment = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "password" },
+                "right": { "kind": "string_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        assignment.diagnostics.is_empty(),
+        "{:?}",
+        assignment.diagnostics
+    );
+    assert_eq!(assignment.matches.len(), 1);
+    assert_eq!(assignment.matches[0].text, r#"$password = "hunter2""#);
+    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+
+    let property_assignment = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "name" },
+                "right": { "text": { "regex": "^\"primary\"$" }, "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        property_assignment.diagnostics.is_empty(),
+        "{:?}",
+        property_assignment.diagnostics
+    );
+    assert_eq!(property_assignment.matches.len(), 1);
+    assert_eq!(property_assignment.matches[0].text, r#"$name = "primary""#);
+    assert_eq!(
+        property_assignment.matches[0].captures[0].text,
+        r#""primary""#
+    );
+
+    let const_assignment = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "LIMIT" },
+                "right": { "kind": "numeric_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        const_assignment.diagnostics.is_empty(),
+        "{:?}",
+        const_assignment.diagnostics
+    );
+    assert_eq!(const_assignment.matches.len(), 1);
+    assert_eq!(const_assignment.matches[0].text, "LIMIT = -3");
+    assert_eq!(const_assignment.matches[0].captures[0].text, "-3");
+
+    let boolean_literal = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "boolean_literal", "text": { "regex": "^true$" } }
+        }),
+    );
+    assert!(
+        boolean_literal.diagnostics.is_empty(),
+        "{:?}",
+        boolean_literal.diagnostics
+    );
+    assert_eq!(boolean_literal.matches.len(), 1);
+    assert_eq!(boolean_literal.matches[0].text, "true");
+
+    let field_access = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "field_access",
+                "object": { "name": "this" },
+                "field": { "name": "name" }
+            }
+        }),
+    );
+    assert!(
+        field_access.diagnostics.is_empty(),
+        "{:?}",
+        field_access.diagnostics
+    );
+    assert_eq!(field_access.matches.len(), 1);
+    assert_eq!(field_access.matches[0].text, "$this->name");
+
+    let static_field_access = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "field_access",
+                "object": { "name": "Service" },
+                "field": { "name": "LIMIT" }
+            }
+        }),
+    );
+    assert!(
+        static_field_access.diagnostics.is_empty(),
+        "{:?}",
+        static_field_access.diagnostics
+    );
+    assert_eq!(static_field_access.matches.len(), 1);
+    assert_eq!(static_field_access.matches[0].text, "Service::LIMIT");
+
+    let import = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "import", "module": { "name": "Formatter" } }
+        }),
+    );
+    assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
+    assert_eq!(import.matches.len(), 1);
+    assert_eq!(import.matches[0].text, "use App\\Support\\Formatter;");
+
+    let full_import = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "import", "module": { "name": "App\\Support\\Formatter" } }
+        }),
+    );
+    assert!(
+        full_import.diagnostics.is_empty(),
+        "{:?}",
+        full_import.diagnostics
+    );
+    assert_eq!(full_import.matches.len(), 1);
+    assert_eq!(full_import.matches[0].text, "use App\\Support\\Formatter;");
+
+    let grouped_import = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "import", "module": { "name": "Logger" } }
+        }),
+    );
+    assert!(
+        grouped_import.diagnostics.is_empty(),
+        "{:?}",
+        grouped_import.diagnostics
+    );
+    assert_eq!(grouped_import.matches.len(), 1);
+    assert_eq!(
+        grouped_import.matches[0].text,
+        "use App\\Support\\{Logger, Writer as WriterAlias};"
+    );
+
+    let aliased_import = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "import", "module": { "name": "WriterAlias" } }
+        }),
+    );
+    assert!(
+        aliased_import.diagnostics.is_empty(),
+        "{:?}",
+        aliased_import.diagnostics
+    );
+    assert_eq!(aliased_import.matches.len(), 1);
+    assert_eq!(
+        aliased_import.matches[0].text,
+        "use App\\Support\\{Logger, Writer as WriterAlias};"
+    );
+
+    let shared_import_prefix = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "import", "module": { "name": "Support" } }
+        }),
+    );
+    assert!(
+        shared_import_prefix.diagnostics.is_empty(),
+        "{:?}",
+        shared_import_prefix.diagnostics
+    );
+    assert!(
+        shared_import_prefix.matches.is_empty(),
+        "unexpected shared-prefix import match: {shared_import_prefix:?}"
+    );
+
+    let declarations = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "declaration", "name": { "regex": "^(Service|__construct|run|audit|audit_named)$" } }
+        }),
+    );
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    let declaration_rows: Vec<_> = declarations
+        .matches
+        .iter()
+        .map(|m| (m.kind, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        declaration_rows,
+        vec![
+            ("class", "#[Route('/run')]…"),
+            ("constructor", "public function __construct() {}"),
+            ("method", "public function run(string $code): string {…"),
+            ("function", "function audit(string $code): string {…"),
+            ("function", "function audit_named(string $code): string {…"),
+        ]
+    );
+
+    let decorated_class = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "class",
+                "decorators": [{ "name": "Route" }]
+            }
+        }),
+    );
+    assert!(
+        decorated_class.diagnostics.is_empty(),
+        "{:?}",
+        decorated_class.diagnostics
+    );
+    assert_eq!(decorated_class.matches.len(), 1);
+    assert_eq!(decorated_class.matches[0].text, "#[Route('/run')]…");
+
+    let lambda = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "lambda", "has": { "kind": "return" } }
+        }),
+    );
+    assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
+    assert_eq!(lambda.matches.len(), 1);
+    assert_eq!(lambda.matches[0].text, "function ($value) {…");
+
+    let trait_use_is_not_import = run_query_with_files(
+        &[("php/app.php", PHP_APP)],
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "import", "module": { "name": "Loggable" } }
+        }),
+    );
+    assert!(
+        trait_use_is_not_import.diagnostics.is_empty(),
+        "{:?}",
+        trait_use_is_not_import.diagnostics
+    );
+    assert!(
+        trait_use_is_not_import.matches.is_empty(),
+        "unexpected trait-use import match: {trait_use_is_not_import:?}"
     );
 }
 

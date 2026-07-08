@@ -58,6 +58,10 @@ impl LanguageAdapter for PhpAdapter {
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_php_file(file, source, tree)
     }
+
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::PHP_STRUCTURAL_SPEC)
+    }
 }
 
 pub(crate) fn php_signature_return_type_text(signature: &str) -> Option<&str> {
