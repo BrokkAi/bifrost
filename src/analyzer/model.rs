@@ -127,9 +127,6 @@ pub enum CodeUnitType {
     /// lambdas, and language-specific equivalents. These share a callable body
     /// model even when their declaration syntax differs.
     Function,
-    /// Runtime-invocable member declarations that should be reported as methods
-    /// externally while sharing callable behavior with `Function`.
-    Method,
     Field,
     Module,
     /// Compile-time invocable units such as Rust `macro_rules!` and C/C++
@@ -149,7 +146,6 @@ impl CodeUnitType {
         match self {
             CodeUnitType::Class => "class",
             CodeUnitType::Function => "function",
-            CodeUnitType::Method => "method",
             CodeUnitType::Field => "field",
             CodeUnitType::Module => "module",
             CodeUnitType::Macro => "macro",
@@ -158,7 +154,7 @@ impl CodeUnitType {
     }
 
     pub fn is_callable_kind(&self) -> bool {
-        matches!(self, CodeUnitType::Function | CodeUnitType::Method)
+        matches!(self, CodeUnitType::Function)
     }
 }
 
@@ -488,10 +484,8 @@ impl CodeUnit {
             .rsplit('.')
             .next()
             .unwrap_or(&self.0.short_name);
-        if matches!(
-            self.0.kind,
-            CodeUnitType::Function | CodeUnitType::Method | CodeUnitType::Field
-        ) || member_name.ends_with('$')
+        if matches!(self.0.kind, CodeUnitType::Function | CodeUnitType::Field)
+            || member_name.ends_with('$')
         {
             member_name
         } else {

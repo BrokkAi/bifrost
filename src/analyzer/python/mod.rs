@@ -492,7 +492,7 @@ impl PythonAnalyzer {
         let header = header?;
         match code_unit.kind() {
             CodeUnitType::Class => rendered.push_str(&header),
-            CodeUnitType::Function | CodeUnitType::Method => {
+            CodeUnitType::Function => {
                 rendered.push_str(header.trim_end_matches(':'));
                 rendered.push_str(": ...");
             }

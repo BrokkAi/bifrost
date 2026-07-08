@@ -562,7 +562,7 @@ fn js_file_summaries_skip_synthetic_module_import_entries() {
 }
 
 #[test]
-fn js_object_literal_method_summary_reports_method_kind() {
+fn js_object_literal_method_summary_reports_function_kind() {
     let project = common::InlineTestProject::with_language(Language::JavaScript)
         .file(
             "library.js",
@@ -585,7 +585,7 @@ fn js_object_literal_method_summary_reports_method_kind() {
         .iter()
         .find(|element| element.symbol == "library.js.helpers.formatTask")
         .expect("object-literal method summary element");
-    assert_eq!("method", element.kind, "{element:?}");
+    assert_eq!("function", element.kind, "{element:?}");
     assert_eq!(2, element.start_line, "{element:?}");
 }
 

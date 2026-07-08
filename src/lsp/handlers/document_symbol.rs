@@ -169,13 +169,6 @@ pub(super) fn classify_symbol_kind(
                 SymbolKind::FUNCTION
             }
         }
-        CodeUnitType::Method => {
-            if is_constructor(code_unit, parent_kind) {
-                SymbolKind::CONSTRUCTOR
-            } else {
-                SymbolKind::METHOD
-            }
-        }
         CodeUnitType::Field => {
             if parent_kind == Some(SymbolKind::ENUM) {
                 SymbolKind::ENUM_MEMBER

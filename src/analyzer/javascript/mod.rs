@@ -1465,11 +1465,10 @@ fn js_module_exports_property_is_reference(node: Node<'_>) -> bool {
 }
 
 fn js_object_literal_property_kind(node: Node<'_>) -> crate::analyzer::CodeUnitType {
-    if node.kind() == "method_definition" {
-        crate::analyzer::CodeUnitType::Method
-    } else if node
-        .child_by_field_name("value")
-        .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+    if node.kind() == "method_definition"
+        || node
+            .child_by_field_name("value")
+            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
     {
         crate::analyzer::CodeUnitType::Function
     } else {

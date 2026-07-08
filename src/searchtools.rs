@@ -5127,7 +5127,7 @@ fn display_signatures(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Str
 
     let fallback = match code_unit.kind() {
         CodeUnitType::Class => format!("class {}", display_identifier_for_target(code_unit)),
-        CodeUnitType::Function | CodeUnitType::Method => code_unit
+        CodeUnitType::Function => code_unit
             .signature()
             .map(|signature| format!("{}{}", display_identifier_for_target(code_unit), signature))
             .unwrap_or_else(|| format!("{}()", display_identifier_for_target(code_unit))),

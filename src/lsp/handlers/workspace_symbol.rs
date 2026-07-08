@@ -103,7 +103,6 @@ fn map_kind(kind: CodeUnitType) -> SymbolKind {
     match kind {
         CodeUnitType::Class => SymbolKind::CLASS,
         CodeUnitType::Function => SymbolKind::FUNCTION,
-        CodeUnitType::Method => SymbolKind::METHOD,
         CodeUnitType::Field => SymbolKind::FIELD,
         CodeUnitType::Module => SymbolKind::MODULE,
         CodeUnitType::Macro => SymbolKind::CONSTANT,

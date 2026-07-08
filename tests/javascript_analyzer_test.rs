@@ -156,7 +156,7 @@ fn javascript_materializes_returned_object_members_under_enclosing_factory() {
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
-        CodeUnitType::Method,
+        CodeUnitType::Function,
         "",
         "selectDirective.compile",
     )));
@@ -168,7 +168,7 @@ fn javascript_materializes_returned_object_members_under_enclosing_factory() {
     )));
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
-        CodeUnitType::Method,
+        CodeUnitType::Function,
         "",
         "factory.run",
     )));

@@ -21,7 +21,7 @@ use std::io;
 /// Bincode envelope version. Bumped when the wire format changes in a way
 /// that cannot be deserialized by older readers; persisted rows tagged with
 /// an unknown version are treated as dirty and re-analyzed.
-pub(crate) const PAYLOAD_VERSION: u32 = 5;
+pub(crate) const PAYLOAD_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct PersistedCodeUnit {
