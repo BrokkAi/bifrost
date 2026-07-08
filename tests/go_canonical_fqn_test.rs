@@ -8,8 +8,8 @@ mod common;
 use brokk_bifrost::{
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
     searchtools::{
-        ScanUsagesParams, SearchSymbolsParams, SymbolLookupParams, get_symbol_locations,
-        get_symbol_sources, scan_usages, search_symbols,
+        ScanUsagesParams, ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams,
+        get_symbol_locations, get_symbol_sources, scan_usages, search_symbols,
     },
 };
 use common::InlineTestProject;
@@ -218,10 +218,10 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
             paths: None,
         },
     );
-    assert!(canonical.ambiguous.is_empty(), "{canonical:#?}");
-    assert_eq!(1, canonical.usages.len(), "{canonical:#?}");
+    assert_eq!(1, canonical.results.len(), "{canonical:#?}");
+    assert_eq!(ScanUsagesStatus::Found, canonical.results[0].status);
     assert!(
-        canonical.usages[0]
+        canonical.results[0]
             .files
             .iter()
             .any(|file| file.path == "consumer/main.go"),
@@ -237,12 +237,10 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
             paths: None,
         },
     );
-    assert_eq!(1, bare.ambiguous.len(), "{bare:#?}");
-    let targets: std::collections::BTreeSet<String> = bare.ambiguous[0]
-        .candidate_targets
-        .iter()
-        .cloned()
-        .collect();
+    assert_eq!(1, bare.results.len(), "{bare:#?}");
+    assert_eq!(ScanUsagesStatus::Ambiguous, bare.results[0].status);
+    let targets: std::collections::BTreeSet<String> =
+        bare.results[0].candidate_targets.iter().cloned().collect();
     assert!(
         targets.contains("example.com/repo/a/list.Run")
             && targets.contains("example.com/repo/b/list.Run"),

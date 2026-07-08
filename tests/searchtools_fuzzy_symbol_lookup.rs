@@ -4,11 +4,22 @@ use brokk_bifrost::{
     CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language,
     PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
     searchtools::{
-        ScanUsagesParams, SearchSymbolsParams, SymbolLookupParams, SymbolSourcesResult,
-        get_symbol_locations, get_symbol_sources, scan_usages, search_symbols,
+        ScanUsagesEntry, ScanUsagesParams, ScanUsagesResult, ScanUsagesStatus, SearchSymbolsParams,
+        SymbolLookupParams, SymbolSourcesResult, get_symbol_locations, get_symbol_sources,
+        scan_usages, search_symbols,
     },
 };
 use common::InlineTestProject;
+
+fn single_found_usage(result: &ScanUsagesResult) -> &ScanUsagesEntry {
+    assert_eq!(1, result.results.len(), "{result:#?}");
+    assert_eq!(
+        ScanUsagesStatus::Found,
+        result.results[0].status,
+        "{result:#?}"
+    );
+    &result.results[0]
+}
 
 #[test]
 fn javascript_constructor_assigned_field_is_searchable_by_property_name() {
@@ -150,11 +161,8 @@ const direct = ApiClient.create("/direct");
         },
     );
 
-    assert!(result.not_found.is_empty(), "{result:#?}");
-    assert!(result.ambiguous.is_empty(), "{result:#?}");
-    assert!(result.failures.is_empty(), "{result:#?}");
-    assert_eq!(1, result.usages.len(), "{result:#?}");
-    let lines = result.usages[0]
+    let usage = single_found_usage(&result);
+    let lines = usage
         .files
         .iter()
         .flat_map(|file| {
@@ -200,12 +208,9 @@ object Service {
         },
     );
 
-    assert!(result.not_found.is_empty(), "{result:#?}");
-    assert!(result.ambiguous.is_empty(), "{result:#?}");
-    assert!(result.failures.is_empty(), "{result:#?}");
-    assert_eq!(1, result.usages.len(), "{result:#?}");
+    let usage = single_found_usage(&result);
     assert!(
-        result.usages[0].files.iter().any(|file| {
+        usage.files.iter().any(|file| {
             file.path == "src/main/scala/example/Service.scala"
                 && file.hits.iter().any(|hit| {
                     hit.line == 8
@@ -1063,10 +1068,8 @@ fn scan_usages_uses_the_common_fuzzy_symbol_resolver() {
         },
     );
 
-    assert!(result.not_found.is_empty());
-    assert!(result.ambiguous.is_empty());
-    assert_eq!(1, result.usages.len());
-    assert_eq!("A::method", result.usages[0].symbol);
+    let usage = single_found_usage(&result);
+    assert_eq!(Some("A::method"), usage.symbol.as_deref());
 }
 
 #[test]
@@ -1094,20 +1097,15 @@ fn scan_usages_finds_c_function_callers_through_header_declaration() {
         },
     );
 
-    assert!(result.not_found.is_empty(), "{result:#?}");
-    assert!(result.ambiguous.is_empty(), "{result:#?}");
-    assert_eq!(1, result.usages.len(), "{result:#?}");
+    let usage = single_found_usage(&result);
     assert!(
-        result.usages[0]
-            .files
-            .iter()
-            .any(|file| file.path == "common-main.c"
-                && file.hits.iter().any(|hit| {
-                    hit.snippet
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains("initialize_the_repository()")
-                })),
+        usage.files.iter().any(|file| file.path == "common-main.c"
+            && file.hits.iter().any(|hit| {
+                hit.snippet
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("initialize_the_repository()")
+            })),
         "{result:#?}",
     );
 }

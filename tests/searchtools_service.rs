@@ -22,11 +22,51 @@ fn fixture_root() -> PathBuf {
 }
 
 fn array_len(value: &Value, key: &str) -> usize {
+    if matches!(
+        key,
+        "usages" | "not_found" | "ambiguous" | "failures" | "too_many_callsites"
+    ) {
+        return value
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| match key {
+                        "usages" => matches!(
+                            item["status"].as_str(),
+                            Some(
+                                "found"
+                                    | "verified_absent"
+                                    | "unverified_absent"
+                                    | "too_many_callsites"
+                            )
+                        ),
+                        "not_found" => item["status"] == "not_found",
+                        "ambiguous" => item["status"] == "ambiguous",
+                        "failures" => item["status"] == "failure",
+                        "too_many_callsites" => item["status"] == "too_many_callsites",
+                        _ => false,
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+    }
     value
         .get(key)
         .and_then(Value::as_array)
         .map(|items| items.len())
         .unwrap_or(0)
+}
+
+fn results(value: &Value) -> &[Value] {
+    value["results"].as_array().expect("results array")
+}
+
+fn only_result(value: &Value) -> &Value {
+    let results = results(value);
+    assert_eq!(1, results.len(), "payload: {value}");
+    &results[0]
 }
 
 #[test]
@@ -1960,21 +2000,19 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    assert_eq!("E.iMethod", usages[0]["symbol"]);
-    assert_eq!("resolved", usages[0]["resolution"]);
-    assert_eq!("resolved", value["summary"]["symbols"][0]["resolution"]);
+    let usage = only_result(&value);
+    assert_eq!("E.iMethod", usage["symbol"]);
+    assert_eq!("found", usage["status"]);
     assert!(
-        usages[0]["total_hits"].as_u64().unwrap() >= 1,
+        usage["total_hits"].as_u64().unwrap() >= 1,
         "expected >=1 hit, payload: {value}"
     );
     assert!(
-        usages[0]["candidate_files_truncated"].is_null(),
-        "candidate_files_truncated should be omitted when false: {value}"
+        usage["complete"].is_null(),
+        "complete should be omitted when true: {value}"
     );
 
-    let files = usages[0]["files"].as_array().unwrap();
+    let files = usage["files"].as_array().unwrap();
     let use_e = files
         .iter()
         .find(|file| file["path"] == "UseE.java")
@@ -2014,8 +2052,9 @@ fn scan_usages_distinguishes_resolved_zero_from_unresolved_symbol() {
     let resolved: Value = serde_json::from_str(&resolved_payload).unwrap();
     assert_eq!(1, array_len(&resolved, "usages"), "payload: {resolved}");
     assert_eq!(0, array_len(&resolved, "not_found"), "payload: {resolved}");
-    assert_eq!("resolved", resolved["usages"][0]["resolution"]);
-    assert_eq!(0, resolved["usages"][0]["total_hits"].as_u64().unwrap());
+    let entry = only_result(&resolved);
+    assert_eq!("verified_absent", entry["status"]);
+    assert_eq!(0, entry["total_hits"].as_u64().unwrap());
 
     let unresolved_payload = service
         .call_tool_json(
@@ -2030,9 +2069,11 @@ fn scan_usages_distinguishes_resolved_zero_from_unresolved_symbol() {
         array_len(&unresolved, "not_found"),
         "payload: {unresolved}"
     );
-    assert_eq!("Greeter.missing", unresolved["not_found"][0]["input"]);
+    let entry = only_result(&unresolved);
+    assert_eq!("not_found", entry["status"]);
+    assert_eq!("Greeter.missing", entry["input"]);
     assert!(
-        unresolved["not_found"][0]["note"]
+        entry["message"]
             .as_str()
             .is_some_and(|note| note.contains("no symbol matched")),
         "payload: {unresolved}"
@@ -2059,7 +2100,7 @@ fn scan_usages_python_payload_includes_rendered_diagnostics_and_zero_notes() {
         .unwrap();
     let unresolved: Value = serde_json::from_str(&unresolved_payload).unwrap();
     let rendered = unresolved["rendered_text"].as_str().expect("rendered text");
-    assert!(rendered.contains("## Not found"), "{rendered}");
+    assert!(rendered.contains("not_found"), "{rendered}");
     assert!(rendered.contains("Greeter.missing"), "{rendered}");
     assert!(rendered.contains("no symbol matched"), "{rendered}");
     assert!(!rendered.trim().eq("No usages found."), "{rendered}");
@@ -2074,7 +2115,7 @@ fn scan_usages_python_payload_includes_rendered_diagnostics_and_zero_notes() {
     let zero: Value = serde_json::from_str(&zero_payload).unwrap();
     let rendered = zero["rendered_text"].as_str().expect("rendered text");
     assert!(
-        rendered.contains("Greeter.unused: 0 usage(s)"),
+        rendered.contains("Greeter.unused: verified_absent"),
         "{rendered}"
     );
     assert!(
@@ -2117,16 +2158,21 @@ fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sampl
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(0, array_len(&value, "usages"), "payload: {value}");
-    assert_eq!(1, array_len(&value, "failures"), "payload: {value}");
+    assert_eq!(1, array_len(&value, "usages"), "payload: {value}");
+    assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
     assert_eq!(true, value["summary"]["partial"], "payload: {value}");
-    let failure = &value["failures"][0];
-    assert_eq!("candidate_files_truncated", failure["reason_kind"]);
-    assert_eq!(true, failure["candidate_files_truncated"]);
+    let failure = only_result(&value);
+    assert_eq!("unverified_absent", failure["status"]);
     assert!(
-        failure["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("not no workspace usages")),
+        failure["complete"]
+            .as_bool()
+            .map(|value| !value)
+            .unwrap_or(false)
+    );
+    assert!(
+        failure["absence_caveats"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "candidate_files_truncated")),
         "payload: {value}"
     );
     assert!(
@@ -2185,7 +2231,7 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let usage = &value["usages"][0];
+    let usage = only_result(&value);
     assert_eq!("lines", usage["rendering"], "payload: {value}");
     assert_eq!(103, usage["total_hits"], "payload: {value}");
 
@@ -2259,11 +2305,10 @@ end
     assert_eq!(0, array_len(&value, "not_found"), "payload: {value}");
     assert_eq!(0, array_len(&value, "ambiguous"), "payload: {value}");
     assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    assert_eq!("User.save", usages[0]["symbol"], "payload: {value}");
-    assert_eq!(1, usages[0]["total_hits"], "payload: {value}");
-    let hits = usages[0]["files"][0]["hits"].as_array().unwrap();
+    let usage = only_result(&value);
+    assert_eq!("User.save", usage["symbol"], "payload: {value}");
+    assert_eq!(1, usage["total_hits"], "payload: {value}");
+    let hits = usage["files"][0]["hits"].as_array().unwrap();
     assert!(
         hits.iter().any(|hit| hit["snippet"]
             .as_str()
@@ -2320,13 +2365,12 @@ end
 
     assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
     assert_eq!(0, array_len(&value, "not_found"), "payload: {value}");
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    assert_eq!("User.save", usages[0]["symbol"]);
-    assert_eq!(0, usages[0]["total_hits"], "payload: {value}");
-    assert_eq!(2, usages[0]["unproven_hits"], "payload: {value}");
+    let usage = only_result(&value);
+    assert_eq!("User.save", usage["symbol"]);
+    assert_eq!(0, usage["total_hits"], "payload: {value}");
+    assert_eq!(2, usage["unproven_hits"], "payload: {value}");
     assert!(
-        usages[0]["unproven_files"]
+        usage["unproven_files"]
             .as_array()
             .is_some_and(|files| !files.is_empty()),
         "unproven sites must be rendered: {value}"
@@ -2367,11 +2411,10 @@ public class Caller {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    assert_eq!("Target.save", usages[0]["symbol"]);
-    assert_eq!(0, usages[0]["total_hits"], "payload: {value}");
-    assert_eq!(1, usages[0]["unproven_hits"], "payload: {value}");
+    let usage = only_result(&value);
+    assert_eq!("Target.save", usage["symbol"]);
+    assert_eq!(0, usage["total_hits"], "payload: {value}");
+    assert_eq!(1, usage["unproven_hits"], "payload: {value}");
 }
 
 #[test]
@@ -2407,10 +2450,9 @@ void entry(Target target) {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    assert_eq!(0, usages[0]["total_hits"], "payload: {value}");
-    assert_eq!(1, usages[0]["unproven_hits"], "payload: {value}");
+    let usage = only_result(&value);
+    assert_eq!(0, usage["total_hits"], "payload: {value}");
+    assert_eq!(1, usage["unproven_hits"], "payload: {value}");
 }
 
 #[test]
@@ -2436,11 +2478,7 @@ fn scan_usages_accepts_location_target_without_symbols() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(
-        1,
-        value["usages"].as_array().unwrap().len(),
-        "payload: {value}"
-    );
+    assert_eq!(1, results(&value).len(), "payload: {value}");
     assert_eq!(0, array_len(&value, "not_found"));
     assert_eq!(0, array_len(&value, "failures"));
 }
@@ -2505,9 +2543,7 @@ function run() {
         .unwrap();
     let string_value: Value = serde_json::from_str(&string_payload).unwrap();
     assert!(
-        string_value["ambiguous"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()),
+        only_result(&string_value)["status"] == "ambiguous",
         "bare string selector should remain ambiguous: {string_value}"
     );
 
@@ -2521,16 +2557,19 @@ function run() {
     assert_eq!(0, array_len(&dependency, "ambiguous"), "{dependency}");
     assert_eq!(0, array_len(&dependency, "failures"), "{dependency}");
     assert_eq!(
-        "lib/request.js#request.js.accepts", dependency["usages"][0]["symbol"],
+        "lib/request.js#request.js.accepts",
+        only_result(&dependency)["symbol"],
         "{dependency}"
     );
-    assert_eq!(1, dependency["usages"][0]["total_hits"], "{dependency}");
+    assert_eq!(1, only_result(&dependency)["total_hits"], "{dependency}");
     assert_eq!(
-        "lib/request.js", dependency["usages"][0]["files"][0]["path"],
+        "lib/request.js",
+        only_result(&dependency)["files"][0]["path"],
         "{dependency}"
     );
     assert_eq!(
-        "req.accepts", dependency["usages"][0]["files"][0]["hits"][0]["enclosing"],
+        "req.accepts",
+        only_result(&dependency)["files"][0]["hits"][0]["enclosing"],
         "{dependency}"
     );
 
@@ -2547,17 +2586,20 @@ function run() {
     assert_eq!(0, array_len(&method, "ambiguous"), "{method}");
     assert_eq!(0, array_len(&method, "failures"), "{method}");
     assert_eq!(
-        "lib/request.js#req.accepts", method["usages"][0]["symbol"],
+        "lib/request.js#req.accepts",
+        only_result(&method)["symbol"],
         "{method}"
     );
-    assert_eq!(0, method["usages"][0]["total_hits"], "{method}");
-    assert_eq!(1, method["usages"][0]["unproven_hits"], "{method}");
+    assert_eq!(0, only_result(&method)["total_hits"], "{method}");
+    assert_eq!(1, only_result(&method)["unproven_hits"], "{method}");
     assert_eq!(
-        "app.js", method["usages"][0]["unproven_files"][0]["path"],
+        "app.js",
+        only_result(&method)["unproven_files"][0]["path"],
         "{method}"
     );
     assert_eq!(
-        "run", method["usages"][0]["unproven_files"][0]["hits"][0]["enclosing"],
+        "run",
+        only_result(&method)["unproven_files"][0]["hits"][0]["enclosing"],
         "{method}"
     );
 }
@@ -2582,7 +2624,7 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(0, array_len(&value, "ambiguous"), "payload: {value}");
-    assert_eq!("app.js#second", value["usages"][0]["symbol"], "{value}");
+    assert_eq!("app.js#second", only_result(&value)["symbol"], "{value}");
 }
 
 #[test]
@@ -2612,12 +2654,13 @@ fn scan_usages_location_target_selects_js_object_literal_method() {
     assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
     assert_eq!(0, array_len(&value, "not_found"), "payload: {value}");
     assert_eq!(
-        "library.js#library.js.helpers.formatTask", value["usages"][0]["symbol"],
+        "library.js#library.js.helpers.formatTask",
+        only_result(&value)["symbol"],
         "{value}"
     );
-    assert_eq!(2, value["usages"][0]["total_hits"], "{value}");
+    assert_eq!(2, only_result(&value)["total_hits"], "{value}");
 
-    let files = value["usages"][0]["files"].as_array().unwrap();
+    let files = only_result(&value)["files"].as_array().unwrap();
     assert!(
         files.iter().any(|file| {
             file["path"] == "library.js"
@@ -2662,7 +2705,7 @@ fn scan_usages_location_target_does_not_select_nested_same_line_member() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(0, array_len(&value, "ambiguous"), "payload: {value}");
-    assert_eq!("app.js#Widget", value["usages"][0]["symbol"]);
+    assert_eq!("app.js#Widget", only_result(&value)["symbol"]);
 }
 
 #[test]
@@ -2683,14 +2726,14 @@ fn scan_usages_ambiguous_symbol_includes_capped_location_details() {
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
-    let ambiguous = &value["ambiguous"][0];
+    let ambiguous = only_result(&value);
 
     assert_eq!(4, ambiguous["candidate_targets"].as_array().unwrap().len());
     assert_eq!(3, ambiguous["candidate_details"].as_array().unwrap().len());
     assert_eq!(4, ambiguous["candidate_details_total"].as_u64().unwrap());
     assert_eq!(true, ambiguous["candidate_details_truncated"]);
     assert!(
-        ambiguous["note"]
+        ambiguous["message"]
             .as_str()
             .unwrap()
             .contains("Showing first 3 of 4 candidate locations"),
@@ -2715,12 +2758,13 @@ fn scan_usages_reports_unknown_symbol_as_not_found() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(0, array_len(&value, "usages"));
-    let not_found = value["not_found"].as_array().unwrap();
-    assert_eq!(1, not_found.len());
-    assert_eq!("does.not.Exist", not_found[0]["input"]);
-    assert_eq!(
-        "no symbol matched; try search_symbols with a substring or regex pattern",
-        not_found[0]["note"]
+    let not_found = only_result(&value);
+    assert_eq!("not_found", not_found["status"]);
+    assert_eq!("does.not.Exist", not_found["input"]);
+    assert!(
+        not_found["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no symbol matched"))
     );
     assert_eq!(0, array_len(&value, "failures"));
 }
@@ -2765,19 +2809,18 @@ namespace Domain {
 
     assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
     assert_eq!(0, array_len(&value, "not_found"));
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    assert_eq!("Domain.Target.Run", usages[0]["symbol"]);
-    assert_eq!(0, usages[0]["total_hits"], "payload: {value}");
-    assert_eq!(1, usages[0]["unproven_hits"], "payload: {value}");
+    let usage = only_result(&value);
+    assert_eq!("Domain.Target.Run", usage["symbol"]);
+    assert_eq!(0, usage["total_hits"], "payload: {value}");
+    assert_eq!(1, usage["unproven_hits"], "payload: {value}");
     assert!(
-        usages[0]["unproven_files"]
+        usage["unproven_files"]
             .as_array()
             .is_some_and(|files| !files.is_empty()),
         "unproven sites must be rendered: {value}"
     );
     assert!(
-        usages[0].get("verified_absent").is_none(),
+        usage["status"] == "unverified_absent",
         "unproven evidence must block the verified-absent claim: {value}"
     );
 }
@@ -2831,9 +2874,8 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
         )
         .unwrap();
     let value: Value = serde_json::from_str(&production_only).unwrap();
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    let files = usages[0]["files"].as_array().unwrap();
+    let usage = only_result(&value);
+    let files = usage["files"].as_array().unwrap();
     let paths: Vec<&str> = files
         .iter()
         .map(|file| file["path"].as_str().unwrap())
@@ -2854,7 +2896,7 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
         )
         .unwrap();
     let value: Value = serde_json::from_str(&with_tests).unwrap();
-    let files = value["usages"][0]["files"].as_array().unwrap();
+    let files = only_result(&value)["files"].as_array().unwrap();
     let paths: Vec<&str> = files
         .iter()
         .map(|file| file["path"].as_str().unwrap())
@@ -2899,7 +2941,7 @@ fn scan_usages_paths_filter_limits_candidate_files() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let files = value["usages"][0]["files"].as_array().unwrap();
+    let files = only_result(&value)["files"].as_array().unwrap();
     let paths: Vec<&str> = files
         .iter()
         .map(|file| file["path"].as_str().unwrap())
@@ -2942,7 +2984,7 @@ fn scan_usages_paths_scope_is_independent_of_out_of_scope_callers() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let files = value["usages"][0]["files"].as_array().unwrap();
+    let files = only_result(&value)["files"].as_array().unwrap();
     let paths: Vec<&str> = files
         .iter()
         .map(|file| file["path"].as_str().unwrap())
@@ -2950,7 +2992,7 @@ fn scan_usages_paths_scope_is_independent_of_out_of_scope_callers() {
     assert_eq!(vec!["want_caller.go"], paths, "payload: {value}");
     assert_eq!(
         1,
-        value["usages"][0]["total_hits"].as_u64().unwrap(),
+        only_result(&value)["total_hits"].as_u64().unwrap(),
         "payload: {value}"
     );
 }
@@ -2988,7 +3030,7 @@ fn scan_usages_paths_scope_returns_all_in_scope_callers() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let files = value["usages"][0]["files"].as_array().unwrap();
+    let files = only_result(&value)["files"].as_array().unwrap();
     let mut paths: Vec<&str> = files
         .iter()
         .map(|file| file["path"].as_str().unwrap())
@@ -3026,8 +3068,8 @@ fn scan_usages_paths_scope_blocks_js_ts_importer_expansion() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(1, array_len(&value, "usages"), "payload: {value}");
-    assert_eq!(0, value["usages"][0]["total_hits"].as_u64().unwrap());
-    assert!(value["usages"][0]["files"].is_null(), "payload: {value}");
+    assert_eq!(0, only_result(&value)["total_hits"].as_u64().unwrap());
+    assert!(only_result(&value)["files"].is_null(), "payload: {value}");
 }
 
 #[test]
@@ -3054,7 +3096,7 @@ fn scan_usages_paths_scope_blocks_csharp_target_source_leakage() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(1, array_len(&value, "usages"), "payload: {value}");
-    assert_eq!(0, value["usages"][0]["total_hits"].as_u64().unwrap());
+    assert_eq!(0, only_result(&value)["total_hits"].as_u64().unwrap());
 }
 
 #[test]
@@ -3077,7 +3119,7 @@ fn scan_usages_paths_scope_blocks_jvm_php_scala_target_source_leakage() {
     let java_value: Value = serde_json::from_str(&java_payload).unwrap();
     assert_eq!(
         0,
-        java_value["usages"][0]["total_hits"].as_u64().unwrap(),
+        only_result(&java_value)["total_hits"].as_u64().unwrap(),
         "payload: {java_value}"
     );
 
@@ -3099,7 +3141,7 @@ fn scan_usages_paths_scope_blocks_jvm_php_scala_target_source_leakage() {
     let php_value: Value = serde_json::from_str(&php_payload).unwrap();
     assert_eq!(
         0,
-        php_value["usages"][0]["total_hits"].as_u64().unwrap(),
+        only_result(&php_value)["total_hits"].as_u64().unwrap(),
         "payload: {php_value}"
     );
 
@@ -3121,7 +3163,7 @@ fn scan_usages_paths_scope_blocks_jvm_php_scala_target_source_leakage() {
     let scala_value: Value = serde_json::from_str(&scala_payload).unwrap();
     assert_eq!(
         0,
-        scala_value["usages"][0]["total_hits"].as_u64().unwrap(),
+        only_result(&scala_value)["total_hits"].as_u64().unwrap(),
         "payload: {scala_value}"
     );
 }
@@ -3147,7 +3189,7 @@ fn scan_usages_paths_scope_blocks_rust_empty_scope_fallback() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(1, array_len(&value, "usages"), "payload: {value}");
-    assert_eq!(0, value["usages"][0]["total_hits"].as_u64().unwrap());
+    assert_eq!(0, only_result(&value)["total_hits"].as_u64().unwrap());
 }
 
 #[test]
@@ -3181,12 +3223,12 @@ fn scan_usages_paths_scope_does_not_truncate_broad_glob_candidates_before_scanni
 
     assert_eq!(false, value["summary"]["partial"], "payload: {value}");
     assert!(
-        value["usages"][0]["candidate_files_truncated"].is_null(),
+        only_result(&value)["complete"].is_null(),
         "path-scoped scans must not apply the generic pre-scan candidate cap: {value}"
     );
     assert_eq!(
         1,
-        value["usages"][0]["total_hits"].as_u64().unwrap(),
+        only_result(&value)["total_hits"].as_u64().unwrap(),
         "payload: {value}"
     );
 }
@@ -3218,7 +3260,7 @@ fn scan_usages_paths_scope_keeps_cross_language_scala_usages_of_java_type() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let files = value["usages"][0]["files"].as_array().unwrap();
+    let files = only_result(&value)["files"].as_array().unwrap();
     let paths: Vec<&str> = files
         .iter()
         .map(|file| file["path"].as_str().unwrap())
@@ -3263,8 +3305,8 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
     );
 
     let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(1, value["summary"]["requested_symbols"].as_u64().unwrap());
-    assert_eq!(1, value["summary"]["resolved_symbols"].as_u64().unwrap());
+    assert_eq!(1, value["summary"]["requested"].as_u64().unwrap());
+    assert_eq!(1, value["summary"]["resolved"].as_u64().unwrap());
     assert_eq!(350, value["summary"]["total_hits"].as_u64().unwrap());
     assert_eq!(
         None,
@@ -3272,11 +3314,10 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
         "payload: {value}"
     );
     assert_eq!(0, array_len(&value, "too_many_callsites"));
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    let usage = &value["usages"][0];
+    let usage = only_result(&value);
     assert_eq!("summary", usage["rendering"]);
     assert_eq!(350, usage["total_hits"].as_u64().unwrap());
+    assert!(!usage["complete"].as_bool().unwrap());
     assert_eq!(
         20,
         usage["files"].as_array().unwrap().len(),
@@ -3284,9 +3325,11 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
     );
     assert_eq!(330, usage["files_truncated"].as_u64().unwrap());
     assert!(
-        usage["note"]
-            .as_str()
-            .is_some_and(|note| note.contains("narrower `paths`")),
+        usage["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains("narrower `paths`")))),
         "payload: {value}"
     );
     assert!(
@@ -3327,12 +3370,12 @@ fn scan_usages_too_many_callsites_returns_incomplete_summary_with_observed_files
 
     assert_eq!(
         1,
-        value["summary"]["requested_symbols"].as_u64().unwrap(),
+        value["summary"]["requested"].as_u64().unwrap(),
         "payload: {value}"
     );
     assert_eq!(
         1,
-        value["summary"]["resolved_symbols"].as_u64().unwrap(),
+        value["summary"]["resolved"].as_u64().unwrap(),
         "payload: {value}"
     );
     assert_eq!(true, value["summary"]["partial"], "payload: {value}");
@@ -3342,22 +3385,15 @@ fn scan_usages_too_many_callsites_returns_incomplete_summary_with_observed_files
         "payload: {value}"
     );
 
-    let too_many = value["too_many_callsites"].as_array().unwrap();
-    assert_eq!(1, too_many.len(), "payload: {value}");
+    let usage = only_result(&value);
+    assert_eq!("too_many_callsites", usage["status"], "payload: {value}");
     assert_eq!(
         1001,
-        too_many[0]["total_callsites"].as_u64().unwrap(),
+        usage["total_callsites"].as_u64().unwrap(),
         "payload: {value}"
     );
-    assert_eq!(
-        1000,
-        too_many[0]["limit"].as_u64().unwrap(),
-        "payload: {value}"
-    );
+    assert_eq!(1000, usage["limit"].as_u64().unwrap(), "payload: {value}");
 
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    let usage = &usages[0];
     assert_eq!("summary", usage["rendering"], "payload: {value}");
     assert_eq!(
         1001,
@@ -3365,10 +3401,12 @@ fn scan_usages_too_many_callsites_returns_incomplete_summary_with_observed_files
         "payload: {value}"
     );
     assert!(
-        usage["note"]
-            .as_str()
-            .is_some_and(|note| note.contains("incomplete summary")
-                && note.contains("`paths` from the files list")),
+        usage["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains("incomplete summary")
+                    && note.contains("`paths` from the files list")))),
         "payload: {value}"
     );
     assert!(
@@ -3401,11 +3439,11 @@ fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    assert_eq!("A.AInner.AInnerInner.method7", usages[0]["symbol"]);
-    assert_eq!(0, usages[0]["total_hits"].as_u64().unwrap());
-    assert_eq!(0, array_len(&usages[0], "files"));
+    let usage = only_result(&value);
+    assert_eq!("verified_absent", usage["status"]);
+    assert_eq!("A.AInner.AInnerInner.method7", usage["symbol"]);
+    assert_eq!(0, usage["total_hits"].as_u64().unwrap());
+    assert_eq!(0, array_len(usage, "files"));
     assert_eq!(0, array_len(&value, "not_found"));
     assert_eq!(0, array_len(&value, "failures"));
 }

@@ -2368,19 +2368,18 @@ namespace NzbDrone.Core
         .to_string(),
     );
 
-    assert_eq!(
-        0,
-        result["failures"].as_array().map_or(0, Vec::len),
-        "{result}"
-    );
-    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
-    assert_eq!(1, result["usages"][0]["unproven_hits"], "{result}");
+    let entry = &result["results"][0];
+    assert_eq!("unverified_absent", entry["status"], "{result}");
+    assert_eq!(0, entry["total_hits"], "{result}");
+    assert_eq!(1, entry["unproven_hits"], "{result}");
     assert!(
-        result["usages"][0]["verified_absent"].is_null(),
+        entry["absence_caveats"]
+            .as_array()
+            .is_some_and(|caveats| caveats.iter().any(|c| c == "unproven_matches")),
         "unproven sites must prevent verified_absent: {result}"
     );
     assert!(
-        result["usages"][0]["unproven_files"][0]["hits"][0]["snippet"]
+        entry["unproven_files"][0]["hits"][0]["snippet"]
             .as_str()
             .is_some_and(|snippet| snippet.contains("size.SizeSuffix()")),
         "dynamic extension call should render in unproven_files: {result}"
@@ -2412,18 +2411,12 @@ namespace App
         .to_string(),
     );
 
-    assert_eq!(
-        1,
-        result["usages"].as_array().map_or(0, Vec::len),
-        "{result}"
-    );
-    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
-    assert_eq!(0, result["usages"][0]["unproven_hits"], "{result}");
-    assert_eq!(true, result["usages"][0]["verified_absent"], "{result}");
-    assert_eq!(
-        true, result["summary"]["symbols"][0]["verified_absent"],
-        "{result}"
-    );
+    let entry = &result["results"][0];
+    assert_eq!("verified_absent", entry["status"], "{result}");
+    assert_eq!(0, entry["total_hits"], "{result}");
+    assert_eq!(0, entry["unproven_hits"], "{result}");
+    assert!(entry["complete"].is_null(), "{result}");
+    assert_eq!(1, result["summary"]["resolved"], "{result}");
 }
 
 #[test]
@@ -2459,32 +2452,21 @@ namespace App
         .to_string(),
     );
 
-    assert_eq!(
-        1,
-        result["usages"].as_array().map_or(0, Vec::len),
-        "{result}"
-    );
-    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
-    assert_eq!(0, result["usages"][0]["unproven_hits"], "{result}");
+    let entry = &result["results"][0];
+    assert_eq!("unverified_absent", entry["status"], "{result}");
+    assert_eq!(0, entry["total_hits"], "{result}");
+    assert_eq!(0, entry["unproven_hits"], "{result}");
     assert!(
-        result["usages"][0]["verified_absent"].is_null(),
+        entry["absence_caveats"]
+            .as_array()
+            .is_some_and(|caveats| caveats.iter().any(|c| c == "reference_only_siblings")),
         "Razor sibling files must prevent verified_absent: {result}"
     );
-    let note = result["usages"][0]["note"].as_str().unwrap_or_default();
+    let notes = entry["notes"].as_array().cloned().unwrap_or_default();
     assert!(
-        note.contains(
-            "workspace contains .razor files that may reference this symbol but are not analyzed; absence not verified"
-        ),
-        "{result}"
-    );
-    assert!(
-        result["summary"]["symbols"][0]["verified_absent"].is_null(),
-        "summary must mirror suppressed verified_absent: {result}"
-    );
-    assert!(
-        result["summary"]["symbols"][0]["note"]
+        notes.iter().any(|note| note
             .as_str()
-            .is_some_and(|summary_note| summary_note.contains(".razor files")),
+            .is_some_and(|note| note.contains(".razor files"))),
         "{result}"
     );
 }
@@ -2523,24 +2505,18 @@ namespace App
         .to_string(),
     );
 
-    assert_eq!(true, result["summary"]["partial"], "{result}");
-    if let Some(usages) = result["usages"].as_array()
-        && let Some(usage) = usages.first()
-    {
-        assert_eq!(true, usage["candidate_files_truncated"], "{result}");
-        assert!(
-            usage["verified_absent"].is_null(),
-            "truncated scans must not claim verified_absent: {result}"
-        );
-        return;
-    }
-    assert_eq!(
-        1,
-        result["failures"].as_array().map_or(0, Vec::len),
+    assert!(
+        result["summary"]["partial"].as_bool() == Some(true),
         "{result}"
     );
+    let entry = &result["results"][0];
+    assert_eq!("unverified_absent", entry["status"], "{result}");
+    assert!(entry["complete"].as_bool() == Some(false), "{result}");
     assert!(
-        result["failures"][0]["candidate_files_truncated"].as_bool() == Some(true),
-        "truncated zero-hit failure should carry truncation evidence: {result}"
+        entry["absence_caveats"].as_array().is_some_and(|caveats| {
+            caveats.iter().any(|c| c == "unproven_matches")
+                && caveats.iter().any(|c| c == "candidate_files_truncated")
+        }),
+        "truncated zero-hit scan should carry truncation evidence: {result}"
     );
 }

@@ -820,32 +820,27 @@ fn assert_scenario_result(
             Ok(())
         }
         BenchmarkScenario::ScanUsages => {
-            let usages = structured["usages"].as_array().ok_or_else(|| {
-                if structured["too_many_callsites"]
-                    .as_array()
-                    .is_some_and(|items| !items.is_empty())
-                {
-                    return format!(
-                        "scan_usages returned too_many_callsites for `{}`",
-                        target.name
-                    );
-                }
+            let results = structured["results"].as_array().ok_or_else(|| {
                 format!(
-                    "scan_usages result missing usages array for `{}`",
+                    "scan_usages result missing results array for `{}`",
                     target.name
                 )
             })?;
-            if usages.is_empty() {
+            if results.is_empty() {
                 return Err(format!(
-                    "scan_usages returned no usages for `{}`",
+                    "scan_usages returned no result entries for `{}`",
                     target.name
                 ));
             }
-            let has_hits = usages.iter().any(|usage| {
-                usage["total_hits"].as_u64().unwrap_or(0) > 0
-                    || usage["files"]
+            let has_hits = results.iter().any(|entry| {
+                matches!(
+                    entry["status"].as_str(),
+                    Some("found" | "too_many_callsites")
+                ) && (entry["total_hits"].as_u64().unwrap_or(0) > 0
+                    || entry["total_callsites"].as_u64().unwrap_or(0) > 0
+                    || entry["files"]
                         .as_array()
-                        .is_some_and(|files| !files.is_empty())
+                        .is_some_and(|files| !files.is_empty()))
             });
             if !has_hits {
                 return Err(format!(

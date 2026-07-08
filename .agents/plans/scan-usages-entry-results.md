@@ -14,12 +14,12 @@ The behavior is visible by calling `scan_usages` with mixed `symbols` and `targe
 
 - [x] (2026-07-08T17:09Z) Read `.agents/PLANS.md` and the current `scan_usages` model in `src/searchtools.rs`, `src/searchtools_render.rs`, benchmark validation, and MCP registry references.
 - [x] (2026-07-08T17:09Z) Created this ExecPlan with the requested result shape, decision table, consumer impact, and validation strategy.
-- [ ] Replace `ScanUsagesResult` top-level arrays with `results: Vec<ScanUsagesEntry>` and a small summary.
-- [ ] Carry a request index and original input through symbol and target resolution, scanning, render-budget demotion, and classification.
-- [ ] Centralize entry classification after render-budget convergence and add unit tests for the decision table.
-- [ ] Update rendered text to drive directly from `results` in entry order and remove the "No usages found." fallback for non-empty requests.
-- [ ] Update benchmark validation, MCP description/docs, and affected tests.
-- [ ] Run formatting and focused tests, then broader Rust checks as practical in this environment.
+- [x] (2026-07-08T17:43Z) Replaced `ScanUsagesResult` top-level arrays with `results: Vec<ScanUsagesEntry>` and a compact `summary`.
+- [x] (2026-07-08T17:43Z) Carried request indexes and original symbol/target inputs through resolution, scanning, render-budget demotion, and classification.
+- [x] (2026-07-08T17:43Z) Centralized entry classification after render-budget convergence and added unit tests for the decision table rows.
+- [x] (2026-07-08T17:43Z) Updated rendered text to drive directly from `results` in entry order and removed the "No usages found." fallback for non-empty requests.
+- [x] (2026-07-08T17:43Z) Updated benchmark validation, MCP description/docs, affected Rust tests, and the Python consumer in `../brokkbench` without scanning `clones/`.
+- [x] (2026-07-08T17:43Z) Ran formatting, focused tests, `cargo clippy-no-cuda`, Brokkbench focused Python tests, and the full `cargo test` suite.
 
 ## Surprises & Discoveries
 
@@ -28,6 +28,12 @@ The behavior is visible by calling `scan_usages` with mixed `symbols` and `targe
 
 - Observation: Target requests currently lose their original structured object immediately after resolution.
   Evidence: `resolve_scan_usages_target` returns a display `symbol` label such as `path:line:column`; the old arrays have no field that preserves the original `{path, line, column, start_byte, end_byte}` object.
+
+- Observation: Several later full-suite failures were stale test expectations that still read old `usages`, `ambiguous`, `failures`, or `summary.symbols` fields.
+  Evidence: `usage_graph_identity_test`, `usages_csharp_graph_test`, and `usages_python_graph_test` failed after the focused scan_usages tests passed; the actual tool output already contained the correct `results` entries.
+
+- Observation: The Brokkbench Python repo has a very dirty working tree unrelated to this refactor.
+  Evidence: `git -C /home/jonathan/Projects/brokkbench status --short` produced thousands of existing modified/untracked files, so only the known consumer files were edited and no broad staging command was used.
 
 ## Decision Log
 
@@ -49,7 +55,21 @@ The behavior is visible by calling `scan_usages` with mixed `symbols` and `targe
 
 ## Outcomes & Retrospective
 
-No implementation outcome yet. The plan is now in place and the next step is changing the core result types and request accumulator.
+Implemented the public `scan_usages` JSON refactor. The service now emits one `results` entry per request, in canonical symbol-then-target order, with status and completeness separated. Zero-hit scans classify as `verified_absent` or `unverified_absent`; truncated zero-hit scans no longer become failures. Ambiguous entries keep structured retry payloads, and too-many-callsite results are represented as one incomplete entry.
+
+Rendering, benchmark validation, MCP tool description text, and Rust tests were updated to the new entry shape. The Brokkbench Python consumers were also updated to read only the new `results` shape, with no old-shape fallback.
+
+Validation completed:
+
+- `cargo fmt`
+- `cargo clippy-no-cuda`
+- `BIFROST_SEMANTIC_INDEX=off cargo test scan_usages_classif`
+- `BIFROST_SEMANTIC_INDEX=off cargo test --test searchtools_service -- scan_usages`
+- `BIFROST_SEMANTIC_INDEX=off cargo test --test searchtools_fuzzy_symbol_lookup --test usages_php_graph_test --test go_canonical_fqn_test`
+- `cargo test --quiet`
+- `PYTHONPATH=. uv run pytest tests/test_prefilter.py tests/test_contextagent.py` in `/home/jonathan/Projects/brokkbench`
+
+The Brokkbench full Python test suite was not run because importing the suite through `python -m pytest` failed on an existing missing `pygit2` dependency from `p2t/conftest.py`. The focused consumer tests passed under `uv run`.
 
 ## Context and Orientation
 
@@ -130,7 +150,7 @@ Fifth, update `src/searchtools_render.rs` so `RenderText for ScanUsagesResult` i
 
 Sixth, update consumers and descriptions. In `src/benchmark/runner.rs`, validate `structured["results"]` and accept `found` and `too_many_callsites` as positive usage-producing statuses. In the MCP tool description/docs for `scan_usages`, describe the `results` entry shape. Update tests, especially `tests/searchtools_service.rs` and the per-language `usages_*_graph_test.rs` files that assert heavily on the old parallel arrays. Prefer behavior-focused updates: list a tool and successfully call it, assert exactly one entry per request, assert status and payload, and assert order.
 
-External follow-up, not a gate for this repository refactor: BrokkAi/usagebench `src/bifrost_runner.rs` parses the old `scan_usages` output for LSP-parity scoring. Coordinate an update there after this change lands, otherwise external benchmark scoring will treat every repository as failed.
+Brokkbench follow-up completed for the local Python consumer under `/home/jonathan/Projects/brokkbench`: `prefilter.py`, `tests/test_prefilter.py`, `tests/test_contextagent.py`, `oneoffs/ca_prefilter.py`, and `p2t/eval/extract_scan_usages.py` now read the new `results` shape only. Searches used `rg --glob '!clones/**'` so cloned repositories were not scanned.
 
 `src/symbol_rename.rs` is unaffected because its not-found handling uses internal usage APIs rather than the public `scan_usages` JSON shape.
 
@@ -231,3 +251,4 @@ The classification function should be shared and testable. A concrete shape is:
 ## Revision Notes
 
 - 2026-07-08T17:09Z: Initial plan created because the refactor changes a public JSON shape, rendering, benchmark validation, and many tests. The plan records the requested status taxonomy and implementation sequencing so future work can continue without relying on conversation memory.
+- 2026-07-08T17:43Z: Implementation completed and validated. Additional full-suite failures were fixed by migrating remaining stale tests to the new `results` shape.

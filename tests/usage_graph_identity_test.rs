@@ -88,10 +88,14 @@ fn same_name_classes_are_distinguishable_in_scan_usages() {
         "usage-graph-ts-samename",
         r#"{"symbols":["Anchor"],"include_tests":true}"#,
     );
-    let ambiguous = result["ambiguous"].as_array().cloned().unwrap_or_default();
-    let entry = ambiguous
-        .iter()
-        .find(|a| a["symbol"].as_str() == Some("Anchor"));
+    let entry = result["results"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .filter(|entry| {
+            entry["input"].as_str() == Some("Anchor")
+                && entry["input_kind"].as_str() == Some("symbol")
+                && entry["status"].as_str() == Some("ambiguous")
+        });
     let candidates: BTreeSet<String> = entry
         .and_then(|e| e["candidate_targets"].as_array())
         .map(|c| {
@@ -115,15 +119,15 @@ fn same_name_classes_are_distinguishable_in_scan_usages() {
     let args = format!(r#"{{"symbols":[{chosen:?}],"include_tests":true}}"#);
     let resolved = scan_usages("usage-graph-ts-samename", &args);
     assert!(
-        resolved["ambiguous"]
+        resolved["results"]
             .as_array()
-            .map(|entries| entries.is_empty())
-            .unwrap_or(true),
+            .map(|entries| entries.iter().all(|entry| entry["status"] != "ambiguous"))
+            .unwrap_or(false),
         "re-calling with the selector {chosen:?} must resolve to one definition, \
          not stay ambiguous; got {resolved:#}"
     );
     assert_eq!(
-        resolved["summary"]["resolved_symbols"].as_u64(),
+        resolved["summary"]["resolved"].as_u64(),
         Some(1),
         "the anchored selector {chosen:?} must resolve exactly one symbol; got {resolved:#}"
     );

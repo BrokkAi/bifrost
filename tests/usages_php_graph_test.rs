@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_bifrost::searchtools::{ScanUsagesParams, scan_usages};
+use brokk_bifrost::searchtools::{ScanUsagesParams, ScanUsagesStatus, scan_usages};
 use brokk_bifrost::usages::{FuzzyResult, PhpUsageGraphStrategy, UsageAnalyzer, UsageFinder};
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, OverlayProject, PhpAnalyzer};
 use common::InlineTestProject;
@@ -327,12 +327,17 @@ class NoCandidate {
             paths: Some(vec!["tests/Consumer.php".to_string()]),
         },
     );
-    assert!(
-        scoped.failures.is_empty() && scoped.not_found.is_empty() && scoped.ambiguous.is_empty(),
+    assert_eq!(1, scoped.results.len(), "scoped usages: {scoped:?}");
+    assert_eq!(
+        ScanUsagesStatus::Found,
+        scoped.results[0].status,
         "path-scoped method query should resolve cleanly: {scoped:?}"
     );
-    assert_eq!(1, scoped.usages.len(), "scoped usages: {scoped:?}");
-    assert_eq!(1, scoped.usages[0].total_hits, "scoped usages: {scoped:?}");
+    assert_eq!(
+        Some(1),
+        scoped.results[0].total_hits,
+        "scoped usages: {scoped:?}"
+    );
 }
 
 #[test]
@@ -761,9 +766,9 @@ $count = Mailer::$sent;
         },
     );
     assert!(
-        result.usages.iter().any(|usage| {
-            usage.symbol == "App.Service.EmailNotifier.create"
-                && usage.files.iter().any(|file| {
+        result.results.iter().any(|entry| {
+            entry.symbol.as_deref() == Some("App.Service.EmailNotifier.create")
+                && entry.files.iter().any(|file| {
                     file.path == "src/Consumer.php"
                         && file.hits.iter().any(|hit| {
                             hit.snippet
@@ -775,9 +780,9 @@ $count = Mailer::$sent;
         "expected scan_usages to include explicit type-alias static method call: {result:#?}"
     );
     assert!(
-        result.usages.iter().any(|usage| {
-            usage.symbol == "App.Service.EmailNotifier.sent"
-                && usage.files.iter().any(|file| {
+        result.results.iter().any(|entry| {
+            entry.symbol.as_deref() == Some("App.Service.EmailNotifier.sent")
+                && entry.files.iter().any(|file| {
                     file.path == "src/Consumer.php"
                         && file.hits.iter().any(|hit| {
                             hit.snippet

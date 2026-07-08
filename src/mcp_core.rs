@@ -77,7 +77,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         ),
         tool_descriptor(
             "scan_usages",
-            "Find references, call sites, usages, callers, and related tests for known fully qualified symbols or source-location declaration targets. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names, or targets when a declaration is only known by path and location. Results are tiered by volume and budget: few callers include snippets, larger results degrade to lines or per-file summaries. Narrow with paths or one symbol/target at a time for detail.",
+            "Find references, call sites, usages, callers, and related tests for known fully qualified symbols or source-location declaration targets. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names, or targets when a declaration is only known by path and location. The response has summary plus results, one entry per requested symbol then target. Each entry echoes input, has input_kind, status (found, verified_absent, unverified_absent, not_found, ambiguous, failure, too_many_callsites), and complete=false when coverage or rendering is incomplete. Narrow with paths or one symbol/target at a time for detail.",
             json!({
                 "type": "object",
                 "properties": {

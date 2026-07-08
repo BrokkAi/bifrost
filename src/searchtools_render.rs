@@ -1,12 +1,11 @@
 use crate::model_context;
 use crate::path_utils::AmbiguousPathInput;
 use crate::searchtools::{
-    AmbiguousSymbol, AmbiguousUsageSymbol, MostRelevantFilesResult, NotFoundInput,
-    ScanUsagesResult, SearchSymbolHit, SearchSymbolsFile, SearchSymbolsResult, SkimFile,
-    SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement, SummaryResult, SymbolAncestors,
-    SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult, SymbolSourcesResult,
-    SymbolUsages, TooManyCallsitesInfo, UsageFailureInfo, UsageFileGroup, UsageGraphResult,
-    UsageLocation,
+    AmbiguousSymbol, MostRelevantFilesResult, NotFoundInput, ScanUsagesEntry, ScanUsagesInput,
+    ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile, SearchSymbolsResult,
+    SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement, SummaryResult,
+    SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
+    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,27 +264,14 @@ impl RenderText for MostRelevantFilesResult {
 
 impl RenderText for ScanUsagesResult {
     fn render_text(&self, _options: RenderOptions) -> String {
-        let mut blocks: Vec<String> = self.usages.iter().map(render_symbol_usages_text).collect();
-
-        if !self.not_found.is_empty() {
-            blocks.push(render_not_found(&self.not_found));
+        if self.results.is_empty() {
+            return "No scan_usages requests were provided.".to_string();
         }
-        if !self.failures.is_empty() {
-            blocks.push(render_usage_failures(&self.failures));
-        }
-        if !self.ambiguous.is_empty() {
-            blocks.push(render_ambiguous_usages(&self.ambiguous));
-        }
-        if !self.too_many_callsites.is_empty() {
-            blocks.push(render_too_many_callsites(&self.too_many_callsites));
-        }
-        if blocks.is_empty() && !self.summary.warnings.is_empty() {
-            blocks.push(render_warnings(&self.summary.warnings));
-        }
-        if blocks.is_empty() {
-            return "No usages found.".to_string();
-        }
-        blocks.join("\n\n")
+        self.results
+            .iter()
+            .map(render_scan_usages_entry_text)
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
@@ -312,38 +298,127 @@ impl RenderText for UsageGraphResult {
     }
 }
 
-fn render_symbol_usages_text(usage: &SymbolUsages) -> String {
-    let mut lines = vec![format!("{}: {} usage(s)", usage.symbol, usage.total_hits)];
-    if let Some(note) = &usage.note {
+fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
+    let label = render_scan_usages_input(&entry.input);
+    let mut lines = vec![format!(
+        "{}: {}",
+        label,
+        render_scan_usages_status(entry.status)
+    )];
+    if !entry.complete {
+        lines.push("  note: incomplete result; narrow paths or use a more specific selector for exhaustive detail.".to_string());
+    }
+    if let Some(message) = &entry.message {
+        lines.push(format!("  message: {message}"));
+    }
+    for note in &entry.notes {
         lines.push(format!("  note: {note}"));
-    } else if usage.total_hits == 0 && usage.verified_absent {
-        lines.push(
-            "  note: resolved symbol; no external usage sites found under current filters."
-                .to_string(),
-        );
     }
-    if usage.candidate_files_truncated {
-        lines.push(
-            "  note: candidate file set was truncated; re-call scan_usages with narrower paths."
-                .to_string(),
-        );
+    if let Some(total_hits) = entry.total_hits {
+        lines.push(format!("  proven usage(s): {total_hits}"));
     }
-    if let Some(count) = usage.definition_sites_excluded {
+    if let Some(unproven_hits) = entry.unproven_hits
+        && unproven_hits > 0
+    {
+        lines.push(format!("  unproven match(es): {unproven_hits}"));
+    }
+    if !entry.absence_caveats.is_empty() {
+        let caveats = entry
+            .absence_caveats
+            .iter()
+            .map(render_absence_caveat)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("  absence caveat(s): {caveats}"));
+    }
+    if let Some(count) = entry.definition_sites_excluded {
         lines.push(format!(
             "  note: {count} definition-site hit(s) were excluded from external usages."
         ));
     }
-    if let Some(count) = usage.files_truncated {
+    if let Some(count) = entry.files_truncated {
         lines.push(format!(
             "  note: {count} file group(s) omitted from rendered output; re-call with narrower paths for detail."
         ));
     }
-    lines.extend(render_usage_file_groups_text(&usage.files, false));
-    if !usage.unproven_files.is_empty() {
+    if !entry.candidate_targets.is_empty() {
+        lines.push(format!(
+            "  candidate target(s): {}",
+            entry.candidate_targets.join(", ")
+        ));
+    }
+    if let Some(total_callsites) = entry.total_callsites {
+        let limit = entry
+            .limit
+            .map(|limit| limit.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        lines.push(format!(
+            "  callsite cap: {total_callsites} callsites exceeded limit {limit}"
+        ));
+    }
+    if let Some(sample) = &entry.candidate_files_sample {
+        if !sample.scanned.is_empty() {
+            lines.push(format!("  scanned: {}", sample.scanned.join(", ")));
+        }
+        if sample.omitted_count > 0 {
+            lines.push(format!(
+                "  omitted {} file(s): {}",
+                sample.omitted_count,
+                sample.omitted.join(", ")
+            ));
+        }
+    }
+    lines.extend(render_usage_file_groups_text(&entry.files, false));
+    if !entry.unproven_files.is_empty() {
         lines.push("unproven matches:".to_string());
-        lines.extend(render_usage_file_groups_text(&usage.unproven_files, true));
+        lines.extend(render_usage_file_groups_text(&entry.unproven_files, true));
     }
     lines.join("\n")
+}
+
+fn render_scan_usages_input(input: &ScanUsagesInput) -> String {
+    match input {
+        ScanUsagesInput::Symbol(symbol) => symbol.clone(),
+        ScanUsagesInput::Target(target) => {
+            if let Some(start) = target.start_byte {
+                match target.end_byte {
+                    Some(end) => format!("{}@bytes:{start}..{end}", target.path),
+                    None => format!("{}@byte:{start}", target.path),
+                }
+            } else if let Some(line) = target.line {
+                match target.column {
+                    Some(column) => format!("{}:{line}:{column}", target.path),
+                    None => format!("{}:{line}", target.path),
+                }
+            } else {
+                target.path.clone()
+            }
+        }
+    }
+}
+
+fn render_scan_usages_status(status: ScanUsagesStatus) -> &'static str {
+    match status {
+        ScanUsagesStatus::Found => "found",
+        ScanUsagesStatus::VerifiedAbsent => "verified_absent",
+        ScanUsagesStatus::UnverifiedAbsent => "unverified_absent",
+        ScanUsagesStatus::NotFound => "not_found",
+        ScanUsagesStatus::Ambiguous => "ambiguous",
+        ScanUsagesStatus::Failure => "failure",
+        ScanUsagesStatus::TooManyCallsites => "too_many_callsites",
+    }
+}
+
+fn render_absence_caveat(caveat: &crate::searchtools::ScanUsagesAbsenceCaveat) -> &'static str {
+    match caveat {
+        crate::searchtools::ScanUsagesAbsenceCaveat::UnprovenMatches => "unproven_matches",
+        crate::searchtools::ScanUsagesAbsenceCaveat::CandidateFilesTruncated => {
+            "candidate_files_truncated"
+        }
+        crate::searchtools::ScanUsagesAbsenceCaveat::ReferenceOnlySiblings => {
+            "reference_only_siblings"
+        }
+    }
 }
 
 fn render_usage_file_groups_text(files: &[UsageFileGroup], indent: bool) -> Vec<String> {
@@ -389,84 +464,6 @@ fn render_usage_location_text(hit: &UsageLocation, prefix: &str) -> Vec<String> 
         );
     }
     lines
-}
-
-fn render_usage_failures(failures: &[UsageFailureInfo]) -> String {
-    let mut lines = vec!["## Usage analysis failures".to_string(), String::new()];
-    for failure in failures {
-        let mut line = format!(
-            "- {}: {} ({})",
-            escape_markdown_inline_code(&failure.symbol),
-            failure.reason,
-            failure.reason_kind
-        );
-        if let Some(hint) = &failure.hint {
-            line.push_str(&format!("; {hint}"));
-        }
-        if failure.candidate_files_truncated {
-            line.push_str("; candidate file set was truncated");
-        }
-        lines.push(line);
-        if let Some(sample) = &failure.candidate_files_sample {
-            if !sample.scanned.is_empty() {
-                lines.push(format!("  scanned: {}", sample.scanned.join(", ")));
-            }
-            if sample.omitted_count > 0 {
-                lines.push(format!(
-                    "  omitted {} file(s): {}",
-                    sample.omitted_count,
-                    sample.omitted.join(", ")
-                ));
-            }
-        }
-    }
-    lines.join("\n")
-}
-
-fn render_ambiguous_usages(items: &[AmbiguousUsageSymbol]) -> String {
-    let mut lines = vec![
-        "## Ambiguous usage symbols".to_string(),
-        String::new(),
-        "| Target | Matches | Note |".to_string(),
-        "| --- | --- | --- |".to_string(),
-    ];
-    for item in items {
-        let matches = item.candidate_targets.join(", ");
-        let note = item.note.as_deref().unwrap_or(
-            "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
-        );
-        lines.push(format!(
-            "| {} | {} | {} |",
-            escape_markdown_inline_code(&item.symbol),
-            escape_markdown_table_cell(&matches),
-            escape_markdown_table_cell(note)
-        ));
-    }
-    lines.join("\n")
-}
-
-fn render_too_many_callsites(items: &[TooManyCallsitesInfo]) -> String {
-    let mut lines = vec!["## Too many callsites".to_string(), String::new()];
-    for item in items {
-        let note = item
-            .note
-            .as_deref()
-            .unwrap_or("Re-call scan_usages with narrower paths to reduce the scan scope.");
-        lines.push(format!(
-            "- {}: {} callsites exceeded limit {}; {}",
-            escape_markdown_inline_code(&item.symbol),
-            item.total_callsites,
-            item.limit,
-            note
-        ));
-    }
-    lines.join("\n")
-}
-
-fn render_warnings(warnings: &[String]) -> String {
-    let mut lines = vec!["## Warnings".to_string(), String::new()];
-    lines.extend(warnings.iter().map(|warning| format!("- {warning}")));
-    lines.join("\n")
 }
 
 fn render_search_symbol_file(file: &SearchSymbolsFile, options: RenderOptions) -> String {

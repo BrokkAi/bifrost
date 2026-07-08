@@ -2338,14 +2338,18 @@ fn chained_attribute_receiver_method_match_is_unproven_not_verified_absent() {
         .to_string(),
     );
 
-    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
-    assert_eq!(1, result["usages"][0]["unproven_hits"], "{result}");
+    let entry = &result["results"][0];
+    assert_eq!("unverified_absent", entry["status"], "{result}");
+    assert_eq!(0, entry["total_hits"], "{result}");
+    assert_eq!(1, entry["unproven_hits"], "{result}");
     assert!(
-        result["usages"][0]["verified_absent"].is_null(),
+        entry["absence_caveats"]
+            .as_array()
+            .is_some_and(|caveats| caveats.iter().any(|c| c == "unproven_matches")),
         "unproven chained receiver must prevent verified_absent: {result}"
     );
     assert!(
-        result["usages"][0]["unproven_files"][0]["hits"][0]["snippet"]
+        entry["unproven_files"][0]["hits"][0]["snippet"]
             .as_str()
             .is_some_and(|snippet| snippet.contains("obj.field.bar()")),
         "expected chained receiver call in unproven files: {result}"
@@ -2372,14 +2376,18 @@ fn unknown_simple_receiver_method_match_is_unproven_not_verified_absent() {
         .to_string(),
     );
 
-    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
-    assert_eq!(1, result["usages"][0]["unproven_hits"], "{result}");
+    let entry = &result["results"][0];
+    assert_eq!("unverified_absent", entry["status"], "{result}");
+    assert_eq!(0, entry["total_hits"], "{result}");
+    assert_eq!(1, entry["unproven_hits"], "{result}");
     assert!(
-        result["usages"][0]["verified_absent"].is_null(),
+        entry["absence_caveats"]
+            .as_array()
+            .is_some_and(|caveats| caveats.iter().any(|c| c == "unproven_matches")),
         "unproven simple receiver must prevent verified_absent: {result}"
     );
     assert!(
-        result["usages"][0]["unproven_files"][0]["hits"][0]["snippet"]
+        entry["unproven_files"][0]["hits"][0]["snippet"]
             .as_str()
             .is_some_and(|snippet| snippet.contains("param.bar()")),
         "expected simple receiver call in unproven files: {result}"
