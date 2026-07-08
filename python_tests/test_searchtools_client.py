@@ -570,13 +570,16 @@ namespace Demo
                 "indexed_chunks": 12,
                 "pending_batches": 1,
                 "phase": "ready",
+                "materialized_files": 4,
+                "materialize_total_files": 5,
             }
         )
 
         self.assertEqual(12, status.indexed_chunks)
         self.assertEqual(1, status.pending_batches)
         self.assertEqual("ready", status.phase)
-
+        self.assertEqual(4, status.materialized_files)
+        self.assertEqual(5, status.materialize_total_files)
 
     def test_refresh_returns_typed_metrics(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
