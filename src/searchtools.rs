@@ -2,6 +2,9 @@ use crate::analyzer::common::{
     display_identifier_for_target, display_parent_symbol_for_target, display_symbol_for_target,
     display_symbol_name, is_scala_object_like, language_for_target,
 };
+use crate::analyzer::declaration_range::{
+    DeclarationNameRangeContext, code_unit_declaration_name_range,
+};
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
 };
@@ -11,7 +14,6 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
-use crate::lsp::handlers::broad_symbol::code_unit_declaration_name_range;
 use crate::model_context;
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
@@ -791,6 +793,7 @@ pub fn search_symbols(
     analyzer: &dyn IAnalyzer,
     params: SearchSymbolsParams,
 ) -> SearchSymbolsResult {
+    let _scope = profiling::scope("searchtools::search_symbols");
     let patterns: Vec<String> = strip_params(params.patterns)
         .into_iter()
         .filter(|pattern| !pattern.trim().is_empty())
@@ -849,17 +852,40 @@ pub fn search_symbols(
 
     let files: Vec<SearchSymbolsFile> = file_entries
         .into_iter()
-        .map(|(file, code_units)| SearchSymbolsFile {
-            path: rel_path_string(&file),
-            loc: file
-                .read_to_string()
-                .map(|content| line_count(&content))
-                .unwrap_or(0),
-            classes: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Class),
-            functions: collect_callable_kind_names(analyzer, &code_units),
-            fields: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Field),
-            modules: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Module),
-            macros: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Macro),
+        .map(|(file, code_units)| {
+            let render_context = load_declaration_name_context(analyzer, &file);
+            let render_context = render_context.as_ref();
+            SearchSymbolsFile {
+                path: rel_path_string(&file),
+                loc: render_context
+                    .map(|context| line_count(context.content()))
+                    .unwrap_or(0),
+                classes: collect_ranked_kind_names(
+                    analyzer,
+                    &code_units,
+                    CodeUnitType::Class,
+                    render_context,
+                ),
+                functions: collect_callable_kind_names(analyzer, &code_units, render_context),
+                fields: collect_ranked_kind_names(
+                    analyzer,
+                    &code_units,
+                    CodeUnitType::Field,
+                    render_context,
+                ),
+                modules: collect_ranked_kind_names(
+                    analyzer,
+                    &code_units,
+                    CodeUnitType::Module,
+                    render_context,
+                ),
+                macros: collect_ranked_kind_names(
+                    analyzer,
+                    &code_units,
+                    CodeUnitType::Macro,
+                    render_context,
+                ),
+            }
         })
         .collect();
     let note = search_symbols_note(truncated, files.len(), total_files);
@@ -1574,16 +1600,14 @@ fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Def
 }
 
 fn definition_display_range(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Range> {
-    let primary = primary_range(analyzer, unit)?;
-    if let Ok(content) = analyzer.project().read_source(unit.source())
-        && let Some(mut name_range) =
+    let name_range = analyzer
+        .project()
+        .read_source(unit.source())
+        .ok()
+        .and_then(|content| {
             code_unit_declaration_name_range(analyzer, unit.source(), &content, unit)
-    {
-        name_range.start_line += 1;
-        name_range.end_line += 1;
-        return Some(name_range);
-    }
-    Some(primary)
+        });
+    display_range_with_declaration_name(analyzer, unit, name_range)
 }
 
 pub fn get_symbol_ancestors(
@@ -4818,20 +4842,25 @@ fn collect_ranked_kind_names(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
     kind: CodeUnitType,
+    render_context: Option<&DeclarationNameRangeContext>,
 ) -> Vec<SearchSymbolHit> {
-    collect_ranked_names_by(analyzer, code_units, |unit| unit.kind() == kind)
+    collect_ranked_names_by(analyzer, code_units, render_context, |unit| {
+        unit.kind() == kind
+    })
 }
 
 fn collect_callable_kind_names(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
+    render_context: Option<&DeclarationNameRangeContext>,
 ) -> Vec<SearchSymbolHit> {
-    collect_ranked_names_by(analyzer, code_units, CodeUnit::is_callable)
+    collect_ranked_names_by(analyzer, code_units, render_context, CodeUnit::is_callable)
 }
 
 fn collect_ranked_names_by(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
+    render_context: Option<&DeclarationNameRangeContext>,
     matches_kind: impl Fn(&CodeUnit) -> bool,
 ) -> Vec<SearchSymbolHit> {
     let mut hits: Vec<_> = code_units
@@ -4843,9 +4872,13 @@ fn collect_ranked_names_by(
                 .map(move |signature| SearchSymbolHit {
                     symbol: display_symbol_for_target(&candidate.code_unit),
                     signature,
-                    line: definition_display_range(analyzer, &candidate.code_unit)
-                        .map(|range| range.start_line)
-                        .unwrap_or(candidate.line),
+                    line: search_symbol_display_range(
+                        analyzer,
+                        &candidate.code_unit,
+                        render_context,
+                    )
+                    .map(|range| range.start_line)
+                    .unwrap_or(candidate.line),
                 })
         })
         .collect();
@@ -4859,6 +4892,37 @@ fn collect_ranked_names_by(
         left.symbol == right.symbol && left.signature == right.signature && left.line == right.line
     });
     hits
+}
+
+fn load_declaration_name_context(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<DeclarationNameRangeContext> {
+    let content = analyzer.project().read_source(file).ok()?;
+    Some(DeclarationNameRangeContext::new(file, content))
+}
+
+fn search_symbol_display_range(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    render_context: Option<&DeclarationNameRangeContext>,
+) -> Option<Range> {
+    let name_range = render_context.and_then(|context| context.name_range(analyzer, code_unit));
+    display_range_with_declaration_name(analyzer, code_unit, name_range)
+}
+
+fn display_range_with_declaration_name(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    name_range: Option<Range>,
+) -> Option<Range> {
+    let primary = primary_range(analyzer, code_unit)?;
+    if let Some(mut name_range) = name_range {
+        name_range.start_line += 1;
+        name_range.end_line += 1;
+        return Some(name_range);
+    }
+    Some(primary)
 }
 
 pub(crate) fn summary_block_for_code_unit(
