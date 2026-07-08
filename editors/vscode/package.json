@@ -2,15 +2,15 @@
   "name": "bifrost-vscode",
   "displayName": "Bifrost: Multi-Language LSP & MCP Server",
   "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
-  "version": "0.0.1",
+  "version": "0.7.4",
   "bifrost": {
-    "binaryVersion": "0.6.8",
+    "binaryVersion": "0.7.4",
     "archiveSha256": {
-      "aarch64-pc-windows-msvc": "4683b6f5ef9ff46fd5c71294e77d51a1dd8eee37a967214349b66790ca81f89c",
-      "aarch64-unknown-linux-gnu": "0287481cd86f2db20b8af7603954ee60feb8baf2e56deeb3eb64943fb1e2fd65",
-      "universal-apple-darwin": "8a9a27bba5d8947d5c9e167988c3c222bb217d15b551d86e88277990b544dbc1",
-      "x86_64-pc-windows-msvc": "cc774ee4d771a9979a0937697c13139021eb8a9ae1f6e92281da7d800aee8202",
-      "x86_64-unknown-linux-gnu": "fb4846273793accadaff28761caf64fe9e7a1b78737bcfd69e9a7bc9f3356b7d"
+      "aarch64-pc-windows-msvc": "2383a3b216319490065c0938e3a18699501aaffdcaf75b775edf6a7a780ec4b5",
+      "aarch64-unknown-linux-gnu": "62732cd57b6a766ba959d7497c015fefc9506bcb5e537aa126cfbdd6cac0fa61",
+      "universal-apple-darwin": "6518812fef23952c05de2c33673870008bfc5adc30bda8329730267a4f543288",
+      "x86_64-pc-windows-msvc": "53494d5fd30b271b1ade9a140d5381bf60b8bdb20ab2bf7a26a6376852d65fee",
+      "x86_64-unknown-linux-gnu": "e08dfe9cfeee81f0282970c2c1fa3a9dc939ed360d7ed27020ee88d46637aeed"
     }
   },
   "publisher": "brokk",

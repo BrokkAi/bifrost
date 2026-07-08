@@ -18,6 +18,7 @@ import {
   looksUnexpandedHostPlaceholder,
   managedBinaryPath,
   parseLauncherArgs,
+  readReleaseMetadata,
   releaseAssetFor,
   releaseTargetFor,
   resolveBifrostBinary,
@@ -108,6 +109,7 @@ test("finds compatible bifrost on PATH", async () => {
 
   const resolved = await resolveBifrostBinary({
     env: { PATH: temp, BIFROST_LAUNCHER_ALLOW_PATH: "1", BIFROST_LAUNCHER_AUTO_INSTALL: "0" },
+    cacheRoot: path.join(temp, "cache"),
     metadata: {
       binaryVersion: "0.7.2",
       archiveSha256: { [releaseTargetFor()]: "a".repeat(64) }
@@ -130,6 +132,7 @@ test("does not use PATH unless explicitly allowed", async () => {
   await assert.rejects(
     resolveBifrostBinary({
       env: { PATH: temp, BIFROST_LAUNCHER_AUTO_INSTALL: "0" },
+      cacheRoot: path.join(temp, "cache"),
       metadata: {
         binaryVersion: "0.7.2",
         archiveSha256: { [releaseTargetFor()]: "a".repeat(64) }
@@ -377,9 +380,10 @@ test("shared MCP manifest launches package-local executable from workspace cwd",
   await fsp.mkdir(workspace);
   const recordPath = path.join(temp, "args.txt");
   const stubBinary = path.join(temp, "bifrost-stub");
+  const metadata = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
   await fsp.writeFile(stubBinary, `#!/bin/sh
 if [ "$1" = "--version" ]; then
-  echo "bifrost 0.7.2"
+  echo "bifrost ${metadata.binaryVersion}"
   exit 0
 fi
 printf '%s\\n' "$@" > "${recordPath}"
