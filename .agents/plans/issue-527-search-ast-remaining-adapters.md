@@ -11,7 +11,7 @@ The observable behavior is that a mixed-language inline project containing all e
 ## Progress
 
 - [x] (2026-07-08 00:00Z) Initial ExecPlan created from issue #527 and the user's milestone/review/commit requirements.
-- [ ] Baseline milestone: add tests proving the current unsupported-adapter diagnostics for Go, C++, Rust, PHP, Scala, C#, and Ruby; run focused checks, run Brokk guided review, fix accepted findings, rerun checks, and commit.
+- [x] (2026-07-08 00:16Z) Baseline milestone: added `remaining_languages_report_missing_structural_adapters_before_issue_527_rollout`, proving current unsupported-adapter diagnostics for Go, C++, Rust, PHP, Scala, C#, and Ruby. Focused and structural regression checks passed; Brokk guided review across security, duplication, senior-dev, devops, and architecture perspectives reported no findings.
 - [ ] Go milestone: implement and register Go structural search; add focused tests; run checks, Brokk guided review, accepted fixes, rerun checks, and commit.
 - [ ] C++ milestone: implement and register C++ structural search; add focused tests; run checks, Brokk guided review, accepted fixes, rerun checks, and commit.
 - [ ] Rust milestone: implement and register Rust structural search; add focused tests; run checks, Brokk guided review, accepted fixes, rerun checks, and commit.
@@ -23,8 +23,8 @@ The observable behavior is that a mixed-language inline project containing all e
 
 ## Surprises & Discoveries
 
-- Observation: Pending. Record grammar quirks, role limitations, review findings, and test evidence here as implementation proceeds.
-  Evidence: Pending.
+- Observation: `cargo clippy-no-cuda` can pick a mismatched Homebrew `cargo-clippy` / `clippy-driver` when `/opt/homebrew/bin` wins over the rustup toolchain for those binaries while `cargo` and `rustc` come from `/Users/dave/.cargo/bin`. The symptom is repeated `E0514` "found crate compiled by an incompatible version of rustc" for many dependencies, even after `cargo clean`.
+  Evidence: `which cargo` and `which rustc` resolved through `/Users/dave/.local/bin` to rustup, while `which cargo-clippy` and `which clippy-driver` resolved to `/opt/homebrew/bin`. Rerunning as `PATH=/Users/dave/.cargo/bin:$PATH cargo clippy-no-cuda` completed successfully.
 
 ## Decision Log
 
@@ -42,7 +42,7 @@ The observable behavior is that a mixed-language inline project containing all e
 
 ## Outcomes & Retrospective
 
-No implementation milestones have completed yet. Add an outcome entry after each commit summarizing what the language can now query, what was intentionally left unsupported, which review findings were fixed, and which commands proved the milestone.
+- Baseline milestone outcome (2026-07-08 / Codex): The current unsupported language set is now captured in `tests/structural_search_cross_language.rs`. The test builds a real inferred-language workspace for Go, C++, Rust, PHP, Scala, C#, and Ruby, runs a shared `audit` call query, asserts there are no matches, and asserts the seven exact unsupported-adapter diagnostics. This gives each language milestone a concrete diagnostic to remove. Verification passed with `BIFROST_SEMANTIC_INDEX=off cargo test --test structural_search_cross_language remaining_languages_report_missing_structural_adapters_before_issue_527_rollout -- --nocapture`, `BIFROST_SEMANTIC_INDEX=off cargo test structural --lib`, `BIFROST_SEMANTIC_INDEX=off cargo test --test structural_search_python --test structural_search_planner --test structural_search_cross_language`, `cargo fmt --check`, and `PATH=/Users/dave/.cargo/bin:$PATH cargo clippy-no-cuda`. Brokk guided review found no issues and required no fixes.
 
 ## Context and Orientation
 
@@ -188,3 +188,5 @@ Each language adapter must expose:
 Use only existing dependencies: `tree_sitter`, the language grammar crates already listed in `Cargo.toml`, and the structural-search helpers under `src/analyzer/structural/`. Do not add dependencies for this work.
 
 Revision note, 2026-07-08: Initial plan created to make issue #527 executable with one reviewed, committed milestone per missing language, matching the user's explicit commit-after-each-milestone requirement.
+
+Revision note, 2026-07-08: Updated after the baseline milestone to record the new unsupported-adapter diagnostic test, passing validation commands, guided-review result, and the local clippy toolchain-path discovery.

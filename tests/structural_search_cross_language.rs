@@ -7,6 +7,7 @@ use brokk_bifrost::analyzer::structural::{AstQuery, SearchAstOutput, execute};
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
 use common::InlineTestProject;
 use serde_json::json;
+use std::collections::BTreeSet;
 
 const APP_PY: &str = r#"
 def route(path):
@@ -99,6 +100,75 @@ fn run_query_with_files(files: &[(&str, &str)], query: serde_json::Value) -> Sea
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let query = AstQuery::from_json(&query).expect("query should parse");
     execute(workspace.analyzer(), &query)
+}
+
+#[test]
+fn remaining_languages_report_missing_structural_adapters_before_issue_527_rollout() {
+    let output = run_query_with_files(
+        &[
+            (
+                "go/app.go",
+                "package app\n\nfunc audit() {}\nfunc run() { audit() }\n",
+            ),
+            ("cpp/app.cpp", "void audit() {}\nvoid run() { audit(); }\n"),
+            ("rust/lib.rs", "fn audit() {}\nfn run() { audit(); }\n"),
+            (
+                "php/app.php",
+                "<?php\nfunction audit() {}\nfunction run() { audit(); }\n",
+            ),
+            (
+                "scala/App.scala",
+                "object App { def audit(): Unit = (); def run(): Unit = audit() }\n",
+            ),
+            (
+                "csharp/App.cs",
+                "class App { void audit() {} void run() { audit(); } }\n",
+            ),
+            ("ruby/app.rb", "def audit; end\ndef run; audit; end\n"),
+        ],
+        json!({ "match": { "kind": "call", "callee": { "name": "audit" } } }),
+    );
+
+    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+
+    let diagnostics: BTreeSet<_> = output
+        .diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.language, diagnostic.message.as_str()))
+        .collect();
+    assert_eq!(
+        diagnostics,
+        BTreeSet::from([
+            (
+                "go",
+                "no structural adapter for go yet; its files were not searched",
+            ),
+            (
+                "cpp",
+                "no structural adapter for cpp yet; its files were not searched",
+            ),
+            (
+                "rust",
+                "no structural adapter for rust yet; its files were not searched",
+            ),
+            (
+                "php",
+                "no structural adapter for php yet; its files were not searched",
+            ),
+            (
+                "scala",
+                "no structural adapter for scala yet; its files were not searched",
+            ),
+            (
+                "csharp",
+                "no structural adapter for csharp yet; its files were not searched",
+            ),
+            (
+                "ruby",
+                "no structural adapter for ruby yet; its files were not searched",
+            ),
+        ])
+    );
 }
 
 #[test]
