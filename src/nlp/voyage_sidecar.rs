@@ -328,7 +328,7 @@ pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
     Ok(Arc::new(ScheduledEmbedder::new(workers)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -337,12 +337,10 @@ mod tests {
         Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default()))
     }
 
-    #[cfg(unix)]
     fn process_exists(pid: i32) -> bool {
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
-    #[cfg(unix)]
     fn timeout_pid(message: &str) -> i32 {
         let (_, after_pid) = message
             .split_once("pid ")
@@ -354,7 +352,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn spawn_sidecar_times_out_and_reaps_child() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("sleep_sidecar.py");
