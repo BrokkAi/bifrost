@@ -28,6 +28,12 @@ pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(hit) = build_hit(node, ctx) {
+        ctx.unproven_hits.insert(hit.into_unproven());
+    }
+}
+
 fn build_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<UsageHit> {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();

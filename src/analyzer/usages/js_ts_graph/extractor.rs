@@ -9,7 +9,7 @@ use crate::analyzer::usages::get_definition::js_ts::{
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::JsTsReceiverFactProvider;
 use crate::analyzer::usages::js_ts_graph::hits::{
-    record_hit, record_import_hit, record_self_receiver_hit,
+    record_hit, record_import_hit, record_self_receiver_hit, record_unproven_hit,
 };
 use crate::analyzer::usages::js_ts_graph::resolver::{
     JsTsUsageIndex, is_static_member, member_name,
@@ -40,6 +40,7 @@ pub(super) fn scan_files_for_seeds(
     language: Language,
 ) -> BTreeSet<UsageHit> {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
+    let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let target_owner = analyzer.parent_of(target);
     let target_member = target_owner
         .as_ref()
@@ -86,6 +87,7 @@ pub(super) fn scan_files_for_seeds(
         let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
         let mut local_hits: BTreeSet<UsageHit> = BTreeSet::new();
+        let mut local_unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
 
         let target_self_file = *file == target.source();
@@ -119,6 +121,7 @@ pub(super) fn scan_files_for_seeds(
             scope_stack: vec![HashMap::default()],
             binding_engine,
             hits: &mut local_hits,
+            unproven_hits: &mut local_unproven_hits,
         };
 
         scan_node(tree_ref.root_node(), &mut scan_ctx);
@@ -129,11 +132,21 @@ pub(super) fn scan_files_for_seeds(
                 .expect("usage hit collector mutex poisoned");
             sink.extend(local_hits);
         }
+        if !local_unproven_hits.is_empty() {
+            let mut sink = unproven_collected
+                .lock()
+                .expect("usage unproven hit collector mutex poisoned");
+            sink.extend(local_unproven_hits);
+        }
     });
 
-    collected
+    let hits = collected
         .into_inner()
-        .expect("usage hit collector mutex poisoned")
+        .expect("usage hit collector mutex poisoned");
+    let unproven_hits = unproven_collected
+        .into_inner()
+        .expect("usage unproven hit collector mutex poisoned");
+    hits.into_iter().chain(unproven_hits).collect()
 }
 
 pub(super) struct ScanCtx<'a> {
@@ -161,6 +174,7 @@ pub(super) struct ScanCtx<'a> {
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -599,8 +613,10 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         // `BaseClass.staticMethod()` style — object binds to the target's parent class, the
         // property is the requested member.
-        if member_object_matches_target(object, object_text, ctx) {
-            record_hit(property, ctx);
+        match member_object_match_status(object, object_text, ctx) {
+            ReceiverMatchStatus::Proven => record_hit(property, ctx),
+            ReceiverMatchStatus::Unproven => record_unproven_hit(property, ctx),
+            ReceiverMatchStatus::NoMatch => {}
         }
     }
 }
@@ -767,20 +783,39 @@ pub(super) fn rightmost_jsx_identifier<'a>(
     }
 }
 
-fn member_object_matches_target(node: Node<'_>, object_text: &str, ctx: &ScanCtx<'_>) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiverMatchStatus {
+    Proven,
+    Unproven,
+    NoMatch,
+}
+
+fn member_object_match_status(
+    node: Node<'_>,
+    object_text: &str,
+    ctx: &ScanCtx<'_>,
+) -> ReceiverMatchStatus {
     if ctx.target_is_static_member {
-        return ctx.binds_target(object_text);
+        return if ctx.binds_target(object_text) {
+            ReceiverMatchStatus::Proven
+        } else {
+            ReceiverMatchStatus::NoMatch
+        };
     }
 
     if ctx.target_self_file
         && simple_identifier_text(node, ctx.source).is_some()
         && ctx.binds_target(object_text)
     {
-        return true;
+        return ReceiverMatchStatus::Proven;
     }
 
     if expression_is_target_constructor(node, ctx) {
-        return true;
+        return ReceiverMatchStatus::Proven;
+    }
+
+    if node.kind() == "call_expression" {
+        return ReceiverMatchStatus::Unproven;
     }
 
     if let Some(binding) = simple_identifier_text(node, ctx.source).and_then(|name| {
@@ -789,11 +824,63 @@ fn member_object_matches_target(node: Node<'_>, object_text: &str, ctx: &ScanCtx
             .rev()
             .find_map(|scope| scope.get(name))
             .copied()
-    }) {
-        return binding == LocalBinding::TargetReceiver;
+    }) && binding == LocalBinding::TargetReceiver
+    {
+        return ReceiverMatchStatus::Proven;
     }
 
-    false
+    receiver_fact_match_status(node, ctx)
+}
+
+fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatchStatus {
+    let Some(owner) = ctx.target_owner else {
+        return ReceiverMatchStatus::Unproven;
+    };
+    let provider = JsTsReceiverFactProvider::new(
+        ctx.analyzer,
+        ctx.analyzer.definition_lookup_index(),
+        ctx.language,
+        ctx.file,
+        ctx.source,
+        ctx.root,
+        ctx.imports.clone(),
+    );
+    let query = ReceiverAnalysisQuery {
+        language: ctx.language,
+        file: ctx.file,
+        receiver_text: slice(node, ctx.source),
+        receiver_range: Some(node_range(node)),
+        member_name: ctx.target_member,
+        context: ReceiverContext::new(None, node.start_byte()),
+        budget: ReceiverAnalysisBudget::default(),
+    };
+    match provider.resolve_receiver(query) {
+        ReceiverAnalysisOutcome::Precise(values) => {
+            if values.iter().any(|value| {
+                let resolved = value.owner();
+                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
+            }) {
+                ReceiverMatchStatus::Proven
+            } else if node.kind() == "call_expression" {
+                ReceiverMatchStatus::Unproven
+            } else {
+                ReceiverMatchStatus::NoMatch
+            }
+        }
+        ReceiverAnalysisOutcome::Ambiguous(values) => {
+            if values.iter().any(|value| {
+                let resolved = value.owner();
+                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
+            }) {
+                ReceiverMatchStatus::Unproven
+            } else {
+                ReceiverMatchStatus::NoMatch
+            }
+        }
+        ReceiverAnalysisOutcome::Unknown
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => ReceiverMatchStatus::Unproven,
+    }
 }
 
 fn this_receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

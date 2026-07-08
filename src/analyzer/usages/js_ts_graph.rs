@@ -44,7 +44,7 @@ pub(crate) use resolver::{JsTsUsageIndex, build_jsts_usage_index};
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
 use crate::analyzer::usages::js_ts_graph::resolver::{is_static_member, target_language};
-use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
+use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface, UsageProof};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{
     UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
@@ -145,26 +145,21 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
             target.short_name(),
             owner_seed_allowed,
         );
-        let hits = if seeds.is_empty() {
-            let mut self_file = HashSet::default();
-            self_file.insert(target.source().clone());
-            let local_hits = scan_files_for_seeds(
+        let scan_hits = if seeds.is_empty() {
+            let mut scan_files: HashSet<ProjectFile> =
+                scan_scope.candidate_files().iter().cloned().collect();
+            if scan_scope.allows(target.source()) {
+                scan_files.insert(target.source().clone());
+            }
+
+            scan_files_for_seeds(
                 analyzer,
                 index,
-                &self_file,
+                &scan_files,
                 target,
                 &BTreeSet::new(),
                 language,
-            );
-            if !local_hits.is_empty() {
-                local_hits
-            } else {
-                return GraphUsageOutcome::fallback_safe(
-                    target.fq_name(),
-                    GraphFailureReason::NoGraphSeed("no export seed resolved"),
-                    "JsTsExportUsageGraphStrategy",
-                );
-            }
+            )
         } else {
             let candidate_files = scan_scope.candidate_files();
             let importers = index.importers_of_seeds(&seeds);
@@ -176,10 +171,10 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
 
             scan_files_for_seeds(analyzer, index, &scan_files, target, &seeds, language)
         };
-        let hits: BTreeSet<UsageHit> = hits
+        let (hits, unproven_hits): (BTreeSet<UsageHit>, BTreeSet<UsageHit>) = scan_hits
             .into_iter()
             .filter(|hit| &hit.enclosing != target)
-            .collect();
+            .partition(|hit| hit.proof == UsageProof::Proven);
 
         let external_hit_count = hits
             .iter()
@@ -194,7 +189,11 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
             });
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+            target.clone(),
+            hits,
+            unproven_hits,
+        ))
     }
 }
 

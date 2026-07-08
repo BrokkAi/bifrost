@@ -462,6 +462,118 @@ fn flatten_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages::UsageHit
     }
 }
 
+fn flatten_unproven_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    match result {
+        FuzzyResult::Success {
+            unproven_by_overload,
+            ..
+        } => unproven_by_overload
+            .into_values()
+            .flat_map(BTreeSet::into_iter)
+            .filter(|hit| {
+                hit.kind
+                    .included_in(brokk_bifrost::usages::UsageHitSurface::ExternalUsages)
+            })
+            .collect(),
+        other => panic!("expected Success, got {other:?}"),
+    }
+}
+
+#[test]
+fn js_seedless_factory_returned_unexported_class_method_scans_external_files() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "duration.js",
+            "class Duration {\n  asDays() {}\n}\nexport function duration() { return new Duration(); }\n",
+        )
+        .file(
+            "consumer.js",
+            "import { duration } from './duration';\nexport function run() { return duration().asDays(); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("duration.js"), |cu| {
+        cu.short_name() == "Duration.asDays" && cu.is_function()
+    });
+
+    let hits = flatten_unproven_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js") && hit.snippet.contains("asDays")),
+        "seedless method scan should include the external factory-return callsite, got {hits:?}"
+    );
+}
+
+#[test]
+fn js_seedless_method_with_self_call_also_scans_external_files() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "duration.js",
+            "class Duration {\n  toISOString() {}\n  clone() { return this.toISOString(); }\n}\nexport function duration() { return new Duration(); }\n",
+        )
+        .file(
+            "consumer.js",
+            "import { duration } from './duration';\nexport function run() { return duration().toISOString(); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("duration.js"), |cu| {
+        cu.short_name() == "Duration.toISOString" && cu.is_function()
+    });
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    assert!(
+        result.all_hits_including_imports().iter().any(|hit| {
+            hit.file == project.file("duration.js") && hit.snippet.contains("this.toISOString")
+        }),
+        "self-call should remain editor-visible: {result:?}"
+    );
+    let unproven_hits = flatten_unproven_hits(result);
+    assert!(
+        unproven_hits.iter().any(|hit| {
+            hit.file == project.file("consumer.js") && hit.snippet.contains("toISOString")
+        }),
+        "seedless fallback must not stop at the declaring file when it finds a self-call, got {unproven_hits:?}"
+    );
+}
+
+#[test]
+fn js_seedless_unprovable_external_member_match_is_unproven() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "duration.js",
+            "class Duration {\n  asDays() {}\n}\nexport function duration() { return new Duration(); }\n",
+        )
+        .file(
+            "consumer.js",
+            "export function run(value) { return value.asDays(); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("duration.js"), |cu| {
+        cu.short_name() == "Duration.asDays" && cu.is_function()
+    });
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    assert!(
+        result.all_hits().is_empty(),
+        "unprovable receiver match must not be reported as proven: {result:?}"
+    );
+    let unproven_hits = flatten_unproven_hits(result);
+    assert!(
+        unproven_hits
+            .iter()
+            .any(|hit| hit.file == project.file("consumer.js") && hit.snippet.contains("asDays")),
+        "unprovable external member match should be preserved as unproven, got {unproven_hits:?}"
+    );
+}
+
 #[test]
 fn js_parent_of_module_scoped_export_const_returns_file_scope_module() {
     let (project, analyzer) = js_inline_analyzer(|p| {
