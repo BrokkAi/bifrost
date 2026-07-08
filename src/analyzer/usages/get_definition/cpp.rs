@@ -680,28 +680,64 @@ fn cpp_visible_name_candidates(
     let namespace_relative = lexical_namespace
         .filter(|namespace| !namespace.is_empty() && normalized.contains("::"))
         .map(|namespace| format!("{namespace}::{normalized}"));
-    let mut candidates = Vec::new();
-    for unit in visibility.visible_units(file) {
-        if let Some(kind) = kind
-            && !cpp_unit_matches_kind(analyzer, support, unit, kind)
+
+    let mut candidates: Vec<CodeUnit> = if normalized.contains("::") {
+        let mut fqns = Vec::new();
+        for reference in [Some(normalized), namespace_relative.as_deref()]
+            .into_iter()
+            .flatten()
         {
-            continue;
-        }
-        let cpp_name = cpp_name_for(unit);
-        if cpp_name == normalized
-            || namespace_relative
-                .as_deref()
-                .is_some_and(|relative| cpp_name == relative)
-            || (!normalized.contains("::") && unit.identifier() == normalized)
-        {
-            let indexed = support.fqn(&unit.fq_name());
-            if indexed.is_empty() {
-                candidates.push(unit.clone());
+            if let Some(kind) = kind {
+                fqns.extend(cpp_reference_fqn_candidates(reference, kind));
             } else {
-                candidates.extend(indexed);
+                for candidate_kind in [
+                    CppTargetKind::Type,
+                    CppTargetKind::Constructor,
+                    CppTargetKind::FreeFunction,
+                    CppTargetKind::Method,
+                    CppTargetKind::GlobalField,
+                    CppTargetKind::MemberField,
+                ] {
+                    fqns.extend(cpp_reference_fqn_candidates(reference, candidate_kind));
+                }
             }
         }
+        fqns.sort();
+        fqns.dedup();
+        support
+            .fqn_candidates(fqns)
+            .into_iter()
+            .filter(|unit| visibility.is_visible(file, unit))
+            .filter(|unit| {
+                let cpp_name = cpp_name_for(unit);
+                cpp_name == normalized
+                    || namespace_relative
+                        .as_deref()
+                        .is_some_and(|relative| cpp_name == relative)
+            })
+            .collect()
+    } else {
+        visibility
+            .visible_identifier_candidates(file, normalized)
+            .filter(|unit| unit.identifier() == normalized)
+            .cloned()
+            .collect()
+    };
+
+    if let Some(kind) = kind {
+        candidates.retain(|unit| cpp_unit_matches_kind(analyzer, support, unit, kind));
     }
+    candidates = candidates
+        .into_iter()
+        .flat_map(|unit| {
+            let indexed = support.fqn(&unit.fq_name());
+            if indexed.is_empty() {
+                vec![unit]
+            } else {
+                indexed
+            }
+        })
+        .collect();
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
