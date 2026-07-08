@@ -28,6 +28,10 @@ impl LanguageAdapter for ScalaAdapter {
         "scala"
     }
 
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::SCALA_STRUCTURAL_SPEC)
+    }
+
     fn normalize_full_name(&self, fq_name: &str) -> String {
         scala_normalize_full_name(fq_name)
     }

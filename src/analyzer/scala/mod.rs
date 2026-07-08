@@ -3,6 +3,7 @@ mod clones;
 mod declarations;
 mod hierarchy;
 pub(crate) mod imports;
+mod structural;
 mod supertypes;
 mod tests;
 
@@ -314,6 +315,12 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
         self.inner.usage_facts_index()
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
     }
 
     fn direct_children<'a>(

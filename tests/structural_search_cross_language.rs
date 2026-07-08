@@ -141,6 +141,7 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
             ("go", "go/app.go", "audit()"),
             ("php", "php/app.php", "audit()"),
             ("rust", "rust/lib.rs", "audit()"),
+            ("scala", "scala/App.scala", "audit()"),
         ]
     );
 
@@ -152,10 +153,6 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
     assert_eq!(
         diagnostics,
         BTreeSet::from([
-            (
-                "scala",
-                "no structural adapter for scala yet; its files were not searched",
-            ),
             (
                 "csharp",
                 "no structural adapter for csharp yet; its files were not searched",
@@ -1333,6 +1330,395 @@ $service->run("input");
         trait_use_is_not_import.matches.is_empty(),
         "unexpected trait-use import match: {trait_use_is_not_import:?}"
     );
+}
+
+#[test]
+fn scala_structural_adapter_matches_normalized_shapes() {
+    const SCALA_APP: &str = r#"
+package app
+
+import scala.util.Try
+import scala.collection.mutable.{ListBuffer, Map as MutableMap}
+
+@deprecated("use Service2", "1.0")
+class Service(var name: String) {
+    def run(code: String): String = {
+        audit(code)
+        val password = "hunter2"
+        val flag = true
+        val callback = (value: String) => {
+            return value
+        }
+        val parsed = parse[String](code)
+        this.name = "updated"
+        code.toString
+    }
+}
+
+object App {
+    def audit(code: String): String = code
+    def auditNamed(code: String): String = code
+    def parse[T](value: String): String = value
+    val limit = -3
+    val service = new Service("primary")
+    service.run("input")
+    auditNamed(code = "named")
+    ListBuffer(1).foreach { value => audit(value.toString) }
+    Try(audit("again"))
+}
+"#;
+
+    let audit = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit" },
+                "args": [{ "name": "code", "capture": "code" }]
+            }
+        }),
+    );
+    assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
+    assert_eq!(audit.matches.len(), 1);
+    assert_eq!(audit.matches[0].text, "audit(code)");
+    assert_eq!(audit.matches[0].captures[0].text, "code");
+
+    let method_call = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service" }
+            }
+        }),
+    );
+    assert!(
+        method_call.diagnostics.is_empty(),
+        "{:?}",
+        method_call.diagnostics
+    );
+    assert_eq!(method_call.matches.len(), 1);
+    assert_eq!(method_call.matches[0].text, r#"service.run("input")"#);
+
+    let generic_call = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "parse" },
+                "args": [{ "name": "code" }]
+            }
+        }),
+    );
+    assert!(
+        generic_call.diagnostics.is_empty(),
+        "{:?}",
+        generic_call.diagnostics
+    );
+    assert_eq!(generic_call.matches.len(), 1);
+    assert_eq!(generic_call.matches[0].text, "parse[String](code)");
+
+    let block_argument = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "foreach" },
+                "args": [{ "has": { "kind": "call", "callee": { "name": "audit" } } }]
+            }
+        }),
+    );
+    assert!(
+        block_argument.diagnostics.is_empty(),
+        "{:?}",
+        block_argument.diagnostics
+    );
+    assert_eq!(block_argument.matches.len(), 1);
+    assert_eq!(
+        block_argument.matches[0].text,
+        "ListBuffer(1).foreach { value => audit(value.toString) }"
+    );
+
+    let named_argument = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "auditNamed" },
+                "kwargs": {
+                    "code": { "kind": "string_literal", "capture": "value" }
+                }
+            }
+        }),
+    );
+    assert!(
+        named_argument.diagnostics.is_empty(),
+        "{:?}",
+        named_argument.diagnostics
+    );
+    assert_eq!(named_argument.matches.len(), 1);
+    assert_eq!(
+        named_argument.matches[0].text,
+        r#"auditNamed(code = "named")"#
+    );
+    assert_eq!(named_argument.matches[0].captures[0].text, r#""named""#);
+
+    let named_argument_is_not_assignment = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "code" },
+                "right": { "kind": "string_literal" }
+            }
+        }),
+    );
+    assert!(
+        named_argument_is_not_assignment.diagnostics.is_empty(),
+        "{:?}",
+        named_argument_is_not_assignment.diagnostics
+    );
+    assert!(
+        named_argument_is_not_assignment.matches.is_empty(),
+        "unexpected named-argument assignment match: {named_argument_is_not_assignment:?}"
+    );
+
+    let assignment = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "password" },
+                "right": { "kind": "string_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        assignment.diagnostics.is_empty(),
+        "{:?}",
+        assignment.diagnostics
+    );
+    assert_eq!(assignment.matches.len(), 1);
+    assert_eq!(assignment.matches[0].text, r#"val password = "hunter2""#);
+    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+
+    let signed_numeric = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "limit" },
+                "right": { "kind": "numeric_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        signed_numeric.diagnostics.is_empty(),
+        "{:?}",
+        signed_numeric.diagnostics
+    );
+    assert_eq!(signed_numeric.matches.len(), 1);
+    assert_eq!(signed_numeric.matches[0].text, "val limit = -3");
+    assert_eq!(signed_numeric.matches[0].captures[0].text, "-3");
+
+    let boolean_literal = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "boolean_literal", "text": { "regex": "^true$" } }
+        }),
+    );
+    assert!(
+        boolean_literal.diagnostics.is_empty(),
+        "{:?}",
+        boolean_literal.diagnostics
+    );
+    assert_eq!(boolean_literal.matches.len(), 1);
+    assert_eq!(boolean_literal.matches[0].text, "true");
+
+    let field_access = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "field_access",
+                "object": { "name": "this" },
+                "field": { "name": "name" }
+            }
+        }),
+    );
+    assert!(
+        field_access.diagnostics.is_empty(),
+        "{:?}",
+        field_access.diagnostics
+    );
+    assert_eq!(field_access.matches.len(), 1);
+    assert_eq!(field_access.matches[0].text, "this.name");
+
+    let import = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "import", "module": { "name": "Try" } }
+        }),
+    );
+    assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
+    assert_eq!(import.matches.len(), 1);
+    assert_eq!(import.matches[0].text, "import scala.util.Try");
+
+    let full_import = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "import", "module": { "name": "scala.util.Try" } }
+        }),
+    );
+    assert!(
+        full_import.diagnostics.is_empty(),
+        "{:?}",
+        full_import.diagnostics
+    );
+    assert_eq!(full_import.matches.len(), 1);
+    assert_eq!(full_import.matches[0].text, "import scala.util.Try");
+
+    let grouped_import = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "import", "module": { "name": "ListBuffer" } }
+        }),
+    );
+    assert!(
+        grouped_import.diagnostics.is_empty(),
+        "{:?}",
+        grouped_import.diagnostics
+    );
+    assert_eq!(grouped_import.matches.len(), 1);
+    assert_eq!(
+        grouped_import.matches[0].text,
+        "import scala.collection.mutable.{ListBuffer, Map as MutableMap}"
+    );
+
+    let aliased_import = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "import", "module": { "name": "MutableMap" } }
+        }),
+    );
+    assert!(
+        aliased_import.diagnostics.is_empty(),
+        "{:?}",
+        aliased_import.diagnostics
+    );
+    assert_eq!(aliased_import.matches.len(), 1);
+    assert_eq!(
+        aliased_import.matches[0].text,
+        "import scala.collection.mutable.{ListBuffer, Map as MutableMap}"
+    );
+
+    let shared_import_prefix = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "import", "module": { "name": "collection" } }
+        }),
+    );
+    assert!(
+        shared_import_prefix.diagnostics.is_empty(),
+        "{:?}",
+        shared_import_prefix.diagnostics
+    );
+    assert!(
+        shared_import_prefix.matches.is_empty(),
+        "unexpected shared-prefix import match: {shared_import_prefix:?}"
+    );
+
+    let declarations = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "declaration", "name": { "regex": "^(Service|run|App|audit|parse)$" } }
+        }),
+    );
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    let declaration_rows: Vec<_> = declarations
+        .matches
+        .iter()
+        .map(|m| (m.kind, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        declaration_rows,
+        vec![
+            ("class", "@deprecated(\"use Service2\", \"1.0\")…"),
+            ("method", "def run(code: String): String = {…"),
+            ("class", "object App {…"),
+            ("method", "def audit(code: String): String = code"),
+            ("method", "def parse[T](value: String): String = value"),
+        ]
+    );
+
+    let methods = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "method", "name": { "regex": "^(run|audit)$" } }
+        }),
+    );
+    assert!(methods.diagnostics.is_empty(), "{:?}", methods.diagnostics);
+    let method_rows: Vec<_> = methods.matches.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(
+        method_rows,
+        vec![
+            "def run(code: String): String = {…",
+            "def audit(code: String): String = code",
+        ]
+    );
+
+    let decorated_class = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": {
+                "kind": "class",
+                "decorators": [{ "name": "deprecated" }]
+            }
+        }),
+    );
+    assert!(
+        decorated_class.diagnostics.is_empty(),
+        "{:?}",
+        decorated_class.diagnostics
+    );
+    assert_eq!(decorated_class.matches.len(), 1);
+    assert_eq!(
+        decorated_class.matches[0].text,
+        "@deprecated(\"use Service2\", \"1.0\")…"
+    );
+
+    let lambda = run_query_with_files(
+        &[("scala/App.scala", SCALA_APP)],
+        json!({
+            "languages": ["scala"],
+            "match": { "kind": "lambda", "has": { "kind": "return" } }
+        }),
+    );
+    assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
+    assert_eq!(lambda.matches.len(), 1);
+    assert_eq!(lambda.matches[0].text, "(value: String) => {…");
 }
 
 #[test]
