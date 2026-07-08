@@ -608,6 +608,44 @@ pub(super) fn resolves_to_target(
         || reference_matches_target_fq_name(&normalized, target)
 }
 
+pub(super) fn resolves_to_target_at(
+    file: &ProjectFile,
+    class_ranges: &ClassRangeIndex,
+    reference: &str,
+    node: Node<'_>,
+    source: &str,
+    target: &CodeUnit,
+    csharp: &CSharpAnalyzer,
+) -> bool {
+    resolve_type_fq_name_at(csharp, file, class_ranges, reference, node, source)
+        .is_some_and(|resolved| type_identity_matches(&resolved, &target.fq_name()))
+}
+
+pub(super) fn resolve_type_fq_name_at(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    class_ranges: &ClassRangeIndex,
+    reference: &str,
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let normalized = normalize_type_text(reference);
+    if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
+        return None;
+    }
+    if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
+        return Some(canonical.to_string());
+    }
+    resolve_in_enclosing_class_ranges(csharp, class_ranges, &normalized, node.start_byte())
+        .map(|unit| unit.fq_name())
+        .or_else(|| {
+            csharp
+                .resolve_visible_type(file, &normalized)
+                .map(|unit| unit.fq_name())
+        })
+        .or_else(|| class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name()))
+}
+
 fn resolve_type_fq_name(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
@@ -621,6 +659,86 @@ fn resolve_type_fq_name(
         return Some(target.fq_name());
     }
     class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name())
+}
+
+fn resolve_in_enclosing_class_ranges(
+    csharp: &CSharpAnalyzer,
+    class_ranges: &ClassRangeIndex,
+    name: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    let mut scope = class_ranges.enclosing(byte)?.to_string();
+    loop {
+        if scope.is_empty() {
+            return None;
+        }
+        let child_fqn = format!("{scope}.{name}");
+        if let Some(child) = class_unit_for_fq_name(csharp, &child_fqn) {
+            return Some(child);
+        }
+        match scope.rfind('.') {
+            Some(idx) => scope.truncate(idx),
+            None => return None,
+        }
+    }
+}
+
+fn type_parameter_shadows_reference(node: Node<'_>, source: &str, reference: &str) -> bool {
+    if reference.contains('.') {
+        return false;
+    }
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if declaration_type_parameters_shadow(parent, source, reference) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn declaration_type_parameters_shadow(
+    declaration: Node<'_>,
+    source: &str,
+    reference: &str,
+) -> bool {
+    if !matches!(
+        declaration.kind(),
+        "class_declaration"
+            | "interface_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "record_struct_declaration"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "operator_declaration"
+            | "delegate_declaration"
+            | "local_function_statement"
+    ) {
+        return false;
+    }
+    declaration
+        .child_by_field_name("type_parameters")
+        .or_else(|| first_named_child_of_kind(declaration, "type_parameter_list"))
+        .is_some_and(|parameters| type_parameter_list_contains(parameters, source, reference))
+}
+
+fn type_parameter_list_contains(parameters: Node<'_>, source: &str, reference: &str) -> bool {
+    let mut cursor = parameters.walk();
+    parameters.named_children(&mut cursor).any(|parameter| {
+        parameter.kind() == "type_parameter" && type_parameter_name(parameter, source) == reference
+    })
+}
+
+fn type_parameter_name<'a>(parameter: Node<'_>, source: &'a str) -> &'a str {
+    parameter
+        .child_by_field_name("name")
+        .map(|name| node_text(name, source))
+        .unwrap_or_else(|| node_text(parameter, source))
+        .trim()
 }
 
 pub(super) fn type_identity_matches(left: &str, right: &str) -> bool {

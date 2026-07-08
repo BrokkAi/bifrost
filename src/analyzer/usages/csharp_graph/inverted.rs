@@ -20,7 +20,7 @@
 use super::extractor::{is_declaration_name, member_access_name, member_access_receiver};
 use super::resolver::{
     argument_count, first_type_child, is_type_reference_node, method_unit_return_type_fq_name,
-    node_text, normalize_type_text, reference_type_text, signature_arity,
+    node_text, reference_type_text, resolve_type_fq_name_at, signature_arity,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
@@ -69,15 +69,16 @@ struct CsScan<'a, 'b> {
 }
 
 impl CsScan<'_, '_> {
-    /// Resolve a type reference's text to its fqn via the file's visible types.
-    fn resolve_type_fqn(&self, text: &str) -> Option<String> {
-        let normalized = normalize_type_text(text);
-        if normalized.is_empty() {
-            return None;
-        }
-        self.csharp
-            .resolve_visible_type(self.file, &normalized)
-            .map(|unit| unit.fq_name())
+    /// Resolve a type reference's text to its fqn via lexical scope, then visible types.
+    fn resolve_type_fqn_at(&self, text: &str, node: Node<'_>) -> Option<String> {
+        resolve_type_fq_name_at(
+            self.csharp,
+            self.file,
+            &self.class_ranges,
+            text,
+            node,
+            self.source,
+        )
     }
 
     /// The fqn of the smallest class declaration containing `byte`.
@@ -150,7 +151,7 @@ fn record_reference(
                 return;
             }
             let reference = reference_type_text(node, ctx.source);
-            if let Some(fqn) = ctx.resolve_type_fqn(&reference) {
+            if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, node) {
                 ctx.record(fqn, node);
             }
         }
@@ -196,14 +197,16 @@ fn receiver_type_fqn(
             // static type, unless it is a known (shadowed) untyped local.
             first_precise(bindings, name).or_else(|| {
                 (!bindings.is_shadowed(name))
-                    .then(|| ctx.resolve_type_fqn(name))
+                    .then(|| ctx.resolve_type_fqn_at(name, receiver))
                     .flatten()
             })
         }
         "this" | "base" => ctx
             .enclosing_class(receiver.start_byte())
             .map(str::to_string),
-        "qualified_name" | "generic_name" => ctx.resolve_type_fqn(node_text(receiver, ctx.source)),
+        "qualified_name" | "generic_name" => {
+            ctx.resolve_type_fqn_at(node_text(receiver, ctx.source), receiver)
+        }
         _ => None,
     }
 }
@@ -223,7 +226,7 @@ fn seed_declaration(
             };
             seed_typed(
                 name,
-                ctx.resolve_type_fqn(node_text(type_node, ctx.source)),
+                ctx.resolve_type_fqn_at(node_text(type_node, ctx.source), type_node),
                 ctx,
                 bindings,
             );
@@ -253,10 +256,12 @@ fn seed_variable_declaration(
         // `var x = new Foo()` infers from the initializer; other `var` is unknown.
         let resolved = if type_text == "var" {
             object_created_type(child)
-                .and_then(|type_node| ctx.resolve_type_fqn(node_text(type_node, ctx.source)))
+                .and_then(|type_node| {
+                    ctx.resolve_type_fqn_at(node_text(type_node, ctx.source), type_node)
+                })
                 .or_else(|| var_initializer_type(child, ctx, bindings))
         } else {
-            ctx.resolve_type_fqn(type_text)
+            ctx.resolve_type_fqn_at(type_text, type_node)
         };
         seed_typed(name, resolved, ctx, bindings);
     }
@@ -329,8 +334,9 @@ fn expression_type_fqn(
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     match expression.kind() {
-        "object_creation_expression" => object_created_type(expression)
-            .and_then(|type_node| ctx.resolve_type_fqn(node_text(type_node, ctx.source))),
+        "object_creation_expression" => object_created_type(expression).and_then(|type_node| {
+            ctx.resolve_type_fqn_at(node_text(type_node, ctx.source), type_node)
+        }),
         "invocation_expression" => invocation_return_type_fqn(expression, ctx, bindings),
         "identifier" => {
             let name = node_text(expression, ctx.source);

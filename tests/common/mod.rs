@@ -91,6 +91,35 @@ pub fn csharp_fixture_project() -> TestProject {
 }
 
 #[allow(dead_code)]
+pub fn csharp_nested_partial_cacheinfo_project() -> InlineTestProject {
+    InlineTestProject::with_language(Language::CSharp)
+        .file("Mapper.CacheInfo.cs", CSHARP_NESTED_PARTIAL_CACHEINFO)
+        .file("Mapper.cs", CSHARP_NESTED_PARTIAL_MAPPER)
+}
+
+#[allow(dead_code)]
+pub const CSHARP_NESTED_PARTIAL_CACHEINFO: &str = r#"
+namespace Dapper {
+    public static partial class SqlMapper {
+        private sealed class CacheInfo {}
+    }
+}
+"#;
+
+#[allow(dead_code)]
+pub const CSHARP_NESTED_PARTIAL_MAPPER: &str = r#"
+namespace Dapper {
+    public static partial class SqlMapper {
+        private static CacheInfo GetCacheInfo() {
+            CacheInfo? info = null;
+            info = new CacheInfo();
+            return info;
+        }
+    }
+}
+"#;
+
+#[allow(dead_code)]
 pub fn php_fixture_project() -> TestProject {
     TestProject::new(
         std::fs::canonicalize("tests/fixtures/testcode-php").unwrap(),

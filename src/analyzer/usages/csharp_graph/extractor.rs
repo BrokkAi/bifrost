@@ -4,9 +4,11 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, argument_count, binding_scope_node, enclosing_declared_type,
     expression_resolves_to_type, first_type_child, is_type_reference_node,
     member_name_is_locally_bound, node_text, normalize_type_text, object_initializer_for_label,
-    receiver_targets_owner, reference_type_text, resolves_to_target, same_node,
-    seed_visible_bindings_at, type_identity_matches, unqualified_member_resolves_to_owner,
+    receiver_targets_owner, reference_type_text, resolves_to_target, resolves_to_target_at,
+    same_node, seed_visible_bindings_at, type_identity_matches,
+    unqualified_member_resolves_to_owner,
 };
+use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -67,6 +69,7 @@ pub(super) fn scan_file(
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
         enclosing_cache: HashMap::default(),
+        class_ranges: ClassRangeIndex::build(csharp, file),
     };
     scan_node(tree.root_node(), &mut ctx);
 }
@@ -83,6 +86,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
+    pub(super) class_ranges: ClassRangeIndex,
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -125,9 +129,21 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let reference = reference_type_text(node, ctx.source);
-    if resolves_to_target(ctx.csharp, ctx.file, &reference, &ctx.spec.target) {
+    if type_reference_resolves_to_target(node, ctx, &reference) {
         push_hit(node, ctx);
     }
+}
+
+fn type_reference_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>, reference: &str) -> bool {
+    resolves_to_target_at(
+        ctx.file,
+        &ctx.class_ranges,
+        reference,
+        node,
+        ctx.source,
+        &ctx.spec.target,
+        ctx.csharp,
+    )
 }
 
 fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -140,11 +156,14 @@ fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     else {
         return;
     };
-    if !resolves_to_target(
-        ctx.csharp,
+    if !resolves_to_target_at(
         ctx.file,
+        &ctx.class_ranges,
         node_text(type_node, ctx.source),
+        type_node,
+        ctx.source,
         &ctx.spec.owner,
+        ctx.csharp,
     ) {
         return;
     }

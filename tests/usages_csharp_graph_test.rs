@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost::usages::{CSharpUsageGraphStrategy, FuzzyResult, UsageAnalyzer, UsageFinder};
 use brokk_bifrost::{CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language};
-use common::{InlineTestProject, call_search_tool_json};
+use common::{InlineTestProject, call_search_tool_json, csharp_nested_partial_cacheinfo_project};
 use serde_json::{Value, json};
 
 fn csharp_analyzer_with_files(
@@ -276,6 +276,73 @@ namespace Other {
     assert!(
         hits.len() >= 3,
         "expected several structured type hits: {hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_graph_resolves_nested_partial_type_references_in_sibling_file() {
+    let project = csharp_nested_partial_cacheinfo_project().build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+
+    let target = type_definition(&analyzer, "Dapper.SqlMapper$CacheInfo");
+    let hits = graph_hits(&analyzer, &target);
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("Mapper.cs")
+                && hit
+                    .snippet
+                    .lines()
+                    .any(|line| line.trim() == "CacheInfo? info = null;")
+        }),
+        "bare nested nullable type should resolve through the partial enclosing class: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("Mapper.cs")
+                && hit
+                    .snippet
+                    .lines()
+                    .any(|line| line.trim() == "info = new CacheInfo();")
+        }),
+        "bare nested constructor type should resolve through the partial enclosing class: {hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_graph_nested_type_reference_respects_type_parameter_shadow() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Mapper.CacheInfo.cs",
+            r#"
+namespace Dapper {
+    public static partial class SqlMapper {
+        private sealed class CacheInfo {}
+    }
+}
+"#,
+        ),
+        (
+            "Mapper.cs",
+            r#"
+namespace Dapper {
+    public static partial class SqlMapper {
+        private static CacheInfo M<CacheInfo>(CacheInfo value) {
+            CacheInfo? local = value;
+            return default;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Dapper.SqlMapper$CacheInfo");
+    let hits = graph_hits(&analyzer, &target);
+
+    assert!(
+        hits.iter().all(|hit| hit.file != project.file("Mapper.cs")),
+        "type parameter CacheInfo should shadow the nested type in scan_usages: {hits:#?}"
     );
 }
 
