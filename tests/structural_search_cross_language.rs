@@ -134,7 +134,13 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
         .iter()
         .map(|m| (m.language, m.path.as_str(), m.text.as_str()))
         .collect();
-    assert_eq!(rows, vec![("go", "go/app.go", "audit()")]);
+    assert_eq!(
+        rows,
+        vec![
+            ("cpp", "cpp/app.cpp", "audit()"),
+            ("go", "go/app.go", "audit()"),
+        ]
+    );
 
     let diagnostics: BTreeSet<_> = output
         .diagnostics
@@ -144,10 +150,6 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
     assert_eq!(
         diagnostics,
         BTreeSet::from([
-            (
-                "cpp",
-                "no structural adapter for cpp yet; its files were not searched",
-            ),
             (
                 "rust",
                 "no structural adapter for rust yet; its files were not searched",
@@ -364,6 +366,239 @@ func (s Service) Run(code string) {
             .iter()
             .any(|diagnostic| diagnostic.language == "go" && diagnostic.message.contains("kwargs")),
         "expected go kwargs diagnostic: {:?}",
+        unsupported.diagnostics
+    );
+}
+
+#[test]
+fn cpp_structural_adapter_matches_normalized_shapes() {
+    const CPP_APP: &str = r#"
+#include <vector>
+#include "service.h"
+
+#include <string>
+
+using Alias = Service;
+
+struct Service {
+    std::string Name;
+
+    Service();
+    void Run(const std::string& code);
+};
+
+Service::Service() {}
+
+void Service::Run(const std::string& code) {
+    audit(code);
+}
+
+std::string password = "hunter2";
+char marker = 'x';
+int retries = 3;
+auto callback = [](int value) {
+    return value;
+};
+
+std::string audit(const std::string& code) {
+    Service service;
+    auto created = new Service();
+    Service::Run(code);
+    service.Name = "updated";
+    return code;
+}
+"#;
+
+    let audit = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit" },
+                "args": [{ "name": "code", "capture": "code" }]
+            }
+        }),
+    );
+    assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
+    assert_eq!(audit.matches.len(), 1);
+    assert_eq!(audit.matches[0].text, "audit(code)");
+    assert_eq!(audit.matches[0].captures[0].text, "code");
+
+    let scoped_call = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "Service" },
+                "args": [{ "name": "code" }]
+            }
+        }),
+    );
+    assert!(
+        scoped_call.diagnostics.is_empty(),
+        "{:?}",
+        scoped_call.diagnostics
+    );
+    assert_eq!(scoped_call.matches.len(), 1);
+    assert_eq!(scoped_call.matches[0].text, "Service::Run(code)");
+
+    let allocation = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Service" }
+            }
+        }),
+    );
+    assert!(
+        allocation.diagnostics.is_empty(),
+        "{:?}",
+        allocation.diagnostics
+    );
+    assert_eq!(allocation.matches.len(), 1);
+    assert_eq!(allocation.matches[0].text, "new Service()");
+
+    let assignment = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "password" },
+                "right": { "kind": "string_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        assignment.diagnostics.is_empty(),
+        "{:?}",
+        assignment.diagnostics
+    );
+    assert_eq!(assignment.matches.len(), 1);
+    assert_eq!(assignment.matches[0].text, r#"password = "hunter2""#);
+    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+
+    let char_literal = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": { "kind": "string_literal", "text": { "regex": "^'x'$" } }
+        }),
+    );
+    assert!(
+        char_literal.diagnostics.is_empty(),
+        "{:?}",
+        char_literal.diagnostics
+    );
+    assert_eq!(char_literal.matches.len(), 1);
+    assert_eq!(char_literal.matches[0].text, "'x'");
+
+    let field_access = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": {
+                "kind": "field_access",
+                "object": { "name": "service" },
+                "field": { "name": "Name" }
+            }
+        }),
+    );
+    assert!(
+        field_access.diagnostics.is_empty(),
+        "{:?}",
+        field_access.diagnostics
+    );
+    assert_eq!(field_access.matches.len(), 1);
+    assert_eq!(field_access.matches[0].text, "service.Name");
+
+    let import = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": { "kind": "import", "module": { "name": "vector" } }
+        }),
+    );
+    assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
+    assert_eq!(import.matches.len(), 1);
+    assert_eq!(import.matches[0].text, "#include <vector>…");
+
+    let declarations = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": { "kind": "declaration", "name": { "regex": "^(Service|Alias|audit|Run)$" } }
+        }),
+    );
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    let declaration_rows: Vec<_> = declarations
+        .matches
+        .iter()
+        .map(|m| (m.kind, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        declaration_rows,
+        vec![
+            ("declaration", "using Alias = Service;"),
+            ("class", "struct Service {…"),
+            ("constructor", "Service::Service() {}"),
+            ("method", "void Service::Run(const std::string& code) {…"),
+            ("function", "std::string audit(const std::string& code) {…"),
+        ]
+    );
+
+    let constructor = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": { "kind": "constructor", "name": "Service" }
+        }),
+    );
+    assert!(
+        constructor.diagnostics.is_empty(),
+        "{:?}",
+        constructor.diagnostics
+    );
+    assert_eq!(constructor.matches.len(), 1);
+    assert_eq!(constructor.matches[0].text, "Service::Service() {}");
+
+    let lambda = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": { "kind": "lambda", "has": { "kind": "return" } }
+        }),
+    );
+    assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
+    assert_eq!(lambda.matches.len(), 1);
+    assert_eq!(lambda.matches[0].text, "[](int value) {…");
+
+    let unsupported = run_query_with_files(
+        &[("cpp/app.cpp", CPP_APP)],
+        json!({
+            "languages": ["cpp"],
+            "match": {
+                "kind": "call",
+                "kwargs": { "shell": { "kind": "boolean_literal" } }
+            }
+        }),
+    );
+    assert!(
+        unsupported
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "cpp"
+                && diagnostic.message.contains("kwargs")),
+        "expected cpp kwargs diagnostic: {:?}",
         unsupported.diagnostics
     );
 }

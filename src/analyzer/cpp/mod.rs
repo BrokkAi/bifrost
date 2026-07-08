@@ -4,6 +4,7 @@ mod clones;
 mod declarations;
 mod hierarchy;
 mod imports;
+mod structural;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
@@ -357,6 +358,12 @@ impl IAnalyzer for CppAnalyzer {
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
