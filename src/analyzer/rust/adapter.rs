@@ -74,4 +74,8 @@ impl LanguageAdapter for RustAdapter {
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&RUST_COGNITIVE_CONFIG)
     }
+
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::RUST_STRUCTURAL_SPEC)
+    }
 }

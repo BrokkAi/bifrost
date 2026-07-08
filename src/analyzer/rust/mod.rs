@@ -6,6 +6,7 @@ mod graph_support;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
+mod structural;
 mod tests;
 mod usage_index;
 
@@ -373,6 +374,12 @@ impl IAnalyzer for RustAnalyzer {
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
     }
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {

@@ -139,6 +139,7 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
         vec![
             ("cpp", "cpp/app.cpp", "audit()"),
             ("go", "go/app.go", "audit()"),
+            ("rust", "rust/lib.rs", "audit()"),
         ]
     );
 
@@ -150,10 +151,6 @@ fn remaining_languages_report_missing_structural_adapters_during_issue_527_rollo
     assert_eq!(
         diagnostics,
         BTreeSet::from([
-            (
-                "rust",
-                "no structural adapter for rust yet; its files were not searched",
-            ),
             (
                 "php",
                 "no structural adapter for php yet; its files were not searched",
@@ -599,6 +596,339 @@ std::string audit(const std::string& code) {
             .any(|diagnostic| diagnostic.language == "cpp"
                 && diagnostic.message.contains("kwargs")),
         "expected cpp kwargs diagnostic: {:?}",
+        unsupported.diagnostics
+    );
+}
+
+#[test]
+fn rust_structural_adapter_matches_normalized_shapes() {
+    const RUST_APP: &str = r#"
+use std::{fmt, io};
+
+type Alias = Service;
+
+const LIMIT: i32 = -3;
+static ENABLED: bool = false;
+
+struct Service {
+    name: String,
+    count: i32,
+}
+
+trait Runner {
+    fn execute(&self, code: &str);
+}
+
+impl Service {
+    fn run(&self, code: &str) -> String {
+        audit(code)
+    }
+}
+
+fn audit(code: &str) -> String {
+    let password = "hunter2";
+    let flag = true;
+    let callback = |value: i32| {
+        return value;
+    };
+    let mut service = Service { name: "primary".to_string(), count: 0 };
+    let parsed = parse::<String>(code);
+    let parsed_method = code.parse::<String>();
+    service.count += 1;
+    service.name = "updated".to_string();
+    code.to_string()
+}
+
+fn parse<T>(value: &str) -> String {
+    value.to_string()
+}
+"#;
+
+    let audit = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "audit" },
+                "args": [{ "name": "code", "capture": "code" }]
+            }
+        }),
+    );
+    assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
+    assert_eq!(audit.matches.len(), 1);
+    assert_eq!(audit.matches[0].text, "audit(code)");
+    assert_eq!(audit.matches[0].captures[0].text, "code");
+
+    let method_call = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "to_string" },
+                "receiver": { "name": "code" }
+            }
+        }),
+    );
+    assert!(
+        method_call.diagnostics.is_empty(),
+        "{:?}",
+        method_call.diagnostics
+    );
+    assert_eq!(method_call.matches.len(), 1);
+    assert_eq!(method_call.matches[0].text, "code.to_string()");
+
+    let generic_call = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "parse" },
+                "args": [{ "name": "code" }]
+            }
+        }),
+    );
+    assert!(
+        generic_call.diagnostics.is_empty(),
+        "{:?}",
+        generic_call.diagnostics
+    );
+    assert_eq!(generic_call.matches.len(), 1);
+    assert_eq!(generic_call.matches[0].text, "parse::<String>(code)");
+
+    let assignment = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "password" },
+                "right": { "kind": "string_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        assignment.diagnostics.is_empty(),
+        "{:?}",
+        assignment.diagnostics
+    );
+    assert_eq!(assignment.matches.len(), 1);
+    assert_eq!(assignment.matches[0].text, r#"let password = "hunter2";"#);
+    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+
+    let mutable_assignment = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "service" },
+                "right": { "text": { "regex": "^Service" }, "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        mutable_assignment.diagnostics.is_empty(),
+        "{:?}",
+        mutable_assignment.diagnostics
+    );
+    assert_eq!(mutable_assignment.matches.len(), 1);
+    assert_eq!(
+        mutable_assignment.matches[0].text,
+        r#"let mut service = Service { name: "primary".to_string(), count: 0 };"#
+    );
+    assert_eq!(
+        mutable_assignment.matches[0].captures[0].text,
+        r#"Service { name: "primary".to_string(), count: 0 }"#
+    );
+
+    let const_assignment = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "LIMIT" },
+                "right": { "kind": "numeric_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        const_assignment.diagnostics.is_empty(),
+        "{:?}",
+        const_assignment.diagnostics
+    );
+    assert_eq!(const_assignment.matches.len(), 1);
+    assert_eq!(const_assignment.matches[0].text, "const LIMIT: i32 = -3;");
+    assert_eq!(const_assignment.matches[0].captures[0].text, "-3");
+
+    let static_assignment = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "ENABLED" },
+                "right": { "kind": "boolean_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        static_assignment.diagnostics.is_empty(),
+        "{:?}",
+        static_assignment.diagnostics
+    );
+    assert_eq!(static_assignment.matches.len(), 1);
+    assert_eq!(
+        static_assignment.matches[0].text,
+        "static ENABLED: bool = false;"
+    );
+    assert_eq!(static_assignment.matches[0].captures[0].text, "false");
+
+    let compound_assignment = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "assignment",
+                "left": { "name": "count" },
+                "right": { "kind": "numeric_literal", "capture": "value" }
+            }
+        }),
+    );
+    assert!(
+        compound_assignment.diagnostics.is_empty(),
+        "{:?}",
+        compound_assignment.diagnostics
+    );
+    assert_eq!(compound_assignment.matches.len(), 1);
+    assert_eq!(compound_assignment.matches[0].text, "service.count += 1");
+    assert_eq!(compound_assignment.matches[0].captures[0].text, "1");
+
+    let boolean_literal = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": { "kind": "boolean_literal", "text": { "regex": "^true$" } }
+        }),
+    );
+    assert!(
+        boolean_literal.diagnostics.is_empty(),
+        "{:?}",
+        boolean_literal.diagnostics
+    );
+    assert_eq!(boolean_literal.matches.len(), 1);
+    assert_eq!(boolean_literal.matches[0].text, "true");
+
+    let generic_method_call = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "parse" },
+                "receiver": { "name": "code" }
+            }
+        }),
+    );
+    assert!(
+        generic_method_call.diagnostics.is_empty(),
+        "{:?}",
+        generic_method_call.diagnostics
+    );
+    assert_eq!(generic_method_call.matches.len(), 1);
+    assert_eq!(
+        generic_method_call.matches[0].text,
+        "code.parse::<String>()"
+    );
+
+    let field_access = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "field_access",
+                "object": { "name": "service" },
+                "field": { "name": "name" }
+            }
+        }),
+    );
+    assert!(
+        field_access.diagnostics.is_empty(),
+        "{:?}",
+        field_access.diagnostics
+    );
+    assert_eq!(field_access.matches.len(), 1);
+    assert_eq!(field_access.matches[0].text, "service.name");
+
+    let import = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": { "kind": "import", "module": { "name": "fmt" } }
+        }),
+    );
+    assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
+    assert_eq!(import.matches.len(), 1);
+    assert_eq!(import.matches[0].text, "use std::{fmt, io};");
+
+    let declarations = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": { "kind": "declaration", "name": { "regex": "^(Service|Alias|execute|audit|run|parse)$" } }
+        }),
+    );
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    let declaration_rows: Vec<_> = declarations
+        .matches
+        .iter()
+        .map(|m| (m.kind, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        declaration_rows,
+        vec![
+            ("declaration", "type Alias = Service;"),
+            ("class", "struct Service {…"),
+            ("method", "fn execute(&self, code: &str);"),
+            ("method", "fn run(&self, code: &str) -> String {…"),
+            ("function", "fn audit(code: &str) -> String {…"),
+            ("function", "fn parse<T>(value: &str) -> String {…"),
+        ]
+    );
+
+    let lambda = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": { "kind": "lambda", "has": { "kind": "return" } }
+        }),
+    );
+    assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
+    assert_eq!(lambda.matches.len(), 1);
+    assert_eq!(lambda.matches[0].text, "|value: i32| {…");
+
+    let unsupported = run_query_with_files(
+        &[("rust/lib.rs", RUST_APP)],
+        json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "call",
+                "kwargs": { "shell": { "kind": "boolean_literal" } }
+            }
+        }),
+    );
+    assert!(
+        unsupported.diagnostics.iter().any(
+            |diagnostic| diagnostic.language == "rust" && diagnostic.message.contains("kwargs")
+        ),
+        "expected rust kwargs diagnostic: {:?}",
         unsupported.diagnostics
     );
 }
