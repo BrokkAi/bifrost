@@ -10,11 +10,14 @@ use lsp_types::{
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, call_reference_ranges,
-    is_call_reference_range, resolve_call_reference_definition_with_source,
-    resolve_definition_batch_with_source,
+    is_call_reference_range_in_tree, parse_tree_for_language,
+    resolve_call_reference_definition_with_source, resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, Range, WorkspaceAnalyzer};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range, WorkspaceAnalyzer,
+};
+use crate::hash::HashMap;
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
@@ -146,8 +149,10 @@ pub fn incoming_calls(
             DEFAULT_MAX_USAGES,
         )
         .all_hits();
+
     let mut grouped: BTreeMap<String, (CodeUnit, Vec<LspRange>)> = BTreeMap::new();
     let mut content_cache = FileContentCache::default();
+    let mut call_reference_cache = CallReferenceRangeCache::default();
     for hit in hits {
         let caller = nearest_call_hierarchy_unit(analyzer, hit.enclosing.clone())
             .or_else(|| caller_for_hit(analyzer, &hit));
@@ -157,7 +162,7 @@ pub fn incoming_calls(
         if same_symbol(&caller, &target) {
             continue;
         }
-        if !is_call_usage_hit(project, &hit, &mut content_cache) {
+        if !call_reference_cache.is_call_usage_hit(project, &hit, &mut content_cache) {
             continue;
         }
         let Some(range) = usage_hit_range(project, &hit, &mut content_cache) else {
@@ -311,11 +316,30 @@ fn usage_hit_range(
     ))
 }
 
-fn is_call_usage_hit(project: &dyn Project, hit: &UsageHit, cache: &mut FileContentCache) -> bool {
-    let Some(entry) = cache.read_project(project, &hit.file) else {
-        return false;
-    };
-    is_call_reference_range(&hit.file, &entry.body, hit.start_offset, hit.end_offset)
+#[derive(Default)]
+struct CallReferenceRangeCache {
+    trees: HashMap<ProjectFile, Option<tree_sitter::Tree>>,
+}
+
+impl CallReferenceRangeCache {
+    fn is_call_usage_hit(
+        &mut self,
+        project: &dyn Project,
+        hit: &UsageHit,
+        cache: &mut FileContentCache,
+    ) -> bool {
+        let Some(entry) = cache.read_project(project, &hit.file) else {
+            return false;
+        };
+        let language = language_for_file(&hit.file);
+        let tree = self
+            .trees
+            .entry(hit.file.clone())
+            .or_insert_with(|| parse_tree_for_language(&hit.file, language, &entry.body));
+        tree.as_ref().is_some_and(|tree| {
+            is_call_reference_range_in_tree(tree, language, hit.start_offset, hit.end_offset)
+        })
+    }
 }
 
 fn call_hierarchy_item(

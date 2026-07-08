@@ -237,7 +237,8 @@ fn measure_hierarchy_scenario(
             )
         })?);
 
-    let start = Instant::now();
+    let total_start = Instant::now();
+    let build_start = Instant::now();
     let workspace = if selected_languages.is_empty() {
         WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default())
     } else {
@@ -247,27 +248,43 @@ fn measure_hierarchy_scenario(
             &selected_languages,
         )
     };
+    let build_ms = elapsed_ms(build_start);
 
-    match scenario {
+    let query_start = Instant::now();
+    let outcome = match scenario {
         BenchmarkScenario::CallHierarchy => {
             for query in &target.call_hierarchy_queries {
                 run_call_hierarchy_query(&workspace, project.as_ref(), checkout_path, query)?;
             }
+            Ok(())
         }
         BenchmarkScenario::TypeHierarchy => {
             for query in &target.type_hierarchy_queries {
                 run_type_hierarchy_query(&workspace, project.as_ref(), checkout_path, query)?;
             }
+            Ok(())
         }
-        _ => {
-            return Err(format!(
-                "scenario `{}` is not a hierarchy scenario",
-                scenario.label()
-            ));
-        }
+        _ => Err(format!(
+            "scenario `{}` is not a hierarchy scenario",
+            scenario.label()
+        )),
+    };
+    let query_ms = elapsed_ms(query_start);
+    outcome?;
+
+    let total_ms = elapsed_ms(total_start);
+    if profile_hierarchy_enabled() {
+        eprintln!(
+            "bifrost_benchmark_profile scenario={} repo={} build_ms={:.3} query_ms={:.3} total_ms={:.3}",
+            scenario.label(),
+            target.name,
+            build_ms,
+            query_ms,
+            total_ms
+        );
     }
 
-    Ok(elapsed_ms(start))
+    Ok(total_ms)
 }
 
 fn run_call_hierarchy_query(
@@ -277,6 +294,9 @@ fn run_call_hierarchy_query(
     query: &HierarchyQueryTarget,
 ) -> Result<(), String> {
     let params = call_hierarchy_prepare_params(checkout_path, &query.selector)?;
+    let profile = profile_hierarchy_enabled();
+    let query_start = Instant::now();
+    let prepare_start = Instant::now();
     let items = call_hierarchy::prepare(workspace, project, &params)
         .filter(|items| !items.is_empty())
         .ok_or_else(|| {
@@ -285,11 +305,13 @@ fn run_call_hierarchy_query(
                 query.selector.path
             )
         })?;
+    let prepare_ms = elapsed_ms(prepare_start);
     let item = items
         .into_iter()
         .next()
         .expect("non-empty call hierarchy item list");
 
+    let incoming_start = Instant::now();
     let incoming = call_hierarchy::incoming_calls(
         workspace,
         project,
@@ -305,6 +327,7 @@ fn run_call_hierarchy_query(
             query.selector.path
         )
     })?;
+    let incoming_ms = elapsed_ms(incoming_start);
     if incoming.len() < query.min_incoming {
         return Err(format!(
             "call_hierarchy incomingCalls for `{}` returned {} result(s), expected at least {}",
@@ -314,6 +337,7 @@ fn run_call_hierarchy_query(
         ));
     }
 
+    let outgoing_start = Instant::now();
     let outgoing = call_hierarchy::outgoing_calls(
         workspace,
         project,
@@ -329,6 +353,7 @@ fn run_call_hierarchy_query(
             query.selector.path
         )
     })?;
+    let outgoing_ms = elapsed_ms(outgoing_start);
     if outgoing.len() < query.min_outgoing {
         return Err(format!(
             "call_hierarchy outgoingCalls for `{}` returned {} result(s), expected at least {}",
@@ -338,7 +363,24 @@ fn run_call_hierarchy_query(
         ));
     }
 
+    if profile {
+        eprintln!(
+            "bifrost_benchmark_profile scenario=call_hierarchy selector={} prepare_ms={:.3} incoming_ms={:.3} outgoing_ms={:.3} incoming_count={} outgoing_count={} total_query_ms={:.3}",
+            query.selector.path,
+            prepare_ms,
+            incoming_ms,
+            outgoing_ms,
+            incoming.len(),
+            outgoing.len(),
+            elapsed_ms(query_start)
+        );
+    }
+
     Ok(())
+}
+
+fn profile_hierarchy_enabled() -> bool {
+    std::env::var_os("BIFROST_BENCHMARK_PROFILE_HIERARCHY").is_some()
 }
 
 fn run_type_hierarchy_query(
