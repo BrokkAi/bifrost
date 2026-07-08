@@ -30,6 +30,7 @@ export default defineConfig({
           items: [
             { label: 'Overview', slug: 'overview' },
             { label: 'Install Bifrost', slug: 'install' },
+            { label: 'CLI', slug: 'cli' },
           ],
         },
         {
@@ -59,8 +60,16 @@ export default defineConfig({
           label: 'Code Querying',
           items: [
             { label: 'Overview', slug: 'code-querying' },
+            { label: 'Semantic Search', slug: 'semantic-search' },
             { label: 'Rune Query Language', slug: 'search-ast-repl' },
             { label: 'JSON AstQuery', slug: 'search-ast-json' },
+          ],
+        },
+        {
+          label: 'Use Bifrost as a Library',
+          items: [
+            { label: 'Rust Library', slug: 'rust-library' },
+            { label: 'Python Client', slug: 'python-client' },
           ],
         },
       ],

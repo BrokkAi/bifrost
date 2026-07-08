@@ -153,7 +153,7 @@ not prose.
 
 It is opt-in. Set `BIFROST_SEMANTIC_INDEX=auto` to enable background indexing;
 the models load via ONNX and download from the HuggingFace hub on first use. The
-[main bifrost README](https://github.com/BrokkAi/bifrost#semantic-search) lists
+[semantic search docs](https://brokkai.github.io/bifrost/semantic-search/) list
 every environment override.
 
 ## License
