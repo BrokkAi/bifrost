@@ -20,6 +20,7 @@ The behavior is visible by calling `scan_usages` with mixed `symbols` and `targe
 - [x] (2026-07-08T17:43Z) Updated rendered text to drive directly from `results` in entry order and removed the "No usages found." fallback for non-empty requests.
 - [x] (2026-07-08T17:43Z) Updated benchmark validation, MCP description/docs, affected Rust tests, and the Python consumer in `../brokkbench` without scanning `clones/`.
 - [x] (2026-07-08T17:43Z) Ran formatting, focused tests, `cargo clippy-no-cuda`, Brokkbench focused Python tests, and the full `cargo test` suite.
+- [x] (2026-07-08T18:22Z) Addressed reviewer feedback: corrected `complete` to coverage/output-loss signals, classified `reference_only_siblings` from structured state, removed absence caveats from found entries, preserved blank symbol requests as entries, migrated the ignored JS/TS measurement test, and removed the legacy-key scan_usages test shim.
 
 ## Surprises & Discoveries
 
@@ -35,6 +36,12 @@ The behavior is visible by calling `scan_usages` with mixed `symbols` and `targe
 - Observation: The Brokkbench Python repo has a very dirty working tree unrelated to this refactor.
   Evidence: `git -C /home/jonathan/Projects/brokkbench status --short` produced thousands of existing modified/untracked files, so only the known consumer files were edited and no broad staging command was used.
 
+- Observation: Treating every non-`Full` rendering as incomplete conflated presentation detail with scan coverage.
+  Evidence: Fully scanned results that naturally start in `Lines` rendering because they have more than 10 hits reported `summary.partial=true`; a budget-demoted zero-hit entry could also lose `verified_absent` without any absence caveat.
+
+- Observation: Recovering `reference_only_siblings` by searching rendered note text made caveats depend on display conditions.
+  Evidence: The note was only emitted when absence otherwise looked verified, so cases with unproven hits or candidate truncation could drop the sibling caveat even though the structured render state still knew about reference-only files.
+
 ## Decision Log
 
 - Decision: The new public shape has one top-level `results: Vec<ScanUsagesEntry>` plus `summary`.
@@ -45,9 +52,9 @@ The behavior is visible by calling `scan_usages` with mixed `symbols` and `targe
   Rationale: This matches `ScanUsagesParams` declaration order and gives callers a stable mapping without sorting by status.
   Date/Author: 2026-07-08 / Codex
 
-- Decision: Status is only the outcome axis; `complete: false` carries incompleteness from candidate truncation, rendering demotion/summarization, or callsite caps.
+- Decision: Status is only the outcome axis; `complete: false` carries incompleteness from candidate truncation, returned file-list truncation, or callsite caps. Ordinary `Lines`/`Summary` rendering is presentation detail and does not make a scan partial by itself.
   Rationale: `unproven_matches`, `candidate_files_truncated`, and `reference_only_siblings` can co-occur, so they belong in `absence_caveats` or payload fields instead of competing statuses.
-  Date/Author: 2026-07-08 / Codex
+  Date/Author: 2026-07-08 / Codex; revised 2026-07-08 after reviewer feedback
 
 - Decision: `truncated_zero_hit_failure` is removed as a failure classification and becomes `unverified_absent` with `candidate_files_truncated`.
   Rationale: The scan completed against a truncated candidate set; the result is inconclusive absence, not an analyzer or graph failure.
@@ -56,6 +63,8 @@ The behavior is visible by calling `scan_usages` with mixed `symbols` and `targe
 ## Outcomes & Retrospective
 
 Implemented the public `scan_usages` JSON refactor. The service now emits one `results` entry per request, in canonical symbol-then-target order, with status and completeness separated. Zero-hit scans classify as `verified_absent` or `unverified_absent`; truncated zero-hit scans no longer become failures. Ambiguous entries keep structured retry payloads, and too-many-callsite results are represented as one incomplete entry.
+
+Reviewer follow-up corrected classification details: `complete` no longer depends on the display rendering tier, reference-only sibling caveats come from structured state instead of rendered prose, found entries do not carry absence caveats, and blank symbol strings produce explicit `not_found` entries rather than disappearing.
 
 Rendering, benchmark validation, MCP tool description text, and Rust tests were updated to the new entry shape. The Brokkbench Python consumers were also updated to read only the new `results` shape, with no old-shape fallback.
 
@@ -66,6 +75,8 @@ Validation completed:
 - `BIFROST_SEMANTIC_INDEX=off cargo test scan_usages_classif`
 - `BIFROST_SEMANTIC_INDEX=off cargo test --test searchtools_service -- scan_usages`
 - `BIFROST_SEMANTIC_INDEX=off cargo test --test searchtools_fuzzy_symbol_lookup --test usages_php_graph_test --test go_canonical_fqn_test`
+- `cargo test --quiet --test usages_csharp_graph_test --test usages_python_graph_test`
+- `cargo test --quiet --test measure_jsts_scan_usages_baseline -- --ignored --nocapture`
 - `cargo test --quiet`
 - `PYTHONPATH=. uv run pytest tests/test_prefilter.py tests/test_contextagent.py` in `/home/jonathan/Projects/brokkbench`
 
@@ -77,7 +88,7 @@ Bifrost is a Rust code-analysis server. The `scan_usages` tool is implemented in
 
 The old public response type is `ScanUsagesResult` in `src/searchtools.rs`. It has a `summary`, then five status arrays: `usages` for successes, `not_found` for unresolved inputs, `failures` for analyzer failures, `ambiguous` for multiple declarations, and `too_many_callsites` for high-fanout symbols. `src/searchtools_render.rs` renders those arrays in category order, which loses request order and can produce `No usages found.` when a request resolved but had no returned usage block. `src/benchmark/runner.rs` currently validates benchmark output by reading `structured["usages"]` and `structured["too_many_callsites"]`.
 
-The render-budget loop uses `SymbolUsageRenderState`. It first records full hit rows, then repeatedly demotes the largest symbol from full snippets to line clusters to per-file summaries until the serialized JSON fits `SCAN_USAGES_RESPONSE_BUDGET_BYTES`. Because final rendering state determines `complete`, classification must happen after this loop converges.
+The render-budget loop uses `SymbolUsageRenderState`. It first records full hit rows, then repeatedly demotes the largest symbol from full snippets to line clusters to per-file summaries until the serialized JSON fits `SCAN_USAGES_RESPONSE_BUDGET_BYTES`. Classification runs after this loop converges because returned file-list truncation and final rendering payloads are only known after budget fitting; ordinary rendering tier does not by itself make the scan incomplete.
 
 Definitions used in this plan:
 
@@ -252,3 +263,4 @@ The classification function should be shared and testable. A concrete shape is:
 
 - 2026-07-08T17:09Z: Initial plan created because the refactor changes a public JSON shape, rendering, benchmark validation, and many tests. The plan records the requested status taxonomy and implementation sequencing so future work can continue without relying on conversation memory.
 - 2026-07-08T17:43Z: Implementation completed and validated. Additional full-suite failures were fixed by migrating remaining stale tests to the new `results` shape.
+- 2026-07-08T18:22Z: Reviewer feedback applied. Completeness semantics now separate scan/output coverage from presentation rendering, caveats use structured state, blank symbols preserve one-entry-per-request ordering, and the ignored JS/TS measurement test reads `results`.

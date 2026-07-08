@@ -96,7 +96,11 @@ fn measure_symbol(
     expected_min_hits: u64,
 ) -> (f64, f64) {
     let first = scan_symbol(service, symbol);
-    let total_hits = first["usages"][0]["total_hits"].as_u64().unwrap_or(0);
+    let total_hits = first["results"]
+        .as_array()
+        .and_then(|results| results.first())
+        .and_then(|entry| entry["total_hits"].as_u64())
+        .unwrap_or(0);
     assert!(
         total_hits >= expected_min_hits,
         "expected >= {expected_min_hits} {symbol} usages, got {total_hits}: {first}"

@@ -2240,6 +2240,12 @@ namespace NzbDrone.Core
 }
 "#,
         ),
+        (
+            "src/NzbDrone.Common/Extensions/NumberExtensions.razor",
+            r#"
+<div>Razor markup is not analyzed as C#.</div>
+"#,
+        ),
     ]);
 
     let size_suffix = member_function(
@@ -2308,9 +2314,10 @@ namespace NzbDrone.Core
         .to_string(),
     );
 
-    assert_eq!(
-        0,
-        result["failures"].as_array().map_or(0, Vec::len),
+    assert!(
+        result["results"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().all(|entry| entry["status"] != "failure")),
         "{result}"
     );
     assert!(
@@ -2354,6 +2361,12 @@ namespace NzbDrone.Core
 }
 "#,
         ),
+        (
+            "src/NzbDrone.Common/Extensions/NumberExtensions.razor",
+            r#"
+<div>Razor markup is not analyzed as C#.</div>
+"#,
+        ),
     ]);
 
     let result = call_search_tool_json(
@@ -2377,6 +2390,12 @@ namespace NzbDrone.Core
             .as_array()
             .is_some_and(|caveats| caveats.iter().any(|c| c == "unproven_matches")),
         "unproven sites must prevent verified_absent: {result}"
+    );
+    assert!(
+        entry["absence_caveats"]
+            .as_array()
+            .is_some_and(|caveats| caveats.iter().any(|c| c == "reference_only_siblings")),
+        "reference-only sibling files must remain a caveat alongside unproven matches: {result}"
     );
     assert!(
         entry["unproven_files"][0]["hits"][0]["snippet"]

@@ -1008,12 +1008,7 @@ impl SearchToolsService {
         let has_symbols = arguments
             .get("symbols")
             .and_then(Value::as_array)
-            .is_some_and(|symbols| {
-                symbols
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .any(|symbol| !symbol.trim().is_empty())
-            });
+            .is_some_and(|symbols| symbols.iter().any(Value::is_string));
         let has_targets = arguments
             .get("targets")
             .and_then(Value::as_array)

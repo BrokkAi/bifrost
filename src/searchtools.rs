@@ -676,25 +676,18 @@ pub enum UsageRendering {
     Summary,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum ScanUsageResolution {
-    Resolved,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolUsages {
     pub symbol: String,
-    pub resolution: ScanUsageResolution,
     pub total_hits: usize,
     pub unproven_hits: usize,
-    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
-    pub verified_absent: bool,
     pub rendering: UsageRendering,
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned. Results are partial when set.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub candidate_files_truncated: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub reference_only_siblings: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition_sites_excluded: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2760,7 +2753,7 @@ impl ScanUsagesWorkEntry {
     }
 }
 
-fn scan_usages_target_label(target: &ScanUsagesTarget) -> String {
+pub(crate) fn scan_usages_target_label(target: &ScanUsagesTarget) -> String {
     if let Some(start) = target.start_byte {
         match target.end_byte {
             Some(end) => format!("{}@bytes:{start}..{end}", target.path),
@@ -3169,7 +3162,6 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         .symbols
         .unwrap_or_default()
         .into_iter()
-        .filter(|symbol| !symbol.trim().is_empty())
         .enumerate()
         .map(|(index, symbol)| ScanUsageRequest::symbol(index, symbol))
         .collect();
@@ -3233,6 +3225,16 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
 
     for request in symbols {
         let symbol = request.label.clone();
+        if symbol.trim().is_empty() {
+            work_entries.push(ScanUsagesWorkEntry::NotFound {
+                request,
+                item: NotFoundInput {
+                    input: symbol,
+                    note: Some("symbol must not be empty".to_string()),
+                },
+            });
+            continue;
+        }
         let (anchor, lookup) = split_definition_selector(&symbol);
         let overloads = match resolve_codeunit_fuzzy(analyzer, lookup) {
             CodeUnitResolution::Resolved(overloads) => overloads,
@@ -4135,10 +4137,7 @@ fn render_scan_usages_with_budget(entries: Vec<ScanUsagesWorkEntry>) -> ScanUsag
         let results: Vec<ScanUsagesEntry> =
             entries.iter().map(classify_scan_usages_entry).collect();
         let summary = build_scan_usages_summary(&results);
-        let result = ScanUsagesResult {
-            summary,
-            results: results.clone(),
-        };
+        let result = ScanUsagesResult { summary, results };
         if serde_json::to_string(&result)
             .map(|text| text.len() <= SCAN_USAGES_RESPONSE_BUDGET_BYTES)
             .unwrap_or(true)
@@ -4149,12 +4148,7 @@ fn render_scan_usages_with_budget(entries: Vec<ScanUsagesWorkEntry>) -> ScanUsag
         if !demote_largest_scan_usage_entry(&mut entries)
             && !truncate_largest_summary_scan_usage_entry(&mut entries)
         {
-            let results: Vec<ScanUsagesEntry> =
-                entries.iter().map(classify_scan_usages_entry).collect();
-            return ScanUsagesResult {
-                summary: build_scan_usages_summary(&results),
-                results,
-            };
+            return result;
         }
     }
 }
@@ -4268,11 +4262,8 @@ fn classify_usage_entry(
     too_many_callsites: bool,
     callsite_cap: Option<(String, usize, usize)>,
 ) -> ScanUsagesEntry {
-    let rendering_incomplete = usage.rendering != UsageRendering::Full;
-    let complete = !too_many_callsites
-        && !usage.candidate_files_truncated
-        && usage.files_truncated.is_none()
-        && !rendering_incomplete;
+    let complete =
+        !too_many_callsites && !usage.candidate_files_truncated && usage.files_truncated.is_none();
 
     if too_many_callsites {
         let (short_name, total_callsites, limit) =
@@ -4293,28 +4284,23 @@ fn classify_usage_entry(
     if usage.candidate_files_truncated {
         caveats.push(ScanUsagesAbsenceCaveat::CandidateFilesTruncated);
     }
-    if usage
-        .note
-        .as_deref()
-        .is_some_and(|note| note.contains("absence not verified"))
-    {
+    if usage.reference_only_siblings {
         caveats.push(ScanUsagesAbsenceCaveat::ReferenceOnlySiblings);
     }
 
     let status = if usage.total_hits > 0 {
         ScanUsagesStatus::Found
-    } else if caveats.is_empty() && complete {
+    } else if caveats.is_empty() {
         ScanUsagesStatus::VerifiedAbsent
     } else {
         ScanUsagesStatus::UnverifiedAbsent
     };
 
     let mut result = scan_usages_entry_base(request, status, complete);
-    result.absence_caveats = caveats;
-    if result
-        .absence_caveats
-        .contains(&ScanUsagesAbsenceCaveat::CandidateFilesTruncated)
-    {
+    if status == ScanUsagesStatus::UnverifiedAbsent {
+        result.absence_caveats = caveats;
+    }
+    if usage.candidate_files_truncated {
         result.candidate_files_sample = candidate_files_sample;
     }
     populate_usage_payload(&mut result, usage);
@@ -4335,10 +4321,12 @@ fn populate_usage_payload(entry: &mut ScanUsagesEntry, usage: SymbolUsages) {
         entry.notes.push(note);
     }
     if usage.candidate_files_truncated {
-        entry.notes.push(
+        let note = if usage.total_hits == 0 {
             "Candidate file set was truncated; zero-hit absence is not authoritative. Re-call scan_usages with narrower `paths`."
-                .to_string(),
-        );
+        } else {
+            "Candidate file set was truncated; additional usage sites may exist. Re-call scan_usages with narrower `paths` for exhaustive coverage."
+        };
+        entry.notes.push(note.to_string());
     }
     if usage.total_hits == 0 && entry.status == ScanUsagesStatus::VerifiedAbsent {
         entry.notes.push(
@@ -4542,21 +4530,20 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
                 .to_string(),
         );
     }
+    let reference_only_siblings = state.reference_only_absence_note.is_some();
     let absence_would_be_verified =
         !state.candidate_files_truncated && state.total_hits == 0 && state.unproven_hits == 0;
     if absence_would_be_verified && let Some(note) = &state.reference_only_absence_note {
         notes.push(note.clone());
     }
-    let verified_absent = absence_would_be_verified && state.reference_only_absence_note.is_none();
 
     SymbolUsages {
         symbol: state.symbol.clone(),
-        resolution: ScanUsageResolution::Resolved,
         total_hits: state.total_hits,
         unproven_hits: state.unproven_hits,
-        verified_absent,
         rendering: state.rendering,
         candidate_files_truncated: state.candidate_files_truncated,
+        reference_only_siblings,
         definition_sites_excluded: some_if_nonzero(state.definition_sites_excluded),
         files_truncated,
         note: if notes.is_empty() {
@@ -6065,7 +6052,7 @@ mod tests {
     use super::{
         ScanUsageRequest, ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample,
         ScanUsagesStatus, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState,
-        UsageFailureInfo, UsageHitRow, classify_scan_usages_entry, list_symbols,
+        UsageFailureInfo, UsageHitRow, UsageRendering, classify_scan_usages_entry, list_symbols,
         resolve_file_patterns, trim_summary_signature,
     };
     use crate::analyzer::{
@@ -6531,6 +6518,35 @@ def gamma():
         ));
         assert_eq!(ScanUsagesStatus::Found, found_truncated.status);
         assert!(!found_truncated.complete);
+        assert!(found_truncated.absence_caveats.is_empty());
+        assert!(found_truncated.candidate_files_sample.is_some());
+
+        let found_with_unproven = classify_scan_usages_entry(&usage_work_entry(
+            "target",
+            vec![usage_row("caller.rs", 1)],
+            1,
+            vec![usage_row("maybe.rs", 2)],
+            false,
+            None,
+        ));
+        assert_eq!(ScanUsagesStatus::Found, found_with_unproven.status);
+        assert!(found_with_unproven.complete);
+        assert!(found_with_unproven.absence_caveats.is_empty());
+
+        let found_lines = classify_scan_usages_entry(&usage_work_entry(
+            "target",
+            (0..11)
+                .map(|line| usage_row("caller.rs", line + 1))
+                .collect(),
+            0,
+            Vec::new(),
+            false,
+            None,
+        ));
+        assert_eq!(ScanUsagesStatus::Found, found_lines.status);
+        assert_eq!(Some(UsageRendering::Lines), found_lines.rendering);
+        assert!(found_lines.complete);
+        assert!(!super::build_scan_usages_summary(std::slice::from_ref(&found_lines)).partial);
 
         let verified_absent = classify_scan_usages_entry(&usage_work_entry(
             "target",
@@ -6588,6 +6604,54 @@ def gamma():
         assert!(sibling_absent.complete);
         assert!(
             sibling_absent
+                .absence_caveats
+                .contains(&ScanUsagesAbsenceCaveat::ReferenceOnlySiblings)
+        );
+
+        let unproven_sibling_absent = classify_scan_usages_entry(&usage_work_entry(
+            "target",
+            Vec::new(),
+            1,
+            vec![usage_row("maybe.rs", 2)],
+            false,
+            Some("workspace contains .razor files; absence not verified".to_string()),
+        ));
+        assert_eq!(
+            ScanUsagesStatus::UnverifiedAbsent,
+            unproven_sibling_absent.status
+        );
+        assert!(unproven_sibling_absent.complete);
+        assert!(
+            unproven_sibling_absent
+                .absence_caveats
+                .contains(&ScanUsagesAbsenceCaveat::UnprovenMatches)
+        );
+        assert!(
+            unproven_sibling_absent
+                .absence_caveats
+                .contains(&ScanUsagesAbsenceCaveat::ReferenceOnlySiblings)
+        );
+
+        let truncated_sibling_absent = classify_scan_usages_entry(&usage_work_entry(
+            "target",
+            Vec::new(),
+            0,
+            Vec::new(),
+            true,
+            Some("workspace contains .razor files; absence not verified".to_string()),
+        ));
+        assert_eq!(
+            ScanUsagesStatus::UnverifiedAbsent,
+            truncated_sibling_absent.status
+        );
+        assert!(!truncated_sibling_absent.complete);
+        assert!(
+            truncated_sibling_absent
+                .absence_caveats
+                .contains(&ScanUsagesAbsenceCaveat::CandidateFilesTruncated)
+        );
+        assert!(
+            truncated_sibling_absent
                 .absence_caveats
                 .contains(&ScanUsagesAbsenceCaveat::ReferenceOnlySiblings)
         );

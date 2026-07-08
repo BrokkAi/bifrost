@@ -5,7 +5,7 @@ use crate::searchtools::{
     ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile, SearchSymbolsResult,
     SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement, SummaryResult,
     SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
-    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation,
+    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,21 +379,7 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
 fn render_scan_usages_input(input: &ScanUsagesInput) -> String {
     match input {
         ScanUsagesInput::Symbol(symbol) => symbol.clone(),
-        ScanUsagesInput::Target(target) => {
-            if let Some(start) = target.start_byte {
-                match target.end_byte {
-                    Some(end) => format!("{}@bytes:{start}..{end}", target.path),
-                    None => format!("{}@byte:{start}", target.path),
-                }
-            } else if let Some(line) = target.line {
-                match target.column {
-                    Some(column) => format!("{}:{line}:{column}", target.path),
-                    None => format!("{}:{line}", target.path),
-                }
-            } else {
-                target.path.clone()
-            }
-        }
+        ScanUsagesInput::Target(target) => scan_usages_target_label(target),
     }
 }
 
