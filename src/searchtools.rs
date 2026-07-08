@@ -3009,6 +3009,56 @@ fn source_has_dot_before(source: Option<&str>, byte: usize) -> bool {
         == Some('.')
 }
 
+fn present_reference_only_sibling_extensions_by_language(
+    analyzer: &dyn IAnalyzer,
+) -> BTreeMap<Language, Vec<&'static str>> {
+    let mut present = BTreeMap::new();
+    let Ok(files) = analyzer.project().all_files() else {
+        return present;
+    };
+
+    let mut workspace_extensions = HashSet::default();
+    for file in files {
+        if let Some(extension) = file
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            workspace_extensions.insert(extension.to_ascii_lowercase());
+        }
+    }
+
+    for language in Language::ANALYZABLE {
+        let language_present = language
+            .reference_only_sibling_extensions()
+            .iter()
+            .copied()
+            .filter(|extension| workspace_extensions.contains(*extension))
+            .collect::<Vec<_>>();
+        if !language_present.is_empty() {
+            present.insert(language, language_present);
+        }
+    }
+
+    present
+}
+
+fn reference_only_absence_note(
+    overloads: &[CodeUnit],
+    present_by_language: &BTreeMap<Language, Vec<&'static str>>,
+) -> Option<String> {
+    let language = overloads.first().map(language_for_target)?;
+    let extensions = present_by_language.get(&language)?;
+    let extension_list = extensions
+        .iter()
+        .map(|extension| format!(".{extension}"))
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(format!(
+        "workspace contains {extension_list} files that may reference this symbol but are not analyzed; absence not verified"
+    ))
+}
+
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages");
 
@@ -3020,6 +3070,8 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         .collect();
     let targets = params.targets;
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
+    let reference_only_sibling_extensions =
+        present_reference_only_sibling_extensions_by_language(analyzer);
 
     // When the caller scopes the query to `paths`, the answer can only live in those files, so
     // resolve the candidate set straight from them instead of enumerating references across the
@@ -3177,6 +3229,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     unproven_total,
                     filtered_unproven.hits,
                     None,
+                    reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
                 ));
             }
             FuzzyResult::Ambiguous {
@@ -3204,6 +3257,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                         0,
                         Vec::new(),
                         None,
+                        reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
                     ));
                     continue;
                 }
@@ -3288,6 +3342,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     0,
                     Vec::new(),
                     Some(too_many_callsites_summary_note(limit)),
+                    reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
                 ));
                 too_many_callsites.push(TooManyCallsitesInfo {
                     symbol,
@@ -3774,12 +3829,14 @@ struct SymbolUsageRenderState {
     summary_files: Vec<SummaryFileCount>,
     top_enclosing: Vec<UsageEnclosingCount>,
     base_note: Option<String>,
+    reference_only_absence_note: Option<String>,
     rendering: UsageRendering,
     file_limit: Option<usize>,
     top_enclosing_limit: usize,
 }
 
 impl SymbolUsageRenderState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         symbol: String,
         candidate_files_truncated: bool,
@@ -3788,6 +3845,7 @@ impl SymbolUsageRenderState {
         unproven_hits: usize,
         unproven_rows: Vec<UsageHitRow>,
         base_note: Option<String>,
+        reference_only_absence_note: Option<String>,
     ) -> Self {
         let total_hits = hits.len();
         let clustered_line_rows = clustered_usage_line_row_count(&hits);
@@ -3840,6 +3898,7 @@ impl SymbolUsageRenderState {
             summary_files,
             top_enclosing,
             base_note,
+            reference_only_absence_note,
             rendering,
             file_limit,
             top_enclosing_limit: SCAN_USAGES_TOP_ENCLOSING_LIMIT,
@@ -3856,6 +3915,7 @@ impl SymbolUsageRenderState {
         unproven_hits: usize,
         unproven_rows: Vec<UsageHitRow>,
         base_note: Option<String>,
+        reference_only_absence_note: Option<String>,
     ) -> Self {
         let mut state = Self::new(
             symbol,
@@ -3865,6 +3925,7 @@ impl SymbolUsageRenderState {
             unproven_hits,
             unproven_rows,
             base_note,
+            reference_only_absence_note,
         );
         state.total_hits = total_hits;
         state.rendering = UsageRendering::Summary;
@@ -4212,8 +4273,12 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
                 .to_string(),
         );
     }
-    let verified_absent =
+    let absence_would_be_verified =
         !state.candidate_files_truncated && state.total_hits == 0 && state.unproven_hits == 0;
+    if absence_would_be_verified && let Some(note) = &state.reference_only_absence_note {
+        notes.push(note.clone());
+    }
+    let verified_absent = absence_would_be_verified && state.reference_only_absence_note.is_none();
 
     SymbolUsages {
         symbol: state.symbol.clone(),

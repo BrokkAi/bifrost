@@ -2371,6 +2371,69 @@ namespace App
 }
 
 #[test]
+fn csharp_scan_usages_zero_with_razor_sibling_does_not_report_verified_absent() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Service.cs",
+            r#"
+namespace App
+{
+    public class Service
+    {
+        public void Run() {}
+    }
+}
+"#,
+        )
+        .file(
+            "Service.razor",
+            r#"
+<div>Razor markup is not analyzed as C#.</div>
+"#,
+        )
+        .build();
+
+    let result = call_search_tool_json(
+        project.root(),
+        "scan_usages",
+        &json!({
+            "symbols": ["App.Service.Run"],
+            "include_tests": true
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        1,
+        result["usages"].as_array().map_or(0, Vec::len),
+        "{result}"
+    );
+    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
+    assert_eq!(0, result["usages"][0]["unproven_hits"], "{result}");
+    assert!(
+        result["usages"][0]["verified_absent"].is_null(),
+        "Razor sibling files must prevent verified_absent: {result}"
+    );
+    let note = result["usages"][0]["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains(
+            "workspace contains .razor files that may reference this symbol but are not analyzed; absence not verified"
+        ),
+        "{result}"
+    );
+    assert!(
+        result["summary"]["symbols"][0]["verified_absent"].is_null(),
+        "summary must mirror suppressed verified_absent: {result}"
+    );
+    assert!(
+        result["summary"]["symbols"][0]["note"]
+            .as_str()
+            .is_some_and(|summary_note| summary_note.contains(".razor files")),
+        "{result}"
+    );
+}
+
+#[test]
 fn csharp_scan_usages_truncated_scan_does_not_report_verified_absent() {
     let mut builder = InlineTestProject::with_language(Language::CSharp).file(
         "Service.cs",

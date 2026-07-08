@@ -81,6 +81,14 @@ impl Language {
         }
     }
 
+    pub fn reference_only_sibling_extensions(self) -> &'static [&'static str] {
+        match self {
+            Language::CSharp => &["razor", "cshtml"],
+            Language::JavaScript | Language::TypeScript => &["vue", "svelte"],
+            _ => &[],
+        }
+    }
+
     pub fn from_extension(extension: &str) -> Self {
         let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
         for language in Self::ANALYZABLE {
