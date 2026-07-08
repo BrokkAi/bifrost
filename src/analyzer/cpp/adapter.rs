@@ -64,4 +64,8 @@ impl LanguageAdapter for CppAdapter {
         recover_quoted_includes(source, &mut parsed);
         parsed
     }
+
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::CPP_STRUCTURAL_SPEC)
+    }
 }

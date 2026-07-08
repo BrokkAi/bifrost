@@ -5,6 +5,7 @@ pub(crate) mod diagnostics;
 mod hierarchy;
 mod imports;
 pub(crate) mod packages;
+mod structural;
 mod tests;
 
 use crate::analyzer::common::language_for_file as file_language;
@@ -404,6 +405,12 @@ impl IAnalyzer for GoAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

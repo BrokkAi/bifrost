@@ -1,19 +1,23 @@
 //! Planner-level tests for `search_ast` (issue #328, ExecPlan milestone 3):
 //! anchor pruning skips files that provably cannot match, the facts cache
 //! serves repeated queries without re-extraction, negation never prunes, and
-//! unsupported workspace languages surface as diagnostics. Extraction counts
+//! language scoping and capability diagnostics stay deterministic. Extraction counts
 //! come from `StructuralSearchProvider::structural_extraction_count`, which
 //! counts facts-cache misses (parse + normalize runs).
 
 mod common;
 
-use brokk_bifrost::AnalyzerConfig;
 use brokk_bifrost::analyzer::structural::{
     AstQuery, SearchAstExecutionLimits, SearchAstOutput, execute, execute_with_limits,
 };
-use brokk_bifrost::{IAnalyzer, Language, WorkspaceAnalyzer};
+use brokk_bifrost::{
+    AnalyzerConfig, CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
+    WorkspaceAnalyzer,
+};
 use common::InlineTestProject;
 use serde_json::json;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 const USES_EVAL_PY: &str = r#"def handler(request):
     eval(request.form["q"])
@@ -51,6 +55,111 @@ fn extraction_count(analyzer: &dyn IAnalyzer) -> u64 {
     let providers = analyzer.structural_search_providers();
     assert_eq!(providers.len(), 1, "expected exactly one python provider");
     providers[0].structural_extraction_count()
+}
+
+#[derive(Clone)]
+struct NoProviderAnalyzer {
+    project: Arc<dyn Project>,
+    files: BTreeSet<ProjectFile>,
+    languages: BTreeSet<Language>,
+}
+
+impl NoProviderAnalyzer {
+    fn new(project: Arc<dyn Project>, file: ProjectFile, language: Language) -> Self {
+        Self {
+            project,
+            files: BTreeSet::from([file]),
+            languages: BTreeSet::from([language]),
+        }
+    }
+}
+
+impl IAnalyzer for NoProviderAnalyzer {
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        Box::new(self.files.iter())
+    }
+
+    fn languages(&self) -> BTreeSet<Language> {
+        self.languages.clone()
+    }
+
+    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+
+    fn update_all(&self) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+
+    fn project(&self) -> &dyn Project {
+        self.project.as_ref()
+    }
+
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        Box::new(std::iter::empty())
+    }
+
+    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
+        None
+    }
+
+    fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
+        None
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        _file: &ProjectFile,
+        _start_line: usize,
+        _end_line: usize,
+    ) -> Option<CodeUnit> {
+        None
+    }
+
+    fn is_access_expression(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+    ) -> bool {
+        false
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+        _ident: &str,
+    ) -> Option<DeclarationInfo> {
+        None
+    }
+
+    fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
+        None
+    }
+
+    fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
+        BTreeSet::new()
+    }
 }
 
 fn assert_truncation_diagnostic(output: &SearchAstOutput, limit: usize) {
@@ -337,7 +446,37 @@ fn execution_budget_bounds_unanchored_no_match_queries() {
 }
 
 #[test]
-fn unsupported_languages_surface_as_diagnostics() {
+fn analyzer_language_without_provider_surfaces_as_diagnostic() {
+    let project = InlineTestProject::new()
+        .file("src/tool.rb", "def run\n  eval(input)\nend\n")
+        .build();
+    let analyzer = NoProviderAnalyzer::new(
+        project.project_dyn(),
+        project.file("src/tool.rb"),
+        Language::Ruby,
+    );
+
+    let output = run(
+        &analyzer,
+        json!({ "match": { "kind": "call", "callee": { "name": "eval" } } }),
+    );
+
+    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "ruby"
+                && diagnostic
+                    .message
+                    .contains("no structural adapter for ruby yet")),
+        "expected a ruby no-provider diagnostic, got: {:?}",
+        output.diagnostics
+    );
+}
+
+#[test]
+fn formerly_unsupported_languages_are_searched_after_adapter_registration() {
     let project = InlineTestProject::new()
         .file("src/app.py", USES_EVAL_PY)
         .file("src/tool.rb", "def run\n  eval(input)\nend\n")
@@ -349,31 +488,26 @@ fn unsupported_languages_surface_as_diagnostics() {
         analyzer,
         json!({ "match": { "kind": "call", "callee": { "name": "eval" } } }),
     );
-    // Python side still matches; the Ruby file is reported, not silently
-    // skipped.
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].language, "python");
+    assert_eq!(output.matches.len(), 2);
+    let languages: Vec<_> = output.matches.iter().map(|mat| mat.language).collect();
+    assert_eq!(languages, vec!["python", "ruby"]);
     assert!(
-        output
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.language == "ruby"),
-        "expected a ruby capability diagnostic, got: {:?}",
+        output.diagnostics.is_empty(),
+        "ruby now has a structural adapter and should not warn: {:?}",
         output.diagnostics
     );
 
-    // An explicit language filter for an unsupported language yields no
-    // matches but keeps the diagnostic.
+    // An explicit language filter searches the registered Ruby provider.
     let filtered = run(
         analyzer,
         json!({ "languages": ["ruby"], "match": { "kind": "call" } }),
     );
-    assert!(filtered.matches.is_empty());
+    assert_eq!(filtered.matches.len(), 1);
+    assert_eq!(filtered.matches[0].language, "ruby");
     assert!(
-        filtered
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.language == "ruby")
+        filtered.diagnostics.is_empty(),
+        "explicit ruby search should not produce adapter diagnostics: {:?}",
+        filtered.diagnostics
     );
 }
 

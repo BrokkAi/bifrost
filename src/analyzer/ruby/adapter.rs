@@ -43,6 +43,10 @@ impl LanguageAdapter for RubyAdapter {
         "rb"
     }
 
+    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
+        Some(&super::structural::RUBY_STRUCTURAL_SPEC)
+    }
+
     fn contains_tests(
         &self,
         _file: &ProjectFile,
