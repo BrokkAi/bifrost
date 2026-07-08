@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The observable outcome is that edits made between MCP requests are reflected aut
 
 ## Progress
 
-- [x] (2026-03-30 21:01Z) Re-read `.agent/PLANS.md`, inspected the current analyzer, workspace, and MCP integration points, and confirmed the implementation targets.
+- [x] (2026-03-30 21:01Z) Re-read `.agents/PLANS.md`, inspected the current analyzer, workspace, and MCP integration points, and confirmed the implementation targets.
 - [x] (2026-03-30 21:01Z) Locked the desired API decisions: unordered set only for the new watcher API, take-and-clear polling semantics, and internal MCP integration without adding a new MCP tool.
 - [x] (2026-03-30 21:33Z) Added `notify` to `Cargo.toml`, created `src/project_watcher.rs`, and exported `ProjectChangeWatcher` plus `ChangeDelta` from `src/lib.rs`.
 - [x] (2026-03-30 21:36Z) Added `WorkspaceAnalyzer::update(&BTreeSet<ProjectFile>) -> Self` so the session wrapper can forward partial refreshes.

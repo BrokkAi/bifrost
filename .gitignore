@@ -12,12 +12,6 @@ __pycache__/
 .bifrost/
 bifrost_searchtools/*.so
 
-### BROKK'S CONFIGURATION ###
-**/.brokk/**
-!AGENTS.md
-!**/.brokk/style.md
-!**/.brokk/project.properties
-
 .mjolnir
 .idea
 .vscode/

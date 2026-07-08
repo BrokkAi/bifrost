@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with [.agent/PLANS.md](../../.agent/PLANS.md).
+This document must be maintained in accordance with [.agents/PLANS.md](../../.agents/PLANS.md).
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ After this change, `search_symbols` should stop surfacing weak or noisy matches 
 
 ## Progress
 
-- [x] (2026-06-09T23:33:00Z) Re-read `.agent/PLANS.md`, inspected the current `search_symbols` pipeline in `src/searchtools.rs`, the service wrapper in `src/searchtools_service.rs`, and the persisted symbol query path in `src/analyzer/persistence/storage.rs`.
+- [x] (2026-06-09T23:33:00Z) Re-read `.agents/PLANS.md`, inspected the current `search_symbols` pipeline in `src/searchtools.rs`, the service wrapper in `src/searchtools_service.rs`, and the persisted symbol query path in `src/analyzer/persistence/storage.rs`.
 - [x] (2026-06-09T23:33:00Z) Confirmed that persisted FTS rank is discarded today because `search_definitions` results are materialized into `BTreeSet<CodeUnit>`, so relevance ranking must be rebuilt in `searchtools`.
 - [x] (2026-06-10T00:12:00Z) Added an internal ranking layer for `search_symbols` candidate and file ordering, keeping the public request and response shapes unchanged.
 - [x] (2026-06-10T00:12:00Z) Added focused ranking tests with `InlineTestProject`, plus a service-level test proving exact relevance beats a hotter partial-match file while keeping the git tie-break path intact.

@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md`. It is self-contained and describes how to audit and break down GitHub issue `BrokkAi/bifrost#141`, "Epic: Replace analyzer and usage graph mini parsers with tree-sitter classification."
+This document follows `.agents/PLANS.md`. It is self-contained and describes how to audit and break down GitHub issue `BrokkAi/bifrost#141`, "Epic: Replace analyzer and usage graph mini parsers with tree-sitter classification."
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ After this work, the team should have an evidence-backed inventory of the import
 
 ## Progress
 
-- [x] (2026-05-28 16:48Z) Read `.agent/PLANS.md`, confirmed this issue branch is attached to `141-epic-replace-analyzer-and-usage-graph-mini-parsers-with-tree-sitter-classification`, and rebased against `origin/master`.
+- [x] (2026-05-28 16:48Z) Read `.agents/PLANS.md`, confirmed this issue branch is attached to `141-epic-replace-analyzer-and-usage-graph-mini-parsers-with-tree-sitter-classification`, and rebased against `origin/master`.
 - [x] (2026-05-28 16:48Z) Recorded the initial mini-parser definition, PHP seed area, language order, and validation policy in this ExecPlan.
 - [x] (2026-05-28 16:48Z) Captured initial audit evidence for PHP, Python, Rust, and Go usage graph mini-parser clusters.
 - [x] (2026-05-28 16:57Z) Audited PHP usage graph mini parsers and replaced the small constructor/function/constant classification probes with tree-sitter parent-node checks.
@@ -194,7 +194,7 @@ During each milestone, update `Progress`, `Surprises & Discoveries`, `Decision L
 
 ## Validation and Acceptance
 
-The ExecPlan-only change is accepted when this file exists, follows `.agent/PLANS.md`, and contains enough concrete audit evidence for the next contributor to start with PHP without external context.
+The ExecPlan-only change is accepted when this file exists, follows `.agents/PLANS.md`, and contains enough concrete audit evidence for the next contributor to start with PHP without external context.
 
 For a language cleanup that edits Rust code, run the focused test for that language. The expected result is that the new or existing regression test fails before the cleanup if it exposes a bug, then passes after the cleanup, or that existing focused tests continue to pass for behavior-preserving refactors. Use these commands as the default focused validations:
 

@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md`.
+This document follows `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -10,7 +10,7 @@ After this change, users of the Scala analyzer can go to definition and find usa
 
 ## Progress
 
-- [x] (2026-07-01 20:10Z) Read `.agent/PLANS.md` and created this living plan.
+- [x] (2026-07-01 20:10Z) Read `.agents/PLANS.md` and created this living plan.
 - [x] (2026-07-01 20:10Z) Inspected `src/analyzer/usages/scala_graph/inverted.rs`, `resolver.rs`, `extractor.rs`, `syntax.rs`, `src/analyzer/scala/declarations.rs`, and Scala import parsing.
 - [x] (2026-07-01 20:18Z) Discovered exact tree-sitter-scala node kinds for Scala 3 extension definitions and calls.
 - [x] (2026-07-01 20:34Z) Implemented declaration indexing for extension methods.

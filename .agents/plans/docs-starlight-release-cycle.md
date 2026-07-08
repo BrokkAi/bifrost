@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md` from the repository root.
+This document follows `.agents/PLANS.md` from the repository root.
 
 ## Purpose / Big Picture
 
@@ -42,7 +42,7 @@ The first slice establishes the docs site skeleton, build scripts, and release-a
 
 ## Context and Orientation
 
-`docs/` is now the public documentation site. It is an independent Node package so the Rust crate and editor extension do not need to share JavaScript dependency state. `.agent/PLANS.md` remains the rules file for ExecPlans. `.agents/docs/` contains agent-only notes and runbooks. `.agents/plans/` contains historical and current ExecPlans.
+`docs/` is now the public documentation site. It is an independent Node package so the Rust crate and editor extension do not need to share JavaScript dependency state. `.agents/PLANS.md` remains the rules file for ExecPlans. `.agents/docs/` contains agent-only notes and runbooks. `.agents/plans/` contains historical and current ExecPlans.
 
 The existing Bifrost release tag format is `v<semver>`, such as `v0.7.2`. The root Rust package version in `Cargo.toml` is the source of truth for non-release docs builds. The docs workflow should use a release tag when one is present and otherwise label the build as a development build for the current crate version.
 

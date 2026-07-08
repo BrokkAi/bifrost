@@ -1,6 +1,6 @@
 # Issue #328 / PR #451: search_ast review remediation
 
-This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agent/PLANS.md` from the repository root.
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agents/PLANS.md` from the repository root.
 
 Upstream context: GitHub issue `BrokkAi/bifrost#328` introduced the normalized `search_ast` tool. Pull request `BrokkAi/bifrost#451` adds the first implementation. A PR comment by `jbellis` on 2026-07-03 identified six review findings around result precision, span policy, capability caveats, query extension/versioning, result ordering/truncation, and broad-query performance UX.
 

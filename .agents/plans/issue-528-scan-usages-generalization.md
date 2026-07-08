@@ -1,6 +1,6 @@
 # Fix scan_usages issue #528 failure modes 1–3 generally: backend inference gaps plus a proof-tier result model
 
-This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agent/PLANS.md` (from the repository root).
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agents/PLANS.md` (from the repository root).
 
 ## Purpose / Big Picture
 

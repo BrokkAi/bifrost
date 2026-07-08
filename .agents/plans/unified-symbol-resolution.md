@@ -1,6 +1,6 @@
 # Unify usage-graph symbol resolution on the analyzer's keyed index
 
-This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agent/PLANS.md` at the repository root.
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agents/PLANS.md` at the repository root.
 
 This plan builds on and supersedes the remaining work of `.agents/plans/shared-usage-index-refactor.md` (checked in; read it for the Scala-specific history). That plan added `src/analyzer/usages/symbol_index.rs` and migrated Scala onto it. This plan dissolves that module into the analyzer-owned index layer, generalizes the pattern to the other languages that need it, and removes the remaining linear declaration scans across the usage-graph code.
 

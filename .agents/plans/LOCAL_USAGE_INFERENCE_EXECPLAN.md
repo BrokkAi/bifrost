@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ This plan is the implementation program for issue `#76`, “Add reusable local r
 
 ## Progress
 
-- [x] (2026-05-18 19:31Z) Read `.agent/PLANS.md`, `src/usages/finder.rs`, `src/usages/graph_core.rs`, `src/usages/js_ts_graph.rs`, `src/usages/python_graph.rs`, `src/usages/rust_graph.rs`, `RUST_USAGE_GRAPH_PARITY_EXECPLAN.md`, `PYTHON_USAGE_GRAPH_PARITY_EXECPLAN.md`, and the full body of GitHub issue `BrokkAi/bifrost#76`.
+- [x] (2026-05-18 19:31Z) Read `.agents/PLANS.md`, `src/usages/finder.rs`, `src/usages/graph_core.rs`, `src/usages/js_ts_graph.rs`, `src/usages/python_graph.rs`, `src/usages/rust_graph.rs`, `RUST_USAGE_GRAPH_PARITY_EXECPLAN.md`, `PYTHON_USAGE_GRAPH_PARITY_EXECPLAN.md`, and the full body of GitHub issue `BrokkAi/bifrost#76`.
 - [x] (2026-05-18 19:31Z) Confirmed the current baseline: Python and Rust both already implement language-specific local receiver/member inference, while JS/TS still relies mostly on direct import/member matching.
 - [x] (2026-05-18 19:31Z) Chose a dedicated repo-root plan file, `LOCAL_USAGE_INFERENCE_EXECPLAN.md`, because this work is broader than any single language parity plan and is the shared follow-on for issue `#76`.
 - [x] (2026-05-18 20:04Z) Completed Milestone 1 by adding `src/usages/local_inference.rs`, exporting the shared API from `src/usages/mod.rs`, and adding `tests/usages_local_inference_test.rs` to prove nested scopes, shadowing, seeding, alias propagation, snapshot queries, and ambiguity-cap degradation in isolation.
@@ -117,7 +117,7 @@ The intended end state is not a single universal parser. The intended end state 
 
 The most relevant current files are:
 
-    .agent/PLANS.md
+    .agents/PLANS.md
     src/usages/finder.rs
     src/usages/graph_core.rs
     src/usages/js_ts_graph.rs
@@ -239,7 +239,7 @@ If a migration stalls midway, do not delete the evidence. Keep the focused tests
 
 Important local references for this plan are:
 
-    .agent/PLANS.md
+    .agents/PLANS.md
     src/usages/finder.rs
     src/usages/graph_core.rs
     src/usages/js_ts_graph.rs

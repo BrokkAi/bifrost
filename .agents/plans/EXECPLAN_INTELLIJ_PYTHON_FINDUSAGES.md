@@ -1,6 +1,6 @@
 # ExecPlan: Port IntelliJ Python find-usages corner cases to bifrost
 
-Living document maintained per `.agent/PLANS.md`.
+Living document maintained per `.agents/PLANS.md`.
 
 
 ## Purpose and Big Picture

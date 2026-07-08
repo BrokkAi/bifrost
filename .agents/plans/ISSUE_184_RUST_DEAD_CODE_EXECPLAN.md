@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This plan follows `.agent/PLANS.md` in this repository. It is self-contained so a future contributor can resume the work from this file and the current working tree alone.
+This plan follows `.agents/PLANS.md` in this repository. It is self-contained so a future contributor can resume the work from this file and the current working tree alone.
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The visible result is that dead-code reports still identify unused private helpe
 
 ## Progress
 
-- [x] (2026-06-17T08:00:19Z) Read `.agent/PLANS.md`, confirmed this ExecPlan format, and created this living plan before code edits.
+- [x] (2026-06-17T08:00:19Z) Read `.agents/PLANS.md`, confirmed this ExecPlan format, and created this living plan before code edits.
 - [x] (2026-06-17T08:00:19Z) Ran `git fetch` and `git rebase`; the current issue branch was already up to date.
 - [x] (2026-06-17T08:04:17Z) Implemented Rust bulk inbound analysis in `src/code_quality/dead_code_smells.rs`.
 - [x] (2026-06-17T08:04:17Z) Updated Rust dead-code tests for graph-derived counts, graph call-site truncation, and public API wording.

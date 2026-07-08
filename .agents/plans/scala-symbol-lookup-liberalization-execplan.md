@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with [.agent/PLANS.md](../../.agent/PLANS.md).
+This document must be maintained in accordance with [.agents/PLANS.md](../../.agents/PLANS.md).
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The visible proof is a focused Scala fixture with nested objects and case object
 
 ## Progress
 
-- [x] (2026-06-09T20:23:58Z) Read `.agent/PLANS.md`, reviewed the existing Scala/C# lookup tests, and confirmed that commit `2831057` only covered simple trailing-`$` companion-object cases.
+- [x] (2026-06-09T20:23:58Z) Read `.agents/PLANS.md`, reviewed the existing Scala/C# lookup tests, and confirmed that commit `2831057` only covered simple trailing-`$` companion-object cases.
 - [x] (2026-06-09T20:23:58Z) Inspected `src/analyzer/symbol_lookup.rs`, `src/analyzer/model.rs`, `src/analyzer/scala/declarations.rs`, `src/searchtools.rs`, `src/searchtools_service.rs`, `src/mcp_common.rs`, and MCP tests to pin down the current resolver, schema, and service boundaries.
 - [x] (2026-06-09T20:53:45Z) Implemented Scala-aware display helpers, updated `list_symbols`, searchtools outputs, and LSP label/name surfaces to render idiomatic Scala names while keeping internal canonical names unchanged.
 - [x] (2026-06-09T20:53:45Z) Removed `kind_filter` from `get_symbol_sources`, `get_symbol_locations`, and `get_symbol_ancestors`, including MCP schemas and legacy compatibility stripping in the service layer.

@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 The shared Git-relevance design docs at the main entry points in bifrost and Brokk are part of the implementation contract for this work. Keep those docs in sync with each other and with the code whenever any shared ranking or canonicalization rule changes.
 

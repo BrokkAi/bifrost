@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, `Outcomes & Retrospective`, and `Timing Log` must be kept up to date as work proceeds.
 
-This document follows `.agent/PLANS.md` from the repository root. Keep the current branch; do not create or switch branches. Fetch remote refs when needed, but do not rebase unless the user explicitly asks. Stage only files changed for each milestone and commit directly on the current branch after Brokk Guided Review findings for that milestone have been fixed.
+This document follows `.agents/PLANS.md` from the repository root. Keep the current branch; do not create or switch branches. Fetch remote refs when needed, but do not rebase unless the user explicitly asks. Stage only files changed for each milestone and commit directly on the current branch after Brokk Guided Review findings for that milestone have been fixed.
 
 ## Purpose / Big Picture
 

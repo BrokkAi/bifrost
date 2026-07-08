@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with [.agent/PLANS.md](../../.agent/PLANS.md).
+This document must be maintained in accordance with [.agents/PLANS.md](../../.agents/PLANS.md).
 
 ## Purpose / Big Picture
 
@@ -12,7 +12,7 @@ The proof is a focused inline C/C++ fixture suite. `list_symbols` should surface
 
 ## Progress
 
-- [x] (2026-06-09T22:40:00Z) Read `.agent/PLANS.md`, reviewed the current C++ declaration walker, persistence encoding, searchtools summary path, and existing analyzer/searchtools tests.
+- [x] (2026-06-09T22:40:00Z) Read `.agents/PLANS.md`, reviewed the current C++ declaration walker, persistence encoding, searchtools summary path, and existing analyzer/searchtools tests.
 - [x] (2026-06-09T23:14:00Z) Added `CodeUnitType::Macro`, wired the new kind through persistence, autocomplete ordering, file-tool labels, LSP symbol/completion mappings, and created this ExecPlan.
 - [x] (2026-06-09T23:14:00Z) Extended `src/analyzer/cpp/declarations.rs` so pointer-returning function definitions and prototypes classify as functions, typedef/alias declarations are indexed, and `preproc_def` / `preproc_function_def` become macro declarations.
 - [x] (2026-06-09T23:14:00Z) Taught searchtools to group and render macros, added `fallback_reason` to file summaries, and implemented `declarations -> includes -> first 20 lines` fallback for exact file targets with no indexed declarations.

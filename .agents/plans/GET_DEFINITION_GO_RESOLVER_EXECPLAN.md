@@ -1,6 +1,6 @@
 # Graph-backed Go get_definition resolution
 
-This ExecPlan is a living document. It is maintained according to `.agent/PLANS.md`.
+This ExecPlan is a living document. It is maintained according to `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 

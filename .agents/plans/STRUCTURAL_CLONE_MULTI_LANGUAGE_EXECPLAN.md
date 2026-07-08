@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agent/PLANS.md`.
+This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
@@ -15,7 +15,7 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 ## Progress
 
 - [x] (2026-05-18) Confirmed the current baseline: Java structural clone smells are implemented in `bifrost` end to end, including analyzer support, MCP wiring, and Java-focused tests.
-- [x] (2026-05-18) Read `.agent/PLANS.md` and local ExecPlan examples to match the repository’s required plan structure and level of detail.
+- [x] (2026-05-18) Read `.agents/PLANS.md` and local ExecPlan examples to match the repository’s required plan structure and level of detail.
 - [x] (2026-05-18) Audited Brokk’s current clone-smell coverage. `brokk` has dedicated tests and analyzer hooks for Java, Python, and JS/TS plus shared tree-sitter similarity tests, but not equivalent clone-smell suites for C#, C++, Scala, or PHP.
 - [x] (2026-05-18) Completed Milestone 1. Added Python structural clone detection in `src/analyzer/python_analyzer.rs`, added Brokk-style Python parity tests in `tests/python_structural_clone_smells.rs`, and proved mixed Java-plus-Python `MultiAnalyzer` routing.
 - [x] (2026-05-18) Validated the Milestone 1 checkpoint with `cargo test --test python_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.

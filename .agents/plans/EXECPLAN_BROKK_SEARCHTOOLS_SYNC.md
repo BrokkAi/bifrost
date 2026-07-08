@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This plan follows `.agent/PLANS.md` in this repository.
+This plan follows `.agents/PLANS.md` in this repository.
 
 ## Purpose / Big Picture
 

@@ -1,6 +1,6 @@
 # Issue #328: `search_ast` — normalized structural query language and matcher (v1)
 
-This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agent/PLANS.md` (repository root: `.agent/PLANS.md`).
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agents/PLANS.md` (repository root: `.agents/PLANS.md`).
 
 Upstream discussion: https://github.com/BrokkAi/bifrost/issues/328
 
