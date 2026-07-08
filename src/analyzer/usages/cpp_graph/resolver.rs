@@ -12,7 +12,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -166,7 +166,8 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     definitions: Arc<DefinitionLookupIndex>,
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
-    aliases_by_file: HashMap<ProjectFile, Vec<CppAlias>>,
+    alias_source_files: HashSet<ProjectFile>,
+    aliases_by_file: OnceLock<HashMap<ProjectFile, Vec<CppAlias>>>,
 }
 
 struct CppAlias {
@@ -207,16 +208,20 @@ impl VisibilityIndex {
             visible_by_file.insert(file.clone(), visible);
         }
         let visible_by_identifier = build_visible_identifier_index(&visible_by_file);
-        let aliases_by_file = build_alias_index(&files);
         Self {
             definitions: cpp.definition_lookup_index_shared(),
             visible_by_file,
             visible_by_identifier,
-            aliases_by_file,
+            alias_source_files: files,
+            aliases_by_file: OnceLock::new(),
         }
     }
 
-    pub(super) fn is_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
+    pub(in crate::analyzer::usages) fn is_visible(
+        &self,
+        file: &ProjectFile,
+        target: &CodeUnit,
+    ) -> bool {
         file == target.source()
             || self
                 .visible_by_file
@@ -334,16 +339,17 @@ impl VisibilityIndex {
         let Some(alias_name) = normalize_reference_name(raw_name) else {
             return false;
         };
+        let aliases_by_file = self
+            .aliases_by_file
+            .get_or_init(|| build_alias_index(&self.alias_source_files));
         self.visible_source_files(file)
             .into_iter()
             .any(|source_file| {
-                self.aliases_by_file
-                    .get(&source_file)
-                    .is_some_and(|aliases| {
-                        aliases.iter().any(|alias| {
-                            alias.name == alias_name && alias_target_matches_target(alias, target)
-                        })
+                aliases_by_file.get(&source_file).is_some_and(|aliases| {
+                    aliases.iter().any(|alias| {
+                        alias.name == alias_name && alias_target_matches_target(alias, target)
                     })
+                })
             })
     }
 
@@ -457,7 +463,7 @@ impl VisibilityIndex {
         unanimous_return_binding(analyzer, self, file, &candidates)
     }
 
-    pub(super) fn visible_identifier_candidates<'b>(
+    pub(in crate::analyzer::usages) fn visible_identifier_candidates<'b>(
         &'b self,
         file: &ProjectFile,
         identifier: &str,
@@ -572,7 +578,10 @@ fn dedup_unit_refs(units: &mut Vec<&CodeUnit>) {
     *units = deduped;
 }
 
-fn cpp_reference_fqn_candidates(reference: &str, kind: TargetKind) -> Vec<String> {
+pub(in crate::analyzer::usages) fn cpp_reference_fqn_candidates(
+    reference: &str,
+    kind: TargetKind,
+) -> Vec<String> {
     let parts = reference
         .split("::")
         .filter(|part| !part.is_empty())

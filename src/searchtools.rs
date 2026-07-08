@@ -1039,8 +1039,14 @@ pub fn get_definition_by_location(
     let outcomes =
         crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
 
+    let mut render_cache = DefinitionCandidateRenderCache::default();
     for ((index, query, _), outcome) in pending.into_iter().zip(outcomes) {
-        results[index] = Some(render_definition_lookup(analyzer, query, outcome));
+        results[index] = Some(render_definition_lookup(
+            analyzer,
+            query,
+            outcome,
+            &mut render_cache,
+        ));
     }
 
     GetDefinitionResult {
@@ -1514,6 +1520,7 @@ fn render_definition_lookup(
     analyzer: &dyn IAnalyzer,
     query: DefinitionReferenceQuery,
     outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
     DefinitionLookupResult {
         query,
@@ -1522,7 +1529,7 @@ fn render_definition_lookup(
             path: site.path,
             target: site.text,
         }),
-        definitions: definition_candidates(analyzer, &outcome.definitions),
+        definitions: definition_candidates_with_cache(analyzer, &outcome.definitions, render_cache),
         diagnostics: outcome
             .diagnostics
             .into_iter()
@@ -1531,6 +1538,24 @@ fn render_definition_lookup(
                 message: diagnostic.message,
             })
             .collect(),
+    }
+}
+
+#[derive(Default)]
+struct DefinitionCandidateRenderCache {
+    contexts: HashMap<ProjectFile, Option<DeclarationNameRangeContext>>,
+}
+
+impl DefinitionCandidateRenderCache {
+    fn display_range(&mut self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Range> {
+        let context = self
+            .contexts
+            .entry(unit.source().clone())
+            .or_insert_with(|| load_declaration_name_context(analyzer, unit.source()));
+        let name_range = context
+            .as_ref()
+            .and_then(|context| context.name_range(analyzer, unit));
+        display_range_with_declaration_name(analyzer, unit, name_range)
     }
 }
 
@@ -1583,9 +1608,37 @@ fn definition_candidates(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Vec<De
         .collect()
 }
 
+fn definition_candidates_with_cache(
+    analyzer: &dyn IAnalyzer,
+    units: &[CodeUnit],
+    render_cache: &mut DefinitionCandidateRenderCache,
+) -> Vec<DefinitionCandidate> {
+    units
+        .iter()
+        .filter_map(|unit| definition_candidate_with_cache(analyzer, unit, render_cache))
+        .collect()
+}
+
+fn definition_candidate_with_cache(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    render_cache: &mut DefinitionCandidateRenderCache,
+) -> Option<DefinitionCandidate> {
+    let range = render_cache.display_range(analyzer, unit)?;
+    Some(definition_candidate_from_range(analyzer, unit, range))
+}
+
 fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DefinitionCandidate> {
     let range = definition_display_range(analyzer, unit)?;
-    Some(DefinitionCandidate {
+    Some(definition_candidate_from_range(analyzer, unit, range))
+}
+
+fn definition_candidate_from_range(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    range: Range,
+) -> DefinitionCandidate {
+    DefinitionCandidate {
         fqn: unit.fq_name(),
         path: rel_path_string(unit.source()),
         start_line: range.start_line,
@@ -1596,7 +1649,7 @@ fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Def
             .map(str::to_string)
             .or_else(|| analyzer.signatures(unit).first().cloned()),
         language: language_name(language_for_target(unit)),
-    })
+    }
 }
 
 fn definition_display_range(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Range> {
