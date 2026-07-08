@@ -74,6 +74,14 @@ fn code_unit_equality_ordering_and_hash_are_semantic() {
 }
 
 #[test]
+fn file_scope_fq_name_uses_stable_slash_separators() {
+    let file = ProjectFile::new(root(), PathBuf::from(r"src\constant.js"));
+    let unit = CodeUnit::file_scope(file);
+
+    assert_eq!("src/constant.js", unit.fq_name());
+}
+
+#[test]
 fn java_wildcard_imports_resolve_from_package_index() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

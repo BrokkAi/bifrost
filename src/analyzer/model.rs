@@ -426,7 +426,7 @@ impl CodeUnit {
     }
 
     pub fn file_scope(source: ProjectFile) -> Self {
-        let short_name = source.rel_path().display().to_string();
+        let short_name = source.rel_path().to_string_lossy().replace('\\', "/");
         Self::with_signature(
             source,
             CodeUnitType::FileScope,
