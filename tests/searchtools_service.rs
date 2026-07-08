@@ -29,21 +29,6 @@ fn array_len(value: &Value, key: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn assert_scan_usages_failure(value: &Value, symbol: &str, strategy: &str, reason_kind: &str) {
-    assert_eq!(0, array_len(value, "usages"), "payload: {value}");
-    assert_eq!(0, array_len(value, "ambiguous"), "payload: {value}");
-    let failures = value["failures"].as_array().unwrap();
-    assert_eq!(1, failures.len(), "payload: {value}");
-    assert_eq!(symbol, failures[0]["symbol"], "payload: {value}");
-    assert_eq!(strategy, failures[0]["strategy"], "payload: {value}");
-    assert_eq!(reason_kind, failures[0]["reason_kind"], "payload: {value}");
-}
-
-fn assert_scan_usages_failure_hint(value: &Value, expected_hint: &str) {
-    let failures = value["failures"].as_array().unwrap();
-    assert_eq!(expected_hint, failures[0]["hint"], "payload: {value}");
-}
-
 #[test]
 fn service_allows_concurrent_read_only_calls() {
     let service = Arc::new(SearchToolsService::new_without_semantic_index(fixture_root()).unwrap());
@@ -2349,43 +2334,6 @@ end
 }
 
 #[test]
-fn scan_usages_location_failure_does_not_repeat_targets_hint() {
-    let project = InlineTestProject::with_language(Language::JavaScript)
-        .file(
-            "lib/request.js",
-            r#"
-var req = exports = module.exports = {};
-
-req.accepts = function acceptsMethod(type) {
-  return type;
-};
-"#,
-        )
-        .build();
-    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
-        .expect("service");
-
-    let payload = service
-        .call_tool_json(
-            "scan_usages",
-            r#"{"targets":[{"path":"lib/request.js","line":4,"column":5}],"include_tests":true}"#,
-        )
-        .unwrap();
-    let recalled: Value = serde_json::from_str(&payload).unwrap();
-    assert_scan_usages_failure(
-        &recalled,
-        "lib/request.js#req.accepts",
-        "JsTsExportUsageGraphStrategy",
-        "no_graph_seed",
-    );
-    let recalled_hint = recalled["failures"][0]["hint"].as_str().unwrap();
-    assert!(
-        !recalled_hint.contains("targets"),
-        "anchored re-call must not suggest another targets re-call: {recalled}"
-    );
-}
-
-#[test]
 fn scan_usages_reports_java_untyped_receiver_as_unproven() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -2593,15 +2541,24 @@ function run() {
         )
         .unwrap();
     let method: Value = serde_json::from_str(&method_payload).unwrap();
-    assert_scan_usages_failure(
-        &method,
-        "lib/request.js#req.accepts",
-        "JsTsExportUsageGraphStrategy",
-        "no_graph_seed",
+    // The seedless candidate scan resolves the anchored method target and
+    // surfaces the cross-file callsite as unproven (receiver proof for the
+    // CommonJS namespace object is incomplete).
+    assert_eq!(0, array_len(&method, "ambiguous"), "{method}");
+    assert_eq!(0, array_len(&method, "failures"), "{method}");
+    assert_eq!(
+        "lib/request.js#req.accepts", method["usages"][0]["symbol"],
+        "{method}"
     );
-    assert_scan_usages_failure_hint(
-        &method,
-        "No export seed was resolved for this selected definition. Use search_symbols or get_symbol_sources to choose an exported declaration, or narrow `paths` to likely callers.",
+    assert_eq!(0, method["usages"][0]["total_hits"], "{method}");
+    assert_eq!(1, method["usages"][0]["unproven_hits"], "{method}");
+    assert_eq!(
+        "app.js", method["usages"][0]["unproven_files"][0]["path"],
+        "{method}"
+    );
+    assert_eq!(
+        "run", method["usages"][0]["unproven_files"][0]["hits"][0]["enclosing"],
+        "{method}"
     );
 }
 

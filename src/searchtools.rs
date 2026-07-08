@@ -5788,6 +5788,7 @@ fn language_name(language: Language) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::usage_failure_hint;
     use super::{
         SourceBlock, SummaryElement, list_symbols, resolve_file_patterns, trim_summary_signature,
     };
@@ -6172,5 +6173,20 @@ def gamma():
             .iter()
             .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
             .collect()
+    }
+
+    #[test]
+    fn no_graph_seed_hint_does_not_repeat_targets_for_anchored_queries() {
+        let anchored = usage_failure_hint("no_graph_seed", true, false).unwrap();
+        assert!(
+            !anchored.contains("targets"),
+            "anchored query must not suggest another targets re-call: {anchored}"
+        );
+
+        let unanchored = usage_failure_hint("no_graph_seed", false, false).unwrap();
+        assert!(
+            unanchored.contains("targets"),
+            "unanchored query should suggest the targets selector: {unanchored}"
+        );
     }
 }
