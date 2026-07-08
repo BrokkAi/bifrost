@@ -594,7 +594,14 @@ fn js_parent_of_module_scoped_export_const_returns_file_scope_module() {
         .parent_of(&target)
         .expect("module-scoped exported const should have a file-scope parent");
     assert!(parent.is_file_scope());
-    assert_eq!("src/constant.js", parent.fq_name());
+    assert_eq!(
+        project
+            .file("src/constant.js")
+            .rel_path()
+            .display()
+            .to_string(),
+        parent.fq_name()
+    );
 }
 
 #[test]
