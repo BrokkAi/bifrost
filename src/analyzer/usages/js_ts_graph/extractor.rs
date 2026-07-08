@@ -43,7 +43,7 @@ pub(super) fn scan_files_for_seeds(
     let target_owner = analyzer.parent_of(target);
     let target_member = target_owner
         .as_ref()
-        .is_none_or(|owner| !owner.is_module())
+        .is_none_or(|owner| !owner.is_module() && !owner.is_file_scope())
         .then(|| member_name(target))
         .flatten();
     let target_short = target_seed_identifier(target, target_owner.as_ref());
@@ -349,6 +349,7 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) -> String {
     if let Some(owner) = target_owner
         && !owner.is_module()
+        && !owner.is_file_scope()
     {
         return owner.identifier().trim_end_matches("$static").to_string();
     }

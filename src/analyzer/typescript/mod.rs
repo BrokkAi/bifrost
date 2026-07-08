@@ -620,6 +620,15 @@ impl IAnalyzer for TypescriptAnalyzer {
     fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.get_direct_children(code_unit)
     }
+
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.inner.structural_parent_of(code_unit).or_else(|| {
+            ts_module_scoped_field_uses_file_name(code_unit)
+                .then(|| self.inner.top_level_file_scope_parent_of(code_unit))
+                .flatten()
+        })
+    }
+
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
     }
@@ -1386,6 +1395,21 @@ fn ts_file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
             .unwrap_or("module"),
         name
     )
+}
+
+fn ts_module_scoped_field_uses_file_name(code_unit: &CodeUnit) -> bool {
+    if !code_unit.is_field() {
+        return false;
+    }
+    let Some(file_name) = code_unit
+        .source()
+        .rel_path()
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    code_unit.short_name().starts_with(&format!("{file_name}."))
 }
 
 fn visit_ts_type_alias_members(

@@ -399,6 +399,11 @@ impl IAnalyzer for MultiAnalyzer {
         }
     }
 
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.delegate_for_code_unit(code_unit)
+            .and_then(|delegate| delegate.analyzer().parent_of(code_unit))
+    }
+
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.delegate_for_file(file)
             .and_then(|delegate| delegate.analyzer().parse_errors(file))

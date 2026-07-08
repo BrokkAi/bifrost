@@ -742,6 +742,63 @@ where
         })
     }
 
+    pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        if code_unit.is_module() {
+            return None;
+        }
+
+        if let Some(parent) = self.state.children.iter().find_map(|(parent, children)| {
+            if children.iter().any(|child| child == code_unit) {
+                Some(parent.clone())
+            } else {
+                None
+            }
+        }) {
+            return Some(parent);
+        }
+
+        for (module_name, children) in &self.state.module_children {
+            if !children.iter().any(|child| child == code_unit) {
+                continue;
+            }
+            if let Some(parent) = self
+                .state
+                .files
+                .values()
+                .flat_map(|state| state.declarations.iter())
+                .find(|unit| {
+                    unit.is_module()
+                        && self.adapter.normalize_full_name(&unit.fq_name()) == *module_name
+                })
+            {
+                return Some(parent.clone());
+            }
+        }
+
+        None
+    }
+
+    pub fn top_level_file_scope_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        if code_unit.is_module() {
+            return None;
+        }
+
+        let state = self.state.files.get(code_unit.source())?;
+        if !state
+            .top_level_declarations
+            .iter()
+            .any(|declaration| declaration == code_unit)
+        {
+            return None;
+        }
+
+        state
+            .declarations
+            .iter()
+            .find(|declaration| declaration.is_file_scope())
+            .cloned()
+    }
+
     fn analyze_files(
         adapter: &A,
         project: &dyn Project,

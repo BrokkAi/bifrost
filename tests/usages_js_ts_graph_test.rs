@@ -4,10 +4,11 @@ use brokk_bifrost::usages::{
     FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer, UsageFinder,
 };
 use brokk_bifrost::{
-    CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
+    AnalyzerDelegate, CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer,
+    ProjectFile, TypescriptAnalyzer,
 };
 use common::{InlineTestProject, js_fixture_project, ts_fixture_project};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn js_analyzer() -> JavascriptAnalyzer {
     JavascriptAnalyzer::from_project(js_fixture_project())
@@ -459,6 +460,138 @@ fn flatten_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages::UsageHit
             .collect(),
         other => panic!("expected Success, got {other:?}"),
     }
+}
+
+#[test]
+fn js_parent_of_module_scoped_export_const_returns_file_scope_module() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "src/constant.js",
+            "export const MILLISECONDS_A_DAY = 86400000;\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("src/constant.js"), |cu| {
+        cu.identifier() == "MILLISECONDS_A_DAY" && cu.is_field()
+    });
+
+    assert_eq!("constant.js.MILLISECONDS_A_DAY", target.short_name());
+
+    let parent = analyzer
+        .parent_of(&target)
+        .expect("module-scoped exported const should have a file-scope parent");
+    assert!(parent.is_file_scope());
+    assert_eq!("src/constant.js", parent.fq_name());
+}
+
+#[test]
+fn js_export_const_seed_resolves_destructured_import_usage() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "src/constant.js",
+            "export const MILLISECONDS_A_DAY = 86400000;\n",
+        )
+        .file(
+            "src/plugin/duration/index.js",
+            "import { MILLISECONDS_A_DAY } from '../../constant.js';\n\
+                 export function days(ms) {\n\
+                   return ms / MILLISECONDS_A_DAY;\n\
+                 }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("src/constant.js"), |cu| {
+        cu.identifier() == "MILLISECONDS_A_DAY" && cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/plugin/duration/index.js")
+                && hit.snippet.contains("MILLISECONDS_A_DAY")
+        }),
+        "expected destructured import usage to be counted, got {hits:?}"
+    );
+}
+
+#[test]
+fn js_export_const_seed_resolves_namespace_import_usage() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "src/constant.js",
+            "export const MILLISECONDS_A_DAY = 86400000;\n",
+        )
+        .file(
+            "src/index.js",
+            "import * as C from './constant.js';\n\
+                 export function days(ms) {\n\
+                   return ms / C.MILLISECONDS_A_DAY;\n\
+                 }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("src/constant.js"), |cu| {
+        cu.identifier() == "MILLISECONDS_A_DAY" && cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/index.js") && hit.snippet.contains("C.MILLISECONDS_A_DAY")
+        }),
+        "expected namespace import usage to be counted, got {hits:?}"
+    );
+}
+
+#[test]
+fn multi_analyzer_delegates_parent_for_js_export_const_seed() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/constant.js",
+            "export const MILLISECONDS_A_DAY = 86400000;\n",
+        )
+        .file(
+            "src/plugin/duration/index.js",
+            "import { MILLISECONDS_A_DAY } from '../../constant';\n\
+             export function days(ms) {\n\
+               return ms / MILLISECONDS_A_DAY;\n\
+             }\n",
+        )
+        .build();
+    let analyzer = MultiAnalyzer::new(BTreeMap::from([(
+        Language::JavaScript,
+        AnalyzerDelegate::JavaScript(JavascriptAnalyzer::from_project(project.project().clone())),
+    )]));
+    let target = analyzer
+        .all_declarations()
+        .find(|cu| {
+            cu.source() == &project.file("src/constant.js")
+                && cu.identifier() == "MILLISECONDS_A_DAY"
+                && cu.is_field()
+        })
+        .cloned()
+        .expect("target definition not found");
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/plugin/duration/index.js")
+                && hit.snippet.contains("MILLISECONDS_A_DAY")
+        }),
+        "expected multi-analyzer destructured import usage to be counted, got {hits:?}"
+    );
 }
 
 #[test]
