@@ -3,7 +3,9 @@ use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use crate::analyzer::usages::model::{ExportIndex, ImportBinder, UsageHit};
-use crate::analyzer::usages::python_graph::hits::{record_hit, record_import_hit};
+use crate::analyzer::usages::python_graph::hits::{
+    record_hit, record_import_hit, record_unproven_hit,
+};
 use crate::analyzer::usages::python_graph::resolver::{
     member_name, normalized_receiver_type, receiver_annotation_matches_target,
     resolve_receiver_type, target_owner_code_unit, top_level_identifier,
@@ -167,8 +169,9 @@ pub(super) fn scan_files_for_seeds(
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
-) -> BTreeSet<UsageHit> {
+) -> ScanResult {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
+    let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
     let target_owner = target_owner_code_unit(analyzer, target);
@@ -227,6 +230,7 @@ pub(super) fn scan_files_for_seeds(
         );
 
         let mut local_hits = BTreeSet::new();
+        let mut local_unproven_hits = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
 
         let mut scan_ctx = ScanCtx {
@@ -244,6 +248,7 @@ pub(super) fn scan_files_for_seeds(
             local_conflicts: &local_conflicts,
             scope_facts: &scope_facts,
             hits: &mut local_hits,
+            unproven_hits: &mut local_unproven_hits,
         };
 
         scan_node(tree_ref.root_node(), &mut scan_ctx);
@@ -254,11 +259,27 @@ pub(super) fn scan_files_for_seeds(
                 .expect("usage hit collector mutex poisoned");
             sink.extend(local_hits);
         }
+        if !local_unproven_hits.is_empty() {
+            let mut sink = unproven_collected
+                .lock()
+                .expect("usage unproven hit collector mutex poisoned");
+            sink.extend(local_unproven_hits);
+        }
     });
 
-    collected
-        .into_inner()
-        .expect("usage hit collector mutex poisoned")
+    ScanResult {
+        hits: collected
+            .into_inner()
+            .expect("usage hit collector mutex poisoned"),
+        unproven_hits: unproven_collected
+            .into_inner()
+            .expect("usage unproven hit collector mutex poisoned"),
+    }
+}
+
+pub(super) struct ScanResult {
+    pub(super) hits: BTreeSet<UsageHit>,
+    pub(super) unproven_hits: BTreeSet<UsageHit>,
 }
 
 pub(super) struct ScanCtx<'a> {
@@ -281,6 +302,7 @@ pub(super) struct ScanCtx<'a> {
     local_conflicts: &'a HashSet<String>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 /// The per-function receiver-type facts enclosing `node`, if any. Shared by the
@@ -574,10 +596,13 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let object_text = slice(object, ctx.source);
     let attribute_text = slice(attribute, ctx.source);
     if let Some(member) = ctx.target_member
-        && ctx.receiver_binds_target(object_text, node)
         && attribute_text == member
     {
-        record_hit(attribute, ctx);
+        if ctx.receiver_binds_target(object_text, node) {
+            record_hit(attribute, ctx);
+        } else if member_receiver_match_is_unproven(object, object_text, node, ctx) {
+            record_unproven_hit(attribute, ctx);
+        }
     }
 
     if ctx.target_member.is_none()
@@ -625,6 +650,24 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     });
     if ctx.target_member.is_none() && namespace_match && attribute_text == ctx.target_short {
         record_hit(attribute, ctx);
+    }
+}
+
+fn member_receiver_match_is_unproven(
+    object: Node<'_>,
+    object_text: &str,
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if matches!(object_text, "self" | "cls") {
+        return false;
+    }
+    match object.kind() {
+        "identifier" => {
+            ctx.receiver_type_is_unknown(object_text, node) && !ctx.member_best_effort_unique
+        }
+        "attribute" => true,
+        _ => false,
     }
 }
 

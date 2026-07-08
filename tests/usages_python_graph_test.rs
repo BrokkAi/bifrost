@@ -4,7 +4,8 @@ use brokk_bifrost::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, Usage
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,
 };
-use common::InlineTestProject;
+use common::{InlineTestProject, call_search_tool_json};
+use serde_json::json;
 use std::collections::BTreeMap;
 
 fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
@@ -2240,6 +2241,74 @@ fn untyped_receiver_does_not_resolve_ambiguous_same_file_member() {
             "m.Foo.shared",
         ),
         0,
+    );
+}
+
+#[test]
+fn chained_attribute_receiver_method_match_is_unproven_not_verified_absent() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            "class Foo:\n    def bar(self):\n        pass\n",
+        )
+        .file("app/consumer.py", "def run(obj):\n    obj.field.bar()\n")
+        .build();
+
+    let result = call_search_tool_json(
+        project.root(),
+        "scan_usages",
+        &json!({
+            "symbols": ["pkg.service.Foo.bar"],
+            "include_tests": true
+        })
+        .to_string(),
+    );
+
+    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
+    assert_eq!(1, result["usages"][0]["unproven_hits"], "{result}");
+    assert!(
+        result["usages"][0]["verified_absent"].is_null(),
+        "unproven chained receiver must prevent verified_absent: {result}"
+    );
+    assert!(
+        result["usages"][0]["unproven_files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("obj.field.bar()")),
+        "expected chained receiver call in unproven files: {result}"
+    );
+}
+
+#[test]
+fn unknown_simple_receiver_method_match_is_unproven_not_verified_absent() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            "class Foo:\n    def bar(self):\n        pass\n",
+        )
+        .file("app/consumer.py", "def run(param):\n    param.bar()\n")
+        .build();
+
+    let result = call_search_tool_json(
+        project.root(),
+        "scan_usages",
+        &json!({
+            "symbols": ["pkg.service.Foo.bar"],
+            "include_tests": true
+        })
+        .to_string(),
+    );
+
+    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
+    assert_eq!(1, result["usages"][0]["unproven_hits"], "{result}");
+    assert!(
+        result["usages"][0]["verified_absent"].is_null(),
+        "unproven simple receiver must prevent verified_absent: {result}"
+    );
+    assert!(
+        result["usages"][0]["unproven_files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("param.bar()")),
+        "expected simple receiver call in unproven files: {result}"
     );
 }
 

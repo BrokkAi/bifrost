@@ -51,7 +51,7 @@ fn python_graph_strategy_finds_fixture_class_usages() {
 }
 
 #[test]
-fn python_graph_strategy_missing_seed_returns_failure() {
+fn python_graph_strategy_seeds_private_module_function() {
     let analyzer = fixture_analyzer();
     let target = definition(&analyzer, "underscore_functions._private_function");
 
@@ -60,8 +60,16 @@ fn python_graph_strategy_missing_seed_returns_failure() {
 
     let strategy = PythonExportUsageGraphStrategy::new();
     match strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000) {
-        FuzzyResult::Failure { .. } => {}
-        other => panic!("expected Failure for unresolved Python graph seed, got {other:?}"),
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => {
+            // The fixture declares _private_function but never calls it; the
+            // scan must complete (module-local declarations seed themselves)
+            // and report zero hits rather than failing to seed.
+            let hits = hits_by_overload.values().flatten().count();
+            assert_eq!(hits, 0, "fixture has no callsites for _private_function");
+        }
+        other => panic!("expected Success for private module-level function, got {other:?}"),
     }
 }
 

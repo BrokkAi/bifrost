@@ -10,6 +10,12 @@ pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(hit) = build_hit(node, ctx) {
+        ctx.unproven_hits.insert(hit.into_unproven());
+    }
+}
+
 /// Record `node` as an `Import`-binding hit (the token that brings the symbol
 /// into this file), which the IDE find-references surface includes but the
 /// call-graph surfaces ignore.

@@ -87,8 +87,14 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             scan_files.retain(|file| scan_scope.allows(file));
         }
 
-        let hits = scan_files_for_seeds(analyzer, py, &graph, &scan_files, target, &seeds);
-        let hits: BTreeSet<UsageHit> = hits
+        let scan_result = scan_files_for_seeds(analyzer, py, &graph, &scan_files, target, &seeds);
+        let hits: BTreeSet<UsageHit> = scan_result
+            .hits
+            .into_iter()
+            .filter(|hit| &hit.enclosing != target)
+            .collect();
+        let unproven_hits: BTreeSet<UsageHit> = scan_result
+            .unproven_hits
             .into_iter()
             .filter(|hit| &hit.enclosing != target)
             .collect();
@@ -102,7 +108,11 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             });
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+            target.clone(),
+            hits,
+            unproven_hits,
+        ))
     }
 }
 

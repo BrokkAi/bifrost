@@ -241,12 +241,21 @@ where
     T: CandidateFileProvider,
 {
     fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile> {
-        let candidates = self.graph.find_candidates(target, analyzer);
+        let mut candidates = self.graph.find_candidates(target, analyzer);
         if candidates.is_empty() && !analyzer.is_empty() {
             return self.text.find_candidates(target, analyzer);
         }
+        if should_union_text_candidates(target) {
+            candidates.extend(self.text.find_candidates(target, analyzer));
+        }
         candidates
     }
+}
+
+fn should_union_text_candidates(target: &CodeUnit) -> bool {
+    language_for_target(target) == Language::Python
+        && (target.is_function() || target.is_field())
+        && target.short_name().contains('.')
 }
 
 /// Convenience constructor for the standard [`ImportGraphCandidateProvider`] +
