@@ -913,28 +913,127 @@ class ScanUsagesResult:
         if self.rendered_text is not None:
             return self.rendered_text
         usages = self.structured.get("usages", [])
-        if not usages:
-            return "No usages found."
         blocks: list[str] = []
         for usage in usages:
             symbol = str(usage.get("symbol", "<unknown>"))
             total_hits = int(usage.get("total_hits", 0))
             lines = [f"{symbol}: {total_hits} usage(s)"]
+            note = usage.get("note")
+            if note:
+                lines.append(f"  note: {note}")
+            elif total_hits == 0 and usage.get("verified_absent"):
+                lines.append(
+                    "  note: resolved symbol; no external usage sites found under current filters."
+                )
+            if usage.get("candidate_files_truncated"):
+                lines.append(
+                    "  note: candidate file set was truncated; re-call scan_usages with narrower paths."
+                )
+            if usage.get("definition_sites_excluded") is not None:
+                lines.append(
+                    f"  note: {usage['definition_sites_excluded']} definition-site hit(s) were excluded from external usages."
+                )
+            if usage.get("files_truncated") is not None:
+                lines.append(
+                    f"  note: {usage['files_truncated']} file group(s) omitted from rendered output; re-call with narrower paths for detail."
+                )
             for file_group in usage.get("files", []):
                 path = str(file_group.get("path", "<unknown>"))
                 lines.append(path)
-                for hit in file_group.get("hits", []):
-                    line = hit.get("line")
-                    enclosing = hit.get("enclosing")
-                    prefix = f"  line {line}" if line is not None else "  hit"
-                    if enclosing:
-                        prefix += f" in {enclosing}"
-                    lines.append(prefix)
-                    snippet = str(hit.get("snippet", "")).rstrip()
-                    if snippet:
-                        lines.extend(f"    {snippet_line}" for snippet_line in snippet.splitlines())
+                _append_usage_hits(lines, file_group, "  ")
+            unproven_files = usage.get("unproven_files", [])
+            if unproven_files:
+                lines.append("unproven matches:")
+                for file_group in unproven_files:
+                    path = str(file_group.get("path", "<unknown>"))
+                    lines.append(f"  {path}")
+                    _append_usage_hits(lines, file_group, "    ")
             blocks.append("\n".join(lines))
+        not_found = self.structured.get("not_found", [])
+        if not_found:
+            blocks.append(
+                "## Not found\n\n"
+                + "\n".join(
+                    f"- `{item.get('input', '<unknown>')}`"
+                    + (f": {item['note']}" if item.get("note") else "")
+                    for item in not_found
+                )
+            )
+        failures = self.structured.get("failures", [])
+        if failures:
+            lines = ["## Usage analysis failures", ""]
+            for failure in failures:
+                line = (
+                    f"- `{failure.get('symbol', '<unknown>')}`: "
+                    f"{failure.get('reason', '<no reason>')} "
+                    f"({failure.get('reason_kind', '<unknown>')})"
+                )
+                if failure.get("hint"):
+                    line += f"; {failure['hint']}"
+                if failure.get("candidate_files_truncated"):
+                    line += "; candidate file set was truncated"
+                lines.append(line)
+            blocks.append("\n".join(lines))
+        ambiguous = self.structured.get("ambiguous", [])
+        if ambiguous:
+            lines = [
+                "## Ambiguous usage symbols",
+                "",
+                "| Target | Matches | Note |",
+                "| --- | --- | --- |",
+            ]
+            for item in ambiguous:
+                matches = ", ".join(item.get("candidate_targets", []))
+                note = item.get(
+                    "note",
+                    "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
+                )
+                lines.append(
+                    f"| `{item.get('symbol', '<unknown>')}` | {matches} | {note} |"
+                )
+            blocks.append("\n".join(lines))
+        too_many = self.structured.get("too_many_callsites", [])
+        if too_many:
+            lines = ["## Too many callsites", ""]
+            for item in too_many:
+                note = item.get(
+                    "note",
+                    "Re-call scan_usages with narrower paths to reduce the scan scope.",
+                )
+                lines.append(
+                    f"- `{item.get('symbol', '<unknown>')}`: {item.get('total_callsites', '?')} "
+                    f"callsites exceeded limit {item.get('limit', '?')}; {note}"
+                )
+            blocks.append("\n".join(lines))
+        if not blocks:
+            warnings = self.structured.get("summary", {}).get("warnings", [])
+            if warnings:
+                return "## Warnings\n\n" + "\n".join(
+                    f"- {warning}" for warning in warnings
+                )
+            return "No usages found."
         return "\n\n".join(blocks)
+
+
+def _append_usage_hits(lines: list[str], file_group: dict, prefix: str) -> None:
+    hits = file_group.get("hits", [])
+    if not hits and file_group.get("hit_count") is not None:
+        lines.append(f"{prefix}{file_group['hit_count']} hit(s)")
+        return
+    for hit in hits:
+        line = hit.get("line_range") or hit.get("line")
+        enclosing = hit.get("enclosing")
+        location = f"{prefix}line {line}" if line is not None else f"{prefix}hit"
+        if enclosing:
+            location += f" in {enclosing}"
+        if hit.get("hit_count") is not None:
+            location += f" ({hit['hit_count']} hit(s))"
+        if float(hit.get("confidence", 1.0)) < 1.0:
+            location += f" [confidence {float(hit['confidence']):.2f}]"
+        lines.append(location)
+        snippet = str(hit.get("snippet", "")).rstrip()
+        if snippet:
+            lines.extend(f"{prefix}  {snippet_line}" for snippet_line in snippet.splitlines())
 
 
 @dataclass(frozen=True)

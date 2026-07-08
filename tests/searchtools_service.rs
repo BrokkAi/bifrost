@@ -2055,6 +2055,50 @@ fn scan_usages_distinguishes_resolved_zero_from_unresolved_symbol() {
 }
 
 #[test]
+fn scan_usages_python_payload_includes_rendered_diagnostics_and_zero_notes() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Greeter.java",
+            "public class Greeter {\n    public String unused() { return \"hi\"; }\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let unresolved_payload = service
+        .call_tool_payload_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.missing"],"include_tests":true}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let unresolved: Value = serde_json::from_str(&unresolved_payload).unwrap();
+    let rendered = unresolved["rendered_text"].as_str().expect("rendered text");
+    assert!(rendered.contains("## Not found"), "{rendered}");
+    assert!(rendered.contains("Greeter.missing"), "{rendered}");
+    assert!(rendered.contains("no symbol matched"), "{rendered}");
+    assert!(!rendered.trim().eq("No usages found."), "{rendered}");
+
+    let zero_payload = service
+        .call_tool_payload_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.unused"],"include_tests":true}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let zero: Value = serde_json::from_str(&zero_payload).unwrap();
+    let rendered = zero["rendered_text"].as_str().expect("rendered text");
+    assert!(
+        rendered.contains("Greeter.unused: 0 usage(s)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("resolved symbol; no external usage sites found under current filters"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sample() {
     let mut project = InlineTestProject::with_language(Language::Php)
         .file(
@@ -3407,6 +3451,21 @@ fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     assert_eq!(0, array_len(&usages[0], "files"));
     assert_eq!(0, array_len(&value, "not_found"));
     assert_eq!(0, array_len(&value, "failures"));
+}
+
+#[test]
+fn usage_graph_python_payload_includes_rendered_summary() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_payload_json("usage_graph", r#"{}"#, RenderOptions::default())
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert!(value["structured"]["nodes"].as_array().is_some());
+    assert!(value["structured"]["edges"].as_array().is_some());
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(rendered.contains("nodes"), "{rendered}");
+    assert!(rendered.contains("edges"), "{rendered}");
 }
 
 #[test]

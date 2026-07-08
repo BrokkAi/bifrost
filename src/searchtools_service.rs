@@ -401,9 +401,12 @@ impl SearchToolsService {
             ),
             "scan_usages" => {
                 Self::validate_scan_usages_arguments(&arguments)?;
-                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    scan_usages(workspace.analyzer(), params)
-                })
+                Self::decode_render_and_run(
+                    &snapshot,
+                    arguments,
+                    render_options,
+                    |workspace, params| scan_usages(workspace.analyzer(), params),
+                )
             }
             "get_definition_by_location" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
@@ -423,9 +426,12 @@ impl SearchToolsService {
             "rename_symbol" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 rename_symbol(workspace.analyzer(), params)
             }),
-            "usage_graph" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                usage_graph(workspace.analyzer(), params)
-            }),
+            "usage_graph" => Self::decode_render_and_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params| usage_graph(workspace.analyzer(), params),
+            ),
             "search_ast" => {
                 let output = Self::search_ast_output_for_snapshot(&snapshot, arguments)?;
                 let rendered_text = output.render_text();
