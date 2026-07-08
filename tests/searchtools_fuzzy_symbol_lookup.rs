@@ -170,6 +170,57 @@ const direct = ApiClient.create("/direct");
 }
 
 #[test]
+fn scan_usages_file_anchor_prefers_exact_scala_class_over_companion_object() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/main/scala/example/Service.scala",
+            r#"package example
+
+class Repository
+class Service(repository: Repository)
+
+object Service {
+  def build(repository: Repository): Service =
+    new Service(repository)
+}
+"#,
+        )
+        .build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+
+    let result = scan_usages(
+        &analyzer,
+        ScanUsagesParams {
+            symbols: Some(vec![
+                "src/main/scala/example/Service.scala#example.Service".to_string(),
+            ]),
+            targets: Vec::new(),
+            include_tests: true,
+            paths: None,
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert!(result.failures.is_empty(), "{result:#?}");
+    assert_eq!(1, result.usages.len(), "{result:#?}");
+    assert!(
+        result.usages[0].files.iter().any(|file| {
+            file.path == "src/main/scala/example/Service.scala"
+                && file.hits.iter().any(|hit| {
+                    hit.line == 8
+                        && hit
+                            .snippet
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("new Service(repository)")
+                })
+        }),
+        "expected constructor usage for exact class target: {result:#?}"
+    );
+}
+
+#[test]
 fn java_annotated_method_search_symbol_uses_name_line() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

@@ -2487,6 +2487,17 @@ fn distinct_definitions(overloads: Vec<CodeUnit>) -> Vec<(String, Vec<CodeUnit>)
     groups
 }
 
+fn prefer_exact_lookup_matches(overloads: Vec<CodeUnit>, lookup: &str) -> Vec<CodeUnit> {
+    if overloads.iter().any(|unit| unit.fq_name() == lookup) {
+        overloads
+            .into_iter()
+            .filter(|unit| unit.fq_name() == lookup)
+            .collect()
+    } else {
+        overloads
+    }
+}
+
 fn code_unit_match_names(matches: Vec<CodeUnit>) -> Vec<String> {
     dedupe_preserving_order(
         matches
@@ -3022,6 +3033,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     .into_iter()
                     .filter(|unit| rel_path_string(unit.source()) == anchor)
                     .collect();
+                let narrowed = prefer_exact_lookup_matches(narrowed, lookup);
                 if narrowed.is_empty() {
                     not_found.push(anchor_not_found_input(symbol.clone(), anchor, lookup));
                     continue;
