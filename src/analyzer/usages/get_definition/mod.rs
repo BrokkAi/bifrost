@@ -576,7 +576,20 @@ fn boundary(message: String) -> DefinitionLookupOutcome {
     diagnostic_outcome(
         DefinitionLookupStatus::UnresolvableImportBoundary,
         "unresolvable_import_boundary",
-        message,
+        import_boundary_workspace_message(message),
+    )
+}
+
+fn import_boundary_workspace_message(message: String) -> String {
+    let message = message.replace(
+        "outside this partial ",
+        "outside the indexed workspace, including this partial ",
+    );
+    if message.contains("outside the indexed workspace") {
+        return message;
+    }
+    format!(
+        "{message}; the imported package, module, namespace, or file may be outside the indexed workspace, including when only a partial workspace is indexed"
     )
 }
 

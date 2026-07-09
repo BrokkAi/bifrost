@@ -6917,6 +6917,11 @@ export function run() {
         value["results"][0]["status"], "unresolvable_import_boundary",
         "{value}"
     );
+    let message = value["results"][0]["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("outside the indexed workspace"), "{value}");
+    assert!(message.contains("partial workspace"), "{value}");
 }
 
 #[test]
@@ -8790,6 +8795,11 @@ public class UseList {
         value["results"][0]["status"], "unresolvable_import_boundary",
         "{value}"
     );
+    let message = value["results"][0]["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("outside the indexed workspace"), "{value}");
+    assert!(message.contains("partial workspace"), "{value}");
 }
 
 #[test]
