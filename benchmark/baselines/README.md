@@ -23,6 +23,14 @@ LSP fixture sweep and its analyzer fixes, so future scheduled runs compare
 against the reviewed July 7 artifact instead of carrying the older July 1 timing
 floor forward.
 
+The July 9 blessed Ubuntu baseline was promoted from the successful scheduled
+benchmark run (`run-20260709T104007Z.json` from Actions run 29011660435). The
+report had zero scenario failures across the same 10 repositories and 71
+scenarios. Comparing that artifact against the July 7 baseline reported 24
+threshold-crossing improvements and one remaining threshold-crossing regression;
+this promotion registers the broad analyzer-performance improvements as the new
+comparison point without changing the regression detector.
+
 It is not written automatically. Promote it deliberately:
 
 1. Run the benchmark workflow or a local `bifrost_benchmark run`.
