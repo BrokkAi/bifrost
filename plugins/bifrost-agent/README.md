@@ -132,6 +132,22 @@ Codex to use generic subagents with the matching prompt. Do not edit
 node scripts/generate-codex-skill-bundle.mjs
 ```
 
+Hosts such as Zed and Antigravity can also load generic Agent Skills directly
+from filesystem roots such as `~/.agents/skills` and
+`<worktree>/.agents/skills`. For those hosts, install Bifrost's generic skills
+with the Bifrost CLI instead of copying directories by hand:
+
+```bash
+bifrost --root /absolute/path/to/workspace --install-skills --target project
+```
+
+The default command installs the three Bifrost code-intelligence skills. Use
+`--target global` for `~/.agents/skills`, `--skills-root /path/to/skills` for an
+explicit skills root, `--mode copy` for self-contained copies, or
+`--skill-set all` to opt into the Brokk workflow/review skills as well. This
+step installs only instructions for the agent. It does not register the Bifrost
+MCP server; keep using the host-specific MCP setup below for analyzer tools.
+
 ## Claude Code Install
 
 Add the Brokk marketplace from GitHub, then install Bifrost:
@@ -238,23 +254,19 @@ Antigravity documents skills under workspace and global skill directories; see
 the official [Skills](https://antigravity.google/docs/skills) documentation for
 the host-side convention. In Antigravity 2.2.1 validation, workspace-local
 skills loaded reliably and appeared in project-specific settings. If global
-skills do not appear in your app session, install the generated Bifrost
-code-intelligence skill into each target workspace. The skill is named
-`bifrost-code-intelligence` because it exposes the analyzer-backed navigation,
-reading, search, and usage tools used by guided review workflows:
+skills do not appear in your app session, install the Bifrost skills into each
+target workspace:
 
 ```bash
-mkdir -p /absolute/path/to/workspace/.agents/skills
-cp -R "$(pwd)/plugins/bifrost-agent/amp-skills/bifrost-code-intelligence" \
-  /absolute/path/to/workspace/.agents/skills/bifrost-code-intelligence
+bifrost --root /absolute/path/to/workspace --install-skills --target project --mode copy
 ```
 
 Open the project-specific settings page in Antigravity. The project
-**Customizations** section should list `bifrost-code-intelligence`. Validate
-with a guided-review prompt that requires a Bifrost MCP tool on source code:
+**Customizations** section should list the installed Bifrost skills. Validate
+with a prompt that requires a Bifrost MCP tool on source code:
 
 ```text
-Use the bifrost-code-intelligence skill for a guided review. Inspect the current changes, use the Bifrost MCP get_summaries tool on src/analyzer/usages for source context, and report review findings with file and line references.
+Use the bifrost-code-reading skill. Use the Bifrost MCP get_summaries tool on src/analyzer/usages for source context, and name the files summarized from the MCP result.
 ```
 
 ## Amp Install and Local Testing

@@ -59,4 +59,18 @@ For JSON-based MCP hosts, configure Bifrost as a stdio server:
 
 Use an absolute binary path if `bifrost` is not on the host's `PATH`. Replace `/path/to/project` with the project root syntax supported by your host, or with an absolute project path.
 
+## Skills Are Separate
+
+MCP setup makes Bifrost tools available to an agent host. Agent Skills are
+separate instructions that teach the host when and how to use those tools. For
+hosts that load generic filesystem skills, install Bifrost's default
+code-intelligence skills with:
+
+```bash
+bifrost --root /path/to/project --install-skills --target project
+```
+
+See [CLI](../cli/#install-agent-skills) for `--target global`,
+`--skills-root`, `--mode`, `--skill-set`, `--dry-run`, and `--force`.
+
 Use the host-specific pages for Codex, Claude Code, Cursor, Zed Agent, Amp, and Antigravity setup flows. The intended external manual client is the official MCP Inspector.
