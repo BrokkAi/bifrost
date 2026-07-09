@@ -268,29 +268,15 @@ class SearchToolsClient:
             rendered_text=payload.rendered_text,
         )
 
-    def get_definition_by_location(
+    def get_definitions_by_location(
         self,
-        path: str,
-        *,
-        line: int | None = None,
-        column: int | None = None,
-        start_byte: int | None = None,
-        end_byte: int | None = None,
-    ) -> DefinitionLookupResult:
-        reference: dict[str, Any] = {"path": path}
-        if line is not None:
-            reference["line"] = line
-        if column is not None:
-            reference["column"] = column
-        if start_byte is not None:
-            reference["start_byte"] = start_byte
-        if end_byte is not None:
-            reference["end_byte"] = end_byte
+        references: list[dict[str, Any]],
+    ) -> list[DefinitionLookupResult]:
         result = self._call_tool(
-            "get_definition_by_location",
-            {"references": [reference]},
+            "get_definitions_by_location",
+            {"references": references},
         )
-        return DefinitionLookupResult.from_dict(result["results"][0])
+        return [DefinitionLookupResult.from_dict(item) for item in result["results"]]
 
     def get_definitions_by_reference(
         self,

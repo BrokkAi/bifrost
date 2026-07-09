@@ -169,7 +169,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
-            "get_definition_by_location",
+            "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
@@ -211,7 +211,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
-            "get_definition_by_location",
+            "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
@@ -250,7 +250,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         ];
         expected
     });
-    assert_tool_schema_omits_property(tools, "get_definition_by_location", "include_tests");
+    assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
     assert_tool_schema_contains_property(tools, "scan_usages", "targets");
     assert_tool_schema_contains_property(tools, "scan_usages", "anyOf");
     assert_scan_usages_schema_requires_non_empty_selectors(tools);
@@ -766,7 +766,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_symbol_sources",
         "get_summaries",
         "scan_usages",
-        "get_definition_by_location",
+        "get_definitions_by_location",
         "get_type_by_location",
         "rename_symbol",
         "usage_graph",
@@ -800,7 +800,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
-            "get_definition_by_location",
+            "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
@@ -1272,7 +1272,7 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
             .expect("tools array"),
     );
     assert!(names.contains(&"get_definitions_by_reference"), "{names:?}");
-    assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
+    assert!(!names.contains(&"get_definitions_by_location"), "{names:?}");
     assert!(!names.contains(&"get_type_by_location"), "{names:?}");
     assert_tool_schema_omits_property(
         list_tools["result"]["tools"]
@@ -1291,7 +1291,7 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
             "id": 11,
             "method": "tools/call",
             "params": {
-                "name": "get_definition_by_location",
+                "name": "get_definitions_by_location",
                 "arguments": {
                     "references": [{
                         "path": "A.java",
@@ -1304,7 +1304,7 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
     );
     assert_eq!(
         unavailable_location_tool["result"]["content"][0]["text"],
-        "Unknown tool: get_definition_by_location",
+        "Unknown tool: get_definitions_by_location",
         "{unavailable_location_tool}"
     );
 
@@ -1368,7 +1368,7 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
             .expect("tools array"),
     );
     assert!(names.contains(&"get_definitions_by_reference"), "{names:?}");
-    assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
+    assert!(!names.contains(&"get_definitions_by_location"), "{names:?}");
     assert!(!names.contains(&"get_type_by_location"), "{names:?}");
 
     let unavailable_location_tool = round_trip(
@@ -1380,7 +1380,7 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
             "id": 11,
             "method": "tools/call",
             "params": {
-                "name": "get_definition_by_location",
+                "name": "get_definitions_by_location",
                 "arguments": {
                     "references": [{
                         "path": "A.java",
@@ -1393,7 +1393,7 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
     );
     assert_eq!(
         unavailable_location_tool["result"]["content"][0]["text"],
-        "Unknown tool: get_definition_by_location",
+        "Unknown tool: get_definitions_by_location",
         "{unavailable_location_tool}"
     );
 

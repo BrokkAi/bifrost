@@ -1019,11 +1019,11 @@ pub fn get_symbol_locations(
     }
 }
 
-pub fn get_definition_by_location(
+pub fn get_definitions_by_location(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionParams,
 ) -> GetDefinitionResult {
-    let _scope = profiling::scope("searchtools::get_definition_by_location");
+    let _scope = profiling::scope("searchtools::get_definitions_by_location");
 
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut pending = Vec::new();

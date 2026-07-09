@@ -33,7 +33,7 @@ pub fn run_searchtools_stdio_server(
 
 pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
     let definition_descriptor = if render_line_numbers {
-        get_definition_by_location_descriptor()
+        get_definitions_by_location_descriptor()
     } else {
         get_definitions_by_reference_descriptor()
     };
@@ -270,9 +270,9 @@ fn get_type_by_location_descriptor() -> Value {
     )
 }
 
-fn get_definition_by_location_descriptor() -> Value {
+fn get_definitions_by_location_descriptor() -> Value {
     tool_descriptor(
-        "get_definition_by_location",
+        "get_definitions_by_location",
         "Resolve source reference sites back to workspace definition metadata from exact line/column or byte locations. Use when line numbers are visible and you need usage-to-definition navigation without building the whole usage_graph.",
         location_references_schema(
             "Project-relative source file path containing the reference.",

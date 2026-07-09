@@ -5,7 +5,7 @@ use common::{InlineTestProject, call_search_tool_json};
 use serde_json::{Value, json};
 
 fn lookup(root: &std::path::Path, args: &str) -> Value {
-    call_search_tool_json(root, "get_definition_by_location", args)
+    call_search_tool_json(root, "get_definitions_by_location", args)
 }
 
 fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
