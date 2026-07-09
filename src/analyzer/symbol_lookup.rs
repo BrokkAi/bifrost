@@ -304,7 +304,13 @@ fn insert_path_variants(paths: &mut BTreeSet<Vec<String>>, language: Language, v
 }
 
 fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
-    let primary = parse_symbol_path(language, value);
+    let primary = if language == Language::Go {
+        go_receiver_declaration_selector(value)
+            .map(|selector| parse_symbol_path(language, &selector))
+            .unwrap_or_else(|| parse_symbol_path(language, value))
+    } else {
+        parse_symbol_path(language, value)
+    };
     if primary.is_empty() {
         return Vec::new();
     }
@@ -444,11 +450,8 @@ fn normalized_client_symbol_segment(language: Language, segment: &str) -> String
 }
 
 fn normalized_go_client_symbol_segment(segment: &str) -> String {
-    let receiver = segment
-        .strip_prefix("(*")
-        .and_then(|value| value.strip_suffix(')'))
-        .unwrap_or(segment)
-        .trim();
+    let receiver = segment.trim();
+    let receiver = go_receiver_type_segment(receiver).unwrap_or(receiver);
     let base = receiver
         .split_once('[')
         .map(|(base, _)| base.trim())
@@ -459,6 +462,48 @@ fn normalized_go_client_symbol_segment(segment: &str) -> String {
     } else {
         base.to_string()
     }
+}
+
+fn go_receiver_declaration_selector(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let receiver_end = trimmed.find(')')?;
+    let receiver = trimmed.get(..=receiver_end)?;
+    let method = trimmed.get(receiver_end + 1..)?.trim();
+    let method = method.strip_prefix('.').unwrap_or(method).trim();
+    if method.is_empty() || method.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let (prefix, receiver) = receiver
+        .rsplit_once(".(")
+        .map(|(prefix, receiver)| (Some(prefix), format!("({receiver}")))
+        .unwrap_or((None, receiver.to_string()));
+    let receiver_type = normalized_go_client_symbol_segment(&receiver);
+    if receiver_type == receiver {
+        return None;
+    }
+    Some(match prefix {
+        Some(prefix) => format!("{prefix}.{receiver_type}.{method}"),
+        None => format!("{receiver_type}.{method}"),
+    })
+}
+
+fn go_receiver_type_segment(segment: &str) -> Option<&str> {
+    let inner = segment.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let receiver = inner.strip_prefix('*').unwrap_or(inner).trim();
+    if receiver.is_empty() {
+        return None;
+    }
+
+    let Some(type_start) = receiver.find(char::is_whitespace) else {
+        return Some(receiver);
+    };
+
+    let receiver_type = receiver[type_start..].trim();
+    if receiver_type.is_empty() {
+        return None;
+    }
+    Some(receiver_type.strip_prefix('*').unwrap_or(receiver_type))
 }
 
 fn path_ends_with(candidate: &[String], query: &[String]) -> bool {

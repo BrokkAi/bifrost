@@ -350,6 +350,36 @@ class Outer {
 }
 
 #[test]
+fn symbol_sources_prefers_exact_cpp_namespace_symbol_over_path_selector() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("fmt", "not a source file\n")
+        .file(
+            "src/fmt.cpp",
+            r#"namespace fmt {
+struct formatter {
+    void write();
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["fmt::formatter".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous_paths.is_empty(), "{result:#?}");
+    assert_eq!(1, result.sources.len(), "{result:#?}");
+    assert_eq!("fmt.formatter", result.sources[0].label);
+    assert_eq!("src/fmt.cpp", result.sources[0].path);
+}
+
+#[test]
 fn scan_usages_normalizes_go_pointer_receiver_method_selector() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module github.com/example/app\n\ngo 1.22\n")

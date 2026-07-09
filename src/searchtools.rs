@@ -17,7 +17,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::model_context;
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
-    rel_path_string,
+    rel_path_string, workspace_rel_path,
 };
 use crate::profiling;
 use crate::relevance::{
@@ -1781,6 +1781,16 @@ enum SelectableDefinitionResolution {
     NotFound(NotFoundInput),
 }
 
+enum DefinitionSelector<'a> {
+    Name(&'a str),
+    FileAnchored { anchor: String, lookup: &'a str },
+}
+
+enum PathQualifiedSelector<'a> {
+    Resolved { anchor: String, lookup: &'a str },
+    AmbiguousPath(AmbiguousPathInput),
+}
+
 fn exact_codeunit_resolution(analyzer: &dyn IAnalyzer, input: &str) -> CodeUnitResolution {
     let units = resolve_codeunit_exact(analyzer, input);
     if units.is_empty() {
@@ -1811,7 +1821,11 @@ fn resolve_selectable_definitions(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
-    let (anchor, lookup) = split_definition_selector(input);
+    let selector = split_definition_selector(input);
+    let (anchor, lookup) = match selector {
+        DefinitionSelector::Name(name) => (None, name),
+        DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
+    };
     let code_units = match resolve(analyzer, lookup) {
         CodeUnitResolution::Resolved(code_units) => code_units,
         CodeUnitResolution::Ambiguous(matches) => matches,
@@ -1828,7 +1842,7 @@ fn resolve_selectable_definitions(
                 .collect();
             if narrowed.is_empty() {
                 return SelectableDefinitionResolution::NotFound(anchor_not_found_input(
-                    input, anchor, lookup,
+                    input, &anchor, lookup,
                 ));
             }
             narrowed
@@ -1894,7 +1908,10 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
         .map(|target| target.trim())
         .filter(|target| !target.is_empty())
     {
-        if split_definition_selector(target).0.is_some() {
+        if matches!(
+            split_definition_selector(target),
+            DefinitionSelector::FileAnchored { .. }
+        ) {
             symbol_targets.push(target.to_string());
             continue;
         }
@@ -1996,6 +2013,51 @@ fn source_blocks_for_resolved_units(
         .collect()
 }
 
+fn resolve_file_anchored_symbol_sources(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    anchor: String,
+    lookup: &str,
+) -> SourceLookupOutcome {
+    let code_units = match exact_then_fuzzy_codeunit_resolution(analyzer, lookup) {
+        CodeUnitResolution::Resolved(code_units) | CodeUnitResolution::Ambiguous(code_units) => {
+            code_units
+        }
+        CodeUnitResolution::NotFound => {
+            return SourceLookupOutcome::NotFound(symbol_not_found_input(input));
+        }
+    };
+    let narrowed: Vec<_> = code_units
+        .into_iter()
+        .filter(|unit| rel_path_string(unit.source()) == anchor)
+        .collect();
+    if narrowed.is_empty() {
+        return SourceLookupOutcome::NotFound(anchor_not_found_input(input, &anchor, lookup));
+    }
+
+    let groups = distinct_definitions(narrowed);
+    match groups.as_slice() {
+        [] => SourceLookupOutcome::NotFound(symbol_not_found_input(input)),
+        [(_, _)] => {
+            let code_units: Vec<_> = groups.into_iter().flat_map(|(_, units)| units).collect();
+            let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+            if sources.is_empty() {
+                SourceLookupOutcome::NotFound(renderable_not_found_input(input))
+            } else {
+                SourceLookupOutcome::Found(sources)
+            }
+        }
+        _ => {
+            let matches: Vec<_> = groups.into_iter().map(|(selector, _)| selector).collect();
+            SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
+                target: input.to_string(),
+                note: ambiguous_symbol_selector_note(&matches),
+                matches,
+            })
+        }
+    }
+}
+
 pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
@@ -2010,35 +2072,10 @@ pub fn get_symbol_sources(
         .into_par_iter()
         .enumerate()
         .map(|(index, symbol)| {
-            if split_definition_selector(&symbol).0.is_some() {
-                return match resolve_selectable_definitions(
-                    analyzer,
-                    &symbol,
-                    exact_then_fuzzy_codeunit_resolution,
-                ) {
-                    SelectableDefinitionResolution::Resolved(code_units) => {
-                        let sources = source_blocks_for_resolved_units(analyzer, &code_units);
-                        if sources.is_empty() {
-                            (
-                                index,
-                                SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
-                            )
-                        } else {
-                            (index, SourceLookupOutcome::Found(sources))
-                        }
-                    }
-                    SelectableDefinitionResolution::Ambiguous(item) => {
-                        (index, SourceLookupOutcome::Ambiguous(item))
-                    }
-                    SelectableDefinitionResolution::NotFound(target) => {
-                        (index, SourceLookupOutcome::NotFound(target))
-                    }
-                };
-            }
-
             // Exact fully-qualified lookup wins before file patterns, so a
             // canonical symbol containing `/` (e.g. a Go import path) is never
-            // misrouted as a filesystem path.
+            // misrouted as a filesystem path, and real namespace symbols like
+            // `fmt::formatter` are never stolen by path-selector parsing.
             match resolve_selectable_definitions(analyzer, &symbol, exact_codeunit_resolution) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = source_blocks_for_resolved_units(analyzer, &code_units);
@@ -2055,6 +2092,57 @@ pub fn get_symbol_sources(
                     return (index, SourceLookupOutcome::Ambiguous(item));
                 }
                 SelectableDefinitionResolution::NotFound(_) => {}
+            }
+
+            match split_path_qualified_definition_selector(analyzer, &symbol) {
+                Some(PathQualifiedSelector::Resolved { anchor, lookup }) => {
+                    return match resolve_file_anchored_symbol_sources(
+                        analyzer, &symbol, anchor, lookup,
+                    ) {
+                        SourceLookupOutcome::Found(blocks) => {
+                            (index, SourceLookupOutcome::Found(blocks))
+                        }
+                        SourceLookupOutcome::NotFound(item) => {
+                            (index, SourceLookupOutcome::NotFound(item))
+                        }
+                        SourceLookupOutcome::Ambiguous(item) => {
+                            (index, SourceLookupOutcome::Ambiguous(item))
+                        }
+                        SourceLookupOutcome::AmbiguousPath(item) => {
+                            (index, SourceLookupOutcome::AmbiguousPath(item))
+                        }
+                    };
+                }
+                Some(PathQualifiedSelector::AmbiguousPath(item)) => {
+                    return (index, SourceLookupOutcome::AmbiguousPath(item));
+                }
+                None => {}
+            }
+
+            if analyzer.languages().contains(&Language::Go)
+                && looks_like_go_receiver_selector(&symbol)
+            {
+                match resolve_selectable_definitions(
+                    analyzer,
+                    &symbol,
+                    exact_then_fuzzy_codeunit_resolution,
+                ) {
+                    SelectableDefinitionResolution::Resolved(code_units) => {
+                        let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+                        return if sources.is_empty() {
+                            (
+                                index,
+                                SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
+                            )
+                        } else {
+                            (index, SourceLookupOutcome::Found(sources))
+                        };
+                    }
+                    SelectableDefinitionResolution::Ambiguous(item) => {
+                        return (index, SourceLookupOutcome::Ambiguous(item));
+                    }
+                    SelectableDefinitionResolution::NotFound(_) => {}
+                }
             }
 
             let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
@@ -2545,13 +2633,59 @@ fn scoped_usage_finder(
 /// Split a definition selector into an optional file anchor and the name to
 /// resolve. A plain input (`Anchor`) has no anchor; a file-anchored selector
 /// (`charts/Anchor.ts#Anchor`), returned in a prior ambiguity result, picks one
-/// of several same-named definitions. The `#` separator does not occur in any
-/// language's symbol grammar, so a bare name is never misread as anchored.
-fn split_definition_selector(input: &str) -> (Option<&str>, &str) {
+/// of several same-named definitions.
+fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
     match input.split_once('#') {
-        Some((anchor, name)) if !anchor.is_empty() && !name.is_empty() => (Some(anchor), name),
-        _ => (None, input),
+        Some((anchor, name)) if !anchor.is_empty() && !name.is_empty() => {
+            DefinitionSelector::FileAnchored {
+                anchor: anchor.to_string(),
+                lookup: name,
+            }
+        }
+        _ => DefinitionSelector::Name(input),
     }
+}
+
+fn split_path_qualified_definition_selector<'a>(
+    analyzer: &dyn IAnalyzer,
+    input: &'a str,
+) -> Option<PathQualifiedSelector<'a>> {
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    for separator in ["::", ":"] {
+        let Some((path, name)) = input.split_once(separator) else {
+            continue;
+        };
+        let path = path.trim();
+        let name = name.trim();
+        if path.is_empty() || name.is_empty() {
+            continue;
+        }
+        if !looks_like_path_selector_anchor(path) {
+            continue;
+        }
+        return Some(match resolver.resolve_literal(path) {
+            ResolvedFileInput::File(file) => PathQualifiedSelector::Resolved {
+                anchor: rel_path_string(&file),
+                lookup: name,
+            },
+            ResolvedFileInput::Ambiguous(item) => PathQualifiedSelector::AmbiguousPath(item),
+            ResolvedFileInput::NotFound(_) => continue,
+        });
+    }
+
+    None
+}
+
+fn looks_like_path_selector_anchor(path: &str) -> bool {
+    if path.contains('/') || path.contains('\\') {
+        return true;
+    }
+    let Some(rel) = workspace_rel_path(path) else {
+        return false;
+    };
+    rel.file_name()
+        .and_then(|name| std::path::Path::new(name).extension())
+        .is_some()
 }
 
 fn unsupported_path_qualified_scan_symbol(
@@ -3286,7 +3420,10 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             });
             continue;
         }
-        let (anchor, lookup) = split_definition_selector(&symbol);
+        let (anchor, lookup) = match split_definition_selector(&symbol) {
+            DefinitionSelector::Name(name) => (None, name),
+            DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
+        };
         let overloads = match resolve_codeunit_fuzzy(analyzer, lookup) {
             CodeUnitResolution::Resolved(overloads) => overloads,
             CodeUnitResolution::Ambiguous(candidate_targets) => {
@@ -3321,7 +3458,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 if narrowed.is_empty() {
                     work_entries.push(ScanUsagesWorkEntry::NotFound {
                         request,
-                        item: anchor_not_found_input(symbol.clone(), anchor, lookup),
+                        item: anchor_not_found_input(symbol.clone(), &anchor, lookup),
                     });
                     continue;
                 }
@@ -5887,6 +6024,11 @@ fn looks_like_file_target(target: &str) -> bool {
         return false;
     };
     !extension.is_empty() && likely_file_target_extension(extension)
+}
+
+fn looks_like_go_receiver_selector(target: &str) -> bool {
+    let trimmed = target.trim();
+    trimmed.starts_with('(') || trimmed.contains(".(")
 }
 
 fn likely_file_target_extension(extension: &str) -> bool {

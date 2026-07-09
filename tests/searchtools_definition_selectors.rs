@@ -151,6 +151,78 @@ fn symbol_sources_disambiguates_same_named_js_functions_by_file_selector() {
 }
 
 #[test]
+fn symbol_sources_accepts_path_colon_selector_spellings() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/a.js",
+            r#"export class Duration {
+  get() {
+    return 'a';
+  }
+}
+"#,
+        )
+        .file(
+            "src/b.js",
+            r#"export class Duration {
+  get() {
+    return 'b';
+  }
+}
+"#,
+        )
+        .build();
+
+    for selector in ["src/a.js::Duration.get", "src/a.js:Duration.get"] {
+        let result = call_tool(
+            &project,
+            "get_symbol_sources",
+            &format!(r#"{{"symbols":["{selector}"]}}"#),
+        );
+
+        assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+        assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+        assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+        assert_eq!("src/a.js", result["sources"][0]["path"], "{result}");
+        assert!(
+            result["sources"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("return 'a'"),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn symbol_sources_reports_ambiguous_path_colon_selector_anchor() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/a.js", "export function helper() { return 'src'; }\n")
+        .file("lib/a.js", "export function helper() { return 'lib'; }\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["a.js:helper"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(
+        1,
+        result["ambiguous_paths"].as_array().unwrap().len(),
+        "{result}"
+    );
+    assert_eq!("a.js", result["ambiguous_paths"][0]["input"], "{result}");
+    assert_eq!(
+        vec!["lib/a.js".to_string(), "src/a.js".to_string()],
+        string_array(&result["ambiguous_paths"][0]["matches"]),
+        "{result}"
+    );
+}
+
+#[test]
 fn symbol_sources_preserves_java_overloads_as_one_non_module_scoped_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

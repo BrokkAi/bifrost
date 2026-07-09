@@ -26,6 +26,10 @@ fn canonical_project() -> common::BuiltInlineTestProject {
         .file("Server/pkg.go", "package Server\nfunc New() string { return \"package\" }\n")
         .file("gin/gin.go", "package gin\ntype Engine struct{}\nfunc New() *Engine { return &Engine{} }\n")
         .file(
+            "cache/cache.go",
+            "package cache\n\ntype ChainCache[T any] struct{}\nfunc (c *ChainCache[T]) Set(value T) {}\n\ntype LoadableCache struct{}\nfunc (c *LoadableCache) Get() string { return \"value\" }\n\ntype Pair[A, B any] struct{}\nfunc (p *Pair[A, B]) Swap() {}\n",
+        )
+        .file(
             "a/list/list_test.go",
             "package list\nimport \"testing\"\nfunc TestListRun(t *testing.T) {}\n",
         )
@@ -133,6 +137,31 @@ fn get_symbol_sources_resolves_exact_canonical_and_flags_bare_ambiguity() {
             && matches.contains("example.com/repo/b/list.TestListRun"),
         "ambiguity matches must be canonical: {matches:#?}"
     );
+}
+
+#[test]
+fn get_symbol_sources_normalizes_go_receiver_selectors() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    for symbol in [
+        "(*ChainCache[T]).Set",
+        "(c *ChainCache[T]) Set",
+        "example.com/repo/cache.(*LoadableCache).Get",
+        "(p *Pair[A, B]) Swap",
+    ] {
+        let result = get_symbol_sources(
+            &analyzer,
+            SymbolLookupParams {
+                symbols: vec![symbol.to_string()],
+            },
+        );
+
+        assert!(result.not_found.is_empty(), "{symbol}: {result:#?}");
+        assert!(result.ambiguous.is_empty(), "{symbol}: {result:#?}");
+        assert_eq!(1, result.sources.len(), "{symbol}: {result:#?}");
+        assert_eq!("cache/cache.go", result.sources[0].path, "{symbol}");
+    }
 }
 
 #[test]
