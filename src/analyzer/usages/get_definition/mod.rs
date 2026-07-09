@@ -153,6 +153,9 @@ pub(super) fn resolve_in_enclosing_scopes(
     }
 }
 
+pub(crate) const SCALA_UNSUPPORTED_CALL_TARGET_SHAPE: &str = "unsupported_scala_call_target_shape";
+pub(crate) const SCALA_UNSUPPORTED_RECEIVER: &str = "unsupported_scala_receiver";
+
 #[derive(Debug, Clone)]
 pub(crate) struct DefinitionLookupRequest {
     pub(crate) file: ProjectFile,

@@ -1340,6 +1340,94 @@ private[stream] class TimeGrouped(
 }
 
 #[test]
+fn get_definitions_by_reference_reports_scala_receiver_guidance() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Consumer.scala",
+            r#"package app
+class Consumer {
+  def run(service: UnknownService): Unit = {
+    service.changeOrganisation()
+  }
+}
+"#,
+        )
+        .build();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            r#"{"references":[{"symbol":"app.Consumer","context":"    service.changeOrganisation()","target":"changeOrganisation"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let result = &value["results"][0];
+    assert_eq!("no_definition", result["status"], "{value}");
+    assert_eq!(
+        "unsupported_scala_receiver", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(
+        message.contains("reference tool cannot follow this Scala receiver/member shape yet"),
+        "{message}"
+    );
+    assert!(message.contains("search_symbols"), "{message}");
+    assert!(message.contains("changeOrganisation"), "{message}");
+    assert!(message.contains("get_symbol_sources"), "{message}");
+    assert!(!message.contains("start_byte"), "{message}");
+}
+
+#[test]
+fn get_definitions_by_reference_reports_scala_call_shape_guidance() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Consumer.scala",
+            r#"package app
+class Consumer {
+  def run(factory: () => () => Int): Int = {
+    factory()()
+  }
+}
+"#,
+        )
+        .build();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            r#"{"references":[{"symbol":"app.Consumer","context":"    factory()()","target":"factory"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let result = &value["results"][0];
+    assert_eq!("no_definition", result["status"], "{value}");
+    assert_eq!(
+        "unsupported_scala_call_target_shape", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(
+        message.contains("reference tool cannot follow this Scala call target shape yet"),
+        "{message}"
+    );
+    assert!(message.contains("search_symbols"), "{message}");
+    assert!(message.contains("callable/member name"), "{message}");
+    assert!(message.contains("get_symbol_sources"), "{message}");
+    assert!(!message.contains("start_byte"), "{message}");
+}
+
+#[test]
 fn python_boundary_returns_canonical_rendered_text_payload() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service

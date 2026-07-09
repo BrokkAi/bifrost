@@ -617,7 +617,7 @@ fn resolve_scala_call(
             )
         }
         _ => no_definition(
-            "unsupported_scala_reference_shape",
+            SCALA_UNSUPPORTED_CALL_TARGET_SHAPE,
             format!(
                 "Scala `{}` call targets are not resolved by get_definition yet",
                 function.kind()
@@ -637,7 +637,7 @@ fn resolve_scala_infix_call(
     };
     let Some(receiver) = call.child_by_field_name("left") else {
         return no_definition(
-            "unsupported_scala_receiver",
+            SCALA_UNSUPPORTED_RECEIVER,
             "Scala infix expression has no receiver",
         );
     };
@@ -659,7 +659,7 @@ fn resolve_scala_infix_call(
         return candidates_outcome(extension_candidates);
     }
     no_definition(
-        "unsupported_scala_receiver",
+        SCALA_UNSUPPORTED_RECEIVER,
         format!("receiver for Scala infix member `{name}` is not resolved"),
     )
 }
@@ -675,7 +675,7 @@ fn resolve_scala_postfix_call(
     };
     let Some(receiver) = scala_postfix_receiver_node(call, method) else {
         return no_definition(
-            "unsupported_scala_receiver",
+            SCALA_UNSUPPORTED_RECEIVER,
             "Scala postfix expression has no receiver",
         );
     };
@@ -696,7 +696,7 @@ fn resolve_scala_postfix_call(
         return candidates_outcome(extension_candidates);
     }
     no_definition(
-        "unsupported_scala_receiver",
+        SCALA_UNSUPPORTED_RECEIVER,
         format!("receiver for Scala postfix member `{name}` is not resolved"),
     )
 }
@@ -795,7 +795,7 @@ fn resolve_scala_field(
         return candidates_outcome(extension_candidates);
     }
     no_definition(
-        "unsupported_scala_receiver",
+        SCALA_UNSUPPORTED_RECEIVER,
         format!("receiver for Scala member `{member}` is not resolved"),
     )
 }
@@ -941,7 +941,7 @@ fn scala_extension_candidates(
         return candidates_outcome(candidates);
     }
     no_definition(
-        "unsupported_scala_receiver",
+        SCALA_UNSUPPORTED_RECEIVER,
         format!("receiver for Scala extension member `{member}` is not resolved"),
     )
 }
@@ -1302,7 +1302,7 @@ fn scala_member_not_found(
     member: &str,
 ) -> DefinitionLookupOutcome {
     no_definition(
-        "unsupported_scala_receiver",
+        SCALA_UNSUPPORTED_RECEIVER,
         format!(
             "receiver for Scala member `{member}` resolved to `{owner_fqn}`, but `{owner_fqn}.{member}` was not indexed"
         ),

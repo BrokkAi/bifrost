@@ -8,6 +8,9 @@ use crate::analyzer::declaration_range::{
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
 };
+use crate::analyzer::usages::get_definition::{
+    SCALA_UNSUPPORTED_CALL_TARGET_SHAPE, SCALA_UNSUPPORTED_RECEIVER,
+};
 use crate::analyzer::usages::reference_site::reference_target_match_offsets;
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
@@ -1575,7 +1578,7 @@ fn render_definition_reference_lookup(
     let diagnostics = outcome
         .diagnostics
         .into_iter()
-        .map(definition_by_reference_diagnostic)
+        .map(|diagnostic| definition_by_reference_diagnostic(&query, diagnostic))
         .collect();
     DefinitionByReferenceLookupResult {
         query,
@@ -1586,16 +1589,31 @@ fn render_definition_reference_lookup(
 }
 
 fn definition_by_reference_diagnostic(
+    query: &DefinitionContextReferenceQuery,
     diagnostic: crate::analyzer::usages::get_definition::DefinitionLookupDiagnostic,
 ) -> DefinitionDiagnostic {
-    let message = if diagnostic.kind == "invalid_location"
-        && diagnostic.message
-            == "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
-    {
-        "target must identify a single reference token; for qualified expressions, set target to the member or name token inside the expression rather than the whole qualified expression"
-            .to_string()
-    } else {
-        diagnostic.message
+    let message = match diagnostic.kind.as_str() {
+        "invalid_location"
+            if diagnostic.message
+                == "byte range must identify a single reference token; use start_byte inside the token for qualified expressions" =>
+        {
+            "target must identify a single reference token; for qualified expressions, set target to the member or name token inside the expression rather than the whole qualified expression"
+                .to_string()
+        }
+        SCALA_UNSUPPORTED_CALL_TARGET_SHAPE => {
+            format!(
+                "{}. The reference tool cannot follow this Scala call target shape yet. Try search_symbols for the callable/member name or owner/member selector when known, then use get_symbol_sources on the owner or resolved member symbol.",
+                diagnostic.message
+            )
+        }
+        SCALA_UNSUPPORTED_RECEIVER => {
+            let target = query.target.trim();
+            format!(
+                "{}. The reference tool cannot follow this Scala receiver/member shape yet. Try search_symbols for `{target}` or an owner/member selector when known, then use get_symbol_sources on the owner or resolved member symbol.",
+                diagnostic.message
+            )
+        }
+        _ => diagnostic.message,
     };
     DefinitionDiagnostic {
         kind: diagnostic.kind,
