@@ -5,7 +5,7 @@
 //! dataclass keyword-argument case is the novel probe — the Python analog of the
 //! Scala named-argument resolution fixed this session.
 //!
-//! Driven through the in-process `get_definition_by_location` tool (like
+//! Driven through the in-process `get_definitions_by_location` tool (like
 //! `get_definition_test.rs`). Assertions are on the resolved FQN. An earlier
 //! nondeterministic flake here (#432) turned out to be an `enclosing_code_unit`
 //! hash-order tie between the equal-span synthetic `FileScope` and the Python
@@ -47,8 +47,8 @@ fn definition_fqns(source_with_caret: &str) -> Vec<String> {
             .expect("searchtools service");
     let args = format!(r#"{{"references":[{{"path":"{file}","line":{line},"column":{column}}}]}}"#);
     let payload = service
-        .call_tool_json("get_definition_by_location", &args)
-        .expect("get_definition_by_location");
+        .call_tool_json("get_definitions_by_location", &args)
+        .expect("get_definitions_by_location");
     let value: Value = serde_json::from_str(&payload).expect("valid json");
     value["results"][0]["definitions"]
         .as_array()

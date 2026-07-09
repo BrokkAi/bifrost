@@ -18,8 +18,8 @@ use crate::{
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
-        MostRelevantFilesParams, RefreshParams, contains_tests, get_definition_by_location,
-        get_definition_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
+        MostRelevantFilesParams, RefreshParams, contains_tests, get_definitions_by_location,
+        get_definitions_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
         get_symbol_sources, get_type_by_location, list_symbols, most_relevant_files,
         refresh_result, rename_symbol, scan_usages, search_symbols, usage_graph,
     },
@@ -408,14 +408,14 @@ impl SearchToolsService {
                     |workspace, params| scan_usages(workspace.analyzer(), params),
                 )
             }
-            "get_definition_by_location" => {
+            "get_definitions_by_location" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    get_definition_by_location(workspace.analyzer(), params)
+                    get_definitions_by_location(workspace.analyzer(), params)
                 })
             }
-            "get_definition_by_reference" => {
+            "get_definitions_by_reference" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    get_definition_by_reference(workspace.analyzer(), params)
+                    get_definitions_by_reference(workspace.analyzer(), params)
                 })
             }
             "get_type_by_location" => {

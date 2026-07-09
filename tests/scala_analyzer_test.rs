@@ -167,6 +167,55 @@ fn test_simple_methods_within_classes() {
 }
 
 #[test]
+fn scala_indexes_methods_inside_recovered_annotated_class_body_under_owner() {
+    let project = inline_scala_project(&[(
+        "ai/brokk/JobSrv.scala",
+        r#"
+        package ai.brokk
+
+        @Singleton
+        class JobSrv @Inject() (
+          implicit val db: Database
+        ) extends VertexSrv[Job] {
+          def submit(id: String): Unit = {}
+        }
+        "#,
+    )]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+
+    let submit = definition(&analyzer, "ai.brokk.JobSrv.submit");
+    assert!(submit.is_function());
+    assert_eq!("JobSrv.submit", submit.short_name());
+    assert!(
+        analyzer.get_definitions("ai.brokk.submit").is_empty(),
+        "method should not be flattened to package scope"
+    );
+}
+
+#[test]
+fn scala_class_name_ignores_annotation_and_extends_nodes() {
+    let project = inline_scala_project(&[(
+        "ai/brokk/Properties.scala",
+        r#"
+        package ai.brokk
+
+        class Database
+        @Singleton
+        class Properties @Inject() (
+          @Named("with-thehive-schema") db: Database
+        ) {
+          lazy val metaProperties: PublicProperties = PublicPropertyListBuilder.build
+        }
+        "#,
+    )]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+
+    let properties = definition(&analyzer, "ai.brokk.Properties");
+    assert!(properties.is_class());
+    assert_eq!("Properties", properties.short_name());
+}
+
+#[test]
 fn test_simple_constructor_in_class_definition() {
     let project = inline_scala_project(&[(
         "ai/brokk/Foo.scala",

@@ -123,7 +123,7 @@ fn definition_lookup(
             "end_byte": end_byte,
         }]
     });
-    call_search_tool_json(root, "get_definition_by_location", &request.to_string())
+    call_search_tool_json(root, "get_definitions_by_location", &request.to_string())
 }
 
 fn graph_hits(

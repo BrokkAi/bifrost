@@ -1021,11 +1021,11 @@ pub fn get_symbol_locations(
     }
 }
 
-pub fn get_definition_by_location(
+pub fn get_definitions_by_location(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionParams,
 ) -> GetDefinitionResult {
-    let _scope = profiling::scope("searchtools::get_definition_by_location");
+    let _scope = profiling::scope("searchtools::get_definitions_by_location");
 
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut pending = Vec::new();
@@ -1352,11 +1352,11 @@ fn rename_symbol_failure(
     }
 }
 
-pub fn get_definition_by_reference(
+pub fn get_definitions_by_reference(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionByReferenceParams,
 ) -> GetDefinitionByReferenceResult {
-    let _scope = profiling::scope("searchtools::get_definition_by_reference");
+    let _scope = profiling::scope("searchtools::get_definitions_by_reference");
 
     let mut results = Vec::with_capacity(params.references.len());
 
@@ -1991,11 +1991,42 @@ fn source_blocks_for_resolved_units(
         .flat_map(|code_unit| {
             if is_file_listing_target(code_unit) {
                 module_file_listing_blocks(code_unit)
+            } else if let Some(blocks) =
+                source_blocks_for_synthetic_java_constructor(analyzer, code_unit)
+            {
+                blocks
             } else {
                 source_blocks_for_code_unit(analyzer, code_unit, true)
             }
         })
         .collect()
+}
+
+const SYNTHETIC_JAVA_CONSTRUCTOR_SOURCE_NOTE: &str =
+    "synthetic Java default constructor; showing declaring class source";
+
+fn source_blocks_for_synthetic_java_constructor(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Option<Vec<SourceBlock>> {
+    if language_for_target(code_unit) != Language::Java
+        || !code_unit.is_synthetic()
+        || !code_unit.is_function()
+        || !analyzer.ranges(code_unit).is_empty()
+    {
+        return None;
+    }
+
+    let parent = analyzer.parent_of(code_unit)?;
+    if !parent.is_class() || parent.identifier() != code_unit.identifier() {
+        return None;
+    }
+
+    let mut blocks = source_blocks_for_code_unit(analyzer, &parent, true);
+    for block in &mut blocks {
+        block.note = Some(SYNTHETIC_JAVA_CONSTRUCTOR_SOURCE_NOTE.to_string());
+    }
+    Some(blocks)
 }
 
 pub fn get_symbol_sources(
