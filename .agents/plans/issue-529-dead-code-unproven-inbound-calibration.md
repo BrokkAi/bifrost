@@ -73,6 +73,9 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 - Observation: Ruby's precise query path already treats dynamic dispatch and unresolved explicit receivers as method evidence, but the inverted edge path previously dropped both.
   Evidence: `src/analyzer/usages/ruby_graph/extractor.rs` has `dynamic_dispatch_target_argument`, `record_unproven_hit` on missing receivers, and unproven hits for empty candidate sets. Before Milestone 5 production edits, the focused Ruby dead-code fixture reported both `Service.target` and `Service.dispatched` as `no non-self usages found`.
 
+- Observation: The repeated `cargo clippy-no-cuda` `E0514` failures were caused by a mixed Rust toolchain path, not by stale target artifacts or issue #529 code.
+  Evidence: `cargo` and `rustc` resolved to `/Users/dave/.local/bin` with LLVM 22.1.2, while `clippy-driver` resolved to `/opt/homebrew/bin` with LLVM 22.1.6. Running `PATH=/opt/homebrew/bin:$PATH cargo clippy-no-cuda` after `cargo clean` completed successfully.
+
 
 ## Decision Log
 
@@ -274,8 +277,8 @@ Final validation evidence:
     BIFROST_SEMANTIC_INDEX=off cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
     result: passed at 2026-07-09T08:38:00Z; validated 10 repos and covered scenarios include dead_code_smells
 
-    cargo clippy-no-cuda
-    result: blocked by repeated E0514 incompatible-rustc dependency metadata errors, consistent with every milestone attempt
+    PATH=/opt/homebrew/bin:$PATH cargo clippy-no-cuda
+    result: passed at 2026-07-09T08:46:00Z after cleaning target artifacts so cargo, rustc, and clippy-driver all used the Homebrew Rust toolchain
 
 
 ## Context and Orientation
