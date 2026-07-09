@@ -946,7 +946,7 @@ fn get_summaries_large_file_glob_stays_full_fidelity_on_service_path() {
 }
 
 #[test]
-fn get_definition_by_reference_resolves_rust_crate_scoped_item() {
+fn get_definitions_by_reference_resolves_rust_crate_scoped_item() {
     let temp = TempDir::new().unwrap();
     let src = temp.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -965,7 +965,7 @@ pub fn caller() {
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "get_definition_by_reference",
+            "get_definitions_by_reference",
             r#"{"references":[{"symbol":"caller","context":"    crate::helper();","target":"helper"}]}"#,
         )
         .unwrap();
@@ -977,7 +977,7 @@ pub fn caller() {
 }
 
 #[test]
-fn get_definition_by_reference_resolves_go_method_receiver_field_chain() {
+fn get_definitions_by_reference_resolves_go_method_receiver_field_chain() {
     let temp = TempDir::new().unwrap();
     fs::write(
         temp.path().join("go.mod"),
@@ -1005,7 +1005,7 @@ func (c *Client) Build() error {
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "get_definition_by_reference",
+            "get_definitions_by_reference",
             r#"{"references":[{"symbol":"example.com/app.Client.Build","context":"    return c.npmMetadataHelper.UpdatePackageMetadata()","target":"UpdatePackageMetadata"}]}"#,
         )
         .unwrap();
@@ -1020,7 +1020,7 @@ func (c *Client) Build() error {
 }
 
 #[test]
-fn get_definition_by_reference_resolves_cpp_overload_by_argument_type() {
+fn get_definitions_by_reference_resolves_cpp_overload_by_argument_type() {
     let temp = TempDir::new().unwrap();
     fs::write(
         temp.path().join("target.h"),
@@ -1054,7 +1054,7 @@ void PYBIND11_MODULE(Net& net, DataReaderFromMemoryCopy& dr) {
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "get_definition_by_reference",
+            "get_definitions_by_reference",
             r#"{"references":[{"symbol":"PYBIND11_MODULE","context":"    net.load_model(dr);","target":"load_model"}]}"#,
         )
         .unwrap();
@@ -1073,7 +1073,7 @@ void PYBIND11_MODULE(Net& net, DataReaderFromMemoryCopy& dr) {
 }
 
 #[test]
-fn get_definition_by_reference_resolves_cpp_constructor_style_local_argument() {
+fn get_definitions_by_reference_resolves_cpp_constructor_style_local_argument() {
     let temp = TempDir::new().unwrap();
     fs::write(
         temp.path().join("target.h"),
@@ -1112,7 +1112,7 @@ void PYBIND11_MODULE(Net& net, const char* mem) {
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "get_definition_by_reference",
+            "get_definitions_by_reference",
             r#"{"references":[{"symbol":"PYBIND11_MODULE","context":"    net.load_model(dr);","target":"load_model"}]}"#,
         )
         .unwrap();
@@ -1131,7 +1131,7 @@ void PYBIND11_MODULE(Net& net, const char* mem) {
 }
 
 #[test]
-fn get_definition_by_reference_resolves_scala_constructor_field_from_symbol_context() {
+fn get_definitions_by_reference_resolves_scala_constructor_field_from_symbol_context() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("app")).unwrap();
     fs::write(
@@ -1177,7 +1177,7 @@ private[stream] class TimeGrouped(
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "get_definition_by_reference",
+            "get_definitions_by_reference",
             r#"{"references":[{"symbol":"com.netflix.atlas.eval.stream.TimeGrouped","context":"    context.registry,","target":"registry"}]}"#,
         )
         .unwrap();

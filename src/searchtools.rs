@@ -1350,11 +1350,11 @@ fn rename_symbol_failure(
     }
 }
 
-pub fn get_definition_by_reference(
+pub fn get_definitions_by_reference(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionByReferenceParams,
 ) -> GetDefinitionByReferenceResult {
-    let _scope = profiling::scope("searchtools::get_definition_by_reference");
+    let _scope = profiling::scope("searchtools::get_definitions_by_reference");
 
     let mut results = Vec::with_capacity(params.references.len());
 

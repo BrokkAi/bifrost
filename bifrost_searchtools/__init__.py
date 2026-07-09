@@ -3,6 +3,7 @@ from .client import (
     SearchToolsError,
     SymbolKindFilter,
     XmlSelectOutput,
+    tool_descriptors,
 )
 from .models import (
     AmbiguousPath,
@@ -139,6 +140,7 @@ __all__ = [
     "SymbolAncestors",
     "SymbolAncestorsResult",
     "SymbolKindFilter",
+    "tool_descriptors",
     "SymbolLocation",
     "SymbolLocationsResult",
     "SymbolSourcesResult",

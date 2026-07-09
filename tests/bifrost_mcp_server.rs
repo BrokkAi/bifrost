@@ -780,7 +780,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
     assert_unknown_tool(
         &fixture_root,
         "core",
-        "get_definition_by_reference",
+        "get_definitions_by_reference",
         json!({
             "references": [{
                 "symbol": "A",
@@ -1271,14 +1271,14 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
             .as_array()
             .expect("tools array"),
     );
-    assert!(names.contains(&"get_definition_by_reference"), "{names:?}");
+    assert!(names.contains(&"get_definitions_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
     assert!(!names.contains(&"get_type_by_location"), "{names:?}");
     assert_tool_schema_omits_property(
         list_tools["result"]["tools"]
             .as_array()
             .expect("tools array"),
-        "get_definition_by_reference",
+        "get_definitions_by_reference",
         "include_tests",
     );
 
@@ -1367,7 +1367,7 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
             .as_array()
             .expect("tools array"),
     );
-    assert!(names.contains(&"get_definition_by_reference"), "{names:?}");
+    assert!(names.contains(&"get_definitions_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
     assert!(!names.contains(&"get_type_by_location"), "{names:?}");
 

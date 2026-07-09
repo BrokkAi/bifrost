@@ -35,7 +35,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
     let definition_descriptor = if render_line_numbers {
         get_definition_by_location_descriptor()
     } else {
-        get_definition_by_reference_descriptor()
+        get_definitions_by_reference_descriptor()
     };
 
     let mut descriptors = vec![
@@ -333,9 +333,9 @@ fn location_references_schema(path_description: &str, max_items: Option<usize>) 
     })
 }
 
-fn get_definition_by_reference_descriptor() -> Value {
+fn get_definitions_by_reference_descriptor() -> Value {
     tool_descriptor(
-        "get_definition_by_reference",
+        "get_definitions_by_reference",
         "Resolve source reference sites back to workspace definition metadata from copied source context and a target token. Use when line numbers are hidden or unreliable. If repeated target occurrences in the context resolve differently, the result is ambiguous.",
         json!({
             "type": "object",

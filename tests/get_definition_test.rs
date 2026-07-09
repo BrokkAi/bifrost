@@ -9,7 +9,7 @@ fn lookup(root: &std::path::Path, args: &str) -> Value {
 }
 
 fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
-    call_search_tool_json(root, "get_definition_by_reference", args)
+    call_search_tool_json(root, "get_definitions_by_reference", args)
 }
 
 fn lookup_type(root: &std::path::Path, args: &str) -> Value {

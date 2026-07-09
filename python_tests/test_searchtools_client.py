@@ -18,6 +18,7 @@ from bifrost_searchtools import (
     SearchToolsError,
     SymbolKindFilter,
     XmlSelectOutput,
+    tool_descriptors,
 )
 from bifrost_searchtools.models import SemanticSearchResult, SemanticSearchStatus
 
@@ -594,6 +595,15 @@ namespace Demo
             result = client.get_active_workspace()
 
         self.assertEqual("testcode-java", Path(result.workspace_path).name)
+
+    def test_tool_descriptors_reflect_hidden_line_number_surface(self) -> None:
+        names = {
+            descriptor["name"]
+            for descriptor in tool_descriptors("symbol", render_line_numbers=False)
+        }
+
+        self.assertIn("get_definitions_by_reference", names)
+        self.assertNotIn("get_definition_by_location", names)
 
     def test_activate_workspace_switches_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
