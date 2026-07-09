@@ -3,6 +3,7 @@ mod hits;
 mod inverted;
 mod jvm_scala;
 mod resolver;
+mod return_type;
 mod shared;
 
 use crate::analyzer::usages::common::language_for_target;

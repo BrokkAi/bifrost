@@ -68,6 +68,46 @@ function build(): Target {
 }
 
 #[test]
+fn php_signature_metadata_captures_declared_type_text_from_ast() {
+    let (_project, analyzer) = php_analyzer_with_files(&[(
+        "Factory.php",
+        r#"<?php
+namespace App;
+
+class Repository {}
+
+function makeRepository(): Repository {
+    return new Repository();
+}
+
+class Service {
+    public Repository $repository;
+
+    public function __construct(private Repository $promoted) {}
+
+    public function create(): Repository {
+        return new Repository();
+    }
+}
+"#,
+    )]);
+
+    for (fqn, expected) in [
+        ("App.makeRepository", "Repository"),
+        ("App.Service.create", "Repository"),
+        ("App.Service.repository", "Repository"),
+        ("App.Service.promoted", "Repository"),
+    ] {
+        let unit = definition(&analyzer, fqn);
+        let actual = analyzer
+            .signature_metadata(&unit)
+            .first()
+            .and_then(|metadata| metadata.return_type_text());
+        assert_eq!(Some(expected), actual, "metadata for {fqn}");
+    }
+}
+
+#[test]
 fn php_import_hits_ignore_unrelated_aliased_use_path() {
     let consumer = r#"<?php
 namespace App\Feature;

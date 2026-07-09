@@ -170,6 +170,8 @@ pub enum BenchmarkScenario {
     MostRelevantFiles,
     #[serde(rename = "scan_usages")]
     ScanUsages,
+    #[serde(rename = "dead_code_smells")]
+    DeadCodeSmells,
     #[serde(rename = "get_definition")]
     GetDefinition,
     #[serde(rename = "call_hierarchy")]
@@ -179,7 +181,7 @@ pub enum BenchmarkScenario {
 }
 
 impl BenchmarkScenario {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::WorkspaceBuild,
         Self::SearchSymbols,
         Self::GetSymbolLocations,
@@ -187,6 +189,7 @@ impl BenchmarkScenario {
         Self::GetSummaries,
         Self::MostRelevantFiles,
         Self::ScanUsages,
+        Self::DeadCodeSmells,
         Self::GetDefinition,
         Self::CallHierarchy,
         Self::TypeHierarchy,
@@ -201,6 +204,7 @@ impl BenchmarkScenario {
             Self::GetSummaries => "get_summaries",
             Self::MostRelevantFiles => "most_relevant_files",
             Self::ScanUsages => "scan_usages",
+            Self::DeadCodeSmells => "dead_code_smells",
             Self::GetDefinition => "get_definition",
             Self::CallHierarchy => "call_hierarchy",
             Self::TypeHierarchy => "type_hierarchy",
@@ -209,6 +213,7 @@ impl BenchmarkScenario {
 
     pub fn tool_name(self) -> &'static str {
         match self {
+            Self::DeadCodeSmells => "report_dead_code_and_unused_abstraction_smells",
             Self::GetDefinition => "get_definitions_by_location",
             Self::CallHierarchy | Self::TypeHierarchy => self.label(),
             _ => self.label(),
@@ -351,6 +356,14 @@ pub struct BenchmarkRepoTarget {
     pub usage_symbols: Vec<String>,
     #[serde(default)]
     pub usage_targets: Vec<BenchmarkLocationSelector>,
+    #[serde(default)]
+    pub dead_code_file_paths: Vec<String>,
+    #[serde(default)]
+    pub dead_code_fq_names: Vec<String>,
+    #[serde(default)]
+    pub dead_code_expect_report_contains: Vec<String>,
+    #[serde(default)]
+    pub dead_code_expect_report_absent: Vec<String>,
     #[serde(default)]
     pub definition_queries: Vec<DefinitionQueryTarget>,
     #[serde(default)]
@@ -506,6 +519,37 @@ impl BenchmarkRepoTarget {
         for (index, query) in self.usage_targets.iter().enumerate() {
             let label = format!("repo `{name}` usage_targets[{index}]");
             query.validate(&label, false, errors);
+        }
+
+        if scenarios.contains(&BenchmarkScenario::DeadCodeSmells) {
+            if !has_non_blank_values(&self.dead_code_fq_names) {
+                errors.push(format!(
+                    "repo `{name}` enables `dead_code_smells` but does not define dead_code_fq_names"
+                ));
+            }
+            if !has_non_blank_values(&self.dead_code_expect_report_contains)
+                && !has_non_blank_values(&self.dead_code_expect_report_absent)
+            {
+                errors.push(format!(
+                    "repo `{name}` enables `dead_code_smells` but does not define dead_code_expect_report_contains or dead_code_expect_report_absent"
+                ));
+            }
+        }
+        for (field, values) in [
+            ("dead_code_file_paths", &self.dead_code_file_paths),
+            ("dead_code_fq_names", &self.dead_code_fq_names),
+            (
+                "dead_code_expect_report_contains",
+                &self.dead_code_expect_report_contains,
+            ),
+            (
+                "dead_code_expect_report_absent",
+                &self.dead_code_expect_report_absent,
+            ),
+        ] {
+            if values.iter().any(|value| value.trim().is_empty()) {
+                errors.push(format!("repo `{name}` has a blank {field} entry"));
+            }
         }
 
         if scenarios.contains(&BenchmarkScenario::GetDefinition) {

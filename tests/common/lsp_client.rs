@@ -13,7 +13,12 @@ use brokk_bifrost::lsp::conversion::path_to_uri_string;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const DROP_SHUTDOWN_ID: u64 = 999_999;
+const DROP_CLEANUP_GRACE: Duration = Duration::from_millis(500);
 
 /// Build an LSP-correct `file://` URI for `path`. Delegates to the crate's
 /// `path_to_uri_string`, which handles drive letters, percent-encoding, and the
@@ -36,10 +41,10 @@ pub struct RefLocation {
 
 /// A running `bifrost` LSP server subprocess plus its stdio pipes.
 pub struct LspServer {
-    child: Child,
-    stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
-    stderr: ChildStderr,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    reader: Option<BufReader<ChildStdout>>,
+    stderr: Option<ChildStderr>,
     next_id: u64,
 }
 
@@ -62,10 +67,10 @@ impl LspServer {
         let stderr = child.stderr.take().expect("stderr");
 
         Self {
-            child,
-            stdin,
-            reader: BufReader::new(stdout),
-            stderr,
+            child: Some(child),
+            stdin: Some(stdin),
+            reader: Some(BufReader::new(stdout)),
+            stderr: Some(stderr),
             next_id: 1,
         }
     }
@@ -113,12 +118,16 @@ impl LspServer {
         );
 
         Self {
-            child,
-            stdin,
-            reader,
-            stderr,
+            child: Some(child),
+            stdin: Some(stdin),
+            reader: Some(reader),
+            stderr: Some(stderr),
             next_id: 2,
         }
+    }
+
+    pub fn child_id(&self) -> u32 {
+        self.child.as_ref().expect("child").id()
     }
 
     fn next_id(&mut self) -> u64 {
@@ -127,15 +136,25 @@ impl LspServer {
         id
     }
 
+    fn stdin_mut(&mut self) -> &mut ChildStdin {
+        self.stdin.as_mut().expect("stdin")
+    }
+
+    fn reader_and_stderr_mut(&mut self) -> (&mut BufReader<ChildStdout>, &mut ChildStderr) {
+        let reader = self.reader.as_mut().expect("stdout");
+        let stderr = self.stderr.as_mut().expect("stderr");
+        (reader, stderr)
+    }
+
     /// Send an arbitrary request and return the matching response `Value`. The
     /// id is allocated and matched internally.
     pub fn request(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id();
         write_message(
-            &mut self.stdin,
+            self.stdin_mut(),
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
         );
-        read_response_for_id(&mut self.reader, &mut self.stderr, id)
+        self.read_response_for_id(id)
     }
 
     /// Send an arbitrary notification.
@@ -145,12 +164,13 @@ impl LspServer {
 
     /// Send a fully-formed JSON-RPC message.
     pub fn notify_value(&mut self, value: Value) {
-        write_message(&mut self.stdin, value);
+        write_message(self.stdin_mut(), value);
     }
 
     /// Read the next inbound JSON-RPC message.
     pub fn read_message(&mut self) -> Value {
-        read_message(&mut self.reader, &mut self.stderr)
+        let (reader, stderr) = self.reader_and_stderr_mut();
+        read_message(reader, stderr)
     }
 
     /// Read inbound messages until a notification with `method` arrives.
@@ -166,7 +186,8 @@ impl LspServer {
 
     /// Read inbound messages until the response with `id` arrives.
     pub fn read_response_for_id(&mut self, id: u64) -> Value {
-        read_response_for_id(&mut self.reader, &mut self.stderr, id)
+        let (reader, stderr) = self.reader_and_stderr_mut();
+        read_response_for_id(reader, stderr, id)
     }
 
     /// A `textDocument/<...>` request that takes only a document URI + position
@@ -330,7 +351,7 @@ impl LspServer {
         let id = self.next_id();
         let file_uri = uri_for(file_path);
         write_message(
-            &mut self.stdin,
+            self.stdin_mut(),
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -342,7 +363,7 @@ impl LspServer {
                 }
             }),
         );
-        read_response_for_id(&mut self.reader, &mut self.stderr, id)
+        self.read_response_for_id(id)
     }
 
     /// Send `textDocument/references` and return the resolved locations, sorted
@@ -382,43 +403,108 @@ impl LspServer {
 
     /// Graceful `shutdown`/`exit` and assert a clean process exit.
     pub fn shutdown(mut self) {
-        write_message(
-            &mut self.stdin,
-            json!({"jsonrpc": "2.0", "id": 999, "method": "shutdown"}),
-        );
-        let _ = read_response_for_id(&mut self.reader, &mut self.stderr, 999);
-        write_message(&mut self.stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
-        drop(self.stdin);
-        let status = self.child.wait().expect("wait bifrost");
+        let status = self.shutdown_with_id_status(999);
         assert!(status.success(), "bifrost exited unsuccessfully: {status}");
     }
 
     /// Graceful `shutdown`/`exit` using an explicit request id.
     pub fn shutdown_with_id(mut self, id: u64) {
-        write_message(
-            &mut self.stdin,
-            json!({"jsonrpc": "2.0", "id": id, "method": "shutdown"}),
-        );
-        let _ = read_response_for_id(&mut self.reader, &mut self.stderr, id);
-        write_message(&mut self.stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
-        drop(self.stdin);
-        let status = self.child.wait().expect("wait bifrost");
+        let status = self.shutdown_with_id_status(id);
         assert!(status.success(), "bifrost exited unsuccessfully: {status}");
     }
 
     /// Send `exit`, close stdin, and assert a clean process exit.
     pub fn exit(mut self) {
-        write_message(&mut self.stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
-        drop(self.stdin);
-        let status = self.child.wait().expect("wait bifrost");
+        self.write_exit();
+        self.close_stdin();
+        let status = self.wait_child().expect("wait bifrost");
         assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+    }
+
+    pub fn drop_cleanup_status_for_test(mut self) -> Option<ExitStatus> {
+        self.drop_cleanup_status(DROP_CLEANUP_GRACE)
+    }
+
+    fn shutdown_with_id_status(&mut self, id: u64) -> ExitStatus {
+        write_message(
+            self.stdin_mut(),
+            json!({"jsonrpc": "2.0", "id": id, "method": "shutdown"}),
+        );
+        let _ = self.read_response_for_id(id);
+        self.write_exit();
+        self.close_stdin();
+        self.wait_child().expect("wait bifrost")
+    }
+
+    fn write_exit(&mut self) {
+        write_message(
+            self.stdin_mut(),
+            json!({"jsonrpc": "2.0", "method": "exit"}),
+        );
+    }
+
+    fn close_stdin(&mut self) {
+        self.stdin.take();
+    }
+
+    fn wait_child(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.take().expect("child").wait()
+    }
+
+    fn drop_cleanup(&mut self) {
+        let _ = self.drop_cleanup_status(DROP_CLEANUP_GRACE);
+    }
+
+    fn drop_cleanup_status(&mut self, grace: Duration) -> Option<ExitStatus> {
+        self.child.as_ref()?;
+
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = try_write_message(
+                stdin,
+                json!({"jsonrpc": "2.0", "id": DROP_SHUTDOWN_ID, "method": "shutdown"}),
+            );
+            let _ = try_write_message(stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+        }
+        self.close_stdin();
+        self.wait_or_kill_child(grace)
+    }
+
+    fn wait_or_kill_child(&mut self, grace: Duration) -> Option<ExitStatus> {
+        let started = Instant::now();
+        loop {
+            let child = self.child.as_mut()?;
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return self.wait_child().ok();
+                }
+                Ok(None) if started.elapsed() >= grace => {
+                    let _ = child.kill();
+                    return self.wait_child().ok();
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(_) => {
+                    let _ = child.kill();
+                    return self.wait_child().ok();
+                }
+            }
+        }
     }
 }
 
-pub fn write_message(stdin: &mut impl Write, payload: Value) {
+impl Drop for LspServer {
+    fn drop(&mut self) {
+        self.drop_cleanup();
+    }
+}
+
+fn try_write_message(stdin: &mut impl Write, payload: Value) -> std::io::Result<()> {
     let body = serde_json::to_string(&payload).expect("serialize");
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write");
-    stdin.flush().expect("flush");
+    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    stdin.flush()
+}
+
+pub fn write_message(stdin: &mut impl Write, payload: Value) {
+    try_write_message(stdin, payload).expect("write");
 }
 
 pub fn read_message(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {

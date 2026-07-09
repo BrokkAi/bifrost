@@ -677,6 +677,12 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
             }
             args
         }
+        BenchmarkScenario::DeadCodeSmells => json!({
+            "fq_names": target.dead_code_fq_names,
+            "file_paths": target.dead_code_file_paths,
+            "max_usage_candidate_files": 2000,
+            "max_usages_per_symbol": 1000
+        }),
         BenchmarkScenario::GetDefinition => json!({
             "references": target.definition_queries.iter().map(|query| {
                 location_selector_arguments(&query.selector)
@@ -847,6 +853,31 @@ fn assert_scenario_result(
                     "scan_usages found no call sites for `{}`",
                     target.name
                 ));
+            }
+            Ok(())
+        }
+        BenchmarkScenario::DeadCodeSmells => {
+            let report = structured["report"].as_str().ok_or_else(|| {
+                format!(
+                    "dead_code_smells result missing report string for `{}`",
+                    target.name
+                )
+            })?;
+            for expected in &target.dead_code_expect_report_contains {
+                if !report.contains(expected) {
+                    return Err(format!(
+                        "dead_code_smells report for `{}` did not contain expected text `{expected}`",
+                        target.name
+                    ));
+                }
+            }
+            for forbidden in &target.dead_code_expect_report_absent {
+                if report.contains(forbidden) {
+                    return Err(format!(
+                        "dead_code_smells report for `{}` contained forbidden text `{forbidden}`",
+                        target.name
+                    ));
+                }
             }
             Ok(())
         }

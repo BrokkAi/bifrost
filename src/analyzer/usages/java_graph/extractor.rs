@@ -1,19 +1,26 @@
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::java_graph::hits;
 use crate::analyzer::usages::java_graph::resolver::{
     TargetKind, TargetSpec, argument_list_arity, has_proven_static_import, infer_type_from_value,
     is_declaration_name, is_ignored_type_context, java_method_signatures_match, node_text,
     receiver_matches_target, resolve_type_from_node, same_owner_context, seed_class_binding,
 };
+use crate::analyzer::usages::java_graph::return_type::{FileReturnCache, MethodReturnCache};
 use crate::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::sync::Mutex;
 use tree_sitter::{Node, Parser};
+
+pub(super) type MethodCallReturnCacheKey = (String, String, usize);
 
 pub(super) struct ScanState<'a> {
     pub(super) max_usages: usize,
@@ -28,6 +35,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
+    pub(super) root: Node<'a>,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) bindings: &'a mut LocalInferenceEngine<String>,
@@ -36,6 +44,11 @@ pub(super) struct ScanCtx<'a> {
     pub(super) raw_match_count: &'a mut usize,
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
+    pub(super) class_ranges: ClassRangeIndex,
+    pub(super) method_call_return_cache:
+        RefCell<HashMap<MethodCallReturnCacheKey, ReceiverAnalysisOutcome<String>>>,
+    pub(super) method_return_cache: &'a MethodReturnCache,
+    pub(super) file_return_cache: &'a FileReturnCache,
     pub(super) enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
 }
 
@@ -70,12 +83,15 @@ pub(super) fn scan_file(
 
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     seed_class_binding(java, file, spec, &mut bindings);
+    let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
+    let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
 
     let mut ctx = ScanCtx {
         java,
         analyzer,
         file,
         source: &source,
+        root: tree.root_node(),
         line_starts: &line_starts,
         spec,
         bindings: &mut bindings,
@@ -84,6 +100,10 @@ pub(super) fn scan_file(
         raw_match_count: state.raw_match_count,
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
+        class_ranges: ClassRangeIndex::build(analyzer, file),
+        method_call_return_cache: RefCell::new(HashMap::default()),
+        method_return_cache: &method_return_cache,
+        file_return_cache: &file_return_cache,
         enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);

@@ -146,3 +146,78 @@ end
         "{report}"
     );
 }
+
+#[test]
+fn ruby_dead_code_smell_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "service.rb",
+        r#"
+class Service
+  def target
+    1
+  end
+
+  def unused
+    2
+  end
+
+  def used
+    3
+  end
+
+  def dispatched
+    4
+  end
+end
+
+class Consumer
+  def use_unknown(service)
+    service.target
+  end
+
+  def use_dynamic(service)
+    service.public_send(:dispatched)
+  end
+
+  def use_proven
+    service = Service.new
+    service.used
+  end
+end
+"#,
+    )]);
+    let target = definition(&analyzer, "Service.target");
+    let unused = definition(&analyzer, "Service.unused");
+    let used = definition(&analyzer, "Service.used");
+    let dispatched = definition(&analyzer, "Service.dispatched");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.rb".to_string()],
+            fq_names: vec![
+                target.fq_name(),
+                unused.fq_name(),
+                used.fq_name(),
+                dispatched.fq_name(),
+            ],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("Service.target`: 1 structurally matching usage site(s)"),
+        "{report}"
+    );
+    assert!(!report.contains("Service.target |"), "{report}");
+    assert!(
+        report.contains("Service.dispatched`: 1 structurally matching usage site(s)"),
+        "{report}"
+    );
+    assert!(!report.contains("Service.dispatched |"), "{report}");
+    assert!(
+        report.contains("Service.unused") && report.contains("no non-self usages found"),
+        "{report}"
+    );
+    assert!(!report.contains("Service.used |"), "{report}");
+}

@@ -13,13 +13,14 @@ mod shared;
 mod syntax;
 
 pub(crate) use extractor::{
-    is_dynamic_dispatch_method, ruby_enclosing_receiver, ruby_field_reference_owner_and_scope,
-    ruby_receiver_type, ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
+    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
+    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
 };
 pub(crate) use resolver::{ReceiverMode, ReceiverType, RubySemanticIndex, ruby_field_target};
 pub(crate) use syntax::{
     is_call_method_identifier, is_declaration_constant, is_declaration_identifier,
-    is_plain_assignment_left_variable, method_receiver_mode, node_text, symbol_or_string_value,
+    is_dynamic_dispatch_method, is_plain_assignment_left_variable, method_receiver_mode, node_text,
+    symbol_or_string_value,
 };
 
 use crate::analyzer::ruby::parse_ruby_tree;

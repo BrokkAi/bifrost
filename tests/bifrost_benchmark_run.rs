@@ -32,6 +32,7 @@ required_scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
@@ -51,6 +52,7 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
@@ -61,6 +63,10 @@ ancestor_symbols = ["XExtendsY"]
 summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["E.iMethod"]
+dead_code_file_paths = ["A.java"]
+dead_code_fq_names = ["A.method1"]
+dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
+dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   {{ path = "A.java", line = 8, column = 19, expected_status = "no_definition" }},
 ]
@@ -102,7 +108,7 @@ type_hierarchy_queries = [
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 10, "report: {report}");
+    assert_eq!(scenarios.len(), 11, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
     }
@@ -118,6 +124,7 @@ type_hierarchy_queries = [
     assert!(names.contains(&"get_summaries"), "report: {report}");
     assert!(names.contains(&"most_relevant_files"), "report: {report}");
     assert!(names.contains(&"scan_usages"), "report: {report}");
+    assert!(names.contains(&"dead_code_smells"), "report: {report}");
     assert!(names.contains(&"get_definition"), "report: {report}");
     assert!(names.contains(&"call_hierarchy"), "report: {report}");
     assert!(names.contains(&"type_hierarchy"), "report: {report}");

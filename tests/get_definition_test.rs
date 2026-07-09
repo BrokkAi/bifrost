@@ -12789,6 +12789,32 @@ fn scala_object_apply_call_resolves_to_definition() {
 }
 
 #[test]
+fn scala_uppercase_local_call_shadows_same_package_object_apply() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Factory.scala",
+            "package app\nclass Service\nobject Factory { def apply(): Service = new Service }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(): Service = { val Factory = () => new Service; Factory() } }\n",
+        )
+        .build();
+
+    let line =
+        "class Controller { def run(): Service = { val Factory = () => new Service; Factory() } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "Factory() }")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn scala_companion_method_call_resolves_from_type_receiver() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

@@ -191,6 +191,126 @@ class Widget {
 }
 
 #[test]
+fn symbol_sources_disambiguates_exact_scala_class_and_companion_selectors() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "org/thp/cortex/dto/v0/Artifact.scala",
+            r#"
+package org.thp.cortex.dto.v0
+
+class InputArtifact(value: String)
+object InputArtifact {
+  def writes: String = "writes"
+}
+"#,
+        )
+        .build();
+
+    let bare = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["org.thp.cortex.dto.v0.InputArtifact"]}"#,
+    );
+    assert_eq!(1, bare["sources"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(0, bare["ambiguous"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(0, bare["not_found"].as_array().unwrap().len(), "{bare}");
+    assert!(
+        bare["sources"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("class InputArtifact"),
+        "{bare}"
+    );
+
+    let companion = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["org.thp.cortex.dto.v0.InputArtifact$"]}"#,
+    );
+    assert_eq!(
+        1,
+        companion["sources"].as_array().unwrap().len(),
+        "{companion}"
+    );
+    assert_eq!(
+        0,
+        companion["ambiguous"].as_array().unwrap().len(),
+        "{companion}"
+    );
+    assert_eq!(
+        0,
+        companion["not_found"].as_array().unwrap().len(),
+        "{companion}"
+    );
+    assert_eq!(
+        "file_listing", companion["sources"][0]["presentation"],
+        "{companion}"
+    );
+}
+
+#[test]
+fn symbol_sources_resolves_scala_annotated_class_and_owner_qualified_method() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "org/thp/thehive/controllers/v1/Properties.scala",
+            r#"
+package org.thp.thehive.controllers.v1
+
+@Singleton
+class Properties @Inject() (
+    @Named("with-thehive-schema") db: Database
+) {
+  lazy val metaProperties: PublicProperties = PublicPropertyListBuilder.build
+}
+"#,
+        )
+        .file(
+            "org/thp/thehive/connector/cortex/services/JobSrv.scala",
+            r#"
+package org.thp.thehive.connector.cortex.services
+
+@Singleton
+class JobSrv @Inject() (
+    implicit val db: Database
+) extends VertexSrv[Job] {
+  val observableJobSrv = new EdgeSrv[ObservableJob, Observable, Job]
+  def submit(id: String): Unit = {}
+}
+"#,
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["org.thp.thehive.controllers.v1.Properties","org.thp.thehive.connector.cortex.services.JobSrv.submit"]}"#,
+    );
+
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(2, result["sources"].as_array().unwrap().len(), "{result}");
+    assert!(
+        result["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["text"]
+                .as_str()
+                .unwrap()
+                .contains("class Properties")),
+        "{result}"
+    );
+    assert!(
+        result["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["text"].as_str().unwrap().contains("def submit")),
+        "{result}"
+    );
+}
+
+#[test]
 fn summaries_and_ancestors_accept_js_file_anchored_selectors() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

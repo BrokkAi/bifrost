@@ -212,6 +212,51 @@ fn bifrost_lsp_server_malformed_initialize_returns_error_response() {
 }
 
 #[test]
+fn lsp_server_drop_cleanup_exits_cleanly_after_initialize() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let status = LspServer::start(&fixture_root)
+        .drop_cleanup_status_for_test()
+        .expect("wait bifrost");
+
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[cfg(unix)]
+#[test]
+fn lsp_server_drop_reaps_child_process() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let child_id = {
+        let server = LspServer::spawn(&fixture_root);
+        server.child_id()
+    };
+
+    assert_no_child_process(child_id);
+}
+
+#[cfg(unix)]
+fn assert_no_child_process(child_id: u32) {
+    let mut status = 0;
+    let wait_result = unsafe { libc::waitpid(child_id as libc::pid_t, &mut status, libc::WNOHANG) };
+    assert_eq!(
+        wait_result, -1,
+        "expected child process {child_id} to be reaped"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD),
+        "expected child process {child_id} to no longer be waitable"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
     let temp = TempDir::new().expect("tempdir");
     let parent = temp.path().canonicalize().expect("canon temp");
@@ -297,8 +342,6 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
             .any(|symbol| symbol["name"] == "BetaRoot"),
         "expected BetaRoot document symbol from second root in {document_symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -353,8 +396,6 @@ fn bifrost_lsp_server_honors_configured_roots() {
         symbols.iter().all(|symbol| symbol["name"] != "siblingLeak"),
         "workspace sibling outside configured roots should not be indexed: {symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -434,8 +475,6 @@ fn bifrost_lsp_server_honors_excluded_paths() {
                 .is_some_and(|symbols| symbols.is_empty()),
         "excluded file should not resolve for documentSymbol: {excluded_symbols_response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -534,8 +573,6 @@ fn bifrost_lsp_server_adds_workspace_folder_dynamically() {
         outside_symbols.is_empty(),
         "sibling outside active workspace folders should not be indexed: {outside_symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -681,8 +718,6 @@ fn bifrost_lsp_server_removes_workspace_folder_dynamically() {
         removed_document["result"].is_null(),
         "document requests should no longer route to removed roots: {removed_document}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -760,8 +795,6 @@ fn bifrost_lsp_server_replays_open_document_after_workspace_folder_readd() {
         symbols.iter().any(|symbol| symbol["name"] == "overlayOnly"),
         "re-added root should replay still-open document overlay: {symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[cfg(unix)]
@@ -837,8 +870,6 @@ fn bifrost_lsp_server_removes_symlinked_workspace_folder_after_symlink_disappear
         symbols.is_empty(),
         "removing the original symlink URI should remove its canonical analyzer root: {symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -884,8 +915,6 @@ fn bifrost_lsp_server_ignores_invalid_dynamic_workspace_folder_additions() {
             .any(|symbol| symbol["name"] == "alphaStillIndexed"),
         "invalid additions should not disturb the existing workspace: {symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -953,8 +982,6 @@ fn bifrost_lsp_server_indexes_new_file_in_second_workspace_folder() {
             .any(|symbol| symbol["name"] == "betaCreatedLater"),
         "expected newly created second-root symbol in {symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -1020,8 +1047,6 @@ fn bifrost_lsp_server_watched_delete_removes_workspace_symbol() {
             .any(|symbol| symbol["name"] == "removedLater"),
         "deleted file symbol should be gone, got {after_symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -1072,8 +1097,6 @@ fn bifrost_lsp_server_falls_back_to_root_uri_when_workspace_folders_null() {
             .any(|symbol| symbol["name"] == "FallbackRoot"),
         "expected rootUri-backed document symbol in {symbols:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -1762,8 +1785,6 @@ fn bifrost_lsp_server_definition_resolves_rust_associated_path_type_segment() {
         character,
     );
 
-    server.shutdown();
-
     let locations = response["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected definition locations, got {response}"));
@@ -1822,8 +1843,6 @@ fn bifrost_lsp_server_type_definition_resolves_rust_explicit_local_type() {
         uri.ends_with("model.rs"),
         "expected model.rs type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -1855,8 +1874,6 @@ fn bifrost_lsp_server_implementation_returns_null_for_go_interface_local_value()
         response["result"].is_null(),
         "Go local values must not resolve implementations, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -1896,8 +1913,6 @@ fn bifrost_lsp_server_implementation_works_from_go_interface_declaration() {
         locations[0]["range"]["start"]["line"], 6,
         "expected Worker declaration from interface declaration lookup: {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -1937,8 +1952,6 @@ fn bifrost_lsp_server_implementation_works_from_go_interface_method() {
         locations[0]["range"]["start"]["line"], 8,
         "expected Worker.Run declaration from interface method lookup: {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2100,8 +2113,6 @@ fn bifrost_lsp_server_implementation_rejects_java_field_declaration() {
         response["result"].is_null(),
         "Java field declarations must not resolve implementations, got {response}"
     );
-
-    server.shutdown();
 }
 
 fn assert_lsp_implementation_start_lines(
@@ -2156,8 +2167,6 @@ fn assert_lsp_implementation_start_lines(
         actual, expected,
         "unexpected implementation locations: {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2200,8 +2209,6 @@ fn bifrost_lsp_server_go_type_or_implementation_rejects_value_contexts() {
             "{label} must not prepare type hierarchy, got {result}"
         );
     }
-
-    server.shutdown();
 }
 
 #[test]
@@ -2260,8 +2267,6 @@ fn bifrost_lsp_server_implementation_filters_java_csharp_scala_value_contexts() 
         fixtures.scala_source,
         &[("def b", "Scala function names"), ("val l", "Scala locals")],
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2295,8 +2300,6 @@ fn bifrost_lsp_server_implementation_works_from_typescript_type_reference() {
         response["result"].is_null(),
         "TypeScript local declaration names must not resolve implementations, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2333,8 +2336,6 @@ fn bifrost_lsp_server_signature_help_returns_java_method_signature() {
             .is_some_and(|doc| doc.contains("Adds two values.")),
         "expected Java signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2367,8 +2368,6 @@ fn bifrost_lsp_server_signature_help_returns_typescript_function_signature() {
             .is_some_and(|doc| doc.contains("Combines two values.")),
         "expected TypeScript signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2401,8 +2400,6 @@ fn bifrost_lsp_server_signature_help_returns_javascript_function_signature() {
             .is_some_and(|doc| doc.contains("Combines JavaScript values.")),
         "expected JavaScript signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2423,8 +2420,6 @@ fn bifrost_lsp_server_signature_help_returns_javascript_default_and_rest_paramet
         "unexpected signature help: {result}"
     );
     assert_signature_parameter_offsets(&result, 0, &["left", "right", "rest"]);
-
-    server.shutdown();
 }
 
 #[test]
@@ -2445,8 +2440,6 @@ fn bifrost_lsp_server_signature_help_returns_javascript_single_arrow_parameter_o
         "unexpected signature help: {result}"
     );
     assert_signature_parameter_offsets(&result, 0, &["value"]);
-
-    server.shutdown();
 }
 
 #[test]
@@ -2472,8 +2465,6 @@ fn bifrost_lsp_server_signature_help_returns_typescript_constructor_signature() 
             .is_some_and(|label| label.contains("Widget") && label.contains("constructor")),
         "expected Widget constructor signature label, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2507,8 +2498,6 @@ fn bifrost_lsp_server_signature_help_returns_go_function_signature() {
             .is_some_and(|doc| doc.contains("combine combines Go values.")),
         "expected Go signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2541,8 +2530,6 @@ fn bifrost_lsp_server_signature_help_returns_csharp_method_signature() {
             .is_some_and(|doc| doc.contains("Combines C# values.")),
         "expected C# signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2575,8 +2562,6 @@ fn bifrost_lsp_server_signature_help_returns_cpp_function_signature() {
             .is_some_and(|doc| doc.contains("Combines C++ values.")),
         "expected C++ signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2609,8 +2594,6 @@ fn bifrost_lsp_server_signature_help_returns_python_function_signature() {
             .is_some_and(|doc| doc.contains("Combines Python values.")),
         "expected Python signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2643,8 +2626,6 @@ fn bifrost_lsp_server_signature_help_returns_ruby_method_signature() {
             .is_some_and(|doc| doc.contains("Combines Ruby values.")),
         "expected Ruby signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2677,8 +2658,6 @@ fn bifrost_lsp_server_signature_help_returns_rust_function_signature() {
             .is_some_and(|doc| doc.contains("Combines Rust values.")),
         "expected Rust signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2711,8 +2690,6 @@ fn bifrost_lsp_server_signature_help_returns_php_function_signature() {
             .is_some_and(|doc| doc.contains("Combines PHP values.")),
         "expected PHP signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2745,8 +2722,6 @@ fn bifrost_lsp_server_signature_help_returns_scala_function_signature() {
             .is_some_and(|doc| doc.contains("Combines Scala values.")),
         "expected Scala signature documentation, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2774,8 +2749,6 @@ fn bifrost_lsp_server_signature_help_handles_scala_brace_argument() {
         "expected target signature label, got {result}"
     );
     assert_signature_parameter_offsets(&result, 0, &["value"]);
-
-    server.shutdown();
 }
 
 #[test]
@@ -2802,8 +2775,6 @@ fn bifrost_lsp_server_signature_help_handles_scala_infix_call() {
         "expected combine signature label, got {result}"
     );
     assert_signature_parameter_offsets(&result, 0, &["value"]);
-
-    server.shutdown();
 }
 
 #[test]
@@ -2829,8 +2800,6 @@ fn bifrost_lsp_server_signature_help_handles_scala_postfix_call() {
             .is_some_and(|label| label.contains("ready") && label.contains("Boolean")),
         "expected ready signature label, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2856,8 +2825,6 @@ fn bifrost_lsp_server_signature_help_handles_scala_postfix_operator_call() {
             .is_some_and(|label| label.contains("!") && label.contains("Boolean")),
         "expected operator signature label, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2885,8 +2852,6 @@ fn bifrost_lsp_server_signature_help_returns_null_outside_call_arguments() {
         response["result"].is_null(),
         "expected null signatureHelp, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2919,8 +2884,6 @@ fn bifrost_lsp_server_signature_help_uses_did_open_overlay_call_context() {
         result["activeParameter"], 1,
         "signatureHelp should use overlay call text, got {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2951,8 +2914,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_unresolved_type() {
         response["result"].is_null(),
         "unresolved type definition should return null, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2972,8 +2933,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_typescript_function_name(
         response["result"].is_null(),
         "function declaration name should not resolve a type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -2994,8 +2953,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_typescript_method_name() 
         response["result"].is_null(),
         "method declaration name should not resolve a type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -3015,8 +2972,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_javascript_callable_symbo
         response["result"].is_null(),
         "JavaScript callable symbol should return null for type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -3037,8 +2992,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_java_method_name() {
         response["result"].is_null(),
         "Java method declaration name should not resolve a type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -3059,8 +3012,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_csharp_method_name() {
         response["result"].is_null(),
         "C# method declaration name should not resolve a type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -3080,8 +3031,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_rust_function_name() {
         response["result"].is_null(),
         "Rust function declaration name should not resolve a type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -3103,8 +3052,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_go_function_name() {
         response["result"].is_null(),
         "Go function declaration name should not resolve a type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -3124,8 +3071,6 @@ fn bifrost_lsp_server_type_definition_returns_null_for_scala_function_name() {
         response["result"].is_null(),
         "Scala function declaration name should not resolve a type definition, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -3182,8 +3127,6 @@ fn bifrost_lsp_server_type_definition_uses_did_open_overlay() {
         uri.ends_with("model.ts"),
         "expected Widget definition from model.ts, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -3513,8 +3456,6 @@ fn bifrost_lsp_server_definition_ignores_comment_token() {
         comment_character,
     );
 
-    server.shutdown();
-
     assert!(
         valid_definition["result"]
             .as_array()
@@ -3552,8 +3493,6 @@ fn bifrost_lsp_server_hover_ignores_comment_token() {
         comment_character,
     );
 
-    server.shutdown();
-
     assert!(
         valid_hover["result"]["contents"]["value"]
             .as_str()
@@ -3584,8 +3523,6 @@ fn bifrost_lsp_server_definition_and_hover_select_duplicate_declaration_name() {
     );
     let hover =
         server.text_document_position_response("textDocument/hover", &file_uri, line, character);
-
-    server.shutdown();
 
     let definition_items = definition["result"]
         .as_array()
@@ -3628,8 +3565,6 @@ fn bifrost_lsp_server_definition_selects_rust_attributed_async_function_declarat
         line,
         character,
     );
-
-    server.shutdown();
 
     let definition_items = definition["result"]
         .as_array()
@@ -3685,8 +3620,6 @@ fn bifrost_lsp_server_definition_selects_rust_function_declaration_across_identi
             "{label} cursor should target the function declaration, got {definition}"
         );
     }
-
-    client.shutdown();
 }
 
 #[test]
@@ -3706,8 +3639,6 @@ fn bifrost_lsp_server_definition_resolves_rust_attributed_async_function_call_to
         line,
         character,
     );
-
-    server.shutdown();
 
     let definition_items = definition["result"]
         .as_array()
@@ -3735,8 +3666,6 @@ fn bifrost_lsp_server_hover_fast_fails_rust_external_import() {
     let (line, character) = position_after(RUST_EXTERNAL_IMPORT_HOVER_SOURCE, "use sqlx::");
     let hover =
         server.text_document_position_response("textDocument/hover", &file_uri, line, character);
-
-    server.shutdown();
 
     assert!(
         hover["result"].is_null(),
@@ -3767,8 +3696,6 @@ fn bifrost_lsp_server_definition_resolves_rust_local_import_despite_external_glo
         line,
         character,
     );
-
-    server.shutdown();
 
     let definition_items = definition["result"]
         .as_array()
@@ -3812,8 +3739,6 @@ fn bifrost_lsp_server_references_ignore_comment_token() {
         true,
     );
 
-    server.shutdown();
-
     assert!(
         valid_references["result"]
             .as_array()
@@ -3853,8 +3778,6 @@ fn bifrost_lsp_server_document_highlight_ignores_comment_token() {
         comment_line,
         comment_character,
     );
-
-    server.shutdown();
 
     assert!(
         valid_highlights["result"]
@@ -3903,8 +3826,6 @@ fn bifrost_lsp_server_references_and_document_highlight_use_shifted_overlay_decl
         character,
     );
 
-    server.shutdown();
-
     assert!(
         references["result"]
             .as_array()
@@ -3942,8 +3863,6 @@ fn bifrost_lsp_server_definition_ignores_literals_keywords_unresolved_and_ambigu
         BroadEndpoint::Definition,
     );
 
-    client.shutdown();
-
     assert_no_invalid_context_results(BroadEndpoint::Definition, &responses);
 }
 
@@ -3957,8 +3876,6 @@ fn bifrost_lsp_server_hover_ignores_literals_keywords_unresolved_and_ambiguous_t
     let file_uri = uri_for(&file_path);
     let responses =
         collect_invalid_context_endpoint_responses(&mut client, &file_uri, BroadEndpoint::Hover);
-
-    client.shutdown();
 
     assert_no_invalid_context_results(BroadEndpoint::Hover, &responses);
 }
@@ -3977,8 +3894,6 @@ fn bifrost_lsp_server_references_ignore_literals_keywords_unresolved_and_ambiguo
         BroadEndpoint::References,
     );
 
-    client.shutdown();
-
     assert_no_invalid_context_results(BroadEndpoint::References, &responses);
 }
 
@@ -3996,8 +3911,6 @@ fn bifrost_lsp_server_document_highlight_ignores_literals_keywords_unresolved_an
         &file_uri,
         BroadEndpoint::DocumentHighlight,
     );
-
-    client.shutdown();
 
     assert_no_invalid_context_results(BroadEndpoint::DocumentHighlight, &responses);
 }
@@ -4025,8 +3938,6 @@ fn bifrost_lsp_server_broad_endpoints_ignore_csharp_ambiguous_using_type() {
         )
     })
     .collect::<Vec<_>>();
-
-    client.shutdown();
 
     for (endpoint, response) in responses {
         let no_result = response["result"].is_null()
@@ -4063,8 +3974,6 @@ fn bifrost_lsp_server_broad_endpoints_ignore_scala_ambiguous_wildcard_import_typ
         )
     })
     .collect::<Vec<_>>();
-
-    client.shutdown();
 
     for (endpoint, response) in responses {
         let no_result = response["result"].is_null()
@@ -4120,8 +4029,6 @@ fn bifrost_lsp_server_prepare_rename_returns_identifier_range() {
         result["range"]["end"]["character"], 25,
         "prepare range: {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4183,8 +4090,6 @@ fn bifrost_lsp_server_rename_returns_workspace_edit_for_java_method() {
         before_a,
         "rename request must return edits without mutating files"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4212,8 +4117,6 @@ fn bifrost_lsp_server_rename_rejects_file_coupled_java_class_without_file_edit()
         prepare["result"].is_null(),
         "file-coupled Java class rename should not prepare without file operation support: {prepare}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4244,8 +4147,6 @@ fn bifrost_lsp_server_rename_returns_null_for_comment_token() {
         response["result"].is_null(),
         "comment token must not rename the real method with the same text: {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4311,8 +4212,6 @@ fn bifrost_lsp_server_rename_keeps_same_short_name_symbols_separate() {
         !changes.contains_key(&q_service_uri) && !changes.contains_key(&q_caller_uri),
         "rename must not edit same-short-name symbols in another package: {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4369,8 +4268,6 @@ fn bifrost_lsp_server_rename_uses_open_document_overlay() {
             .contains("LiveName"),
         "overlay-only symbol must not be read from disk"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4397,8 +4294,6 @@ fn bifrost_lsp_server_rename_returns_null_for_unresolved_position() {
         response["result"].is_null(),
         "unresolved rename should return null: {response}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4440,8 +4335,6 @@ fn bifrost_lsp_server_call_hierarchy_finds_java_incoming_and_outgoing_calls() {
         .find(|call| call["to"]["name"] == "target")
         .expect("target outgoing call");
     assert_call_range(&target_call["fromRanges"], 5, 16, 22);
-
-    server.shutdown();
 }
 
 #[test]
@@ -4479,8 +4372,6 @@ fn bifrost_lsp_server_call_hierarchy_prepare_filters_java_cursor_contexts() {
         result.is_null(),
         "field accesses must not prepare call hierarchy: {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4527,8 +4418,6 @@ fn bifrost_lsp_server_call_hierarchy_prepare_filters_js_ts_cursor_contexts() {
     let (line, character) = position_after(ts_source, "new M");
     let maker = prepare_call_hierarchy(&mut server, &ts_uri, line, character);
     assert_eq!(maker["name"], "Maker", "prepared TS new call: {maker}");
-
-    server.shutdown();
 }
 
 #[test]
@@ -4563,8 +4452,6 @@ fn bifrost_lsp_server_call_hierarchy_prepare_filters_rust_cursor_contexts() {
     let (line, character) = position_after(source, "    t");
     let target = prepare_call_hierarchy(&mut server, &file_uri, line, character);
     assert_eq!(target["name"], "target", "prepared Rust call: {target}");
-
-    server.shutdown();
 }
 
 #[test]
@@ -4689,8 +4576,6 @@ fn bifrost_lsp_server_call_hierarchy_prepare_filters_remaining_language_contexts
         result.is_null(),
         "Ruby call references stay unsupported until Ruby definition lookup lands: {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4724,8 +4609,6 @@ fn bifrost_lsp_server_call_hierarchy_preserves_java_overload_identity() {
         vec!["stringCaller"],
         "String overload should not include no-arg caller: {incoming:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4757,8 +4640,6 @@ fn bifrost_lsp_server_call_hierarchy_ignores_non_call_type_references() {
         outgoing.is_empty(),
         "type references without calls must not produce outgoing call hierarchy edges: {outgoing:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4791,8 +4672,6 @@ fn bifrost_lsp_server_call_hierarchy_finds_qualified_java_constructor_calls() {
         .find(|call| call["to"]["name"] == "Service")
         .expect("Service outgoing call");
     assert_call_range(&service_call["fromRanges"], 2, 16, 23);
-
-    server.shutdown();
 }
 
 #[test]
@@ -4815,8 +4694,6 @@ fn bifrost_lsp_server_call_hierarchy_does_not_include_nested_function_calls() {
         outgoing.is_empty(),
         "calls inside nested functions must not be attributed to the outer function: {outgoing:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -4839,8 +4716,6 @@ fn bifrost_lsp_server_call_hierarchy_does_not_include_nested_type_calls() {
         outgoing.is_empty(),
         "calls inside nested types must not be attributed to the outer type: {outgoing:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -5310,8 +5185,6 @@ func Run() {
                 .is_some_and(|message| message.contains("Missing"))),
         "expected store.Missing semantic diagnostic: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -5352,8 +5225,6 @@ fn bifrost_lsp_server_go_malformed_file_reports_parse_not_semantic_diagnostics()
         items.iter().all(|item| item["source"] != "bifrost-go"),
         "malformed Go must suppress semantic diagnostics: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -5390,8 +5261,6 @@ def run():
                 .is_some_and(|message| message.contains("missing_value"))),
         "expected missing_value semantic diagnostic: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -5424,8 +5293,6 @@ fn bifrost_lsp_server_python_semantic_diagnostics_malformed_file_reports_parse_n
         items.iter().all(|item| item["source"] != "bifrost-python"),
         "malformed Python must suppress semantic diagnostics: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -5480,8 +5347,6 @@ class Service {
                 .is_some_and(|message| message.contains("missing_function"))),
         "expected missing_function PHP semantic diagnostic: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -5517,8 +5382,6 @@ fn bifrost_lsp_server_php_semantic_diagnostics_malformed_file_reports_parse_not_
         items.iter().all(|item| item["source"] != "bifrost-php"),
         "malformed PHP must suppress semantic diagnostics: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -5565,8 +5428,6 @@ fn run(input: MissingType) {
                 .is_some_and(|message| message.contains("missing_value"))),
         "expected missing_value Rust semantic diagnostic: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -5603,8 +5464,6 @@ fn bifrost_lsp_server_rust_semantic_diagnostics_malformed_file_reports_parse_not
         items.iter().all(|item| item["source"] != "bifrost-rust"),
         "malformed Rust must suppress semantic diagnostics: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -5677,8 +5536,6 @@ fn bifrost_lsp_server_js_ts_semantic_diagnostics_pull_reports_unrecognized_symbo
                     .is_some_and(|message| message.contains("missingValue"))),
         "expected missingValue TypeScript semantic diagnostic: {ts_response}"
     );
-
-    server.shutdown_with_id(4);
 }
 
 #[test]
@@ -5716,8 +5573,6 @@ fn bifrost_lsp_server_js_ts_malformed_file_reports_parse_not_semantic_diagnostic
             .all(|item| item["source"] != "bifrost-javascript"),
         "malformed JavaScript must suppress semantic diagnostics: {response}"
     );
-
-    server.shutdown_with_id(3);
 }
 
 #[test]
@@ -6025,8 +5880,6 @@ fn bifrost_lsp_server_did_save_publishes_go_semantic_diagnostics() {
                 .is_some_and(|message| message.contains("missingValue"))),
         "expected publishDiagnostics semantic Go item: {publish}"
     );
-
-    server.shutdown_with_id(99);
 }
 
 #[test]
@@ -6058,8 +5911,6 @@ fn bifrost_lsp_server_did_save_publishes_python_semantic_diagnostics() {
                 .is_some_and(|message| message.contains("missing_value"))),
         "expected publishDiagnostics semantic Python item: {publish}"
     );
-
-    server.shutdown_with_id(99);
 }
 
 #[test]
@@ -6098,8 +5949,6 @@ fn bifrost_lsp_server_did_save_publishes_php_semantic_diagnostics() {
                 .is_some_and(|message| message.contains("MissingType"))),
         "expected publishDiagnostics semantic PHP item: {publish}"
     );
-
-    server.shutdown_with_id(99);
 }
 
 #[test]
@@ -6135,8 +5984,6 @@ fn bifrost_lsp_server_did_save_publishes_rust_semantic_diagnostics() {
                 .is_some_and(|message| message.contains("missing_value"))),
         "expected publishDiagnostics semantic Rust item: {publish}"
     );
-
-    server.shutdown_with_id(99);
 }
 
 #[test]
@@ -6173,8 +6020,6 @@ fn bifrost_lsp_server_did_save_publishes_js_ts_semantic_diagnostics() {
                     .is_some_and(|message| message.contains("MissingType"))),
         "expected publishDiagnostics semantic TypeScript item: {publish}"
     );
-
-    server.shutdown_with_id(99);
 }
 
 #[test]
@@ -6283,8 +6128,6 @@ fn bifrost_lsp_server_type_hierarchy_java_round_trips_item_data() {
         .filter_map(|item| item["name"].as_str())
         .collect();
     assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
-
-    server.shutdown();
 }
 
 #[test]
@@ -6308,8 +6151,6 @@ fn bifrost_lsp_server_type_hierarchy_python_uses_same_handler() {
         .filter_map(|item| item["name"].as_str())
         .collect();
     assert_eq!(supertype_names, vec!["Base"], "supertypes: {supertypes:#?}");
-
-    server.shutdown();
 }
 
 #[test]
@@ -6342,8 +6183,6 @@ fn bifrost_lsp_server_type_hierarchy_javascript_uses_same_handler() {
         .filter_map(|item| item["name"].as_str())
         .collect();
     assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
-
-    server.shutdown();
 }
 
 #[test]
@@ -6400,8 +6239,6 @@ fn bifrost_lsp_server_type_hierarchy_typescript_uses_same_handler() {
         result.is_null(),
         "TypeScript local declaration names must not prepare hierarchy: {result}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -6441,8 +6278,6 @@ fn bifrost_lsp_server_type_hierarchy_php_uses_same_handler() {
         .filter_map(|item| item["name"].as_str())
         .collect();
     assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
-
-    server.shutdown();
 }
 
 #[test]
@@ -6475,8 +6310,6 @@ fn bifrost_lsp_server_type_hierarchy_cpp_uses_same_handler() {
         .filter_map(|item| item["name"].as_str())
         .collect();
     assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
-
-    server.shutdown();
 }
 
 #[test]
@@ -6517,8 +6350,6 @@ fn bifrost_lsp_server_type_hierarchy_scala_uses_same_handler() {
         .filter_map(|item| item["name"].as_str())
         .collect();
     assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
-
-    server.shutdown();
 }
 
 #[test]
@@ -6562,8 +6393,6 @@ fn bifrost_lsp_server_type_hierarchy_rust_uses_same_handler() {
         runnable_ref["name"], "Worker",
         "prepared Rust Worker reference: {runnable_ref}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -6593,8 +6422,6 @@ fn bifrost_lsp_server_go_type_hierarchy_returns_structural_interface_edges() {
         subtypes.iter().any(|item| item["name"] == "Worker"),
         "expected Worker subtype, got {subtypes:#?}"
     );
-
-    server.shutdown();
 }
 
 #[test]
@@ -6657,8 +6484,6 @@ fn bifrost_lsp_server_ruby_type_hierarchy_and_implementation_filter_value_contex
             "Ruby {label} must not resolve implementations, got {response}"
         );
     }
-
-    server.shutdown();
 }
 
 #[test]
@@ -6741,8 +6566,6 @@ fn bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts() 
         fixtures.scala_source,
         &[("def b", "Scala function names"), ("val l", "Scala locals")],
     );
-
-    server.shutdown();
 }
 
 fn assert_implementation_null_cases(
@@ -6957,8 +6780,6 @@ fn bifrost_lsp_server_formatting_uses_did_open_overlay() {
     assert_eq!(edits[0]["range"]["start"]["character"], 0);
     assert_eq!(edits[0]["range"]["end"]["line"], 1);
     assert_eq!(edits[0]["range"]["end"]["character"], 0);
-
-    server.shutdown();
 }
 
 #[cfg(unix)]
@@ -7029,8 +6850,6 @@ fn bifrost_lsp_server_formatting_suppresses_stale_snapshot_edits() {
         edits.is_empty(),
         "expected stale formatting response to be suppressed, got {response}"
     );
-
-    server.shutdown();
 }
 
 #[cfg(unix)]
@@ -7078,8 +6897,6 @@ fn bifrost_lsp_server_formatting_cancel_stops_active_formatter() {
     assert_eq!(response["error"]["code"], -32800, "{response}");
     let message = response["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("cancelled"), "{response}");
-
-    server.shutdown();
 }
 
 #[cfg(unix)]
@@ -7161,8 +6978,6 @@ fn bifrost_lsp_server_formatting_returns_empty_edits_for_noop() {
         edits.is_empty(),
         "expected no-op formatting edits: {response}"
     );
-
-    server.shutdown();
 }
 
 #[cfg(unix)]
@@ -7198,8 +7013,6 @@ fn bifrost_lsp_server_formatting_respects_configured_cwd() {
         .as_array()
         .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
     assert_eq!(edits[0]["newText"], format!("{}\n", package.display()));
-
-    server.shutdown();
 }
 
 #[cfg(unix)]
@@ -7234,8 +7047,6 @@ fn bifrost_lsp_server_formatting_reports_formatter_failure() {
     let error = response["error"]["message"].as_str().unwrap_or_default();
     assert!(error.contains("formatter exploded"), "{response}");
     assert!(error.contains("exited with status"), "{response}");
-
-    server.shutdown();
 }
 
 #[test]

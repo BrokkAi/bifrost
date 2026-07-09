@@ -987,10 +987,33 @@ fn record_scoped_receiver_member(
             }
             true
         }
-        ReceiverAnalysisOutcome::Ambiguous(_)
-        | ReceiverAnalysisOutcome::Unsupported { .. }
-        | ReceiverAnalysisOutcome::ExceededBudget { .. } => true,
-        ReceiverAnalysisOutcome::Unknown => false,
+        ReceiverAnalysisOutcome::Ambiguous(targets) => {
+            for target in targets {
+                ctx.collector.record_unproven(
+                    UsageNodeKey::new(target.source().clone(), target.fq_name()),
+                    property.start_byte(),
+                    property.end_byte(),
+                );
+            }
+            true
+        }
+        ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
+            ctx.collector.record_unproven_name(
+                property_text,
+                property.start_byte(),
+                property.end_byte(),
+            );
+            true
+        }
+        ReceiverAnalysisOutcome::Unknown => {
+            ctx.collector.record_unproven_name(
+                property_text,
+                property.start_byte(),
+                property.end_byte(),
+            );
+            false
+        }
     }
 }
 

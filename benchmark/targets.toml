@@ -22,6 +22,7 @@ required_scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
@@ -120,6 +121,7 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
   "get_definition",
 ]
 search_patterns = ["listen"]
@@ -129,6 +131,10 @@ seed_file_paths = ["lib/application.js"]
 usage_targets = [
   { path = "lib/request.js", line = 16, column = 5 },
 ]
+dead_code_file_paths = ["lib/application.js"]
+dead_code_fq_names = ["tryRender"]
+dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
+dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   { path = "lib/application.js", line = 574, column = 3, symbol = "tryRender", expected_status = "resolved", expected_fqn = "tryRender" },
 ]
@@ -146,6 +152,7 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
   "get_definition",
 ]
 search_patterns = ["Ky"]
@@ -153,6 +160,10 @@ location_symbols = ["Ky.create$static"]
 summary_targets = ["source/core/Ky.ts"]
 seed_file_paths = ["source/core/Ky.ts"]
 usage_symbols = ["Ky"]
+dead_code_file_paths = ["source/core/Ky.ts"]
+dead_code_fq_names = ["Ky.create$static"]
+dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
+dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   { path = "source/core/Ky.ts", line = 151, column = 18, symbol = "Ky", expected_status = "resolved", expected_fqn = "Ky" },
 ]
@@ -170,6 +181,7 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
   "get_definition",
 ]
 search_patterns = ["Command"]
@@ -177,6 +189,10 @@ location_symbols = ["click.core.Command.main"]
 summary_targets = ["src/click/core.py"]
 seed_file_paths = ["src/click/core.py"]
 usage_symbols = ["click.core.Command.main"]
+dead_code_file_paths = ["src/click/core.py"]
+dead_code_fq_names = ["click.core.Command.main"]
+dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
+dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   { path = "src/click/core.py", line = 1366, column = 42, symbol = "_complete_visible_commands", expected_status = "resolved", expected_fqn = "click.core._complete_visible_commands" },
 ]
@@ -217,6 +233,7 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
   "get_definition",
 ]
 search_patterns = ["RouteCollector"]
@@ -229,6 +246,10 @@ seed_file_paths = [
   "src/Dispatcher/RegexBasedAbstract.php",
 ]
 usage_symbols = ["FastRoute.RouteCollector.addRoute"]
+dead_code_file_paths = ["src/RouteCollector.php"]
+dead_code_fq_names = ["FastRoute.RouteCollector.addRoute"]
+dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
+dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   { path = "src/RouteCollector.php", line = 74, column = 16, symbol = "addRoute", expected_status = "resolved", expected_fqn = "FastRoute.RouteCollector.addRoute" },
 ]
@@ -246,6 +267,7 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
   "get_definition",
 ]
 search_patterns = ["Elem"]
@@ -253,6 +275,10 @@ location_symbols = ["scala.xml.Elem.copy"]
 summary_targets = ["shared/src/main/scala/scala/xml/Elem.scala"]
 seed_file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"]
 usage_symbols = ["scala.xml.Elem.Elem"]
+dead_code_file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"]
+dead_code_fq_names = ["scala.xml.Elem.copy"]
+dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
+dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },
   { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },

@@ -50,6 +50,21 @@ fn checked_in_targets_manifest_loads_and_validates() {
             "{} must define at least one get_definition query",
             repo.name
         );
+        if repo
+            .scenario_set()
+            .contains(&BenchmarkScenario::DeadCodeSmells)
+        {
+            assert!(
+                !repo.dead_code_file_paths.is_empty(),
+                "{} must pin dead_code_file_paths for subset benchmark runs",
+                repo.name
+            );
+            assert!(
+                !repo.dead_code_fq_names.is_empty(),
+                "{} must define dead_code_fq_names",
+                repo.name
+            );
+        }
     }
 
     let gson = manifest
@@ -137,6 +152,13 @@ scenarios = ["workspace_build", "search_symbols", "get_symbol_locations", "get_s
             .messages()
             .iter()
             .any(|message| message.contains("scan_usages")),
+        "{validation}"
+    );
+    assert!(
+        validation
+            .messages()
+            .iter()
+            .any(|message| message.contains("dead_code_smells")),
         "{validation}"
     );
     assert!(

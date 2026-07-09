@@ -275,6 +275,8 @@ where
         std::collections::BTreeMap::new();
     let mut truncated: std::collections::BTreeMap<UsageNodeKey, usize> =
         std::collections::BTreeMap::new();
+    let mut unproven_inbound: std::collections::BTreeMap<UsageNodeKey, usize> =
+        std::collections::BTreeMap::new();
     let mut node_status: std::collections::BTreeMap<UsageNodeKey, JsTsScopedNodeStatus> =
         std::collections::BTreeMap::new();
     let mut any = false;
@@ -308,11 +310,18 @@ where
         for (callee, total) in result.edges.truncated {
             *truncated.entry(callee).or_insert(0) += total;
         }
+        for (callee, total) in result.edges.unproven_inbound {
+            *unproven_inbound.entry(callee).or_insert(0) += total;
+        }
         node_status.extend(result.node_status);
     }
 
     any.then_some(JsTsScopedUsageEdges {
-        edges: UsageEdgeWeights { edges, truncated },
+        edges: UsageEdgeWeights {
+            edges,
+            truncated,
+            unproven_inbound,
+        },
         node_status,
     })
 }

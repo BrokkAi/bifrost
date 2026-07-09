@@ -63,8 +63,16 @@ those tools.
 Zed loads skills only from `~/.agents/skills/` and
 `<worktree>/.agents/skills/`. It does not discover skills directly from
 `plugins/bifrost-agent/skills`. If you want Zed to see the Bifrost
-code-intelligence skills, copy or symlink the skill folders into one of Zed's
-supported skill roots.
+code-intelligence skills, use the Bifrost CLI to install them into one of Zed's
+supported skill roots:
+
+```bash
+bifrost --root /path/to/project --install-skills --target project
+```
+
+Use `--target global` for `~/.agents/skills`, or `--mode copy` when you want a
+self-contained install instead of a checkout-local symlink. See
+[CLI](/cli/#install-agent-skills) for the full option list.
 
 The recommended first set is:
 

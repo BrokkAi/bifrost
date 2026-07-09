@@ -180,6 +180,65 @@ function second(): int { return helper(); }
 }
 
 #[test]
+fn php_bulk_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let (_project, analyzer) = php_analyzer_with_files(&[(
+        "Service.php",
+        r#"<?php
+namespace App;
+class Service {
+    public function target(): int { return 1; }
+    public function unused(): int { return 2; }
+    public function used(): int { return 3; }
+}
+function use_unknown($service): int { return $service->target(); }
+function use_proven(Service $service): int { return $service->used(); }
+"#,
+    )]);
+    let target = definition(&analyzer, "App.Service.target");
+    let unused = definition(&analyzer, "App.Service.unused");
+    let used = definition(&analyzer, "App.Service.used");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["Service.php".to_string()],
+            fq_names: vec![target.fq_name(), unused.fq_name(), used.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("App.Service.target`: 1 structurally matching usage site(s)"),
+        "untyped receiver should make target inconclusive: {report}"
+    );
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "untyped receiver should make target inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("App.Service.target |"),
+        "inconclusive target must not be reported dead: {report}"
+    );
+    assert!(
+        report.contains("App.Service.unused") && report.contains("no non-self usages found"),
+        "genuinely unused method should still report dead: {report}"
+    );
+    assert!(
+        report.contains("| 30 | 0.95 | `function` | `App.Service.unused`"),
+        "unused method scoring should stay on the existing PHP method bar: {report}"
+    );
+    assert!(
+        report.contains("App.Service.used")
+            && report.contains("one workspace inbound edge from App.use_proven"),
+        "proven inbound method reporting should stay unchanged: {report}"
+    );
+    assert!(
+        report.contains("| 12 | 0.75 | `function` | `App.Service.used`"),
+        "proven inbound method scoring should stay on the existing PHP method bar: {report}"
+    );
+}
+
+#[test]
 fn php_dead_code_smell_honors_usage_candidate_file_cap() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
@@ -302,7 +361,7 @@ function build(): Target { return new Target(); }
 }
 
 #[test]
-fn php_method_candidate_stays_on_precise_path() {
+fn php_method_candidate_with_proven_inbound_stays_reported_as_one_call() {
     let (_project, analyzer) = php_analyzer_with_files(&[(
         "Target.php",
         r#"<?php
@@ -324,8 +383,19 @@ function use_target(Target $target): void { $target->run(); }
         },
     );
 
-    assert!(!report.contains("no non-self usages found"), "{report}");
-    assert!(!report.contains("one workspace inbound edge"), "{report}");
+    assert!(report.contains("App.Target.run"), "{report}");
+    assert!(
+        report.contains("one workspace inbound edge from App.use_target"),
+        "{report}"
+    );
+    assert!(
+        report.contains("| 12 | 0.75 | `function` | `App.Target.run`"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("could not be proven or disproven"),
+        "{report}"
+    );
 }
 
 #[test]

@@ -140,6 +140,7 @@ fn pinned_probe_files(
         .summary_targets
         .iter()
         .chain(target.seed_file_paths.iter())
+        .chain(target.dead_code_file_paths.iter())
         .chain(target.usage_targets.iter().map(|query| &query.path))
         .chain(
             target

@@ -189,6 +189,7 @@ fn semantic_search_returns_constituent_rankings() {
         snapshot.clone(),
         FakeEngineProvider { embedder },
     );
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
 
     let result = semantic_search(
         &snapshot,

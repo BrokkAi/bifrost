@@ -13,6 +13,9 @@ use brokk_bifrost::mcp_registry::{
 };
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
+use brokk_bifrost::skill_install::{
+    InstallMode, InstallSkillsOptions, InstallTarget, SkillSet, install_skills,
+};
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
 use search_ast_repl::run_search_ast_repl;
 use serde_json::{Value, json};
@@ -35,6 +38,14 @@ fn run() -> Result<(), String> {
     let mut mcp_mode: Option<String> = None;
     let mut run_lsp = false;
     let mut run_repl = false;
+    let mut run_skill_install = false;
+    let mut install_option_seen = false;
+    let mut install_target: Option<InstallTarget> = None;
+    let mut skills_root: Option<PathBuf> = None;
+    let mut install_mode = InstallMode::Auto;
+    let mut skill_set = SkillSet::Code;
+    let mut force_install = false;
+    let mut dry_run_install = false;
     let mut tool_name: Option<String> = None;
     let mut tool_args = json!({});
     let mut tool_sources = Vec::new();
@@ -60,6 +71,45 @@ fn run() -> Result<(), String> {
             }
             "--repl" => {
                 run_repl = true;
+            }
+            "--install-skills" => {
+                run_skill_install = true;
+            }
+            "--target" => {
+                install_option_seen = true;
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--target requires project or global".to_string())?;
+                install_target = Some(parse_install_target(&value)?);
+            }
+            "--skills-root" => {
+                install_option_seen = true;
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--skills-root requires a directory".to_string())?;
+                skills_root = Some(value.into());
+            }
+            "--mode" => {
+                install_option_seen = true;
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--mode requires auto, symlink, or copy".to_string())?;
+                install_mode = parse_install_mode(&value)?;
+            }
+            "--skill-set" => {
+                install_option_seen = true;
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--skill-set requires code or all".to_string())?;
+                skill_set = parse_skill_set(&value)?;
+            }
+            "--force" => {
+                install_option_seen = true;
+                force_install = true;
+            }
+            "--dry-run" => {
+                install_option_seen = true;
+                dry_run_install = true;
             }
             // DEPRECATED: superseded by `--mcp <toolsets>` and `--lsp`. Kept as a
             // backwards-compatible alias and intentionally undocumented in --help.
@@ -121,14 +171,41 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(tool_name) = tool_name {
-        if run_lsp || run_repl || mcp_mode.is_some() {
-            return Err("--tool cannot be combined with --mcp, --lsp, or --repl".to_string());
+        if run_lsp || run_repl || run_skill_install || mcp_mode.is_some() {
+            return Err(
+                "--tool cannot be combined with --mcp, --lsp, or --repl; it also cannot be combined with --install-skills"
+                    .to_string(),
+            );
         }
         return run_tool(root, &tool_name, tool_args, &tool_sources, render_options);
     }
 
     if !tool_sources.is_empty() {
         return Err("--sources may only be used with --tool".to_string());
+    }
+
+    if run_skill_install {
+        if run_lsp || run_repl || mcp_mode.is_some() {
+            return Err(
+                "--install-skills cannot be combined with --mcp, --lsp, or --repl".to_string(),
+            );
+        }
+        return install_skills(InstallSkillsOptions {
+            root,
+            target: install_target,
+            skills_root,
+            mode: install_mode,
+            skill_set,
+            force: force_install,
+            dry_run: dry_run_install,
+        });
+    }
+
+    if install_option_seen {
+        return Err(
+            "--target, --skills-root, --mode, --skill-set, --force, and --dry-run require --install-skills"
+                .to_string(),
+        );
     }
 
     if run_lsp && mcp_mode.is_some() {
@@ -158,6 +235,37 @@ fn run() -> Result<(), String> {
     let git_repo = brokk_bifrost::mcp_registry::workspace_is_git(&root);
     let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
     run_stdio_server(root, render_options, &spec)
+}
+
+fn parse_install_target(value: &str) -> Result<InstallTarget, String> {
+    match value {
+        "project" => Ok(InstallTarget::Project),
+        "global" => Ok(InstallTarget::Global),
+        other => Err(format!(
+            "Invalid --target value: {other}. Expected project or global."
+        )),
+    }
+}
+
+fn parse_install_mode(value: &str) -> Result<InstallMode, String> {
+    match value {
+        "auto" => Ok(InstallMode::Auto),
+        "symlink" => Ok(InstallMode::Symlink),
+        "copy" => Ok(InstallMode::Copy),
+        other => Err(format!(
+            "Invalid --mode value: {other}. Expected auto, symlink, or copy."
+        )),
+    }
+}
+
+fn parse_skill_set(value: &str) -> Result<SkillSet, String> {
+    match value {
+        "code" => Ok(SkillSet::Code),
+        "all" => Ok(SkillSet::All),
+        other => Err(format!(
+            "Invalid --skill-set value: {other}. Expected code or all."
+        )),
+    }
 }
 
 fn run_tool(
@@ -232,6 +340,7 @@ USAGE:
     bifrost --lsp              Run a Language Server (LSP) over stdio
     bifrost --repl             Run an interactive search_ast REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
+    bifrost --install-skills   Install Bifrost Agent Skills into a .agents/skills root
     bifrost --version | --help [TOOL]
 
 OPTIONS:
@@ -243,6 +352,15 @@ OPTIONS:
     --sources PATH         Restrict one-shot --tool workspace construction to selected files,
                            directories, or globs. Repeatable; valid only with --tool.
     --no-line-numbers      Render source output without leading line numbers
+    --target project|global
+                           Skill install destination for --install-skills
+                           (project: <root>/.agents/skills, global: ~/.agents/skills)
+    --skills-root DIR      Explicit .agents-compatible skills root for --install-skills
+    --mode auto|symlink|copy
+                           Skill install mode (default: auto)
+    --skill-set code|all   Skills to install (default: code)
+    --force                Replace drifted Bifrost-managed copied skills
+    --dry-run              Show planned skill install actions without writing files
     --force-semantic-cpu   Allow semantic_search without a CUDA/Metal accelerator (run the embedder on CPU)
     -h, --help [TOOL]      Show this help, or a single tool's description and parameters
     -V, --version          Show version and exit
@@ -283,6 +401,9 @@ EXAMPLES:
     # Human search_ast exploration with S-expressions, completion, docs, and history:
     bifrost --root /path/to/project --repl
 
+    # Install generic Agent Skills for Zed/Antigravity-style hosts:
+    bifrost --install-skills --target project
+
     # One-shot against a subset workspace built from a directory and a glob:
     bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
 
@@ -291,6 +412,7 @@ EXAMPLES:
 
 Servers speak their protocol over stdio (no network port). The workspace index is built
 in the background: the server is ready immediately and the first request waits for indexing.
+Skills provide agent instructions only; configure MCP separately for analyzer tools.
 "#;
     print!("{bottom}");
 }

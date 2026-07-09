@@ -196,6 +196,12 @@ fn record_reference(
             }
             if let Some(owner) = receiver_type_fqn(object, scan, bindings) {
                 scan.record(format!("{owner}.{method}"), name_node);
+            } else {
+                scan.collector.record_unproven_name(
+                    method,
+                    name_node.start_byte(),
+                    name_node.end_byte(),
+                );
             }
         }
         // A bare constant name in reference position (`LIMIT`): not a call, not a

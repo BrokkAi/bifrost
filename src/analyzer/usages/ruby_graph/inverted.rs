@@ -6,7 +6,8 @@
 //! calls such as `Klass.call`, constructor calls as `Klass.initialize`, and calls
 //! through `self`, lexical receivers, factory-return inference, or locally typed
 //! receivers. Unknown receivers and candidate sets with anything other than one
-//! resolved declaration record no edge.
+//! resolved declaration record unproven inbound evidence for bulk dead-code
+//! analysis rather than a proven edge.
 
 use super::extractor::{
     ruby_enclosing_receiver, ruby_receiver_type, ruby_seed_assignment, ruby_seed_parameter_shadows,
@@ -14,8 +15,8 @@ use super::extractor::{
 };
 use super::resolver::{ReceiverMode, ReceiverType, RubySemanticIndex};
 use super::syntax::{
-    is_call_method_identifier, is_declaration_constant, is_declaration_identifier,
-    method_receiver_mode, node_text,
+    dynamic_dispatch_target_argument, is_call_method_identifier, is_declaration_constant,
+    is_declaration_identifier, method_receiver_mode, node_text,
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -85,6 +86,11 @@ impl RubyEdgeScan<'_, '_> {
     fn record(&mut self, callee: String, node: Node<'_>) {
         self.collector
             .record(callee, node.start_byte(), node.end_byte());
+    }
+
+    fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
+        self.collector
+            .record_unproven_name(name, node.start_byte(), node.end_byte());
     }
 }
 
@@ -237,29 +243,55 @@ impl RubyEdgeWalkState<'_, '_, '_> {
         if member.is_empty() {
             return;
         }
+        if let Some((dispatched_member, dispatched_node)) =
+            dynamic_dispatch_target_argument(node, self.scan.source)
+        {
+            self.record_call_method_reference(
+                node,
+                &dispatched_member,
+                dispatched_node,
+                MethodLookup::Explicit,
+            );
+            return;
+        }
+        self.record_call_method_reference(
+            node,
+            member,
+            method,
+            if node.child_by_field_name("receiver").is_some() {
+                MethodLookup::Explicit
+            } else {
+                MethodLookup::Bare
+            },
+        );
+    }
+
+    fn record_call_method_reference(
+        &mut self,
+        node: Node<'_>,
+        member: &str,
+        hit_node: Node<'_>,
+        lookup: MethodLookup,
+    ) {
         let receiver_node = node.child_by_field_name("receiver");
         let receiver = match receiver_node {
             Some(receiver) => self.receiver_type(receiver),
             None => self.enclosing_receiver(node.start_byte()),
         };
         let Some(receiver) = receiver else {
+            self.scan.record_unproven_name(member, hit_node);
             return;
         };
         if member == "new" && receiver.mode == ReceiverMode::Class {
             self.record_unique_method_candidate(
                 self.initialize_receiver(&receiver),
                 "initialize",
-                method,
+                hit_node,
                 MethodLookup::Explicit,
             );
             return;
         }
-        let lookup = if receiver_node.is_some() {
-            MethodLookup::Explicit
-        } else {
-            MethodLookup::Bare
-        };
-        self.record_unique_method_candidate(receiver, member, method, lookup);
+        self.record_unique_method_candidate(receiver, member, hit_node, lookup);
     }
 
     fn record_bare_identifier_method_reference(&mut self, node: Node<'_>) {
@@ -300,6 +332,8 @@ impl RubyEdgeWalkState<'_, '_, '_> {
         };
         if let Some(fqn) = unique_candidate_fqn(candidates) {
             self.scan.record(fqn, node);
+        } else {
+            self.scan.record_unproven_name(member, node);
         }
     }
 

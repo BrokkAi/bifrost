@@ -167,6 +167,67 @@ class Service {
 }
 
 #[test]
+fn scala_bulk_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "example/Service.scala",
+        r#"
+package example
+
+class Service {
+  def target(): Int = 1
+
+  def unused(): Int = 2
+
+  def used(): Int = 3
+}
+
+class Consumer {
+  def useUnknown(): Int = {
+    val service = ???
+    service.target()
+  }
+
+  def useProven(service: Service): Int = service.used()
+}
+"#,
+    )]);
+    let target = scala_definition(&analyzer, "example.Service.target");
+    let unused = scala_definition(&analyzer, "example.Service.unused");
+    let used = scala_definition(&analyzer, "example.Service.used");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["example/Service.scala".to_string()],
+            fq_names: vec![target.fq_name(), unused.fq_name(), used.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("example.Service.target`: 1 structurally matching usage site(s)"),
+        "unknown local receiver should make target inconclusive: {report}"
+    );
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "unknown local receiver should make target inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("example.Service.target |"),
+        "inconclusive target must not be reported dead: {report}"
+    );
+    assert!(
+        report.contains("example.Service.unused") && report.contains("no non-self usages found"),
+        "genuinely unused method should still report dead: {report}"
+    );
+    assert!(
+        report.contains("example.Service.used")
+            && report.contains("one workspace inbound edge from example.Consumer.useProven"),
+        "proven inbound method reporting should stay unchanged: {report}"
+    );
+}
+
+#[test]
 fn scala_dead_code_smell_honors_usage_candidate_file_cap() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
