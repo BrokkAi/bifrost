@@ -5,7 +5,8 @@ use crate::searchtools::{
     ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile, SearchSymbolsResult,
     SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement, SummaryResult,
     SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
-    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
+    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation,
+    scan_usages_absence_caveat_prose, scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,11 +268,12 @@ impl RenderText for ScanUsagesResult {
         if self.results.is_empty() {
             return "No scan_usages requests were provided.".to_string();
         }
-        self.results
-            .iter()
-            .map(render_scan_usages_entry_text)
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        let mut sections = Vec::new();
+        if self.results.len() > 1 {
+            sections.push(render_scan_usages_summary_banner(self));
+        }
+        sections.extend(self.results.iter().map(render_scan_usages_entry_text));
+        sections.join("\n\n")
     }
 }
 
@@ -337,6 +339,12 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!("  absence caveat(s): {caveats}"));
+        for caveat in &entry.absence_caveats {
+            lines.push(format!(
+                "  absence caveat detail: {}",
+                scan_usages_absence_caveat_prose(*caveat)
+            ));
+        }
     }
     if let Some(count) = entry.definition_sites_excluded {
         lines.push(format!(
@@ -381,6 +389,72 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
         lines.extend(render_usage_file_groups_text(&entry.unproven_files, true));
     }
     lines.join("\n")
+}
+
+fn render_scan_usages_summary_banner(result: &ScanUsagesResult) -> String {
+    let summary = &result.summary;
+    let mut parts = vec![format!(
+        "{}/{} symbols with usages",
+        summary.found, summary.requested
+    )];
+    push_scan_usages_status_count(&mut parts, summary.verified_absent, "verified_absent");
+    push_scan_usages_status_count(&mut parts, summary.unverified_absent, "unverified_absent");
+    push_scan_usages_status_count(&mut parts, summary.not_found, "not_found");
+    push_scan_usages_status_count(&mut parts, summary.ambiguous, "ambiguous");
+    push_scan_usages_status_count(&mut parts, summary.failure, "failure");
+    push_scan_usages_status_count(&mut parts, summary.too_many_callsites, "too_many_callsites");
+    let mut lines = vec![format!("{}; see per-symbol sections.", parts.join("; "))];
+
+    let zero_members = result
+        .results
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.status,
+                ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::UnverifiedAbsent
+            )
+        })
+        .map(|entry| {
+            format!(
+                "{} ({})",
+                render_scan_usages_input(&entry.input),
+                render_scan_usages_status(entry.status)
+            )
+        })
+        .collect::<Vec<_>>();
+    if !zero_members.is_empty() {
+        lines.push(format!("No proven usages: {}.", zero_members.join(", ")));
+    }
+
+    let not_found = render_scan_usages_members_with_status(result, ScanUsagesStatus::NotFound);
+    if !not_found.is_empty() {
+        lines.push(format!("Not found: {}.", not_found.join(", ")));
+    }
+
+    let failures = render_scan_usages_members_with_status(result, ScanUsagesStatus::Failure);
+    if !failures.is_empty() {
+        lines.push(format!("Failures: {}.", failures.join(", ")));
+    }
+
+    lines.join("\n")
+}
+
+fn push_scan_usages_status_count(parts: &mut Vec<String>, count: usize, label: &str) {
+    if count > 0 {
+        parts.push(format!("{count} {label}"));
+    }
+}
+
+fn render_scan_usages_members_with_status(
+    result: &ScanUsagesResult,
+    status: ScanUsagesStatus,
+) -> Vec<String> {
+    result
+        .results
+        .iter()
+        .filter(|entry| entry.status == status)
+        .map(|entry| render_scan_usages_input(&entry.input))
+        .collect()
 }
 
 fn render_scan_usages_input(input: &ScanUsagesInput) -> String {

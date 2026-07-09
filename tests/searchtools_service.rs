@@ -2441,7 +2441,62 @@ fn scan_usages_python_payload_includes_rendered_diagnostics_and_zero_notes() {
         "{rendered}"
     );
     assert!(
-        rendered.contains("resolved symbol; no external usage sites found under current filters"),
+        rendered.contains("resolved symbol; no external usage sites found"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("scanned all code including tests; scope covered the whole workspace"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn scan_usages_verified_absent_names_filters_and_followups() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Target.java",
+            "package src;\npublic class Target {\n    public void unused() {}\n}\n",
+        )
+        .file(
+            "src/Scoped.java",
+            "package src;\npublic class Scoped {}\n",
+        )
+        .file(
+            "src/TargetTest.java",
+            "package src;\npublic class TargetTest {\n    public void calls() { new Target().unused(); }\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_payload_json(
+            "scan_usages",
+            r#"{"symbols":["src.Target.unused"],"include_tests":false,"paths":["src/Scoped.java"]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+
+    let structured = &value["structured"];
+    assert_eq!("verified_absent", only_result(structured)["status"]);
+    assert!(
+        rendered.contains(
+            "scanned production code only (include_tests=false); scope restricted to paths: src/Scoped.java."
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("retry with include_tests=true to include test usages."),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("drop or widen paths to search the whole workspace."),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("framework-invoked entrypoint"),
         "{rendered}"
     );
 }
@@ -2737,6 +2792,35 @@ public class Caller {
     assert_eq!("Target.save", usage["symbol"]);
     assert_eq!(0, usage["total_hits"], "payload: {value}");
     assert_eq!(1, usage["unproven_hits"], "payload: {value}");
+
+    let rendered_payload = service
+        .call_tool_payload_json(
+            "scan_usages",
+            r#"{"symbols":["Target.save"],"include_tests":true}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let rendered_value: Value = serde_json::from_str(&rendered_payload).unwrap();
+    let rendered = rendered_value["rendered_text"]
+        .as_str()
+        .expect("rendered text");
+    assert!(
+        rendered.contains(
+            "message: no PROVEN usage sites, but 1 unproven candidate usage(s) found across 1 file(s); inspect these before concluding absence"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "absence caveat detail: unproven_matches: candidate usages matched structurally"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.find("message: no PROVEN usage sites").unwrap()
+            < rendered.find("unproven matches:").unwrap(),
+        "candidate guidance should lead before raw candidates: {rendered}"
+    );
 }
 
 #[test]
@@ -3085,6 +3169,44 @@ fn scan_usages_reports_unknown_symbol_as_not_found() {
             .is_some_and(|message| message.contains("no symbol matched"))
     );
     assert_eq!(0, status_count(&value, "failure"));
+}
+
+#[test]
+fn scan_usages_multi_symbol_rendered_banner_names_not_found_member() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Target.java",
+            "public class Target {\n    public void hit() {}\n}\n",
+        )
+        .file(
+            "Caller.java",
+            "public class Caller {\n    public void run() { new Target().hit(); }\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_payload_json(
+            "scan_usages",
+            r#"{"symbols":["Target.hit","Target.missing"],"include_tests":true}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let structured = &value["structured"];
+    assert_eq!(2, structured["summary"]["requested"]);
+    assert_eq!(1, structured["summary"]["found"]);
+    assert_eq!(1, structured["summary"]["not_found"]);
+    assert_eq!(0, structured["summary"]["failure"]);
+
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(
+        rendered.starts_with(
+            "1/2 symbols with usages; 1 not_found; see per-symbol sections.\nNot found: Target.missing."
+        ),
+        "{rendered}"
+    );
 }
 
 #[test]

@@ -620,6 +620,13 @@ pub struct ScanUsagesSummary {
     pub resolved: usize,
     pub total_hits: usize,
     pub partial: bool,
+    pub found: usize,
+    pub verified_absent: usize,
+    pub unverified_absent: usize,
+    pub not_found: usize,
+    pub ambiguous: usize,
+    pub failure: usize,
+    pub too_many_callsites: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3010,26 +3017,48 @@ struct ScanUsageRequest {
     input: ScanUsagesInput,
     input_kind: ScanUsagesInputKind,
     label: String,
+    scope: ScanUsagesQueryScope,
 }
 
 impl ScanUsageRequest {
-    fn symbol(index: usize, symbol: String) -> Self {
+    fn symbol(index: usize, symbol: String, scope: ScanUsagesQueryScope) -> Self {
         Self {
             index,
             input: ScanUsagesInput::Symbol(symbol.clone()),
             input_kind: ScanUsagesInputKind::Symbol,
             label: symbol,
+            scope,
         }
     }
 
-    fn target(index: usize, target: ScanUsagesTarget) -> Self {
+    fn target(index: usize, target: ScanUsagesTarget, scope: ScanUsagesQueryScope) -> Self {
         let label = scan_usages_target_label(&target);
         Self {
             index,
             input: ScanUsagesInput::Target(target),
             input_kind: ScanUsagesInputKind::Target,
             label,
+            scope,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanUsagesQueryScope {
+    paths: Vec<String>,
+    include_tests: bool,
+}
+
+impl ScanUsagesQueryScope {
+    fn new(paths: Option<&[String]>, include_tests: bool) -> Self {
+        Self {
+            paths: paths.unwrap_or_default().to_vec(),
+            include_tests,
+        }
+    }
+
+    fn whole_workspace(&self) -> bool {
+        self.paths.is_empty()
     }
 }
 
@@ -3047,6 +3076,7 @@ enum ScanUsagesWorkEntry {
         request: ScanUsageRequest,
         state: SymbolUsageRenderState,
         candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
+        target_is_method: bool,
     },
     NotFound {
         request: ScanUsageRequest,
@@ -3066,6 +3096,7 @@ enum ScanUsagesWorkEntry {
         short_name: String,
         total_callsites: usize,
         limit: usize,
+        target_is_method: bool,
     },
 }
 
@@ -3510,19 +3541,22 @@ fn reference_only_absence_note(
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages");
 
+    let query_scope = ScanUsagesQueryScope::new(params.paths.as_deref(), params.include_tests);
     let symbols: Vec<ScanUsageRequest> = params
         .symbols
         .unwrap_or_default()
         .into_iter()
         .enumerate()
-        .map(|(index, symbol)| ScanUsageRequest::symbol(index, symbol))
+        .map(|(index, symbol)| ScanUsageRequest::symbol(index, symbol, query_scope.clone()))
         .collect();
     let symbol_count = symbols.len();
     let targets: Vec<ScanUsageRequest> = params
         .targets
         .into_iter()
         .enumerate()
-        .map(|(offset, target)| ScanUsageRequest::target(symbol_count + offset, target))
+        .map(|(offset, target)| {
+            ScanUsageRequest::target(symbol_count + offset, target, query_scope.clone())
+        })
         .collect();
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
     let reference_only_sibling_extensions =
@@ -3673,6 +3707,9 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             location_selected,
         } = resolved;
         let resolved_definition = resolved_usage_definition(analyzer, &overloads);
+        let target_is_method = overloads
+            .iter()
+            .any(|unit| unit.is_function() && display_parent_symbol_for_target(unit).is_some());
         let finder = scoped_usage_finder(test_files.as_ref(), &path_filter);
         let max_candidate_files = if path_scoped_candidates.is_some() {
             SCAN_USAGES_PATH_SCOPED_MAX_FILES
@@ -3732,6 +3769,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     request,
                     state,
                     candidate_files_sample,
+                    target_is_method,
                 });
             }
             FuzzyResult::Ambiguous {
@@ -3766,6 +3804,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                         request,
                         state,
                         candidate_files_sample,
+                        target_is_method,
                     });
                     continue;
                 }
@@ -3861,6 +3900,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     short_name,
                     total_callsites,
                     limit,
+                    target_is_method,
                 });
             }
         }
@@ -4541,6 +4581,13 @@ fn render_scan_usages_with_budget(entries: Vec<ScanUsagesWorkEntry>) -> ScanUsag
 
 fn build_scan_usages_summary(results: &[ScanUsagesEntry]) -> ScanUsagesSummary {
     let requested = results.len();
+    let found = scan_usages_status_count(results, ScanUsagesStatus::Found);
+    let verified_absent = scan_usages_status_count(results, ScanUsagesStatus::VerifiedAbsent);
+    let unverified_absent = scan_usages_status_count(results, ScanUsagesStatus::UnverifiedAbsent);
+    let not_found = scan_usages_status_count(results, ScanUsagesStatus::NotFound);
+    let ambiguous = scan_usages_status_count(results, ScanUsagesStatus::Ambiguous);
+    let failure = scan_usages_status_count(results, ScanUsagesStatus::Failure);
+    let too_many_callsites = scan_usages_status_count(results, ScanUsagesStatus::TooManyCallsites);
     let resolved = results
         .iter()
         .filter(|entry| {
@@ -4567,7 +4614,21 @@ fn build_scan_usages_summary(results: &[ScanUsagesEntry]) -> ScanUsagesSummary {
         resolved,
         total_hits,
         partial,
+        found,
+        verified_absent,
+        unverified_absent,
+        not_found,
+        ambiguous,
+        failure,
+        too_many_callsites,
     }
+}
+
+fn scan_usages_status_count(results: &[ScanUsagesEntry], status: ScanUsagesStatus) -> usize {
+    results
+        .iter()
+        .filter(|entry| entry.status == status)
+        .count()
 }
 
 fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
@@ -4576,9 +4637,17 @@ fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
             request,
             state,
             candidate_files_sample,
+            target_is_method,
         } => {
             let usage = render_symbol_usages(state);
-            classify_usage_entry(request, usage, candidate_files_sample.clone(), false, None)
+            classify_usage_entry(
+                request,
+                usage,
+                candidate_files_sample.clone(),
+                false,
+                None,
+                *target_is_method,
+            )
         }
         ScanUsagesWorkEntry::TooManyCallsites {
             request,
@@ -4586,6 +4655,7 @@ fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
             short_name,
             total_callsites,
             limit,
+            target_is_method,
         } => {
             let usage = render_symbol_usages(state);
             classify_usage_entry(
@@ -4594,6 +4664,7 @@ fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
                 None,
                 true,
                 Some((short_name.clone(), *total_callsites, *limit)),
+                *target_is_method,
             )
         }
         ScanUsagesWorkEntry::NotFound { request, item } => {
@@ -4647,6 +4718,7 @@ fn classify_usage_entry(
     candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
     too_many_callsites: bool,
     callsite_cap: Option<(String, usize, usize)>,
+    target_is_method: bool,
 ) -> ScanUsagesEntry {
     let complete =
         !too_many_callsites && !usage.candidate_files_truncated && usage.files_truncated.is_none();
@@ -4655,7 +4727,7 @@ fn classify_usage_entry(
         let (short_name, total_callsites, limit) =
             callsite_cap.expect("too_many_callsites entry includes cap details");
         let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites, false);
-        populate_usage_payload(&mut result, usage);
+        populate_usage_payload(&mut result, usage, &request.scope, target_is_method, &[]);
         result.short_name = Some(short_name);
         result.total_callsites = Some(total_callsites);
         result.limit = Some(limit);
@@ -4683,17 +4755,36 @@ fn classify_usage_entry(
     };
 
     let mut result = scan_usages_entry_base(request, status, complete);
-    if status == ScanUsagesStatus::UnverifiedAbsent {
-        result.absence_caveats = caveats;
-    }
     if usage.candidate_files_truncated {
         result.candidate_files_sample = candidate_files_sample;
     }
-    populate_usage_payload(&mut result, usage);
+    populate_usage_payload(
+        &mut result,
+        usage,
+        &request.scope,
+        target_is_method,
+        &caveats,
+    );
+    if status == ScanUsagesStatus::UnverifiedAbsent {
+        result.absence_caveats = caveats;
+    }
     result
 }
 
-fn populate_usage_payload(entry: &mut ScanUsagesEntry, usage: SymbolUsages) {
+fn populate_usage_payload(
+    entry: &mut ScanUsagesEntry,
+    usage: SymbolUsages,
+    scope: &ScanUsagesQueryScope,
+    target_is_method: bool,
+    absence_caveats: &[ScanUsagesAbsenceCaveat],
+) {
+    let guidance = scan_usages_absence_guidance(
+        entry.status,
+        scope,
+        target_is_method,
+        &usage,
+        absence_caveats,
+    );
     entry.symbol = Some(usage.symbol);
     entry.fq_name = usage.fq_name;
     entry.definition_path = usage.definition_path;
@@ -4717,10 +4808,110 @@ fn populate_usage_payload(entry: &mut ScanUsagesEntry, usage: SymbolUsages) {
         };
         entry.notes.push(note.to_string());
     }
-    if usage.total_hits == 0 && entry.status == ScanUsagesStatus::VerifiedAbsent {
-        entry.notes.push(
-            "resolved symbol; no external usage sites found under current filters.".to_string(),
+    if entry.message.is_none() {
+        entry.message = guidance.message;
+    }
+    entry.notes.extend(guidance.notes);
+}
+
+struct ScanUsagesAbsenceGuidance {
+    message: Option<String>,
+    notes: Vec<String>,
+}
+
+fn scan_usages_absence_guidance(
+    status: ScanUsagesStatus,
+    scope: &ScanUsagesQueryScope,
+    target_is_method: bool,
+    usage: &SymbolUsages,
+    caveats: &[ScanUsagesAbsenceCaveat],
+) -> ScanUsagesAbsenceGuidance {
+    let mut notes = Vec::new();
+    let message = match status {
+        ScanUsagesStatus::VerifiedAbsent => {
+            notes.extend(scan_usages_scope_and_followup_notes(
+                scope,
+                target_is_method,
+            ));
+            Some("resolved symbol; no external usage sites found.".to_string())
+        }
+        ScanUsagesStatus::UnverifiedAbsent => {
+            notes.extend(scan_usages_scope_and_followup_notes(
+                scope,
+                target_is_method,
+            ));
+            scan_usages_unverified_absence_message(usage, caveats)
+        }
+        _ => None,
+    };
+    ScanUsagesAbsenceGuidance { message, notes }
+}
+
+fn scan_usages_scope_and_followup_notes(
+    scope: &ScanUsagesQueryScope,
+    target_is_method: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let test_scope = if scope.include_tests {
+        "scanned all code including tests"
+    } else {
+        "scanned production code only (include_tests=false)"
+    };
+    let path_scope = if scope.whole_workspace() {
+        "scope covered the whole workspace".to_string()
+    } else {
+        format!("scope restricted to paths: {}", scope.paths.join(", "))
+    };
+    notes.push(format!("{test_scope}; {path_scope}."));
+    if !scope.include_tests {
+        notes.push("retry with include_tests=true to include test usages.".to_string());
+    }
+    if !scope.whole_workspace() {
+        notes.push("drop or widen paths to search the whole workspace.".to_string());
+    }
+    if target_is_method {
+        notes.push("if this is a framework-invoked entrypoint (e.g. servlet filters, DI callbacks), direct callers may not exist: scan the enclosing type or search for its registration.".to_string());
+    }
+    notes
+}
+
+fn scan_usages_unverified_absence_message(
+    usage: &SymbolUsages,
+    caveats: &[ScanUsagesAbsenceCaveat],
+) -> Option<String> {
+    if usage.unproven_hits > 0 {
+        let file_count = usage.unproven_files.len();
+        return Some(format!(
+            "no PROVEN usage sites, but {} unproven candidate usage(s) found across {} file(s); inspect these before concluding absence. Next step: review the unproven matches and choose a location-anchored target if one is the intended caller.",
+            usage.unproven_hits, file_count
+        ));
+    }
+    if caveats.contains(&ScanUsagesAbsenceCaveat::CandidateFilesTruncated) {
+        return Some(
+            "no PROVEN usage sites in the scanned candidate sample; candidate files were truncated, so narrow paths and retry before concluding absence."
+                .to_string(),
         );
+    }
+    if caveats.contains(&ScanUsagesAbsenceCaveat::ReferenceOnlySiblings) {
+        return Some(
+            "no PROVEN usage sites, but reference-only sibling files prevent a verified absence; inspect the sibling-source note before concluding absence."
+                .to_string(),
+        );
+    }
+    None
+}
+
+pub(crate) fn scan_usages_absence_caveat_prose(caveat: ScanUsagesAbsenceCaveat) -> &'static str {
+    match caveat {
+        ScanUsagesAbsenceCaveat::UnprovenMatches => {
+            "unproven_matches: candidate usages matched structurally, but receiver/type proof was incomplete; inspect the candidate snippets before concluding absence."
+        }
+        ScanUsagesAbsenceCaveat::CandidateFilesTruncated => {
+            "candidate_files_truncated: the candidate file set was capped, so zero proven hits are not exhaustive; retry with narrower paths."
+        }
+        ScanUsagesAbsenceCaveat::ReferenceOnlySiblings => {
+            "reference_only_siblings: related files are visible only as references, so analyzer coverage cannot prove absence across the full symbol family."
+        }
     }
 }
 
@@ -6456,9 +6647,9 @@ mod tests {
     use super::usage_failure_hint;
     use super::{
         ScanUsageRequest, ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample,
-        ScanUsagesStatus, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState,
-        UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
-        list_symbols, resolve_file_patterns, trim_summary_signature,
+        ScanUsagesQueryScope, ScanUsagesStatus, ScanUsagesWorkEntry, SourceBlock, SummaryElement,
+        SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
+        classify_scan_usages_entry, list_symbols, resolve_file_patterns, trim_summary_signature,
     };
     use crate::analyzer::{
         CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
@@ -6859,7 +7050,7 @@ def gamma():
     }
 
     fn scan_usage_request(symbol: &str) -> ScanUsageRequest {
-        ScanUsageRequest::symbol(0, symbol.to_string())
+        ScanUsageRequest::symbol(0, symbol.to_string(), ScanUsagesQueryScope::new(None, true))
     }
 
     fn usage_row(path: &str, line: usize) -> UsageHitRow {
@@ -6899,6 +7090,7 @@ def gamma():
                 omitted: vec!["omitted.rs".to_string()],
                 omitted_count: 1,
             }),
+            target_is_method: false,
         }
     }
 
@@ -7083,6 +7275,7 @@ def gamma():
             short_name: "target".to_string(),
             total_callsites: 1001,
             limit: 1000,
+            target_is_method: false,
         });
         assert_eq!(ScanUsagesStatus::TooManyCallsites, too_many.status);
         assert!(!too_many.complete);
