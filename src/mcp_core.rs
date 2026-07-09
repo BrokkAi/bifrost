@@ -355,7 +355,7 @@ fn get_definitions_by_reference_descriptor() -> Value {
                             },
                             "target": {
                                 "type": "string",
-                                "description": "Exact reference text to resolve inside the context."
+                                "description": "Exact single reference token to resolve inside the context; for qualified expressions, use the member or name token rather than the whole expression."
                             }
                         },
                         "required": ["symbol", "context", "target"]

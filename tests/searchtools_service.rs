@@ -977,6 +977,61 @@ pub fn caller() {
 }
 
 #[test]
+fn get_definitions_guidance_matches_call_surface_for_qualified_targets() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let source = r#"pub fn helper() {}
+
+pub fn caller() {
+    crate::helper();
+}
+"#;
+    fs::write(src.join("lib.rs"), source).unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let by_reference_payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            r#"{"references":[{"symbol":"caller","context":"    crate::helper();","target":"crate::helper"}]}"#,
+        )
+        .unwrap();
+    let by_reference: Value = serde_json::from_str(&by_reference_payload).unwrap();
+    let reference_message = by_reference["results"][0]["diagnostics"][0]["message"]
+        .as_str()
+        .expect("by-reference diagnostic message");
+
+    assert_eq!(
+        "invalid_location", by_reference["results"][0]["status"],
+        "{by_reference}"
+    );
+    assert!(reference_message.contains("target must identify a single reference token"));
+    assert!(!reference_message.contains("start_byte"));
+
+    let start = source.find("crate::helper").expect("qualified reference");
+    let end = start + "crate::helper".len();
+    let by_location_payload = service
+        .call_tool_json(
+            "get_definitions_by_location",
+            &format!(
+                r#"{{"references":[{{"path":"src/lib.rs","start_byte":{start},"end_byte":{end}}}]}}"#
+            ),
+        )
+        .unwrap();
+    let by_location: Value = serde_json::from_str(&by_location_payload).unwrap();
+    let location_message = by_location["results"][0]["diagnostics"][0]["message"]
+        .as_str()
+        .expect("by-location diagnostic message");
+
+    assert_eq!(
+        "invalid_location", by_location["results"][0]["status"],
+        "{by_location}"
+    );
+    assert!(location_message.contains("use start_byte inside the token"));
+}
+
+#[test]
 fn get_definitions_by_reference_resolves_go_method_receiver_field_chain() {
     let temp = TempDir::new().unwrap();
     fs::write(

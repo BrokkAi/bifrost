@@ -1520,18 +1520,34 @@ fn render_definition_reference_lookup(
     query: DefinitionContextReferenceQuery,
     outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
 ) -> DefinitionByReferenceLookupResult {
+    let diagnostics = outcome
+        .diagnostics
+        .into_iter()
+        .map(definition_by_reference_diagnostic)
+        .collect();
     DefinitionByReferenceLookupResult {
         query,
         status: outcome.status.as_str().to_string(),
         definitions: definition_candidates(analyzer, &outcome.definitions),
-        diagnostics: outcome
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| DefinitionDiagnostic {
-                kind: diagnostic.kind,
-                message: diagnostic.message,
-            })
-            .collect(),
+        diagnostics,
+    }
+}
+
+fn definition_by_reference_diagnostic(
+    diagnostic: crate::analyzer::usages::get_definition::DefinitionLookupDiagnostic,
+) -> DefinitionDiagnostic {
+    let message = if diagnostic.kind == "invalid_location"
+        && diagnostic.message
+            == "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
+    {
+        "target must identify a single reference token; for qualified expressions, set target to the member or name token inside the expression rather than the whole qualified expression"
+            .to_string()
+    } else {
+        diagnostic.message
+    };
+    DefinitionDiagnostic {
+        kind: diagnostic.kind,
+        message,
     }
 }
 
