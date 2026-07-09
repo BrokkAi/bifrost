@@ -1032,6 +1032,53 @@ pub fn caller() {
 }
 
 #[test]
+fn get_definitions_by_reference_reports_path_symbol_guidance() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        r#"pub fn helper() {}
+
+pub fn caller() {
+    helper();
+}
+"#,
+    )
+    .unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            r#"{"references":[{"symbol":"src/lib.rs","context":"    helper();","target":"helper"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = &value["results"][0];
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+
+    assert_eq!("not_found", result["status"], "{value}");
+    assert_eq!(
+        "symbol_not_found", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
+    assert!(
+        message.contains("`symbol` must be an enclosing workspace symbol, not a file path"),
+        "{message}"
+    );
+    assert!(
+        message.contains("`context` must be exact source text"),
+        "{message}"
+    );
+    assert!(message.contains("get_summaries"), "{message}");
+    assert!(message.contains("get_symbol_sources"), "{message}");
+}
+
+#[test]
 fn get_definitions_by_reference_resolves_go_method_receiver_field_chain() {
     let temp = TempDir::new().unwrap();
     fs::write(

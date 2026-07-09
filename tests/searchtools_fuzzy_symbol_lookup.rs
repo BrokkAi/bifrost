@@ -5,8 +5,8 @@ use brokk_bifrost::{
     PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
     searchtools::{
         ScanUsagesEntry, ScanUsagesParams, ScanUsagesResult, ScanUsagesStatus, SearchSymbolsParams,
-        SymbolLookupParams, SymbolSourcesResult, get_symbol_locations, get_symbol_sources,
-        scan_usages, search_symbols,
+        SymbolLookupParams, SymbolSourcesResult, get_symbol_ancestors, get_symbol_locations,
+        get_symbol_sources, scan_usages, search_symbols,
     },
 };
 use common::InlineTestProject;
@@ -443,6 +443,35 @@ fn scan_usages_reports_path_qualified_symbol_selector_as_unsupported() {
 }
 
 #[test]
+fn scan_usages_reports_plain_path_symbol_with_path_guidance() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/cli.ts", "export function main() {}\n")
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let result = scan_usages(
+        &analyzer,
+        ScanUsagesParams {
+            symbols: Some(vec!["src/cli.ts".to_string()]),
+            targets: Vec::new(),
+            include_tests: true,
+            paths: None,
+        },
+    );
+
+    assert_eq!(1, result.results.len(), "{result:#?}");
+    let entry = &result.results[0];
+    assert_eq!(ScanUsagesStatus::NotFound, entry.status, "{result:#?}");
+    let message = entry.message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains("expects workspace symbols, not file paths"),
+        "{message}"
+    );
+    assert!(message.contains("Use `paths` only to narrow"), "{message}");
+    assert!(message.contains("use `targets`"), "{message}");
+}
+
+#[test]
 fn scan_usages_bounds_ambiguous_path_qualified_selector_message() {
     let mut builder = InlineTestProject::with_language(Language::TypeScript);
     for index in 0..7 {
@@ -629,6 +658,65 @@ class Thing {
     assert!(source.text.contains("- Thing"), "{source:#?}");
     assert!(!source.text.contains("method"), "{source:#?}");
     assert!(!source.text.contains("Inner"), "{source:#?}");
+}
+
+#[test]
+fn extended_symbol_lookup_reports_path_inputs_as_symbols() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/pkg/Thing.java",
+            r#"package pkg;
+class Thing {
+    void method() {}
+}
+"#,
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let locations = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["src/pkg/Thing.java".to_string()],
+        },
+    );
+    assert!(locations.locations.is_empty(), "{locations:#?}");
+    assert_eq!(1, locations.not_found.len(), "{locations:#?}");
+    let location_note = locations.not_found[0].note.as_deref().unwrap_or_default();
+    assert!(
+        location_note.contains("expects a workspace symbol, not a file path"),
+        "{location_note}"
+    );
+    assert!(
+        location_note.contains("use list_symbols"),
+        "{location_note}"
+    );
+    assert!(
+        !location_note.contains("get_symbol_sources"),
+        "{location_note}"
+    );
+
+    let ancestors = get_symbol_ancestors(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["src/pkg/Thing.java".to_string()],
+        },
+    );
+    assert!(ancestors.ancestors.is_empty(), "{ancestors:#?}");
+    assert_eq!(1, ancestors.not_found.len(), "{ancestors:#?}");
+    let ancestor_note = ancestors.not_found[0].note.as_deref().unwrap_or_default();
+    assert!(
+        ancestor_note.contains("expects a workspace symbol, not a file path"),
+        "{ancestor_note}"
+    );
+    assert!(
+        ancestor_note.contains("use list_symbols"),
+        "{ancestor_note}"
+    );
+    assert!(
+        !ancestor_note.contains("get_symbol_sources"),
+        "{ancestor_note}"
+    );
 }
 
 #[test]

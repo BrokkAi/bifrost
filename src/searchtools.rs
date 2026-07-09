@@ -447,6 +447,13 @@ const SYMBOL_NOT_FOUND_NOTE: &str =
 const FILE_NOT_FOUND_NOTE: &str =
     "no workspace file matched this path; check the relative path or pass a glob pattern";
 
+#[derive(Debug, Clone, Copy)]
+enum PathLikeSymbolGuidanceContext {
+    DefinitionByReference,
+    ScanUsages,
+    SymbolLookup,
+}
+
 fn not_found_input(input: impl Into<String>, note: Option<String>) -> NotFoundInput {
     NotFoundInput {
         input: input.into(),
@@ -456,6 +463,39 @@ fn not_found_input(input: impl Into<String>, note: Option<String>) -> NotFoundIn
 
 fn symbol_not_found_input(input: impl Into<String>) -> NotFoundInput {
     not_found_input(input, Some(SYMBOL_NOT_FOUND_NOTE.to_string()))
+}
+
+fn path_like_symbol_not_found_input(
+    input: impl Into<String>,
+    context: PathLikeSymbolGuidanceContext,
+) -> NotFoundInput {
+    let input = input.into();
+    let note = path_like_symbol_guidance(&input, context)
+        .unwrap_or_else(|| SYMBOL_NOT_FOUND_NOTE.to_string());
+    not_found_input(input, Some(note))
+}
+
+fn path_like_symbol_guidance(
+    input: &str,
+    context: PathLikeSymbolGuidanceContext,
+) -> Option<String> {
+    if !looks_like_file_target(input) {
+        return None;
+    }
+    Some(match context {
+        PathLikeSymbolGuidanceContext::DefinitionByReference => {
+            "`symbol` must be an enclosing workspace symbol, not a file path. `context` must be exact source text copied from inside that symbol. If you already have exact context, use get_summaries on the file to identify the enclosing symbol, then retry with the same context and a single-token target. If you do not have exact context, identify the enclosing symbol first, then call get_symbol_sources for that symbol and copy context from the returned source."
+                .to_string()
+        }
+        PathLikeSymbolGuidanceContext::ScanUsages => {
+            "`symbols` expects workspace symbols, not file paths. Use `paths` only to narrow a real symbol scan, or use `targets` when you know the declaration location."
+                .to_string()
+        }
+        PathLikeSymbolGuidanceContext::SymbolLookup => {
+            "this field expects a workspace symbol, not a file path; use list_symbols on the file to discover symbols, then retry with the symbol"
+                .to_string()
+        }
+    })
 }
 
 fn file_not_found_input(input: impl Into<String>) -> NotFoundInput {
@@ -976,7 +1016,13 @@ pub fn get_symbol_locations(
                 CodeUnitResolution::Ambiguous(_) | CodeUnitResolution::NotFound => None,
             };
             let Some(code_units) = code_units else {
-                return Some((index, Err(symbol_not_found_input(symbol))));
+                return Some((
+                    index,
+                    Err(path_like_symbol_not_found_input(
+                        symbol,
+                        PathLikeSymbolGuidanceContext::SymbolLookup,
+                    )),
+                ));
             };
             let locations: Vec<_> = code_units
                 .into_iter()
@@ -1466,7 +1512,11 @@ fn resolve_definition_context_symbol(
         }]),
         CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
             kind: "symbol_not_found".to_string(),
-            message: format!("`{symbol}` does not resolve to a workspace symbol"),
+            message: path_like_symbol_guidance(
+                symbol,
+                PathLikeSymbolGuidanceContext::DefinitionByReference,
+            )
+            .unwrap_or_else(|| format!("`{symbol}` does not resolve to a workspace symbol")),
         }]),
     }
 }
@@ -1779,7 +1829,21 @@ pub fn get_symbol_ancestors(
                 }
             }
             SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
-            SelectableDefinitionResolution::NotFound(target) => not_found.push(target),
+            SelectableDefinitionResolution::NotFound(target) => {
+                if path_like_symbol_guidance(
+                    &target.input,
+                    PathLikeSymbolGuidanceContext::SymbolLookup,
+                )
+                .is_some()
+                {
+                    not_found.push(path_like_symbol_not_found_input(
+                        target.input,
+                        PathLikeSymbolGuidanceContext::SymbolLookup,
+                    ));
+                } else {
+                    not_found.push(target);
+                }
+            }
         }
     }
 
@@ -3350,7 +3414,12 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             }
             CodeUnitResolution::NotFound => {
                 let item = unsupported_path_qualified_scan_symbol(&resolver, &symbol)
-                    .unwrap_or_else(|| symbol_not_found_input(symbol.clone()));
+                    .unwrap_or_else(|| {
+                        path_like_symbol_not_found_input(
+                            symbol.clone(),
+                            PathLikeSymbolGuidanceContext::ScanUsages,
+                        )
+                    });
                 work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
                 continue;
             }
