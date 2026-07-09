@@ -20,7 +20,7 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 - [x] (2026-07-09T07:59:56Z) Milestone 0: added benchmark-harness support for a `dead_code_smells` scenario and pinned manifest probes.
 - [x] (2026-07-09T08:14:34Z) Milestone 1: calibrated PHP bulk dead-code unproven-inbound evidence.
 - [x] (2026-07-09T08:18:06Z) Milestone 2: calibrated Scala bulk dead-code unproven-inbound evidence.
-- [ ] Milestone 3: calibrate scoped JavaScript/TypeScript bulk dead-code unproven-inbound evidence.
+- [x] (2026-07-09T08:25:09Z) Milestone 3: calibrated scoped JavaScript/TypeScript bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 4: calibrate Python bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 5: calibrate Ruby bulk dead-code unproven-inbound evidence.
 - [ ] Final validation and retrospective.
@@ -57,6 +57,12 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 
 - Observation: The Scala red fixture reproduced the same false-positive shape: an unknown local receiver call let `example.Service.target` report as dead.
   Evidence: `BIFROST_SEMANTIC_INDEX=off cargo test --test scala_dead_code_smells scala_bulk_unproven_receiver_usage_is_inconclusive_not_dead` failed before production changes with `example.Service.target` reported as `no non-self usages found`.
+
+- Observation: Scoped JS/TS needed the shared `UsageEdgeWeights<UsageNodeKey>` result to carry unproven inbound counts before dead-code could consume them.
+  Evidence: Before Milestone 3, `UsageEdges` had `unproven_inbound`, but `UsageEdgeWeights` exposed only `edges` and `truncated`, and `analyze_jsts_candidates_with_scoped_usage_graph` destructured only those fields.
+
+- Observation: A constructed instance receiver (`new Service().used()` or a local initialized from it) is not currently proven by the scoped dead-code receiver path.
+  Evidence: The first JS/TS fixture variant skipped the intended proven `Service.used` instance method as inconclusive. The fixture was changed to use static `Service.used()` because that is already proven by the scoped class-member path.
 
 
 ## Decision Log
@@ -95,6 +101,14 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 
 - Decision: Scala records unproven inbound only after receiver typing fails and visible extension-method fallback produces no proven edge.
   Rationale: Scala extension methods can legitimately satisfy `receiver.method` syntax even when the direct receiver owner is unavailable. Recording unproven before that fallback would hide real extension usage; recording after an empty fallback preserves existing extension behavior while preventing unresolved member calls from being called dead.
+  Date/Author: 2026-07-09 / Codex.
+
+- Decision: `UsageEdgeWeights<K>` now carries `unproven_inbound`, matching `UsageEdges<K>`.
+  Rationale: Scoped JS/TS dead-code uses weighted `UsageNodeKey` edges to preserve file identity for duplicate names. Without unproven counts in the weighted result, the dead-code layer cannot apply the same zero-proven/nonzero-unproven inconclusive skip.
+  Date/Author: 2026-07-09 / Codex.
+
+- Decision: Scoped JS/TS records exact unproven keys for ambiguous receiver-analysis targets and terminal-name unproven evidence only for unknown, unsupported, or budget-exceeded receiver analysis.
+  Rationale: Ambiguous receiver analysis can return concrete member targets, so exact keys avoid unnecessary duplicate-name broadening. Unknown/unsupported/budget outcomes have no target set, so they use the existing structured terminal-name gate.
   Date/Author: 2026-07-09 / Codex.
 
 
@@ -161,6 +175,26 @@ Validation evidence after guided review:
 Guided review finding before the Milestone 2 commit:
 
     No related findings. The diff records unproven evidence only after structured receiver typing fails and after the existing visible-extension fallback has no targets.
+
+Milestone 3 calibrated scoped JS/TS by extending `UsageEdgeWeights<UsageNodeKey>` with unproven inbound counts, aggregating those counts across JS and TS scoped scans, making scoped dead-code skip zero-proven/nonzero-unproven candidates, and recording scoped receiver-analysis failures as unproven evidence. The JS and TS fixtures prove unresolved receiver calls make `Service.target` inconclusive, `Service.unused` still reports dead, and static `Service.used` remains a proven one-call candidate.
+
+Validation evidence after guided review:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test python_js_ts_dead_code_smells --test usage_graph_ts_test --test usages_js_ts_graph_test --test usages_js_ts_path_alias_test
+    result: passed at 2026-07-09T08:25:09Z; 23 python_js_ts_dead_code_smells tests, 17 usage_graph_ts_test tests, 68 passing usages_js_ts_graph_test tests with 2 ignored parity markers, and 10 usages_js_ts_path_alias_test tests passed
+
+    BIFROST_SEMANTIC_INDEX=off cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
+    result: passed at 2026-07-09T08:25:09Z; validated 10 repos and covered scenarios include dead_code_smells
+
+    cargo fmt --check
+    result: passed at 2026-07-09T08:25:09Z
+
+    cargo clippy-no-cuda
+    result: blocked by the same repeated E0514 incompatible-rustc dependency metadata errors seen in prior milestones
+
+Guided review finding before the Milestone 3 commit:
+
+    No related findings. The diff preserves scoped `UsageNodeKey` identity, uses exact keys for ambiguous receiver-analysis targets, and keeps duplicate-name JS/TS tests passing.
 
 
 ## Context and Orientation

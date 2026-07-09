@@ -1251,7 +1251,11 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
         return Vec::new();
     };
     let crate::analyzer::usages::js_ts_graph::JsTsScopedUsageEdges { edges, node_status } = result;
-    let crate::analyzer::usages::inverted_edges::UsageEdgeWeights { edges, truncated } = edges;
+    let crate::analyzer::usages::inverted_edges::UsageEdgeWeights {
+        edges,
+        truncated,
+        unproven_inbound,
+    } = edges;
 
     let declarations_by_key = scoped_declarations_by_key_for_languages(
         analyzer,
@@ -1262,6 +1266,9 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
         let usage = incoming.entry(callee).or_default();
         usage.total += weight;
         usage.callers.entry(caller).or_insert(weight);
+    }
+    for (callee, total) in unproven_inbound {
+        incoming.entry(callee).or_default().unproven_inbound += total;
     }
 
     candidates
@@ -1299,6 +1306,14 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
                     "`{}`: too many workspace inbound call sites ({}, limit {usage_cap}); evidence is inconclusive",
                     candidate.fq_name(),
                     usage.total
+                ));
+                return None;
+            }
+            if usage.total == 0 && usage.unproven_inbound > 0 {
+                skipped.push(format!(
+                    "`{}`: {} structurally matching usage site(s) could not be proven or disproven; evidence is inconclusive",
+                    candidate.fq_name(),
+                    usage.unproven_inbound
                 ));
                 return None;
             }
@@ -1640,6 +1655,7 @@ fn public_surface_graph_finding(
 struct ScopedGraphIncomingUsage {
     total: usize,
     callers: BTreeMap<UsageNodeKey, usize>,
+    unproven_inbound: usize,
 }
 
 fn scoped_graph_finding_for_language(

@@ -185,6 +185,9 @@ pub(crate) struct UsageEdgeWeights<K = String> {
     pub(crate) edges: BTreeMap<(K, K), usize>,
     /// Callees past the call-site cap: `callee -> total call sites`.
     pub(crate) truncated: BTreeMap<K, usize>,
+    /// Per-callee count of structurally matching call/member sites whose receiver
+    /// could not be resolved to a proven edge.
+    pub(crate) unproven_inbound: BTreeMap<K, usize>,
 }
 
 impl<K: Ord> Default for UsageEdgeWeights<K> {
@@ -192,6 +195,7 @@ impl<K: Ord> Default for UsageEdgeWeights<K> {
         Self {
             edges: BTreeMap::new(),
             truncated: BTreeMap::new(),
+            unproven_inbound: BTreeMap::new(),
         }
     }
 }
@@ -359,27 +363,37 @@ impl<'a, K: NodeKey> EdgeCollector<'a, K> {
         let Some(candidates) = self.nodes_by_terminal.get(name) else {
             return;
         };
+        let candidates = candidates.clone();
+        for callee in candidates {
+            self.record_unproven(callee, start, end);
+        }
+    }
+
+    /// Record that a structured call/member site matched `callee` exactly but
+    /// could not be resolved to a proven edge.
+    pub(crate) fn record_unproven(&mut self, callee: K, start: usize, end: usize) {
+        if !self.nodes.contains(&callee) {
+            return;
+        }
         let Some(caller) = self.enclosing(start, end).cloned() else {
             return;
         };
-        for callee in candidates {
-            if &caller == callee {
-                continue;
-            }
-            if self
-                .declarations
-                .definitions
-                .get(callee)
-                .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
-            {
-                continue;
-            }
-            self.out
-                .unproven_inbound
-                .entry(callee.clone())
-                .or_default()
-                .insert(start);
+        if caller == callee {
+            return;
         }
+        if self
+            .declarations
+            .definitions
+            .get(&callee)
+            .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
+        {
+            return;
+        }
+        self.out
+            .unproven_inbound
+            .entry(callee)
+            .or_default()
+            .insert(start);
     }
 
     pub(crate) fn finish(self) -> PerFileEdges<K> {
@@ -565,12 +579,16 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
 ) -> UsageEdgeWeights<K> {
     let mut edge_weights: BTreeMap<(K, K), usize> = BTreeMap::new();
     let mut callsites: BTreeMap<K, usize> = BTreeMap::new();
+    let mut unproven_inbound: BTreeMap<K, usize> = BTreeMap::new();
     for file in per_file {
         for (key, lines) in file.edge_lines {
             *edge_weights.entry(key).or_insert(0) += lines.len();
         }
         for (callee, sites) in file.callsites {
             *callsites.entry(callee).or_insert(0) += sites.len();
+        }
+        for (callee, sites) in file.unproven_inbound {
+            *unproven_inbound.entry(callee).or_insert(0) += sites.len();
         }
     }
 
@@ -583,7 +601,11 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
         .filter(|((_, callee), _)| !truncated.contains_key(callee))
         .collect();
 
-    UsageEdgeWeights { edges, truncated }
+    UsageEdgeWeights {
+        edges,
+        truncated,
+        unproven_inbound,
+    }
 }
 
 #[cfg(test)]

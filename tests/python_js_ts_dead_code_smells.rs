@@ -604,6 +604,177 @@ export function run(): number {
 }
 
 #[test]
+fn js_dead_code_smell_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "service.js",
+            r#"
+export class Service {
+  target() {
+    return 1;
+  }
+
+  unused() {
+    return 2;
+  }
+
+  static used() {
+    return 3;
+  }
+}
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"
+import { Service } from "./service";
+
+export function useUnknown(service) {
+  return service.target();
+}
+
+export function useProven() {
+  return Service.used();
+}
+"#,
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let service_file = project.file("service.js");
+    let target = js_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Service.target" && cu.source() == &service_file
+    });
+    let unused = js_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Service.unused" && cu.source() == &service_file
+    });
+    let used = js_definition(&analyzer, |cu| {
+        cu.is_function() && cu.identifier() == "used" && cu.source() == &service_file
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.js".to_string(), "consumer.js".to_string()],
+            fq_names: vec![target.fq_name(), unused.fq_name(), used.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("Service.target`: 1 structurally matching usage site(s)"),
+        "{}",
+        result.report
+    );
+    assert!(
+        !result.report.contains("Service.target |"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("Service.unused")
+            && result.report.contains("no non-self usages found"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("Service.used")
+            && result
+                .report
+                .contains("one workspace inbound edge from useProven"),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn ts_dead_code_smell_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service {
+  target(): number {
+    return 1;
+  }
+
+  unused(): number {
+    return 2;
+  }
+
+  static used(): number {
+    return 3;
+  }
+}
+"#,
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import { Service } from "./service";
+
+export function useUnknown(value: unknown): number {
+  const service = value;
+  return service.target();
+}
+
+export function useProven(): number {
+  return Service.used();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let service_file = project.file("service.ts");
+    let target = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Service.target" && cu.source() == &service_file
+    });
+    let unused = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Service.unused" && cu.source() == &service_file
+    });
+    let used = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Service.used$static" && cu.source() == &service_file
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.ts".to_string(), "consumer.ts".to_string()],
+            fq_names: vec![target.fq_name(), unused.fq_name(), used.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("Service.target`: 1 structurally matching usage site(s)"),
+        "{}",
+        result.report
+    );
+    assert!(
+        !result.report.contains("Service.target |"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("Service.unused")
+            && result.report.contains("no non-self usages found"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("Service.used")
+            && result
+                .report
+                .contains("one workspace inbound edge from useProven"),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn ts_dead_code_smell_namespace_import_uses_target_module_not_local_name() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
