@@ -120,14 +120,34 @@ impl Language {
     }
 }
 
+/// Coarse declaration categories used across analyzers, lookup, usages, and
+/// serialized state. Keep this enum lean and language-agnostic: prefer mapping
+/// syntax-specific distinctions onto an existing high-level kind unless callers
+/// must handle the unit with genuinely different semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CodeUnitType {
+    /// Type-like declarations: classes, interfaces, abstract classes, structs,
+    /// traits, protocols, enums, unions, aliases, and language equivalents.
+    /// Use `Class` for declarations whose primary role is defining a named
+    /// type or member namespace, even when the language uses another keyword.
     Class,
     /// Runtime-invocable executable units: free functions, methods, closures,
     /// lambdas, and language-specific equivalents. These share a callable body
     /// model even when their declaration syntax differs.
     Function,
+    /// Addressable data members and named values: fields, properties,
+    /// constants, enum cases, and similar slots. For object-property-heavy
+    /// languages, classify by the declared value's role: JavaScript/TypeScript
+    /// `{ run() {} }` and `{ run: () => {} }` are `Function`, while `{ enabled:
+    /// true }` is `Field`; PHP methods are `Function`, while properties and
+    /// constants are `Field`.
     Field,
+    /// Named importable or namespace-like containers. Examples currently
+    /// emitted as `Module` include C++ namespaces, Java package units, Python
+    /// modules, Rust modules, Ruby modules, and file-level JavaScript/TypeScript
+    /// modules. Do not assume every language namespace is a `Module`: C#
+    /// namespaces are package scope for contained declarations, and TypeScript
+    /// `namespace`/`module` declarations are currently class-like CodeUnits.
     Module,
     /// Compile-time invocable units such as Rust `macro_rules!` and C/C++
     /// preprocessor macros. Keep these distinct from `Function` because their
