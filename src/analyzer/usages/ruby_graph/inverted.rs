@@ -10,13 +10,13 @@
 //! analysis rather than a proven edge.
 
 use super::extractor::{
-    is_dynamic_dispatch_method, ruby_enclosing_receiver, ruby_receiver_type, ruby_seed_assignment,
-    ruby_seed_parameter_shadows, ruby_type_owner,
+    ruby_enclosing_receiver, ruby_receiver_type, ruby_seed_assignment, ruby_seed_parameter_shadows,
+    ruby_type_owner,
 };
 use super::resolver::{ReceiverMode, ReceiverType, RubySemanticIndex};
 use super::syntax::{
-    is_call_method_identifier, is_declaration_constant, is_declaration_identifier,
-    method_receiver_mode, node_text, symbol_or_string_value,
+    dynamic_dispatch_target_argument, is_call_method_identifier, is_declaration_constant,
+    is_declaration_identifier, method_receiver_mode, node_text,
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -243,17 +243,15 @@ impl RubyEdgeWalkState<'_, '_, '_> {
         if member.is_empty() {
             return;
         }
-        if is_dynamic_dispatch_method(method, self.scan.source) {
-            if let Some((dispatched_member, dispatched_node)) =
-                dynamic_dispatch_target_argument(node, self.scan.source)
-            {
-                self.record_call_method_reference(
-                    node,
-                    &dispatched_member,
-                    dispatched_node,
-                    MethodLookup::Explicit,
-                );
-            }
+        if let Some((dispatched_member, dispatched_node)) =
+            dynamic_dispatch_target_argument(node, self.scan.source)
+        {
+            self.record_call_method_reference(
+                node,
+                &dispatched_member,
+                dispatched_node,
+                MethodLookup::Explicit,
+            );
             return;
         }
         self.record_call_method_reference(
@@ -404,14 +402,4 @@ fn unique_candidate_fqn(candidates: Vec<CodeUnit>) -> Option<String> {
     } else {
         None
     }
-}
-
-fn dynamic_dispatch_target_argument<'tree>(
-    node: Node<'tree>,
-    source: &str,
-) -> Option<(String, Node<'tree>)> {
-    let arguments = node.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let first_argument = arguments.named_children(&mut cursor).next()?;
-    symbol_or_string_value(first_argument, source).map(|member| (member, first_argument))
 }

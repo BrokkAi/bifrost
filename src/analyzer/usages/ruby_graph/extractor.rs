@@ -16,8 +16,9 @@ use super::resolver::{
     RubyTargetSpec, ruby_method_lookup_mode_matches,
 };
 use super::syntax::{
-    constant_hit_node, is_call_method_identifier, is_declaration_constant,
-    is_declaration_identifier, method_receiver_mode, node_text, symbol_or_string_value,
+    constant_hit_node, dynamic_dispatch_target_argument, is_call_method_identifier,
+    is_declaration_constant, is_declaration_identifier, method_receiver_mode, node_text,
+    symbol_or_string_value,
 };
 pub(super) struct RubyFileScan<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
@@ -254,8 +255,9 @@ impl RubyWalkState<'_, '_> {
         if node.kind() != "call" {
             return;
         }
-        if let Some(dispatched_method) =
-            dynamic_dispatch_target_argument(node, self.scan.source, &self.scan.spec.member_name)
+        if let Some((dispatched_member, dispatched_method)) =
+            dynamic_dispatch_target_argument(node, self.scan.source)
+            && dispatched_member == self.scan.spec.member_name
         {
             self.record_method_hit_for_call_receiver(
                 node,
@@ -411,30 +413,6 @@ impl RubyWalkState<'_, '_> {
             node,
         );
     }
-}
-
-pub(crate) fn is_dynamic_dispatch_method(method: Node<'_>, source: &str) -> bool {
-    matches!(
-        node_text(method, source),
-        "send" | "__send__" | "public_send"
-    )
-}
-
-fn dynamic_dispatch_target_argument<'tree>(
-    node: Node<'tree>,
-    source: &str,
-    member: &str,
-) -> Option<Node<'tree>> {
-    let method = node.child_by_field_name("method")?;
-    if !is_dynamic_dispatch_method(method, source) {
-        return None;
-    }
-    let arguments = node.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let first_argument = arguments.named_children(&mut cursor).next()?;
-    symbol_or_string_value(first_argument, source)
-        .is_some_and(|value| value == member)
-        .then_some(first_argument)
 }
 
 fn alias_method_target_argument<'tree>(

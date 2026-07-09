@@ -99,6 +99,27 @@ pub(crate) fn is_call_method_identifier(node: Node<'_>) -> bool {
     })
 }
 
+pub(crate) fn dynamic_dispatch_target_argument<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(String, Node<'tree>)> {
+    let method = node.child_by_field_name("method")?;
+    if !is_dynamic_dispatch_method(method, source) {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let first_argument = arguments.named_children(&mut cursor).next()?;
+    symbol_or_string_value(first_argument, source).map(|member| (member, first_argument))
+}
+
+pub(crate) fn is_dynamic_dispatch_method(method: Node<'_>, source: &str) -> bool {
+    matches!(
+        node_text(method, source),
+        "send" | "__send__" | "public_send"
+    )
+}
+
 pub(super) fn constant_hit_node(node: Node<'_>) -> Node<'_> {
     if node.kind() == "scope_resolution" {
         node.child_by_field_name("name").unwrap_or(node)
