@@ -175,6 +175,27 @@ fn token_bounds_at(source: &str, byte: usize, allow_at_ident: bool) -> Option<(u
     Some((start, end))
 }
 
+pub(crate) fn reference_target_match_offsets<'a>(
+    source: &'a str,
+    target: &'a str,
+    language: Language,
+) -> impl Iterator<Item = usize> + 'a {
+    let allow_at_ident = language == Language::Ruby;
+    let target_is_identifier = target
+        .bytes()
+        .all(|byte| is_ident_byte(byte, allow_at_ident));
+    source.match_indices(target).filter_map(move |(offset, _)| {
+        if !target_is_identifier
+            || token_bounds_at(source, offset, allow_at_ident)
+                .is_some_and(|(start, end)| start == offset && end == offset + target.len())
+        {
+            Some(offset)
+        } else {
+            None
+        }
+    })
+}
+
 fn expand_reference_expression(
     source: &str,
     start: usize,

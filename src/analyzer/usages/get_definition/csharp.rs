@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 
 pub(crate) enum CSharpTypeLookupResolution {
@@ -135,10 +136,6 @@ pub(super) fn resolve_csharp(
             if text.is_empty() {
                 return no_definition("no_reference_text", "C# identifier is blank");
             }
-            if csharp_is_type_reference_node(identifier) {
-                let reference = csharp_reference_type_text(identifier, source);
-                return csharp_type_outcome(csharp, support, file, &reference);
-            }
             if let Some(outcome) = csharp_object_initializer_label_outcome(
                 analyzer, csharp, support, file, source, identifier,
             ) {
@@ -151,6 +148,10 @@ pub(super) fn resolve_csharp(
                 tree.root_node(),
                 identifier.start_byte(),
             );
+            if csharp_is_type_reference_node(identifier) {
+                let reference = csharp_reference_type_text(identifier, source);
+                return csharp_type_outcome(csharp, support, file, &reference);
+            }
             if !bindings.is_shadowed(text) {
                 if csharp_is_unqualified_member_reference(identifier)
                     && let Some(owner) =
@@ -522,8 +523,13 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
             && parent.start_byte() <= current.start_byte()
             && parent.end_byte() >= current.end_byte())
             || (parent.kind() == "member_access_expression"
-                && (csharp_member_access_name(parent) == Some(current)
-                    || csharp_member_access_name(parent) == Some(original)))
+                && !csharp_member_access_receiver(parent)
+                    .is_some_and(|receiver| same_node(receiver, current))
+                && !csharp_member_access_receiver(parent)
+                    .is_some_and(|receiver| same_node(receiver, original))
+                && (csharp_member_access_name(parent).is_some_and(|name| same_node(name, current))
+                    || csharp_member_access_name(parent)
+                        .is_some_and(|name| same_node(name, original))))
             || (parent.kind() == "object_creation_expression"
                 && (parent.child_by_field_name("type") == Some(current)
                     || csharp_first_type_child(parent) == Some(current)))
@@ -543,6 +549,9 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
         "identifier" | "type" => {
             if csharp_is_unqualified_invocation_target(current) {
                 return Some(CSharpReferenceNode::UnqualifiedMember(current));
+            }
+            if csharp_is_unqualified_member_reference(current) {
+                return Some(CSharpReferenceNode::Identifier(current));
             }
             if csharp_is_type_reference_node(current) {
                 Some(CSharpReferenceNode::Type(current))
@@ -755,10 +764,9 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if parent.kind() == "member_access_expression"
-        && csharp_member_access_name(parent) == Some(node)
-    {
-        return false;
+    if parent.kind() == "member_access_expression" {
+        return csharp_member_access_receiver(parent)
+            .is_some_and(|receiver| same_node(receiver, node));
     }
     if matches!(parent.kind(), "argument" | "attribute_argument")
         && parent.child_by_field_name("name") == Some(node)
@@ -1065,10 +1073,23 @@ fn csharp_enclosing_class(
     file: &ProjectFile,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let fqn = ClassRangeIndex::build(analyzer, file)
-        .enclosing(byte)?
-        .to_string();
-    analyzer.definitions(&fqn).next().cloned()
+    if let Some(fqn) = ClassRangeIndex::build(analyzer, file).enclosing(byte) {
+        return analyzer.definitions(fqn).next().cloned();
+    }
+
+    let range = Range {
+        start_byte: byte,
+        end_byte: byte.saturating_add(1),
+        start_line: 0,
+        end_line: 0,
+    };
+    let mut current = analyzer.enclosing_code_unit(file, &range)?;
+    loop {
+        if current.is_class() {
+            return Some(current);
+        }
+        current = analyzer.parent_of(&current)?;
+    }
 }
 
 fn csharp_import_boundary_for_type(
@@ -1180,7 +1201,7 @@ fn csharp_seed_active_path(
         bindings.enter_scope();
     }
 
-    if matches!(node.kind(), "parameter" | "variable_declaration")
+    if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
         && node.end_byte() <= cutoff_start
     {
         seed_csharp_bindings_before(node, cutoff_start, csharp, file, source, bindings);
@@ -1193,4 +1214,11 @@ fn csharp_seed_active_path(
         }
         csharp_seed_active_path(child, cutoff_start, csharp, file, source, bindings);
     }
+}
+
+fn csharp_is_local_variable_declaration(node: Node<'_>) -> bool {
+    node.kind() == "variable_declaration"
+        && !node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "field_declaration")
 }

@@ -1,6 +1,6 @@
 use crate::analyzer::common::{
     display_identifier_for_target, display_parent_symbol_for_target, display_symbol_for_target,
-    display_symbol_name, is_scala_object_like, language_for_target,
+    display_symbol_name, is_scala_object_like, language_for_file, language_for_target,
 };
 use crate::analyzer::declaration_range::{
     DeclarationNameRangeContext, code_unit_declaration_name_range,
@@ -8,6 +8,7 @@ use crate::analyzer::declaration_range::{
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
 };
+use crate::analyzer::usages::reference_site::reference_target_match_offsets;
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitSurface,
@@ -1410,8 +1411,9 @@ fn resolve_definition_context_query(
         let Some(symbol_source) = source.get(range.start_byte..range.end_byte) else {
             continue;
         };
+        let language = language_for_file(unit.source());
         for (context_offset, context) in symbol_source.match_indices(&query.context) {
-            for (target_offset, _) in context.match_indices(&query.target) {
+            for target_offset in reference_target_match_offsets(context, &query.target, language) {
                 let start_byte = range.start_byte + context_offset + target_offset;
                 requests.push(
                     crate::analyzer::usages::get_definition::DefinitionLookupRequest {
