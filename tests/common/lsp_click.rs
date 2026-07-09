@@ -179,7 +179,6 @@ pub fn assert_click_cases(fixture: ClickFixture, cases: &[ClickCase<'_>]) -> Vec
         timings.push(timing);
     }
 
-    server.shutdown();
     if let Some(message) = failure {
         panic!("{message}");
     }
