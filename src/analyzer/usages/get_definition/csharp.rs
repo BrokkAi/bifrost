@@ -550,14 +550,13 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
             if csharp_is_unqualified_invocation_target(current) {
                 return Some(CSharpReferenceNode::UnqualifiedMember(current));
             }
+            if csharp_is_type_reference_node(current) {
+                return Some(CSharpReferenceNode::Type(current));
+            }
             if csharp_is_unqualified_member_reference(current) {
                 return Some(CSharpReferenceNode::Identifier(current));
             }
-            if csharp_is_type_reference_node(current) {
-                Some(CSharpReferenceNode::Type(current))
-            } else {
-                Some(CSharpReferenceNode::Identifier(current))
-            }
+            Some(CSharpReferenceNode::Identifier(current))
         }
         "qualified_name" | "generic_name" | "nullable_type" | "array_type" => {
             Some(CSharpReferenceNode::Type(current))
