@@ -2,7 +2,9 @@ use crate::analyzer::scala::imports::parse_scala_import_infos;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::usages::scala_graph::hits::{add_hit, add_import_hit};
+use crate::analyzer::usages::scala_graph::hits::{
+    add_hit, add_import_hit, add_override_declaration_hit,
+};
 use crate::analyzer::usages::scala_graph::resolver::{
     TargetKind, TargetSpec, Visibility, method_signature_arity, package_name_of,
     scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
@@ -208,7 +210,7 @@ fn scan_method_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .spec
         .related_override_owner_fq_matches(owner_fq_name.as_str())
     {
-        add_hit(name, ctx);
+        add_override_declaration_hit(name, ctx);
     }
 }
 

@@ -1,7 +1,9 @@
 mod common;
 
 use brokk_bifrost::searchtools::{ScanUsagesParams, ScanUsagesStatus, scan_usages};
-use brokk_bifrost::usages::{FuzzyResult, PhpUsageGraphStrategy, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::usages::{
+    FuzzyResult, PhpUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHitKind,
+};
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, OverlayProject, PhpAnalyzer};
 use common::InlineTestProject;
 use std::sync::Arc;
@@ -1408,6 +1410,13 @@ function consume(): void {
             .iter()
             .any(|hit| hit.snippet.contains("public function notify")),
         "implementation declarations should appear as interface method usages: {external_hits:#?}"
+    );
+    assert!(
+        external_hits.iter().any(|hit| {
+            hit.kind == UsageHitKind::OverrideDeclaration
+                && hit.snippet.contains("public function notify")
+        }),
+        "implementation declaration should be tagged: {external_hits:#?}"
     );
     assert!(
         lsp_hits

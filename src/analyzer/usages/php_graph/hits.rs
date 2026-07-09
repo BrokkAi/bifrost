@@ -1,4 +1,7 @@
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
+use crate::analyzer::usages::common::{
+    SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, reclassify_override_declaration_hit_at,
+    usage_hit,
+};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::php_graph::resolver::TargetSpec;
 use crate::analyzer::{CodeUnit, IAnalyzer, PhpAnalyzer, ProjectFile, Range};
@@ -110,6 +113,7 @@ pub(super) fn push_override_declaration_hit(
             SNIPPET_CONTEXT_LINES,
         ),
     ));
+    reclassify_override_declaration_hit_at(hits, file, start, end);
 }
 
 fn declaration_name_range(

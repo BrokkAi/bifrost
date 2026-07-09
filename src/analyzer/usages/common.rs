@@ -66,13 +66,32 @@ pub(super) fn reclassify_import_hit_at(
     start: usize,
     end: usize,
 ) {
+    reclassify_hit_at(hits, file, start, end, UsageHit::into_import);
+}
+
+pub(super) fn reclassify_override_declaration_hit_at(
+    hits: &mut BTreeSet<UsageHit>,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+) {
+    reclassify_hit_at(hits, file, start, end, UsageHit::into_override_declaration);
+}
+
+fn reclassify_hit_at(
+    hits: &mut BTreeSet<UsageHit>,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+    reclassify: impl FnOnce(UsageHit) -> UsageHit,
+) {
     if let Some(hit) = hits
         .iter()
         .find(|hit| hit.file == *file && hit.start_offset == start && hit.end_offset == end)
         .cloned()
     {
         hits.remove(&hit);
-        hits.insert(hit.into_import());
+        hits.insert(reclassify(hit));
     }
 }
 

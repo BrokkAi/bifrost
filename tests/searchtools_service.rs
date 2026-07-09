@@ -2266,6 +2266,91 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
 }
 
 #[test]
+fn scan_usages_labels_override_declarations_and_reports_resolved_definition() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Base.java",
+            r#"
+package com.example;
+
+public abstract class Base {
+    public abstract void run(int value);
+
+
+
+    public void run(int value, String unrelated) {}
+}
+"#,
+        )
+        .file(
+            "com/example/Child.java",
+            r#"
+package com.example;
+
+public class Child extends Base {
+    @Override
+    public void run(int value) {}
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let args = r#"{"symbols":["com.example.Child.run"],"include_tests":true}"#;
+    let payload = service.call_tool_json("scan_usages", args).unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!("found", usage["status"]);
+    assert_eq!("com.example.Child.run", usage["fq_name"]);
+    assert_eq!("com/example/Child.java", usage["definition_path"]);
+    assert!(
+        usage["definition_line"].as_u64().is_some(),
+        "payload: {value}"
+    );
+
+    let base = usage["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "com/example/Base.java")
+        .unwrap_or_else(|| panic!("expected Base.java in files: {value}"));
+    let hits = base["hits"].as_array().unwrap();
+    assert!(
+        hits.iter().any(|hit| {
+            hit["kind"] == "override_declaration"
+                && hit["snippet"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.contains("abstract void run(int value)"))
+        }),
+        "expected tagged abstract declaration hit: {value}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            !hit["snippet"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("String unrelated")
+        }),
+        "unrelated overload must not be reported: {value}"
+    );
+
+    let rendered_payload = service
+        .call_tool_payload_json("scan_usages", args, RenderOptions::default())
+        .unwrap();
+    let rendered_value: Value = serde_json::from_str(&rendered_payload).unwrap();
+    let rendered = rendered_value["rendered_text"]
+        .as_str()
+        .expect("rendered text");
+    assert!(
+        rendered.contains("resolved: com.example.Child.run (com/example/Child.java:"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("[override_declaration]"), "{rendered}");
+}
+
+#[test]
 fn scan_usages_distinguishes_resolved_zero_from_unresolved_symbol() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

@@ -14,7 +14,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::reference_site::reference_target_match_offsets;
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
-    ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitSurface,
+    ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
@@ -702,6 +702,10 @@ pub struct ScanUsagesEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fq_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_kind: Option<String>,
@@ -724,6 +728,12 @@ pub enum UsageRendering {
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolUsages {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fq_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_line: Option<usize>,
     pub total_hits: usize,
     pub unproven_hits: usize,
     pub rendering: UsageRendering,
@@ -762,6 +772,8 @@ pub struct UsageLocation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_range: Option<String>,
     pub enclosing: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3384,6 +3396,30 @@ fn retain_hits_resolving_to_overloads(
         .collect()
 }
 
+fn resolved_usage_definition(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+) -> Option<ResolvedUsageDefinition> {
+    overloads
+        .iter()
+        .filter_map(|unit| {
+            let range = primary_range(analyzer, unit)?;
+            Some((unit, range))
+        })
+        .min_by(|(left, left_range), (right, right_range)| {
+            rel_path_string(left.source())
+                .cmp(&rel_path_string(right.source()))
+                .then_with(|| left_range.start_line.cmp(&right_range.start_line))
+                .then_with(|| left_range.start_byte.cmp(&right_range.start_byte))
+                .then_with(|| left.fq_name().cmp(&right.fq_name()))
+        })
+        .map(|(unit, range)| ResolvedUsageDefinition {
+            fq_name: unit.fq_name(),
+            path: rel_path_string(unit.source()),
+            line: range.start_line,
+        })
+}
+
 fn unresolved_hit_matches_target_shape(
     analyzer: &dyn IAnalyzer,
     overloads: &[CodeUnit],
@@ -3636,6 +3672,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             overloads,
             location_selected,
         } = resolved;
+        let resolved_definition = resolved_usage_definition(analyzer, &overloads);
         let finder = scoped_usage_finder(test_files.as_ref(), &path_filter);
         let max_candidate_files = if path_scoped_candidates.is_some() {
             SCAN_USAGES_PATH_SCOPED_MAX_FILES
@@ -3682,6 +3719,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
 
                 let state = SymbolUsageRenderState::new(
                     symbol,
+                    resolved_definition.clone(),
                     truncated,
                     filtered.definition_sites_excluded,
                     filtered.hits,
@@ -3715,6 +3753,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
                     let state = SymbolUsageRenderState::new(
                         symbol,
+                        resolved_definition.clone(),
                         truncated,
                         filtered.definition_sites_excluded,
                         filtered.hits,
@@ -3806,6 +3845,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     filter_and_dedupe_hits(analyzer, &overloads, sample_hits.into_iter().collect());
                 let state = SymbolUsageRenderState::partial_summary(
                     symbol.clone(),
+                    resolved_definition.clone(),
                     total_callsites,
                     truncated,
                     filtered.definition_sites_excluded,
@@ -4257,8 +4297,16 @@ struct UsageHitRow {
     path: String,
     line: usize,
     enclosing: String,
+    kind: UsageHitKind,
     snippet: String,
     confidence: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedUsageDefinition {
+    fq_name: String,
+    path: String,
+    line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -4270,6 +4318,9 @@ struct SummaryFileCount {
 #[derive(Debug, Clone)]
 struct SymbolUsageRenderState {
     symbol: String,
+    fq_name: Option<String>,
+    definition_path: Option<String>,
+    definition_line: Option<usize>,
     total_hits: usize,
     unproven_hits: usize,
     candidate_files_truncated: bool,
@@ -4289,6 +4340,7 @@ impl SymbolUsageRenderState {
     #[allow(clippy::too_many_arguments)]
     fn new(
         symbol: String,
+        resolved_definition: Option<ResolvedUsageDefinition>,
         candidate_files_truncated: bool,
         definition_sites_excluded: usize,
         hits: Vec<UsageHitRow>,
@@ -4339,6 +4391,13 @@ impl SymbolUsageRenderState {
 
         Self {
             symbol,
+            fq_name: resolved_definition
+                .as_ref()
+                .map(|definition| definition.fq_name.clone()),
+            definition_path: resolved_definition
+                .as_ref()
+                .map(|definition| definition.path.clone()),
+            definition_line: resolved_definition.map(|definition| definition.line),
             total_hits,
             unproven_hits,
             candidate_files_truncated,
@@ -4358,6 +4417,7 @@ impl SymbolUsageRenderState {
     #[allow(clippy::too_many_arguments)]
     fn partial_summary(
         symbol: String,
+        resolved_definition: Option<ResolvedUsageDefinition>,
         total_hits: usize,
         candidate_files_truncated: bool,
         definition_sites_excluded: usize,
@@ -4369,6 +4429,7 @@ impl SymbolUsageRenderState {
     ) -> Self {
         let mut state = Self::new(
             symbol,
+            resolved_definition,
             candidate_files_truncated,
             definition_sites_excluded,
             hits,
@@ -4398,7 +4459,7 @@ fn filter_and_dedupe_hits(
             .extend(analyzer.ranges_of(overload));
     }
 
-    let mut rows: BTreeMap<(String, usize, String), UsageHitRow> = BTreeMap::new();
+    let mut rows: BTreeMap<(String, usize, String, UsageHitKind), UsageHitRow> = BTreeMap::new();
     let mut definition_sites_excluded = 0usize;
     for hit in hits {
         // Import and self-receiver hits are for editor references, not the
@@ -4406,9 +4467,10 @@ fn filter_and_dedupe_hits(
         if !hit.kind.included_in(UsageHitSurface::ExternalUsages) {
             continue;
         }
-        if definition_ranges
-            .get(&hit.file)
-            .is_some_and(|ranges| ranges.iter().any(|range| ranges_overlap(range, &hit)))
+        if hit.kind == UsageHitKind::Reference
+            && definition_ranges
+                .get(&hit.file)
+                .is_some_and(|ranges| ranges.iter().any(|range| ranges_overlap(range, &hit)))
         {
             definition_sites_excluded += 1;
             continue;
@@ -4420,10 +4482,11 @@ fn filter_and_dedupe_hits(
             path: path.clone(),
             line: hit.line,
             enclosing: enclosing.clone(),
+            kind: hit.kind,
             snippet: hit.snippet.trim_end().to_string(),
             confidence: hit.confidence,
         };
-        let key = (path, hit.line, enclosing);
+        let key = (path, hit.line, enclosing, hit.kind);
         rows.entry(key)
             .and_modify(|existing| {
                 if row.confidence > existing.confidence
@@ -4632,6 +4695,9 @@ fn classify_usage_entry(
 
 fn populate_usage_payload(entry: &mut ScanUsagesEntry, usage: SymbolUsages) {
     entry.symbol = Some(usage.symbol);
+    entry.fq_name = usage.fq_name;
+    entry.definition_path = usage.definition_path;
+    entry.definition_line = usage.definition_line;
     entry.total_hits = Some(usage.total_hits);
     entry.unproven_hits = Some(usage.unproven_hits);
     entry.rendering = Some(usage.rendering);
@@ -4687,6 +4753,8 @@ fn scan_usages_entry_base(
         candidate_details_truncated: false,
         candidates: Vec::new(),
         fq_name: None,
+        definition_path: None,
+        definition_line: None,
         strategy: None,
         reason_kind: None,
         candidate_files_sample: None,
@@ -4862,6 +4930,9 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
 
     SymbolUsages {
         symbol: state.symbol.clone(),
+        fq_name: state.fq_name.clone(),
+        definition_path: state.definition_path.clone(),
+        definition_line: state.definition_line,
         total_hits: state.total_hits,
         unproven_hits: state.unproven_hits,
         rendering: state.rendering,
@@ -4890,6 +4961,7 @@ fn render_usage_file_groups(hits: &[UsageHitRow], include_snippets: bool) -> Vec
                 line: hit.line,
                 line_range: None,
                 enclosing: hit.enclosing.clone(),
+                kind: hit.kind.external_label().map(str::to_string),
                 snippet: include_snippets.then(|| hit.snippet.clone()),
                 hit_count: None,
                 confidence: hit.confidence,
@@ -4957,6 +5029,10 @@ fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGrou
                             format!("{}-{}", first.line, last.line)
                         }),
                         enclosing,
+                        kind: group
+                            .iter()
+                            .find_map(|hit| hit.kind.external_label())
+                            .map(str::to_string),
                         snippet: None,
                         hit_count: Some(group.len()),
                         confidence: max_confidence,
@@ -4966,6 +5042,7 @@ fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGrou
                         line: hit.line,
                         line_range: None,
                         enclosing: hit.enclosing.clone(),
+                        kind: hit.kind.external_label().map(str::to_string),
                         snippet: Some(hit.snippet.clone()),
                         hit_count: None,
                         confidence: hit.confidence,
@@ -6380,8 +6457,8 @@ mod tests {
     use super::{
         ScanUsageRequest, ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample,
         ScanUsagesStatus, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState,
-        UsageFailureInfo, UsageHitRow, UsageRendering, classify_scan_usages_entry, list_symbols,
-        resolve_file_patterns, trim_summary_signature,
+        UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
+        list_symbols, resolve_file_patterns, trim_summary_signature,
     };
     use crate::analyzer::{
         CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
@@ -6790,6 +6867,7 @@ def gamma():
             path: path.to_string(),
             line,
             enclosing: "Caller.run".to_string(),
+            kind: UsageHitKind::Reference,
             snippet: "target();".to_string(),
             confidence: 1.0,
         }
@@ -6807,6 +6885,7 @@ def gamma():
             request: scan_usage_request(symbol),
             state: SymbolUsageRenderState::new(
                 symbol.to_string(),
+                None,
                 candidate_files_truncated,
                 0,
                 proven,
@@ -6991,6 +7070,7 @@ def gamma():
             request: scan_usage_request("target"),
             state: SymbolUsageRenderState::partial_summary(
                 "target".to_string(),
+                None,
                 1001,
                 false,
                 0,

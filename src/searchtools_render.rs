@@ -311,6 +311,13 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
     if let Some(message) = &entry.message {
         lines.push(format!("  message: {message}"));
     }
+    if let (Some(fq_name), Some(path), Some(line)) = (
+        entry.fq_name.as_ref(),
+        entry.definition_path.as_ref(),
+        entry.definition_line,
+    ) {
+        lines.push(format!("  resolved: {fq_name} ({path}:{line})"));
+    }
     for note in &entry.notes {
         lines.push(format!("  note: {note}"));
     }
@@ -437,6 +444,9 @@ fn render_usage_location_text(hit: &UsageLocation, prefix: &str) -> Vec<String> 
     }
     if let Some(hit_count) = hit.hit_count {
         line.push_str(&format!(" ({hit_count} hit(s))"));
+    }
+    if let Some(kind) = &hit.kind {
+        line.push_str(&format!(" [{kind}]"));
     }
     if hit.confidence < 1.0 {
         line.push_str(&format!(" [confidence {:.2}]", hit.confidence));

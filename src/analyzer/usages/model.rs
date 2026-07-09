@@ -16,18 +16,18 @@ pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// internal self/this receiver reference.
 ///
 /// The call-graph / relevance surfaces (SearchTools, dead-code, rename, call
-/// hierarchy) care only about ordinary external `Reference` hits; the LSP
-/// `textDocument/references` surface (IDE "find references") also wants import
-/// bindings, self-receiver references, and override declarations. Keeping all in
-/// one graph with a kind lets each consumer choose through [`UsageHitSurface`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// hierarchy) care about ordinary external `Reference` hits and override /
+/// implementation declarations. The LSP `textDocument/references` surface (IDE
+/// "find references") also wants import bindings and self-receiver references.
+/// Keeping all in one graph with a kind lets each consumer choose through
+/// [`UsageHitSurface`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum UsageHitKind {
     #[default]
     Reference,
     Import,
     SelfReceiver,
-    /// A declaration that overrides/implements the queried declaration; editor-visible,
-    /// not an external usage.
+    /// A declaration that overrides/implements the queried declaration.
     OverrideDeclaration,
 }
 
@@ -51,8 +51,21 @@ pub enum UsageHitSurface {
 impl UsageHitKind {
     pub fn included_in(self, surface: UsageHitSurface) -> bool {
         match surface {
-            UsageHitSurface::ExternalUsages => self == UsageHitKind::Reference,
+            UsageHitSurface::ExternalUsages => {
+                matches!(
+                    self,
+                    UsageHitKind::Reference | UsageHitKind::OverrideDeclaration
+                )
+            }
             UsageHitSurface::LspReferences => true,
+        }
+    }
+
+    pub fn external_label(self) -> Option<&'static str> {
+        match self {
+            UsageHitKind::Reference => None,
+            UsageHitKind::OverrideDeclaration => Some("override_declaration"),
+            UsageHitKind::Import | UsageHitKind::SelfReceiver => None,
         }
     }
 }
@@ -617,7 +630,9 @@ mod tests {
 
         assert_eq!(
             result.all_hits_for_surface(UsageHitSurface::ExternalUsages),
-            [reference.clone()].into_iter().collect()
+            [reference.clone(), override_declaration.clone()]
+                .into_iter()
+                .collect()
         );
         assert_eq!(
             result.all_hits_for_surface(UsageHitSurface::LspReferences),

@@ -1,5 +1,7 @@
 use crate::analyzer::Range;
-use crate::analyzer::usages::common::{reclassify_import_hit_at, usage_hit};
+use crate::analyzer::usages::common::{
+    reclassify_import_hit_at, reclassify_override_declaration_hit_at, usage_hit,
+};
 use crate::analyzer::usages::scala_graph::extractor::ScanCtx;
 use crate::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
@@ -49,6 +51,11 @@ pub(super) fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 pub(super) fn add_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     add_hit(node, ctx);
     reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+}
+
+pub(super) fn add_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    add_hit(node, ctx);
+    reclassify_override_declaration_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
 }
 
 fn range_within_any(ranges: &[Range], needle: &Range) -> bool {

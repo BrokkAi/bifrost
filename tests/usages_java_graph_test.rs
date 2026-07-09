@@ -3,6 +3,7 @@ mod common;
 use brokk_bifrost::usages::FuzzyResult;
 use brokk_bifrost::usages::{
     JavaUsageGraphStrategy, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit,
+    UsageHitKind,
 };
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ScalaAnalyzer,
@@ -639,6 +640,86 @@ public class Consumer {
             .iter()
             .any(|snippet| snippet.contains("impl.run()")),
         "concrete receiver call should be a reference: {snippets:#?}"
+    );
+}
+
+#[test]
+fn java_graph_method_declaration_hits_validate_the_visited_overload_signature() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/AbstractAverageSpeedParser.java",
+            r#"
+package com.example;
+
+public abstract class AbstractAverageSpeedParser {
+    public abstract void handleWayTags(int edgeId, ReaderWay way, IntsRef relationFlags);
+
+
+
+    public void handleWayTags(int edgeId, ReaderWay way, IntsRef relationFlags, String unrelated) {}
+}
+"#,
+        ),
+        (
+            "com/example/BikeCommonAverageSpeedParser.java",
+            r#"
+package com.example;
+
+public class BikeCommonAverageSpeedParser extends AbstractAverageSpeedParser {
+    @Override
+    public void handleWayTags(int edgeId, ReaderWay way, IntsRef relationFlags) {}
+}
+"#,
+        ),
+        (
+            "com/example/ReaderWay.java",
+            "package com.example; public class ReaderWay {}\n",
+        ),
+        (
+            "com/example/IntsRef.java",
+            "package com.example; public class IntsRef {}\n",
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(
+        &analyzer,
+        "com.example.BikeCommonAverageSpeedParser.handleWayTags",
+    );
+    let method_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("subclass method family success");
+    let snippets = method_hits
+        .iter()
+        .map(|hit| hit.snippet.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        1,
+        method_hits.len(),
+        "expected only the matching abstract declaration, got {method_hits:#?}"
+    );
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("abstract void handleWayTags")),
+        "matching abstract declaration should be a usage: {snippets:#?}"
+    );
+    assert!(
+        snippets
+            .iter()
+            .all(|snippet| !snippet.contains("String unrelated")),
+        "unrelated overload must not be swept in: {snippets:#?}"
+    );
+    assert_eq!(
+        Some(UsageHitKind::OverrideDeclaration),
+        method_hits.iter().map(|hit| hit.kind).next()
     );
 }
 

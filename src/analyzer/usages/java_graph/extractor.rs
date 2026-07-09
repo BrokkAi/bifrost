@@ -413,6 +413,9 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let context = hits::enclosing_context(declaration, ctx);
+    let Some(enclosing) = context.enclosing.as_ref() else {
+        return;
+    };
     let Some(owner) = context.owner.as_ref() else {
         return;
     };
@@ -426,15 +429,8 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    let matching_declaration = ctx
-        .analyzer
-        .get_definitions(&format!("{}.{}", owner.fq_name(), ctx.spec.member_name))
-        .into_iter()
-        .any(|candidate| {
-            candidate.is_function() && java_method_signatures_match(&ctx.spec.target, &candidate)
-        });
-    if matching_declaration {
-        hits::push_hit(node, ctx);
+    if enclosing.is_function() && java_method_signatures_match(&ctx.spec.target, enclosing) {
+        hits::push_override_declaration_hit(node, ctx);
     }
 }
 
