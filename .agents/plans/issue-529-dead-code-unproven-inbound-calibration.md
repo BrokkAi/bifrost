@@ -18,7 +18,7 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 
 - [x] (2026-07-09T07:44:31Z) Created this ExecPlan from issue #529, `.agents/PLANS.md`, the existing issue #528 Stage 7 design record, and the current benchmark/dead-code code paths.
 - [x] (2026-07-09T07:59:56Z) Milestone 0: added benchmark-harness support for a `dead_code_smells` scenario and pinned manifest probes.
-- [ ] Milestone 1: calibrate PHP bulk dead-code unproven-inbound evidence.
+- [x] (2026-07-09T08:14:34Z) Milestone 1: calibrated PHP bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 2: calibrate Scala bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 3: calibrate scoped JavaScript/TypeScript bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 4: calibrate Python bulk dead-code unproven-inbound evidence.
@@ -49,6 +49,12 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 - Observation: Guided review found that FQN-only dead-code probes were fragile in `--max-files` subset benchmark mode because subset preparation only pins path-based probe files.
   Evidence: `src/benchmark/subset_workspace.rs` gathered summary, seed, usage, definition, call-hierarchy, and type-hierarchy paths, but no dead-code paths.
 
+- Observation: The initial PHP fixture proved method candidates were still effectively using the old dead-code behavior and an untyped receiver allowed `App.Service.target` to report dead.
+  Evidence: `BIFROST_SEMANTIC_INDEX=off cargo test --test php_dead_code_smells php_bulk_unproven_receiver_usage_is_inconclusive_not_dead` failed with `App.Service.target` reported as `no non-self usages found` before PHP method unproven evidence was wired through the bulk path.
+
+- Observation: Moving PHP methods to the bulk graph without preserving method scoring changed method scores and public-surface wording.
+  Evidence: Guided review of the Milestone 1 diff found `App.Service.unused` shifted from the existing PHP method bar to public-surface scoring (`10 | 0.55`) and `App.Service.used` shifted to `8 | 0.45`.
+
 
 ## Decision Log
 
@@ -76,6 +82,14 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
   Rationale: Exact `fq_names` remain the dead-code report targets, but subset workspace preparation needs concrete paths to make those FQNs resolvable when benchmarks run against a reduced file set.
   Date/Author: 2026-07-09 / Codex.
 
+- Decision: PHP methods are now bulk-safe, but constructors, fields, and constants remain on the precise path.
+  Rationale: Issue #529's PHP receiver calibration is about `$obj->method()` calls, and the inverted graph can prove typed method calls and mark untyped method calls inconclusive. Constructors, fields, and constants do not participate in this method-only unproven receiver bar.
+  Date/Author: 2026-07-09 / Codex.
+
+- Decision: Preserve the existing PHP method dead-code score/confidence/rationale in the bulk graph finding builder.
+  Rationale: The milestone requires proven-inbound reporting to stay unchanged. Bulk graph evidence records callers rather than exact hit snippets, but method severity should not be weakened just because the candidate moved from the precise strategy to calibrated bulk analysis.
+  Date/Author: 2026-07-09 / Codex.
+
 
 ## Outcomes & Retrospective
 
@@ -99,6 +113,27 @@ Guided review finding before commit:
 
     LOW / Infrastructure: dead-code FQN probes were not represented in subset workspace pinning, so future dead-code-only probes could fail under --max-files even when the full benchmark passed.
     Fix: added dead_code_file_paths to the manifest model, runner arguments, subset workspace pinned paths, current pinned repos, README, and checked-in manifest test.
+
+Milestone 1 calibrated PHP by adding unproven inbound emission for unresolved `member_call_expression` receiver typing, routing PHP methods through the bulk graph, and preserving PHP method score/confidence/rationale in the graph finding builder. The focused fixture proves an untyped `$service->target()` caller makes `App.Service.target` inconclusive, `App.Service.unused` still reports dead at the existing PHP method score, and typed `Service $service->used()` still reports as a one-call abstraction at the existing PHP method score.
+
+Validation evidence after guided review fix:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test php_dead_code_smells --test usage_graph_php_test
+    result: passed at 2026-07-09T08:14:34Z; 15 php_dead_code_smells tests and 15 usage_graph_php_test tests passed
+
+    BIFROST_SEMANTIC_INDEX=off cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
+    result: passed at 2026-07-09T08:14:34Z; validated 10 repos and covered scenarios include dead_code_smells
+
+    cargo fmt --check
+    result: passed at 2026-07-09T08:14:34Z
+
+    cargo clippy-no-cuda
+    result: blocked by the same repeated E0514 incompatible-rustc dependency metadata errors seen in Milestone 0
+
+Guided review finding before the Milestone 1 commit:
+
+    MEDIUM / Tests and behavior: routing PHP methods to the bulk graph changed method scores/wording to public-surface scoring, violating the milestone requirement that proven-inbound reporting stay unchanged.
+    Fix: added a PHP method-specific graph finding builder with the existing method score/confidence/rationale, and strengthened tests to assert the method scores for unused and proven-inbound cases.
 
 
 ## Context and Orientation

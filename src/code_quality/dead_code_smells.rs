@@ -1500,6 +1500,9 @@ fn php_graph_finding(
     candidate: &CodeUnit,
     usage: GraphIncomingUsage,
 ) -> Option<DeadCodeFinding> {
+    if php_method_candidate(analyzer, candidate) {
+        return php_method_graph_finding(analyzer, declarations_by_fqn, candidate, usage);
+    }
     public_surface_graph_finding(
         analyzer,
         Language::Php,
@@ -1509,6 +1512,61 @@ fn php_graph_finding(
         true,
         "public",
     )
+}
+
+fn php_method_candidate(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    candidate.is_function()
+        && analyzer
+            .parent_of(candidate)
+            .is_some_and(|parent| parent.is_class())
+}
+
+fn php_method_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    if usage.total > 1 {
+        return None;
+    }
+
+    let range = analyzer
+        .ranges_of(candidate)
+        .into_iter()
+        .filter(|range| !range.is_empty())
+        .max_by_key(span_lines)?;
+    let declaration_lines = span_lines(&range);
+    let score = graph_score(usage.total, declaration_lines);
+    let confidence = if usage.total == 0 { 0.95 } else { 0.75 };
+    let evidence = graph_inbound_evidence(&usage);
+    let rationale = if usage.total == 0 {
+        "symbol has no usage evidence in PHP tree-sitter analysis and may be generated residue"
+            .to_string()
+    } else {
+        "symbol has only one non-self caller in PHP tree-sitter analysis and may be a low-value abstraction"
+            .to_string()
+    };
+
+    Some(DeadCodeFinding {
+        language: Language::Php,
+        score,
+        confidence,
+        kind: candidate.kind().display_lowercase().to_string(),
+        symbol: candidate.fq_name(),
+        file: candidate.source().clone(),
+        start_line: range.start_line + 1,
+        end_line: range.end_line + 1,
+        total_usage_count: usage.total,
+        external_usage_count: external_usage_count(
+            analyzer,
+            declarations_by_fqn,
+            candidate,
+            &usage,
+        ),
+        evidence,
+        rationale,
+    })
 }
 
 fn ruby_graph_finding(

@@ -53,8 +53,10 @@ pub(crate) fn dead_code_bulk_eligibility(
         return PhpDeadCodeBulkEligibility::NeedsPrecise;
     };
     match spec.kind {
-        TargetKind::Type | TargetKind::Function => PhpDeadCodeBulkEligibility::BulkSafe,
-        TargetKind::Constructor | TargetKind::Method | TargetKind::Field | TargetKind::Constant => {
+        TargetKind::Type | TargetKind::Function | TargetKind::Method => {
+            PhpDeadCodeBulkEligibility::BulkSafe
+        }
+        TargetKind::Constructor | TargetKind::Field | TargetKind::Constant => {
             PhpDeadCodeBulkEligibility::NeedsPrecise
         }
     }
