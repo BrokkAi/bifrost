@@ -214,7 +214,7 @@ impl BenchmarkScenario {
     pub fn tool_name(self) -> &'static str {
         match self {
             Self::DeadCodeSmells => "report_dead_code_and_unused_abstraction_smells",
-            Self::GetDefinition => "get_definition_by_location",
+            Self::GetDefinition => "get_definitions_by_location",
             Self::CallHierarchy | Self::TypeHierarchy => self.label(),
             _ => self.label(),
         }

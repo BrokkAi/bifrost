@@ -14,27 +14,26 @@
 //! - `Type.method(..)` (static) resolves the type directly;
 //! - a bare `method(..)` attributes to the enclosing class (`this`/inherited).
 //!
-//! Receivers that need return-type inference (method chains) or field-access
-//! typing are not resolved — a recall gap, not a wrong edge. This mirrors the
-//! receiver shapes the forward Java scan proves.
+//! Receivers that need field-access typing are not resolved — a recall gap, not
+//! a wrong edge. Method-invocation receivers are typed from the callee's declared
+//! return type, matching the same inference used when seeding locals.
 
-use super::resolver::{is_ignored_type_context, node_text, signature_arity};
+use super::resolver::{is_ignored_type_context, node_text};
+use super::return_type::{
+    FileReturnCache, JavaReturnTypeContext, METHOD_RECEIVER_CHAIN_LIMIT,
+    METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodReturnCache, merge_receiver_type_outcomes,
+    method_return_type_for_owner_fqn,
+};
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
-use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile, Range};
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Mutex;
-use tree_sitter::{Node, Parser};
-
-type MethodReturnCacheKey = (ProjectFile, String, Option<String>);
-type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
-type FileReturnCacheKey = (String, Option<String>);
-type FileReturnCache =
-    Mutex<HashMap<ProjectFile, HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>>>;
+use tree_sitter::Node;
 
 pub(super) fn build_java_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -105,6 +104,32 @@ impl JavaScan<'_, '_> {
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
         self.collector
             .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
+}
+
+impl JavaReturnTypeContext for JavaScan<'_, '_> {
+    fn java(&self) -> &JavaAnalyzer {
+        self.java
+    }
+
+    fn file(&self) -> &ProjectFile {
+        self.file
+    }
+
+    fn root(&self) -> Node<'_> {
+        self.root
+    }
+
+    fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
+        JavaScan::resolve_type_fqn(self, node)
+    }
+
+    fn method_return_cache(&self) -> &MethodReturnCache {
+        self.return_type_cache
+    }
+
+    fn file_return_cache(&self) -> &FileReturnCache {
+        self.file_return_cache
     }
 }
 
@@ -212,8 +237,17 @@ fn method_owner_fqn(
     ctx: &JavaScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
+    method_owner_fqn_at_depth(node, ctx, bindings, 0)
+}
+
+fn method_owner_fqn_at_depth(
+    node: Node<'_>,
+    ctx: &JavaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+    depth: usize,
+) -> Option<String> {
     match node.child_by_field_name("object") {
-        Some(object) => receiver_type_fqn(object, ctx, bindings),
+        Some(object) => receiver_type_fqn_at_depth(object, ctx, bindings, depth + 1),
         None => ctx
             .class_ranges
             .enclosing(node.start_byte())
@@ -227,6 +261,15 @@ fn receiver_type_fqn(
     object: Node<'_>,
     ctx: &JavaScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    receiver_type_fqn_at_depth(object, ctx, bindings, 0)
+}
+
+fn receiver_type_fqn_at_depth(
+    object: Node<'_>,
+    ctx: &JavaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+    depth: usize,
 ) -> Option<String> {
     match object.kind() {
         "identifier" => {
@@ -249,6 +292,16 @@ fn receiver_type_fqn(
         "object_creation_expression" => object
             .child_by_field_name("type")
             .and_then(|type_node| ctx.resolve_type_fqn(type_node)),
+        "method_invocation" => match receiver_type_outcome_at_depth(object, ctx, bindings, depth) {
+            ReceiverAnalysisOutcome::Precise(values) if values.len() == 1 => {
+                values.into_iter().next()
+            }
+            ReceiverAnalysisOutcome::Precise(_)
+            | ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. }
+            | ReceiverAnalysisOutcome::Unknown => None,
+        },
         _ => None,
     }
 }
@@ -371,13 +424,29 @@ fn receiver_type_outcome(
     ctx: &JavaScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> ReceiverAnalysisOutcome<String> {
+    receiver_type_outcome_at_depth(expression, ctx, bindings, 0)
+}
+
+fn receiver_type_outcome_at_depth(
+    expression: Node<'_>,
+    ctx: &JavaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+    depth: usize,
+) -> ReceiverAnalysisOutcome<String> {
+    if depth > METHOD_RECEIVER_CHAIN_LIMIT {
+        return ReceiverAnalysisOutcome::ExceededBudget {
+            limit: METHOD_RECEIVER_CHAIN_LIMIT_NAME,
+        };
+    }
     match expression.kind() {
         "object_creation_expression" => expression
             .child_by_field_name("type")
             .and_then(|type_node| ctx.resolve_type_fqn(type_node))
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown),
-        "method_invocation" => method_invocation_return_type_outcome(expression, ctx, bindings),
+        "method_invocation" => {
+            method_invocation_return_type_outcome(expression, ctx, bindings, depth)
+        }
         "identifier" => {
             let name = node_text(expression, ctx.source);
             single_precise_binding(bindings, name)
@@ -388,13 +457,13 @@ fn receiver_type_outcome(
             let outcomes: Vec<_> = ["consequence", "alternative"]
                 .into_iter()
                 .filter_map(|field| expression.child_by_field_name(field))
-                .map(|branch| receiver_type_outcome(branch, ctx, bindings))
+                .map(|branch| receiver_type_outcome_at_depth(branch, ctx, bindings, depth))
                 .collect();
             merge_receiver_type_outcomes(outcomes)
         }
         "parenthesized_expression" => expression
             .named_child(0)
-            .map(|child| receiver_type_outcome(child, ctx, bindings))
+            .map(|child| receiver_type_outcome_at_depth(child, ctx, bindings, depth))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown),
         _ => ReceiverAnalysisOutcome::Unknown,
     }
@@ -404,7 +473,13 @@ fn method_invocation_return_type_outcome(
     invocation: Node<'_>,
     ctx: &JavaScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
+    depth: usize,
 ) -> ReceiverAnalysisOutcome<String> {
+    if depth > METHOD_RECEIVER_CHAIN_LIMIT {
+        return ReceiverAnalysisOutcome::ExceededBudget {
+            limit: METHOD_RECEIVER_CHAIN_LIMIT_NAME,
+        };
+    }
     let Some(name_node) = invocation.child_by_field_name("name") else {
         return ReceiverAnalysisOutcome::Unknown;
     };
@@ -412,10 +487,10 @@ fn method_invocation_return_type_outcome(
     if name.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
     }
-    let Some(owner) = method_owner_fqn(invocation, ctx, bindings) else {
+    let Some(owner) = method_owner_fqn_at_depth(invocation, ctx, bindings, depth) else {
         return ReceiverAnalysisOutcome::Unknown;
     };
-    method_unit_declared_return_type_outcome(&owner, name, argument_count(invocation), ctx)
+    method_return_type_for_owner_fqn(&owner, name, argument_count(invocation), ctx)
 }
 
 fn argument_count(invocation: Node<'_>) -> usize {
@@ -423,191 +498,4 @@ fn argument_count(invocation: Node<'_>) -> usize {
         .child_by_field_name("arguments")
         .map(|arguments| arguments.named_child_count())
         .unwrap_or(0)
-}
-
-fn method_unit_declared_return_type_outcome(
-    owner: &str,
-    name: &str,
-    arity: usize,
-    ctx: &JavaScan<'_, '_>,
-) -> ReceiverAnalysisOutcome<String> {
-    let fqn = format!("{owner}.{name}");
-    let units = ctx
-        .java
-        .definitions(&fqn)
-        .filter(|unit| signature_arity(unit.signature()) == arity)
-        .cloned()
-        .collect::<Vec<_>>();
-    if units.is_empty() {
-        return ReceiverAnalysisOutcome::Unknown;
-    }
-    if let Some(return_type) = ctx.java.usage_facts_index().callable_return_type(&fqn) {
-        return ReceiverAnalysisOutcome::Precise(vec![return_type.to_string()]);
-    }
-    merge_receiver_type_outcomes(
-        units
-            .into_iter()
-            .map(|unit| method_unit_declared_return_type(&unit, ctx)),
-    )
-}
-
-fn method_unit_declared_return_type(
-    method: &CodeUnit,
-    ctx: &JavaScan<'_, '_>,
-) -> ReceiverAnalysisOutcome<String> {
-    if let Some(return_type) = ctx
-        .java
-        .usage_facts_index()
-        .fact_for_declaration(method)
-        .and_then(|facts| facts.return_type_fqn.as_deref())
-    {
-        return ReceiverAnalysisOutcome::Precise(vec![return_type.to_string()]);
-    }
-
-    let cache_key = (
-        method.source().clone(),
-        method.fq_name(),
-        method.signature().map(str::to_string),
-    );
-    if let Some(cached) = ctx
-        .return_type_cache
-        .lock()
-        .expect("java return type cache poisoned")
-        .get(&cache_key)
-        .cloned()
-    {
-        return cached;
-    }
-    let outcome = method_unit_declared_return_type_uncached(method, ctx);
-    ctx.return_type_cache
-        .lock()
-        .expect("java return type cache poisoned")
-        .insert(cache_key, outcome.clone());
-    outcome
-}
-
-fn method_unit_declared_return_type_uncached(
-    method: &CodeUnit,
-    ctx: &JavaScan<'_, '_>,
-) -> ReceiverAnalysisOutcome<String> {
-    let Some(range) = ctx.java.ranges(method).first().copied() else {
-        return ReceiverAnalysisOutcome::Unknown;
-    };
-    if method.source() == ctx.file {
-        return java_return_type_node_covering(ctx.root, &range)
-            .and_then(|type_node| ctx.resolve_type_fqn(type_node))
-            .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
-            .unwrap_or(ReceiverAnalysisOutcome::Unknown);
-    }
-    java_file_return_type_index(ctx, method.source())
-        .get(&(method.fq_name(), method.signature().map(str::to_string)))
-        .cloned()
-        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
-}
-
-fn java_file_return_type_index(
-    ctx: &JavaScan<'_, '_>,
-    file: &ProjectFile,
-) -> HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>> {
-    if let Some(cached) = ctx
-        .file_return_cache
-        .lock()
-        .expect("java file return cache poisoned")
-        .get(file)
-        .cloned()
-    {
-        return cached;
-    }
-
-    let index = build_java_file_return_type_index(ctx, file);
-    ctx.file_return_cache
-        .lock()
-        .expect("java file return cache poisoned")
-        .insert(file.clone(), index.clone());
-    index
-}
-
-fn build_java_file_return_type_index(
-    ctx: &JavaScan<'_, '_>,
-    file: &ProjectFile,
-) -> HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>> {
-    let Ok(source) = file.read_to_string() else {
-        return HashMap::default();
-    };
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .is_err()
-    {
-        return HashMap::default();
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return HashMap::default();
-    };
-    ctx.java
-        .declarations(file)
-        .filter(|unit| unit.is_function())
-        .map(|unit| {
-            let outcome = ctx
-                .java
-                .ranges(unit)
-                .first()
-                .copied()
-                .and_then(|range| java_return_type_node_covering(tree.root_node(), &range))
-                .and_then(|type_node| java_type_fqn_from_node(ctx.java, file, &source, type_node))
-                .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
-                .unwrap_or(ReceiverAnalysisOutcome::Unknown);
-            (
-                (unit.fq_name(), unit.signature().map(str::to_string)),
-                outcome,
-            )
-        })
-        .collect()
-}
-
-fn java_type_fqn_from_node(
-    java: &JavaAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    type_node: Node<'_>,
-) -> Option<String> {
-    let raw = node_text(type_node, source);
-    let normalized = raw
-        .split('<')
-        .next()
-        .unwrap_or(raw)
-        .trim()
-        .trim_end_matches("[]")
-        .trim();
-    (!normalized.is_empty())
-        .then(|| java.resolve_type_name_in_file(file, normalized))
-        .flatten()
-        .map(|unit| unit.fq_name())
-}
-
-fn java_return_type_node_covering<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
-    let mut result = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
-            continue;
-        }
-        if node.kind() == "method_declaration"
-            && let Some(type_node) = node.child_by_field_name("type")
-        {
-            result = Some(type_node);
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    result
-}
-
-fn merge_receiver_type_outcomes(
-    outcomes: impl IntoIterator<Item = ReceiverAnalysisOutcome<String>>,
-) -> ReceiverAnalysisOutcome<String> {
-    ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, ReceiverAnalysisBudget::default())
 }

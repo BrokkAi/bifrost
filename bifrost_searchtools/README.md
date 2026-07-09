@@ -66,8 +66,8 @@ exposes:
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
-| `get_definition_by_location(path, *, line=..., column=...)` | Resolve a reference at a known file location. |
-| `get_definition_by_reference(symbol, *, context=..., target=...)` | Resolve a copied reference inside a symbol source block. |
+| `get_definitions_by_location([{"path": ..., "line": ..., "column": ...}])` | Resolve references at known file locations. |
+| `get_definitions_by_reference([{"symbol": ..., "context": ..., "target": ...}])` | Resolve copied references inside symbol source blocks. |
 | `get_type_by_location(path, *, line=..., column=...)` | Resolve the type of an expression or identifier at a known file location. |
 | `get_summaries(targets)` | Signature-level outline of files / classes / directories. |
 | `list_symbols(file_patterns)` | Skim the symbols declared in matching files. |

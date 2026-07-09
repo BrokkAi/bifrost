@@ -271,7 +271,11 @@ impl<'a> PhpVisitor<'a> {
             } else {
                 format!("{modifiers}{type_prefix}{raw_name};")
             };
-            self.parsed.add_signature(code_unit, signature);
+            self.parsed.add_signature_with_metadata(
+                code_unit,
+                SignatureMetadata::new(signature, Vec::new())
+                    .with_return_type_text(php_declared_type_text(node, self.source)),
+            );
         }
     }
 
@@ -393,7 +397,11 @@ impl<'a> PhpVisitor<'a> {
                 "{};",
                 normalize_php_snippet(&php_node_text(parameter, self.source)).trim_end_matches(',')
             );
-            self.parsed.add_signature(code_unit, signature);
+            self.parsed.add_signature_with_metadata(
+                code_unit,
+                SignatureMetadata::new(signature, Vec::new())
+                    .with_return_type_text(php_declared_type_text(parameter, self.source)),
+            );
         }
     }
 }
@@ -509,6 +517,22 @@ fn php_signature_metadata(signature: String, node: Node<'_>, source: &str) -> Si
         })
         .collect();
     SignatureMetadata::new(signature, parameters)
+        .with_return_type_text(php_declared_type_text(node, source))
+}
+
+fn php_declared_type_text(node: Node<'_>, source: &str) -> Option<String> {
+    php_declared_type_node(node)
+        .map(|type_node| php_node_text(type_node, source).trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+pub(super) fn php_declared_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let field_name = match node.kind() {
+        "function_definition" | "method_declaration" => "return_type",
+        "property_declaration" | "property_promotion_parameter" => "type",
+        _ => return None,
+    };
+    node.child_by_field_name(field_name)
 }
 
 fn php_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {

@@ -7,7 +7,8 @@ use brokk_bifrost::usages::{
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ScalaAnalyzer,
 };
-use common::InlineTestProject;
+use common::{InlineTestProject, call_search_tool_json};
+use serde_json::json;
 use std::collections::BTreeMap;
 
 fn definition(analyzer: &JavaAnalyzer, fq_name: &str) -> CodeUnit {
@@ -639,6 +640,149 @@ public class Consumer {
             .any(|snippet| snippet.contains("impl.run()")),
         "concrete receiver call should be a reference: {snippets:#?}"
     );
+}
+
+#[test]
+fn java_graph_strategy_resolves_singleton_return_receiver_calls() {
+    let (project, analyzer) = java_analyzer_with_files(&[
+        (
+            "org/example/ProcessOperationLockRegistry.java",
+            r#"
+package org.example;
+
+public final class ProcessOperationLockRegistry {
+    private static final ProcessOperationLockRegistry INSTANCE =
+            new ProcessOperationLockRegistry();
+
+    public static ProcessOperationLockRegistry getInstance() {
+        return INSTANCE;
+    }
+
+    public void notify(String processId) {}
+
+    public void waitUntilReleaseReady(String processId, long timeoutMillis) {}
+}
+"#,
+        ),
+        (
+            "org/example/Consumer.java",
+            r#"
+package org.example;
+
+public class Consumer {
+    void lock(String processId) {
+        ProcessOperationLockRegistry.getInstance().notify(processId);
+        ProcessOperationLockRegistry.getInstance().waitUntilReleaseReady(processId, 10L);
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let notify = definition(&analyzer, "org.example.ProcessOperationLockRegistry.notify");
+    let wait_until_release_ready = definition(
+        &analyzer,
+        "org.example.ProcessOperationLockRegistry.waitUntilReleaseReady",
+    );
+
+    let notify_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&notify),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&notify_hits, "getInstance().notify(processId)");
+
+    let wait_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&wait_until_release_ready),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(
+        &wait_hits,
+        "getInstance().waitUntilReleaseReady(processId, 10L)",
+    );
+
+    let scan = call_search_tool_json(
+        project.root(),
+        "scan_usages",
+        &json!({
+            "symbols": [
+                "org.example.ProcessOperationLockRegistry.notify",
+                "org.example.ProcessOperationLockRegistry.waitUntilReleaseReady"
+            ],
+            "include_tests": true
+        })
+        .to_string(),
+    );
+    for symbol in [
+        "org.example.ProcessOperationLockRegistry.notify",
+        "org.example.ProcessOperationLockRegistry.waitUntilReleaseReady",
+    ] {
+        let entry = scan["results"]
+            .as_array()
+            .and_then(|results| results.iter().find(|entry| entry["input"] == symbol))
+            .unwrap_or_else(|| panic!("missing scan_usages result for {symbol}: {scan}"));
+        assert_eq!("found", entry["status"], "{scan}");
+        assert_eq!(1, entry["total_hits"], "{scan}");
+        assert_eq!(0, entry["unproven_hits"], "{scan}");
+    }
+}
+
+#[test]
+fn java_graph_strategy_budgets_deep_return_receiver_chains() {
+    let deep_receiver = (0..80).fold(
+        "ProcessOperationLockRegistry.getInstance()".to_string(),
+        |receiver, _| format!("{receiver}.next()"),
+    );
+    let consumer = format!(
+        r#"
+package org.example;
+
+public class Consumer {{
+    void lock(String processId) {{
+        {deep_receiver}.notify(processId);
+    }}
+}}
+"#
+    );
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "org/example/ProcessOperationLockRegistry.java",
+            r#"
+package org.example;
+
+public final class ProcessOperationLockRegistry {
+    private static final ProcessOperationLockRegistry INSTANCE =
+            new ProcessOperationLockRegistry();
+
+    public static ProcessOperationLockRegistry getInstance() {
+        return INSTANCE;
+    }
+
+    public ProcessOperationLockRegistry next() {
+        return this;
+    }
+
+    public void notify(String processId) {}
+}
+"#,
+        ),
+        ("org/example/Consumer.java", &consumer),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let notify = definition(&analyzer, "org.example.ProcessOperationLockRegistry.notify");
+    let result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&notify),
+        &candidates,
+        1000,
+    );
+
+    assert_success_counts(result, &notify, 0, 1);
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use crate::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
+    mcp_common::McpRenderOptions, mcp_registry::resolve_server_spec_for_render_options,
     scoped_project::create_scoped_service, searchtools_render::RenderOptions,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -104,8 +105,28 @@ fn service_error_to_py(err: SearchToolsServiceError) -> PyErr {
     }
 }
 
+#[pyfunction]
+#[pyo3(signature = (toolset="core", render_line_numbers=true, git_repo=true))]
+fn tool_descriptors_json(
+    toolset: &str,
+    render_line_numbers: bool,
+    git_repo: bool,
+) -> PyResult<String> {
+    let spec = resolve_server_spec_for_render_options(
+        toolset,
+        McpRenderOptions {
+            render_line_numbers,
+        },
+        git_repo,
+    )
+    .map_err(PyValueError::new_err)?;
+    serde_json::to_string(&spec.tool_descriptors)
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SearchToolsNativeSession>()?;
+    module.add_function(wrap_pyfunction!(tool_descriptors_json, module)?)?;
     Ok(())
 }

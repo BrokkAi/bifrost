@@ -1,7 +1,12 @@
 pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::usages::java_graph::hits::enclosing_context;
+use crate::analyzer::usages::java_graph::return_type::{
+    FileReturnCache, JavaReturnTypeContext, METHOD_RECEIVER_CHAIN_LIMIT, MethodReturnCache,
+    method_return_type_for_owner_fqns,
+};
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
@@ -160,6 +165,32 @@ pub(super) fn seed_class_binding(
     }
 }
 
+impl JavaReturnTypeContext for ScanCtx<'_> {
+    fn java(&self) -> &JavaAnalyzer {
+        self.java
+    }
+
+    fn file(&self) -> &ProjectFile {
+        self.file
+    }
+
+    fn root(&self) -> Node<'_> {
+        self.root
+    }
+
+    fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
+        resolve_type_from_node(node, self).map(|unit| unit.fq_name())
+    }
+
+    fn method_return_cache(&self) -> &MethodReturnCache {
+        self.method_return_cache
+    }
+
+    fn file_return_cache(&self) -> &FileReturnCache {
+        self.file_return_cache
+    }
+}
+
 pub(super) fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
     match receiver.kind() {
         "identifier" => {
@@ -188,6 +219,13 @@ pub(super) fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>)
                     .receiver_owner_fq_names
                     .contains(&resolved.fq_name())
             }),
+        "method_invocation" => {
+            method_invocation_return_type(receiver, ctx).is_some_and(|resolved| {
+                ctx.spec
+                    .receiver_owner_fq_names
+                    .contains(&resolved.fq_name())
+            })
+        }
         "this" => {
             owner_matches_target_context(receiver, ctx)
                 || anonymous_creation_context_matches_target(receiver, ctx)
@@ -343,6 +381,7 @@ pub(super) fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option
         "object_creation_expression" => node
             .child_by_field_name("type")
             .and_then(|type_node| resolve_type_from_node(type_node, ctx)),
+        "method_invocation" => method_invocation_return_type(node, ctx),
         "identifier" => {
             let name = node_text(node, ctx.source);
             let targets = ctx.bindings.resolve_symbol(name);
@@ -354,6 +393,129 @@ pub(super) fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option
         }
         _ => None,
     }
+}
+
+fn method_invocation_return_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    method_invocation_return_type_at_depth(node, ctx, 0)
+}
+
+fn method_invocation_return_type_at_depth(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
+    if depth > METHOD_RECEIVER_CHAIN_LIMIT {
+        return None;
+    }
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, ctx.source);
+    if name.is_empty() {
+        return None;
+    }
+    let owner = match node.child_by_field_name("object") {
+        Some(object) => receiver_type_from_node_at_depth(object, ctx, depth + 1)?,
+        None => enclosing_owner(node, ctx)?,
+    };
+    method_return_type_for_call(&owner, name, argument_list_arity(node), ctx)
+}
+
+fn receiver_type_from_node_at_depth(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
+    if depth > METHOD_RECEIVER_CHAIN_LIMIT {
+        return None;
+    }
+    match node.kind() {
+        "identifier" => {
+            let name = node_text(node, ctx.source);
+            let targets = ctx.bindings.resolve_symbol(name);
+            if let Some(fq_name) = targets
+                .as_precise()
+                .and_then(|targets| (targets.len() == 1).then(|| targets.iter().next().unwrap()))
+            {
+                return class_definition(ctx, fq_name);
+            }
+            (!ctx.bindings.is_shadowed(name))
+                .then(|| resolve_type_from_node(node, ctx))
+                .flatten()
+        }
+        "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+            resolve_type_from_node(node, ctx)
+        }
+        "object_creation_expression" => node
+            .child_by_field_name("type")
+            .and_then(|type_node| resolve_type_from_node(type_node, ctx)),
+        "method_invocation" => method_invocation_return_type_at_depth(node, ctx, depth),
+        "this" | "super" => enclosing_owner(node, ctx),
+        _ => None,
+    }
+}
+
+fn method_return_type_for_call(
+    owner: &CodeUnit,
+    method_name: &str,
+    arity: usize,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let cache_key = (owner.fq_name(), method_name.to_string(), arity);
+    if let Some(cached) = ctx
+        .method_call_return_cache
+        .borrow()
+        .get(&cache_key)
+        .cloned()
+    {
+        return single_return_class(ctx, cached);
+    }
+
+    let mut owners = vec![cache_key.0.clone()];
+    if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
+        owners.extend(
+            provider
+                .get_ancestors(owner)
+                .into_iter()
+                .map(|ancestor| ancestor.fq_name()),
+        );
+    }
+    let outcome = method_return_type_for_owner_fqns(
+        owners.iter().map(String::as_str),
+        method_name,
+        arity,
+        ctx,
+    );
+    ctx.method_call_return_cache
+        .borrow_mut()
+        .insert(cache_key, outcome.clone());
+    single_return_class(ctx, outcome)
+}
+
+fn single_return_class(
+    ctx: &ScanCtx<'_>,
+    outcome: ReceiverAnalysisOutcome<String>,
+) -> Option<CodeUnit> {
+    match outcome {
+        ReceiverAnalysisOutcome::Precise(values) if values.len() == 1 => {
+            class_definition(ctx, &values[0])
+        }
+        ReceiverAnalysisOutcome::Precise(_)
+        | ReceiverAnalysisOutcome::Ambiguous(_)
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. }
+        | ReceiverAnalysisOutcome::Unknown => None,
+    }
+}
+
+fn class_definition(ctx: &ScanCtx<'_>, fq_name: &str) -> Option<CodeUnit> {
+    ctx.analyzer
+        .get_definitions(fq_name)
+        .into_iter()
+        .find(|unit| unit.is_class())
+}
+
+fn enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    let owner = ctx.class_ranges.enclosing(node.start_byte())?;
+    class_definition(ctx, owner)
 }
 
 pub(super) fn is_ignored_type_context(node: Node<'_>) -> bool {

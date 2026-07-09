@@ -211,6 +211,8 @@ impl ParameterMetadata {
 pub struct SignatureMetadata {
     label: String,
     parameters: Vec<ParameterMetadata>,
+    #[serde(default)]
+    return_type_text: Option<String>,
 }
 
 impl SignatureMetadata {
@@ -218,6 +220,7 @@ impl SignatureMetadata {
         Self {
             label: label.into(),
             parameters,
+            return_type_text: None,
         }
     }
 
@@ -249,7 +252,19 @@ impl SignatureMetadata {
                 ))
             })
             .collect();
-        Self { label, parameters }
+        Self {
+            label,
+            parameters,
+            return_type_text: None,
+        }
+    }
+
+    pub fn with_return_type_text(mut self, return_type_text: Option<impl Into<String>>) -> Self {
+        self.return_type_text = return_type_text
+            .map(Into::into)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        self
     }
 
     pub fn label(&self) -> &str {
@@ -258,6 +273,10 @@ impl SignatureMetadata {
 
     pub fn parameters(&self) -> &[ParameterMetadata] {
         &self.parameters
+    }
+
+    pub fn return_type_text(&self) -> Option<&str> {
+        self.return_type_text.as_deref()
     }
 }
 

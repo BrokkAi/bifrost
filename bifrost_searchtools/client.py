@@ -268,46 +268,28 @@ class SearchToolsClient:
             rendered_text=payload.rendered_text,
         )
 
-    def get_definition_by_location(
+    def get_definitions_by_location(
         self,
-        path: str,
-        *,
-        line: int | None = None,
-        column: int | None = None,
-        start_byte: int | None = None,
-        end_byte: int | None = None,
-    ) -> DefinitionLookupResult:
-        reference: dict[str, Any] = {"path": path}
-        if line is not None:
-            reference["line"] = line
-        if column is not None:
-            reference["column"] = column
-        if start_byte is not None:
-            reference["start_byte"] = start_byte
-        if end_byte is not None:
-            reference["end_byte"] = end_byte
+        references: list[dict[str, Any]],
+    ) -> list[DefinitionLookupResult]:
         result = self._call_tool(
-            "get_definition_by_location",
-            {"references": [reference]},
+            "get_definitions_by_location",
+            {"references": references},
         )
-        return DefinitionLookupResult.from_dict(result["results"][0])
+        return [DefinitionLookupResult.from_dict(item) for item in result["results"]]
 
-    def get_definition_by_reference(
+    def get_definitions_by_reference(
         self,
-        symbol: str,
-        *,
-        context: str,
-        target: str,
-    ) -> DefinitionByReferenceLookupResult:
+        references: list[dict[str, str]],
+    ) -> list[DefinitionByReferenceLookupResult]:
         result = self._call_tool(
-            "get_definition_by_reference",
-            {
-                "references": [
-                    {"symbol": symbol, "context": context, "target": target}
-                ]
-            },
+            "get_definitions_by_reference",
+            {"references": references},
         )
-        return DefinitionByReferenceLookupResult.from_dict(result["results"][0])
+        return [
+            DefinitionByReferenceLookupResult.from_dict(item)
+            for item in result["results"]
+        ]
 
     def get_type_by_location(
         self,
@@ -388,15 +370,19 @@ class SearchToolsClient:
 
     def scan_usages(
         self,
-        symbols: list[str],
+        symbols: list[str] | None = None,
         *,
+        targets: list[dict[str, Any]] | None = None,
         include_tests: bool = False,
         paths: list[str] | None = None,
     ) -> ScanUsagesResult:
         arguments: dict[str, Any] = {
-            "symbols": symbols,
             "include_tests": include_tests,
         }
+        if symbols is not None:
+            arguments["symbols"] = symbols
+        if targets is not None:
+            arguments["targets"] = targets
         if paths is not None:
             arguments["paths"] = paths
         payload = self._call_tool_payload("scan_usages", arguments)
@@ -1058,3 +1044,20 @@ def _load_native_module(library_path: Path | None) -> ModuleType:
         _EXPLICIT_NATIVE_MODULE = module
         _EXPLICIT_NATIVE_PATH = library_path
         return module
+
+
+def tool_descriptors(
+    toolset: str = "core",
+    *,
+    render_line_numbers: bool = True,
+    git_repo: bool = True,
+    library_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    native = _load_native_module(
+        Path(library_path).expanduser().resolve() if library_path is not None else None
+    )
+    payload = native.tool_descriptors_json(toolset, render_line_numbers, git_repo)
+    decoded = json.loads(payload)
+    if not isinstance(decoded, list):
+        raise SearchToolsError("Native tool descriptor call did not return a JSON array")
+    return decoded
