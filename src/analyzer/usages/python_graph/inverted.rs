@@ -158,19 +158,24 @@ impl PyScan<'_, '_> {
         self.collector
             .record(callee, node.start_byte(), node.end_byte());
     }
+
+    fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
+        self.collector
+            .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
 }
 
 fn scan_tree(root: Node<'_>, ctx: &mut PyScan<'_, '_>) {
     // A stack of in-scope local names, one frame per enclosing function. A name
     // bound in any frame shadows a same-named import/declaration.
-    let mut shadows: Vec<HashSet<String>> = Vec::new();
-    walk(root, ctx, &mut shadows, None);
+    let mut scopes: Vec<FunctionScope> = Vec::new();
+    walk(root, ctx, &mut scopes, None);
 }
 
 fn walk<'a>(
     node: Node<'_>,
     ctx: &mut PyScan<'a, '_>,
-    shadows: &mut Vec<HashSet<String>>,
+    scopes: &mut Vec<FunctionScope>,
     facts: Option<&'a LocalBindingsSnapshot<String>>,
 ) {
     let mut stack = vec![WalkFrame::Enter { node, facts }];
@@ -182,7 +187,7 @@ fn walk<'a>(
                 // assigns are local throughout it, so collect them up front. Resolve the
                 // scope's receiver-type facts once here and thread them down.
                 "function_definition" | "lambda" => {
-                    shadows.push(collect_function_locals(node, ctx.source));
+                    scopes.push(collect_function_scope(node, ctx.source));
                     let scope_facts =
                         enclosing_scope_facts(ctx.analyzer, ctx.file, ctx.scope_facts, node)
                             .or(facts);
@@ -193,17 +198,17 @@ fn walk<'a>(
                 // no enclosing-function facts. Methods inside re-resolve their own facts.
                 "class_definition" => push_children(node, None, &mut stack),
                 "identifier" => {
-                    handle_identifier(node, ctx, shadows);
+                    handle_identifier(node, ctx, scopes);
                     push_children(node, facts, &mut stack);
                 }
                 "attribute" => {
-                    handle_attribute(node, ctx, shadows, facts);
+                    handle_attribute(node, ctx, scopes, facts);
                     push_children(node, facts, &mut stack);
                 }
                 _ => push_children(node, facts, &mut stack),
             },
             WalkFrame::ExitScope => {
-                shadows.pop();
+                scopes.pop();
             }
         }
     }
@@ -229,11 +234,24 @@ fn push_children<'tree, 'facts>(
     }
 }
 
-fn is_shadowed(shadows: &[HashSet<String>], name: &str) -> bool {
-    shadows.iter().any(|scope| scope.contains(name))
+#[derive(Default)]
+struct FunctionScope {
+    locals: HashSet<String>,
+    parameters: HashSet<String>,
 }
 
-fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_, '_>, shadows: &[HashSet<String>]) {
+fn is_shadowed(scopes: &[FunctionScope], name: &str) -> bool {
+    scopes.iter().any(|scope| scope.locals.contains(name))
+}
+
+fn is_receiver_parameter(scopes: &[FunctionScope], name: &str) -> bool {
+    scopes
+        .iter()
+        .rev()
+        .any(|scope| scope.parameters.contains(name))
+}
+
+fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[FunctionScope]) {
     // The object of an `attribute` is handled by handle_attribute.
     if node
         .parent()
@@ -245,7 +263,7 @@ fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_, '_>, shadows: &[HashSe
         return;
     }
     let text = slice(node, ctx.source);
-    if text.is_empty() || is_shadowed(shadows, text) {
+    if text.is_empty() || is_shadowed(scopes, text) {
         return;
     }
     if let Some(callee) = ctx.bare_callee(text) {
@@ -256,7 +274,7 @@ fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_, '_>, shadows: &[HashSe
 fn handle_attribute<'a>(
     node: Node<'_>,
     ctx: &mut PyScan<'a, '_>,
-    shadows: &[HashSet<String>],
+    scopes: &[FunctionScope],
     facts: Option<&'a LocalBindingsSnapshot<String>>,
 ) {
     let (Some(object), Some(attribute)) = (
@@ -273,7 +291,7 @@ fn handle_attribute<'a>(
     // `module.symbol` where the object is a namespace import: the callee is the
     // module prefix plus the accessed attribute. A local of the same name as the
     // module shadows the import.
-    if !is_shadowed(shadows, object_text)
+    if !is_shadowed(scopes, object_text)
         && let Some(module) = ctx.namespace.get(object_text)
     {
         ctx.record(format!("{module}.{attribute_text}"), attribute);
@@ -281,12 +299,24 @@ fn handle_attribute<'a>(
     }
 
     // `recv.method` where recv is a typed local/parameter: resolve to the
-    // receiver's class fqn. The node-membership check downstream drops it unless
-    // `Class.method` is a real node, so an untyped or mistyped receiver is inert.
-    if let Some(facts) = facts
-        && let Some(type_fqn) = ctx.receiver_type_fqn(facts, object_text)
-    {
-        ctx.record(format!("{type_fqn}.{attribute_text}"), attribute);
+    // receiver's class fqn. Unknown or ambiguous receiver facts are not enough
+    // for a proven edge, but they are structured evidence that a same-named
+    // member may be reachable, so bulk dead-code treats the candidate as
+    // inconclusive instead of dead.
+    if let Some(facts) = facts {
+        if let Some(type_fqn) = ctx.receiver_type_fqn(facts, object_text) {
+            ctx.record(format!("{type_fqn}.{attribute_text}"), attribute);
+        } else if object.kind() == "identifier"
+            && !matches!(object_text, "self" | "cls")
+            && !ctx.named.contains_key(object_text)
+        {
+            let resolution = facts.resolution_for(object_text);
+            if resolution.is_ambiguous()
+                || (resolution.is_unknown() && is_receiver_parameter(scopes, object_text))
+            {
+                ctx.record_unproven_name(attribute_text, attribute);
+            }
+        }
     }
 }
 
@@ -294,15 +324,16 @@ fn handle_attribute<'a>(
 /// Python scoping is function-wide, so a name assigned anywhere in the body is
 /// local throughout; nested function/class scopes are skipped (they get their
 /// own frame), but the names they bind in *this* scope are kept.
-fn collect_function_locals(func: Node<'_>, source: &str) -> HashSet<String> {
-    let mut locals = HashSet::default();
+fn collect_function_scope(func: Node<'_>, source: &str) -> FunctionScope {
+    let mut scope = FunctionScope::default();
     if let Some(params) = func.child_by_field_name("parameters") {
-        collect_parameter_names(params, source, &mut locals);
+        collect_parameter_names(params, source, &mut scope.parameters);
+        scope.locals.extend(scope.parameters.iter().cloned());
     }
     if let Some(body) = func.child_by_field_name("body") {
-        collect_bound_targets(body, source, &mut locals);
+        collect_bound_targets(body, source, &mut scope.locals);
     }
-    locals
+    scope
 }
 
 fn collect_parameter_names(params: Node<'_>, source: &str, out: &mut HashSet<String>) {

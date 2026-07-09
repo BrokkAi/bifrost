@@ -21,7 +21,7 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 - [x] (2026-07-09T08:14:34Z) Milestone 1: calibrated PHP bulk dead-code unproven-inbound evidence.
 - [x] (2026-07-09T08:18:06Z) Milestone 2: calibrated Scala bulk dead-code unproven-inbound evidence.
 - [x] (2026-07-09T08:25:09Z) Milestone 3: calibrated scoped JavaScript/TypeScript bulk dead-code unproven-inbound evidence.
-- [ ] Milestone 4: calibrate Python bulk dead-code unproven-inbound evidence.
+- [x] (2026-07-09T08:32:00Z) Milestone 4: calibrated Python bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 5: calibrate Ruby bulk dead-code unproven-inbound evidence.
 - [ ] Final validation and retrospective.
 
@@ -63,6 +63,12 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 
 - Observation: A constructed instance receiver (`new Service().used()` or a local initialized from it) is not currently proven by the scoped dead-code receiver path.
   Evidence: The first JS/TS fixture variant skipped the intended proven `Service.used` instance method as inconclusive. The fixture was changed to use static `Service.used()` because that is already proven by the scoped class-member path.
+
+- Observation: The initial Python fixture using `service = build_unknown()` did not exercise the unknown-receiver branch because local inference resolved enough structure to avoid unproven evidence.
+  Evidence: The first focused Python test run after wiring unproven evidence still reported `service.Service.target` as `no non-self usages found`. Changing the fixture to an unannotated receiver parameter reproduced the intended unproven-only shape.
+
+- Observation: A too-broad Python unproven branch would have let assigned scalar-local noise hide real dead methods.
+  Evidence: Guided review of the Milestone 4 diff found that `count = 0; count.unused()` would record unproven evidence for `unused`. The fixture now includes this scalar-local call and still expects `service.Service.unused` to report dead.
 
 
 ## Decision Log
@@ -109,6 +115,10 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 
 - Decision: Scoped JS/TS records exact unproven keys for ambiguous receiver-analysis targets and terminal-name unproven evidence only for unknown, unsupported, or budget-exceeded receiver analysis.
   Rationale: Ambiguous receiver analysis can return concrete member targets, so exact keys avoid unnecessary duplicate-name broadening. Unknown/unsupported/budget outcomes have no target set, so they use the existing structured terminal-name gate.
+  Date/Author: 2026-07-09 / Codex.
+
+- Decision: Python records unproven inbound only for ambiguous receiver facts or unknown unannotated receiver parameters, not arbitrary assigned locals.
+  Rationale: An unannotated parameter is a plausible object receiver whose type the structured resolver could not prove, while an assigned local with no receiver type can be scalar or unrelated data. This preserves dead-code findings in the presence of local attribute noise and avoids generic same-terminal matching.
   Date/Author: 2026-07-09 / Codex.
 
 
@@ -195,6 +205,27 @@ Validation evidence after guided review:
 Guided review finding before the Milestone 3 commit:
 
     No related findings. The diff preserves scoped `UsageNodeKey` identity, uses exact keys for ambiguous receiver-analysis targets, and keeps duplicate-name JS/TS tests passing.
+
+Milestone 4 calibrated Python by adding unproven inbound emission to the inverted `attribute` handling when structured receiver facts are ambiguous or when an unannotated receiver parameter has unknown type. The fixture proves an unannotated `service.target()` parameter call makes `service.Service.target` inconclusive, scalar-local `count.unused()` noise does not hide `service.Service.unused`, and typed `Service` receiver usage of `service.Service.used` still reports as a one-call abstraction. Existing helper and wrapper dead-code tests still pass.
+
+Validation evidence after guided review fix:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test python_js_ts_dead_code_smells --test usage_graph_test --test usages_python_graph_test
+    result: passed at 2026-07-09T08:32:00Z; 24 python_js_ts_dead_code_smells tests, 16 usage_graph_test tests, and 77 passing usages_python_graph_test tests with 3 ignored parity markers passed
+
+    BIFROST_SEMANTIC_INDEX=off cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
+    result: passed at 2026-07-09T08:32:00Z; validated 10 repos and covered scenarios include dead_code_smells
+
+    cargo fmt --check
+    result: passed at 2026-07-09T08:32:00Z
+
+    cargo clippy-no-cuda
+    result: blocked by the same repeated E0514 incompatible-rustc dependency metadata errors seen in prior milestones
+
+Guided review finding before the Milestone 4 commit:
+
+    MEDIUM / Tactical: recording unproven Python evidence for every unknown local attribute receiver was too broad and could make scalar-local noise such as `count.unused()` suppress a real dead method.
+    Fix: track function parameters separately from all local shadows, record unknown unproven evidence only for receiver parameters, keep ambiguous receiver facts as unproven, and add scalar-local noise to the fixture while preserving the unused-method dead finding.
 
 
 ## Context and Orientation

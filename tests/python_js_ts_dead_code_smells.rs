@@ -354,6 +354,82 @@ def helper():
 }
 
 #[test]
+fn python_dead_code_smell_unproven_receiver_usage_is_inconclusive_not_dead() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    def target(self):
+        return 1
+
+    def unused(self):
+        return 2
+
+    def used(self):
+        return 3
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Service
+
+def use_unknown(service):
+    return service.target()
+
+def use_proven(service: Service):
+    return service.used()
+
+def scalar_noise():
+    count = 0
+    return count.unused()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = python_definition(&analyzer, "service.Service.target");
+    let unused = python_definition(&analyzer, "service.Service.unused");
+    let used = python_definition(&analyzer, "service.Service.used");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.py".to_string(), "consumer.py".to_string()],
+            fq_names: vec![target.fq_name(), unused.fq_name(), used.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("service.Service.target`: 1 structurally matching usage site(s)"),
+        "{}",
+        result.report
+    );
+    assert!(
+        !result.report.contains("service.Service.target |"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("service.Service.unused")
+            && result.report.contains("no non-self usages found"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("service.Service.used")
+            && result
+                .report
+                .contains("one workspace inbound edge from consumer.use_proven"),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn js_dead_code_smell_reports_unused_export() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
