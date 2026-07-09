@@ -1192,6 +1192,49 @@ namespace Domain {
 }
 
 #[test]
+fn csharp_graph_finds_unqualified_same_class_async_member_calls_with_arguments() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "MudTabs.cs",
+        r#"
+namespace MudBlazor {
+    public class MudPanel {}
+
+    public class MudTabs {
+        private System.Threading.Tasks.Task ActivatePanelClickAsync(MudPanel panel, object args) {
+            return System.Threading.Tasks.Task.CompletedTask;
+        }
+
+        private async System.Threading.Tasks.Task HandleTabKeyDownAsync(MudPanel panel, object args) {
+            await ActivatePanelClickAsync(panel, args);
+        }
+    }
+}
+"#,
+    )]);
+
+    let activate =
+        member_function_with_arity(&analyzer, "MudBlazor.MudTabs", "ActivatePanelClickAsync", 2);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = CSharpUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&activate),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .unwrap_or_else(|err| panic!("same-class async call should resolve: {err}"));
+
+    assert_eq!(1, hits.len());
+    assert!(hits.iter().any(|hit| {
+        hit.file == project.file("MudTabs.cs")
+            && hit
+                .snippet
+                .contains("await ActivatePanelClickAsync(panel, args)")
+    }));
+}
+
+#[test]
 fn csharp_graph_finds_static_and_instance_member_references() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -1251,6 +1294,105 @@ namespace App {
             target.fq_name()
         );
     }
+}
+
+#[test]
+fn csharp_graph_resolves_static_generic_factory_calls_on_class_receiver() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[(
+        "DownloadClients.cs",
+        r#"
+namespace NzbDrone.Core.Download {
+    public interface IProviderConfig {}
+    public class DownloadClientBase<TSettings> {}
+    public class TorrentSettings : IProviderConfig {}
+    public class UsenetSettings : IProviderConfig {}
+    public class DownloadClientItem {
+        public DownloadClientItemClientInfo DownloadClientInfo { get; set; }
+    }
+
+    public class DownloadClientItemClientInfo {
+        public static DownloadClientItemClientInfo FromDownloadClient<TSettings>(
+            DownloadClientBase<TSettings> downloadClient,
+            bool hasPostImportCategory)
+            where TSettings : IProviderConfig, new() {
+            return new DownloadClientItemClientInfo();
+        }
+    }
+
+    public class TorrentBlackhole : DownloadClientBase<TorrentSettings> {
+        public void GetItems() {
+            var queueItem = new DownloadClientItem {
+                DownloadClientInfo = DownloadClientItemClientInfo.FromDownloadClient(this, false),
+            };
+        }
+    }
+
+    public class UsenetBlackhole : DownloadClientBase<UsenetSettings> {
+        public void GetItems() {
+            var queueItem = new DownloadClientItem {
+                DownloadClientInfo = DownloadClientItemClientInfo.FromDownloadClient(this, false),
+            };
+        }
+    }
+}
+"#,
+    )]);
+
+    let target = member_function_with_arity(
+        &analyzer,
+        "NzbDrone.Core.Download.DownloadClientItemClientInfo",
+        "FromDownloadClient",
+        2,
+    );
+    assert_eq!(2, graph_hits(&analyzer, &target).len());
+}
+
+#[test]
+fn csharp_graph_resolves_static_calls_when_namespace_and_class_share_name() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Parser.cs",
+            r#"
+namespace NzbDrone.Core.Parser {
+    public static class Parser {
+        public static void ParseMovieTitle(string title) {}
+        public static string ParseReleaseGroup(string title) { return title; }
+    }
+}
+"#,
+        ),
+        (
+            "Consumer.cs",
+            r#"
+using NzbDrone.Core.Parser;
+
+namespace App {
+    public class Consumer {
+        public void Run() {
+            Parser.ParseMovieTitle("Alien");
+            var group = Parser.ParseReleaseGroup("GROUP");
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let parse_movie_title = member_function_with_arity(
+        &analyzer,
+        "NzbDrone.Core.Parser.Parser",
+        "ParseMovieTitle",
+        1,
+    );
+    let parse_release_group = member_function_with_arity(
+        &analyzer,
+        "NzbDrone.Core.Parser.Parser",
+        "ParseReleaseGroup",
+        1,
+    );
+
+    assert_eq!(1, graph_hits(&analyzer, &parse_movie_title).len());
+    assert_eq!(1, graph_hits(&analyzer, &parse_release_group).len());
 }
 
 #[test]

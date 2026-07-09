@@ -1177,6 +1177,54 @@ func ExampleService() {
 }
 
 #[test]
+fn go_graph_strategy_finds_interface_receiver_method_calls() {
+    let (project, analyzer) = go_analyzer_with_files(&[(
+        "pkg/extensions/manager.go",
+        r#"
+package extensions
+
+import "io"
+
+type ExtensionManager interface {
+    Dispatch(args []string, stdin io.Reader, stdout, stderr io.Writer) (bool, error)
+}
+
+type IOStreams struct {
+    In io.Reader
+    Out io.Writer
+    ErrOut io.Writer
+}
+
+func Run(m ExtensionManager, args []string, streams IOStreams) error {
+    if found, err := m.Dispatch(args, streams.In, streams.Out, streams.ErrOut); !found {
+        return err
+    } else {
+        return err
+    }
+}
+"#,
+    )]);
+
+    let target = definition(
+        &analyzer,
+        "example.com/app/pkg/extensions.ExtensionManager.Dispatch",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("interface receiver dispatch should resolve");
+
+    assert_eq!(1, hits.len(), "expected the m.Dispatch call: {hits:?}");
+    assert!(hits.iter().all(|hit| {
+        hit.file == project.file("pkg/extensions/manager.go")
+            && hit
+                .snippet
+                .contains("m.Dispatch(args, streams.In, streams.Out, streams.ErrOut)")
+    }));
+}
+
+#[test]
 fn go_graph_strategy_does_not_match_interface_fields_by_method_name_only() {
     let (_project, analyzer) = go_analyzer_with_files(&[(
         "example/service.go",
