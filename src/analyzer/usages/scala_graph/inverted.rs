@@ -693,8 +693,17 @@ fn record_reference(
                             }
                         }
                     } else {
-                        for extension in visible_extensions(ctx, name, None) {
-                            ctx.record(extension.fqn, field);
+                        let extensions = visible_extensions(ctx, name, None);
+                        if extensions.is_empty() {
+                            ctx.collector.record_unproven_name(
+                                name,
+                                field.start_byte(),
+                                field.end_byte(),
+                            );
+                        } else {
+                            for extension in extensions {
+                                ctx.record(extension.fqn, field);
+                            }
                         }
                     }
                 }

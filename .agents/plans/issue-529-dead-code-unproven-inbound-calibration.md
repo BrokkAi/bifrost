@@ -19,7 +19,7 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 - [x] (2026-07-09T07:44:31Z) Created this ExecPlan from issue #529, `.agents/PLANS.md`, the existing issue #528 Stage 7 design record, and the current benchmark/dead-code code paths.
 - [x] (2026-07-09T07:59:56Z) Milestone 0: added benchmark-harness support for a `dead_code_smells` scenario and pinned manifest probes.
 - [x] (2026-07-09T08:14:34Z) Milestone 1: calibrated PHP bulk dead-code unproven-inbound evidence.
-- [ ] Milestone 2: calibrate Scala bulk dead-code unproven-inbound evidence.
+- [x] (2026-07-09T08:18:06Z) Milestone 2: calibrated Scala bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 3: calibrate scoped JavaScript/TypeScript bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 4: calibrate Python bulk dead-code unproven-inbound evidence.
 - [ ] Milestone 5: calibrate Ruby bulk dead-code unproven-inbound evidence.
@@ -55,6 +55,9 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 - Observation: Moving PHP methods to the bulk graph without preserving method scoring changed method scores and public-surface wording.
   Evidence: Guided review of the Milestone 1 diff found `App.Service.unused` shifted from the existing PHP method bar to public-surface scoring (`10 | 0.55`) and `App.Service.used` shifted to `8 | 0.45`.
 
+- Observation: The Scala red fixture reproduced the same false-positive shape: an unknown local receiver call let `example.Service.target` report as dead.
+  Evidence: `BIFROST_SEMANTIC_INDEX=off cargo test --test scala_dead_code_smells scala_bulk_unproven_receiver_usage_is_inconclusive_not_dead` failed before production changes with `example.Service.target` reported as `no non-self usages found`.
+
 
 ## Decision Log
 
@@ -88,6 +91,10 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 
 - Decision: Preserve the existing PHP method dead-code score/confidence/rationale in the bulk graph finding builder.
   Rationale: The milestone requires proven-inbound reporting to stay unchanged. Bulk graph evidence records callers rather than exact hit snippets, but method severity should not be weakened just because the candidate moved from the precise strategy to calibrated bulk analysis.
+  Date/Author: 2026-07-09 / Codex.
+
+- Decision: Scala records unproven inbound only after receiver typing fails and visible extension-method fallback produces no proven edge.
+  Rationale: Scala extension methods can legitimately satisfy `receiver.method` syntax even when the direct receiver owner is unavailable. Recording unproven before that fallback would hide real extension usage; recording after an empty fallback preserves existing extension behavior while preventing unresolved member calls from being called dead.
   Date/Author: 2026-07-09 / Codex.
 
 
@@ -134,6 +141,26 @@ Guided review finding before the Milestone 1 commit:
 
     MEDIUM / Tests and behavior: routing PHP methods to the bulk graph changed method scores/wording to public-surface scoring, violating the milestone requirement that proven-inbound reporting stay unchanged.
     Fix: added a PHP method-specific graph finding builder with the existing method score/confidence/rationale, and strengthened tests to assert the method scores for unused and proven-inbound cases.
+
+Milestone 2 calibrated Scala by marking unresolved receiver `field_expression` calls as unproven only when visible extension methods do not prove a target. The fixture proves an unknown local receiver makes `example.Service.target` inconclusive, `example.Service.unused` still reports dead, and typed `Service` receiver usage of `example.Service.used` still reports as a one-call abstraction.
+
+Validation evidence after guided review:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test scala_dead_code_smells --test usage_graph_scala_test --test usages_scala_graph_test
+    result: passed at 2026-07-09T08:18:06Z; 21 scala_dead_code_smells tests, 18 usage_graph_scala_test tests, and 43 usages_scala_graph_test tests passed
+
+    BIFROST_SEMANTIC_INDEX=off cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
+    result: passed at 2026-07-09T08:18:06Z; validated 10 repos and covered scenarios include dead_code_smells
+
+    cargo fmt --check
+    result: passed at 2026-07-09T08:18:06Z
+
+    cargo clippy-no-cuda
+    result: blocked by the same repeated E0514 incompatible-rustc dependency metadata errors seen in prior milestones
+
+Guided review finding before the Milestone 2 commit:
+
+    No related findings. The diff records unproven evidence only after structured receiver typing fails and after the existing visible-extension fallback has no targets.
 
 
 ## Context and Orientation
