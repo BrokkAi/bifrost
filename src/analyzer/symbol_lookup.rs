@@ -376,19 +376,19 @@ fn parse_symbol_path(language: Language, value: &str) -> Vec<String> {
         }
 
         if rest.starts_with("::") {
-            flush_segment(&mut current, &mut segments);
+            flush_segment(language, &mut current, &mut segments);
             chars.next();
             continue;
         }
 
         if matches!(ch, '.' | '\\' | '/' | '+') {
-            flush_segment(&mut current, &mut segments);
+            flush_segment(language, &mut current, &mut segments);
             continue;
         }
 
         current.push(ch);
     }
-    flush_segment(&mut current, &mut segments);
+    flush_segment(language, &mut current, &mut segments);
 
     segments
 }
@@ -424,12 +424,41 @@ fn is_symbol_path_delimiter_at(value: &str) -> bool {
             .is_some_and(|ch| matches!(ch, '.' | '\\' | '/' | '+'))
 }
 
-fn flush_segment(current: &mut String, segments: &mut Vec<String>) {
+fn flush_segment(language: Language, current: &mut String, segments: &mut Vec<String>) {
     let trimmed = current.trim();
     if !trimmed.is_empty() {
-        segments.push(trimmed.to_string());
+        segments.push(normalized_client_symbol_segment(language, trimmed));
     }
     current.clear();
+}
+
+fn normalized_client_symbol_segment(language: Language, segment: &str) -> String {
+    // This normalizes client-provided symbol selector text, not Go source.
+    // Go declaration extraction already uses tree-sitter receiver nodes and
+    // indexes pointer receiver methods canonically as `Type.Method`.
+    if language == Language::Go {
+        return normalized_go_client_symbol_segment(segment);
+    }
+
+    segment.to_string()
+}
+
+fn normalized_go_client_symbol_segment(segment: &str) -> String {
+    let receiver = segment
+        .strip_prefix("(*")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(segment)
+        .trim();
+    let base = receiver
+        .split_once('[')
+        .map(|(base, _)| base.trim())
+        .unwrap_or(receiver);
+
+    if base.is_empty() {
+        segment.to_string()
+    } else {
+        base.to_string()
+    }
 }
 
 fn path_ends_with(candidate: &[String], query: &[String]) -> bool {

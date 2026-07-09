@@ -43,6 +43,7 @@ const SCAN_USAGES_PATH_SCOPED_MAX_FILES: usize = 10_000;
 const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
 const SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT: usize = 3;
+const SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT: usize = 5;
 pub const TYPE_LOOKUP_MAX_REFERENCES: usize = 100;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
@@ -2553,6 +2554,56 @@ fn split_definition_selector(input: &str) -> (Option<&str>, &str) {
     }
 }
 
+fn unsupported_path_qualified_scan_symbol(
+    resolver: &WorkspaceFileResolver,
+    input: &str,
+) -> Option<NotFoundInput> {
+    let (path, symbol) = input.trim().split_once("::")?;
+    let path = path.trim();
+    let symbol = symbol.trim();
+    if path.is_empty() || symbol.is_empty() {
+        return None;
+    }
+
+    match resolver.resolve_literal(path) {
+        ResolvedFileInput::File(file) => {
+            let path = rel_path_string(&file);
+            Some(not_found_input(
+                input,
+                Some(format!(
+                    "unsupported path::symbol selector; re-call scan_usages with symbols:[\"{symbol}\"] and paths:[\"{path}\"], or use targets with the declaration location"
+                )),
+            ))
+        }
+        ResolvedFileInput::Ambiguous(item) => Some(not_found_input(
+            input,
+            Some(format!(
+                "unsupported path::symbol selector; `{}` is ambiguous; choose one path from {} and re-call scan_usages with symbols:[\"{symbol}\"] and paths:[\"chosen/path\"], or use targets with the declaration location",
+                item.input,
+                path_match_sample(&item.matches)
+            )),
+        )),
+        ResolvedFileInput::NotFound(_) => None,
+    }
+}
+
+fn path_match_sample(matches: &[String]) -> String {
+    let sample = matches
+        .iter()
+        .take(SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if matches.len() > SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT {
+        format!(
+            "{sample} (showing first {SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT} of {})",
+            matches.len()
+        )
+    } else {
+        sample
+    }
+}
+
 /// The selector a caller re-queries to choose exactly this definition. Module-
 /// scoped ecosystems (JS/TS) share bare fqns across files, so the selector is
 /// file-anchored to stay unique; elsewhere the fqn already is.
@@ -3251,10 +3302,9 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 continue;
             }
             CodeUnitResolution::NotFound => {
-                work_entries.push(ScanUsagesWorkEntry::NotFound {
-                    request,
-                    item: symbol_not_found_input(symbol),
-                });
+                let item = unsupported_path_qualified_scan_symbol(&resolver, &symbol)
+                    .unwrap_or_else(|| symbol_not_found_input(symbol.clone()));
+                work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
                 continue;
             }
         };
