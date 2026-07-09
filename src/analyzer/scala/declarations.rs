@@ -155,9 +155,7 @@ impl<'a> ScalaVisitor<'a> {
         parent: Option<CodeUnit>,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) -> Option<CodeUnit> {
-        let Some(name_node) = scala_type_declaration_name_node(node) else {
-            return None;
-        };
+        let name_node = scala_type_declaration_name_node(node)?;
         let raw_name = scala_node_text(name_node, self.source).trim();
         if raw_name.is_empty() {
             return None;
