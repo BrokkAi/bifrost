@@ -14355,3 +14355,289 @@ fn unsupported_language_returns_structured_status() {
     );
     assert!(value["results"][0]["reference"].is_null(), "{value}");
 }
+
+#[test]
+fn php_reference_context_resolves_static_qualifier_to_class() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .file(
+            "src/Types.php",
+            "<?php\nnamespace App;\nclass Types { public const JSON = 'json'; }\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller { public function handle(): string { return Types::JSON; } }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "App.Controller.handle",
+                "context": "return Types::JSON;",
+                "target": "Types"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Types", "{value}");
+}
+
+#[test]
+fn php_reference_context_resolves_static_member_to_constant() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .file(
+            "src/Types.php",
+            "<?php\nnamespace App;\nclass Types { public const JSON = 'json'; }\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller { public function handle(): string { return Types::JSON; } }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "App.Controller.handle",
+                "context": "return Types::JSON;",
+                "target": "JSON"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Types.JSON", "{value}");
+}
+
+#[test]
+fn java_reference_context_resolves_field_access_qualifier_to_class() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Types.java",
+            "package app; public class Types { public static String JSON = \"json\"; }\n",
+        )
+        .file(
+            "app/UseTypes.java",
+            "package app; public class UseTypes { public Object run() { return Types.JSON; } }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "app.UseTypes.run",
+                "context": "return Types.JSON;",
+                "target": "Types"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Types", "{value}");
+}
+
+#[test]
+fn java_reference_context_resolves_field_access_member_to_field() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Types.java",
+            "package app; public class Types { public static String JSON = \"json\"; }\n",
+        )
+        .file(
+            "app/UseTypes.java",
+            "package app; public class UseTypes { public Object run() { return Types.JSON; } }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "app.UseTypes.run",
+                "context": "return Types.JSON;",
+                "target": "JSON"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Types.JSON", "{value}");
+}
+
+#[test]
+fn cpp_reference_context_resolves_qualified_scope_to_class() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("types.h", "struct Types { static const int JSON = 1; };\n")
+        .file(
+            "app.cpp",
+            "#include \"types.h\"\nint run() { return Types::JSON; }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "run",
+                "context": "return Types::JSON;",
+                "target": "Types"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Types", "{value}");
+}
+
+#[test]
+fn cpp_reference_context_resolves_qualified_name_to_static_field() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("types.h", "struct Types { static const int JSON = 1; };\n")
+        .file(
+            "app.cpp",
+            "#include \"types.h\"\nint run() { return Types::JSON; }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "run",
+                "context": "return Types::JSON;",
+                "target": "JSON"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Types.JSON", "{value}");
+}
+
+#[test]
+fn rust_reference_context_resolves_path_qualifier_to_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "pub struct Types; impl Types { pub const JSON: i32 = 1; } pub fn run() -> i32 { Types::JSON }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "run",
+                "context": "Types::JSON",
+                "target": "Types"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Types", "{value}");
+}
+
+#[test]
+fn csharp_reference_context_resolves_member_access_qualifier_to_class() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App/Types.cs",
+            "namespace App { public class Types { public static string JSON = \"json\"; } public class UseTypes { public object Run() { return Types.JSON; } } }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "App.UseTypes.Run",
+                "context": "return Types.JSON;",
+                "target": "Types"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Types", "{value}");
+}
+
+#[test]
+fn python_reference_context_resolves_attribute_qualifier_to_class() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            "class Types:\n    JSON = 'json'\n\ndef run():\n    return Types.JSON\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "run",
+                "context": "return Types.JSON",
+                "target": "Types"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Types", "{value}");
+}
+
+#[test]
+fn scala_reference_context_resolves_select_qualifier_to_object() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Types.scala",
+            "package app\nobject Types { val JSON: String = \"json\" }\nclass UseTypes { def run: String = Types.JSON }\n",
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "app.UseTypes.run",
+                "context": "Types.JSON",
+                "target": "Types"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Types$", "{value}");
+}

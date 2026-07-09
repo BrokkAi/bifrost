@@ -521,6 +521,40 @@ fn dotted_focus_segment_index(
         .position(|(_, start, end)| *start <= focus && focus < *end)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QualifiedAccessFocus {
+    Qualifier,
+    Member,
+}
+
+pub(super) fn qualified_access_focus(
+    focus: Node<'_>,
+    access: Node<'_>,
+    qualifier_fields: &[&str],
+    member_fields: &[&str],
+) -> Option<QualifiedAccessFocus> {
+    if fields_contain_focus(access, qualifier_fields, focus) {
+        return Some(QualifiedAccessFocus::Qualifier);
+    }
+    if fields_contain_focus(access, member_fields, focus) {
+        return Some(QualifiedAccessFocus::Member);
+    }
+    None
+}
+
+fn fields_contain_focus(access: Node<'_>, fields: &[&str], focus: Node<'_>) -> bool {
+    fields.iter().any(|field| {
+        access
+            .child_by_field_name(field)
+            .is_some_and(|child| node_contains_focus(child, focus))
+    })
+}
+
+pub(super) fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
+    node.id() == focus.id()
+        || (node.start_byte() <= focus.start_byte() && focus.end_byte() <= node.end_byte())
+}
+
 pub(crate) fn parse_tree_for_language(
     file: &ProjectFile,
     language: Language,

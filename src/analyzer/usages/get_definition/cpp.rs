@@ -170,8 +170,8 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
     let mut current = node;
     while let Some(parent) = current.parent() {
         if parent.kind() == "qualified_identifier"
-            && (parent.child_by_field_name("name") == Some(current)
-                || parent.child_by_field_name("scope") == Some(current))
+            && qualified_access_focus(current, parent, &["scope"], &["name"])
+                == Some(QualifiedAccessFocus::Member)
         {
             current = parent;
             continue;
@@ -216,9 +216,11 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
         }
         "call_expression" => Some(CppReferenceNode::Call(current)),
         "field_expression" => Some(CppReferenceNode::Field(current)),
-        "type_identifier" | "qualified_identifier" | "template_type" | "scoped_type_identifier" => {
-            Some(CppReferenceNode::Type(current))
-        }
+        "type_identifier"
+        | "namespace_identifier"
+        | "qualified_identifier"
+        | "template_type"
+        | "scoped_type_identifier" => Some(CppReferenceNode::Type(current)),
         "identifier" | "field_identifier" => Some(CppReferenceNode::Identifier(current)),
         _ => None,
     }

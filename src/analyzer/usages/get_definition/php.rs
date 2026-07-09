@@ -22,7 +22,7 @@ pub(super) fn resolve_php(
         return no_definition("php_parse_failed", "PHP source could not be parsed");
     };
     let root = tree.root_node();
-    let Some(node) = smallest_named_node_covering(root, site.range.start_byte, site.range.end_byte)
+    let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
         return no_definition(
             "no_indexed_definition",
@@ -206,12 +206,7 @@ fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree
                 }
                 "scoped_call_expression"
                 | "class_constant_access_expression"
-                | "scoped_property_access_expression"
-                    if php_static_member_name(parent) == Some(node) =>
-                {
-                    let (scope, _) = php_static_member_parts(parent)?;
-                    Some(PhpReferenceNode::StaticMember { scope, name: node })
-                }
+                | "scoped_property_access_expression" => php_static_access_reference(parent, node),
                 "member_call_expression" | "member_access_expression"
                     if parent.child_by_field_name("name") == Some(node) =>
                 {
@@ -225,6 +220,14 @@ fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree
         }
         _ => {
             let parent = node.parent()?;
+            if matches!(
+                parent.kind(),
+                "scoped_call_expression"
+                    | "class_constant_access_expression"
+                    | "scoped_property_access_expression"
+            ) {
+                return php_static_access_reference(parent, node);
+            }
             php_reference_node(parent)
         }
     }
@@ -244,6 +247,20 @@ fn php_is_instanceof_type_name(node: Node<'_>) -> bool {
         && parent.child_by_field_name("right").is_some_and(|right| {
             right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
         })
+}
+
+fn php_static_access_reference<'tree>(
+    access: Node<'tree>,
+    focus: Node<'tree>,
+) -> Option<PhpReferenceNode<'tree>> {
+    let (scope, name) = php_static_member_parts(access)?;
+    if node_contains_focus(scope, focus) {
+        return Some(PhpReferenceNode::Type(focus));
+    }
+    if node_contains_focus(name, focus) {
+        return Some(PhpReferenceNode::StaticMember { scope, name });
+    }
+    None
 }
 
 fn php_static_member_name(node: Node<'_>) -> Option<Node<'_>> {

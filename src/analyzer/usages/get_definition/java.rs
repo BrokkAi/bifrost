@@ -83,9 +83,33 @@ pub(super) fn resolve_java(
                         );
                     }
                     "field_access" => {
-                        return resolve_java_field_access(
-                            analyzer, support, file, source, root, parent,
-                        );
+                        return match qualified_access_focus(node, parent, &["object"], &["field"]) {
+                            Some(QualifiedAccessFocus::Qualifier)
+                                if java_field_access_is_simple_focused_qualifier(
+                                    root, site, parent, node,
+                                ) =>
+                            {
+                                java_receiver_type(analyzer, file, source, root, node)
+                                    .map(|unit| candidates_outcome(vec![unit]))
+                                    .unwrap_or_else(|| {
+                                        resolve_java_bare_identifier(
+                                            analyzer, java, support, file, source, root, node,
+                                        )
+                                    })
+                            }
+                            Some(QualifiedAccessFocus::Member)
+                            | Some(QualifiedAccessFocus::Qualifier) => resolve_java_field_access(
+                                analyzer, support, file, source, root, parent,
+                            ),
+                            None => no_definition(
+                                "unsupported_java_reference_shape",
+                                format!(
+                                    "`{}` is a Java `{}` reference shape that get_definition does not resolve yet",
+                                    site.text,
+                                    node.kind()
+                                ),
+                            ),
+                        };
                     }
                     "method_reference" => {
                         return resolve_java_method_reference(
@@ -497,6 +521,24 @@ fn java_method_reference_member_name(mut text: &str) -> &str {
         .map(|(idx, _)| idx)
         .unwrap_or(text.len());
     &text[..end]
+}
+
+fn java_field_access_is_nested_object(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "field_access" && parent.child_by_field_name("object") == Some(node)
+    })
+}
+
+fn java_field_access_is_simple_focused_qualifier(
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    access: Node<'_>,
+    focus: Node<'_>,
+) -> bool {
+    !java_field_access_is_nested_object(access)
+        && access.child_by_field_name("object") == Some(focus)
+        && smallest_named_node_covering(root, site.range.start_byte, site.range.end_byte)
+            == Some(access)
 }
 
 fn resolve_java_field_access(
