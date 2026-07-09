@@ -1,7 +1,7 @@
 mod common;
 
 use brokk_bifrost::{
-    CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language,
+    CSharpAnalyzer, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language,
     PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
     searchtools::{
         ScanUsagesEntry, ScanUsagesParams, ScanUsagesResult, ScanUsagesStatus, SearchSymbolsParams,
@@ -347,6 +347,139 @@ class Outer {
     let csharp = CSharpAnalyzer::from_project(csharp_project.project().clone());
     let csharp_result = source_for(&csharp, "N.Outer+Inner.Method");
     assert_eq!("N.Outer.Inner.Method", csharp_result.sources[0].label);
+}
+
+#[test]
+fn scan_usages_normalizes_go_pointer_receiver_method_selector() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module github.com/example/app\n\ngo 1.22\n")
+        .file(
+            "store/options.go",
+            r#"
+package store
+
+type Options struct{}
+type Box[T any] struct{}
+
+func (o *Options) IsEmpty() bool {
+    return true
+}
+
+func (b *Box[T]) Empty() bool {
+    return true
+}
+
+func caller(options *Options, box *Box[int]) bool {
+    return options.IsEmpty() && box.Empty()
+}
+"#,
+        )
+        .build();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    for (symbol, snippet) in [
+        (
+            "github.com/example/app/store.(*Options).IsEmpty",
+            "options.IsEmpty()",
+        ),
+        (
+            "github.com/example/app/store.(*Box[T]).Empty",
+            "box.Empty()",
+        ),
+    ] {
+        let result = scan_usages(
+            &analyzer,
+            ScanUsagesParams {
+                symbols: Some(vec![symbol.to_string()]),
+                targets: Vec::new(),
+                include_tests: true,
+                paths: None,
+            },
+        );
+
+        let usage = single_found_usage(&result);
+        assert_eq!(Some(symbol), usage.symbol.as_deref());
+        assert_eq!(Some(1), usage.total_hits, "{result:#?}");
+        assert!(
+            usage
+                .files
+                .iter()
+                .any(|file| file.path == "store/options.go"
+                    && file.hits.iter().any(|hit| {
+                        hit.snippet.as_deref().unwrap_or_default().contains(snippet)
+                    })),
+            "{result:#?}"
+        );
+    }
+}
+
+#[test]
+fn scan_usages_reports_path_qualified_symbol_selector_as_unsupported() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/cli.ts", "export function main() {}\n")
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let result = scan_usages(
+        &analyzer,
+        ScanUsagesParams {
+            symbols: Some(vec!["src/cli.ts::main".to_string()]),
+            targets: Vec::new(),
+            include_tests: true,
+            paths: None,
+        },
+    );
+
+    assert_eq!(1, result.results.len(), "{result:#?}");
+    let entry = &result.results[0];
+    assert_eq!(ScanUsagesStatus::NotFound, entry.status, "{result:#?}");
+    let message = entry.message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains("unsupported path::symbol selector"),
+        "{message}"
+    );
+    assert!(message.contains("symbols:[\"main\"]"), "{message}");
+    assert!(message.contains("paths:[\"src/cli.ts\"]"), "{message}");
+}
+
+#[test]
+fn scan_usages_bounds_ambiguous_path_qualified_selector_message() {
+    let mut builder = InlineTestProject::with_language(Language::TypeScript);
+    for index in 0..7 {
+        builder = builder.file(
+            format!("dir{index}/index.ts"),
+            format!("export const value{index} = {index};\n"),
+        );
+    }
+    let project = builder.build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let result = scan_usages(
+        &analyzer,
+        ScanUsagesParams {
+            symbols: Some(vec!["index.ts::missing".to_string()]),
+            targets: Vec::new(),
+            include_tests: true,
+            paths: None,
+        },
+    );
+
+    assert_eq!(1, result.results.len(), "{result:#?}");
+    let entry = &result.results[0];
+    assert_eq!(ScanUsagesStatus::NotFound, entry.status, "{result:#?}");
+    let message = entry.message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains("unsupported path::symbol selector"),
+        "{message}"
+    );
+    assert!(
+        message.contains("showing first 5 of 7"),
+        "expected capped match list in {message}"
+    );
+    assert!(message.contains("dir0/index.ts"), "{message}");
+    assert!(message.contains("dir4/index.ts"), "{message}");
+    assert!(!message.contains("dir5/index.ts"), "{message}");
+    assert!(!message.contains("dir6/index.ts"), "{message}");
 }
 
 #[test]
@@ -1045,6 +1178,7 @@ fn fuzzy_lookup_does_not_treat_arrow_or_hash_as_symbol_delimiters() {
 #[test]
 fn scan_usages_uses_the_common_fuzzy_symbol_resolver() {
     let project = InlineTestProject::with_language(Language::Java)
+        .file("A", "not Java source\n")
         .file(
             "A.java",
             r#"class A {
