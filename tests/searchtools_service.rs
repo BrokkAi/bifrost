@@ -1122,6 +1122,52 @@ func (c *Client) Build() error {
 }
 
 #[test]
+fn get_definitions_by_reference_matches_exact_identifier_target() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "freqtrade/exchange/exchange_utils.py",
+            r#"EXCHANGE_HAS_OPTIONAL = "spot"
+EXCHANGE_HAS_OPTIONAL_FUTURES = "futures"
+
+def _exchange_has_helper(ex_has, key):
+    return key in ex_has
+
+def validate_exchange(ex_has):
+    _exchange_has_helper(ex_has, EXCHANGE_HAS_OPTIONAL)
+    _exchange_has_helper(ex_has, EXCHANGE_HAS_OPTIONAL_FUTURES)
+"#,
+        )
+        .build();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let args = serde_json::json!({
+        "references": [{
+            "symbol": "exchange_utils.validate_exchange",
+            "context": "    _exchange_has_helper(ex_has, EXCHANGE_HAS_OPTIONAL)\n    _exchange_has_helper(ex_has, EXCHANGE_HAS_OPTIONAL_FUTURES)",
+            "target": "EXCHANGE_HAS_OPTIONAL"
+        }]
+    })
+    .to_string();
+    let payload = service
+        .call_tool_json("get_definitions_by_reference", &args)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!(
+        1,
+        result["definitions"].as_array().unwrap().len(),
+        "{value}"
+    );
+    assert_eq!(
+        "freqtrade.exchange.exchange_utils.EXCHANGE_HAS_OPTIONAL", result["definitions"][0]["fqn"],
+        "{value}"
+    );
+}
+
+#[test]
 fn get_definitions_by_reference_resolves_cpp_overload_by_argument_type() {
     let temp = TempDir::new().unwrap();
     fs::write(

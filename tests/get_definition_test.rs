@@ -10289,6 +10289,85 @@ fn csharp_same_namespace_static_receiver_type_resolves_to_definition() {
 }
 
 #[test]
+fn csharp_reference_context_resolves_unqualified_static_field() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "NzbDrone.Core/Organizer/FileNameBuilder.cs",
+            r#"using System.Text.RegularExpressions;
+
+namespace NzbDrone.Core.Organizer;
+
+public sealed class FileNameBuilder
+{
+    private static readonly Regex TitleRegex = new Regex("[^a-z]+");
+
+    public string BuildFileName(string title)
+    {
+        return TitleRegex.Replace(title, "");
+    }
+}
+"#,
+        )
+        .build();
+
+    let args = json!({
+        "references": [{
+            "symbol": "NzbDrone.Core.Organizer.FileNameBuilder.BuildFileName",
+            "context": "        return TitleRegex.Replace(title, \"\");",
+            "target": "TitleRegex"
+        }]
+    })
+    .to_string();
+    let value = lookup_reference(project.root(), &args);
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "NzbDrone.Core.Organizer.FileNameBuilder.TitleRegex",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_type_reference_beats_same_named_member_and_local() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App/Service.cs",
+            "namespace App { public class Service {} }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            r#"namespace App;
+
+public class Controller
+{
+    private int Service;
+
+    public void Handle()
+    {
+        var Service = 1;
+        Service value;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        Service value;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":10,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Service", "{value}");
+}
+
+#[test]
 fn csharp_instance_member_receiver_resolves_from_enclosing_property_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
