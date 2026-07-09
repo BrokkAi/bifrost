@@ -23,7 +23,7 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 - [x] (2026-07-09T08:25:09Z) Milestone 3: calibrated scoped JavaScript/TypeScript bulk dead-code unproven-inbound evidence.
 - [x] (2026-07-09T08:32:00Z) Milestone 4: calibrated Python bulk dead-code unproven-inbound evidence.
 - [x] (2026-07-09T08:36:00Z) Milestone 5: calibrated Ruby bulk dead-code unproven-inbound evidence.
-- [ ] Final validation and retrospective.
+- [x] (2026-07-09T08:38:00Z) Final validation and retrospective.
 
 
 ## Surprises & Discoveries
@@ -254,6 +254,28 @@ Guided review finding before the Milestone 5 commit:
 
     LOW / Documentation: the Ruby inverted-edge module header still said unknown receivers and non-unique candidates record no edge.
     Fix: updated the module comment to state that those cases record unproven inbound evidence for bulk dead-code analysis rather than a proven edge.
+
+Final validation completed after all milestone commits. PHP, Scala, scoped JS/TS, Python, and Ruby now have focused dead-code fixtures proving inconclusive unproven-only receivers, genuinely unused candidates, and preserved proven-inbound behavior. Benchmark harness support is present for Python, JS, TS, PHP, and Scala pinned repos; Ruby remains focused-test-only because the pinned benchmark manifest still has no Ruby repo.
+
+Final validation evidence:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test php_dead_code_smells --test scala_dead_code_smells --test python_js_ts_dead_code_smells --test ruby_dead_code_smells
+    result: passed at 2026-07-09T08:38:00Z; 15 PHP, 21 Scala, 24 Python/JS/TS, and 8 Ruby dead-code tests passed
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usage_graph_php_test --test usage_graph_scala_test --test usage_graph_ts_test --test usage_graph_ruby_test --test usage_graph_test
+    result: passed at 2026-07-09T08:38:00Z; 15 PHP, 18 Scala, 17 TS, 10 Ruby, and 16 Python/general usage graph tests passed
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_scala_graph_test --test usages_js_ts_graph_test --test usages_js_ts_path_alias_test --test usages_python_graph_test --test usages_ruby_test
+    result: passed at 2026-07-09T08:38:00Z; 43 Scala, 68 passing JS/TS with 2 ignored parity markers, 10 JS/TS path alias, 77 passing Python with 3 ignored parity markers, and 44 Ruby usage tests passed
+
+    cargo fmt --check
+    result: passed at 2026-07-09T08:38:00Z
+
+    BIFROST_SEMANTIC_INDEX=off cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
+    result: passed at 2026-07-09T08:38:00Z; validated 10 repos and covered scenarios include dead_code_smells
+
+    cargo clippy-no-cuda
+    result: blocked by repeated E0514 incompatible-rustc dependency metadata errors, consistent with every milestone attempt
 
 
 ## Context and Orientation
