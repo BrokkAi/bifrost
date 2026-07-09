@@ -22,7 +22,7 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 - [x] (2026-07-09T08:18:06Z) Milestone 2: calibrated Scala bulk dead-code unproven-inbound evidence.
 - [x] (2026-07-09T08:25:09Z) Milestone 3: calibrated scoped JavaScript/TypeScript bulk dead-code unproven-inbound evidence.
 - [x] (2026-07-09T08:32:00Z) Milestone 4: calibrated Python bulk dead-code unproven-inbound evidence.
-- [ ] Milestone 5: calibrate Ruby bulk dead-code unproven-inbound evidence.
+- [x] (2026-07-09T08:36:00Z) Milestone 5: calibrated Ruby bulk dead-code unproven-inbound evidence.
 - [ ] Final validation and retrospective.
 
 
@@ -69,6 +69,9 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 
 - Observation: A too-broad Python unproven branch would have let assigned scalar-local noise hide real dead methods.
   Evidence: Guided review of the Milestone 4 diff found that `count = 0; count.unused()` would record unproven evidence for `unused`. The fixture now includes this scalar-local call and still expects `service.Service.unused` to report dead.
+
+- Observation: Ruby's precise query path already treats dynamic dispatch and unresolved explicit receivers as method evidence, but the inverted edge path previously dropped both.
+  Evidence: `src/analyzer/usages/ruby_graph/extractor.rs` has `dynamic_dispatch_target_argument`, `record_unproven_hit` on missing receivers, and unproven hits for empty candidate sets. Before Milestone 5 production edits, the focused Ruby dead-code fixture reported both `Service.target` and `Service.dispatched` as `no non-self usages found`.
 
 
 ## Decision Log
@@ -119,6 +122,10 @@ Issue #529 extends that same safety to the remaining bulk dead-code paths: PHP, 
 
 - Decision: Python records unproven inbound only for ambiguous receiver facts or unknown unannotated receiver parameters, not arbitrary assigned locals.
   Rationale: An unannotated parameter is a plausible object receiver whose type the structured resolver could not prove, while an assigned local with no receiver type can be scalar or unrelated data. This preserves dead-code findings in the presence of local attribute noise and avoids generic same-terminal matching.
+  Date/Author: 2026-07-09 / Codex.
+
+- Decision: Ruby inverted edges mirror the precise method scanner's unproven cases: unknown explicit receivers, dynamic dispatch by symbol/string, and non-unique method candidate sets.
+  Rationale: These sites are structured Ruby call forms that the existing resolver cannot prove as one declaration. Recording them as unproven keeps dead-code from calling plausible dynamic Ruby dispatch dead without inventing a proven edge.
   Date/Author: 2026-07-09 / Codex.
 
 
@@ -226,6 +233,27 @@ Guided review finding before the Milestone 4 commit:
 
     MEDIUM / Tactical: recording unproven Python evidence for every unknown local attribute receiver was too broad and could make scalar-local noise such as `count.unused()` suppress a real dead method.
     Fix: track function parameters separately from all local shadows, record unknown unproven evidence only for receiver parameters, keep ambiguous receiver facts as unproven, and add scalar-local noise to the fixture while preserving the unused-method dead finding.
+
+Milestone 5 calibrated Ruby by adding unproven inbound emission for unknown explicit receivers, non-unique method candidate lookup, and `send`/`__send__`/`public_send` dynamic dispatch whose first argument is a method symbol or string. The fixture proves unknown `service.target` and `service.public_send(:dispatched)` calls make their methods inconclusive, `Service.unused` still reports dead, and locally constructed `Service.used` remains proven and absent from the findings table.
+
+Validation evidence after guided review cleanup:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test ruby_dead_code_smells --test usage_graph_ruby_test --test usages_ruby_test
+    result: passed at 2026-07-09T08:36:00Z; 8 ruby_dead_code_smells tests, 10 usage_graph_ruby_test tests, and 44 usages_ruby_test tests passed
+
+    BIFROST_SEMANTIC_INDEX=off cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
+    result: passed at 2026-07-09T08:36:00Z; validated 10 repos and covered scenarios include dead_code_smells
+
+    cargo fmt --check
+    result: passed at 2026-07-09T08:36:00Z
+
+    cargo clippy-no-cuda
+    result: blocked by the same repeated E0514 incompatible-rustc dependency metadata errors seen in prior milestones
+
+Guided review finding before the Milestone 5 commit:
+
+    LOW / Documentation: the Ruby inverted-edge module header still said unknown receivers and non-unique candidates record no edge.
+    Fix: updated the module comment to state that those cases record unproven inbound evidence for bulk dead-code analysis rather than a proven edge.
 
 
 ## Context and Orientation
