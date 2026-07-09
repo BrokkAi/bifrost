@@ -521,6 +521,104 @@ fn anchored_selector_wrong_path_reports_anchor_recovery_note() {
 }
 
 #[test]
+fn synthetic_java_constructor_selector_returns_declaring_class_source() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/org/example/EventPublisherTest.java",
+            "package org.example;\n\nclass EventPublisherTest {}\n",
+        )
+        .build();
+
+    let search = call_tool(
+        &project,
+        "search_symbols",
+        r#"{"patterns":["EventPublisherTest"],"include_tests":true,"limit":5}"#,
+    );
+    let functions = search["files"][0]["functions"].as_array().unwrap();
+    assert!(
+        functions
+            .iter()
+            .any(|hit| hit["symbol"] == "org.example.EventPublisherTest.EventPublisherTest"),
+        "{search}"
+    );
+
+    let bare = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["EventPublisherTest"]}"#,
+    );
+    assert_eq!(0, bare["sources"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(0, bare["not_found"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(1, bare["ambiguous"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(
+        "EventPublisherTest", bare["ambiguous"][0]["target"],
+        "{bare}"
+    );
+    assert_eq!(
+        vec![
+            "org.example.EventPublisherTest".to_string(),
+            "org.example.EventPublisherTest.EventPublisherTest".to_string(),
+        ],
+        string_array(&bare["ambiguous"][0]["matches"]),
+        "{bare}"
+    );
+
+    let exact = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["org.example.EventPublisherTest.EventPublisherTest"]}"#,
+    );
+
+    assert_eq!(0, exact["not_found"].as_array().unwrap().len(), "{exact}");
+    assert_eq!(0, exact["ambiguous"].as_array().unwrap().len(), "{exact}");
+    assert_eq!(1, exact["sources"].as_array().unwrap().len(), "{exact}");
+    assert_eq!(
+        "org.example.EventPublisherTest", exact["sources"][0]["label"],
+        "{exact}"
+    );
+    assert_eq!(
+        "synthetic Java default constructor; showing declaring class source",
+        exact["sources"][0]["note"],
+        "{exact}"
+    );
+    assert!(
+        exact["sources"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("class EventPublisherTest {}"),
+        "{exact}"
+    );
+}
+
+#[test]
+fn explicit_java_constructor_selector_returns_constructor_source() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/org/example/EventPublisherTest.java",
+            "package org.example;\n\nclass EventPublisherTest {\n  EventPublisherTest() {}\n}\n",
+        )
+        .build();
+
+    let exact = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["org.example.EventPublisherTest.EventPublisherTest"]}"#,
+    );
+
+    assert_eq!(0, exact["not_found"].as_array().unwrap().len(), "{exact}");
+    assert_eq!(1, exact["sources"].as_array().unwrap().len(), "{exact}");
+    assert_eq!(
+        "org.example.EventPublisherTest.EventPublisherTest", exact["sources"][0]["label"],
+        "{exact}"
+    );
+    assert!(exact["sources"][0]["note"].is_null(), "{exact}");
+    assert_eq!(
+        "EventPublisherTest() {}", exact["sources"][0]["text"],
+        "{exact}"
+    );
+}
+
+#[test]
 fn unresolvable_symbol_reports_search_symbols_recovery_note() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file("src/a.js", "export class Widget {}\n")
