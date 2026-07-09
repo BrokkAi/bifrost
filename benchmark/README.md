@@ -19,7 +19,20 @@ Current probe-input fields are:
 - `summary_targets` for `get_summaries`
 - `seed_file_paths` for `most_relevant_files`
 - `usage_symbols` for `scan_usages`
+- `dead_code_file_paths`, `dead_code_fq_names`,
+  `dead_code_expect_report_contains`, and `dead_code_expect_report_absent`
+  for `dead_code_smells`
 - `definition_queries` for `get_definition`
+
+`dead_code_smells` entries call `report_dead_code_and_unused_abstraction_smells`
+with exact `fq_names` and assert stable substrings in the returned Markdown
+report. Use `dead_code_file_paths` to pin the files containing those symbols
+for subset benchmark runs, `dead_code_expect_report_contains` for text that
+must appear, and `dead_code_expect_report_absent` for failure text that must not
+appear, such as unresolved-symbol skips. The checked-in corpus currently covers
+Python, JavaScript, TypeScript, PHP, and Scala dead-code probes. Ruby is
+intentionally absent because the pinned benchmark corpus does not include a
+Ruby repo.
 
 `definition_queries` entries are source-location probes. Each entry defines a
 project-relative `path`, either `line` plus `column` or a byte range, optional
