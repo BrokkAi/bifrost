@@ -189,6 +189,13 @@ impl RenderText for SymbolSourcesResult {
             .iter()
             .map(|source| source.render_text(options))
             .collect();
+        if !self.sources.is_empty()
+            && (!self.not_found.is_empty()
+                || !self.ambiguous.is_empty()
+                || !self.ambiguous_paths.is_empty())
+        {
+            blocks.insert(0, render_symbol_sources_mixed_status(self));
+        }
         if !self.not_found.is_empty() {
             blocks.push(render_not_found(&self.not_found));
         }
@@ -204,6 +211,27 @@ impl RenderText for SymbolSourcesResult {
             blocks.join("\n\n")
         }
     }
+}
+
+fn render_symbol_sources_mixed_status(result: &SymbolSourcesResult) -> String {
+    let resolved = result.sources.len();
+    let total =
+        resolved + result.not_found.len() + result.ambiguous.len() + result.ambiguous_paths.len();
+    let unresolved = result
+        .not_found
+        .iter()
+        .map(|item| item.input.as_str())
+        .chain(result.ambiguous.iter().map(|item| item.target.as_str()))
+        .chain(
+            result
+                .ambiguous_paths
+                .iter()
+                .map(|item| item.input.as_str()),
+        );
+    format!(
+        "Resolved {resolved} of {total} requested symbols; unresolved: {} (see sections below)",
+        render_inline_list(unresolved)
+    )
 }
 
 impl RenderText for SkimFilesResult {

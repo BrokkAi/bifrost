@@ -20,8 +20,8 @@ use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, 
 use crate::hash::{HashMap, HashSet};
 use crate::model_context;
 use crate::path_utils::{
-    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
-    rel_path_string, workspace_rel_path,
+    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, has_drive_letter_prefix,
+    normalize_pattern, rel_path_string, workspace_rel_path,
 };
 use crate::profiling;
 use crate::relevance::{
@@ -467,6 +467,14 @@ fn not_found_input(input: impl Into<String>, note: Option<String>) -> NotFoundIn
 
 fn symbol_not_found_input(input: impl Into<String>) -> NotFoundInput {
     not_found_input(input, Some(SYMBOL_NOT_FOUND_NOTE.to_string()))
+}
+
+fn unsupported_selector_shape_not_found_input(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+) -> Option<NotFoundInput> {
+    unsupported_selector_shape_guidance(analyzer, input)
+        .map(|note| not_found_input(input.to_string(), Some(note)))
 }
 
 fn path_like_symbol_not_found_input(
@@ -2147,6 +2155,9 @@ fn resolve_file_anchored_symbol_sources(
             code_units
         }
         CodeUnitResolution::NotFound => {
+            if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, input) {
+                return SourceLookupOutcome::NotFound(item);
+            }
             return SourceLookupOutcome::NotFound(symbol_not_found_input(input));
         }
     };
@@ -2312,6 +2323,9 @@ pub fn get_symbol_sources(
             }
 
             if looks_like_file_target(&symbol) {
+                if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, &symbol) {
+                    return (index, SourceLookupOutcome::NotFound(item));
+                }
                 return (
                     index,
                     SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
@@ -2334,6 +2348,8 @@ pub fn get_symbol_sources(
                     (index, SourceLookupOutcome::Ambiguous(item))
                 }
                 SelectableDefinitionResolution::NotFound(target) => {
+                    let target = unsupported_selector_shape_not_found_input(analyzer, &symbol)
+                        .unwrap_or(target);
                     (index, SourceLookupOutcome::NotFound(target))
                 }
             }
@@ -6174,6 +6190,7 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
             if !text.trim().is_empty() {
                 let end_line = text.lines().count().max(1);
                 let path = rel_path_string(&file);
+                let note = file_outline_source_note(&file);
                 return Some(SourceBlock {
                     label: path.clone(),
                     path,
@@ -6181,10 +6198,7 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
                     end_line,
                     text,
                     presentation: None,
-                    note: Some(
-                        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for JS/TS module-scoped symbols, use the full relative path selector such as src/plugin/relativeTime/index.js#default), or use get_summaries for structured summaries"
-                            .to_string(),
-                    ),
+                    note: Some(note),
                 });
             }
 
@@ -6195,6 +6209,16 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
             excerpt_fallback_source_block(analyzer, &file)
         })
         .collect()
+}
+
+fn file_outline_source_note(file: &ProjectFile) -> String {
+    if Ecosystem::of(language_for_file(file)).is_module_scoped() {
+        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for JS/TS module-scoped symbols, use the full relative path selector such as src/plugin/relativeTime/index.js#default), or use get_summaries for structured summaries"
+            .to_string()
+    } else {
+        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for example, <path>#<symbol>), or use get_summaries for structured summaries"
+            .to_string()
+    }
 }
 
 fn include_fallback_source_block(
@@ -6428,6 +6452,136 @@ fn looks_like_file_target(target: &str) -> bool {
         return false;
     };
     !extension.is_empty() && likely_file_target_extension(extension)
+}
+
+fn unsupported_selector_shape_guidance(analyzer: &dyn IAnalyzer, input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(anchor) = line_range_anchor_selector(trimmed) {
+        return Some(format!(
+            "`{}` is a line/range anchor, not a symbol selector. Use get_summaries or `{}` as a file target for an outline, or retry as path#symbol with a real symbol name.",
+            anchor.anchor, anchor.file_path
+        ));
+    }
+    if let Some(name) = signature_string_selector_name(trimmed) {
+        return Some(format!(
+            "signature strings are not supported as symbol selectors; retry with the bare function name `{name}`"
+        ));
+    }
+    if let Some((symbol, path)) = malformed_at_joined_selector(trimmed) {
+        return Some(format!(
+            "`symbol@path` selectors are not supported; retry with the bare symbol `{symbol}` plus the `paths` parameter `{path}`, or use `{path}#{symbol}`"
+        ));
+    }
+    if let Some((path, pseudo_symbol)) = file_pseudo_symbol_selector(analyzer, trimmed) {
+        return Some(format!(
+            "`{pseudo_symbol}` is not a symbol in `{path}`; use `{path}` as a file target for an outline, or call get_summaries on `{path}`"
+        ));
+    }
+    if looks_like_absolute_path(trimmed) {
+        return Some(absolute_path_selector_guidance(analyzer, trimmed));
+    }
+    None
+}
+
+struct LineRangeAnchorSelector<'a> {
+    file_path: &'a str,
+    anchor: &'a str,
+}
+
+fn line_range_anchor_selector(input: &str) -> Option<LineRangeAnchorSelector<'_>> {
+    let (file_path, anchor) = input.rsplit_once('#').or_else(|| input.rsplit_once(':'))?;
+    if file_path.is_empty() || anchor.is_empty() {
+        return None;
+    }
+    is_line_range_anchor(anchor).then_some(LineRangeAnchorSelector { file_path, anchor })
+}
+
+fn is_line_range_anchor(anchor: &str) -> bool {
+    let Some((start, end)) = anchor.split_once('-') else {
+        return is_line_anchor_part(anchor);
+    };
+    is_line_anchor_part(start) && is_line_anchor_part(end)
+}
+
+fn is_line_anchor_part(part: &str) -> bool {
+    let digits = part
+        .strip_prefix('L')
+        .or_else(|| part.strip_prefix('l'))
+        .unwrap_or(part);
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn signature_string_selector_name(input: &str) -> Option<&str> {
+    if !input.contains('(') || !input.contains(')') || !input.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let before_paren = input.split_once('(')?.0.trim_end();
+    let name_start = before_paren
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| (!is_symbol_identifier_char(ch)).then_some(index + ch.len_utf8()))
+        .unwrap_or(0);
+    let name = before_paren[name_start..].trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn is_symbol_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+}
+
+fn malformed_at_joined_selector(input: &str) -> Option<(&str, &str)> {
+    let (symbol, path) = input.split_once('@')?;
+    if symbol.is_empty() || path.is_empty() || path.contains('@') {
+        return None;
+    }
+    (looks_like_file_target(path) || path.contains('/') || path.contains('\\'))
+        .then_some((symbol, path))
+}
+
+fn file_pseudo_symbol_selector<'a>(
+    analyzer: &dyn IAnalyzer,
+    input: &'a str,
+) -> Option<(String, &'a str)> {
+    let (path_candidate, pseudo_symbol) = input.rsplit_once('.')?;
+    if path_candidate.is_empty()
+        || pseudo_symbol.is_empty()
+        || likely_file_target_extension(pseudo_symbol)
+    {
+        return None;
+    }
+    match WorkspaceFileResolver::new(analyzer.project()).resolve_literal(path_candidate) {
+        ResolvedFileInput::File(file) => Some((rel_path_string(&file), pseudo_symbol)),
+        ResolvedFileInput::Ambiguous(_) | ResolvedFileInput::NotFound(_) => None,
+    }
+}
+
+fn looks_like_absolute_path(input: &str) -> bool {
+    input.starts_with('/') || input.starts_with('\\') || has_drive_letter_prefix(input)
+}
+
+fn absolute_path_selector_guidance(analyzer: &dyn IAnalyzer, input: &str) -> String {
+    if let Some(relative_path) = unique_absolute_suffix_match(analyzer, input) {
+        return format!(
+            "this looks like an absolute path; strip the workspace-root prefix and retry `{relative_path}`"
+        );
+    }
+    "this looks like an absolute path; strip the workspace-root prefix and retry the workspace-relative path".to_string()
+}
+
+fn unique_absolute_suffix_match(analyzer: &dyn IAnalyzer, input: &str) -> Option<String> {
+    let normalized = normalize_pattern(input);
+    let matches: Vec<_> = analyzer
+        .analyzed_files()
+        .map(rel_path_string)
+        .filter(|relative| normalized.ends_with(relative))
+        .collect();
+    match matches.as_slice() {
+        [relative] => Some(relative.clone()),
+        _ => None,
+    }
 }
 
 fn looks_like_go_receiver_selector(target: &str) -> bool {

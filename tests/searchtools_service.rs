@@ -1451,21 +1451,20 @@ fn python_boundary_returns_canonical_rendered_text_payload() {
 
 #[test]
 fn get_symbol_sources_file_input_returns_top_level_outline_payload() {
-    let temp = TempDir::new().unwrap();
-    fs::create_dir_all(temp.path().join("src").join("pkg")).unwrap();
-    fs::write(
-        temp.path().join("src").join("pkg").join("Thing.java"),
-        r#"package pkg;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/pkg/Thing.java",
+            r#"package pkg;
 class Thing {
     void method() {}
     static class Inner {}
 }
 "#,
-    )
-    .unwrap();
+        )
+        .build();
 
     let service =
-        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_symbol_sources",
@@ -1486,7 +1485,7 @@ class Thing {
     assert!(!source_text.contains("method"), "{source_text}");
     assert!(!source_text.contains("Inner"), "{source_text}");
     assert_eq!(
-        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for JS/TS module-scoped symbols, use the full relative path selector such as src/plugin/relativeTime/index.js#default), or use get_summaries for structured summaries",
+        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for example, <path>#<symbol>), or use get_summaries for structured summaries",
         source["note"]
     );
 
@@ -1504,6 +1503,42 @@ class Thing {
     );
     assert!(
         rendered.contains("```text\n1: # pkg\n2: - Thing\n```"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn get_symbol_sources_js_file_input_keeps_module_scoped_selector_copy() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/plugin/relativeTime/index.js",
+            "export default function relativeTime() {\n  return 'now';\n}\n",
+        )
+        .build();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_payload_json(
+            "get_symbol_sources",
+            r#"{"symbols":["src/plugin/relativeTime/index.js"]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let note = value["structured"]["sources"][0]["note"]
+        .as_str()
+        .expect("source note");
+    assert!(
+        note.contains("src/plugin/relativeTime/index.js#default"),
+        "{note}"
+    );
+    assert!(note.contains("JS/TS module-scoped symbols"), "{note}");
+
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(
+        rendered.contains("src/plugin/relativeTime/index.js#default"),
         "{rendered}"
     );
 }

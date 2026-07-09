@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
+use brokk_bifrost::{Language, SearchToolsService, searchtools_render::RenderOptions};
 use common::InlineTestProject;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
@@ -13,6 +13,16 @@ fn call_tool(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -
         .expect("service");
     let payload = service
         .call_tool_json(tool, args)
+        .expect("tool call failed");
+    serde_json::from_str(&payload).expect("tool returned invalid JSON")
+}
+
+fn call_tool_payload(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -> Value {
+    let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+    let payload = service
+        .call_tool_payload_json(tool, args, RenderOptions::default())
         .expect("tool call failed");
     serde_json::from_str(&payload).expect("tool returned invalid JSON")
 }
@@ -712,5 +722,135 @@ fn unresolvable_symbol_reports_search_symbols_recovery_note() {
     assert!(
         not_found_note(&result["not_found"][0]).contains("search_symbols"),
         "{result}"
+    );
+}
+
+#[test]
+fn line_range_selectors_report_symbol_selector_guidance() {
+    let project = InlineTestProject::new()
+        .file("src/unix/pipe.c", "int includes_nul(void) { return 0; }\n")
+        .file("src/core.ts", "export function core() {\n  return 1;\n}\n")
+        .file("src/pkg/Thing.java", "package pkg;\nclass Thing {}\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["src/unix/pipe.c:1-32","src/core.ts#1-30","src/core.ts#L1-L79","src/pkg/Thing.java:0"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    let not_found = result["not_found"].as_array().unwrap();
+    assert_eq!(4, not_found.len(), "{result}");
+    let expected = [
+        (
+            "src/unix/pipe.c:1-32",
+            "`1-32` is a line/range anchor, not a symbol selector. Use get_summaries or `src/unix/pipe.c` as a file target for an outline, or retry as path#symbol with a real symbol name.",
+        ),
+        (
+            "src/core.ts#1-30",
+            "`1-30` is a line/range anchor, not a symbol selector. Use get_summaries or `src/core.ts` as a file target for an outline, or retry as path#symbol with a real symbol name.",
+        ),
+        (
+            "src/core.ts#L1-L79",
+            "`L1-L79` is a line/range anchor, not a symbol selector. Use get_summaries or `src/core.ts` as a file target for an outline, or retry as path#symbol with a real symbol name.",
+        ),
+        (
+            "src/pkg/Thing.java:0",
+            "`0` is a line/range anchor, not a symbol selector. Use get_summaries or `src/pkg/Thing.java` as a file target for an outline, or retry as path#symbol with a real symbol name.",
+        ),
+    ];
+    for (item, (input, note)) in not_found.iter().zip(expected) {
+        assert_eq!(input, not_found_input(item), "{result}");
+        assert_eq!(note, not_found_note(item), "{result}");
+    }
+}
+
+#[test]
+fn unsupported_selector_shapes_report_specific_recovery_guidance() {
+    let project = InlineTestProject::new()
+        .file("src/unix/pipe.c", "int includes_nul(void) { return 0; }\n")
+        .file("src/pkg/Thing.java", "package pkg;\nclass Thing {}\n")
+        .build();
+    let absolute = format!(
+        "/opt/work/repo/{}",
+        project
+            .file("src/pkg/Thing.java")
+            .rel_path()
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let args = format!(
+        r#"{{"symbols":["int uv_pipe_bind2(uv_pipe_t* handle, ...)","includes_nul@src/unix/pipe.c","src/pkg/Thing.java.package_and_imports","{absolute}"]}}"#
+    );
+
+    let result = call_tool(&project, "get_symbol_sources", &args);
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    let not_found = result["not_found"].as_array().unwrap();
+    assert_eq!(4, not_found.len(), "{result}");
+    assert_eq!(
+        "int uv_pipe_bind2(uv_pipe_t* handle, ...)",
+        not_found_input(&not_found[0]),
+        "{result}"
+    );
+    assert_eq!(
+        "signature strings are not supported as symbol selectors; retry with the bare function name `uv_pipe_bind2`",
+        not_found_note(&not_found[0]),
+        "{result}"
+    );
+    assert_eq!(
+        "includes_nul@src/unix/pipe.c",
+        not_found_input(&not_found[1]),
+        "{result}"
+    );
+    assert_eq!(
+        "`symbol@path` selectors are not supported; retry with the bare symbol `includes_nul` plus the `paths` parameter `src/unix/pipe.c`, or use `src/unix/pipe.c#includes_nul`",
+        not_found_note(&not_found[1]),
+        "{result}"
+    );
+    assert_eq!(
+        "src/pkg/Thing.java.package_and_imports",
+        not_found_input(&not_found[2]),
+        "{result}"
+    );
+    assert_eq!(
+        "`package_and_imports` is not a symbol in `src/pkg/Thing.java`; use `src/pkg/Thing.java` as a file target for an outline, or call get_summaries on `src/pkg/Thing.java`",
+        not_found_note(&not_found[2]),
+        "{result}"
+    );
+    assert_eq!(absolute, not_found_input(&not_found[3]), "{result}");
+    assert_eq!(
+        "this looks like an absolute path; strip the workspace-root prefix and retry `src/pkg/Thing.java`",
+        not_found_note(&not_found[3]),
+        "{result}"
+    );
+}
+
+#[test]
+fn mixed_symbol_sources_render_lead_in_before_unresolved_sections() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/a.js", "export class Widget {}\n")
+        .build();
+
+    let payload = call_tool_payload(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["Widget","MissingWidget"]}"#,
+    );
+
+    let rendered = payload["rendered_text"].as_str().expect("rendered text");
+    assert!(
+        rendered.starts_with(
+            "Resolved 1 of 2 requested symbols; unresolved: `MissingWidget` (see sections below)"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("## Widget"), "{rendered}");
+    assert!(
+        rendered.contains(
+            "- `MissingWidget`: no symbol matched; try search_symbols with a substring or regex pattern"
+        ),
+        "{rendered}"
     );
 }
