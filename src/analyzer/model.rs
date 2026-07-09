@@ -191,7 +191,7 @@ impl ParameterMetadata {
 pub struct SignatureMetadata {
     label: String,
     parameters: Vec<ParameterMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     return_type_text: Option<String>,
 }
 
