@@ -1218,7 +1218,7 @@ fn csharp_seed_active_path(
 
 fn csharp_is_local_variable_declaration(node: Node<'_>) -> bool {
     node.kind() == "variable_declaration"
-        && !node
+        && node
             .parent()
-            .is_some_and(|parent| parent.kind() == "field_declaration")
+            .is_none_or(|parent| parent.kind() != "field_declaration")
 }
