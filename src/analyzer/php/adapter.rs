@@ -1,7 +1,7 @@
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
-use super::declarations::parse_php_file;
+use super::declarations::{parse_php_file, php_declared_type_node};
 use super::tests::php_contains_tests;
 
 #[derive(Debug, Clone, Default)]
@@ -86,13 +86,7 @@ fn php_wrapped_signature_return_type_text<'a>(
         .ok()?;
     let tree = parser.parse(source.as_str(), None)?;
     let declaration = find_signature_declaration(tree.root_node())?;
-    let type_node = match declaration.kind() {
-        "function_definition" | "method_declaration" => {
-            declaration.child_by_field_name("return_type")
-        }
-        "property_declaration" => declaration.child_by_field_name("type"),
-        _ => None,
-    }?;
+    let type_node = php_declared_type_node(declaration)?;
     signature_slice(
         signature,
         prefix.len(),

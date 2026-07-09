@@ -21,7 +21,7 @@ use std::io;
 /// Bincode envelope version. Bumped when the wire format changes in a way
 /// that cannot be deserialized by older readers; persisted rows tagged with
 /// an unknown version are treated as dirty and re-analyzed.
-pub(crate) const PAYLOAD_VERSION: u32 = 6;
+pub(crate) const PAYLOAD_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct PersistedCodeUnit {
@@ -269,4 +269,43 @@ pub(crate) fn decode(bytes: &[u8], source: &ProjectFile) -> io::Result<FileState
         ));
     }
     Ok(dto.into_file_state(source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_rejects_previous_payload_version() {
+        let dto = PersistedFileState {
+            version: PAYLOAD_VERSION - 1,
+            source: "<?php\n".to_string(),
+            package_name: String::new(),
+            contains_tests: false,
+            top_level_declarations: Vec::new(),
+            declarations: Vec::new(),
+            definition_lookup_units: Vec::new(),
+            import_statements: Vec::new(),
+            imports: Vec::new(),
+            raw_supertypes: Vec::new(),
+            type_identifiers: Vec::new(),
+            signatures: Vec::new(),
+            signature_metadata: Vec::new(),
+            ruby_method_dispatch_modes: Vec::new(),
+            scala_traits: Vec::new(),
+            ranges: Vec::new(),
+            children: Vec::new(),
+            type_aliases: Vec::new(),
+        };
+        let bytes = bincode::serialize(&dto).expect("payload serializes");
+        let source = ProjectFile::new(std::env::temp_dir(), "src/Test.php");
+
+        let error = decode(&bytes, &source).expect_err("old payload version must be rejected");
+
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            error.to_string().contains("unknown payload version"),
+            "{error}"
+        );
+    }
 }

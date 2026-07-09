@@ -98,9 +98,14 @@ impl UsageFactsIndex {
             }
             let signature = signature_of(unit);
             let metadata = metadata_of(unit);
-            let return_type_fqn = signature
-                .as_deref()
-                .and_then(|signature| extract.return_type_text(signature))
+            let return_type_fqn = metadata
+                .as_ref()
+                .and_then(crate::analyzer::SignatureMetadata::return_type_text)
+                .or_else(|| {
+                    signature
+                        .as_deref()
+                        .and_then(|signature| extract.return_type_text(signature))
+                })
                 .and_then(|return_type| {
                     return_type_fqn(return_type, unit.package_name(), definitions, extract)
                 });
@@ -298,5 +303,43 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(candidates, vec!["example.Other", "example.Service"]);
         assert_eq!(facts.facts("example.Factory.make").len(), 2);
+    }
+
+    #[test]
+    fn prefers_metadata_return_type_over_signature_fallback() {
+        let root = std::env::temp_dir().join("bifrost-usage-facts-metadata-test");
+        let declarations = vec![
+            unit(&root, CodeUnitType::Class, "example", "Service", None),
+            unit(&root, CodeUnitType::Class, "example", "Other", None),
+            unit(
+                &root,
+                CodeUnitType::Function,
+                "example",
+                "Factory.make",
+                Some("arity:0 -> Other"),
+            ),
+        ];
+        let definitions = DefinitionLookupIndex::from_declarations(
+            &declarations,
+            |fqn| fqn.replace("$.", ".").trim_end_matches('$').to_string(),
+            |unit| unit.identifier().trim_end_matches('$').to_string(),
+        );
+        let facts = UsageFactsIndex::build_from_declarations(
+            &definitions,
+            declarations.iter().filter(|unit| !unit.is_class()),
+            |unit| unit.signature().map(str::to_string),
+            |_| {
+                Some(
+                    crate::analyzer::SignatureMetadata::new("ignored", Vec::new())
+                        .with_return_type_text(Some("Service")),
+                )
+            },
+            &TestExtractor,
+        );
+
+        assert_eq!(
+            facts.callable_return_type("example.Factory.make"),
+            Some("example.Service")
+        );
     }
 }
