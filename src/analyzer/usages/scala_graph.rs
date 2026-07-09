@@ -22,9 +22,9 @@ use crate::hash::HashSet;
 
 pub(crate) use inverted::{NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes};
 pub(in crate::analyzer::usages) use resolver::{
-    import_candidate_owner_fq_names, method_signature_arity, package_name_of,
-    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
-    scala_normalized_fq_name,
+    import_candidate_fq_names, import_candidate_owner_fq_names, method_signature_arity,
+    package_name_of, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
+    scala_literal_type_name, scala_normalized_fq_name, scala_visible_type_fqn_from_index,
 };
 pub(in crate::analyzer::usages) use syntax::{node_text as scala_node_text, scala_import_path};
 
