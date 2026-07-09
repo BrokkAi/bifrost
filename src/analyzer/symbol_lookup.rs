@@ -22,7 +22,13 @@ pub(crate) fn resolve_codeunit_exact(analyzer: &dyn IAnalyzer, input: &str) -> V
     if trimmed.is_empty() {
         return Vec::new();
     }
-    analyzer.definitions(trimmed).cloned().collect()
+    let matches: Vec<_> = analyzer.definitions(trimmed).cloned().collect();
+    let exact: Vec<_> = matches
+        .iter()
+        .filter(|unit| unit.fq_name() == trimmed)
+        .cloned()
+        .collect();
+    if exact.is_empty() { matches } else { exact }
 }
 
 fn resolve_codeunit_fuzzy_with(
