@@ -11,5 +11,6 @@ mod capabilities;
 pub mod conversion;
 pub(crate) mod handlers;
 mod server;
+mod text_sync;
 
 pub use server::run_lsp_stdio_server;

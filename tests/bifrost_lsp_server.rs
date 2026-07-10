@@ -96,6 +96,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["textDocumentSync"].is_object(),
         "textDocumentSync should be advertised: {initialize}"
     );
+    assert_eq!(
+        initialize["result"]["capabilities"]["textDocumentSync"]["change"], 2,
+        "incremental text synchronization should be advertised: {initialize}"
+    );
     assert!(
         initialize["result"]["capabilities"]["completionProvider"].is_null(),
         "completionProvider should be omitted when the client advertises no completion sub-capabilities: {initialize}"
@@ -770,6 +774,22 @@ fn bifrost_lsp_server_replays_open_document_after_workspace_folder_readd() {
             }
         }
     }));
+    // The client still owns the open document while its workspace root is
+    // absent. Preserve incremental text/version state for the later rebuild.
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": uri_for(&beta_path), "version": 2},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": 1, "character": 9},
+                    "end": {"line": 1, "character": 20}
+                },
+                "text": "updatedOutsideRoot"
+            }]
+        }
+    }));
     server.notify_value(json!({
         "jsonrpc": "2.0",
         "method": "workspace/didChangeWorkspaceFolders",
@@ -785,15 +805,17 @@ fn bifrost_lsp_server_replays_open_document_after_workspace_folder_readd() {
         "jsonrpc": "2.0",
         "id": 2,
         "method": "workspace/symbol",
-        "params": {"query": "overlayOnly"}
+        "params": {"query": "updatedOutsideRoot"}
     }));
     let response = server.read_response_for_id(2);
     let symbols = response["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
     assert!(
-        symbols.iter().any(|symbol| symbol["name"] == "overlayOnly"),
-        "re-added root should replay still-open document overlay: {symbols:#?}"
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "updatedOutsideRoot"),
+        "re-added root should replay the latest still-open document overlay: {symbols:#?}"
     );
 }
 
@@ -6837,7 +6859,7 @@ fn bifrost_lsp_server_formatting_suppresses_stale_snapshot_edits() {
         "jsonrpc": "2.0",
         "method": "textDocument/didChange",
         "params": {
-            "textDocument": {"uri": file_uri, "version": 2},
+            "textDocument": {"uri": file_uri, "version": 7},
             "contentChanges": [{"text": "fn after() {}\n"}]
         }
     }));
@@ -7196,15 +7218,29 @@ fn bifrost_lsp_server_did_change_completion_finds_overlay_only_symbol() {
     }));
     let _ = server.read_notification("textDocument/publishDiagnostics");
 
-    // The overlay introduces `mark_overlay_42` followed by a partial call at
-    // position (2, 4) so the completion prefix on the cursor is `mark`.
-    let overlay_text = "fn mark_overlay_42() {}\nfn caller() {\n    mark\n}\n";
+    // Two ordered incremental changes rename the declaration, then append a
+    // caller against the intermediate buffer. Completion must observe both.
     server.notify_value(json!({
         "jsonrpc": "2.0",
         "method": "textDocument/didChange",
         "params": {
             "textDocument": {"uri": file_uri, "version": 2},
-            "contentChanges": [{"text": overlay_text}]
+            "contentChanges": [
+                {
+                    "range": {
+                        "start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 14}
+                    },
+                    "text": "mark_overlay_42"
+                },
+                {
+                    "range": {
+                        "start": {"line": 1, "character": 0},
+                        "end": {"line": 1, "character": 0}
+                    },
+                    "text": "fn caller() {\n    mark\n}\n"
+                }
+            ]
         }
     }));
     let _ = server.read_notification("textDocument/publishDiagnostics");
@@ -7297,19 +7333,114 @@ fn bifrost_lsp_server_did_close_reverts_completion_to_disk() {
 }
 
 #[test]
-fn bifrost_lsp_server_malformed_didchange_drops_silently_to_client() {
-    // A non-conforming client that sends `didChange` events with `range`
-    // populated (INCREMENTAL semantics) despite our advertising
-    // `TextDocumentSyncKind::FULL` must NOT trigger a parse or a
-    // publishDiagnostics — we have no way to apply the partial edits and
-    // applying any one of them as a full document would silently truncate
-    // the buffer.
-    //
-    // The visible contract this test pins is the absence of side effects:
-    // a hover request issued immediately after the malformed didChange
-    // must receive its response without an interleaved publishDiagnostics
-    // notification. (Stderr does carry a throttled warning; capturing
-    // child stderr deterministically is too flaky to assert on here.)
+fn bifrost_lsp_server_incremental_utf16_crlf_edits_refresh_hover_and_diagnostics() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    fs::write(&file_path, "fn disk() {}\r\n").expect("write disk");
+
+    let mut server = LspServer::start(&root);
+    let file_uri = uri_for(&file_path);
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": "/*😀*/ fn before() {}\r\n"
+            }
+        }
+    }));
+    let _ = server.read_notification("textDocument/publishDiagnostics");
+
+    // The emoji occupies two UTF-16 code units. Rename the valid function,
+    // then append malformed Rust at the CRLF-created trailing line.
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": file_uri, "version": 2},
+            "contentChanges": [
+                {
+                    "range": {
+                        "start": {"line": 0, "character": 10},
+                        "end": {"line": 0, "character": 16}
+                    },
+                    "text": "after"
+                },
+                {
+                    "range": {
+                        "start": {"line": 1, "character": 0},
+                        "end": {"line": 1, "character": 0}
+                    },
+                    "text": "fn broken( {\r\n"
+                }
+            ]
+        }
+    }));
+    let broken = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        !broken["params"]["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected diagnostics array, got {broken}"))
+            .is_empty(),
+        "incremental malformed text should publish diagnostics: {broken}"
+    );
+
+    // Remove the malformed CRLF line and verify diagnostics clear.
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": file_uri, "version": 3},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": 1, "character": 0},
+                    "end": {"line": 2, "character": 0}
+                },
+                "text": ""
+            }]
+        }
+    }));
+    let cleared = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        cleared["params"]["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected diagnostics array, got {cleared}"))
+            .is_empty(),
+        "removing malformed incremental text should clear diagnostics: {cleared}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 35,
+        "method": "textDocument/hover",
+        "params": {
+            "textDocument": {"uri": file_uri},
+            "position": {"line": 0, "character": 11}
+        }
+    }));
+    let hover = server.read_response_for_id(35);
+    let hover_text = hover["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        hover_text.contains("after"),
+        "hover should reflect the UTF-16 incremental rename: {hover}"
+    );
+
+    server.notify_value(json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}));
+    let _ = server.read_response_for_id(99);
+    server.exit();
+}
+
+#[test]
+fn bifrost_lsp_server_rejected_didchanges_preserve_overlay() {
+    // Rejected notifications must not update the overlay, reparse, or publish
+    // diagnostics. Stderr carries a bounded, throttled reason that is not
+    // captured here because child stderr timing is nondeterministic.
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = root.join("lib.rs");
@@ -7326,25 +7457,25 @@ fn bifrost_lsp_server_malformed_didchange_drops_silently_to_client() {
             "textDocument": {
                 "uri": file_uri,
                 "languageId": "rust",
-                "version": 1,
+                "version": 3,
                 "text": "fn original() {}\n"
             }
         }
     }));
     let _ = server.read_notification("textDocument/publishDiagnostics");
 
-    // Malformed didChange: a single content_change with a populated range.
+    // Equal versions are stale even when their range would otherwise apply.
     server.notify_value(json!({
         "jsonrpc": "2.0",
         "method": "textDocument/didChange",
         "params": {
-            "textDocument": {"uri": file_uri, "version": 2},
+            "textDocument": {"uri": file_uri, "version": 3},
             "contentChanges": [{
                 "range": {
-                    "start": {"line": 0, "character": 0},
-                    "end": {"line": 0, "character": 0}
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 11}
                 },
-                "text": "this would be an incremental edit"
+                "text": "stale"
             }]
         }
     }));
@@ -7364,23 +7495,154 @@ fn bifrost_lsp_server_malformed_didchange_drops_silently_to_client() {
         }
     }));
 
-    // Read the very next inbound message. If the malformed didChange had
+    // Read the very next inbound message. If the rejected didChange had
     // emitted publishDiagnostics, the notification would arrive first.
     let next = server.read_message();
     assert_eq!(
         next["id"].as_u64(),
         Some(40),
         "expected hover response (id 40) as the next message; \
-         malformed didChange must not emit publishDiagnostics: {next}"
+         rejected didChange must not emit publishDiagnostics: {next}"
     );
 
-    // Overlay must still reflect the pre-malformed-didChange state.
+    // Overlay must still reflect the pre-rejection state.
     let hover_text = next["result"]["contents"]["value"]
         .as_str()
         .unwrap_or_default();
     assert!(
         hover_text.contains("original"),
-        "hover should still see the didOpen overlay content, got {hover_text}"
+        "hover should still see the didOpen overlay after a stale change, got {hover_text}"
+    );
+
+    // An empty change array advances only the protocol version. Reusing that
+    // version with an otherwise valid edit is stale and must remain a no-op.
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": file_uri, "version": 4},
+            "contentChanges": []
+        }
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": file_uri, "version": 4},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 11}
+                },
+                "text": "same_version"
+            }]
+        }
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "textDocument/hover",
+        "params": {
+            "textDocument": {"uri": file_uri},
+            "position": {"line": 0, "character": 5}
+        }
+    }));
+    let next = server.read_message();
+    assert_eq!(
+        next["id"].as_u64(),
+        Some(41),
+        "empty and stale didChange notifications must not publish diagnostics: {next}"
+    );
+    let hover_text = next["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        hover_text.contains("original"),
+        "empty changes must not alter content and must make same-version edits stale: {next}"
+    );
+
+    // A newer version with a nonexistent line is also rejected, and because
+    // the empty notification advanced state this is validated against v4.
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": file_uri, "version": 5},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": 99, "character": 0},
+                    "end": {"line": 99, "character": 0}
+                },
+                "text": "invalid"
+            }]
+        }
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "textDocument/hover",
+        "params": {
+            "textDocument": {"uri": file_uri},
+            "position": {"line": 0, "character": 5}
+        }
+    }));
+    let next = server.read_message();
+    assert_eq!(
+        next["id"].as_u64(),
+        Some(42),
+        "out-of-range didChange must not publish diagnostics: {next}"
+    );
+    let hover_text = next["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        hover_text.contains("original"),
+        "hover should still see the didOpen overlay after an invalid range: {next}"
+    );
+
+    server.notify_value(json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}));
+    let _ = server.read_response_for_id(99);
+    server.exit();
+}
+
+#[test]
+fn bifrost_lsp_server_didchange_for_unknown_document_is_ignored() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    fs::write(&file_path, "fn disk_original() {}\n").expect("write disk");
+
+    let mut server = LspServer::start(&root);
+    let file_uri = uri_for(&file_path);
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": file_uri, "version": 1},
+            "contentChanges": [{"text": "fn unknown_change() {}\n"}]
+        }
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 45,
+        "method": "textDocument/hover",
+        "params": {
+            "textDocument": {"uri": file_uri},
+            "position": {"line": 0, "character": 5}
+        }
+    }));
+    let next = server.read_message();
+    assert_eq!(
+        next["id"].as_u64(),
+        Some(45),
+        "unknown-document didChange must not publish diagnostics: {next}"
+    );
+    let hover_text = next["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        hover_text.contains("disk_original"),
+        "unknown-document didChange must not replace disk content: {next}"
     );
 
     server.notify_value(json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}));

@@ -30,9 +30,9 @@ Clients can also pass Bifrost-specific `initializationOptions`:
 
 Bifrost advertises LSP capabilities only after the matching handler exists. Unsupported requests return JSON-RPC `MethodNotFound`; unsupported notifications are ignored.
 
-Current support includes full-document text synchronization, save notifications, diagnostics, definition/type-definition/implementation, hover, signature help, completion, references, rename, document highlights, document symbols, formatting, folding ranges, workspace symbols, type and call hierarchy, workspace folder changes, watched-file notifications, startup progress, and formatting cancellation.
+Current support includes incremental and whole-document text synchronization, save notifications, diagnostics, definition/type-definition/implementation, hover, signature help, completion, references, rename, document highlights, document symbols, formatting, folding ranges, workspace symbols, type and call hierarchy, workspace folder changes, watched-file notifications, startup progress, and formatting cancellation.
 
-Incremental text synchronization, runtime configuration changes, semantic tokens, and broader cancellation/progress support are intentional follow-up areas. Code actions, server-side execute commands, and pre-save hooks are not advertised until Bifrost has concrete safe edits or commands to expose.
+Runtime configuration changes, semantic tokens, and broader cancellation/progress support are intentional follow-up areas. Code actions, server-side execute commands, and pre-save hooks are not advertised until Bifrost has concrete safe edits or commands to expose.
 
 ## CLI Tooling
 
