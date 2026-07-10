@@ -5791,47 +5791,6 @@ fn search_symbol_path_tier(patterns: &[String], file: &ProjectFile) -> u8 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ContainsTestsParams {
-    pub file_paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ContainsTestsResult {
-    /// Per resolved file: whether the language analyzer detects test code in it
-    /// (tree-sitter based, not a path heuristic). Keyed by workspace-relative path.
-    pub contains_tests: BTreeMap<String, bool>,
-    /// Inputs that did not resolve to a single existing repo file (missing or
-    /// ambiguous); the caller decides how to treat these.
-    pub unresolved: Vec<String>,
-}
-
-/// Return the semantic test-code predicate for each resolved file. This is
-/// path-independent and does not identify the full test surface: fixtures and
-/// helpers under test roots can return `false`. Use `classify_test_files` when
-/// callers need file-level test-surface identification.
-pub fn contains_tests(
-    analyzer: &dyn IAnalyzer,
-    params: ContainsTestsParams,
-) -> ContainsTestsResult {
-    let project = analyzer.project();
-    let resolver = WorkspaceFileResolver::new(project);
-    let mut found = BTreeMap::new();
-    let mut unresolved = Vec::new();
-    for input in params.file_paths.iter() {
-        match resolver.resolve_literal(input.trim()) {
-            ResolvedFileInput::File(file) if file.exists() => {
-                found.insert(rel_path_string(&file), analyzer.contains_tests(&file));
-            }
-            _ => unresolved.push(input.clone()),
-        }
-    }
-    ContainsTestsResult {
-        contains_tests: found,
-        unresolved,
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ClassifyTestFilesParams {
     pub file_paths: Vec<String>,
 }

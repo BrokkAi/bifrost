@@ -356,22 +356,6 @@ class SearchToolsClient:
             rendered_text=payload.rendered_text,
         )
 
-    def contains_tests(self, file_paths: list[str]) -> dict[str, bool]:
-        """Per file: whether the language analyzer detects test code in it
-        (tree-sitter based, not a path heuristic). Keyed by workspace-relative
-        path. This semantic-only predicate does not identify the full test
-        surface because fixtures/helpers can return false; use
-        classify_test_files for hermetic test-surface identification. Inputs
-        that do not resolve to a single existing repo file are omitted from the
-        returned mapping."""
-        structured = self._call_tool("contains_tests", {"file_paths": list(file_paths)})
-        result = structured.get("contains_tests", {})
-        if not isinstance(result, dict):
-            raise SearchToolsError(
-                "Native contains_tests did not return a JSON object mapping"
-            )
-        return {str(path): bool(flag) for path, flag in result.items()}
-
     def classify_test_files(self, file_paths: list[str]) -> dict[str, dict[str, Any]]:
         """Per file: classify as test, test_support, production, or ambiguous.
         Each entry also includes contains_test_code, the semantic test-code bit.

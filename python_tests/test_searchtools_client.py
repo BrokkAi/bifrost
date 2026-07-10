@@ -222,20 +222,18 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("    - AInnerInner", text)
         self.assertIn("      - method7", text)
 
-    def test_contains_tests_classifies_files(self) -> None:
+    def test_classify_test_files_classifies_files(self) -> None:
         py_root = ROOT / "tests" / "fixtures" / "testcode-py"
         with SearchToolsClient(root=py_root) as client:
-            result = client.contains_tests(
+            result = client.classify_test_files(
                 [
                     "tests/units/utils/test_utils.py",
                     "documented.py",
                     "does_not_exist.py",
                 ]
             )
-        # Real analyzer detection: the pytest module is a test, the documented
-        # sample is not, and an unresolved path is omitted from the mapping.
-        self.assertTrue(result["tests/units/utils/test_utils.py"])
-        self.assertFalse(result["documented.py"])
+        self.assertEqual("test", result["tests/units/utils/test_utils.py"]["kind"])
+        self.assertEqual("ambiguous", result["documented.py"]["kind"])
         self.assertNotIn("does_not_exist.py", result)
 
     def test_scoped_revision_client_reads_selected_old_files(self) -> None:
