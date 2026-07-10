@@ -526,7 +526,7 @@ fn bifrost_lsp_server_runtime_configuration_registers_and_pulls_bifrost_section(
     server.notify_value(json!({
         "jsonrpc": "2.0",
         "method": "workspace/didChangeConfiguration",
-        "params": {"settings": null}
+        "params": {}
     }));
     let pull = server.read_message();
     assert_eq!(pull["method"], "workspace/configuration");
@@ -705,6 +705,66 @@ fn bifrost_lsp_server_runtime_configuration_replays_open_overlay_across_rebuild(
 }
 
 #[test]
+fn bifrost_lsp_server_runtime_configuration_replays_overlay_opened_outside_explicit_roots() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(root_a.join("Alpha.java"), "class Alpha {}\n").expect("write Alpha.java");
+    let file = root_b.join("Beta.java");
+    fs::write(&file, "class Beta { void diskOnly() {} }\n").expect("write Beta.java");
+    let file_uri = uri_for(&file);
+    let mut server = LspServer::start_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&parent),
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "initializationOptions": {"roots": [root_a.display().to_string()]},
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "java",
+                "version": 1,
+                "text": "class Beta { void inactiveOverlayOnly() {} }\n"
+            }
+        }),
+    );
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": file_uri, "version": 2},
+            "contentChanges": [{"text": "class Beta { void inactiveChangedOnly() {} }\n"}]
+        }),
+    );
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {"roots": [], "exclude": [], "formatterCommands": []}
+        }),
+    );
+
+    let response = server.workspace_symbol("inactiveChangedOnly");
+    assert!(
+        response["result"].as_array().is_some_and(|symbols| symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "inactiveChangedOnly")),
+        "an overlay changed outside explicit roots should be replayed when editor roots return: {response}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_runtime_configuration_ignores_stale_and_malformed_pull_responses() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
@@ -782,6 +842,52 @@ fn bifrost_lsp_server_runtime_configuration_ignores_stale_and_malformed_pull_res
         json!([]),
         "failed pull must preserve the last working exclusion: {after_failure}"
     );
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({"settings": null}),
+    );
+    let wrong_shape_pull = server.read_message();
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": wrong_shape_pull["id"].clone(),
+        "result": [
+            {"roots": [], "exclude": [], "formatterCommands": []},
+            {"roots": [], "exclude": [], "formatterCommands": []}
+        ]
+    }));
+    let after_wrong_shape = server.workspace_symbol("hiddenRuntime");
+    assert_eq!(
+        after_wrong_shape["result"],
+        json!([]),
+        "wrong-shaped pull response must preserve the last working exclusion: {after_wrong_shape}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_runtime_configuration_ignores_malformed_legacy_notification() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        root.join("Main.java"),
+        "class Main { void stillAlive() {} }\n",
+    )
+    .expect("write Main.java");
+    let mut server = LspServer::start(&root);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {}
+    }));
+
+    let response = server.workspace_symbol("stillAlive");
+    assert!(
+        response["result"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == "stillAlive")),
+        "malformed legacy configuration notification must not terminate the server: {response}"
+    );
 }
 
 #[cfg(unix)]
@@ -813,6 +919,22 @@ fn bifrost_lsp_server_runtime_configuration_changes_formatter_for_later_requests
     assert_eq!(
         response["result"][0]["newText"], "FN LOWER() {}\n",
         "{response}"
+    );
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "roots": [],
+                "exclude": [],
+                "formatterCommands": [{"include": ["*.rs"], "command": ""}]
+            }
+        }),
+    );
+    let after_invalid = formatting_response(&mut server, &uri_for(&file));
+    assert_eq!(
+        after_invalid["result"][0]["newText"], "FN LOWER() {}\n",
+        "an invalid runtime formatter rule must preserve the last working snapshot: {after_invalid}"
     );
 }
 

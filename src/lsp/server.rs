@@ -245,7 +245,7 @@ fn handle_response(
         if let Some(error) = response.error {
             eprintln!(
                 "[bifrost-lsp] runtime configuration registration failed: {}",
-                error.message
+                truncate_runtime_configuration_log(&error.message)
             );
         }
         return Ok(());
@@ -265,15 +265,23 @@ fn handle_response(
         Some(error) => {
             eprintln!(
                 "[bifrost-lsp] runtime configuration pull failed: {}",
-                error.message
+                truncate_runtime_configuration_log(&error.message)
             );
             return Ok(());
         }
         None => match response.result {
             Some(serde_json::Value::Array(mut values)) if values.len() == 1 => values.remove(0),
+            Some(serde_json::Value::Array(values)) => {
+                eprintln!(
+                    "[bifrost-lsp] ignoring runtime configuration response: expected one item, received {}",
+                    values.len()
+                );
+                return Ok(());
+            }
             Some(value) => {
                 eprintln!(
-                    "[bifrost-lsp] ignoring runtime configuration response: expected one-element array, got {value}"
+                    "[bifrost-lsp] ignoring runtime configuration response: expected an array, received {}",
+                    json_value_kind(&value)
                 );
                 return Ok(());
             }
@@ -284,6 +292,30 @@ fn handle_response(
         },
     };
     apply_runtime_configuration_value(connection, state, &value)
+}
+
+const MAX_RUNTIME_CONFIGURATION_LOG_CHARS: usize = 240;
+
+fn truncate_runtime_configuration_log(message: &str) -> String {
+    let mut truncated = message
+        .chars()
+        .take(MAX_RUNTIME_CONFIGURATION_LOG_CHARS)
+        .collect::<String>();
+    if message.chars().count() > MAX_RUNTIME_CONFIGURATION_LOG_CHARS {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 #[derive(Clone)]
@@ -975,16 +1007,20 @@ fn handle_notification(
 ) -> Result<(), String> {
     match note.method.as_str() {
         DidChangeConfiguration::METHOD => {
-            let params: DidChangeConfigurationParams = serde_json::from_value(note.params)
-                .map_err(|err| {
-                    format!(
-                        "Failed to decode {} params: {err}",
-                        DidChangeConfiguration::METHOD
-                    )
-                })?;
             if state.configuration_protocol.supports_pull {
                 state.request_runtime_configuration(connection)
             } else {
+                let params: DidChangeConfigurationParams = match serde_json::from_value(note.params)
+                {
+                    Ok(params) => params,
+                    Err(err) => {
+                        eprintln!(
+                            "[bifrost-lsp] ignoring runtime configuration notification: {}",
+                            truncate_runtime_configuration_log(&err.to_string())
+                        );
+                        return Ok(());
+                    }
+                };
                 apply_runtime_configuration_value(connection, state, &params.settings)
             }
         }
@@ -996,21 +1032,30 @@ fn handle_notification(
                         DidOpenTextDocument::METHOD
                     )
                 })?;
-            if let Some(file) = resolve_project_file(state.project(), &params.text_document.uri) {
+            let document = params.text_document;
+            if let Some(file) = resolve_project_file(state.project(), &document.uri) {
                 state.remember_open_document(
-                    params.text_document.uri.clone(),
+                    document.uri.clone(),
                     file.abs_path(),
-                    params.text_document.version,
-                    params.text_document.text.clone(),
+                    document.version,
+                    document.text.clone(),
                 );
-                state
-                    .overlay
-                    .set(file.abs_path(), params.text_document.text);
+                state.overlay.set(file.abs_path(), document.text);
                 state.completion_cache.invalidate(&file.abs_path());
                 let mut changed = BTreeSet::new();
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
-                publish_diagnostics_for_state(connection, state, &params.text_document.uri)?;
+                publish_diagnostics_for_state(connection, state, &document.uri)?;
+            } else if let Some(abs_path) = uri_to_path(&document.uri) {
+                let abs_path = abs_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| normalize_path_lexically(abs_path));
+                state.remember_open_document(
+                    document.uri,
+                    abs_path,
+                    document.version,
+                    document.text,
+                );
             }
             Ok(())
         }
@@ -2162,11 +2207,16 @@ fn parse_runtime_configuration(
     };
     let roots = strict_optional_string_array(object, "roots")?;
     let exclude = strict_optional_string_array(object, "exclude")?;
-    let formatter_commands = match object.get("formatterCommands") {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|err| format!("formatterCommands is invalid: {err}"))?,
-        None => Vec::new(),
-    };
+    let formatter_commands: Vec<formatting::FormatterCommandRule> =
+        match object.get("formatterCommands") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|err| format!("formatterCommands is invalid: {err}"))?,
+            None => Vec::new(),
+        };
+    for (index, rule) in formatter_commands.iter().enumerate() {
+        rule.validate()
+            .map_err(|err| format!("formatterCommands[{index}] is invalid: {err}"))?;
+    }
     let mut configured_roots = roots
         .iter()
         .map(|root| runtime_workspace_root_for_config_path(root, base))
@@ -2235,42 +2285,28 @@ fn optional_string_array(
 }
 
 fn workspace_root_for_config_path(raw: &str, base: &Path) -> Option<WorkspaceRoot> {
-    let Some(path) = scoped_config_path(raw, base) else {
-        eprintln!("[bifrost-lsp] ignoring empty bifrost root setting");
-        return None;
-    };
-    match path.canonicalize() {
-        Ok(analyzer_path) if analyzer_path.is_dir() => Some(WorkspaceRoot {
-            identity_uri: path_to_uri_string(&path),
-            identity_path: path,
-            analyzer_path,
-        }),
-        Ok(path) => {
-            eprintln!(
-                "[bifrost-lsp] ignoring bifrost root that is not a directory: {}",
-                path.display()
-            );
-            None
-        }
+    match configured_workspace_root(raw, base) {
+        Ok(root) => Some(root),
         Err(err) => {
-            eprintln!(
-                "[bifrost-lsp] ignoring unavailable bifrost root {}: {err}",
-                path.display()
-            );
+            eprintln!("[bifrost-lsp] ignoring bifrost root setting: {err}");
             None
         }
     }
 }
 
 fn runtime_workspace_root_for_config_path(raw: &str, base: &Path) -> Result<WorkspaceRoot, String> {
+    configured_workspace_root(raw, base)
+}
+
+fn configured_workspace_root(raw: &str, base: &Path) -> Result<WorkspaceRoot, String> {
     let path = scoped_config_path(raw, base)
         .ok_or_else(|| "roots entries must not be empty".to_string())?;
     let analyzer_path = path
         .canonicalize()
-        .map_err(|err| format!("runtime root {} is unavailable: {err}", path.display()))?;
+        .map_err(|err| format!("root {} is unavailable: {err}", path.display()))?;
     if !analyzer_path.is_dir() {
         return Err(format!(
-            "runtime root is not a directory: {}",
+            "root is not a directory: {}",
             analyzer_path.display()
         ));
     }
@@ -2374,6 +2410,32 @@ mod tests {
         )
         .expect_err("invalid formatter rule must reject the snapshot");
         assert!(formatter_error.contains("formatterCommands is invalid"));
+    }
+
+    #[test]
+    fn runtime_configuration_rejects_semantically_invalid_formatter_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let invalid_rules = [
+            (
+                json!({"formatterCommands": [{"command": "   "}]}),
+                "command must not be empty",
+            ),
+            (
+                json!({"formatterCommands": [{"command": "fmt", "language": "brainfuck"}]}),
+                "unknown language",
+            ),
+            (
+                json!({"formatterCommands": [{"command": "fmt", "include": ["["]}]}),
+                "not a valid glob",
+            ),
+        ];
+
+        for (settings, expected) in invalid_rules {
+            let error = parse_runtime_configuration(&settings, &base)
+                .expect_err("semantic formatter error must reject the whole snapshot");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
     }
 
     #[test]

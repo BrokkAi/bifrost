@@ -20,6 +20,8 @@ Users can observe the result without restarting Bifrost: a new formatter command
 - [x] (2026-07-10 07:55Z) Updated the VS Code extension so startup and `workspace/configuration` pulls share one complete settings builder, workspace-scoped formatter rules remain excluded, and only launch-setting changes prompt for restart. Evidence: all 29 extension tests pass.
 - [x] (2026-07-10 07:55Z) Documented full-snapshot precedence, pull/legacy shapes, rebuild and diagnostic behavior, live VS Code settings, and the LSP 3.18 reference; updated the API audit. Evidence: Astro check and production build pass, and both changed pages were inspected in the rendered local preview.
 - [x] (2026-07-10 08:04Z) Ran focused and regression validation, completed a diff self-review, and confirmed formatting, Rust linting, extension tests, documentation checks/build, and rendered documentation. Evidence: every command listed under `Outcomes & Retrospective` passes.
+- [x] (2026-07-10 08:52Z) Ran the five-perspective guided review against `origin/master...HEAD`, deduplicated five relevant findings, and fixed all of them: semantic formatter-rule validation, inactive-root overlay retention, malformed-notification liveness, bounded configuration logging, and shared configured-root resolution.
+- [x] (2026-07-10 08:52Z) Verified the review fixes with seven server unit tests, nine focused runtime-configuration integration tests, the complete Rust test suite including doctests, `cargo fmt`, and `cargo clippy-no-cuda`. The complete suite and clippy used the consistent Homebrew Cargo/rustc/rustdoc toolchain recorded below.
 
 ## Surprises & Discoveries
 
@@ -43,6 +45,9 @@ Users can observe the result without restarting Bifrost: a new formatter command
 
 - Observation: the default shell exposed Cargo/Rustc from the user toolchain but `cargo-clippy` from Homebrew, whose Rust compiler used a different LLVM patch release and rejected dependency metadata with `E0514`.
   Evidence: both a normal and a fresh-target `cargo clippy-no-cuda` failed until Cargo, Rustc, Rustdoc, and the target directory were pinned consistently. `RUSTC=/opt/homebrew/bin/rustc RUSTDOC=/opt/homebrew/bin/rustdoc CARGO_TARGET_DIR=/tmp/bifrost-clippy-homebrew-explicit-576 /opt/homebrew/bin/cargo clippy-no-cuda` passes.
+
+- Observation: editor `didOpen` notifications for files outside explicit configured roots were discarded before the runtime rebuild machinery could retain them.
+  Evidence: the guided review identified that `remember_open_document` ran only after active-project resolution. The server now records file-backed open documents even while inactive, updates their later full-document changes, and the integration test proves the newest unsaved text is replayed when clearing explicit roots restores the editor workspace.
 
 ## Decision Log
 
@@ -97,7 +102,9 @@ Final validation completed successfully:
     cd editors/vscode && npm test
     cd docs && npm run check && npm run build
 
-The seven macOS runtime-configuration integration cases pass locally. The Windows-only `cmd.exe` cancellation and removable-handle case is included for Windows CI but was not executed on this macOS host. `git diff --check origin/master...HEAD` also passes, and the final self-review found no remaining correctness or scope issues.
+The nine macOS runtime-configuration integration cases pass locally. The Windows-only `cmd.exe` cancellation and removable-handle case is included for Windows CI but was not executed on this macOS host. `git diff --check origin/master...HEAD` also passes, and the final self-review found no remaining correctness or scope issues.
+
+The post-implementation guided review produced five findings and all five were applied and verified. Runtime snapshots now reject empty formatter commands, unknown language labels, and malformed globs before replacing working rules. Inactive-root editor buffers survive until their root becomes effective, malformed legacy notifications no longer terminate the server, pull/registration logs avoid serializing configuration payloads and bound client error text, and startup/runtime root resolution shares one strict implementation. The complete pinned-toolchain `cargo test` run, including doctests, passes after these fixes; the ordinary test run also passed every executable test before its known mixed-toolchain doctest failure.
 
 ## Context and Orientation
 
@@ -214,3 +221,5 @@ Plan update (2026-07-10 07:49Z): recorded the completed behavioral test matrix a
 Plan update (2026-07-10 07:55Z): recorded the completed VS Code and documentation milestones, including extension tests, Astro validation, and rendered-page inspection.
 
 Plan update (2026-07-10 08:04Z): recorded successful final validation and self-review, the mixed Rust toolchain discovery and pinned clippy invocation, and the completed outcome for issue #576.
+
+Plan update (2026-07-10 08:52Z): recorded the guided-review findings, all five applied fixes, the new inactive-root overlay behavior, and successful focused plus full Rust verification.

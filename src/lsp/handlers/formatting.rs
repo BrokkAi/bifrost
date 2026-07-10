@@ -42,6 +42,26 @@ pub(crate) struct FormatterCommandRule {
     pub(crate) cwd: Option<String>,
 }
 
+impl FormatterCommandRule {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.command.trim().is_empty() {
+            return Err("command must not be empty".to_string());
+        }
+        if let Some(language) = self.language.as_deref()
+            && Language::from_config_label(language).is_none()
+        {
+            return Err(format!("unknown language `{language}`"));
+        }
+        for (field, patterns) in [("include", &self.include), ("exclude", &self.exclude)] {
+            for (index, pattern) in patterns.iter().enumerate() {
+                Pattern::new(pattern)
+                    .map_err(|err| format!("{field}[{index}] is not a valid glob: {err}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FormatterCommand {
     pub(crate) command: String,
