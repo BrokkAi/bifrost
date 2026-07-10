@@ -1073,7 +1073,7 @@ fn csharp_enclosing_class(
     byte: usize,
 ) -> Option<CodeUnit> {
     if let Some(fqn) = ClassRangeIndex::build(analyzer, file).enclosing(byte) {
-        return analyzer.definitions(fqn).next().cloned();
+        return analyzer.definitions(fqn).next();
     }
 
     let range = Range {

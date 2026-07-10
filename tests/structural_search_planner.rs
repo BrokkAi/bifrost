@@ -79,8 +79,8 @@ impl IAnalyzer for NoProviderAnalyzer {
         None
     }
 
-    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
-        Box::new(self.files.iter())
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
+        self.files.iter().cloned().collect()
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -105,7 +105,7 @@ impl IAnalyzer for NoProviderAnalyzer {
         self.project.as_ref()
     }
 
-    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }
 

@@ -614,7 +614,7 @@ fn symbol_snapshot_map(
         if is_test && !include_tests {
             continue;
         }
-        let Some(range) = primary_range(analyzer, unit) else {
+        let Some(range) = primary_range(analyzer, &unit) else {
             continue;
         };
         let language = language_for_path(unit.source().rel_path());
@@ -625,7 +625,7 @@ fn symbol_snapshot_map(
             language: language.clone(),
         };
         let signature = analyzer
-            .signatures(unit)
+            .signatures(&unit)
             .first()
             .map(|s| s.to_string())
             .or_else(|| unit.signature().map(str::to_string))
@@ -748,7 +748,7 @@ fn imports_for_path(analyzer: &dyn IAnalyzer, path: &Path) -> BTreeSet<String> {
     if !structured.is_empty() {
         return structured;
     }
-    analyzer.import_statements_of(&file).into_iter().collect()
+    analyzer.import_statements(&file).into_iter().collect()
 }
 
 fn call_edge_changes_and_dependencies(

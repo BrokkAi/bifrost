@@ -95,6 +95,7 @@ where
                 }
                 let same_file: HashSet<String> = analyzer
                     .declarations(file)
+                    .into_iter()
                     .map(|unit| unit.identifier().to_string())
                     .collect();
 
@@ -320,6 +321,7 @@ fn scoped_same_file_declarations(
     let mut grouped: HashMap<String, BTreeSet<UsageNodeKey>> = HashMap::default();
     for declaration in analyzer
         .declarations(file)
+        .into_iter()
         .filter(|unit| crate::analyzer::common::language_for_file(unit.source()) == language)
     {
         let key = UsageNodeKey::new(declaration.source().clone(), declaration.fq_name());

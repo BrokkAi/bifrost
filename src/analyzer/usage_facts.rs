@@ -65,9 +65,10 @@ impl UsageFactsIndex {
         analyzer: &dyn IAnalyzer,
         extract: &dyn SignatureFactsExtractor,
     ) -> UsageFactsIndex {
+        let declarations: Vec<_> = analyzer.all_declarations().collect();
         Self::build_from_declarations(
             analyzer.definition_lookup_index(),
-            analyzer.all_declarations(),
+            declarations.iter(),
             |unit| {
                 analyzer
                     .signatures(unit)

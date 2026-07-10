@@ -8,14 +8,14 @@ impl CppAnalyzer {
         let mut index = HashMap::default();
 
         for code_unit in self.all_declarations().filter(|unit| unit.is_class()) {
-            if self.is_type_alias(code_unit) {
+            if self.is_type_alias(&code_unit) {
                 continue;
             }
             let visible =
                 self.visible_type_units(code_unit.source(), include_targets, &mut visible_by_file);
             let mut ancestors = Vec::new();
-            for raw in self.inner.raw_supertypes_of(code_unit) {
-                if let Some(ancestor) = self.resolve_base_type(code_unit, raw, &visible)
+            for raw in self.inner.raw_supertypes_of(&code_unit) {
+                if let Some(ancestor) = self.resolve_base_type(&code_unit, raw, &visible)
                     && !ancestors.iter().any(|existing| existing == &ancestor)
                 {
                     ancestors.push(ancestor);
@@ -62,12 +62,13 @@ impl CppAnalyzer {
         }
 
         out.extend(
-            self.get_declarations(file)
+            self.declarations(file)
                 .into_iter()
                 .filter(|unit| unit.is_class() || self.is_type_alias(unit)),
         );
 
-        for include in include_paths(self.inner.import_statements(file)) {
+        let imports = self.inner.import_statements(file);
+        for include in include_paths(&imports) {
             for target in resolve_include_targets_with_index(file, &include, include_targets) {
                 self.collect_visible_type_units(&target, include_targets, visited, out);
             }

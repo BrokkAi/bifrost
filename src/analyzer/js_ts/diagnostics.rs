@@ -123,6 +123,7 @@ fn collect_js_ts_semantic_diagnostics(
         .collect();
     let same_file_declarations = analyzer
         .top_level_declarations(file)
+        .into_iter()
         .map(|unit| unit.identifier().to_string())
         .filter(|name| !name.is_empty())
         .collect();

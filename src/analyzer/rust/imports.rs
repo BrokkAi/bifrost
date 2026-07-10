@@ -21,7 +21,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
             if let Some(target_fq_name) =
                 resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
             {
-                resolved.extend(self.inner.definitions(&target_fq_name).cloned());
+                resolved.extend(self.inner.definitions(&target_fq_name));
             }
         }
 

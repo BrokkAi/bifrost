@@ -485,7 +485,7 @@ fn python_resolve_callable(
                 return Some(class);
             }
             analyzer
-                .get_declarations(file)
+                .declarations(file)
                 .into_iter()
                 .find(|unit| unit.identifier() == name && unit.is_function())
         }
@@ -497,7 +497,6 @@ fn python_resolve_callable(
             analyzer
                 .definitions(&format!("{}.{}", receiver_type.fq_name(), method))
                 .next()
-                .cloned()
         }
         _ => None,
     }

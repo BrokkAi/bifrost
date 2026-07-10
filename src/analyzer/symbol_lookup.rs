@@ -77,7 +77,7 @@ pub(crate) fn resolve_codeunit_exact(analyzer: &dyn IAnalyzer, input: &str) -> V
     if trimmed.is_empty() {
         return Vec::new();
     }
-    let matches: Vec<_> = analyzer.definitions(trimmed).cloned().collect();
+    let matches: Vec<_> = analyzer.definitions(trimmed).collect();
     let exact: Vec<_> = matches
         .iter()
         .filter(|unit| unit.fq_name() == trimmed)
@@ -192,7 +192,6 @@ fn matching_definitions(
     analyzer
         .definitions(symbol)
         .filter(|code_unit| include(code_unit))
-        .cloned()
         .collect()
 }
 

@@ -33,8 +33,8 @@ const MAX_DECLARATIONS_PER_FILE: usize = 50_000;
 /// thresholds in `weights`.
 ///
 /// The algorithm is intentionally generic: any analyzer that implements the
-/// trait primitives (`get_top_level_declarations`, `get_direct_children`,
-/// `ranges_of`) participates. Per-function cyclomatic complexity is computed
+/// trait primitives (`top_level_declarations`, `direct_children`, `ranges`)
+/// participates. Per-function cyclomatic complexity is computed
 /// via [`cyclomatic_complexity_for`] (shared with
 /// `compute_cyclomatic_complexity`).
 ///
@@ -64,7 +64,7 @@ pub fn find_long_method_and_god_object_smells(
         Exit(CodeUnit, bool),
     }
 
-    let top_levels = analyzer.get_top_level_declarations(file);
+    let top_levels = analyzer.top_level_declarations(file);
     let mut stack: Vec<Frame> = Vec::with_capacity(top_levels.len() * 2);
     for cu in top_levels.into_iter().rev() {
         stack.push(Frame::Enter(cu, true));
@@ -81,7 +81,7 @@ pub fn find_long_method_and_god_object_smells(
                     // run and produce findings for the partial subtree.
                     continue;
                 }
-                let children = analyzer.get_direct_children(&cu);
+                let children = analyzer.direct_children(&cu);
                 stack.push(Frame::Exit(cu, top_level));
                 for child in children.into_iter().rev() {
                     stack.push(Frame::Enter(child, false));
@@ -144,7 +144,7 @@ fn score_maintainability_size_unit(
     };
     let mut descendant_span_lines = own_span_lines;
 
-    let children = analyzer.get_direct_children(cu);
+    let children = analyzer.direct_children(cu);
     let non_synthetic_children: Vec<CodeUnit> = children
         .iter()
         .filter(|child| !child.is_synthetic())
@@ -310,7 +310,7 @@ fn maintainability_size_smell_cmp(
 /// position rather than the widest.
 fn widest_non_empty_range_of(analyzer: &dyn IAnalyzer, cu: &CodeUnit) -> Range {
     analyzer
-        .ranges_of(cu)
+        .ranges(cu)
         .into_iter()
         .filter(|range| !range.is_empty())
         .max_by_key(|range| range.span_lines())
@@ -850,7 +850,7 @@ mod tests {
         let fix = AnalyzerFixture::new(&[("com/example/Foo.java", java)]);
         let analyzer = fix.analyzer.analyzer();
         let package_modules: Vec<_> = analyzer
-            .get_top_level_declarations(
+            .top_level_declarations(
                 &analyzer
                     .project()
                     .file_by_rel_path(std::path::Path::new("com/example/Foo.java"))
@@ -878,7 +878,7 @@ mod tests {
             .file_by_rel_path(std::path::Path::new("com/example/Foo.java"))
             .unwrap();
         let class_cu = analyzer
-            .get_top_level_declarations(&file)
+            .top_level_declarations(&file)
             .into_iter()
             .find(|cu| cu.is_class())
             .expect("expected the Foo class");
@@ -886,7 +886,7 @@ mod tests {
             !is_file_level_module(analyzer, &class_cu, true),
             "non-module CU must never be flagged file-level"
         );
-        for cu in analyzer.get_top_level_declarations(&file) {
+        for cu in analyzer.top_level_declarations(&file) {
             if cu.is_module() {
                 assert!(
                     !is_file_level_module(analyzer, &cu, false),

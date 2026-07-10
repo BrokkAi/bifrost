@@ -139,11 +139,7 @@ pub(super) fn resolve_in_enclosing_scopes(
             return None;
         }
         let child_fqn = format!("{scope}.{name}");
-        if let Some(child) = analyzer
-            .definitions(&child_fqn)
-            .find(|unit| accept(unit))
-            .cloned()
-        {
+        if let Some(child) = analyzer.definitions(&child_fqn).find(|unit| accept(unit)) {
             return Some(child);
         }
         match scope.rfind('.') {

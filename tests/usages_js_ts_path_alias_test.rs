@@ -19,7 +19,6 @@ fn ts_target(analyzer: &TypescriptAnalyzer, source: &ProjectFile, name: &str) ->
     analyzer
         .all_declarations()
         .find(|cu| cu.source() == source && cu.identifier() == name && cu.is_function())
-        .cloned()
         .unwrap_or_else(|| panic!("target function `{name}` not found"))
 }
 
@@ -245,7 +244,6 @@ fn js_config_alias_resolves_in_export_graph() {
                 && cu.identifier() == "validateWebhookUrl"
                 && cu.is_function()
         })
-        .cloned()
         .expect("target function not found");
 
     let hits = flatten_hits(

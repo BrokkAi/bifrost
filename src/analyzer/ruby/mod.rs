@@ -170,7 +170,7 @@ impl RubySemanticFacts {
             .filter(|unit| unit.is_class() || unit.is_module())
         {
             let direct = ruby
-                .get_direct_ancestors(unit)
+                .get_direct_ancestors(&unit)
                 .into_iter()
                 .map(|ancestor| ancestor.fq_name())
                 .collect();
@@ -204,14 +204,11 @@ fn push_ordered_mixin(index: &mut HashMap<String, Vec<String>>, from: String, to
 }
 
 impl IAnalyzer for RubyAnalyzer {
-    fn top_level_declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
 
-    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
@@ -219,18 +216,15 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.indexed_source(file)
     }
 
-    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
 
-    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
 
@@ -244,18 +238,15 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.structural_search_providers()
     }
 
-    fn direct_children<'a>(
-        &'a self,
-        code_unit: &CodeUnit,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
     }
 
-    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
 
-    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
         self.inner.ranges(code_unit)
     }
 
@@ -263,11 +254,11 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
     }
 

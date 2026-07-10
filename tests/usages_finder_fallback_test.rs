@@ -12,7 +12,6 @@ fn definition(analyzer: &dyn IAnalyzer, predicate: impl Fn(&CodeUnit) -> bool) -
     analyzer
         .all_declarations()
         .find(|unit| predicate(unit))
-        .cloned()
         .expect("definition not found")
 }
 

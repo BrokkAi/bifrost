@@ -26,6 +26,8 @@ static RUBY_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
 #[derive(Debug, Clone, Default)]
 pub struct RubyAdapter;
 
+impl crate::analyzer::StorageLanguageAdapter for RubyAdapter {}
+
 impl LanguageAdapter for RubyAdapter {
     fn language(&self) -> Language {
         Language::Ruby

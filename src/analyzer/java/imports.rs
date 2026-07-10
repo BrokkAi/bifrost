@@ -311,7 +311,6 @@ impl JavaAnalyzer {
                     .inner
                     .definitions(import_path)
                     .find(|code_unit| code_unit.is_class())
-                    .cloned()
                 {
                     resolved.insert(code_unit.identifier().to_string(), code_unit);
                 }
@@ -348,7 +347,6 @@ impl JavaAnalyzer {
                 .inner
                 .definitions(normalized)
                 .find(|code_unit| code_unit.is_class())
-                .cloned()
             {
                 return Some(code_unit);
             }
@@ -367,7 +365,6 @@ impl JavaAnalyzer {
             .inner
             .definitions(&same_package_fqn)
             .find(|code_unit| code_unit.is_class())
-            .cloned()
         {
             return Some(code_unit);
         }
@@ -375,7 +372,6 @@ impl JavaAnalyzer {
         self.inner
             .definitions(normalized)
             .find(|code_unit| code_unit.is_class())
-            .cloned()
     }
 
     pub(crate) fn resolve_type_name_with_external(
@@ -446,7 +442,6 @@ impl JavaAnalyzer {
         self.inner
             .definitions(&nested_fqn)
             .find(|code_unit| code_unit.is_class())
-            .cloned()
     }
 
     fn resolve_visible_external_simple_type(
@@ -522,12 +517,10 @@ impl JavaAnalyzer {
         self.inner
             .definitions(&same_package_fqn)
             .find(|code_unit| code_unit.is_class())
-            .cloned()
             .or_else(|| {
                 self.inner
                     .definitions(name)
                     .find(|code_unit| code_unit.is_class())
-                    .cloned()
             })
     }
 

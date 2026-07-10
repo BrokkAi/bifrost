@@ -191,7 +191,7 @@ impl VisibilityIndex {
         }
         let declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = files
             .iter()
-            .map(|file| (file.clone(), analyzer.get_declarations(file)))
+            .map(|file| (file.clone(), analyzer.declarations(file)))
             .collect();
         let mut visible_by_file = HashMap::default();
         for file in roots {
@@ -916,7 +916,8 @@ pub(super) fn collect_include_closure(
         if !out.insert(file.clone()) {
             continue;
         }
-        for include in cpp_include_paths(analyzer.import_statements(&file)) {
+        let imports = analyzer.import_statements(&file);
+        for include in cpp_include_paths(&imports) {
             for target in resolve_include_targets_with_index(&file, &include, include_targets) {
                 stack.push(target);
             }
@@ -940,7 +941,8 @@ pub(super) fn collect_visible_declarations(
         if let Some(declarations) = declarations_by_file.get(&file) {
             out.extend(declarations.iter().cloned());
         }
-        for include in cpp_include_paths(analyzer.import_statements(&file)) {
+        let imports = analyzer.import_statements(&file);
+        for include in cpp_include_paths(&imports) {
             for target in resolve_include_targets_with_index(&file, &include, include_targets) {
                 stack.push(target);
             }
@@ -1096,7 +1098,7 @@ pub(super) fn declaration_is_object_construction_candidate(
     ctx: &ScanCtx<'_>,
 ) -> bool {
     !ctx.analyzer
-        .get_declarations(ctx.file)
+        .declarations(ctx.file)
         .into_iter()
         .filter(|unit| unit.is_function())
         .any(|unit| {

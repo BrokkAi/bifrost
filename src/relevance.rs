@@ -494,9 +494,10 @@ fn imported_files_for(
     if resolved.is_empty() {
         for import in analyzer.import_statements(file) {
             let before = resolved.len();
-            add_definitions_to_files(analyzer.definitions(import), &mut resolved);
+            let definitions: Vec<_> = analyzer.definitions(&import).collect();
+            add_definitions_to_files(definitions.iter(), &mut resolved);
             if resolved.len() == before {
-                let matches = analyzer.search_definitions(import, true);
+                let matches = analyzer.search_definitions(&import, true);
                 add_definitions_to_files(matches.iter(), &mut resolved);
             }
         }

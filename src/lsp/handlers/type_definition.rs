@@ -74,7 +74,7 @@ pub fn implementation(
             } else {
                 descendants
                     .into_iter()
-                    .flat_map(|descendant| analyzer.get_direct_children(&descendant))
+                    .flat_map(|descendant| analyzer.direct_children(&descendant))
                     .filter(|child| implementation_member_matches(child, &name, kind))
                     .collect()
             }
@@ -106,7 +106,7 @@ fn rust_trait_member_implementations(
         .filter(|unit| rust.is_rust_trait_declaration(unit))
         .find_map(|trait_unit| {
             analyzer
-                .get_direct_children(trait_unit)
+                .direct_children(trait_unit)
                 .into_iter()
                 .filter(|child| implementation_member_matches(child, name, kind))
                 .find_map(|child| rust.rust_trait_member_implementations(&child))

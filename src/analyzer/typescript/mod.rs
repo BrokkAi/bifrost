@@ -6,8 +6,9 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
     ImportInfo, Language, PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, build_reverse_import_index,
+    SignatureMetadata, StorageLanguageAdapter, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -38,6 +39,53 @@ use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorde
 use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
 #[derive(Debug, Clone, Default)]
 pub struct TypescriptAdapter;
+
+impl StorageLanguageAdapter for TypescriptAdapter {
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
+        if file.rel_path().extension().is_some_and(|ext| ext == "tsx") {
+            "typescript:tsx".to_string()
+        } else {
+            "typescript:ts".to_string()
+        }
+    }
+
+    fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
+        vec![
+            (
+                "typescript:ts".to_string(),
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            (
+                "typescript:tsx".to_string(),
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+            ),
+        ]
+    }
+
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        crate::analyzer::js_ts::should_persist_code_unit(code_unit)
+    }
+
+    fn storage_contains_tests(
+        &self,
+        state: &crate::analyzer::tree_sitter_analyzer::FileState,
+    ) -> bool {
+        crate::analyzer::js_ts::storage_contains_tests(state)
+    }
+
+    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
+        crate::analyzer::js_ts::hydrate_contains_tests(stored, file, source)
+    }
+
+    fn synthesize_hydrated_units(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
+    ) {
+        crate::analyzer::js_ts::synthesize_hydrated_module(file, source, state);
+    }
+}
 
 impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
     fn language(&self) -> Language {
@@ -75,12 +123,7 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         _tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        let rel = file.rel_path().to_string_lossy().to_ascii_lowercase();
-        rel.contains(".test.")
-            || rel.contains(".spec.")
-            || source.contains("describe(")
-            || source.contains("test(")
-            || source.contains("it(")
+        crate::analyzer::js_ts::contains_tests(file, source)
     }
 
     fn parse_file(
@@ -333,12 +376,11 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                 Language::TypeScript,
                 Some(&self.alias_resolver),
             ) {
-                let top_level: Vec<_> = self.inner.top_level_declarations(&target).collect();
+                let top_level = self.inner.top_level_declarations(&target);
                 if import.is_wildcard {
                     resolved.extend(
                         top_level
                             .iter()
-                            .copied()
                             .filter(|code_unit| !code_unit.is_module())
                             .cloned(),
                     );
@@ -348,7 +390,6 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                     let mut matched = false;
                     for code_unit in top_level
                         .iter()
-                        .copied()
                         .filter(|code_unit| code_unit.identifier() == identifier)
                     {
                         matched = true;
@@ -357,7 +398,6 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                     if !matched {
                         let module_units = top_level
                             .iter()
-                            .copied()
                             .filter(|code_unit| code_unit.is_module())
                             .cloned()
                             .collect::<Vec<_>>();
@@ -371,7 +411,6 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                     resolved.extend(
                         top_level
                             .iter()
-                            .copied()
                             .filter(|code_unit| !code_unit.is_module())
                             .cloned(),
                     );
@@ -504,14 +543,11 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
 }
 
 impl IAnalyzer for TypescriptAnalyzer {
-    fn top_level_declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
 
-    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
@@ -523,18 +559,15 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.indexed_source(file)
     }
 
-    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
 
-    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
 
@@ -542,18 +575,15 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.definition_lookup_index()
     }
 
-    fn direct_children<'a>(
-        &'a self,
-        code_unit: &CodeUnit,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
     }
 
-    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
 
-    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
         self.inner.ranges(code_unit)
     }
 
@@ -561,20 +591,25 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
-        self.inner.signatures(code_unit)
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        let is_type_alias = self.inner.is_type_alias(code_unit);
+        self.inner
+            .signatures(code_unit)
+            .into_iter()
+            .map(|signature| {
+                if is_type_alias && !signature.ends_with(';') {
+                    format!("{signature};")
+                } else {
+                    signature
+                }
+            })
+            .collect()
     }
 
-    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
     }
 
-    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.get_top_level_declarations(file)
-    }
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
-    }
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
@@ -628,19 +663,6 @@ impl IAnalyzer for TypescriptAnalyzer {
     fn project(&self) -> &dyn Project {
         self.inner.project()
     }
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.get_declarations(file)
-    }
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
-    }
-    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.get_direct_children(code_unit)
-    }
-
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit).or_else(|| {
             ts_module_scoped_field_uses_file_name(code_unit)
@@ -662,9 +684,6 @@ impl IAnalyzer for TypescriptAnalyzer {
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         self.inner.extract_call_receiver(reference)
-    }
-    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements_of(file)
     }
     fn enclosing_code_unit(
         &self,
@@ -695,9 +714,6 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner
             .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
-    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges_of(code_unit)
-    }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.module_import_skeleton(code_unit)
             .or_else(|| self.type_alias_skeleton(code_unit))
@@ -719,19 +735,6 @@ impl IAnalyzer for TypescriptAnalyzer {
     }
     fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions_persisted(pattern)
-    }
-    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner
-            .signatures_of(code_unit)
-            .iter()
-            .map(|signature| {
-                if self.inner.is_type_alias(code_unit) && !signature.ends_with(';') {
-                    format!("{signature};")
-                } else {
-                    signature.clone()
-                }
-            })
-            .collect()
     }
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         Some(self)

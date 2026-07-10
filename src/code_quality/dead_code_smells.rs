@@ -529,7 +529,7 @@ fn dead_code_candidates(
         }
     } else {
         for file in files {
-            for declaration in analyzer.get_declarations(file) {
+            for declaration in analyzer.declarations(file) {
                 if !is_dead_code_candidate(&declaration) {
                     continue;
                 }
@@ -606,7 +606,7 @@ fn analyze_candidate(
 ) -> Option<DeadCodeFinding> {
     let language = code_unit_language(candidate);
     let range = analyzer
-        .ranges_of(candidate)
+        .ranges(candidate)
         .into_iter()
         .filter(|range| !range.is_empty())
         .max_by_key(span_lines)?;
@@ -801,7 +801,7 @@ fn analyze_rust_candidates_with_usage_graph(
                 && !unit.is_synthetic()
                 && (unit.is_function() || unit.is_class())
         })
-        .map(CodeUnit::fq_name)
+        .map(|unit| unit.fq_name())
         .collect();
     nodes.extend(candidates.iter().map(CodeUnit::fq_name));
 
@@ -1146,7 +1146,7 @@ where
         .filter(|unit| {
             code_unit_language(unit) == language && !unit.is_synthetic() && node_predicate(unit)
         })
-        .map(CodeUnit::fq_name)
+        .map(|unit| unit.fq_name())
         .collect();
     nodes.extend(candidates.iter().map(CodeUnit::fq_name));
 
@@ -1233,7 +1233,7 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
             ) && !unit.is_synthetic()
                 && (unit.is_function() || unit.is_class() || unit.is_field())
         })
-        .map(scoped_key_for)
+        .map(|unit| scoped_key_for(&unit))
         .collect();
     nodes.extend(candidates.iter().map(scoped_key_for));
 
@@ -1340,7 +1340,7 @@ fn rust_graph_finding(
     }
 
     let range = analyzer
-        .ranges_of(candidate)
+        .ranges(candidate)
         .into_iter()
         .filter(|range| !range.is_empty())
         .max_by_key(span_lines)?;
@@ -1384,7 +1384,7 @@ fn graph_finding_for_language(
     }
 
     let range = analyzer
-        .ranges_of(candidate)
+        .ranges(candidate)
         .into_iter()
         .filter(|range| !range.is_empty())
         .max_by_key(span_lines)?;
@@ -1547,7 +1547,7 @@ fn php_method_graph_finding(
     }
 
     let range = analyzer
-        .ranges_of(candidate)
+        .ranges(candidate)
         .into_iter()
         .filter(|range| !range.is_empty())
         .max_by_key(span_lines)?;
@@ -1615,7 +1615,7 @@ fn public_surface_graph_finding(
     }
 
     let range = analyzer
-        .ranges_of(candidate)
+        .ranges(candidate)
         .into_iter()
         .filter(|range| !range.is_empty())
         .max_by_key(span_lines)?;
@@ -1835,9 +1835,9 @@ fn scoped_declarations_by_key_for_languages(
         .filter(|unit| languages.contains(&code_unit_language(unit)))
     {
         declarations
-            .entry(scoped_key_for(declaration))
+            .entry(scoped_key_for(&declaration))
             .or_default()
-            .push(declaration.clone());
+            .push(declaration);
     }
     declarations
 }

@@ -143,27 +143,22 @@ impl RubyAnalyzer {
     fn resolve_mixin_target(&self, file: &ProjectFile, raw: &str) -> Option<CodeUnit> {
         let visible_files = self.visible_mixin_files(file);
         self.declarations(file)
+            .into_iter()
             .find(|unit| ruby_type_matches(unit, raw))
-            .cloned()
             .or_else(|| {
                 self.imported_code_units_of(file)
                     .into_iter()
                     .find(|unit| ruby_type_matches(unit, raw))
             })
             .or_else(|| {
-                self.inner
-                    .definitions(raw)
-                    .find(|unit| {
-                        (unit.is_class() || unit.is_module())
-                            && visible_files.contains(unit.source())
-                    })
-                    .cloned()
+                self.inner.definitions(raw).find(|unit| {
+                    (unit.is_class() || unit.is_module()) && visible_files.contains(unit.source())
+                })
             })
             .or_else(|| {
                 self.all_declarations()
                     .filter(|unit| visible_files.contains(unit.source()))
                     .find(|unit| ruby_type_matches(unit, raw))
-                    .cloned()
             })
     }
 

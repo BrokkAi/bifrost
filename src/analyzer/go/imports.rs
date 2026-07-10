@@ -25,8 +25,8 @@ impl ImportAnalysisProvider for GoAnalyzer {
                 resolved.extend(
                     self.inner
                         .top_level_declarations(&target_file)
-                        .filter(|code_unit| !code_unit.is_module())
-                        .cloned(),
+                        .into_iter()
+                        .filter(|code_unit| !code_unit.is_module()),
                 );
             }
         }
@@ -121,6 +121,7 @@ impl GoAnalyzer {
     pub(super) fn go_package_of(&self, file: &ProjectFile) -> Option<String> {
         self.inner
             .top_level_declarations(file)
+            .into_iter()
             .next()
             .map(|unit| unit.package_name().to_string())
     }

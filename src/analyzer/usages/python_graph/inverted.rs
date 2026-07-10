@@ -77,6 +77,7 @@ where
             }
             let same_file: HashMap<String, String> = analyzer
                 .declarations(file)
+                .into_iter()
                 .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
                 .collect();
 

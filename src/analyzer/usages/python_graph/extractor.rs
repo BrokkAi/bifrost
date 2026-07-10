@@ -180,7 +180,7 @@ pub(super) fn scan_files_for_seeds(
     // declares it), so `recv.member` can only mean the target.
     let member_unique_in_target_file = target_member.as_deref().is_some_and(|member| {
         let owners: HashSet<CodeUnit> = analyzer
-            .get_declarations(target.source())
+            .declarations(target.source())
             .into_iter()
             .filter(|decl| member_name(decl).as_deref() == Some(member))
             .filter_map(|decl| target_owner_code_unit(analyzer, &decl))
@@ -781,7 +781,6 @@ fn collect_imported_factory_return_types(
         let fqn = format!("{}.{}", binding.module_specifier, imported);
         let units: Vec<CodeUnit> = analyzer
             .definitions(&fqn)
-            .cloned()
             .chain(py.resolve_exported_fqn(&fqn))
             .collect();
         for unit in units {
@@ -863,7 +862,7 @@ fn collect_scope_facts_with_factory_returns(
     target_short: &str,
     factory_return_types: &HashMap<String, String>,
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
-    let declarations = analyzer.get_declarations(file);
+    let declarations = analyzer.declarations(file);
     let mut class_facts_by_name: HashMap<String, LocalBindingsSnapshot<String>> =
         HashMap::default();
     for declaration in declarations

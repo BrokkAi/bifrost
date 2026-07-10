@@ -21,14 +21,14 @@ impl ScalaAnalyzer {
                 .map(|units| units.iter().cloned().collect())
                 .unwrap_or_default();
         }
-        self.inner.definitions(&path).cloned().collect()
+        self.inner.definitions(&path).collect()
     }
 
     fn importable_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
         self.importable_declarations_by_package.get_or_init(|| {
             let mut declarations: HashMap<String, Vec<CodeUnit>> = HashMap::default();
             for unit in self.inner.all_declarations() {
-                if is_scala_importable_top_level(unit) {
+                if is_scala_importable_top_level(&unit) {
                     declarations
                         .entry(unit.package_name().to_string())
                         .or_default()
@@ -109,7 +109,6 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         if file_language(file) != Language::Scala {
             return HashSet::default();
         }
-
         let reverse_index = self.reverse_import_index.get_or_build(
             || {
                 let files: Vec<_> = self.inner.all_files().cloned().collect();
@@ -172,8 +171,9 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         let target_names: HashSet<String> = self
             .inner
             .top_level_declarations(target)
-            .filter(|unit| is_scala_importable_top_level(unit))
-            .map(scala_importable_name)
+            .into_iter()
+            .filter(is_scala_importable_top_level)
+            .map(|unit| scala_importable_name(&unit))
             .collect();
         imports.iter().any(|info| {
             let Some(path) = scala_import_path(info) else {

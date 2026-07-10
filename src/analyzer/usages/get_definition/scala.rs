@@ -1050,7 +1050,7 @@ fn scala_member_candidate_units_with_seen(
         }
     }
 
-    if let Some(owner) = ctx.analyzer.definitions(owner_fqn).next().cloned()
+    if let Some(owner) = ctx.analyzer.definitions(owner_fqn).next()
         && let Some(provider) = ctx.analyzer.type_hierarchy_provider()
     {
         let mut seen = HashSet::default();
@@ -1101,7 +1101,7 @@ fn scala_owner_source_ancestor_member_units(
         .definitions(owner_fqn)
         .filter(|unit| unit.is_class())
     {
-        let Some(source) = ctx.analyzer.get_source(owner, false) else {
+        let Some(source) = ctx.analyzer.get_source(&owner, false) else {
             continue;
         };
         let Some(tree) = parse_scala_tree(&source) else {
@@ -1111,7 +1111,7 @@ fn scala_owner_source_ancestor_member_units(
             ctx.analyzer,
             tree.root_node(),
             &source,
-            owner,
+            &owner,
         ) else {
             continue;
         };
@@ -1155,7 +1155,7 @@ fn scala_find_type_declaration_node_for_unit<'tree>(
         root,
         source,
         owner.identifier(),
-        ranges,
+        &ranges,
         &owner_path,
         &mut Vec::new(),
     )
@@ -1364,8 +1364,9 @@ fn scala_imported_member_return_type(
         .find(|unit| unit.is_function())?;
     let signature = unit
         .signature()
-        .or_else(|| ctx.scala.signatures(&unit).first().map(String::as_str))?;
-    let return_type = scala_signature_return_type(signature)?;
+        .map(str::to_string)
+        .or_else(|| ctx.scala.signatures(&unit).into_iter().next())?;
+    let return_type = scala_signature_return_type(&signature)?;
     let factory_resolver = ScalaNameResolver::for_file(ctx.scala, unit.source(), ctx.types);
     scala_resolve_type_annotation(&factory_resolver, return_type).or_else(|| {
         scala_package_type_fqn(unit.package_name(), return_type)
@@ -1725,7 +1726,7 @@ fn scala_enclosing_class(
     let fqn = ClassRangeIndex::build(analyzer, file)
         .enclosing(byte)?
         .to_string();
-    analyzer.definitions(&fqn).next().cloned()
+    analyzer.definitions(&fqn).next()
 }
 
 fn scala_enclosing_member_shadows_bare_call(

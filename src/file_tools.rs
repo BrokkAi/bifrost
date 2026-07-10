@@ -619,13 +619,14 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFile
 
         let declarations: Vec<SkimDeclaration> = analyzer
             .top_level_declarations(&file)
+            .into_iter()
             .flat_map(|code_unit| {
                 analyzer
-                    .ranges_of(code_unit)
+                    .ranges(&code_unit)
                     .into_iter()
                     .map(move |range| SkimDeclaration {
                         symbol: code_unit.short_name().to_string(),
-                        kind: code_unit_kind_label(code_unit),
+                        kind: code_unit_kind_label(&code_unit),
                         start_line: range.start_line,
                         end_line: range.end_line,
                     })

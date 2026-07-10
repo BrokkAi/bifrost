@@ -67,23 +67,18 @@ pub(super) fn resolve_hierarchy_item_code_unit(
 
     analyzer
         .declarations(&file)
+        .into_iter()
         .find(|candidate| {
             candidate.fq_name() == fq_name
                 && predicate(candidate)
                 && item_identity_matches(analyzer, candidate, signature, start_byte, end_byte)
         })
-        .cloned()
         .or_else(|| {
-            analyzer
-                .definitions(fq_name)
-                .find(|candidate| {
-                    candidate.source() == &file
-                        && predicate(candidate)
-                        && item_identity_matches(
-                            analyzer, candidate, signature, start_byte, end_byte,
-                        )
-                })
-                .cloned()
+            analyzer.definitions(fq_name).find(|candidate| {
+                candidate.source() == &file
+                    && predicate(candidate)
+                    && item_identity_matches(analyzer, candidate, signature, start_byte, end_byte)
+            })
         })
 }
 

@@ -1106,7 +1106,8 @@ fn test_alias_signature_formatting() {
         .into_iter()
         .find(|code_unit| code_unit.short_name().contains("Foo"))
         .unwrap();
-    let signatures = analyzer.signatures_of(&alias);
+    let signatures = analyzer.signatures(&alias);
     assert!(!signatures.is_empty());
     assert_eq!("export type Foo = string | number;", signatures[0]);
+    assert_eq!(signatures, analyzer.signatures_of(&alias));
 }

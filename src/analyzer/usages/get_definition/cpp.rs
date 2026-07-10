@@ -1426,7 +1426,7 @@ fn cpp_enclosing_class(
     byte: usize,
 ) -> Option<CodeUnit> {
     if let Some(fqn) = ClassRangeIndex::build(analyzer, file).enclosing(byte) {
-        return analyzer.definitions(fqn).next().cloned();
+        return analyzer.definitions(fqn).next();
     }
     if let Some(owner) = cpp_out_of_line_function_owner(visibility, file, source, root, byte) {
         return Some(owner);
@@ -1443,10 +1443,7 @@ fn cpp_enclosing_class(
     let enclosing = analyzer.enclosing_code_unit(file, &range)?;
     let enclosing_fqn = enclosing.fq_name();
     let owner_fqn = enclosing_fqn.rsplit_once('.')?.0;
-    analyzer
-        .definitions(owner_fqn)
-        .find(|unit| unit.is_class())
-        .cloned()
+    analyzer.definitions(owner_fqn).find(|unit| unit.is_class())
 }
 
 fn cpp_out_of_line_function_owner(
@@ -2441,11 +2438,11 @@ fn cpp_alias_target_texts<'a>(
     analyzer: &'a dyn IAnalyzer,
     unit: &'a CodeUnit,
 ) -> impl Iterator<Item = String> + 'a {
-    unit.signature()
-        .map(str::to_string)
+    let mut signatures: Vec<String> = unit.signature().map(str::to_string).into_iter().collect();
+    signatures.extend(analyzer.signatures(unit));
+    signatures.extend(analyzer.get_source(unit, false));
+    signatures
         .into_iter()
-        .chain(analyzer.signatures(unit).iter().cloned())
-        .chain(analyzer.get_source(unit, false))
         .filter_map(|signature| cpp_alias_target_text(&signature))
 }
 

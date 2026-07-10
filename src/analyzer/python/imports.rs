@@ -67,8 +67,7 @@ impl PythonAnalyzer {
                             .map(|code_unit| (binding.clone(), code_unit))
                             .collect();
                     }
-                    let definitions: Vec<_> =
-                        self.inner.definitions(&module_candidate).cloned().collect();
+                    let definitions: Vec<_> = self.inner.definitions(&module_candidate).collect();
                     if !definitions.is_empty() {
                         return definitions
                             .into_iter()
@@ -78,7 +77,6 @@ impl PythonAnalyzer {
                     let package_candidate: Vec<_> = self
                         .inner
                         .definitions(&format!("{resolved_module}.{name}"))
-                        .cloned()
                         .collect();
                     if !package_candidate.is_empty() {
                         return package_candidate
@@ -161,7 +159,7 @@ impl PythonAnalyzer {
 
     fn local_export_declarations(&self, file: &ProjectFile, local_name: &str) -> Vec<CodeUnit> {
         self.inner
-            .get_top_level_declarations(file)
+            .top_level_declarations(file)
             .into_iter()
             .filter(|unit| unit.identifier() == local_name)
             .collect()

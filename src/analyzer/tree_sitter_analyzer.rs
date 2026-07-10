@@ -134,6 +134,56 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
 }
 
+/// Language-specific transformations required to store analyzer facts without
+/// baking a live workspace path into content-addressed data. The current
+/// analyzer does not activate a storage backend through this trait; it defines
+/// the contract that a later backend can consume while `FileState` remains the
+/// authoritative runtime representation.
+pub trait StorageLanguageAdapter: LanguageAdapter {
+    fn storage_language_key_for_file(&self, _file: &ProjectFile) -> String {
+        self.language().config_label().to_string()
+    }
+
+    fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
+        vec![(
+            self.language().config_label().to_string(),
+            self.parser_language(),
+        )]
+    }
+
+    fn storage_content_qualifier(&self, code_unit: &CodeUnit) -> String {
+        code_unit.package_name().to_string()
+    }
+
+    fn storage_file_content_qualifier(&self, package_name: &str) -> String {
+        package_name.to_string()
+    }
+
+    fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
+        content_qualifier.to_string()
+    }
+
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        !code_unit.is_file_scope()
+    }
+
+    fn storage_contains_tests(&self, state: &FileState) -> bool {
+        state.contains_tests
+    }
+
+    fn hydrate_contains_tests(&self, stored: bool, _file: &ProjectFile, _source: &str) -> bool {
+        stored
+    }
+
+    fn synthesize_hydrated_units(
+        &self,
+        _file: &ProjectFile,
+        _source: &str,
+        _state: &mut FileState,
+    ) {
+    }
+}
+
 pub type BuildProgress = Arc<dyn Fn(BuildProgressEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +223,7 @@ impl BuildProgressEvent {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FileState {
+pub struct FileState {
     pub(crate) source: String,
     pub(crate) package_name: String,
     pub(crate) top_level_declarations: Vec<CodeUnit>,
@@ -502,7 +552,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
 
 impl<A> TreeSitterAnalyzer<A>
 where
-    A: LanguageAdapter,
+    A: LanguageAdapter + StorageLanguageAdapter,
 {
     fn child_order_key(ranges: &HashMap<CodeUnit, Vec<Range>>, code_unit: &CodeUnit) -> usize {
         ranges
@@ -1340,14 +1390,15 @@ where
         }
 
         let all_children: Vec<_> = crate::analyzer::IAnalyzer::direct_children(self, code_unit)
+            .into_iter()
             .filter(|child| {
                 !child.is_synthetic() || !crate::analyzer::IAnalyzer::ranges(self, child).is_empty()
             })
             .collect();
         let field_children: Vec<_> = all_children
             .iter()
-            .copied()
             .filter(|child| child.is_field())
+            .cloned()
             .collect();
         let parent_start = crate::analyzer::IAnalyzer::ranges(self, code_unit)
             .iter()
@@ -1356,8 +1407,8 @@ where
             .unwrap_or(usize::MAX);
         let non_field_children: Vec<_> = all_children
             .iter()
-            .copied()
             .filter(|child| !child.is_field())
+            .cloned()
             .collect();
         let children = if header_only {
             field_children.clone()
@@ -1374,14 +1425,14 @@ where
                         .iter()
                         .filter(|child| Self::child_first_start(self, child) < parent_start),
                 )
-                .copied()
+                .cloned()
                 .collect()
         };
 
         if !children.is_empty() || code_unit.is_class() {
             let child_indent = format!("{indent}  ");
             for child in children {
-                self.render_skeleton_recursive(child, &child_indent, header_only, out);
+                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
             }
             if header_only && !non_field_children.is_empty() {
                 out.push_str(&child_indent);
@@ -1397,7 +1448,7 @@ where
 
 impl<A> TreeSitterAnalyzer<A>
 where
-    A: LanguageAdapter,
+    A: LanguageAdapter + StorageLanguageAdapter,
 {
     fn child_first_start(&self, child: &CodeUnit) -> usize {
         crate::analyzer::IAnalyzer::ranges(self, child)
@@ -1423,25 +1474,23 @@ where
 
 impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
-    A: LanguageAdapter,
+    A: LanguageAdapter + StorageLanguageAdapter,
 {
-    fn top_level_declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
-        match self.file_state(file) {
-            Some(state) => Box::new(
+    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+        self.file_state(file)
+            .map(|state| {
                 state
                     .top_level_declarations
                     .iter()
-                    .filter(|code_unit| !code_unit.is_file_scope()),
-            ),
-            None => Box::new(std::iter::empty()),
-        }
+                    .filter(|code_unit| !code_unit.is_file_scope())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
-        Box::new(self.state.files.keys())
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
+        self.state.files.keys().cloned().collect()
     }
 
     fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
@@ -1546,53 +1595,70 @@ where
         self.project()
     }
 
-    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         Box::new(
             self.state
                 .files
                 .values()
                 .flat_map(|state| state.declarations.iter())
-                .filter(|unit| !unit.is_file_scope()),
+                .filter(|unit| !unit.is_file_scope())
+                .cloned(),
         )
     }
 
-    fn declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
-        match self.file_state(file) {
-            Some(state) => Box::new(
+    fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
+        self.state
+            .files
+            .values()
+            .flat_map(|state| state.declarations.iter())
+            .filter(|unit| !unit.is_file_scope())
+            .map(|unit| {
+                let range = self.state.ranges.get(unit).and_then(|ranges| {
+                    ranges
+                        .iter()
+                        .min_by_key(|range| (range.start_line, range.start_byte))
+                        .copied()
+                });
+                (unit.clone(), range)
+            })
+            .collect()
+    }
+
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.file_state(file)
+            .map(|state| {
                 state
                     .declarations
                     .iter()
-                    .filter(|unit| !unit.is_file_scope()),
-            ),
-            None => Box::new(std::iter::empty()),
-        }
+                    .filter(|unit| !unit.is_file_scope())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         let normalized = self.adapter.normalize_full_name(fq_name);
         let Some(matches) = self.state.definitions.get(&normalized) else {
             return Box::new(std::iter::empty());
         };
-        Box::new(
-            matches
-                .iter()
-                .scan(false, |saw_module, code_unit| {
-                    if code_unit.is_module() {
-                        if *saw_module {
-                            Some(None)
-                        } else {
-                            *saw_module = true;
-                            Some(Some(code_unit))
-                        }
+        let mut saw_module = false;
+        let matches = matches
+            .iter()
+            .filter_map(|code_unit| {
+                if code_unit.is_module() {
+                    if saw_module {
+                        None
                     } else {
-                        Some(Some(code_unit))
+                        saw_module = true;
+                        Some(code_unit.clone())
                     }
-                })
-                .flatten(),
-        )
+                } else {
+                    Some(code_unit.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        Box::new(matches.into_iter())
     }
 
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
@@ -1603,21 +1669,20 @@ where
         &self.state.usage_facts_index
     }
 
-    fn direct_children<'a>(
-        &'a self,
-        code_unit: &CodeUnit,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         if code_unit.is_module() {
             let target_name = self.adapter.normalize_full_name(&code_unit.fq_name());
-            match self.state.module_children.get(&target_name) {
-                Some(children) => Box::new(children.iter()),
-                None => Box::new(std::iter::empty()),
-            }
+            self.state
+                .module_children
+                .get(&target_name)
+                .cloned()
+                .unwrap_or_default()
         } else {
-            match self.state.children.get(code_unit) {
-                Some(children) => Box::new(children.iter()),
-                None => Box::new(std::iter::empty()),
-            }
+            self.state
+                .children
+                .get(code_unit)
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -1630,10 +1695,10 @@ where
         self.adapter.extract_call_receiver(reference)
     }
 
-    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.file_state(file)
-            .map(|state| state.import_statements.as_slice())
-            .unwrap_or(&[])
+            .map(|state| state.import_statements.clone())
+            .unwrap_or_default()
     }
 
     fn structural_search_providers(
@@ -1657,7 +1722,7 @@ where
             .filter_map(|code_unit| {
                 let best_range = self
                     .ranges(code_unit)
-                    .iter()
+                    .into_iter()
                     .find(|candidate| candidate.contains(range))?;
                 Some((
                     best_range.end_byte - best_range.start_byte,
@@ -1690,8 +1755,9 @@ where
             end_line,
         };
         self.declarations(file)
+            .into_iter()
             .filter_map(|code_unit| {
-                let best_range = self.ranges(code_unit).iter().find(|candidate| {
+                let best_range = self.ranges(&code_unit).into_iter().find(|candidate| {
                     candidate.start_line <= line_range.start_line
                         && candidate.end_line >= line_range.end_line
                 })?;
@@ -1723,12 +1789,12 @@ where
         None
     }
 
-    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [Range] {
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
         self.state
             .ranges
             .get(code_unit)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
@@ -1820,12 +1886,12 @@ where
             let mut grouped = Vec::new();
             for candidate in self.definitions(&code_unit.fq_name()) {
                 if candidate.source() == code_unit.source() {
-                    grouped.extend(self.ranges(candidate).iter().copied());
+                    grouped.extend(self.ranges(&candidate));
                 }
             }
             grouped
         } else {
-            self.ranges(code_unit).to_vec()
+            self.ranges(code_unit)
         };
 
         ranges.sort_by_key(|range| range.start_byte);
@@ -1945,12 +2011,12 @@ where
             .unwrap_or(false)
     }
 
-    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
-        self.signatures_of(code_unit)
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.signatures_of(code_unit).to_vec()
     }
 
-    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
-        self.signature_metadata_of(code_unit)
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.signature_metadata_of(code_unit).to_vec()
     }
 }
 
@@ -2059,6 +2125,14 @@ pub(crate) fn collect_parse_errors(node: Node, out: &mut Vec<crate::analyzer::Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitType;
+    use crate::analyzer::go::GoAdapter;
+    use crate::analyzer::java::JavaAdapter;
+    use crate::analyzer::javascript::JavascriptAdapter;
+    use crate::analyzer::python::PythonAdapter;
+    use crate::analyzer::rust::RustAdapter;
+    use crate::analyzer::typescript::TypescriptAdapter;
+    use std::path::Path;
 
     fn parse_javascript(source: &str) -> Tree {
         let mut parser = Parser::new();
@@ -2066,6 +2140,33 @@ mod tests {
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .expect("javascript parser");
         parser.parse(source, None).expect("parse javascript")
+    }
+
+    fn empty_file_state(source: impl Into<String>, contains_tests: bool) -> FileState {
+        FileState {
+            source: source.into(),
+            package_name: String::new(),
+            top_level_declarations: Vec::new(),
+            declarations: HashSet::default(),
+            definition_lookup_units: HashSet::default(),
+            import_statements: Vec::new(),
+            imports: Vec::new(),
+            raw_supertypes: HashMap::default(),
+            type_identifiers: HashSet::default(),
+            signatures: HashMap::default(),
+            signature_metadata: HashMap::default(),
+            ruby_method_dispatch_modes: HashMap::default(),
+            ranges: HashMap::default(),
+            children: HashMap::default(),
+            scala_traits: HashSet::default(),
+            type_aliases: HashSet::default(),
+            contains_tests,
+            parse_errors: None,
+        }
+    }
+
+    fn temp_file(root: &Path, rel_path: &str) -> ProjectFile {
+        ProjectFile::new(root.to_path_buf(), rel_path)
     }
 
     #[test]
@@ -2109,5 +2210,163 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn storage_adapter_identity_defaults_preserve_in_memory_facts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/Service.java");
+        let adapter = JavaAdapter;
+        let unit = CodeUnit::new(file.clone(), CodeUnitType::Class, "example", "Service");
+        let mut state = empty_file_state("class Service {}\n", true);
+        state.declarations.insert(unit.clone());
+        let before = state.clone();
+
+        assert_eq!(adapter.storage_language_key_for_file(&file), "java");
+        assert_eq!(adapter.storage_language_keys().len(), 1);
+        assert_eq!(adapter.storage_content_qualifier(&unit), "example");
+        assert_eq!(adapter.storage_file_content_qualifier("example"), "example");
+        assert_eq!(
+            adapter.hydrate_content_qualifier("example", &file),
+            "example"
+        );
+        assert!(adapter.should_persist_code_unit(&unit));
+        assert!(!adapter.should_persist_code_unit(&CodeUnit::file_scope(file.clone())));
+        assert!(adapter.storage_contains_tests(&state));
+        assert!(adapter.hydrate_contains_tests(true, &file, &state.source));
+
+        let source = state.source.clone();
+        adapter.synthesize_hydrated_units(&file, &source, &mut state);
+        assert_eq!(state.declarations, before.declarations);
+        assert_eq!(state.top_level_declarations, before.top_level_declarations);
+        assert_eq!(state.ranges, before.ranges);
+    }
+
+    #[test]
+    fn storage_adapter_path_qualifiers_reconstruct_workspace_identity() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+
+        let python_file = temp_file(&root, "pkg/service.py");
+        python_file.write("class Service:\n    pass\n").unwrap();
+        let python = PythonAdapter;
+        let python_unit = CodeUnit::new(
+            python_file.clone(),
+            CodeUnitType::Class,
+            "pkg.service",
+            "Service",
+        );
+        assert_eq!(python.storage_content_qualifier(&python_unit), "");
+        assert_eq!(python.storage_file_content_qualifier("pkg.service"), "");
+        assert_eq!(
+            python.hydrate_content_qualifier("", &python_file),
+            "pkg.service"
+        );
+
+        let rust_file = temp_file(&root, "src/net/mod.rs");
+        let rust = RustAdapter;
+        let rust_unit = CodeUnit::new(rust_file.clone(), CodeUnitType::Class, "net", "Client");
+        assert_eq!(rust.storage_content_qualifier(&rust_unit), "");
+        assert_eq!(rust.hydrate_content_qualifier("", &rust_file), "net");
+
+        std::fs::write(root.join("go.mod"), "module example.com/demo\n").unwrap();
+        let go_file = temp_file(&root, "internal/service/service.go");
+        go_file
+            .write("package service\n\ntype Service struct{}\n")
+            .unwrap();
+        let go = GoAdapter;
+        let go_unit = CodeUnit::new(
+            go_file.clone(),
+            CodeUnitType::Class,
+            "example.com/demo/internal/service",
+            "Service",
+        );
+        assert_eq!(go.storage_content_qualifier(&go_unit), "");
+        assert_eq!(
+            go.hydrate_content_qualifier("", &go_file),
+            "example.com/demo/internal/service"
+        );
+    }
+
+    #[test]
+    fn storage_adapter_path_units_and_tests_reconstruct_after_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let tsx_file = temp_file(&root, "src/widget.test.tsx");
+        let source = "import { value } from './value';\ntest('value', () => value());\n";
+        let adapter = TypescriptAdapter;
+
+        assert_eq!(
+            adapter.storage_language_key_for_file(&tsx_file),
+            "typescript:tsx"
+        );
+        assert_eq!(
+            adapter
+                .storage_language_keys()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["typescript:ts".to_string(), "typescript:tsx".to_string()])
+        );
+
+        let mut state = empty_file_state(source, true);
+        state.imports.push(ImportInfo {
+            raw_snippet: "import { value } from './value';".to_string(),
+            is_wildcard: false,
+            identifier: Some("value".to_string()),
+            alias: None,
+        });
+        assert!(adapter.storage_contains_tests(&state));
+        assert!(adapter.hydrate_contains_tests(false, &tsx_file, ""));
+
+        adapter.synthesize_hydrated_units(&tsx_file, source, &mut state);
+        let module = state
+            .top_level_declarations
+            .iter()
+            .find(|unit| unit.is_module())
+            .expect("synthetic TypeScript module");
+        assert!(!adapter.should_persist_code_unit(module));
+        assert!(state.declarations.contains(module));
+        assert_eq!(state.ranges.get(module).map(Vec::len), Some(1));
+
+        let js_file = temp_file(&root, "src/widget.spec.js");
+        let javascript = JavascriptAdapter;
+        assert!(javascript.hydrate_contains_tests(false, &js_file, ""));
+        let mut js_state = empty_file_state(source, true);
+        js_state.imports = state.imports.clone();
+        javascript.synthesize_hydrated_units(&js_file, source, &mut js_state);
+        let js_module = js_state
+            .top_level_declarations
+            .iter()
+            .find(|unit| unit.is_module())
+            .expect("synthetic JavaScript module");
+        assert!(!javascript.should_persist_code_unit(js_module));
+        assert!(js_state.declarations.contains(js_module));
+        assert_eq!(js_state.ranges.get(js_module).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn storage_adapter_python_synthesizes_path_module_and_children() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "pkg/service.py");
+        let source = "class Service:\n    pass\n";
+        let class = CodeUnit::new(file.clone(), CodeUnitType::Class, "pkg.service", "Service");
+        let mut state = empty_file_state(source, false);
+        state.top_level_declarations.push(class.clone());
+        state.declarations.insert(class.clone());
+
+        let adapter = PythonAdapter;
+        adapter.synthesize_hydrated_units(&file, source, &mut state);
+        let module = state
+            .top_level_declarations
+            .first()
+            .expect("synthetic Python module");
+        assert!(module.is_module());
+        assert_eq!(module.fq_name(), "pkg.service");
+        assert!(!adapter.should_persist_code_unit(module));
+        assert_eq!(state.children.get(module), Some(&vec![class]));
+        assert_eq!(state.ranges.get(module).map(Vec::len), Some(1));
     }
 }

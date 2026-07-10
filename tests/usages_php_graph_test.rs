@@ -101,8 +101,8 @@ class Service {
         ("App.Service.promoted", "Repository"),
     ] {
         let unit = definition(&analyzer, fqn);
-        let actual = analyzer
-            .signature_metadata(&unit)
+        let metadata = analyzer.signature_metadata(&unit);
+        let actual = metadata
             .first()
             .and_then(|metadata| metadata.return_type_text());
         assert_eq!(Some(expected), actual, "metadata for {fqn}");

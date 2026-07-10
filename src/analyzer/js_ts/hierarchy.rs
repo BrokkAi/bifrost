@@ -110,7 +110,7 @@ where
         .all_declarations()
         .filter(|candidate| candidate.is_class())
     {
-        for ancestor in provider.get_direct_ancestors(candidate) {
+        for ancestor in provider.get_direct_ancestors(&candidate) {
             reverse
                 .entry(ancestor)
                 .or_default()
@@ -275,8 +275,8 @@ fn type_declarations_in_file(
 ) -> Vec<CodeUnit> {
     analyzer
         .top_level_declarations(file)
+        .into_iter()
         .filter(|candidate| candidate.is_class() && candidate.identifier() == identifier)
-        .cloned()
         .collect()
 }
 

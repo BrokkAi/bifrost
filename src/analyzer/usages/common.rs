@@ -35,8 +35,8 @@ pub(crate) fn analyzed_files_for_language(
 ) -> Vec<ProjectFile> {
     let mut files: Vec<ProjectFile> = analyzer
         .analyzed_files()
+        .into_iter()
         .filter(|file| language_for_file(file) == language)
-        .cloned()
         .collect();
     files.sort();
     files

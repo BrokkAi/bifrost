@@ -58,7 +58,7 @@ mod dispatch_mode_tests {
             .definitions(fq_name)
             .next()
             .unwrap_or_else(|| panic!("missing Ruby method {fq_name}"));
-        analyzer.method_dispatch_mode(method)
+        analyzer.method_dispatch_mode(&method)
     }
 
     #[test]

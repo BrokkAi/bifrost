@@ -465,7 +465,7 @@ pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
 /// Resolve the type named by a method's declared return type, so a call
 /// receiver (`GetFoo().Member`) can be typed by the callee. The stored member
 /// `signature()` keeps only the parameter list, so read the return type from the
-/// full signature text (`signatures_of`), which is `Return Name(params) { … }`.
+/// full signature text (`signatures`), which is `Return Name(params) { … }`.
 pub(in crate::analyzer::usages) fn method_return_type_fq_name(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
@@ -543,7 +543,7 @@ fn resolve_member_type_fq_name(
 }
 
 fn member_declared_type(csharp: &CSharpAnalyzer, member: &CodeUnit) -> Option<String> {
-    let signatures = csharp.signatures_of(member);
+    let signatures = csharp.signatures(member);
     let signature = member
         .signature()
         .or_else(|| signatures.first().map(String::as_str))?;
@@ -554,7 +554,7 @@ fn member_declared_type(csharp: &CSharpAnalyzer, member: &CodeUnit) -> Option<St
 /// (`Return Name(params) { … }`); constructors, whose signature starts at the
 /// name, yield `None`.
 fn method_return_type(csharp: &CSharpAnalyzer, method: &CodeUnit) -> Option<String> {
-    let signatures = csharp.signatures_of(method);
+    let signatures = csharp.signatures(method);
     let signature = signatures.first().map(String::as_str)?;
     type_text_before_name(signature, method.identifier())
 }
@@ -777,7 +777,7 @@ pub(in crate::analyzer::usages) fn is_extension_method(
 ) -> bool {
     unit.is_function()
         && analyzer
-            .signatures_of(unit)
+            .signatures(unit)
             .iter()
             .any(|signature| extension_receiver_type_from_signature(signature).is_some())
 }
@@ -792,7 +792,7 @@ pub(in crate::analyzer::usages) fn extension_method_receiver_type(
     let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
     let owner = analyzer.parent_of(unit)?;
     analyzer
-        .signatures_of(unit)
+        .signatures(unit)
         .iter()
         .find_map(|signature| extension_receiver_type_from_signature(signature))
         .and_then(|type_text| {

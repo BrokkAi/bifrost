@@ -619,7 +619,7 @@ fn java_receiver_type(
             .then(|| {
                 ClassRangeIndex::build(analyzer, file)
                     .enclosing(object.start_byte())
-                    .and_then(|fqn| analyzer.definitions(fqn).next().cloned())
+                    .and_then(|fqn| analyzer.definitions(fqn).next())
             })
             .flatten()
     })
@@ -774,7 +774,6 @@ fn java_qualified_nested_type(
         analyzer
             .definitions(&format!("{}.{}", owner.fq_name(), name))
             .find(|unit| unit.is_class())
-            .cloned()
     };
     if let Some(unit) = nested(&qualifier_type) {
         return Some(unit);
@@ -825,13 +824,12 @@ fn java_nested_type_from_context(
     let class_ranges = ClassRangeIndex::build(analyzer, file);
     let mut owner = class_ranges
         .enclosing(byte)
-        .and_then(|fqn| analyzer.definitions(fqn).next().cloned());
+        .and_then(|fqn| analyzer.definitions(fqn).next());
     while let Some(current) = owner {
         let child_fqn = format!("{}.{}", current.fq_name(), normalized);
         if let Some(child) = analyzer
             .definitions(&child_fqn)
             .find(|code_unit| code_unit.is_class())
-            .cloned()
         {
             return Some(child);
         }
@@ -1250,7 +1248,7 @@ fn java_expression_type_text(
             let signature = unit
                 .signature()
                 .map(str::to_string)
-                .or_else(|| analyzer.signatures(&unit).iter().next().cloned())?;
+                .or_else(|| analyzer.signatures(&unit).first().cloned())?;
             java_field_type_text_from_signature(&signature, field)
         }
         "method_invocation" => {
@@ -1526,7 +1524,7 @@ fn java_member_candidates(
         return candidates_outcome(candidates);
     }
 
-    let owner = analyzer.definitions(owner_fqn).next().cloned();
+    let owner = analyzer.definitions(owner_fqn).next();
     if allow_generated_accessors && let Some(owner) = owner.as_ref() {
         let generated_accessor_candidates =
             java_lombok_accessor_field_candidates(analyzer, support, owner, member);
@@ -1646,7 +1644,7 @@ fn java_field_is_boolean(analyzer: &dyn IAnalyzer, field: &CodeUnit) -> bool {
     let signature = field
         .signature()
         .map(str::to_string)
-        .or_else(|| analyzer.signatures(field).iter().next().cloned());
+        .or_else(|| analyzer.signatures(field).first().cloned());
     signature
         .as_deref()
         .and_then(|signature| java_field_type_text_from_signature(signature, field.identifier()))
@@ -1769,7 +1767,7 @@ fn java_static_import_candidates(
     let mut candidates = Vec::new();
     let mut saw_external = false;
     for import in analyzer.import_statements(file) {
-        let Some(path) = java_static_import_path(import) else {
+        let Some(path) = java_static_import_path(&import) else {
             continue;
         };
         if let Some(owner) = path.strip_suffix(".*") {

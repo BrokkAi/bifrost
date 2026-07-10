@@ -1013,7 +1013,7 @@ fn go_callable_return_type_text(
 ) -> Option<String> {
     candidates.into_iter().find_map(|candidate| {
         for signature in analyzer.signatures(&candidate) {
-            if let Some(return_type) = go_function_return_type_text(signature) {
+            if let Some(return_type) = go_function_return_type_text(&signature) {
                 return Some(return_type.to_string());
             }
         }
@@ -1030,8 +1030,8 @@ fn go_callable_return_type_fqn(
     candidates: Vec<CodeUnit>,
 ) -> Option<String> {
     candidates.into_iter().find_map(|candidate| {
-        let return_type = analyzer
-            .signatures(&candidate)
+        let signatures = analyzer.signatures(&candidate);
+        let return_type = signatures
             .iter()
             .find_map(|signature| go_function_return_type_text(signature))
             .or_else(|| candidate.signature().and_then(go_function_return_type_text))?;
@@ -1218,7 +1218,7 @@ fn go_field_unit_type_text(
     let signature = field_unit
         .signature()
         .map(str::to_string)
-        .or_else(|| analyzer.signatures(field_unit).iter().next().cloned())?;
+        .or_else(|| analyzer.signatures(field_unit).first().cloned())?;
     let trimmed = signature.trim();
     if let Some(type_text) = trimmed
         .strip_prefix(field)

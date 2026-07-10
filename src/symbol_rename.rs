@@ -408,7 +408,7 @@ fn declaration_target_at_span(
     cursor: &RenameCursorRef<'_>,
 ) -> Option<CodeUnit> {
     let mut matches = analyzer
-        .get_declarations(cursor.file)
+        .declarations(cursor.file)
         .into_iter()
         .filter(|code_unit| code_unit.identifier() == cursor.identifier)
         .filter(|code_unit| {

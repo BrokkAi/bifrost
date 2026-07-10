@@ -132,6 +132,7 @@ fn rust_declaration_targets_in_files(
         .flat_map(|file| {
             analyzer
                 .declarations(file)
+                .into_iter()
                 .filter(move |unit| unit.identifier() == name)
                 .map(|unit| (file.clone(), unit.identifier().to_string()))
         })
@@ -150,7 +151,7 @@ impl RustAnalyzer {
             if identifier.is_empty() || identifier.starts_with('_') {
                 continue;
             }
-            if !self.is_module_export_candidate(code_unit) {
+            if !self.is_module_export_candidate(&code_unit) {
                 continue;
             }
             index.exports_by_name.insert(
@@ -333,6 +334,7 @@ impl RustAnalyzer {
         self.insert_reexport_reference_bindings(file, &mut named);
         let same_file: HashMap<String, String> = self
             .declarations(file)
+            .into_iter()
             .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
             .collect();
         RustReferenceContext {
@@ -429,10 +431,10 @@ impl RustAnalyzer {
             .filter(|file| rust_package_name(file) == resolved_module)
             .collect();
         files.extend(self.get_analyzed_files().into_iter().filter(|file| {
-            self.declarations(file).any(|code_unit| {
+            self.declarations(file).into_iter().any(|code_unit| {
                 code_unit.is_module()
                     && code_unit.short_name() == resolved_module
-                    && (*file == *importing_file || self.is_visible_module_path(code_unit))
+                    && (*file == *importing_file || self.is_visible_module_path(&code_unit))
             })
         }));
         files.extend(rust_module_files_from_path(
@@ -452,6 +454,7 @@ impl RustAnalyzer {
         _instance_receiver: bool,
     ) -> Option<CodeUnit> {
         self.declarations(source_file)
+            .into_iter()
             .find(|code_unit| {
                 code_unit.identifier() == member_name
                     && self
@@ -459,7 +462,6 @@ impl RustAnalyzer {
                         .map(|parent| parent.identifier() == owner_name)
                         .unwrap_or(false)
             })
-            .cloned()
     }
 
     pub fn rust_usage_candidate_files(
@@ -644,7 +646,8 @@ impl RustAnalyzer {
         let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
             return false;
         };
-        let Some(range) = self.ranges(code_unit).first() else {
+        let ranges = self.ranges(code_unit);
+        let Some(range) = ranges.first() else {
             return false;
         };
         let Some(tree) = parse_rust_tree(&source) else {
@@ -664,6 +667,7 @@ impl RustAnalyzer {
         member_kind: RustTraitMemberKind,
     ) -> Option<CodeUnit> {
         self.declarations(file)
+            .into_iter()
             .filter(|unit| unit.identifier() == member_name)
             .filter(|unit| rust_code_unit_kind_matches(unit, member_kind))
             .find(|unit| {
@@ -671,7 +675,6 @@ impl RustAnalyzer {
                     range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
                 })
             })
-            .cloned()
     }
 }
 

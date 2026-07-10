@@ -49,8 +49,7 @@ fn java_wildcard_import_is_ambiguous(
         candidates.extend(
             analyzer
                 .definitions(&format!("{package}.{identifier}"))
-                .filter(|code_unit| code_unit.is_class())
-                .cloned(),
+                .filter(|code_unit| code_unit.is_class()),
         );
     }
     has_multiple_distinct_candidates(candidates)
@@ -72,7 +71,7 @@ fn csharp_using_import_is_ambiguous(
     let file_namespace = analyzer.namespace_of_file(file);
     if analyzer
         .all_declarations()
-        .any(|unit| is_class_named_in_package(unit, identifier, &file_namespace))
+        .any(|unit| is_class_named_in_package(&unit, identifier, &file_namespace))
     {
         return false;
     }
@@ -82,8 +81,7 @@ fn csharp_using_import_is_ambiguous(
         candidates.extend(
             analyzer
                 .definitions(&format!("{namespace}.{identifier}"))
-                .filter(|code_unit| code_unit.is_class())
-                .cloned(),
+                .filter(|code_unit| code_unit.is_class()),
         );
     }
     has_multiple_distinct_candidates(candidates)
@@ -113,8 +111,7 @@ fn scala_wildcard_import_is_ambiguous(
         candidates.extend(
             analyzer
                 .definitions(&format!("{package}.{identifier}"))
-                .filter(|code_unit| code_unit.is_class())
-                .cloned(),
+                .filter(|code_unit| code_unit.is_class()),
         );
     }
     has_multiple_distinct_candidates(candidates)
@@ -127,6 +124,7 @@ fn package_local_class_exists(
 ) -> bool {
     let Some(package) = analyzer
         .top_level_declarations(file)
+        .into_iter()
         .next()
         .map(|unit| unit.package_name().to_string())
     else {

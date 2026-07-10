@@ -853,7 +853,8 @@ fn cpp_signature_metadata_labels_unnamed_pointer_parameters() {
         .unwrap();
     let metadata = analyzer
         .signature_metadata(&function)
-        .first()
+        .into_iter()
+        .next()
         .unwrap_or_else(|| panic!("missing metadata for {}", function.fq_name()));
     let labels: Vec<_> = metadata
         .parameters()
@@ -879,7 +880,8 @@ fn cpp_signature_metadata_anchors_multi_declarator_parameters() {
         .unwrap();
     let metadata = analyzer
         .signature_metadata(&function)
-        .first()
+        .into_iter()
+        .next()
         .unwrap_or_else(|| panic!("missing metadata for {}", function.fq_name()));
     let parameter = metadata
         .parameters()

@@ -32,7 +32,7 @@ where
 #[test]
 fn js_graph_strategy_finds_in_file_references() {
     let analyzer = js_analyzer();
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let target = definition_in(units.iter(), |cu| {
         cu.is_class()
             && cu.identifier() == "BaseClass"
@@ -73,7 +73,7 @@ fn js_graph_strategy_finds_in_file_references() {
 #[test]
 fn ts_graph_strategy_finds_in_file_references() {
     let analyzer = ts_analyzer();
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let target = definition_in(units.iter(), |cu| {
         cu.is_class()
             && cu.identifier() == "BaseClass"
@@ -110,7 +110,7 @@ fn ts_graph_strategy_finds_in_file_references() {
 #[test]
 fn usage_finder_routes_jsts_targets_to_graph_strategy() {
     let analyzer = ts_analyzer();
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let target = definition_in(units.iter(), |cu| {
         cu.is_class()
             && cu.identifier() == "BaseClass"
@@ -149,7 +149,7 @@ export function build(): Alias {
         )
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let base_file = project.file("base.ts");
     let target = definition_in(units.iter(), |cu| {
         cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
@@ -188,7 +188,7 @@ export function build() {
         )
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let base_file = project.file("base.ts");
     let target = definition_in(units.iter(), |cu| {
         cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
@@ -228,7 +228,7 @@ export function outside() {
         )
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let base_file = project.file("base.ts");
     let target = definition_in(units.iter(), |cu| {
         cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
@@ -268,7 +268,7 @@ export function build() {
         )
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let base_file = project.file("base.ts");
     let target = definition_in(units.iter(), |cu| {
         cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
@@ -306,7 +306,7 @@ export function inside(Alias: typeof Other) {
         )
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let base_file = project.file("base.ts");
     let target = definition_in(units.iter(), |cu| {
         cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
@@ -343,7 +343,7 @@ export function inside(BaseClass: typeof Other) {
         )
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let base_file = project.file("base.ts");
     let target = definition_in(units.iter(), |cu| {
         cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
@@ -381,7 +381,7 @@ export function inside({ Alias }: { Alias: typeof Other }) {
         )
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let base_file = project.file("base.ts");
     let target = definition_in(units.iter(), |cu| {
         cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
@@ -428,7 +428,6 @@ fn find_ts_target(
     analyzer
         .all_declarations()
         .find(|cu| cu.source() == source_file && predicate(cu))
-        .cloned()
         .expect("target definition not found")
 }
 
@@ -440,7 +439,6 @@ fn find_js_target(
     analyzer
         .all_declarations()
         .find(|cu| cu.source() == source_file && predicate(cu))
-        .cloned()
         .expect("target definition not found")
 }
 
@@ -690,7 +688,6 @@ fn multi_analyzer_delegates_parent_for_js_export_const_seed() {
                 && cu.identifier() == "MILLISECONDS_A_DAY"
                 && cu.is_field()
         })
-        .cloned()
         .expect("target definition not found");
 
     let hits = flatten_hits(
@@ -2114,7 +2111,7 @@ fn parity_jsts_cache_and_thread_safety_hardening_is_follow_up_work() {}
 // `update` → re-query tests prove a stale cached index never survives an edit.
 
 fn widget_usages_in_consumer(analyzer: &dyn IAnalyzer, consumer: &ProjectFile) -> bool {
-    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let units: Vec<_> = analyzer.all_declarations().collect();
     let target = definition_in(units.iter(), |cu| {
         cu.is_class() && cu.identifier() == "Widget"
     });

@@ -128,7 +128,7 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
     }
 
     analyzer
-        .get_declarations(file)
+        .declarations(file)
         .into_iter()
         .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
         .or_else(|| {

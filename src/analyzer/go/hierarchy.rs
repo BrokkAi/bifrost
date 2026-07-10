@@ -428,12 +428,12 @@ impl<'a> GoHierarchyBuilder<'a> {
                     if let Some(target) = self.resolve_type_node(file, type_node) {
                         aliases.insert(alias_fqn.clone(), target);
                     }
-                    let alias_unit = self.analyzer.definitions(&alias_fqn).next().cloned();
+                    let alias_unit = self.analyzer.definitions(&alias_fqn).next();
                     let alias_unit = alias_unit.or_else(|| {
                         self.analyzer
                             .declarations(&file.file)
+                            .into_iter()
                             .find(|unit| unit.identifier() == name)
-                            .cloned()
                     });
                     if let Some(unit) = alias_unit {
                         alias_units.insert(alias_fqn, unit);
@@ -753,12 +753,11 @@ impl<'a> GoHierarchyBuilder<'a> {
         self.analyzer
             .definitions(&fqn)
             .find(|unit| unit.source() == file && unit.is_class())
-            .cloned()
             .or_else(|| {
                 self.analyzer
                     .declarations(file)
+                    .into_iter()
                     .find(|unit| unit.is_class() && unit.identifier() == name)
-                    .cloned()
             })
     }
 }

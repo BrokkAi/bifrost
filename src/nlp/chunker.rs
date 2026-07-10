@@ -88,7 +88,7 @@ pub fn extract_file_chunks(
     // local definitions.
     let mut stack: Vec<(CodeUnit, Option<CodeUnit>)> = analyzer
         .top_level_declarations(file)
-        .cloned()
+        .into_iter()
         .map(|unit| (unit, None))
         .collect();
     let mut functions: Vec<(CodeUnit, Option<CodeUnit>)> = Vec::new();
@@ -106,7 +106,7 @@ pub fn extract_file_chunks(
             } else {
                 enclosing_class.clone()
             };
-            for child in analyzer.get_direct_children(&unit) {
+            for child in analyzer.direct_children(&unit) {
                 if child.source() == file {
                     stack.push((child, next_enclosing.clone()));
                 }
@@ -239,8 +239,8 @@ mod tests {
     fn chunks_for(analyzer: &dyn IAnalyzer, name: &str) -> FileChunks {
         let file = analyzer
             .analyzed_files()
+            .into_iter()
             .find(|file| rel_path_string(file) == name)
-            .cloned()
             .unwrap_or_else(|| panic!("fixture file {name} not analyzed"));
         extract_file_chunks(analyzer, &file, &word_count)
     }

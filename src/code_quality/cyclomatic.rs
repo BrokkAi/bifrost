@@ -56,7 +56,7 @@ pub fn compute_cyclomatic_complexity(
         // Iterative DFS over the code-unit tree to avoid unbounded
         // recursion on pathological inputs (deeply nested generated code,
         // for example).
-        let mut work: VecDeque<CodeUnit> = analyzer.get_top_level_declarations(file).into();
+        let mut work: VecDeque<CodeUnit> = analyzer.top_level_declarations(file).into();
         while let Some(cu) = work.pop_front() {
             if cu.is_function() {
                 let complexity = cyclomatic_complexity_for(analyzer, &cu) as i32;
@@ -76,7 +76,7 @@ pub fn compute_cyclomatic_complexity(
                     found_any = true;
                 }
             }
-            for child in analyzer.get_direct_children(&cu) {
+            for child in analyzer.direct_children(&cu) {
                 work.push_back(child);
             }
         }

@@ -303,6 +303,7 @@ fn rust_declaration_targets_in_files(
         .flat_map(|file| {
             analyzer
                 .declarations(file)
+                .into_iter()
                 .filter(move |unit| unit.identifier() == name)
                 .map(|unit| (file.clone(), unit.identifier().to_string()))
         })

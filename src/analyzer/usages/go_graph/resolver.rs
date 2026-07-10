@@ -515,8 +515,12 @@ fn collect_go_embedded_field_type_fqns(
         if !package_names.contains_key(file) {
             continue;
         }
-        for field in analyzer.declarations(file).filter(|unit| unit.is_field()) {
-            let Some(type_text) = go_embedded_field_unit_type_text(analyzer, field, Some(parsed))
+        for field in analyzer
+            .declarations(file)
+            .into_iter()
+            .filter(|unit| unit.is_field())
+        {
+            let Some(type_text) = go_embedded_field_unit_type_text(analyzer, &field, Some(parsed))
             else {
                 continue;
             };
@@ -565,7 +569,7 @@ fn go_field_unit_is_embedded(
     field: &CodeUnit,
     parsed: &ParsedFile,
 ) -> bool {
-    let Some(range) = analyzer.ranges(field).first() else {
+    let Some(range) = analyzer.ranges(field).into_iter().next() else {
         return false;
     };
     let Some(node) = parsed
@@ -1615,7 +1619,7 @@ fn go_field_unit_type_text(
     let signature = field_unit
         .signature()
         .map(str::to_string)
-        .or_else(|| analyzer.signatures(field_unit).iter().next().cloned())?;
+        .or_else(|| analyzer.signatures(field_unit).first().cloned())?;
     let trimmed = signature.trim();
     if let Some(type_text) = trimmed
         .strip_prefix(field)

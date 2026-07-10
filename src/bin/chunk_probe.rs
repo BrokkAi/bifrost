@@ -43,7 +43,7 @@ fn main() -> Result<(), String> {
         Arc::new(FilesystemProject::new(root.clone()).map_err(|e| e.to_string())?);
     let snapshot = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
     let analyzer = snapshot.analyzer();
-    let files: Vec<_> = analyzer.analyzed_files().cloned().collect();
+    let files: Vec<_> = analyzer.analyzed_files().into_iter().collect();
     eprintln!(
         "[probe] {} analyzed files; timing extract_file_chunks each",
         files.len()

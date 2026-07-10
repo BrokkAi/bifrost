@@ -248,12 +248,13 @@ fn push_scala_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
 }
 
 fn nearest_scala_declaration(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<CodeUnit> {
-    scala.declarations(file).next().cloned()
+    scala.declarations(file).into_iter().next()
 }
 
 fn scala_file_package(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> {
     scala
         .declarations(file)
+        .into_iter()
         .next()
         .map(|unit| unit.package_name().to_string())
 }

@@ -24,8 +24,8 @@ pub fn handle(
 
     let top_level: Vec<CodeUnit> = analyzer
         .top_level_declarations(&project_file)
+        .into_iter()
         .filter(|cu| !cu.is_anonymous())
-        .cloned()
         .collect();
     let symbols = build_symbols_iterative(analyzer, top_level, &content, &line_starts);
 
@@ -53,8 +53,8 @@ fn build_symbols_iterative(
                 let child_parent_kind = Some(parts.kind);
                 let children: Vec<CodeUnit> = analyzer
                     .direct_children(&code_unit)
+                    .into_iter()
                     .filter(|child| !child.is_anonymous())
-                    .cloned()
                     .collect();
                 let child_count = children.len();
                 stack.push(SymbolWorkItem::Exit { parts, child_count });

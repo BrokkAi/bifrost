@@ -137,7 +137,7 @@ impl RustAnalyzer {
             return Vec::new();
         };
         let fq_name = join_rust_fqn(&resolved_package, name);
-        let mut candidates: Vec<_> = self.definitions(&fq_name).cloned().collect();
+        let mut candidates: Vec<_> = self.definitions(&fq_name).collect();
         if !candidates.is_empty() {
             candidates.sort();
             candidates.dedup();
@@ -157,8 +157,8 @@ impl RustAnalyzer {
         if candidates.is_empty() {
             candidates.extend(module_files.iter().flat_map(|module_file| {
                 self.declarations(module_file)
+                    .into_iter()
                     .filter(move |unit| unit.identifier() == name)
-                    .cloned()
             }));
         }
 
@@ -202,8 +202,8 @@ impl RustAnalyzer {
     ) -> Vec<CodeUnit> {
         let short_name = module_scoped_short_name(impl_item, source, name);
         self.declarations(file)
+            .into_iter()
             .filter(|unit| unit.identifier() == name && unit.short_name() == short_name)
-            .cloned()
             .collect()
     }
 
@@ -224,8 +224,8 @@ impl RustAnalyzer {
         let mut units: Vec<_> = targets
             .flat_map(|(file, name)| {
                 self.declarations(&file)
+                    .into_iter()
                     .filter(move |unit| unit.identifier() == name)
-                    .cloned()
             })
             .collect();
         units.sort();

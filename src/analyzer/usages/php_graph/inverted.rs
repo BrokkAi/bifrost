@@ -274,7 +274,7 @@ fn receiver_member_access_type_fqn(
         .analyzer
         .definitions(&field_fqn)
         .find(|unit| unit.is_field())?;
-    declared_field_type_fq_name(scan.php, scan.analyzer, field)
+    declared_field_type_fq_name(scan.php, scan.analyzer, &field)
 }
 
 /// Seed parameter types into the binding scope: a `simple_parameter` with a type
@@ -357,7 +357,7 @@ fn declared_callable_return_type_fqn(scan: &PhpScan<'_, '_>, callable_fqn: &str)
     if definitions.next().is_some() {
         return None;
     }
-    declared_callable_return_type_fq_name(scan.php, scan.analyzer, callable)
+    declared_callable_return_type_fq_name(scan.php, scan.analyzer, &callable)
 }
 
 /// True when `node` is the type name inside a `new X(..)` expression (so the

@@ -13,9 +13,10 @@ impl ImportAnalysisProvider for CppAnalyzer {
 
         let mut resolved = HashSet::default();
         let include_targets = self.include_target_index();
-        for path in quoted_include_paths(self.inner.import_statements(file)) {
+        let imports = self.inner.import_statements(file);
+        for path in quoted_include_paths(&imports) {
             for target in resolve_direct_include_targets_with_index(file, &path, include_targets) {
-                resolved.extend(self.inner.top_level_declarations(&target).cloned());
+                resolved.extend(self.inner.top_level_declarations(&target));
             }
         }
 
@@ -111,7 +112,8 @@ impl CppAnalyzer {
             |candidate| {
                 let mut matched_targets = HashSet::default();
                 let mut resolved_targets = Vec::new();
-                for include in quoted_include_paths(self.inner.import_statements(candidate)) {
+                let imports = self.inner.import_statements(candidate);
+                for include in quoted_include_paths(&imports) {
                     for target in include_targets.resolve_indexed(&include) {
                         if matched_targets.insert(target.clone()) {
                             resolved_targets.push(target);

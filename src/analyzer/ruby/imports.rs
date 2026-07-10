@@ -231,8 +231,7 @@ impl RubyAnalyzer {
         self.zeitwerk_reference_files()
             .get(identifier)
             .into_iter()
-            .flat_map(|files| files.iter())
-            .cloned()
+            .flat_map(|files| files.iter().cloned())
             .collect()
     }
 

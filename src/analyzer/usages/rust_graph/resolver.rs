@@ -338,15 +338,16 @@ fn local_declaration_graph_seeds(
 fn is_local_declaration(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     analyzer
         .declarations(target.source())
-        .any(|declaration| declaration == target)
+        .into_iter()
+        .any(|declaration| &declaration == target)
 }
 
 fn canonical_imported_impl_target(rust: &RustAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
     let resolved_fqn = imported_impl_target_fqn(rust, target)?;
     let mut definitions = rust
         .definitions(&resolved_fqn)
-        .filter(|definition| *definition != target);
-    let first = definitions.next()?.clone();
+        .filter(|definition| definition != target);
+    let first = definitions.next()?;
     definitions.next().is_none().then_some(first)
 }
 
@@ -364,7 +365,7 @@ fn is_impl_target_unit(rust: &RustAnalyzer, target: &CodeUnit) -> bool {
     let Ok(source) = target.source().read_to_string() else {
         return false;
     };
-    let Some(range) = rust.ranges(target).first() else {
+    let Some(range) = rust.ranges(target).into_iter().next() else {
         return false;
     };
     let mut parser = Parser::new();

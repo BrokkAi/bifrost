@@ -27,8 +27,9 @@ use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_inde
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
     ImportInfo, Language, LanguageAdapter, ParameterMetadata, PoolSafeMemo, Project, ProjectFile,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    SemanticDiagnostic, SignatureMetadata, StorageLanguageAdapter, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -39,6 +40,32 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 #[derive(Debug, Clone, Default)]
 pub struct JavascriptAdapter;
+
+impl StorageLanguageAdapter for JavascriptAdapter {
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        crate::analyzer::js_ts::should_persist_code_unit(code_unit)
+    }
+
+    fn storage_contains_tests(
+        &self,
+        state: &crate::analyzer::tree_sitter_analyzer::FileState,
+    ) -> bool {
+        crate::analyzer::js_ts::storage_contains_tests(state)
+    }
+
+    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
+        crate::analyzer::js_ts::hydrate_contains_tests(stored, file, source)
+    }
+
+    fn synthesize_hydrated_units(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
+    ) {
+        crate::analyzer::js_ts::synthesize_hydrated_module(file, source, state);
+    }
+}
 
 impl LanguageAdapter for JavascriptAdapter {
     fn language(&self) -> Language {
@@ -302,12 +329,11 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
                 Language::JavaScript,
                 Some(&self.alias_resolver),
             ) {
-                let top_level: Vec<_> = self.inner.top_level_declarations(&target).collect();
+                let top_level = self.inner.top_level_declarations(&target);
                 if import.is_wildcard {
                     resolved.extend(
                         top_level
                             .iter()
-                            .copied()
                             .filter(|code_unit| !code_unit.is_module())
                             .cloned(),
                     );
@@ -317,7 +343,6 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
                     let mut matched = false;
                     for code_unit in top_level
                         .iter()
-                        .copied()
                         .filter(|code_unit| code_unit.identifier() == identifier)
                     {
                         matched = true;
@@ -326,7 +351,6 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
                     if !matched {
                         let module_units = top_level
                             .iter()
-                            .copied()
                             .filter(|code_unit| code_unit.is_module())
                             .cloned()
                             .collect::<Vec<_>>();
@@ -340,7 +364,6 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
                     resolved.extend(
                         top_level
                             .iter()
-                            .copied()
                             .filter(|code_unit| !code_unit.is_module())
                             .cloned(),
                     );
@@ -472,14 +495,11 @@ impl TypeHierarchyProvider for JavascriptAnalyzer {
 
 impl TestDetectionProvider for JavascriptAnalyzer {}
 impl IAnalyzer for JavascriptAnalyzer {
-    fn top_level_declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
 
-    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
@@ -491,18 +511,15 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.indexed_source(file)
     }
 
-    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
 
-    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
 
@@ -510,18 +527,15 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.definition_lookup_index()
     }
 
-    fn direct_children<'a>(
-        &'a self,
-        code_unit: &CodeUnit,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
     }
 
-    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
 
-    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
         self.inner.ranges(code_unit)
     }
 
@@ -529,20 +543,12 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
-    }
-
-    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.get_top_level_declarations(file)
-    }
-
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -576,22 +582,6 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.project()
     }
 
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.get_declarations(file)
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
-    }
-
-    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.get_direct_children(code_unit)
-    }
-
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit).or_else(|| {
             js_module_scoped_field_uses_file_name(code_unit)
@@ -613,10 +603,6 @@ impl IAnalyzer for JavascriptAnalyzer {
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         self.inner.extract_call_receiver(reference)
-    }
-
-    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements_of(file)
     }
 
     fn enclosing_code_unit(
@@ -652,10 +638,6 @@ impl IAnalyzer for JavascriptAnalyzer {
             .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
-    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges_of(code_unit)
-    }
-
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.module_import_skeleton(code_unit)
             .or_else(|| self.inner.get_skeleton(code_unit))
@@ -680,10 +662,6 @@ impl IAnalyzer for JavascriptAnalyzer {
 
     fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions_persisted(pattern)
-    }
-
-    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures_of(code_unit).to_vec()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
@@ -2823,10 +2801,5 @@ fn is_component_like_name(name: &str) -> bool {
 }
 
 fn js_ts_contains_tests(file: &ProjectFile, source: &str) -> bool {
-    let rel = file.rel_path().to_string_lossy().to_ascii_lowercase();
-    rel.contains(".test.")
-        || rel.contains(".spec.")
-        || source.contains("describe(")
-        || source.contains("test(")
-        || source.contains("it(")
+    crate::analyzer::js_ts::contains_tests(file, source)
 }

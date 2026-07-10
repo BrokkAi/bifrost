@@ -62,7 +62,7 @@ fn main() -> Result<(), String> {
     let project: Arc<dyn Project> =
         Arc::new(FilesystemProject::new(root.clone()).map_err(|err| err.to_string())?);
     let snapshot = Arc::new(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()));
-    let analyzed_files = snapshot.analyzer().analyzed_files().count();
+    let analyzed_files = snapshot.analyzer().analyzed_files().len();
     let build_secs = start.elapsed().as_secs_f64();
     eprintln!(
         "[profile] {build_secs:.1}s workspace built: {analyzed_files} analyzed files, rss_mib={:.0}",

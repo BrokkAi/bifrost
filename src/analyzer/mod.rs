@@ -91,6 +91,7 @@ pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
 pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
+pub(crate) use tree_sitter_analyzer::StorageLanguageAdapter;
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
 };

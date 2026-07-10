@@ -56,7 +56,6 @@ where
         .java()
         .definitions(&fqn)
         .filter(|unit| unit.is_function() && signature_arity(unit.signature()) == arity)
-        .cloned()
         .collect::<Vec<_>>();
     if units.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
@@ -178,11 +177,12 @@ where
     };
     ctx.java()
         .declarations(file)
+        .into_iter()
         .filter(|unit| unit.is_function())
         .map(|unit| {
             let outcome = ctx
                 .java()
-                .ranges(unit)
+                .ranges(&unit)
                 .first()
                 .copied()
                 .and_then(|range| java_return_type_node_covering(tree.root_node(), &range))
