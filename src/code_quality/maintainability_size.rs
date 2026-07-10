@@ -897,10 +897,9 @@ mod tests {
     }
 
     #[test]
-    fn long_method_synthetic_constructor_does_not_inflate_god_object() {
-        // brokk-shared's `ignoresSyntheticConstructorAtThresholdBoundary`
-        // checks that a Java class's synthetic constructor doesn't push the
-        // class over the god-object thresholds.
+    fn java_implicit_constructor_does_not_inflate_god_object() {
+        // Java's compiler-provided default constructor is not an analyzer CodeUnit, so a class
+        // with fourteen real methods must remain below a fifteen-child threshold.
         let java = format!(
             "package com.example;\npublic class Boundary {{\n{helpers}\n}}\n",
             helpers = java_helpers(14),
@@ -924,7 +923,7 @@ mod tests {
             result
                 .report
                 .contains("No long method or god object smells found."),
-            "synthetic constructor must not count toward direct-children / functions; report: {}",
+            "implicit constructor must not count toward direct-children / functions; report: {}",
             result.report
         );
     }

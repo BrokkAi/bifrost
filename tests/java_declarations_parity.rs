@@ -111,7 +111,6 @@ fn packaged_file_declarations_include_module_and_members() {
         vec![
             "Module:io.github.jbellis.brokk".to_string(),
             "Class:io.github.jbellis.brokk.Foo".to_string(),
-            "Function:io.github.jbellis.brokk.Foo.Foo".to_string(),
             "Function:io.github.jbellis.brokk.Foo.bar".to_string(),
         ],
         declarations

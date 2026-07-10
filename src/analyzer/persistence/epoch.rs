@@ -281,7 +281,7 @@ lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07"
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
