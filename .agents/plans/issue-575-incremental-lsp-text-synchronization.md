@@ -12,7 +12,7 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 - [x] (2026-07-10 06:56Z) Confirmed the issue branch is clean, fetched its remote, and verified it is already up to date.
 - [x] (2026-07-10 06:56Z) Recorded the implementation contract and validation plan in this ExecPlan.
-- [ ] Implement the private transactional text-change applicator and focused unit tests.
+- [x] (2026-07-10 07:00Z) Implemented the private transactional text-change applicator and nine focused unit tests.
 - [ ] Integrate document versions and incremental changes into the LSP server while preserving downstream refresh behavior.
 - [ ] Update capability advertisement, integration coverage, and public LSP documentation.
 - [ ] Run formatting, focused and full tests, no-CUDA clippy, and a final diff review.
@@ -24,6 +24,9 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 - Observation: the current `didChange` handler keeps only the last range-less event and discards ranged events, but the complete overlay, cache invalidation, analyzer update, generation, and diagnostics pipeline already exists.
   Evidence: the focused initialization, overlay/completion, malformed-change, and conversion tests all passed before implementation.
+
+- Observation: a single owned `String` plus recomputed line starts is sufficient to implement the protocol safely without adding a rope or text-buffer dependency.
+  Evidence: `cargo test lsp::text_sync::tests --lib` passes nine cases covering ordered edits, UTF-16, line endings, clamping, and transactional rejection.
 
 ## Decision Log
 
@@ -49,7 +52,7 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The pre-change baseline is green and the branch is synchronized with its remote.
+The first implementation milestone is complete: the private edit applicator passes its focused unit tests without changing public APIs or dependencies. Server integration remains.
 
 ## Context and Orientation
 
@@ -118,3 +121,5 @@ The private module must expose to its parent only:
     ) -> Result<String, TextSyncError>;
 
 `TextSyncError` must implement `Display` with document-content-free details suitable for the throttled stderr rejection log.
+
+Plan revision note (2026-07-10 07:00Z): Marked the pure text-sync milestone complete and recorded the no-new-dependency result because its focused tests now pass.
