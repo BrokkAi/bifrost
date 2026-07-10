@@ -5,21 +5,33 @@
 //! files; on CRLF checkouts it intentionally differs so cache identity stays
 //! aligned with the bytes consumed by analyzers and semantic indexing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "nlp")]
+use std::collections::HashSet;
+#[cfg(feature = "nlp")]
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "nlp")]
+use std::path::PathBuf;
+#[cfg(feature = "nlp")]
 use std::process::{Command, Stdio};
 
-use git2::{IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions};
+use git2::{IndexEntry, ObjectType, Oid, Repository};
+#[cfg(feature = "nlp")]
+use git2::{Status, StatusOptions};
+#[cfg(feature = "nlp")]
 use growable_bloom_filter::GrowableBloom;
 
+#[cfg(feature = "nlp")]
 use crate::path_normalization::NormalizePath;
 
 pub(crate) type Result<T> = std::result::Result<T, String>;
 
+#[cfg(feature = "nlp")]
 pub(crate) const CACHE_DIR_NAME: &str = ".brokk";
 
 /// Discover the non-bare repository containing `root`, if any.
+#[cfg(feature = "nlp")]
 pub(crate) fn discover(root: &Path) -> Option<Repository> {
     Repository::discover(root)
         .ok()
@@ -27,12 +39,14 @@ pub(crate) fn discover(root: &Path) -> Option<Repository> {
 }
 
 /// Whether `root` is inside a non-bare Git repository.
+#[cfg(feature = "nlp")]
 pub(crate) fn is_git_repo(root: &Path) -> bool {
     discover(root).is_some()
 }
 
 /// Resolve the primary repository root. Linked worktrees collapse to the
 /// checkout that owns the common object database.
+#[cfg(feature = "nlp")]
 pub(crate) fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
     if repo.is_bare() {
         return None;
@@ -47,6 +61,7 @@ pub(crate) fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
 
 /// Resolve the unified cache path under the primary repository's `.brokk`
 /// directory. Non-Git roots fall back to the provided workspace root.
+#[cfg(feature = "nlp")]
 pub(crate) fn cache_db_path(workspace_root: &Path) -> PathBuf {
     let primary_root = discover(workspace_root)
         .as_ref()
@@ -58,6 +73,7 @@ pub(crate) fn cache_db_path(workspace_root: &Path) -> PathBuf {
 }
 
 /// Working-tree blob OID (hex) for each project-relative path.
+#[cfg(feature = "nlp")]
 pub(crate) fn working_tree_oids(
     repo: &Repository,
     rel_paths: &[String],
@@ -103,17 +119,21 @@ pub(crate) fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> R
 }
 
 /// Read a Git blob's bytes by hexadecimal OID.
+#[cfg(feature = "nlp")]
 pub(crate) fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
     let oid = Oid::from_str(oid_hex).map_err(|err| err.to_string())?;
     let blob = repo.find_blob(oid).map_err(|err| err.to_string())?;
     Ok(blob.content().to_vec())
 }
 
+#[cfg(feature = "nlp")]
 const GC_BLOOM_FP_RATE: f64 = 0.05;
+#[cfg(feature = "nlp")]
 const GC_BLOOM_EST_OIDS: usize = 1 << 19;
 
 /// Build a Bloom filter containing every object reachable from refs or a
 /// linked-worktree HEAD, including detached HEADs not named by a ref.
+#[cfg(feature = "nlp")]
 pub(crate) fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
     let workdir = workdir(repo)?;
     let mut args = vec![
@@ -152,6 +172,7 @@ pub(crate) fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
 }
 
 /// Commit OIDs checked out by every linked worktree.
+#[cfg(feature = "nlp")]
 pub(crate) fn worktree_heads(repo: &Repository) -> Result<Vec<String>> {
     let text = worktree_porcelain(repo)?;
     let mut heads = Vec::new();
@@ -169,6 +190,7 @@ pub(crate) fn worktree_heads(repo: &Repository) -> Result<Vec<String>> {
 }
 
 /// Roots of every linked worktree, including the primary checkout.
+#[cfg(feature = "nlp")]
 pub(crate) fn worktree_roots(repo: &Repository) -> Result<Vec<PathBuf>> {
     let text = worktree_porcelain(repo)?;
     let mut roots = Vec::new();
@@ -187,6 +209,7 @@ pub(crate) fn worktree_roots(repo: &Repository) -> Result<Vec<PathBuf>> {
 
 /// Exact-byte OIDs held by every worktree: all present indexed files plus
 /// untracked files. This is the shared working-tree liveness root for caches.
+#[cfg(feature = "nlp")]
 pub(crate) fn worktree_live_oids(repo: &Repository) -> Result<HashSet<String>> {
     let mut oids = HashSet::new();
     for root in worktree_roots(repo)? {
@@ -198,6 +221,7 @@ pub(crate) fn worktree_live_oids(repo: &Repository) -> Result<HashSet<String>> {
     Ok(oids)
 }
 
+#[cfg(feature = "nlp")]
 fn worktree_porcelain(repo: &Repository) -> Result<String> {
     let workdir = workdir(repo)?;
     let output = Command::new("git")
@@ -215,6 +239,7 @@ fn worktree_porcelain(repo: &Repository) -> Result<String> {
 }
 
 /// Blob OIDs of dirty or untracked files in one worktree.
+#[cfg(feature = "nlp")]
 pub(crate) fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
     let Some(repo) = discover(root) else {
         return Ok(HashSet::new());
@@ -253,6 +278,7 @@ pub(crate) fn index_path_to_string(entry: &IndexEntry) -> Result<String> {
     String::from_utf8(entry.path.clone()).map_err(|err| format!("non-UTF-8 git index path: {err}"))
 }
 
+#[cfg(feature = "nlp")]
 fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
@@ -274,6 +300,7 @@ fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
     Ok(dirty)
 }
 
+#[cfg(feature = "nlp")]
 fn dirty_flags() -> Status {
     Status::WT_MODIFIED
         | Status::WT_NEW
@@ -292,7 +319,11 @@ fn hash_working_file(workdir: &Path, rel: &str) -> Result<Oid> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[cfg(feature = "nlp")]
+    use crate::path_normalization::NormalizePath;
     use git2::{IndexAddOption, Signature};
+    #[cfg(feature = "nlp")]
+    use std::process::Command;
 
     pub(crate) fn init_repo(dir: &Path) -> Repository {
         let repo = Repository::init(dir).unwrap();
@@ -323,6 +354,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "nlp")]
     fn run_git(dir: &Path, args: &[&str]) {
         let output = Command::new("git")
             .current_dir(dir)
@@ -336,6 +368,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "nlp")]
     #[test]
     fn clean_file_oid_matches_working_tree_bytes() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -359,6 +392,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "nlp")]
     #[test]
     fn clean_crlf_checkout_uses_working_tree_not_index_bytes() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -396,6 +430,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "nlp")]
     #[test]
     fn dirty_and_untracked_files_reflect_working_tree_bytes() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -434,6 +469,7 @@ pub(crate) mod tests {
         assert!(uncommitted.contains(&bulk["new.txt"]));
     }
 
+    #[cfg(feature = "nlp")]
     #[test]
     fn linked_worktrees_share_cache_path_and_are_enumerated() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -469,7 +505,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "nlp"))]
     #[test]
     fn cache_root_normalizes_verbatim_disk_and_unc_paths() {
         assert_eq!(

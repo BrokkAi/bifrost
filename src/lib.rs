@@ -1,9 +1,10 @@
 pub mod analyzer;
 pub mod benchmark;
-mod cancellation;
+#[cfg(feature = "nlp")]
 mod cache_db;
 #[cfg(feature = "nlp")]
 mod cache_gc;
+mod cancellation;
 pub mod code_quality;
 pub mod commit_analysis;
 pub mod file_tools;

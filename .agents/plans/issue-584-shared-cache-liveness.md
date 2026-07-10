@@ -16,6 +16,7 @@ The observable proof is that linked worktrees resolve the same `.brokk/bifrost_c
 - [x] (2026-07-10) Milestone 2: added the unified semantic cache schema and shared semantic GC driver without analyzer tables or activation; 6 cache DB, 2 GC, 6 semantic store, and 8 semantic integration tests pass.
 - [x] (2026-07-10) Milestone 3: ran focused regressions, formatting, strict no-CUDA clippy, diff checks, and the guided review; fixed all valid in-scope correctness, migration, security, API-surface, and duplication findings.
 - [x] (2026-07-10) Review follow-up: preserved exact-byte OIDs from clean CRLF/filter checkouts during GC, made legacy cleanup safe for arbitrary paths and live legacy writers, and centralized worktree liveness/path-normalization helpers.
+- [x] (2026-07-10) CI follow-up: feature-gated semantic cache/GC and NLP-only Git helpers so strict no-NLP builds do not reject inactive plumbing as dead code.
 
 ## Surprises & Discoveries
 
@@ -45,6 +46,9 @@ The observable proof is that linked worktrees resolve the same `.brokk/bifrost_c
 
 - Observation: reachability from Git refs is insufficient once cache keys use literal working-tree bytes: a clean CRLF checkout has a different blob OID from Git's LF-normalized object.
   Evidence: `forced_gc_preserves_clean_crlf_working_tree_identity` proves shared GC retains the working-byte OID, and `worktree_live_oids` centralizes that root calculation for every linked worktree.
+
+- Observation: the Android target compiles without `nlp` and promotes warnings to errors, while the new shared cache module was compiled even though its only active consumer is NLP.
+  Evidence: CI run `29093927597` failed on dead-code errors from `cache_db` and NLP-only Git helpers. Gating those helpers while retaining liveness' exact-byte resolver makes strict no-NLP clippy pass.
 
 ## Decision Log
 
@@ -84,6 +88,10 @@ The observable proof is that linked worktrees resolve the same `.brokk/bifrost_c
   Rationale: compatibility migration machinery is unnecessary for derived data at this stage, but GC must not immediately evict an active clean CRLF/filter-transformed file and opening a custom cache path must not delete a sibling legacy file.
   Date/Author: 2026-07-10 / Codex.
 
+- Decision: Compile semantic cache setup and Git cache/GC helpers only with the `nlp` feature; retain the exact-byte index/file resolvers needed by inert analyzer liveness in the base build.
+  Rationale: this matches the active consumer boundary, eliminates no-NLP dead-code failures, and does not attach liveness to an analyzer database backend.
+  Date/Author: 2026-07-10 / Codex.
+
 ## Outcomes & Retrospective
 
 The issue #584 plumbing is complete in three checkpoint commits. Git identity now follows exact working-tree bytes across clean LF, clean CRLF, dirty, untracked, bulk, targeted, full-index, and single-path resolution. Primary and linked worktrees share one cache path; reachable refs, detached worktree HEADs, and every worktree's dirty content remain GC roots.
@@ -92,7 +100,7 @@ The active semantic cache now uses `.brokk/bifrost_cache.db`, semantic-prefixed 
 
 The guided review covered security, operations, duplication, architecture, and senior correctness. It found and prompted fixes for tracked-file snapshot refresh, same-size index invalidation, no-growth interval GC, future-schema downgrade safety, cleanup ordering, directory replacement, duplicated validation logic, and an overbroad compatibility re-export. The synthetic compile-only liveness contract remains intentionally temporary because strict clippy must type-check the inert crate-private API before the final backend supplies a real consumer.
 
-Final evidence is: Git tests 4 passed; liveness 10; path normalization 1 locally plus Windows-only disk/UNC cases in the Windows matrix; cache DB 12; cache GC 4; semantic store 6; analyzer parity/no-backend activation 8; semantic integration 8. `cargo fmt --all`, strict `cargo clippy-no-cuda` with the corrected Rustup toolchain path, and `git diff --check` all pass. No analyzer SQLite backend was activated.
+Final evidence is: no-NLP liveness 10 and strict all-target clippy pass; Git tests 4 passed; path normalization 1 locally plus Windows-only disk/UNC cases in the Windows matrix; cache DB 12; cache GC 4; semantic store 6; analyzer parity/no-backend activation 8; semantic integration 8. `cargo fmt --all`, strict `cargo clippy-no-cuda` with the corrected Rustup toolchain path, and `git diff --check` all pass. No analyzer SQLite backend was activated.
 
 ## Context and Orientation
 
@@ -171,6 +179,6 @@ The authoritative donor seams are `src/gitblob.rs`, `src/analyzer/store/liveness
 
 `src/analyzer/store/liveness.rs` provides crate-internal `Liveness`, `LivePathMap`, `LiveSnapshot`, `LivePathEntry`, and `LivePathValidation`. These types accept explicit filesystem or overlay identities and remain unused by production analyzer paths in #584.
 
-`growable-bloom-filter` becomes non-optional because shared reachability is compiled outside the optional NLP module. No other dependency changes are required.
+`growable-bloom-filter` remains available for shared reachability, while the current cache/GC consumer is feature-gated with NLP. The base build retains only the exact-byte Git helpers required by inert analyzer liveness. No other dependency changes are required.
 
-Plan revision note (2026-07-10): recorded post-review CRLF GC liveness, safe legacy cleanup, worktree-liveness centralization, direct path-normalization imports, updated validation counts, and the rebuildable-cache compatibility policy.
+Plan revision note (2026-07-10): recorded post-review CRLF GC liveness, safe legacy cleanup, worktree-liveness centralization, direct path-normalization imports, no-NLP CI feature gating, updated validation counts, and the rebuildable-cache compatibility policy.
