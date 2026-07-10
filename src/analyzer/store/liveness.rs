@@ -517,6 +517,33 @@ impl PlatformStat {
     }
 }
 
+// Issue #584 deliberately lands this crate-internal API before the analyzer
+// store that will call it. Keep the complete contract type-checked in normal
+// builds without adding a runtime consumer or suppressing dead-code lints.
+fn compile_liveness_api_contract(repo: Repository, file: ProjectFile, oid: Oid) -> Result<()> {
+    let liveness = Liveness::new(repo)?;
+    let _ = liveness.oid_for_path(&file)?;
+    liveness.refresh_overlay([LivePathEntry::filesystem(file.clone(), oid)])?;
+    let snapshot = liveness.snapshot()?;
+    let _ = snapshot.paths_for_oid(oid);
+    let _ = snapshot.oid_for_path(&file);
+    let _ = snapshot.validated_oid_for_path(&file);
+    let _ = snapshot.contains_oid(oid);
+    let _ = snapshot.all_paths().count();
+    let _ = snapshot.validate([&file].into_iter());
+    liveness.remove_overlay_paths([file.clone()]);
+
+    let live_paths = LivePathMap::default();
+    live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
+    let fork = live_paths.fork();
+    fork.replace_all([LivePathEntry::overlay(file.clone(), oid)]);
+    let _ = fork.snapshot();
+    fork.remove([file]);
+    Ok(())
+}
+
+const _: fn(Repository, ProjectFile, Oid) -> Result<()> = compile_liveness_api_contract;
+
 #[cfg(test)]
 mod tests {
     use super::*;

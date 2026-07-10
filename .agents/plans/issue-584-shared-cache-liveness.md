@@ -13,7 +13,7 @@ The observable proof is that linked worktrees resolve the same `.brokk/bifrost_c
 - [x] (2026-07-10) Verified issue #583 landed as commit `69b4aa7` and rebased the existing #584 branch onto current `origin/master`.
 - [x] (2026-07-10) Inspected issue #584, current semantic cache and analyzer behavior, and the reviewed PR #447 donor implementation.
 - [x] (2026-07-10) Milestone 1: added shared path normalization, Git blob identity, and inert analyzer liveness; 4 Git, 9 liveness, and 1 cross-platform path test pass locally, with Windows-only disk/UNC cases compiled by the Windows matrix.
-- [ ] Milestone 2: add the unified semantic cache schema and shared semantic GC driver without analyzer tables or activation.
+- [x] (2026-07-10) Milestone 2: added the unified semantic cache schema and shared semantic GC driver without analyzer tables or activation; 6 cache DB, 2 GC, 6 semantic store, and 8 semantic integration tests pass.
 - [ ] Milestone 3: run focused regressions, formatting, clippy, diff checks, and guided review; address valid in-scope findings.
 
 ## Surprises & Discoveries
@@ -29,6 +29,9 @@ The observable proof is that linked worktrees resolve the same `.brokk/bifrost_c
 
 - Observation: macOS temporary directories may be spelled through `/var` by the test harness and `/private/var` by `git worktree list --porcelain`.
   Evidence: the first linked-worktree root assertion failed until worktree roots were canonicalized before lexical normalization; the cache-path equality itself already passed.
+
+- Observation: the liveness API is intentionally not consumed by production analyzer code in #584, so a private module otherwise triggers dead-code warnings under strict clippy.
+  Evidence: the semantic integration build reported every liveness type as unused. A compile-only function-pointer contract now exercises the crate-internal interface in normal builds without runtime wiring or lint suppression; the function is optimized away and will be removed when the final analyzer store becomes the real consumer.
 
 ## Decision Log
 
