@@ -14,7 +14,7 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 - [x] (2026-07-10 13:21Z) Milestone 1: published and verified the Python tutorial with exact filtered-call, decorated-assignment, and callable-exclusion results; focused/docs/build/render checks passed.
 - [x] (2026-07-10 13:25Z) Milestone 2: published and verified the Java tutorial with member-call narrowing, annotated constructors, exception/control-flow descendants, and the exact unsupported-kwargs diagnostic.
 - [x] (2026-07-10 13:28Z) Milestone 3: published and verified the JavaScript tutorial with receiver/context narrowing, arrow/new matching, anonymous class-expression field access, and unsupported kwargs.
-- [ ] Milestone 4: publish and verify the TypeScript tutorial.
+- [x] (2026-07-10 13:31Z) Milestone 4: published and verified TypeScript-only declarations/class-like forms, decorated callable exclusions, and TSX path/language scoping.
 - [ ] Milestone 5: publish and verify the Go tutorial.
 - [ ] Milestone 6: publish and verify the shared C/C++ tutorial.
 - [ ] Milestone 7: publish and verify the Rust tutorial.
@@ -65,6 +65,8 @@ Milestone 1 published Python's tutorial with three exact cases. The member-call 
 Milestone 2 published Java's tutorial with six exact cases. It distinguishes two same-name calls by receiver, captures an annotated constructor, queries catch/if/loop nodes by throw/return descendants, and records the adapter's precise unsupported-kwargs diagnostic. Focused and existing docs tests, Astro check/build, and a fresh rendered-page check passed; expected output was expanded from authoring-friendly one-line JSON to readable blocks, reducing horizontal overflow from seven blocks to two unavoidable source/query lines.
 
 Milestone 3 published JavaScript's tutorial with four exact cases: same-name call narrowing by receiver and enclosing method, a captured arrow containing a normalized `new` call, an anonymous class expression containing a specific field access, and the unsupported-kwargs diagnostic. Focused/docs tests, Astro check/build, and a fresh route/navigation/date/code-block inspection passed.
+
+Milestone 4 published TypeScript's tutorial with exact type-alias, interface/enum/abstract-class, decorated callable, and TSX call results. It proves `.tsx` participates in the `typescript` filter and uses path scoping to isolate it. Focused/docs tests, both production and root-based preview builds, and a fresh rendered route/navigation/date/code-block inspection passed.
 
 ## Context and Orientation
 
@@ -148,3 +150,5 @@ Revision note, 2026-07-10: Updated after Milestone 1 with Python's exact outputs
 Revision note, 2026-07-10: Updated after Milestone 2 with Java's exact call/constructor/control-flow/diagnostic results and rendered readability check.
 
 Revision note, 2026-07-10: Updated after Milestone 3 with JavaScript's exact outputs, anonymous-class name boundary, and rendered-page evidence.
+
+Revision note, 2026-07-10: Updated after Milestone 4 with TypeScript declaration/refinement/TSX results and rendered-page evidence.

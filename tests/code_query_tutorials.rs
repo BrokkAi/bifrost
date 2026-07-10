@@ -76,6 +76,11 @@ fn javascript_tutorial() {
     verify_tutorial("docs/src/content/docs/code-query-tutorials/javascript.md");
 }
 
+#[test]
+fn typescript_tutorial() {
+    verify_tutorial("docs/src/content/docs/code-query-tutorials/typescript.md");
+}
+
 #[allow(dead_code)]
 fn verify_tutorial(relative: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
