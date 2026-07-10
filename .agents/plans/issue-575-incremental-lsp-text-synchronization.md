@@ -13,8 +13,8 @@ Bifrost currently asks editors to resend an entire open document after every key
 - [x] (2026-07-10 06:56Z) Confirmed the issue branch is clean, fetched its remote, and verified it is already up to date.
 - [x] (2026-07-10 06:56Z) Recorded the implementation contract and validation plan in this ExecPlan.
 - [x] (2026-07-10 07:00Z) Implemented the private transactional text-change applicator and nine focused unit tests.
-- [ ] Integrate document versions and incremental changes into the LSP server while preserving downstream refresh behavior.
-- [ ] Update capability advertisement, integration coverage, and public LSP documentation.
+- [x] (2026-07-10 07:09Z) Integrated document versions and incremental changes into the LSP server while preserving downstream refresh behavior.
+- [x] (2026-07-10 07:09Z) Updated capability advertisement, integration coverage, and public LSP documentation.
 - [ ] Run formatting, focused and full tests, no-CUDA clippy, and a final diff review.
 
 ## Surprises & Discoveries
@@ -27,6 +27,9 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 - Observation: a single owned `String` plus recomputed line starts is sufficient to implement the protocol safely without adding a rope or text-buffer dependency.
   Evidence: `cargo test lsp::text_sync::tests --lib` passes nine cases covering ordered edits, UTF-16, line endings, clamping, and transactional rejection.
+
+- Observation: open-document state already survives workspace-root removal, so incremental edits received while a root is absent can be retained without analyzer work and replayed when the root returns.
+  Evidence: the extended `bifrost_lsp_server_replays_open_document_after_workspace_folder_readd` test passes after editing the tracked document between root removal and re-addition.
 
 ## Decision Log
 
@@ -52,7 +55,7 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 ## Outcomes & Retrospective
 
-The first implementation milestone is complete: the private edit applicator passes its focused unit tests without changing public APIs or dependencies. Server integration remains.
+The implementation milestones are complete. The server advertises incremental sync, preserves whole-document changes, validates versions, applies ordered UTF-16 edits, retains out-of-root open documents, and rejects unsafe notifications without side effects. The 160-test LSP integration target passed before the final workspace-replay extension, whose focused test also passes. Full repository validation remains.
 
 ## Context and Orientation
 
@@ -123,3 +126,5 @@ The private module must expose to its parent only:
 `TextSyncError` must implement `Display` with document-content-free details suitable for the throttled stderr rejection log.
 
 Plan revision note (2026-07-10 07:00Z): Marked the pure text-sync milestone complete and recorded the no-new-dependency result because its focused tests now pass.
+
+Plan revision note (2026-07-10 07:09Z): Marked server, capability, docs, and integration work complete after the focused cases and the full LSP integration target passed.

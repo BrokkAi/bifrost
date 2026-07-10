@@ -8,18 +8,13 @@ use lsp_types::{
 };
 
 pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCapabilities {
-    // Full-document sync: each `didChange` carries the entire buffer, which we
-    // store in `OverlayProject` so request-time reads and the analyzer's
-    // reparse both see the unsaved content. INCREMENTAL would require applying
-    // range edits locally and is left as a follow-up.
-    //
-    // Non-conforming clients that ignore the advertised FULL kind and send
-    // INCREMENTAL events anyway are detected by `server.rs::handle_notification`
-    // (the `DidChangeTextDocument` arm) and warned about via a throttled
-    // stderr line — see `maybe_log_malformed_didchange` for the contract.
+    // Incremental changes are applied transactionally to the complete buffer
+    // stored in `OverlayProject`, so request-time reads and analyzer reparses
+    // see the same unsaved content. Range-less whole-document replacements
+    // remain valid content-change events and follow the same update path.
     let text_document_sync = TextDocumentSyncOptions {
         open_close: Some(true),
-        change: Some(TextDocumentSyncKind::FULL),
+        change: Some(TextDocumentSyncKind::INCREMENTAL),
         will_save: None,
         will_save_wait_until: None,
         save: Some(TextDocumentSyncSaveOptions::Supported(true)),

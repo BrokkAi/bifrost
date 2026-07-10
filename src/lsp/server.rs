@@ -49,6 +49,7 @@ use crate::lsp::handlers::{
     folding_range, formatting, hover, references, rename, signature_help, type_definition,
     type_hierarchy, workspace_symbol,
 };
+use crate::lsp::text_sync::apply_content_changes;
 use crate::util::throttled_log::ThrottledLog;
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -937,6 +938,7 @@ fn handle_notification(
                 state.remember_open_document(
                     params.text_document.uri.clone(),
                     file.abs_path(),
+                    params.text_document.version,
                     params.text_document.text.clone(),
                 );
                 state
@@ -958,45 +960,46 @@ fn handle_notification(
                         DidChangeTextDocument::METHOD
                     )
                 })?;
-            // With TextDocumentSyncKind::FULL each event has `range = None`
-            // and `text` = full document. We capability-advertise FULL, but
-            // tolerate non-conforming clients by taking the *last* event
-            // that looks full-document — anything else, drop the
-            // notification rather than apply a malformed partial edit.
             let uri = params.text_document.uri;
-            let n_changes = params.content_changes.len();
-            let full_text = params
-                .content_changes
-                .into_iter()
-                .rev()
-                .find(|change| change.range.is_none())
-                .map(|change| change.text);
-            if let Some(file) = resolve_project_file(state.project(), &uri) {
-                match full_text {
-                    Some(text) => {
-                        state.remember_open_document(uri.clone(), file.abs_path(), text.clone());
-                        state.overlay.set(file.abs_path(), text);
-                        state.completion_cache.invalidate(&file.abs_path());
-                        let mut changed = BTreeSet::new();
-                        changed.insert(file);
-                        state.workspace = state.workspace.update(&changed);
-                        publish_diagnostics_for_state(connection, state, &uri)?;
-                    }
-                    None if n_changes > 0 => {
-                        // Non-conforming client: it sent events but none was
-                        // full-document. Drop the notification (we have no
-                        // way to apply incremental ranges) but warn so the
-                        // user can debug "edits aren't reflected" instead of
-                        // silently diverging from the buffer.
-                        state.maybe_log_malformed_didchange(&uri, n_changes);
-                    }
-                    None => {
-                        // Empty content_changes — spec-permitted no-op. Stay
-                        // silent.
-                    }
+            let version = params.text_document.version;
+            let Some(document) = state.open_documents.get(uri.as_str()) else {
+                state.maybe_log_rejected_didchange(&uri, version, "document is not open");
+                return Ok(());
+            };
+            if version <= document.version {
+                state.maybe_log_rejected_didchange(
+                    &uri,
+                    version,
+                    &format!(
+                        "version must be newer than the current version {}",
+                        document.version
+                    ),
+                );
+                return Ok(());
+            }
+
+            if params.content_changes.is_empty() {
+                state.update_open_document_version(&uri, version);
+                return Ok(());
+            }
+
+            let current_text = document.text.clone();
+            let updated_text = match apply_content_changes(&current_text, &params.content_changes) {
+                Ok(text) => text,
+                Err(error) => {
+                    state.maybe_log_rejected_didchange(&uri, version, &error.to_string());
+                    return Ok(());
                 }
-            } else if let Some(text) = full_text {
-                state.update_open_document_text(&uri, text);
+            };
+
+            state.update_open_document(&uri, version, updated_text.clone());
+            if let Some(file) = resolve_project_file(state.project(), &uri) {
+                state.overlay.set(file.abs_path(), updated_text);
+                state.completion_cache.invalidate(&file.abs_path());
+                let mut changed = BTreeSet::new();
+                changed.insert(file);
+                state.workspace = state.workspace.update(&changed);
+                publish_diagnostics_for_state(connection, state, &uri)?;
             }
             Ok(())
         }
@@ -1174,11 +1177,11 @@ pub(crate) struct ServerState {
     /// definition, references) fire far less often, so they continue to
     /// re-read on every request without sharing this cache.
     completion_cache: completion::CompletionCache,
-    /// Last instant we logged a malformed `didChange` for a given URI. Used
+    /// Last instant we logged a rejected `didChange` for a given URI. Used
     /// to throttle the warning to one line per URI per
-    /// [`MALFORMED_DIDCHANGE_LOG_THROTTLE`] — a misbehaving client sending
-    /// incremental events per keystroke would otherwise flood stderr.
-    malformed_didchange_log: ThrottledLog<String>,
+    /// [`REJECTED_DIDCHANGE_LOG_THROTTLE`] — a misbehaving client sending
+    /// invalid events per keystroke would otherwise flood stderr.
+    rejected_didchange_log: ThrottledLog<String>,
     published_diagnostic_uris: Vec<Uri>,
     open_documents: HashMap<String, OpenDocument>,
     document_generations: Arc<Mutex<HashMap<String, u64>>>,
@@ -1215,18 +1218,19 @@ struct BifrostInitializationOptions {
 struct OpenDocument {
     uri: Uri,
     abs_path: PathBuf,
+    version: i32,
     text: String,
 }
 
-/// Minimum interval between stderr lines reporting a malformed `didChange`
+/// Minimum interval between stderr lines reporting a rejected `didChange`
 /// for the same URI. Mirrors the cadence of `OVERLAY_REJECTION_LOG_THROTTLE`
 /// in the analyzer layer.
-const MALFORMED_DIDCHANGE_LOG_THROTTLE: Duration = Duration::from_secs(60);
+const REJECTED_DIDCHANGE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 
-/// Soft cap on the malformed-didChange throttle map. Same rationale as
+/// Soft cap on the rejected-didChange throttle map. Same rationale as
 /// `OVERLAY_REJECTION_LOG_MAX_ENTRIES`: a sloppy or hostile client could
 /// otherwise send a stream of distinct URIs and grow the map without bound.
-const MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
+const REJECTED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
 const MAX_CONCURRENT_FORMATTING_REQUESTS: usize = 2;
 const FORMATTER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
@@ -1328,9 +1332,9 @@ impl ServerState {
             workspace,
             overlay,
             completion_cache: completion::CompletionCache::new(),
-            malformed_didchange_log: ThrottledLog::new(
-                MALFORMED_DIDCHANGE_LOG_THROTTLE,
-                MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES,
+            rejected_didchange_log: ThrottledLog::new(
+                REJECTED_DIDCHANGE_LOG_THROTTLE,
+                REJECTED_DIDCHANGE_LOG_MAX_ENTRIES,
             ),
             published_diagnostic_uris: Vec::new(),
             open_documents: HashMap::new(),
@@ -1417,22 +1421,30 @@ impl ServerState {
         }
     }
 
-    fn remember_open_document(&mut self, uri: Uri, abs_path: PathBuf, text: String) {
+    fn remember_open_document(&mut self, uri: Uri, abs_path: PathBuf, version: i32, text: String) {
         self.bump_document_generation(&uri);
         self.open_documents.insert(
             uri.as_str().to_string(),
             OpenDocument {
                 uri,
                 abs_path,
+                version,
                 text,
             },
         );
     }
 
-    fn update_open_document_text(&mut self, uri: &Uri, text: String) {
+    fn update_open_document(&mut self, uri: &Uri, version: i32, text: String) {
         self.bump_document_generation(uri);
         if let Some(document) = self.open_documents.get_mut(uri.as_str()) {
+            document.version = version;
             document.text = text;
+        }
+    }
+
+    fn update_open_document_version(&mut self, uri: &Uri, version: i32) {
+        if let Some(document) = self.open_documents.get_mut(uri.as_str()) {
+            document.version = version;
         }
     }
 
@@ -1460,14 +1472,14 @@ impl ServerState {
     }
 
     /// Emit a single stderr warning for `uri` if we haven't logged one
-    /// within [`MALFORMED_DIDCHANGE_LOG_THROTTLE`]. The throttle map is
+    /// within [`REJECTED_DIDCHANGE_LOG_THROTTLE`]. The throttle map is
     /// bounded; entries older than the throttle window are pruned when it
     /// fills.
-    fn maybe_log_malformed_didchange(&self, uri: &Uri, n_changes: usize) {
+    fn maybe_log_rejected_didchange(&self, uri: &Uri, version: i32, reason: &str) {
         let now = Instant::now();
-        if self.malformed_didchange_log.should_log(uri.as_str(), now) {
+        if self.rejected_didchange_log.should_log(uri.as_str(), now) {
             eprintln!(
-                "[bifrost-lsp] dropping didChange for {}: {n_changes} content_change events but none was a full-document replacement (server advertises TextDocumentSyncKind::FULL)",
+                "[bifrost-lsp] dropping didChange for {} at version {version}: {reason}",
                 uri.as_str(),
             );
         }
