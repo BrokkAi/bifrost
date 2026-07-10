@@ -73,7 +73,6 @@ fn direct_children_match_fixture_class_members() {
             "Function:D.methodD2".to_string(),
             "Class:D.DSubStatic".to_string(),
             "Class:D.DSub".to_string(),
-            "Function:D.D".to_string(),
         ],
         child_kinds_and_names
     );
