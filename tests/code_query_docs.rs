@@ -7,6 +7,7 @@ const DOCS: &[&str] = &[
     "docs/src/content/docs/code-querying.md",
     "docs/src/content/docs/code-query-json.md",
     "docs/src/content/docs/rune-query-language.md",
+    "docs/src/content/docs/code-query-tutorials/index.md",
 ];
 
 const PUBLIC_QUERY_SURFACES: &[&str] = &[
