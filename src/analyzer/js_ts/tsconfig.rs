@@ -17,8 +17,8 @@
 //! roots tried in order.
 
 use crate::analyzer::ProjectFile;
-use crate::analyzer::model::NormalizePath;
 use crate::hash::HashMap;
+use crate::path_normalization::NormalizePath;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 

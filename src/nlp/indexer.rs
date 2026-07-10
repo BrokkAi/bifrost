@@ -36,9 +36,6 @@ use super::{BM25_TOKENIZER_VERSION, CHUNKER_VERSION};
 /// Blobs materialized per embedding round so component texts batch well.
 const FILE_GROUP: usize = 64;
 
-/// Minimum interval between opportunistic GC sweeps (seconds).
-const GC_MIN_INTERVAL_SECS: i64 = 6 * 3600;
-
 /// Default ceiling for `wait_ready`; generous because explicit readiness
 /// callers want to wait for the first build of a large repo.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -633,41 +630,12 @@ fn language_of(file: &ProjectFile) -> Option<String> {
         .map(|ext| ext.to_string())
 }
 
-/// Best-effort GC: drop cache entries no longer reachable from git (or held by a
-/// worktree's uncommitted working set). Throttled; failures are non-fatal.
-/// Compute the live OID set (reachable ∪ each worktree's uncommitted) and sweep.
-/// Used unthrottled by an explicit GC request and (throttled) by `maybe_gc`.
+/// Forced shared GC for explicit maintenance requests.
 fn run_gc(store: &SemanticStore, repo: &git2::Repository) -> Result<(), String> {
-    // Liveness is unchanged — "reachable from any ref" ∪ "held by a worktree's uncommitted
-    // working set" — but represented as a Bloom filter we stream `git rev-list` into, plus
-    // each worktree's dirty OIDs. We never materialize the reachable OID set (millions of
-    // objects on a monorepo, which OOMs); the cache's blobs are then streamed past the
-    // filter, so peak memory is O(filter) ≈ a few MB. A Bloom false positive only lets a
-    // dead blob linger a cycle; there are no false negatives, so a reachable blob is never
-    // dropped (the repo-level cache keeps surviving branch switches).
-    let mut live = gitcache::reachable_bloom(repo)?;
-    for root in gitcache::worktree_roots(repo)? {
-        if let Ok(dirty) = gitcache::uncommitted_oids(&root) {
-            for oid in dirty {
-                live.insert(oid);
-            }
-        }
-    }
-    store
-        .gc_with(|oid| live.contains(oid))
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    crate::cache_gc::force_gc_for_semantic(store, repo).map(|_| ())
 }
 
 /// Best-effort throttled GC run after a full build; errors are swallowed.
 fn maybe_gc(store: &SemanticStore, repo: &git2::Repository) {
-    let due = match store.seconds_since_gc() {
-        Ok(Some(secs)) => secs >= GC_MIN_INTERVAL_SECS,
-        Ok(None) => true,
-        Err(_) => false,
-    };
-    if !due {
-        return;
-    }
-    let _ = run_gc(store, repo);
+    let _ = crate::cache_gc::maybe_gc_for_semantic(store, repo);
 }

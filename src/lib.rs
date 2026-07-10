@@ -1,5 +1,9 @@
 pub mod analyzer;
 pub mod benchmark;
+#[cfg(feature = "nlp")]
+mod cache_db;
+#[cfg(feature = "nlp")]
+mod cache_gc;
 mod cancellation;
 pub mod code_quality;
 pub mod commit_analysis;
@@ -7,6 +11,7 @@ pub mod file_tools;
 mod get_summaries_output;
 mod git_file;
 pub mod git_tools;
+mod gitblob;
 pub mod hash;
 pub mod lsp;
 pub mod mcp_cli;
@@ -20,6 +25,7 @@ pub mod mcp_text;
 mod model_context;
 #[cfg(feature = "nlp")]
 pub mod nlp;
+mod path_normalization;
 mod path_utils;
 pub mod profiling;
 mod project_watcher;

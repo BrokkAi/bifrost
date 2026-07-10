@@ -1,5 +1,6 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, ProjectFile};
+use crate::path_normalization::NormalizePath;
 use crate::util::throttled_log::ThrottledLog;
 use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap};
@@ -45,11 +46,13 @@ pub trait Project: Send + Sync {
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile>;
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let abs_path = abs_path.to_path_buf().normalize();
         let rel_path = abs_path.strip_prefix(self.root()).ok()?;
         self.file_by_rel_path(rel_path)
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let abs_path = abs_path.to_path_buf().normalize();
         let rel_path = abs_path.strip_prefix(self.root()).ok()?;
         Some(ProjectFile::new(
             self.root().to_path_buf(),
@@ -93,7 +96,7 @@ impl TestProject {
     }
 
     pub fn with_languages(root: impl Into<PathBuf>, languages: BTreeSet<Language>) -> Self {
-        let root = root.into();
+        let root = root.into().normalize();
         assert!(root.is_absolute(), "test project root must be absolute");
         assert!(root.is_dir(), "test project root must exist");
         assert!(
@@ -105,7 +108,7 @@ impl TestProject {
     }
 
     pub fn from_root_with_inferred_languages(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let root = root.into();
+        let root = root.into().normalize();
         assert!(root.is_absolute(), "test project root must be absolute");
         assert!(root.is_dir(), "test project root must exist");
 
@@ -189,7 +192,7 @@ pub struct FilesystemProject {
 
 impl FilesystemProject {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let root = root.into().canonicalize()?;
+        let root = root.into().canonicalize()?.normalize();
         if !root.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -274,7 +277,7 @@ impl FileSetProject {
     /// file extensions; files of unsupported types stay listed but contribute
     /// no language (and so are never parsed).
     pub fn new(root: impl Into<PathBuf>, rel_paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        let root = root.into();
+        let root = root.into().normalize();
         let files: BTreeSet<ProjectFile> = rel_paths
             .into_iter()
             .map(|rel| ProjectFile::new(root.clone(), rel))
@@ -337,7 +340,7 @@ impl MultiRootProject {
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
         let mut roots = roots
             .into_iter()
-            .map(|root| root.canonicalize())
+            .map(|root| root.canonicalize().map(NormalizePath::normalize))
             .collect::<io::Result<Vec<_>>>()?;
         roots.sort();
         roots.dedup();
@@ -422,6 +425,7 @@ impl Project for MultiRootProject {
     }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let abs_path = abs_path.to_path_buf().normalize();
         for root in &self.roots {
             let Ok(root_rel_path) = abs_path.strip_prefix(root.root()) else {
                 continue;
@@ -434,6 +438,7 @@ impl Project for MultiRootProject {
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let abs_path = abs_path.to_path_buf().normalize();
         let rel_path = abs_path.strip_prefix(&self.root).ok()?;
         for root in &self.roots {
             if abs_path.strip_prefix(root.root()).is_ok() {
@@ -597,6 +602,7 @@ impl OverlayProject {
     /// case any prior overlay for the path is cleared so subsequent reads
     /// fall through to disk rather than serving stale content.
     pub fn set(&self, abs_path: PathBuf, content: String) -> bool {
+        let abs_path = abs_path.normalize();
         if content.len() > self.max_overlay_bytes {
             self.log_rejection(&abs_path, content.len());
             // Drop any stale overlay so reads return disk content rather than
@@ -617,10 +623,11 @@ impl OverlayProject {
     /// Remove an overlay, if present. Returns `true` when an overlay was
     /// actually removed — callers use this to decide whether reparse is needed.
     pub fn clear(&self, abs_path: &Path) -> bool {
+        let abs_path = abs_path.to_path_buf().normalize();
         self.overlays
             .write()
             .expect("overlay lock poisoned")
-            .remove(abs_path)
+            .remove(&abs_path)
             .is_some()
     }
 
@@ -741,6 +748,27 @@ mod tests {
         ProjectFile::new(root.to_path_buf(), PathBuf::from(rel))
     }
 
+    #[cfg(windows)]
+    fn verbatim(path: &Path) -> PathBuf {
+        PathBuf::from(format!(r"\\?\{}", path.display()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_constructors_normalize_verbatim_roots() {
+        let temp = TempDir::new().unwrap();
+        let ordinary = temp.path().canonicalize().unwrap().normalize();
+        std::fs::write(ordinary.join("main.rs"), "fn main() {}\n").unwrap();
+        let verbatim = verbatim(&ordinary);
+
+        let filesystem = FilesystemProject::new(&verbatim).unwrap();
+        let test = TestProject::new(&verbatim, Language::Rust);
+        let files = FileSetProject::new(&verbatim, [PathBuf::from("main.rs")]);
+        assert_eq!(filesystem.root(), ordinary);
+        assert_eq!(test.root(), ordinary);
+        assert_eq!(files.root(), ordinary);
+    }
+
     #[test]
     fn filesystem_project_read_source_reads_disk() {
         let temp = TempDir::new().unwrap();
@@ -793,7 +821,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let project = FileSetProject::new(root.clone(), [PathBuf::from("A.java")]);
-        assert_eq!(project.root(), root.as_path());
+        assert_eq!(project.root(), root.normalize());
         assert!(project.persistence_root().is_none());
     }
 

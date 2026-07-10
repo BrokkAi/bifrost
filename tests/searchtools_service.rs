@@ -9,7 +9,7 @@ use git2::{Repository, Signature};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{MAIN_SEPARATOR, PathBuf};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use tempfile::TempDir;
@@ -19,6 +19,20 @@ fn fixture_root() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("testcode-java")
+}
+
+fn assert_workspace_path(value: &Value, expected: &Path) {
+    let actual = value["workspace_path"]
+        .as_str()
+        .expect("workspace_path string");
+    assert_eq!(
+        Path::new(actual)
+            .canonicalize()
+            .expect("canonicalize actual workspace path"),
+        expected
+            .canonicalize()
+            .expect("canonicalize expected workspace path")
+    );
 }
 
 fn array_len(value: &Value, key: &str) -> usize {
@@ -2118,8 +2132,7 @@ fn get_active_workspace_returns_initial_root() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let expected = fixture_root().canonicalize().unwrap();
-    assert_eq!(value["workspace_path"], expected.display().to_string());
+    assert_workspace_path(&value, &fixture_root());
 }
 
 #[test]
@@ -2172,7 +2185,7 @@ fn activate_workspace_idempotent_for_same_root() {
         .call_tool_json("activate_workspace", &arguments)
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(value["workspace_path"], same_root.display().to_string());
+    assert_workspace_path(&value, &same_root);
 }
 
 #[test]
@@ -2194,16 +2207,13 @@ fn activate_workspace_switches_to_new_root() {
         .call_tool_json("activate_workspace", &arguments)
         .unwrap();
     let activate_value: Value = serde_json::from_str(&activate_payload).unwrap();
-    assert_eq!(
-        activate_value["workspace_path"],
-        new_root.display().to_string()
-    );
+    assert_workspace_path(&activate_value, &new_root);
 
     let get_payload = service
         .call_tool_json("get_active_workspace", "{}")
         .unwrap();
     let get_value: Value = serde_json::from_str(&get_payload).unwrap();
-    assert_eq!(get_value["workspace_path"], new_root.display().to_string());
+    assert_workspace_path(&get_value, &new_root);
 
     // The new workspace should index files from the new root, not the old one.
     let summary_payload = service
@@ -2239,11 +2249,7 @@ fn activate_workspace_failure_preserves_existing_workspace() {
         .call_tool_json("get_active_workspace", "{}")
         .unwrap();
     let active_value: Value = serde_json::from_str(&active_payload).unwrap();
-    let expected = fixture_root().canonicalize().unwrap();
-    assert_eq!(
-        active_value["workspace_path"],
-        expected.display().to_string()
-    );
+    assert_workspace_path(&active_value, &fixture_root());
 
     let summary_payload = service
         .call_tool_json("get_summaries", r#"{"targets":["A.java"]}"#)
@@ -4251,7 +4257,7 @@ fn activate_workspace_normalizes_to_git_root() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(value["workspace_path"], repo_root.display().to_string());
+    assert_workspace_path(&value, &repo_root);
 }
 
 #[test]

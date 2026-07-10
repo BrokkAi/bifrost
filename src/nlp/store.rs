@@ -1,20 +1,9 @@
-use git2::Repository;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
 
-const DB_FILE_NAME: &str = "semantic_cache.db";
-const DB_DIR_NAME: &str = ".brokk";
-const LATEST_SCHEMA_VERSION: i64 = 1;
-const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
-const META_SCHEMA_VERSION: &str = "schema_version";
-const META_EMBED_FINGERPRINT: &str = "embed_fingerprint";
-const META_BM25_TOKENIZER_VERSION: &str = "bm25_tokenizer_version";
-const META_CHUNKER_VERSION: &str = "chunker_version";
-const META_LAST_GC_AT: &str = "last_gc_at";
 const SQLITE_IN_LIMIT: usize = 500;
 
 /// Resolve the per-primary-repo cache path. Worktrees collapse to the primary
@@ -24,20 +13,7 @@ const SQLITE_IN_LIMIT: usize = 500;
 /// only); for a non-repo path this still returns a path, but the indexer is
 /// never started there.
 pub fn semantic_db_path(workspace_root: &Path) -> PathBuf {
-    let primary_root = Repository::discover(workspace_root)
-        .ok()
-        .and_then(|repo| {
-            if repo.is_bare() {
-                return None;
-            }
-            if repo.is_worktree() {
-                let common = repo.commondir();
-                return common.parent().map(Path::to_path_buf);
-            }
-            repo.workdir().map(Path::to_path_buf)
-        })
-        .unwrap_or_else(|| workspace_root.to_path_buf());
-    primary_root.join(DB_DIR_NAME).join(DB_FILE_NAME)
+    crate::gitblob::cache_db_path(workspace_root)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +49,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct SemanticStore {
     conn: Mutex<Connection>,
+    db_path: PathBuf,
 }
 
 /// A single chunk's persisted metadata, written by `put_blob`. The chunk's own
@@ -87,17 +64,17 @@ pub struct BlobChunkIn<'a> {
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
     pub fts_tokens: &'a str,
-    /// `hash(text)` — key into `component_vectors`.
+    /// `hash(text)` — key into `semantic_component_vectors`.
     pub hash: [u8; 32],
-    /// `hash(parent_summary)` — key into `component_vectors` and `blob_summaries`.
+    /// `hash(parent_summary)` — key into `semantic_component_vectors` and `semantic_blob_summaries`.
     pub parent_summary_hash: Option<[u8; 32]>,
-    /// `compose(...)` — key into `vectors` (the searchable vector).
+    /// `compose(...)` — key into `semantic_vectors` (the searchable vector).
     pub composed_hash: [u8; 32],
 }
 
 /// A chunk row read back for active-index construction. Carries `blob_oid` so the
 /// caller can attach the per-worktree path; `text`/keys for embedding are not
-/// needed here (the vectors already live in the cache, keyed by `composed_hash`).
+/// needed here (the semantic_vectors already live in the cache, keyed by `composed_hash`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlobChunkRow {
     pub blob_oid: String,
@@ -120,39 +97,21 @@ pub struct VectorRow {
 
 impl SemanticStore {
     pub fn open(db_path: &Path) -> Result<Self> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )?;
-        conn.busy_timeout(Duration::from_millis(5000))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-        // Write-throughput tuning. This is a rebuildable cache, so synchronous=NORMAL is
-        // safe (a crash can lose the last committed txns but never corrupts the DB) and
-        // is the big WAL win — ~10x fewer fsyncs. temp_store=MEMORY keeps indices/temp
-        // B-trees off disk; a large page cache and mmap cut read I/O during the heavy
-        // materialize writes.
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "temp_store", "MEMORY")?;
-        conn.pragma_update(None, "cache_size", -65536)?; // ~64 MiB page cache
-        conn.pragma_update(None, "mmap_size", 268435456i64)?; // 256 MiB
-        conn.pragma_update(None, "wal_autocheckpoint", 2000)?; // fewer checkpoint stalls
-
-        migrate(&mut conn)?;
+        let conn = crate::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS active_chunks(
                  composed_hash BLOB PRIMARY KEY
-             ) WITHOUT ROWID;",
+             ) WITHOUT ROWID, STRICT;",
         )?;
 
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: db_path.to_path_buf(),
         })
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     /// Wipe all cached content when the embedding fingerprint or text-derivation
@@ -167,9 +126,16 @@ impl SemanticStore {
     ) -> Result<bool> {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
-        let stored_fp = meta_value_tx(&tx, META_EMBED_FINGERPRINT)?;
-        let stored_chunker = meta_value_tx(&tx, META_CHUNKER_VERSION)?;
-        let stored_bm25 = meta_value_tx(&tx, META_BM25_TOKENIZER_VERSION)?;
+        let (stored_fp, stored_chunker, stored_bm25): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT embed_fingerprint, chunker_version, bm25_tokenizer_version
+             FROM cache_state WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
         let first_run = stored_fp.is_none() && stored_chunker.is_none() && stored_bm25.is_none();
         let matches = stored_fp.as_deref() == Some(fingerprint)
             && stored_chunker.as_deref() == Some(chunker_version)
@@ -177,16 +143,21 @@ impl SemanticStore {
         let wiped = if first_run || matches {
             false
         } else {
-            // blob_chunks cascade from blobs.
-            tx.execute("DELETE FROM blobs", [])?;
-            tx.execute("DELETE FROM blob_summaries", [])?;
-            tx.execute("DELETE FROM vectors", [])?;
-            tx.execute("DELETE FROM component_vectors", [])?;
+            // semantic_blob_chunks cascade from semantic_blobs.
+            tx.execute("DELETE FROM semantic_blobs", [])?;
+            tx.execute("DELETE FROM semantic_blob_summaries", [])?;
+            tx.execute("DELETE FROM semantic_vectors", [])?;
+            tx.execute("DELETE FROM semantic_component_vectors", [])?;
             true
         };
-        set_meta_value_tx(&tx, META_EMBED_FINGERPRINT, fingerprint)?;
-        set_meta_value_tx(&tx, META_CHUNKER_VERSION, chunker_version)?;
-        set_meta_value_tx(&tx, META_BM25_TOKENIZER_VERSION, bm25_tokenizer_version)?;
+        tx.execute(
+            "UPDATE cache_state
+             SET embed_fingerprint = ?1,
+                 chunker_version = ?2,
+                 bm25_tokenizer_version = ?3
+             WHERE id = 1",
+            params![fingerprint, chunker_version, bm25_tokenizer_version],
+        )?;
         tx.commit()?;
         Ok(wiped)
     }
@@ -196,7 +167,7 @@ impl SemanticStore {
     /// Which of `oids` are not yet materialized in the cache.
     pub fn missing_blobs(&self, oids: &[String]) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let mut stmt = conn.prepare("SELECT 1 FROM blobs WHERE blob_oid = ?1 LIMIT 1")?;
+        let mut stmt = conn.prepare("SELECT 1 FROM semantic_blobs WHERE blob_oid = ?1 LIMIT 1")?;
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for oid in oids {
@@ -212,18 +183,19 @@ impl SemanticStore {
     }
 
     pub fn missing_component_hashes(&self, hashes: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
-        self.missing_hashes("component_vectors", "hash", hashes)
+        self.missing_hashes("semantic_component_vectors", "hash", hashes)
     }
 
     pub fn missing_composed_hashes(&self, hashes: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
-        self.missing_hashes("vectors", "composed_hash", hashes)
+        self.missing_hashes("semantic_vectors", "composed_hash", hashes)
     }
 
-    /// Component vectors are stored as fastrq codes; decode them (lossily) back to
+    /// Component semantic_vectors are stored as fastrq codes; decode them (lossily) back to
     /// f32 for re-composition.
     pub fn component_vectors(&self, hashes: &[[u8; 32]]) -> Result<HashMap<[u8; 32], Vec<f32>>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let mut select = conn.prepare("SELECT vector FROM component_vectors WHERE hash = ?1")?;
+        let mut select =
+            conn.prepare("SELECT vector FROM semantic_component_vectors WHERE hash = ?1")?;
         let mut out = HashMap::new();
         let mut seen = HashSet::new();
         for hash in hashes {
@@ -244,11 +216,11 @@ impl SemanticStore {
     }
 
     pub fn upsert_component_vectors(&self, items: &[([u8; 32], Vec<f32>)]) -> Result<()> {
-        self.upsert_codes("component_vectors", "hash", items)
+        self.upsert_codes("semantic_component_vectors", "hash", items)
     }
 
     pub fn upsert_composed_vectors(&self, items: &[([u8; 32], Vec<f32>)]) -> Result<()> {
-        self.upsert_codes("vectors", "composed_hash", items)
+        self.upsert_codes("semantic_vectors", "composed_hash", items)
     }
 
     /// Encode each vector to a fastrq 8-bit code (~4x smaller than f32; see
@@ -283,36 +255,40 @@ impl SemanticStore {
         Ok(())
     }
 
-    /// Replace several blobs' materialized chunks in a single transaction. With a
-    /// group of 64 blobs this collapses ~64 transactions (and their fsyncs) into one,
+    /// Replace several semantic_blobs' materialized chunks in a single transaction. With a
+    /// group of 64 semantic_blobs this collapses ~64 transactions (and their fsyncs) into one,
     /// the dominant SQLite cost during materialization.
-    pub fn put_blobs(&self, blobs: &[(&str, Option<&str>, &[BlobChunkIn<'_>])]) -> Result<()> {
-        if blobs.is_empty() {
+    pub fn put_blobs(
+        &self,
+        semantic_blobs: &[(&str, Option<&str>, &[BlobChunkIn<'_>])],
+    ) -> Result<()> {
+        if semantic_blobs.is_empty() {
             return Ok(());
         }
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
         {
             let mut upsert_blob = tx.prepare(
-                "INSERT INTO blobs(blob_oid, language) VALUES(?1, ?2)
+                "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, ?2)
                  ON CONFLICT(blob_oid) DO UPDATE SET
                      language = excluded.language,
                      materialized_at = datetime('now')",
             )?;
-            let mut delete_chunks = tx.prepare("DELETE FROM blob_chunks WHERE blob_oid = ?1")?;
+            let mut delete_chunks =
+                tx.prepare("DELETE FROM semantic_blob_chunks WHERE blob_oid = ?1")?;
             let mut intern_summary = tx.prepare(
-                "INSERT INTO blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING",
+                "INSERT INTO semantic_blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING",
             )?;
             let mut select_summary =
-                tx.prepare("SELECT blob_summary_id FROM blob_summaries WHERE hash = ?1")?;
+                tx.prepare("SELECT blob_summary_id FROM semantic_blob_summaries WHERE hash = ?1")?;
             let mut insert_chunk = tx.prepare(
-                "INSERT INTO blob_chunks(
+                "INSERT INTO semantic_blob_chunks(
                      blob_oid, chunk_ord, kind, symbol, start_line, end_line,
                      fts_tokens, hash, parent_summary_id, composed_hash
                  ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             let mut summary_ids: HashMap<[u8; 32], i64> = HashMap::new();
-            for (blob_oid, language, chunks) in blobs {
+            for (blob_oid, language, chunks) in semantic_blobs {
                 upsert_blob.execute(params![blob_oid, language])?;
                 delete_chunks.execute([blob_oid])?;
                 for chunk in *chunks {
@@ -349,7 +325,7 @@ impl SemanticStore {
     }
 
     /// Replace one blob's materialized chunks (and intern its parent summaries).
-    /// The component/composed vectors must already be upserted.
+    /// The component/composed semantic_vectors must already be upserted.
     pub fn put_blob(
         &self,
         blob_oid: &str,
@@ -359,20 +335,24 @@ impl SemanticStore {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO blobs(blob_oid, language) VALUES(?1, ?2)
+            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, ?2)
              ON CONFLICT(blob_oid) DO UPDATE SET
                  language = excluded.language,
                  materialized_at = datetime('now')",
             params![blob_oid, language],
         )?;
-        tx.execute("DELETE FROM blob_chunks WHERE blob_oid = ?1", [blob_oid])?;
+        tx.execute(
+            "DELETE FROM semantic_blob_chunks WHERE blob_oid = ?1",
+            [blob_oid],
+        )?;
 
-        let mut intern_summary =
-            tx.prepare("INSERT INTO blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING")?;
+        let mut intern_summary = tx.prepare(
+            "INSERT INTO semantic_blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING",
+        )?;
         let mut select_summary =
-            tx.prepare("SELECT blob_summary_id FROM blob_summaries WHERE hash = ?1")?;
+            tx.prepare("SELECT blob_summary_id FROM semantic_blob_summaries WHERE hash = ?1")?;
         let mut insert_chunk = tx.prepare(
-            "INSERT INTO blob_chunks(
+            "INSERT INTO semantic_blob_chunks(
                  blob_oid, chunk_ord, kind, symbol, start_line, end_line,
                  fts_tokens, hash, parent_summary_id, composed_hash
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -431,7 +411,7 @@ impl SemanticStore {
             let sql = format!(
                 "SELECT blob_oid, chunk_ord, kind, symbol, start_line, end_line,
                         fts_tokens, composed_hash
-                 FROM blob_chunks
+                 FROM semantic_blob_chunks
                  WHERE blob_oid IN ({placeholders})
                  ORDER BY blob_oid, chunk_ord"
             );
@@ -513,7 +493,7 @@ impl SemanticStore {
         Ok(())
     }
 
-    /// Stream the active set's searchable vectors in batches. Producer side of
+    /// Stream the active set's searchable semantic_vectors in batches. Producer side of
     /// the parallel vector scan: consumers score cosine off-thread.
     pub fn scan_active_vectors(
         &self,
@@ -524,7 +504,7 @@ impl SemanticStore {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT v.composed_hash, v.vector
-             FROM vectors v
+             FROM semantic_vectors v
              JOIN active_chunks a ON a.composed_hash = v.composed_hash",
         )?;
         let mut rows = stmt.query([])?;
@@ -555,10 +535,10 @@ impl SemanticStore {
     }
 
     /// Drop every cached blob for which `keep(blob_oid)` is false, cascading to its chunks
-    /// and any now-orphaned vectors/summaries. Returns the number of blobs dropped.
+    /// and any now-orphaned semantic_vectors/summaries. Returns the number of semantic_blobs dropped.
     ///
-    /// Streams the blobs table past `keep` and materializes only the (usually small) dead
-    /// set, so peak memory is O(dropped), not O(all cached blobs) — letting the caller pass
+    /// Streams the semantic_blobs table past `keep` and materializes only the (usually small) dead
+    /// set, so peak memory is O(dropped), not O(all cached semantic_blobs) — letting the caller pass
     /// a Bloom-filter membership test (`gitcache::reachable_bloom`) and never hold the OID
     /// set. `keep` must not return false for a live blob; a Bloom test satisfies this (no
     /// false negatives), at the cost of occasionally keeping a dead blob (false positive).
@@ -566,7 +546,7 @@ impl SemanticStore {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
         let dead: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT blob_oid FROM blobs")?;
+            let mut stmt = tx.prepare("SELECT blob_oid FROM semantic_blobs")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             let mut dead = Vec::new();
             for oid in rows {
@@ -578,34 +558,33 @@ impl SemanticStore {
             dead
         };
         {
-            // blob_chunks cascade from blobs.
-            let mut del = tx.prepare("DELETE FROM blobs WHERE blob_oid = ?1")?;
+            // semantic_blob_chunks cascade from semantic_blobs.
+            let mut del = tx.prepare("DELETE FROM semantic_blobs WHERE blob_oid = ?1")?;
             for oid in &dead {
                 del.execute([oid])?;
             }
         }
         tx.execute(
-            "DELETE FROM vectors
-             WHERE composed_hash NOT IN (SELECT composed_hash FROM blob_chunks)",
+            "DELETE FROM semantic_vectors
+             WHERE composed_hash NOT IN (SELECT composed_hash FROM semantic_blob_chunks)",
             [],
         )?;
         tx.execute(
-            "DELETE FROM blob_summaries
+            "DELETE FROM semantic_blob_summaries
              WHERE blob_summary_id NOT IN (
-                 SELECT parent_summary_id FROM blob_chunks
+                 SELECT parent_summary_id FROM semantic_blob_chunks
                  WHERE parent_summary_id IS NOT NULL
              )",
             [],
         )?;
         tx.execute(
-            "DELETE FROM component_vectors
+            "DELETE FROM semantic_component_vectors
              WHERE hash NOT IN (
-                 SELECT hash FROM blob_chunks
-                 UNION SELECT hash FROM blob_summaries
+                 SELECT hash FROM semantic_blob_chunks
+                 UNION SELECT hash FROM semantic_blob_summaries
              )",
             [],
         )?;
-        set_meta_value_tx(&tx, META_LAST_GC_AT, &now_unix_seconds().to_string())?;
         tx.commit()?;
         conn.pragma_update(None, "incremental_vacuum", 0)?;
         Ok(dead.len())
@@ -614,16 +593,14 @@ impl SemanticStore {
     /// Seconds since the last `gc`, or `None` if never run.
     pub fn seconds_since_gc(&self) -> Result<Option<i64>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                [META_LAST_GC_AT],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(stored
-            .and_then(|value| value.parse::<i64>().ok())
-            .map(|at| now_unix_seconds() - at))
+        let stored: i64 = conn.query_row(
+            "SELECT last_gc_at FROM cache_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(Some(stored)
+            .filter(|at| *at > 0)
+            .map(|at| crate::cache_db::now_unix_seconds() - at))
     }
 
     fn missing_hashes(
@@ -653,162 +630,6 @@ impl SemanticStore {
     }
 }
 
-fn migrate(conn: &mut Connection) -> Result<()> {
-    assert_sqlite_version(conn)?;
-    let current = schema_version(conn)?;
-    if current != 0 && current != LATEST_SCHEMA_VERSION {
-        // The index is a rebuildable cache: on any schema mismatch, drop and
-        // recreate rather than carry migration code.
-        recreate_schema(conn)?;
-        return Ok(());
-    }
-    if current == 0 {
-        let tx = conn.transaction()?;
-        create_schema(&tx)?;
-        set_meta_value_tx(&tx, META_SCHEMA_VERSION, &LATEST_SCHEMA_VERSION.to_string())?;
-        tx.commit()?;
-    }
-    Ok(())
-}
-
-fn recreate_schema(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction()?;
-    tx.execute_batch(
-        "DROP TABLE IF EXISTS blob_chunks;
-         DROP TABLE IF EXISTS blob_summaries;
-         DROP TABLE IF EXISTS blobs;
-         DROP TABLE IF EXISTS vectors;
-         DROP TABLE IF EXISTS component_vectors;
-         DROP TABLE IF EXISTS meta;",
-    )?;
-    create_schema(&tx)?;
-    set_meta_value_tx(&tx, META_SCHEMA_VERSION, &LATEST_SCHEMA_VERSION.to_string())?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        r#"
-        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-
-        CREATE TABLE blobs(
-          blob_oid        TEXT PRIMARY KEY,
-          language        TEXT,
-          materialized_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE blob_summaries(
-          blob_summary_id INTEGER PRIMARY KEY,
-          hash            BLOB NOT NULL UNIQUE
-        );
-
-        CREATE TABLE blob_chunks(
-          blob_oid          TEXT NOT NULL REFERENCES blobs(blob_oid) ON DELETE CASCADE,
-          chunk_ord         INTEGER NOT NULL,
-          kind              TEXT NOT NULL,
-          symbol            TEXT,
-          start_line        INTEGER,
-          end_line          INTEGER,
-          fts_tokens        TEXT NOT NULL,
-          hash              BLOB NOT NULL,
-          parent_summary_id INTEGER REFERENCES blob_summaries(blob_summary_id),
-          composed_hash     BLOB NOT NULL,
-          PRIMARY KEY(blob_oid, chunk_ord)
-        ) WITHOUT ROWID;
-        CREATE INDEX blob_chunks_by_hash     ON blob_chunks(hash);
-        CREATE INDEX blob_chunks_by_parent   ON blob_chunks(parent_summary_id);
-        CREATE INDEX blob_chunks_by_composed ON blob_chunks(composed_hash);
-
-        CREATE TABLE component_vectors(
-          hash   BLOB PRIMARY KEY,
-          dim    INTEGER NOT NULL,
-          vector BLOB NOT NULL
-        ) WITHOUT ROWID;
-
-        CREATE TABLE vectors(
-          composed_hash BLOB PRIMARY KEY,
-          dim           INTEGER NOT NULL,
-          vector        BLOB NOT NULL
-        ) WITHOUT ROWID;
-        "#,
-    )?;
-    Ok(())
-}
-
-fn schema_version(conn: &Connection) -> Result<i64> {
-    let meta_exists: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if meta_exists.is_none() {
-        return Ok(0);
-    }
-    let version = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            [META_SCHEMA_VERSION],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    version
-        .as_deref()
-        .unwrap_or("0")
-        .parse::<i64>()
-        .map_err(|err| StoreError::new(format!("invalid semantic store schema version: {err}")))
-}
-
-fn meta_value_tx(
-    tx: &rusqlite::Transaction<'_>,
-    key: &str,
-) -> std::result::Result<Option<String>, rusqlite::Error> {
-    tx.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
-        row.get(0)
-    })
-    .optional()
-}
-
-fn set_meta_value_tx(
-    tx: &rusqlite::Transaction<'_>,
-    key: &str,
-    value: &str,
-) -> std::result::Result<(), rusqlite::Error> {
-    tx.execute(
-        "INSERT INTO meta(key, value) VALUES(?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-fn assert_sqlite_version(conn: &Connection) -> Result<()> {
-    let version: String = conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
-    let parsed = parse_sqlite_version(&version).ok_or_else(|| {
-        StoreError::new(format!(
-            "unable to parse sqlite_version() output: {version}"
-        ))
-    })?;
-    if parsed < SQLITE_MIN_VERSION {
-        return Err(StoreError::new(format!(
-            "semantic store requires sqlite >= {}.{}.{} but found {version}",
-            SQLITE_MIN_VERSION.0, SQLITE_MIN_VERSION.1, SQLITE_MIN_VERSION.2
-        )));
-    }
-    Ok(())
-}
-
-fn parse_sqlite_version(version: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = version.split('.');
-    Some((
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    ))
-}
-
 fn decode_key_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
     blob.try_into().map_err(|value: Vec<u8>| {
         StoreError::new(format!(
@@ -818,13 +639,6 @@ fn decode_key_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
     })
 }
 
-fn now_unix_seconds() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|delta| delta.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,7 +646,8 @@ mod tests {
 
     fn open_temp() -> (tempfile::TempDir, SemanticStore) {
         let temp = tempfile::TempDir::new().unwrap();
-        let store = SemanticStore::open(&temp.path().join("semantic_cache.db")).unwrap();
+        let store =
+            SemanticStore::open(&temp.path().join(crate::cache_db::CACHE_DB_FILE_NAME)).unwrap();
         (temp, store)
     }
 
@@ -878,9 +693,11 @@ mod tests {
         store
             .upsert_composed_vectors(&[([5; 32], vec![1.0, 0.0]), ([6; 32], vec![0.0, 1.0])])
             .unwrap();
+        let oid_a = "1111111111111111111111111111111111111111";
+        let oid_b = "2222222222222222222222222222222222222222";
         store
             .put_blob(
-                "oid_a",
+                oid_a,
                 Some("rust"),
                 &[
                     chunk(0, [2; 32], [5; 32], None),
@@ -889,17 +706,14 @@ mod tests {
             )
             .unwrap();
 
-        let rows = store.chunks_for_oids(&["oid_a".to_string()]).unwrap();
+        let rows = store.chunks_for_oids(&[oid_a.to_string()]).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, "file_summary");
         assert_eq!(rows[1].symbol.as_deref(), Some("pkg.Cls.method"));
         assert_eq!(rows[1].composed_hash, [6; 32]);
 
         assert!(
-            store
-                .missing_blobs(&["oid_a".into(), "oid_b".into()])
-                .unwrap()
-                == vec!["oid_b".to_string()]
+            store.missing_blobs(&[oid_a.into(), oid_b.into()]).unwrap() == vec![oid_b.to_string()]
         );
     }
 
@@ -909,8 +723,9 @@ mod tests {
         store
             .upsert_composed_vectors(&[([5; 32], vec![1.0, 0.0]), ([6; 32], vec![0.0, 1.0])])
             .unwrap();
+        let oid_a = "1111111111111111111111111111111111111111";
         store
-            .put_blob("oid_a", None, &[chunk(1, [1; 32], [5; 32], None)])
+            .put_blob(oid_a, None, &[chunk(1, [1; 32], [5; 32], None)])
             .unwrap();
 
         let active: HashSet<[u8; 32]> = [[5u8; 32]].into_iter().collect();
@@ -925,6 +740,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_short_semantic_hash_key() {
+        let (_temp, store) = open_temp();
+        let conn = store.conn.lock().unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO semantic_component_vectors(hash, dim, vector)
+                 VALUES(?1, 3, X'010203')",
+                [vec![1u8; 31]],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK"),
+            "expected CHECK constraint error, got {err}"
+        );
+    }
+
+    #[test]
     fn gc_drops_unreachable_blobs_and_orphans() {
         let (_temp, store) = open_temp();
         store
@@ -933,24 +765,20 @@ mod tests {
         store
             .upsert_composed_vectors(&[([5; 32], vec![1.0, 0.0])])
             .unwrap();
+        let oid_keep = "1111111111111111111111111111111111111111";
+        let oid_drop = "2222222222222222222222222222222222222222";
         store
-            .put_blob("oid_keep", None, &[chunk(1, [1; 32], [5; 32], None)])
+            .put_blob(oid_keep, None, &[chunk(1, [1; 32], [5; 32], None)])
             .unwrap();
         store
-            .put_blob("oid_drop", None, &[chunk(1, [1; 32], [5; 32], None)])
+            .put_blob(oid_drop, None, &[chunk(1, [1; 32], [5; 32], None)])
             .unwrap();
 
-        let live: HashSet<String> = ["oid_keep".to_string()].into_iter().collect();
+        let live: HashSet<String> = [oid_keep.to_string()].into_iter().collect();
         store.gc(&live).unwrap();
 
-        assert_eq!(
-            store.chunks_for_oids(&["oid_drop".into()]).unwrap().len(),
-            0
-        );
-        assert_eq!(
-            store.chunks_for_oids(&["oid_keep".into()]).unwrap().len(),
-            1
-        );
+        assert_eq!(store.chunks_for_oids(&[oid_drop.into()]).unwrap().len(), 0);
+        assert_eq!(store.chunks_for_oids(&[oid_keep.into()]).unwrap().len(), 1);
         // The shared vector/component are still referenced by oid_keep.
         assert!(
             store
@@ -958,7 +786,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(store.seconds_since_gc().unwrap().is_some());
     }
 
     #[test]
@@ -968,12 +795,13 @@ mod tests {
         store
             .upsert_composed_vectors(&[([5; 32], vec![1.0, 0.0])])
             .unwrap();
+        let oid_a = "1111111111111111111111111111111111111111";
         store
-            .put_blob("oid_a", None, &[chunk(1, [1; 32], [5; 32], None)])
+            .put_blob(oid_a, None, &[chunk(1, [1; 32], [5; 32], None)])
             .unwrap();
 
         assert!(store.ensure_index_compatible("fp2", "ck1", "bm1").unwrap());
-        assert_eq!(store.chunks_for_oids(&["oid_a".into()]).unwrap().len(), 0);
+        assert_eq!(store.chunks_for_oids(&[oid_a.into()]).unwrap().len(), 0);
         assert!(
             !store
                 .missing_composed_hashes(&[[5; 32]])
@@ -1003,7 +831,7 @@ mod tests {
         let actual = semantic_db_path(&worktree_root);
         assert_eq!(
             actual.file_name().and_then(|n| n.to_str()),
-            Some(DB_FILE_NAME)
+            Some(crate::cache_db::CACHE_DB_FILE_NAME)
         );
         let actual_root = actual.parent().and_then(Path::parent).unwrap();
         assert_eq!(

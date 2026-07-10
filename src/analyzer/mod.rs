@@ -26,6 +26,7 @@ mod rust;
 mod scala;
 pub(crate) mod semantic_diagnostics;
 mod source_content;
+pub(crate) mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub(crate) mod test_paths;
