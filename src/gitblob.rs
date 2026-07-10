@@ -15,25 +15,25 @@ use growable_bloom_filter::GrowableBloom;
 
 use crate::path_normalization::NormalizePath;
 
-pub type Result<T> = std::result::Result<T, String>;
+pub(crate) type Result<T> = std::result::Result<T, String>;
 
-pub const CACHE_DIR_NAME: &str = ".brokk";
+pub(crate) const CACHE_DIR_NAME: &str = ".brokk";
 
 /// Discover the non-bare repository containing `root`, if any.
-pub fn discover(root: &Path) -> Option<Repository> {
+pub(crate) fn discover(root: &Path) -> Option<Repository> {
     Repository::discover(root)
         .ok()
         .filter(|repo| !repo.is_bare())
 }
 
 /// Whether `root` is inside a non-bare Git repository.
-pub fn is_git_repo(root: &Path) -> bool {
+pub(crate) fn is_git_repo(root: &Path) -> bool {
     discover(root).is_some()
 }
 
 /// Resolve the primary repository root. Linked worktrees collapse to the
 /// checkout that owns the common object database.
-pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
+pub(crate) fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
     if repo.is_bare() {
         return None;
     }
@@ -47,7 +47,7 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
 
 /// Resolve the unified cache path under the primary repository's `.brokk`
 /// directory. Non-Git roots fall back to the provided workspace root.
-pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
+pub(crate) fn cache_db_path(workspace_root: &Path) -> PathBuf {
     let primary_root = discover(workspace_root)
         .as_ref()
         .and_then(primary_repo_root)
@@ -58,7 +58,7 @@ pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
 }
 
 /// Working-tree blob OID (hex) for each project-relative path.
-pub fn working_tree_oids(
+pub(crate) fn working_tree_oids(
     repo: &Repository,
     rel_paths: &[String],
 ) -> Result<HashMap<String, String>> {
@@ -73,7 +73,7 @@ pub fn working_tree_oids(
 }
 
 /// Explicit incremental-update API. Resolution remains per requested path.
-pub fn working_tree_oids_targeted(
+pub(crate) fn working_tree_oids_targeted(
     repo: &Repository,
     rel_paths: &[String],
 ) -> Result<HashMap<String, String>> {
@@ -81,7 +81,7 @@ pub fn working_tree_oids_targeted(
 }
 
 /// Resolve every indexed path to the OID of its current working-tree bytes.
-pub fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, String>> {
+pub(crate) fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, String>> {
     let workdir = workdir(repo)?;
     let index = repo.index().map_err(|err| err.to_string())?;
     let mut out = HashMap::with_capacity(index.len());
@@ -95,7 +95,7 @@ pub fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, Strin
 
 /// Resolve one path to the OID of its current working-tree bytes. Missing
 /// files return `Ok(None)`.
-pub fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> Result<Option<Oid>> {
+pub(crate) fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> Result<Option<Oid>> {
     let workdir = workdir(repo)?;
     let index = repo.index().map_err(|err| err.to_string())?;
     let Some(rel) = rel_path.to_str() else {
@@ -108,7 +108,7 @@ pub fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> Result<O
 }
 
 /// Read a Git blob's bytes by hexadecimal OID.
-pub fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
     let oid = Oid::from_str(oid_hex).map_err(|err| err.to_string())?;
     let blob = repo.find_blob(oid).map_err(|err| err.to_string())?;
     Ok(blob.content().to_vec())
@@ -119,7 +119,7 @@ const GC_BLOOM_EST_OIDS: usize = 1 << 19;
 
 /// Build a Bloom filter containing every object reachable from refs or a
 /// linked-worktree HEAD, including detached HEADs not named by a ref.
-pub fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
+pub(crate) fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
     let workdir = workdir(repo)?;
     let mut args = vec![
         "rev-list".to_string(),
@@ -157,7 +157,7 @@ pub fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
 }
 
 /// Commit OIDs checked out by every linked worktree.
-pub fn worktree_heads(repo: &Repository) -> Result<Vec<String>> {
+pub(crate) fn worktree_heads(repo: &Repository) -> Result<Vec<String>> {
     let text = worktree_porcelain(repo)?;
     let mut heads = Vec::new();
     let mut seen = HashSet::new();
@@ -174,7 +174,7 @@ pub fn worktree_heads(repo: &Repository) -> Result<Vec<String>> {
 }
 
 /// Roots of every linked worktree, including the primary checkout.
-pub fn worktree_roots(repo: &Repository) -> Result<Vec<PathBuf>> {
+pub(crate) fn worktree_roots(repo: &Repository) -> Result<Vec<PathBuf>> {
     let text = worktree_porcelain(repo)?;
     let mut roots = Vec::new();
     for line in text.lines() {
@@ -207,7 +207,7 @@ fn worktree_porcelain(repo: &Repository) -> Result<String> {
 }
 
 /// Blob OIDs of dirty or untracked files in one worktree.
-pub fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
+pub(crate) fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
     let Some(repo) = discover(root) else {
         return Ok(HashSet::new());
     };
@@ -374,6 +374,19 @@ pub(crate) mod tests {
         let crlf_oid = Oid::hash_object(ObjectType::Blob, b"hello\r\n").unwrap();
         assert_eq!(index_oid, lf_oid);
         assert_ne!(index_oid, crlf_oid);
+        let paths = vec!["a.txt".to_string()];
+        assert_eq!(
+            working_tree_oids(&repo, &paths).unwrap()["a.txt"],
+            crlf_oid.to_string()
+        );
+        assert_eq!(
+            working_tree_oids_targeted(&repo, &paths).unwrap()["a.txt"],
+            crlf_oid.to_string()
+        );
+        assert_eq!(
+            working_tree_oids_full(&repo).unwrap()["a.txt"],
+            crlf_oid.to_string()
+        );
         assert_eq!(
             working_tree_oid_for_path(&repo, Path::new("a.txt")).unwrap(),
             Some(crlf_oid)
@@ -392,7 +405,17 @@ pub(crate) mod tests {
         let paths = vec!["dirty.txt".to_string(), "new.txt".to_string()];
         let bulk = working_tree_oids(&repo, &paths).unwrap();
         let targeted = working_tree_oids_targeted(&repo, &paths).unwrap();
+        let full = working_tree_oids_full(&repo).unwrap();
         assert_eq!(bulk, targeted);
+        assert_eq!(full["dirty.txt"], bulk["dirty.txt"]);
+        assert_eq!(
+            working_tree_oid_for_path(&repo, Path::new("dirty.txt")).unwrap(),
+            Some(Oid::from_str(&bulk["dirty.txt"]).unwrap())
+        );
+        assert_eq!(
+            working_tree_oid_for_path(&repo, Path::new("new.txt")).unwrap(),
+            Some(Oid::from_str(&bulk["new.txt"]).unwrap())
+        );
         assert_eq!(
             bulk["dirty.txt"],
             Oid::hash_object(ObjectType::Blob, b"working\n")
@@ -436,5 +459,18 @@ pub(crate) mod tests {
         assert!(roots.contains(&repo_root.canonicalize().unwrap().normalize()));
         assert!(roots.contains(&linked.canonicalize().unwrap().normalize()));
         assert_eq!(worktree_heads(&repo).unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cache_root_normalizes_verbatim_disk_and_unc_paths() {
+        assert_eq!(
+            cache_db_path(Path::new(r"C:\Users\runner\repo")),
+            cache_db_path(Path::new(r"\\?\C:\Users\runner\repo"))
+        );
+        assert_eq!(
+            cache_db_path(Path::new(r"\\server\share\repo")),
+            cache_db_path(Path::new(r"\\?\UNC\server\share\repo"))
+        );
     }
 }

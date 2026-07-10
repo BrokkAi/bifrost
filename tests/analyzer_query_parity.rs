@@ -1,7 +1,8 @@
 mod common;
 
 use brokk_bifrost::{
-    AnalyzerDelegate, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,
+    AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer,
+    PythonAnalyzer,
 };
 use common::InlineTestProject;
 use std::collections::{BTreeMap, BTreeSet};
@@ -172,5 +173,24 @@ fn multi_analyzer_preserves_owned_query_results_across_languages() {
     assert_eq!(
         multi.get_analyzed_files(),
         BTreeSet::from([java_file, python_file])
+    );
+}
+
+#[test]
+fn ordinary_analyzer_build_does_not_activate_unified_cache_backend() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("worker.py", "class Worker:\n    pass\n")
+        .build();
+    let _repo = git2::Repository::init(project.root()).unwrap();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+
+    assert!(!analyzer.analyzer().is_empty());
+    assert!(
+        !project
+            .root()
+            .join(".brokk")
+            .join("bifrost_cache.db")
+            .exists(),
+        "ordinary analyzer construction must remain in-memory"
     );
 }

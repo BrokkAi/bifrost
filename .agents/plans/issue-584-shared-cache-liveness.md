@@ -14,7 +14,7 @@ The observable proof is that linked worktrees resolve the same `.brokk/bifrost_c
 - [x] (2026-07-10) Inspected issue #584, current semantic cache and analyzer behavior, and the reviewed PR #447 donor implementation.
 - [x] (2026-07-10) Milestone 1: added shared path normalization, Git blob identity, and inert analyzer liveness; 4 Git, 9 liveness, and 1 cross-platform path test pass locally, with Windows-only disk/UNC cases compiled by the Windows matrix.
 - [x] (2026-07-10) Milestone 2: added the unified semantic cache schema and shared semantic GC driver without analyzer tables or activation; 6 cache DB, 2 GC, 6 semantic store, and 8 semantic integration tests pass.
-- [ ] Milestone 3: run focused regressions, formatting, clippy, diff checks, and guided review; address valid in-scope findings.
+- [x] (2026-07-10) Milestone 3: ran focused regressions, formatting, strict no-CUDA clippy, diff checks, and the guided review; fixed all valid in-scope correctness, migration, security, API-surface, and duplication findings.
 
 ## Surprises & Discoveries
 
@@ -32,6 +32,15 @@ The observable proof is that linked worktrees resolve the same `.brokk/bifrost_c
 
 - Observation: the liveness API is intentionally not consumed by production analyzer code in #584, so a private module otherwise triggers dead-code warnings under strict clippy.
   Evidence: the semantic integration build reported every liveness type as unused. A compile-only function-pointer contract now exercises the crate-internal interface in normal builds without runtime wiring or lint suppression; the function is optimized away and will be removed when the final analyzer store becomes the real consumer.
+
+- Observation: stat-only index fingerprints can miss a same-size index rewrite on filesystems with coarse modification times, and removing tracked filesystem refresh entries leaves a memoized live snapshot stale after an unstaged edit.
+  Evidence: guided review identified both seams. `current_index_fingerprint` now hashes the index bytes, and `refreshing_tracked_filesystem_entry_replaces_memoized_identity` proves a refreshed tracked path replaces the old snapshot identity.
+
+- Observation: the machine's default `cargo clippy-no-cuda` mixes Rustup's compiler with Homebrew's `clippy-driver`, whose LLVM patch versions differ.
+  Evidence: the ordinary command failed before crate analysis; running the same Cargo alias with the Rustup toolchain first in `PATH` and an isolated `/private/tmp/bifrost-clippy-9251` target completed with no warnings.
+
+- Observation: a time-based GC check cannot require positive registry growth because deleting refs can make cached rows unreachable without inserting any new rows.
+  Evidence: the guided review found the early `growth <= 0` return; `elapsed_interval_sweeps_without_registry_growth` now proves elapsed-interval GC removes such a row.
 
 ## Decision Log
 
@@ -55,9 +64,27 @@ The observable proof is that linked worktrees resolve the same `.brokk/bifrost_c
   Rationale: claim/throttle and Git reachability belong to shared cache plumbing, but referencing analyzer rows or `AnalyzerStore` would violate #584.
   Date/Author: 2026-07-10 / Codex.
 
+- Decision: Refuse a unified cache whose analyzer schema version is nonzero instead of rewriting it, while allowing future versions to store a nonzero value by constraining the column only to nonnegative integers.
+  Rationale: an older #584 binary must not destructively downgrade a future analyzer cache. When analyzer version remains zero, a rebuildable schema mismatch may atomically replace all user tables so stale donor/analyzer-shaped tables cannot survive under reset metadata.
+  Date/Author: 2026-07-10 / Codex.
+
+- Decision: Preserve only the pre-#584 public functions in `nlp::gitcache`; keep primary-root, cache-path, full-index, single-path, and worktree-HEAD helpers crate-internal.
+  Rationale: the compatibility facade must not accidentally publish the new implementation seams that the final backend may need to evolve.
+  Date/Author: 2026-07-10 / Codex.
+
+- Decision: Hold and revalidate a no-follow cache-directory handle around SQLite initialization, and delete the legacy semantic files only after the first successful unified-cache initialization.
+  Rationale: directory identity checks catch replacement races before or during initialization, while deferred best-effort cleanup keeps the legacy warm cache intact if initialization fails. Cleanup is keyed to the absence of initialized `cache_state`, not pre-open file existence, so an interrupted first creation can recover without one process deleting a concurrent creator's valid database.
+  Date/Author: 2026-07-10 / Codex.
+
 ## Outcomes & Retrospective
 
-Implementation is in progress. This section will record the final behavior, validation evidence, remaining gaps, and review outcomes.
+The issue #584 plumbing is complete in three checkpoint commits. Git identity now follows exact working-tree bytes across clean LF, clean CRLF, dirty, untracked, bulk, targeted, full-index, and single-path resolution. Primary and linked worktrees share one cache path; reachable refs, detached worktree HEADs, and every worktree's dirty content remain GC roots.
+
+The active semantic cache now uses `.brokk/bifrost_cache.db`, semantic-prefixed tables, and shared `cache_state`. Analyzer version zero is reserved without creating analyzer tables or attaching any liveness/store type to analyzer construction or queries. Future nonzero analyzer schemas are refused without mutation by this older plumbing. First-open legacy cleanup occurs only after successful initialization, and cache paths reject symlinks plus directory replacement.
+
+The guided review covered security, operations, duplication, architecture, and senior correctness. It found and prompted fixes for tracked-file snapshot refresh, same-size index invalidation, no-growth interval GC, future-schema downgrade safety, cleanup ordering, directory replacement, duplicated validation logic, and an overbroad compatibility re-export. The synthetic compile-only liveness contract remains intentionally temporary because strict clippy must type-check the inert crate-private API before the final backend supplies a real consumer.
+
+Final evidence is: Git tests 4 passed; liveness 10; path normalization 1 locally plus Windows-only disk/UNC cases in the Windows matrix; cache DB 10; cache GC 3; semantic store 6; analyzer parity/no-backend activation 8; semantic integration 8. `cargo fmt --all`, strict `cargo clippy-no-cuda` with the corrected Rustup toolchain path, and `git diff --check` all pass. No analyzer SQLite backend was activated, and no push or PR was performed.
 
 ## Context and Orientation
 
@@ -100,7 +127,7 @@ Final validation:
     BIFROST_SEMANTIC_INDEX=off cargo test --test analyzer_query_parity
     BIFROST_SEMANTIC_INDEX=off cargo test --features nlp --test semantic_search
     cargo fmt --all
-    cargo clippy-no-cuda
+    /usr/bin/env PATH=/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:/bin CARGO_TARGET_DIR=/private/tmp/bifrost-clippy-9251 cargo clippy-no-cuda
     git diff --check
     git status --short
 
@@ -120,7 +147,7 @@ Analyzer regressions must prove normal construction and queries remain resident 
 
 ## Idempotence and Recovery
 
-Formatting, tests, clippy, and cache tests use temporary directories and are safe to repeat. The cache is rebuildable, so a schema mismatch recreates only the semantic namespace. If a milestone fails, leave its edits visible, update `Progress` with completed and remaining work, and fix forward. Never reset unrelated user changes. The donor worktree remains read-only.
+Formatting, tests, clippy, and cache tests use temporary directories and are safe to repeat. The cache is rebuildable: a schema mismatch may recreate the whole unified database only while analyzer version is zero; a nonzero analyzer version is rejected without mutation so an older binary cannot damage a future backend. If a milestone fails, leave its edits visible, update `Progress` with completed and remaining work, and fix forward. Never reset unrelated user changes. The donor worktree remains read-only.
 
 ## Artifacts and Notes
 
@@ -128,7 +155,7 @@ The authoritative donor seams are `src/gitblob.rs`, `src/analyzer/store/liveness
 
 ## Interfaces and Dependencies
 
-`src/gitblob.rs` provides repository discovery, primary-root/cache-path resolution, exact-byte bulk/targeted/full/single-path OIDs, blob reads, worktree roots/HEADs, reachable Bloom construction, and uncommitted OIDs. `src/nlp/gitcache.rs` publicly re-exports the same functions.
+`src/gitblob.rs` provides repository discovery, primary-root/cache-path resolution, exact-byte bulk/targeted/full/single-path OIDs, blob reads, worktree roots/HEADs, reachable Bloom construction, and uncommitted OIDs. `src/nlp/gitcache.rs` preserves the previous public functions through explicit wrappers. New primary-root, cache-path, full-index, single-path, and worktree-HEAD helpers remain crate-internal.
 
 `src/cache_db.rs` provides the unified DB filename, safe connection setup, semantic schema lifecycle, shared cache state, and current time. The analyzer namespace is represented only by version zero.
 
@@ -137,3 +164,5 @@ The authoritative donor seams are `src/gitblob.rs`, `src/analyzer/store/liveness
 `src/analyzer/store/liveness.rs` provides crate-internal `Liveness`, `LivePathMap`, `LiveSnapshot`, `LivePathEntry`, and `LivePathValidation`. These types accept explicit filesystem or overlay identities and remain unused by production analyzer paths in #584.
 
 `growable-bloom-filter` becomes non-optional because shared reachability is compiled outside the optional NLP module. No other dependency changes are required.
+
+Plan revision note (2026-07-10): marked milestone 3 complete and recorded final validation, guided-review fixes, future-schema safety, cache-directory race hardening, compatibility-surface narrowing, and the toolchain-specific clippy command so a new contributor can reproduce the finished state.

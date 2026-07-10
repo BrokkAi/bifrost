@@ -137,13 +137,11 @@ fn gc_due_tx(tx: &rusqlite::Transaction<'_>, current_total: i64, now: i64) -> Re
         )
         .map_err(gc_sqlite_error)?;
     let growth = current_total - blobs_at_last_gc;
-    if growth <= 0 {
-        return Ok(false);
-    }
     if growth > AUTO_BLOB_THRESHOLD.load(Ordering::Relaxed) {
         return Ok(true);
     }
-    Ok(now.saturating_sub(last_gc_at) >= MIN_INTERVAL_SECS.load(Ordering::Relaxed))
+    Ok(current_total > 0
+        && now.saturating_sub(last_gc_at) >= MIN_INTERVAL_SECS.load(Ordering::Relaxed))
 }
 
 fn finish_gc(db_path: &Path) -> Result<i64, String> {
@@ -264,21 +262,35 @@ mod tests {
         commit_all(&linked_repo, "detached");
         let detached_oid = Oid::hash_object(ObjectType::Blob, b"detached\n").unwrap();
         std::fs::write(linked.join("tracked.txt"), b"dirty\n").unwrap();
-        let dirty_oid = Oid::hash_object(ObjectType::Blob, b"dirty\n").unwrap();
+        std::fs::write(linked.join("linked-new.txt"), b"linked untracked\n").unwrap();
+        let linked_dirty_oid = Oid::hash_object(ObjectType::Blob, b"dirty\n").unwrap();
+        let linked_untracked_oid =
+            Oid::hash_object(ObjectType::Blob, b"linked untracked\n").unwrap();
+        std::fs::write(root.join("tracked.txt"), b"primary dirty\n").unwrap();
+        std::fs::write(root.join("primary-new.txt"), b"primary untracked\n").unwrap();
+        let primary_dirty_oid = Oid::hash_object(ObjectType::Blob, b"primary dirty\n").unwrap();
+        let primary_untracked_oid =
+            Oid::hash_object(ObjectType::Blob, b"primary untracked\n").unwrap();
         let unreachable_oid = Oid::hash_object(ObjectType::Blob, b"unreachable\n").unwrap();
 
         let db_path = gitblob::cache_db_path(&root);
         let store = SemanticStore::open(&db_path).unwrap();
         put_oid(&store, detached_oid);
-        put_oid(&store, dirty_oid);
+        put_oid(&store, linked_dirty_oid);
+        put_oid(&store, linked_untracked_oid);
+        put_oid(&store, primary_dirty_oid);
+        put_oid(&store, primary_untracked_oid);
         put_oid(&store, unreachable_oid);
 
         let outcome = force_gc_for_semantic(&store, &repo).unwrap();
         assert!(outcome.ran);
         assert_eq!(outcome.semantic_dropped, 1);
-        assert_eq!(outcome.total_blobs_after, 2);
+        assert_eq!(outcome.total_blobs_after, 5);
         assert!(is_present(&store, detached_oid));
-        assert!(is_present(&store, dirty_oid));
+        assert!(is_present(&store, linked_dirty_oid));
+        assert!(is_present(&store, linked_untracked_oid));
+        assert!(is_present(&store, primary_dirty_oid));
+        assert!(is_present(&store, primary_untracked_oid));
         assert!(!is_present(&store, unreachable_oid));
     }
 
@@ -308,5 +320,33 @@ mod tests {
         assert!(swept.ran);
         assert_eq!(swept.semantic_dropped, 2);
         assert_eq!(swept.total_blobs_after, 0);
+    }
+
+    #[test]
+    fn elapsed_interval_sweeps_without_registry_growth() {
+        let _tuning = set_tuning(i64::MAX, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let repo = init_repo(&root);
+        let db_path = gitblob::cache_db_path(&root);
+        let store = SemanticStore::open(&db_path).unwrap();
+        let unreachable = Oid::hash_object(ObjectType::Blob, b"unreachable").unwrap();
+        put_oid(&store, unreachable);
+
+        let conn = cache_db::open_unified_connection(&db_path).unwrap();
+        conn.execute(
+            "UPDATE cache_state
+             SET last_gc_at = ?1, blobs_at_last_gc = 1, gc_claim_until = 0
+             WHERE id = 1",
+            [cache_db::now_unix_seconds()],
+        )
+        .unwrap();
+
+        let swept = maybe_gc_for_semantic(&store, &repo).unwrap();
+        assert!(swept.ran);
+        assert_eq!(swept.semantic_dropped, 1);
+        assert_eq!(swept.total_blobs_after, 0);
+        assert!(!is_present(&store, unreachable));
     }
 }
