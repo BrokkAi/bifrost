@@ -9,6 +9,27 @@ const DOCS: &[&str] = &[
     "docs/src/content/docs/rune-query-language.md",
 ];
 
+const PUBLIC_QUERY_SURFACES: &[&str] = &[
+    "README.md",
+    "bifrost_searchtools/README.md",
+    "bifrost_searchtools/__init__.py",
+    "bifrost_searchtools/client.py",
+    "bifrost_searchtools/models.py",
+    "docs/astro.config.mjs",
+    "docs/src/content/docs/code-querying.md",
+    "docs/src/content/docs/code-query-json.md",
+    "docs/src/content/docs/rune-query-language.md",
+    "docs/src/content/docs/mcp.md",
+    "docs/src/content/docs/python-client.md",
+    "src/mcp_extended.rs",
+    "src/bin/bifrost.rs",
+    "src/bin/bifrost/code_query_repl.rs",
+    "plugins/bifrost-agent/skills/bifrost-codebase-search/SKILL.md",
+    "plugins/bifrost-agent/codex-skills/bifrost-codebase-search/SKILL.md",
+    "plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/SKILL.md",
+    "plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/mcp.json",
+];
+
 const REQUIRED_JSON_EXAMPLES: &[&str] = &[
     "minimal-call",
     "receiver-args-kwargs",
@@ -80,9 +101,9 @@ fn documented_code_queries_parse() {
 }
 
 #[test]
-fn current_public_query_docs_use_the_new_name() {
+fn current_public_query_surfaces_use_the_new_name() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for relative in DOCS {
+    for relative in PUBLIC_QUERY_SURFACES {
         let path = root.join(relative);
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));

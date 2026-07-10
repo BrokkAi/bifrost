@@ -314,7 +314,7 @@ Version 1 enforces these budgets:
 | Kinds in one union/exclusion | `32` |
 | Entries in one role list | `64` |
 | Named arguments | `64`; names at most `128` bytes |
-| Name/text regex source | `4096` bytes |
+| Name predicate source (exact or regex) and text regex source | `4096` bytes |
 | Capture label | `128` bytes |
 
 Validation failures carry a JSON path so agents can correct the precise field. For example, this misspelling:

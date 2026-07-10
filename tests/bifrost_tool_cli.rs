@@ -648,6 +648,7 @@ fn help_mentions_tool_mode() {
     assert!(stdout.contains("--tool NAME"), "{stdout}");
     assert!(stdout.contains("--args"), "{stdout}");
     assert!(stdout.contains("--sources PATH"), "{stdout}");
+    assert!(!stdout.contains("search_ast"), "{stdout}");
 }
 
 #[test]
@@ -670,6 +671,7 @@ fn query_code_help_includes_boundary_example_and_guide() {
     );
     assert!(stdout.contains("does not traverse call graphs"), "{stdout}");
     assert!(stdout.contains(r#"{"match":{"kind":"call""#), "{stdout}");
+    assert!(!stdout.contains("search_ast"), "{stdout}");
     assert!(
         stdout.contains("https://brokkai.github.io/bifrost/code-querying/"),
         "{stdout}"
