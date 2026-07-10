@@ -893,3 +893,91 @@ fn python_signature_metadata_labels_typed_default_and_rest_parameters() {
         .collect();
     assert_eq!(vec!["combine", "right", "rest"], labels);
 }
+
+#[test]
+fn python_overload_declarations_keep_lookup_identity_and_mark_type_only_signatures() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "overloads.py",
+            r#"import typing as t
+import typing_extensions as te
+from typing import overload as ov
+from typing_extensions import overload
+
+class Command:
+    @t.overload
+    def main(self, value: str) -> str: ...
+
+    @t.overload
+    def main(self, value: int) -> int: ...
+
+    def main(self, value):
+        return value
+
+    @te.overload
+    def extension(self, value: str) -> str: ...
+
+    def extension(self, value):
+        return value
+
+    @ov
+    def aliased(self, value: str) -> str: ...
+
+    def aliased(self, value):
+        return value
+
+    @overload
+    def direct(self, value: str) -> str: ...
+
+    def direct(self, value):
+        return value
+"#,
+        )
+        .file(
+            "custom.py",
+            r#"def overload(function):
+    return function
+
+@overload
+def runtime_decorated(value):
+    return value
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+
+    for (fq_name, expected_flags) in [
+        ("overloads.Command.main", vec![true, true, false]),
+        ("overloads.Command.extension", vec![true, false]),
+        ("overloads.Command.aliased", vec![true, false]),
+        ("overloads.Command.direct", vec![true, false]),
+    ] {
+        let mut definitions = analyzer.get_definitions(fq_name);
+        definitions.sort_by_key(|unit| {
+            analyzer
+                .ranges(unit)
+                .into_iter()
+                .map(|range| range.start_line)
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        let flags = definitions
+            .iter()
+            .map(|unit| {
+                let metadata = analyzer.signature_metadata(unit);
+                assert_eq!(1, metadata.len(), "metadata for {unit:?}");
+                assert!(!metadata[0].label().is_empty());
+                metadata[0].is_declaration_only()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected_flags, flags, "{fq_name}");
+    }
+
+    let custom = definition(&analyzer, "custom.runtime_decorated");
+    assert!(
+        analyzer
+            .signature_metadata(&custom)
+            .iter()
+            .all(|metadata| !metadata.is_declaration_only())
+    );
+}

@@ -10,6 +10,8 @@ use crate::analyzer::structural::adapter_helpers::{
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, StructuralSpec};
 use tree_sitter::Node;
 
+use super::syntax::expression_name_node;
+
 #[derive(Debug, Default)]
 pub(crate) struct PythonStructuralSpec;
 
@@ -43,22 +45,6 @@ const PYTHON_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("while_statement", NormalizedKind::Loop),
     ("decorator", NormalizedKind::Decorator),
 ];
-
-/// The name-bearing node of an expression, resolved through AST fields:
-/// identifiers name themselves, `a.b` names `b`, `f(...)` names whatever
-/// names `f`. `None` for expressions without an obvious name (subscripts,
-/// literals, comprehensions, ...).
-fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
-    let mut current = expression;
-    loop {
-        match current.kind() {
-            "identifier" => return Some(current),
-            "attribute" => current = current.child_by_field_name("attribute")?,
-            "call" => current = current.child_by_field_name("function")?,
-            _ => return None,
-        }
-    }
-}
 
 /// Attach `decorators` edges for a definition wrapped in Python's
 /// `decorated_definition` node (which itself is not normalized).

@@ -2,6 +2,7 @@ use super::declarations::{
     PythonVisitor, collect_python_identifiers, module_code_unit,
     python_is_decorated_function_boundary, python_module_name,
 };
+use super::syntax::PythonOverloadDecoratorBindings;
 use super::tests::python_source_contains_tests;
 use super::*;
 use crate::analyzer::cognitive_complexity;
@@ -133,12 +134,14 @@ impl LanguageAdapter for PythonAdapter {
             parsed.add_code_unit(module, root, source, None, None);
         }
 
+        let overload_decorators = PythonOverloadDecoratorBindings::collect(root, source);
         let mut visitor = PythonVisitor {
             file,
             source,
             package_name: &module_fq,
             parsed: &mut parsed,
             module: module_code_unit,
+            overload_decorators: &overload_decorators,
         };
         visitor.visit_container(root, &[], 0);
 

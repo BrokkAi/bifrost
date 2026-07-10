@@ -213,6 +213,8 @@ pub struct SignatureMetadata {
     parameters: Vec<ParameterMetadata>,
     #[serde(default)]
     return_type_text: Option<String>,
+    #[serde(default)]
+    declaration_only: bool,
 }
 
 impl SignatureMetadata {
@@ -221,6 +223,7 @@ impl SignatureMetadata {
             label: label.into(),
             parameters,
             return_type_text: None,
+            declaration_only: false,
         }
     }
 
@@ -256,6 +259,7 @@ impl SignatureMetadata {
             label,
             parameters,
             return_type_text: None,
+            declaration_only: false,
         }
     }
 
@@ -264,6 +268,11 @@ impl SignatureMetadata {
             .map(Into::into)
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty());
+        self
+    }
+
+    pub fn with_declaration_only(mut self, declaration_only: bool) -> Self {
+        self.declaration_only = declaration_only;
         self
     }
 
@@ -277,6 +286,10 @@ impl SignatureMetadata {
 
     pub fn return_type_text(&self) -> Option<&str> {
         self.return_type_text.as_deref()
+    }
+
+    pub fn is_declaration_only(&self) -> bool {
+        self.declaration_only
     }
 }
 
