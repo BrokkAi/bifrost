@@ -19,8 +19,8 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
 - [x] (2026-07-10 09:57Z) Added the crate-private cooperative cancellation token and propagated it through default candidate discovery and every language query loop used by references.
 - [x] (2026-07-10 09:57Z) Added the two-worker LSP request registry, request-scoped progress reporter, asynchronous references dispatch, `-32800` cancellation mapping, and shutdown joins.
 - [x] (2026-07-10 09:57Z) Added deterministic worker/progress tests, stdio reference progress/cancellation coverage, and updated the public LSP documentation.
-- [ ] Run formatting, focused tests, `cargo clippy-no-cuda`, and the full test suite. Completed: formatting and every planned focused test. Remaining: clippy and full suite.
-- [ ] Run specialist reviews, address actionable findings, and record final outcomes.
+- [x] (2026-07-10 10:50Z) Ran formatting, every planned focused test, `cargo clippy-no-cuda`, and the complete test suite successfully.
+- [x] (2026-07-10 10:50Z) Completed security, DRY, senior-engineer, architecture, and DevOps reviews; addressed all findings and obtained clean focused re-reviews.
 
 ## Surprises & Discoveries
 
@@ -37,7 +37,13 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
   Evidence: `cargo test --lib lsp::` reported three timeouts; exact reruns of `formatter_executor_passes_stdin_and_returns_stdout`, `formatter_executor_drains_stdout_while_writing_large_stdin`, and `formatter_executor_reports_failure_stderr` all passed. The reference and formatter-cancellation integration tests also pass.
 
 - Observation: Client cancellation can be tested end to end without a production test hook.
-  Evidence: the integration test sends a reference request for a large structured Java fixture followed immediately by `$/cancelRequest`; registration completes before the main loop reads the notification, and the response is deterministically `-32800`.
+  Evidence: the integration test waits for the request-owned `Searching workspace` progress report before sending `$/cancelRequest`; the response is `-32800`, while deterministic unit tests cover the cooperative checkpoints and join lifecycle without sleeps.
+
+- Observation: This host's default `PATH` mixed rustup `cargo`/`rustc` (LLVM 22.1.2) with Homebrew `cargo-clippy`, `clippy-driver`, and `rustdoc` (LLVM 22.1.6), which produce incompatible Rust metadata despite the same 1.96.0 version string.
+  Evidence: the initial clippy and doctest runs failed with `E0514`; putting `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` first in `PATH` made both `cargo clippy-no-cuda` and the complete `cargo test` pass.
+
+- Observation: The first full-suite run exposed a test-only completion race in the new reaping test.
+  Evidence: the channel signaled immediately before the worker returned, so `JoinHandle::is_finished` could still be false. The test now yields until the handle reports completion, then reaps it; the complete rerun passes without sleeps.
 
 ## Decision Log
 
@@ -58,12 +64,28 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
   Date/Author: 2026-07-10 / Codex
 
 - Decision: Use request-time clones of `WorkspaceAnalyzer` and `Arc<OverlayProject>` in workers.
-  Rationale: These types are sendable and cloneable, avoid borrowing mutable `ServerState`, and preserve the same request-start snapshot semantics as the old synchronous dispatch while later editor notifications continue on the main loop.
+  Rationale: `OverlayProject::snapshot` copies the current overlay map, every analyzer delegate is rebound to that immutable project view, and the multi-analyzer's immutable definition index is shared through `Arc`. Snapshot capture therefore preserves one coherent request generation without workspace-sized work on the message loop.
+  Date/Author: 2026-07-10 / Codex
+
+- Decision: Reserve active JSON-RPC ids in one registry shared by reference and formatter workers.
+  Rationale: Separate registries could otherwise accept a formatting request and references request with the same id, emit two responses, and both react to one cancellation. An RAII reservation now covers normal completion, early returns, and worker-spawn failure.
+  Date/Author: 2026-07-10 / Codex
+
+- Decision: Allocate fresh C++ project-sensitive import/reference caches for request snapshots and analyzer updates.
+  Rationale: Sharing these lazy caches would allow an old snapshot request to populate values later consumed by a live post-edit analyzer. Immutable or source-validated caches remain shareable, while the project-sensitive caches are isolated and behavior-tested.
   Date/Author: 2026-07-10 / Codex
 
 ## Outcomes & Retrospective
 
-Implementation has not started. On completion, summarize the supported behavior, validation results, remaining issue #578 handlers, and any review-driven design changes here.
+The references-first milestone is complete. `textDocument/references` now runs in a bounded two-worker registry, remains cancelable while the main loop processes messages, returns `-32800` after client cancellation, and emits begin/report/end work-done progress only when the request supplies a token. A third heavy request receives `-32802`. Shutdown cancels and joins reference workers before preserving the formatter cleanup path.
+
+Cancellation reaches default candidate discovery, graph preprocessing, and per-file structured scans for every language resolver used by references. Analyzer results produced after early cooperative abort are discarded by the LSP handler, so cancellation does not appear as a usage-analysis failure. Public Rust usage APIs and provider shapes remain unchanged.
+
+Review strengthened the implementation in four places: true immutable overlay/analyzer snapshots, cheap sharing of the immutable multi-language definition index, global async request-id reservation, and isolation of C++ project-sensitive caches. It also consolidated formatter cancellation on the shared token and unified ordinary/cancellable candidate fallback policy.
+
+Validation passed: `cargo fmt --check`; `cargo test --lib lsp::server::tests`; pre-cancelled finder/Python/Rust/mapping and snapshot/cache tests; `cargo test --test usages_finder_fallback_test`; all six filtered references integration tests; the exact formatter-cancellation integration test; `cargo clippy-no-cuda`; and the complete `cargo test` suite including doctests.
+
+Deferred issue #578 scope remains unchanged: workspace symbols, diagnostics, type/call hierarchy, semantic tokens, generic partial-result transport, and verified append-only reference streaming.
 
 ## Context and Orientation
 

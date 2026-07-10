@@ -345,6 +345,14 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        match self {
+            Self::Empty(_) => Self::Empty(EmptyAnalyzer::new(project)),
+            Self::Single(delegate) => Self::Single(Box::new(delegate.clone_with_project(project))),
+            Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_with_project(project))),
+        }
+    }
+
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
@@ -359,5 +367,37 @@ impl WorkspaceAnalyzer {
             Self::Single(delegate) => Self::Single(Box::new(delegate.update_all())),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update_all())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{FilesystemProject, OverlayProject};
+
+    #[test]
+    fn clone_with_project_rebinds_analyzer_reads_to_overlay_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("Main.java");
+        std::fs::write(&path, "class Main {}\n").unwrap();
+        let file = ProjectFile::new(root.clone(), "Main.java");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = Arc::new(OverlayProject::new(delegate));
+        assert!(overlay.set(path.clone(), "class First {}\n".to_string()));
+        let workspace = WorkspaceAnalyzer::build(overlay.clone(), AnalyzerConfig::default());
+
+        let snapshot = Arc::new(overlay.snapshot());
+        let request_workspace = workspace.clone_with_project(snapshot.clone() as Arc<dyn Project>);
+        assert!(overlay.set(path, "class Second {}\n".to_string()));
+
+        assert_eq!(
+            request_workspace
+                .analyzer()
+                .project()
+                .read_source(&file)
+                .unwrap(),
+            "class First {}\n"
+        );
     }
 }

@@ -48,7 +48,12 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         if scan_scope.allows(target.source()) {
             files.insert(target.source().clone());
         }
-        let visibility = VisibilityIndex::build(self.cpp, analyzer, &files);
+        let visibility = VisibilityIndex::build_with_cancellation(
+            self.cpp,
+            analyzer,
+            &files,
+            scan_scope.cancellation(),
+        );
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();

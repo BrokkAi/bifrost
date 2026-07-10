@@ -22,11 +22,18 @@ impl RequestContext {
     pub(crate) fn new(
         cancellation: CancellationToken,
         work_done_token: Option<ProgressToken>,
+        title: impl Into<String>,
+        initial_message: impl Into<String>,
         send_message: Arc<dyn Fn(Message) -> Result<(), String> + Send + Sync>,
     ) -> Self {
         Self {
             cancellation,
-            progress: RequestProgress::new(work_done_token, send_message),
+            progress: RequestProgress::new(
+                work_done_token,
+                title.into(),
+                initial_message.into(),
+                send_message,
+            ),
         }
     }
 
@@ -57,6 +64,8 @@ impl RequestContext {
 
 struct RequestProgress {
     token: Option<ProgressToken>,
+    title: String,
+    initial_message: String,
     send_message: Arc<dyn Fn(Message) -> Result<(), String> + Send + Sync>,
     started: AtomicBool,
     ended: AtomicBool,
@@ -65,10 +74,14 @@ struct RequestProgress {
 impl RequestProgress {
     fn new(
         token: Option<ProgressToken>,
+        title: String,
+        initial_message: String,
         send_message: Arc<dyn Fn(Message) -> Result<(), String> + Send + Sync>,
     ) -> Self {
         Self {
             token,
+            title,
+            initial_message,
             send_message,
             started: AtomicBool::new(false),
             ended: AtomicBool::new(false),
@@ -80,9 +93,9 @@ impl RequestProgress {
             return;
         }
         self.send(WorkDoneProgress::Begin(WorkDoneProgressBegin {
-            title: "Finding references".to_string(),
+            title: self.title.clone(),
             cancellable: Some(true),
-            message: Some("Resolving symbol".to_string()),
+            message: Some(self.initial_message.clone()),
             percentage: None,
         }));
     }
@@ -137,6 +150,8 @@ mod tests {
         let context = RequestContext::new(
             CancellationToken::default(),
             None,
+            "Finding references",
+            "Resolving symbol",
             Arc::new(move |message| {
                 sink.lock().unwrap().push(message);
                 Ok(())
@@ -157,6 +172,8 @@ mod tests {
         let context = RequestContext::new(
             CancellationToken::default(),
             Some(ProgressToken::String("reference-progress".to_string())),
+            "Finding references",
+            "Resolving symbol",
             Arc::new(move |message| {
                 sink.lock().unwrap().push(message);
                 Ok(())

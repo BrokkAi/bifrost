@@ -11,6 +11,7 @@ use crate::hash::HashSet;
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Resolve a concrete analyzer of type `T` out of a `&dyn IAnalyzer`, whether it is
 /// that analyzer directly or a [`MultiAnalyzer`] holding it as a per-language delegate.
@@ -54,6 +55,22 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => analyzer,
             Self::Scala(analyzer) => analyzer,
             Self::Ruby(analyzer) => analyzer,
+        }
+    }
+
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        match self {
+            Self::Java(analyzer) => Self::Java(analyzer.clone_with_project(project)),
+            Self::CSharp(analyzer) => Self::CSharp(analyzer.clone_with_project(project)),
+            Self::Cpp(analyzer) => Self::Cpp(analyzer.clone_with_project(project)),
+            Self::Go(analyzer) => Self::Go(analyzer.clone_with_project(project)),
+            Self::JavaScript(analyzer) => Self::JavaScript(analyzer.clone_with_project(project)),
+            Self::Php(analyzer) => Self::Php(analyzer.clone_with_project(project)),
+            Self::Python(analyzer) => Self::Python(analyzer.clone_with_project(project)),
+            Self::TypeScript(analyzer) => Self::TypeScript(analyzer.clone_with_project(project)),
+            Self::Rust(analyzer) => Self::Rust(analyzer.clone_with_project(project)),
+            Self::Scala(analyzer) => Self::Scala(analyzer.clone_with_project(project)),
+            Self::Ruby(analyzer) => Self::Ruby(analyzer.clone_with_project(project)),
         }
     }
 
@@ -174,18 +191,18 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
 #[derive(Clone, Default)]
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
-    definition_lookup_index: DefinitionLookupIndex,
+    definition_lookup_index: Arc<DefinitionLookupIndex>,
 }
 
 impl MultiAnalyzer {
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
-        let definition_lookup_index = DefinitionLookupIndex::from_declarations(
+        let definition_lookup_index = Arc::new(DefinitionLookupIndex::from_declarations(
             delegates
                 .values()
                 .flat_map(|delegate| delegate.analyzer().all_declarations()),
             str::to_string,
             |unit| unit.identifier().to_string(),
-        );
+        ));
         Self {
             delegates,
             definition_lookup_index,
@@ -201,6 +218,19 @@ impl MultiAnalyzer {
 
     pub fn delegates(&self) -> &BTreeMap<Language, AnalyzerDelegate> {
         &self.delegates
+    }
+
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        Self {
+            delegates: self
+                .delegates
+                .iter()
+                .map(|(language, delegate)| {
+                    (*language, delegate.clone_with_project(Arc::clone(&project)))
+                })
+                .collect(),
+            definition_lookup_index: Arc::clone(&self.definition_lookup_index),
+        }
     }
 
     fn delegate_for_file(&self, file: &ProjectFile) -> Option<&AnalyzerDelegate> {
@@ -396,7 +426,7 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
-        &self.definition_lookup_index
+        self.definition_lookup_index.as_ref()
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {

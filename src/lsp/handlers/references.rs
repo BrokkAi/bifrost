@@ -42,18 +42,12 @@ pub fn handle(
     );
     context.check_cancelled()?;
     context.report("Preparing locations");
-    let mut locations = Vec::new();
-    for hit in hits {
-        context.check_cancelled()?;
-        if let Some(location) = usage_hit_to_location(&hit, &mut content_cache) {
-            locations.push(location);
-        }
-    }
+    let mut locations = usage_hits_to_locations(project, hits, &mut content_cache, context)?;
 
     if params.context.include_declaration {
         for cu in &target.candidates {
             context.check_cancelled()?;
-            let entry = content_cache.read_disk(&cu.source().abs_path());
+            let entry = content_cache.read_project(project, cu.source());
             locations.extend(entry.and_then(|entry| {
                 code_unit_location_from_content(
                     analyzer,
@@ -80,9 +74,29 @@ pub fn handle(
     Ok(Some(locations))
 }
 
-fn usage_hit_to_location(hit: &UsageHit, cache: &mut FileContentCache) -> Option<Location> {
+fn usage_hits_to_locations(
+    project: &dyn Project,
+    hits: impl IntoIterator<Item = UsageHit>,
+    cache: &mut FileContentCache,
+    context: &RequestContext,
+) -> Result<Vec<Location>, RequestCancelled> {
+    let mut locations = Vec::new();
+    for hit in hits {
+        context.check_cancelled()?;
+        if let Some(location) = usage_hit_to_location(project, &hit, cache) {
+            locations.push(location);
+        }
+    }
+    Ok(locations)
+}
+
+fn usage_hit_to_location(
+    project: &dyn Project,
+    hit: &UsageHit,
+    cache: &mut FileContentCache,
+) -> Option<Location> {
     let abs_path = hit.file.abs_path();
-    let entry = cache.read_disk(&abs_path)?;
+    let entry = cache.read_project(project, &hit.file)?;
     let range = ByteRange {
         start_byte: hit.start_offset,
         end_byte: hit.end_offset,
@@ -95,4 +109,36 @@ fn usage_hit_to_location(hit: &UsageHit, cache: &mut FileContentCache) -> Option
         uri,
         range: lsp_range,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{CodeUnit, CodeUnitType, FileSetProject, ProjectFile};
+    use crate::cancellation::CancellationToken;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn pre_cancelled_mapping_discards_analyzer_hits() {
+        let root = std::env::temp_dir();
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Target.java"));
+        let enclosing = CodeUnit::new(file.clone(), CodeUnitType::Function, "pkg", "Target.call");
+        let hit = UsageHit::new(file, 0, 0, 6, enclosing, 1.0, "Target");
+        let project = FileSetProject::new(root, [PathBuf::from("Target.java")]);
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let context = RequestContext::new(
+            cancellation,
+            None,
+            "Finding references",
+            "Resolving symbol",
+            Arc::new(|_| Ok(())),
+        );
+
+        let result =
+            usage_hits_to_locations(&project, [hit], &mut FileContentCache::default(), &context);
+
+        assert_eq!(result, Err(RequestCancelled));
+    }
 }

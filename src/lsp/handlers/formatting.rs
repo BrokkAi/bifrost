@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, Project, ProjectFile, Range as ByteRange};
+use crate::cancellation::CancellationToken;
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::read_document_for_uri;
 
@@ -77,7 +78,7 @@ pub(crate) struct PreparedFormatting {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FormatterCancellation {
-    cancelled: Arc<AtomicBool>,
+    cancellation: CancellationToken,
     pid: Arc<AtomicU32>,
 }
 
@@ -87,7 +88,7 @@ impl FormatterCancellation {
     }
 
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancellation.cancel();
         let pid = self.pid.load(Ordering::Acquire);
         if pid != 0 {
             terminate_process_id(pid);
@@ -95,7 +96,7 @@ impl FormatterCancellation {
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.cancellation.is_cancelled()
     }
 
     fn set_pid(&self, pid: u32) {

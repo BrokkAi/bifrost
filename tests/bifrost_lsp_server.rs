@@ -4233,9 +4233,19 @@ fn bifrost_lsp_server_references_cancel_stops_active_search() {
         "params": {
             "textDocument": {"uri": uri_for(&target_path)},
             "position": {"line": 0, "character": 13},
-            "context": {"includeDeclaration": false}
+            "context": {"includeDeclaration": false},
+            "workDoneToken": "cancel-progress"
         }
     }));
+
+    loop {
+        let progress = server.read_message();
+        assert_eq!(progress["method"], "$/progress", "{progress}");
+        assert_eq!(progress["params"]["token"], "cancel-progress");
+        if progress["params"]["value"]["message"] == "Searching workspace" {
+            break;
+        }
+    }
     server.notify_value(json!({
         "jsonrpc": "2.0",
         "method": "$/cancelRequest",

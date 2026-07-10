@@ -366,6 +366,57 @@ fn sorted_files(files: &HashSet<ProjectFile>) -> Vec<ProjectFile> {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{CodeUnitType, EmptyAnalyzer, FileSetProject, Project, ProjectFile};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct PanicCandidateProvider;
+
+    impl CandidateFileProvider for PanicCandidateProvider {
+        fn find_candidates(
+            &self,
+            _target: &CodeUnit,
+            _analyzer: &dyn IAnalyzer,
+        ) -> HashSet<ProjectFile> {
+            panic!("pre-cancelled query must not discover candidates");
+        }
+    }
+
+    #[test]
+    fn pre_cancelled_query_skips_candidate_discovery() {
+        let root = std::env::temp_dir();
+        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
+            root.clone(),
+            std::iter::empty::<PathBuf>(),
+        ));
+        let analyzer = EmptyAnalyzer::new(project);
+        let target = CodeUnit::new(
+            ProjectFile::new(root, PathBuf::from("Target.java")),
+            CodeUnitType::Class,
+            "pkg",
+            "Target",
+        );
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let result = UsageFinder::new()
+            .with_cancellation(cancellation)
+            .query_with_provider(
+                &analyzer,
+                &[target],
+                Some(&PanicCandidateProvider),
+                DEFAULT_MAX_FILES,
+                DEFAULT_MAX_USAGES,
+            );
+
+        assert!(result.candidate_files.is_empty());
+        assert!(result.result.all_hits_including_imports().is_empty());
+    }
+}
+
 macro_rules! impl_graph_usage_analyzer {
     ($strategy:ty) => {
         impl GraphUsageAnalyzer for $strategy {

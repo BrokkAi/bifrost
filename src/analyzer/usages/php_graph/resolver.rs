@@ -3,6 +3,7 @@ use crate::analyzer::{
     CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, Range, TypeHierarchyProvider,
     resolve_php_type,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use crate::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
@@ -81,6 +82,7 @@ impl PhpHierarchyIndex {
         php: &PhpAnalyzer,
         spec: &TargetSpec,
         files: &HashSet<ProjectFile>,
+        cancellation: Option<&CancellationToken>,
     ) -> Self {
         let Some(owner) = spec.owner.as_ref() else {
             return Self::default();
@@ -88,6 +90,7 @@ impl PhpHierarchyIndex {
         let owner_fq_name = owner.fq_name();
         let descendant_fq_names = files
             .iter()
+            .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
             .flat_map(|file| php.declarations(file))
             .filter(|unit| unit.is_class())
             .filter(|unit| unit.fq_name() != owner_fq_name)
@@ -111,6 +114,7 @@ impl PhpHierarchyIndex {
         php: &PhpAnalyzer,
         spec: &TargetSpec,
         files: &HashSet<ProjectFile>,
+        cancellation: Option<&CancellationToken>,
     ) -> Vec<CodeUnit> {
         if !self.owner_is_interface || !matches!(spec.kind, TargetKind::Method) {
             return Vec::new();
@@ -118,6 +122,7 @@ impl PhpHierarchyIndex {
 
         files
             .iter()
+            .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
             .flat_map(|file| php.declarations(file))
             .filter(|unit| unit.is_class())
             .filter(|unit| self.descendant_fq_names.contains(&unit.fq_name()))

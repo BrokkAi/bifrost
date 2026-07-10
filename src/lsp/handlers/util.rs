@@ -48,10 +48,6 @@ impl FileContentCache {
         self.read_with(file.abs_path(), || project.read_source(file).ok())
     }
 
-    pub(super) fn read_disk<'a>(&'a mut self, path: &Path) -> Option<&'a FileContent> {
-        self.read_with(path.to_path_buf(), || std::fs::read_to_string(path).ok())
-    }
-
     pub(super) fn read_disk_or_empty<'a>(&'a mut self, path: &Path) -> &'a FileContent {
         let key = path.to_path_buf();
         if !self.files.contains_key(&key) {

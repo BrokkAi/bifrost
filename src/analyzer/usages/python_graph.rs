@@ -63,7 +63,15 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
         let py = self.py;
         let candidate_files = scan_scope.candidate_files();
 
-        let graph = build_python_graph(py, candidate_files, target.source());
+        let graph = build_python_graph(
+            py,
+            candidate_files,
+            target.source(),
+            scan_scope.cancellation(),
+        );
+        if scan_scope.is_cancelled() {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        }
         let seed_names = infer_export_names(py, target);
         if seed_names.is_empty() {
             return GraphUsageOutcome::fallback_safe(

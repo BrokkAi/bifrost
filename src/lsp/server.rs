@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::panic;
 use std::path::{Component, Path, PathBuf};
@@ -886,11 +886,35 @@ fn handle_references_request(
             .send(Message::Response(response))
             .map_err(|err| format!("Failed to send LSP response: {err}"));
     };
+    let Some(active_request) = state.active_request_ids.try_reserve(id.clone()) else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
 
     let cancellation = CancellationToken::default();
+    if !state.request_jobs.reserve(id.clone(), cancellation.clone()) {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    }
     let worker_cancellation = cancellation.clone();
-    let workspace = state.workspace.clone();
-    let project = Arc::clone(&state.overlay);
+    let project = Arc::new(state.overlay.snapshot());
+    let workspace = state
+        .workspace
+        .clone_with_project(Arc::clone(&project) as Arc<dyn Project>);
     let sender = connection.sender.clone();
     let progress_sender = sender.clone();
     let work_done_token = params.work_done_progress_params.work_done_token.clone();
@@ -899,6 +923,8 @@ fn handle_references_request(
     let context = RequestContext::new(
         worker_cancellation.clone(),
         work_done_token,
+        "Finding references",
+        "Resolving symbol",
         Arc::new(move |message| {
             progress_sender
                 .send(message)
@@ -954,10 +980,12 @@ fn handle_references_request(
                     worker_method, worker_id
                 );
             }
+            drop(active_request);
             drop(slot);
         }) {
         Ok(handle) => handle,
         Err(err) => {
+            state.request_jobs.remove(&id);
             let response = Response::new_err(
                 id,
                 ErrorCode::InternalError as i32,
@@ -969,7 +997,7 @@ fn handle_references_request(
                 .map_err(|send_err| format!("Failed to send LSP response: {send_err}"));
         }
     };
-    state.request_jobs.insert(id, cancellation, handle);
+    state.request_jobs.start(&id, handle);
     Ok(())
 }
 
@@ -1010,6 +1038,17 @@ fn handle_formatting_request(
             id,
             ErrorCode::InternalError as i32,
             "too many concurrent formatting requests".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+    let Some(active_request) = state.active_request_ids.try_reserve(id.clone()) else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
         );
         return connection
             .sender
@@ -1087,6 +1126,7 @@ fn handle_formatting_request(
             );
         }
         jobs.remove(&id);
+        drop(active_request);
         drop(slot);
     });
     Ok(())
@@ -1465,6 +1505,7 @@ pub(crate) struct ServerState {
     document_generations: Arc<Mutex<HashMap<String, u64>>>,
     request_jobs: RequestJobs,
     formatting_jobs: FormattingJobs,
+    active_request_ids: ActiveRequestIds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1544,6 +1585,39 @@ struct RequestSlot {
     active: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Default)]
+struct ActiveRequestIds {
+    ids: Arc<Mutex<HashSet<RequestId>>>,
+}
+
+impl ActiveRequestIds {
+    fn try_reserve(&self, id: RequestId) -> Option<ActiveRequestReservation> {
+        let mut ids = self.ids.lock().expect("active request id lock poisoned");
+        ids.insert(id.clone()).then(|| ActiveRequestReservation {
+            registry: self.clone(),
+            id,
+        })
+    }
+
+    fn release(&self, id: &RequestId) {
+        self.ids
+            .lock()
+            .expect("active request id lock poisoned")
+            .remove(id);
+    }
+}
+
+struct ActiveRequestReservation {
+    registry: ActiveRequestIds,
+    id: RequestId,
+}
+
+impl Drop for ActiveRequestReservation {
+    fn drop(&mut self) {
+        self.registry.release(&self.id);
+    }
+}
+
 impl Drop for RequestSlot {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
@@ -1552,7 +1626,7 @@ impl Drop for RequestSlot {
 
 struct RequestJob {
     cancellation: CancellationToken,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -1573,20 +1647,33 @@ impl RequestJobs {
             })
     }
 
-    fn insert(&self, id: RequestId, cancellation: CancellationToken, handle: JoinHandle<()>) {
-        let previous = self.jobs.lock().expect("request job lock poisoned").insert(
-            id,
-            RequestJob {
-                cancellation,
-                handle,
-            },
-        );
-        if let Some(previous) = previous {
-            previous.cancellation.cancel();
-            if previous.handle.join().is_err() {
-                eprintln!("[bifrost-lsp] replaced request worker panicked");
+    fn reserve(&self, id: RequestId, cancellation: CancellationToken) -> bool {
+        use std::collections::hash_map::Entry;
+
+        let mut jobs = self.jobs.lock().expect("request job lock poisoned");
+        match jobs.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(RequestJob {
+                    cancellation,
+                    handle: None,
+                });
+                true
             }
+            Entry::Occupied(_) => false,
         }
+    }
+
+    fn start(&self, id: &RequestId, handle: JoinHandle<()>) {
+        let mut jobs = self.jobs.lock().expect("request job lock poisoned");
+        let job = jobs.get_mut(id).expect("request job must be reserved");
+        assert!(job.handle.replace(handle).is_none());
+    }
+
+    fn remove(&self, id: &RequestId) {
+        self.jobs
+            .lock()
+            .expect("request job lock poisoned")
+            .remove(id);
     }
 
     fn cancel(&self, id: &RequestId) {
@@ -1606,7 +1693,7 @@ impl RequestJobs {
             let mut jobs = self.jobs.lock().expect("request job lock poisoned");
             let ids: Vec<_> = jobs
                 .iter()
-                .filter(|(_, job)| job.handle.is_finished())
+                .filter(|(_, job)| job.handle.as_ref().is_some_and(JoinHandle::is_finished))
                 .map(|(id, _)| id.clone())
                 .collect();
             ids.into_iter()
@@ -1614,7 +1701,7 @@ impl RequestJobs {
                 .collect::<Vec<_>>()
         };
         for job in finished {
-            if job.handle.join().is_err() {
+            if job.handle.is_some_and(|handle| handle.join().is_err()) {
                 eprintln!("[bifrost-lsp] request worker panicked");
             }
         }
@@ -1632,7 +1719,7 @@ impl RequestJobs {
             job.cancellation.cancel();
         }
         for job in jobs {
-            if job.handle.join().is_err() {
+            if job.handle.is_some_and(|handle| handle.join().is_err()) {
                 eprintln!("[bifrost-lsp] request worker panicked during shutdown");
             }
         }
@@ -1754,6 +1841,7 @@ impl ServerState {
             document_generations: Arc::new(Mutex::new(HashMap::new())),
             request_jobs: RequestJobs::default(),
             formatting_jobs: FormattingJobs::default(),
+            active_request_ids: ActiveRequestIds::default(),
         })
     }
 
@@ -2758,7 +2846,8 @@ mod tests {
             drop(slot);
         });
         let id = RequestId::from(1);
-        jobs.insert(id.clone(), token, handle);
+        assert!(jobs.reserve(id.clone(), token));
+        jobs.start(&id, handle);
 
         ready_rx.recv().unwrap();
         jobs.cancel(&id);
@@ -2784,8 +2873,19 @@ mod tests {
             done_tx.send(()).unwrap();
         });
         let id = RequestId::from(2);
-        jobs.insert(id.clone(), CancellationToken::default(), handle);
+        assert!(jobs.reserve(id.clone(), CancellationToken::default()));
+        jobs.start(&id, handle);
         done_rx.recv().unwrap();
+        while !jobs
+            .jobs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|job| job.handle.as_ref())
+            .is_some_and(JoinHandle::is_finished)
+        {
+            thread::yield_now();
+        }
         jobs.reap_finished();
         jobs.cancel(&id);
 
@@ -2809,7 +2909,9 @@ mod tests {
                 }
                 drop(slot);
             });
-            jobs.insert(RequestId::from(id as i32), token, handle);
+            let id = RequestId::from(id as i32);
+            assert!(jobs.reserve(id.clone(), token));
+            jobs.start(&id, handle);
         }
 
         barrier.wait();
@@ -2817,5 +2919,31 @@ mod tests {
 
         assert!(jobs.jobs.lock().unwrap().is_empty());
         assert_eq!(jobs.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn request_jobs_reject_duplicate_active_ids_without_replacement() {
+        let jobs = RequestJobs::default();
+        let id = RequestId::from(7);
+        let original = CancellationToken::default();
+
+        assert!(jobs.reserve(id.clone(), original.clone()));
+        assert!(!jobs.reserve(id.clone(), CancellationToken::default()));
+        jobs.cancel(&id);
+
+        assert!(original.is_cancelled());
+        jobs.remove(&id);
+    }
+
+    #[test]
+    fn active_request_ids_are_reserved_across_async_job_kinds() {
+        let ids = ActiveRequestIds::default();
+        let id = RequestId::from(8);
+
+        let reference_reservation = ids.try_reserve(id.clone()).unwrap();
+        assert!(ids.try_reserve(id.clone()).is_none());
+        drop(reference_reservation);
+
+        assert!(ids.try_reserve(id).is_some());
     }
 }

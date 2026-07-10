@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Cancellation is advisory: callers set the shared flag and long-running
 /// loops stop at explicit checkpoints. The token does not forcibly terminate
 /// threads or encode a domain-specific error.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct CancellationToken {
     cancelled: Arc<AtomicBool>,
 }

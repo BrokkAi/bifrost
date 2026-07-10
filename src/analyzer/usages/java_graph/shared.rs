@@ -71,7 +71,13 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             }
         }
         if !scan_scope.is_cancelled() {
-            scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state);
+            scan_scala_files_for_java_type(
+                analyzer,
+                candidate_files,
+                &spec,
+                &mut state,
+                scan_scope.cancellation(),
+            );
         }
 
         if limit_exceeded || hits.len() > max_usages {

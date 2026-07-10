@@ -9,6 +9,7 @@ use crate::analyzer::{
     ProjectFile, cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
     resolve_include_targets_with_index,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::hash::Hash;
@@ -184,17 +185,33 @@ impl VisibilityIndex {
         analyzer: &dyn IAnalyzer,
         roots: &HashSet<ProjectFile>,
     ) -> Self {
+        Self::build_with_cancellation(cpp, analyzer, roots, None)
+    }
+
+    pub(in crate::analyzer::usages) fn build_with_cancellation(
+        cpp: &CppAnalyzer,
+        analyzer: &dyn IAnalyzer,
+        roots: &HashSet<ProjectFile>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Self {
         let mut files = HashSet::default();
         let include_targets = cpp.include_target_index();
         for file in roots {
-            collect_include_closure(analyzer, include_targets, file, &mut files);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+            collect_include_closure(analyzer, include_targets, file, &mut files, cancellation);
         }
         let declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = files
             .iter()
+            .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
             .map(|file| (file.clone(), analyzer.declarations(file)))
             .collect();
         let mut visible_by_file = HashMap::default();
         for file in roots {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
             let mut visited = HashSet::default();
             let mut visible = HashSet::default();
             collect_visible_declarations(
@@ -204,6 +221,7 @@ impl VisibilityIndex {
                 file,
                 &mut visited,
                 &mut visible,
+                cancellation,
             );
             visible_by_file.insert(file.clone(), visible);
         }
@@ -910,9 +928,13 @@ pub(super) fn collect_include_closure(
     include_targets: &IncludeTargetIndex,
     file: &ProjectFile,
     out: &mut HashSet<ProjectFile>,
+    cancellation: Option<&CancellationToken>,
 ) {
     let mut stack = vec![file.clone()];
     while let Some(file) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
         if !out.insert(file.clone()) {
             continue;
         }
@@ -932,9 +954,13 @@ pub(super) fn collect_visible_declarations(
     file: &ProjectFile,
     visited: &mut HashSet<ProjectFile>,
     out: &mut HashSet<CodeUnit>,
+    cancellation: Option<&CancellationToken>,
 ) {
     let mut stack = vec![file.clone()];
     while let Some(file) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
         if !visited.insert(file.clone()) {
             continue;
         }

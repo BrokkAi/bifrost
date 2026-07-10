@@ -13,6 +13,7 @@ use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
     CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use regex::Regex;
@@ -762,6 +763,7 @@ pub(super) fn build_go_graph(
     candidate_files: &HashSet<ProjectFile>,
     target_file: &ProjectFile,
     cache: Option<&ParsedFileCache>,
+    cancellation: Option<&CancellationToken>,
 ) -> GoProjectGraph {
     let mut parsed: HashMap<ProjectFile, Arc<ParsedFile>> = HashMap::default();
     let mut files = Vec::new();
@@ -774,6 +776,9 @@ pub(super) fn build_go_graph(
         .collect();
 
     for file in scoped_files {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
         if language_for_file(&file) != Language::Go {
             continue;
         }
@@ -787,8 +792,16 @@ pub(super) fn build_go_graph(
                 None => continue,
             },
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
         files.push(file.clone());
         parsed.insert(file, parsed_file);
+    }
+
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        files.clear();
+        parsed.clear();
     }
 
     let dir_index = build_parent_dir_index(parsed.keys());
@@ -801,6 +814,9 @@ pub(super) fn build_go_graph(
     let mut exports_by_file = HashMap::default();
     let mut binders_by_file = HashMap::default();
     for file in &files {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
         exports_by_file.insert(file.clone(), export_index_of(analyzer, file));
         binders_by_file.insert(
             file.clone(),
@@ -839,7 +855,13 @@ pub(crate) fn build_workspace_go_graph(
         .iter()
         .find(|file| language_for_file(file) == Language::Go)?;
     let all_files: HashSet<ProjectFile> = files.iter().cloned().collect();
-    Some(build_go_graph(analyzer, &all_files, target_file, cache))
+    Some(build_go_graph(
+        analyzer,
+        &all_files,
+        target_file,
+        cache,
+        None,
+    ))
 }
 
 fn export_index_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ExportIndex {

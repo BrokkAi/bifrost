@@ -550,6 +550,14 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
     }
 }
 
+impl<A> TreeSitterAnalyzer<A> {
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.project = project;
+        snapshot
+    }
+}
+
 impl<A> TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter + StorageLanguageAdapter,

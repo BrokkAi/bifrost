@@ -246,3 +246,43 @@ fn extract_braced_body(source: &str, open_brace_index: usize) -> Option<(&str, u
     }
     None
 }
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::analyzer::FileSetProject;
+    use std::path::PathBuf;
+
+    #[test]
+    fn project_sensitive_caches_are_isolated_across_snapshots_and_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
+            root.clone(),
+            std::iter::empty::<PathBuf>(),
+        ));
+        let analyzer = CppAnalyzer::new(Arc::clone(&project));
+        let snapshot = analyzer.clone_with_project(Arc::clone(&project));
+        let updated = analyzer.with_updated_inner(analyzer.inner.clone());
+        let file = ProjectFile::new(root, "sample.cpp");
+
+        snapshot
+            .imported_code_units
+            .insert(file.clone(), Arc::new(HashSet::default()));
+        snapshot
+            .referencing_files
+            .insert(file.clone(), Arc::new(HashSet::default()));
+        assert!(analyzer.imported_code_units.get(&file).is_none());
+        assert!(analyzer.referencing_files.get(&file).is_none());
+
+        analyzer
+            .imported_code_units
+            .insert(file.clone(), Arc::new(HashSet::default()));
+        analyzer
+            .referencing_files
+            .insert(file.clone(), Arc::new(HashSet::default()));
+
+        assert!(updated.imported_code_units.get(&file).is_none());
+        assert!(updated.referencing_files.get(&file).is_none());
+    }
+}

@@ -223,6 +223,12 @@ impl JavascriptAnalyzer {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.inner = self.inner.clone_with_project(project);
+        snapshot
+    }
+
     /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
     /// language. Built once and reused until `update`/`update_all` rebuilds the cache bucket.
     pub(crate) fn jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {

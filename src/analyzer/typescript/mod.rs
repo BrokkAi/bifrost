@@ -239,6 +239,12 @@ impl TypescriptAnalyzer {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.inner = self.inner.clone_with_project(project);
+        snapshot
+    }
+
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));

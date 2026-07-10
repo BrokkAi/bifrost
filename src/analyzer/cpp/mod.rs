@@ -52,6 +52,10 @@ impl CppAnalyzer {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
+    }
+
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config(project, CppAdapter, config);
@@ -119,8 +123,11 @@ impl CppAnalyzer {
         Self {
             inner,
             memo_budget: self.memo_budget,
-            imported_code_units: self.imported_code_units.clone(),
-            referencing_files: self.referencing_files.clone(),
+            imported_code_units: build_weighted_cache(
+                self.memo_budget / 4,
+                weight_code_unit_set_by_file,
+            ),
+            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_unit,

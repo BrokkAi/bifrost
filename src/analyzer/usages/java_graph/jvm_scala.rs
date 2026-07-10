@@ -10,6 +10,7 @@ use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, Range, ScalaAnalyzer,
     resolve_analyzer,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset, snippet_around_line};
 use std::collections::BTreeSet;
@@ -20,6 +21,7 @@ pub(super) fn scan_scala_files_for_java_type(
     candidate_files: &HashSet<ProjectFile>,
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
+    cancellation: Option<&CancellationToken>,
 ) {
     if *state.limit_exceeded || spec.kind != TargetKind::Type {
         return;
@@ -32,8 +34,11 @@ pub(super) fn scan_scala_files_for_java_type(
         .iter()
         .filter(|file| language_for_file(file) == Language::Scala)
     {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
         scan_scala_file(analyzer, scala, file, spec, state);
-        if *state.limit_exceeded {
+        if *state.limit_exceeded || cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
     }

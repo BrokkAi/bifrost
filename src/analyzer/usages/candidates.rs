@@ -283,15 +283,34 @@ where
     T: CandidateFileProvider,
 {
     fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile> {
-        let mut candidates = self.graph.find_candidates(target, analyzer);
-        if candidates.is_empty() && !analyzer.is_empty() {
-            return self.text.find_candidates(target, analyzer);
-        }
-        if should_union_text_candidates(target) {
-            candidates.extend(self.text.find_candidates(target, analyzer));
-        }
-        candidates
+        apply_fallback_policy(
+            target,
+            analyzer,
+            || self.graph.find_candidates(target, analyzer),
+            || self.text.find_candidates(target, analyzer),
+            || false,
+        )
     }
+}
+
+fn apply_fallback_policy(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    mut find_graph: impl FnMut() -> HashSet<ProjectFile>,
+    mut find_text: impl FnMut() -> HashSet<ProjectFile>,
+    is_cancelled: impl Fn() -> bool,
+) -> HashSet<ProjectFile> {
+    let mut candidates = find_graph();
+    if is_cancelled() {
+        return candidates;
+    }
+    if candidates.is_empty() && !analyzer.is_empty() {
+        return find_text();
+    }
+    if should_union_text_candidates(target) {
+        candidates.extend(find_text());
+    }
+    candidates
 }
 
 fn should_union_text_candidates(target: &CodeUnit) -> bool {
@@ -315,17 +334,13 @@ pub(crate) fn find_default_candidates_with_cancellation(
     analyzer: &dyn IAnalyzer,
     cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
-    let mut candidates = find_import_graph_candidates(target, analyzer, Some(cancellation));
-    if cancellation.is_cancelled() {
-        return candidates;
-    }
-    if candidates.is_empty() && !analyzer.is_empty() {
-        return find_text_candidates(target, analyzer, Some(cancellation));
-    }
-    if should_union_text_candidates(target) {
-        candidates.extend(find_text_candidates(target, analyzer, Some(cancellation)));
-    }
-    candidates
+    apply_fallback_policy(
+        target,
+        analyzer,
+        || find_import_graph_candidates(target, analyzer, Some(cancellation)),
+        || find_text_candidates(target, analyzer, Some(cancellation)),
+        || cancellation.is_cancelled(),
+    )
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
