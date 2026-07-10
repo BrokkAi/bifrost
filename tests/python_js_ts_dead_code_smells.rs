@@ -430,6 +430,80 @@ def scalar_noise():
 }
 
 #[test]
+fn python_dead_code_smell_analyzes_only_overload_implementation() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"from typing import overload as ov
+
+class Command:
+    @ov
+    def main(self, value: str) -> str: ...
+
+    @ov
+    def main(self, value: int) -> int: ...
+
+    def main(self, value):
+        return value
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"from service import Command
+
+class Runner:
+    def invoke(self, command: Command):
+        return command.main("value")
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let main = python_definition(&analyzer, "service.Command.main");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.py".to_string(), "consumer.py".to_string()],
+            fq_names: vec![main.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result.report.contains("Candidate symbols analyzed: 1"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("Findings shown: 1 of 1"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("service.py:11-12"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result
+            .report
+            .contains("one workspace inbound edge from consumer.Runner.invoke"),
+        "{}",
+        result.report
+    );
+    assert_eq!(
+        1,
+        result
+            .report
+            .lines()
+            .filter(|line| line.contains("| `service.Command.main` |"))
+            .count(),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn js_dead_code_smell_reports_unused_export() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

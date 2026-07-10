@@ -503,7 +503,7 @@ fn dead_code_candidates(
                 if !selected_files.is_empty() && !selected_files.contains(definition.source()) {
                     continue;
                 }
-                if !is_dead_code_candidate(&definition) {
+                if !is_dead_code_candidate(analyzer, &definition) {
                     continue;
                 }
                 if code_unit_language(&definition) == Language::CSharp
@@ -530,7 +530,7 @@ fn dead_code_candidates(
     } else {
         for file in files {
             for declaration in analyzer.declarations(file) {
-                if !is_dead_code_candidate(&declaration) {
+                if !is_dead_code_candidate(analyzer, &declaration) {
                     continue;
                 }
                 if code_unit_language(&declaration) == Language::CSharp
@@ -570,7 +570,7 @@ fn dead_code_candidates(
     }
 }
 
-fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
+fn is_dead_code_candidate(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> bool {
     if code_unit.is_anonymous() {
         return false;
     }
@@ -579,6 +579,13 @@ fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
         return false;
     }
     if language == Language::Go && go_implicit_entry_point(code_unit) {
+        return false;
+    }
+    if analyzer
+        .signature_metadata(code_unit)
+        .iter()
+        .any(crate::analyzer::SignatureMetadata::is_declaration_only)
+    {
         return false;
     }
     matches!(

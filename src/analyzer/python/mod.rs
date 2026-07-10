@@ -6,6 +6,7 @@ mod diagnostics;
 mod hierarchy;
 mod imports;
 mod structural;
+mod syntax;
 mod tests;
 mod usage_index;
 

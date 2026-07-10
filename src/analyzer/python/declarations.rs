@@ -1,4 +1,5 @@
 use super::imports::parse_python_import_infos;
+use super::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
 use super::*;
 use crate::analyzer::ParameterMetadata;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
@@ -35,6 +36,7 @@ pub(super) struct PythonVisitor<'a> {
     pub(super) package_name: &'a str,
     pub(super) parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
     pub(super) module: Option<CodeUnit>,
+    pub(super) overload_decorators: &'a PythonOverloadDecoratorBindings,
 }
 
 struct PythonContainer<'tree> {
@@ -292,7 +294,10 @@ impl<'a> PythonVisitor<'a> {
             let signature = python_function_signature(range_node, self.source);
             self.parsed.add_signature_with_metadata(
                 code_unit.clone(),
-                python_signature_metadata(signature, node, self.source),
+                python_signature_metadata(signature, node, self.source).with_declaration_only(
+                    self.overload_decorators
+                        .decorates_as_overload(node, self.source),
+                ),
             );
             if let Some(module) = &self.module
                 && scope.is_empty()
@@ -801,18 +806,13 @@ fn python_function_has_decorator(node: Node<'_>, source: &str, decorator_name: &
     if parent.kind() != "decorated_definition" {
         return false;
     }
-    source
-        .get(parent.start_byte()..node.start_byte())
-        .is_some_and(|decorators| {
-            decorators
-                .lines()
-                .map(str::trim)
-                .filter(|line| line.starts_with('@'))
-                .any(|line| {
-                    line.trim_start_matches('@').split(['(', ' ', '\t']).next()
-                        == Some(decorator_name)
-                })
-        })
+    let mut cursor = parent.walk();
+    parent
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .filter_map(|decorator| decorator.named_child(0))
+        .filter_map(expression_name_node)
+        .any(|name| py_node_text(name, source).trim() == decorator_name)
 }
 
 fn python_first_parameter_name(node: Node<'_>, source: &str) -> Option<String> {

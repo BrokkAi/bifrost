@@ -1,5 +1,7 @@
 //! End-to-end tests for the SQLite-backed analyzer persistence layer.
 
+mod common;
+
 use brokk_bifrost::analyzer::{
     BuildProgressEvent, BuildProgressPhase,
     persistence::{AnalyzerStorage, PersistenceError, SymbolQueryMode, default_db_path},
@@ -8,6 +10,7 @@ use brokk_bifrost::{
     AnalyzerConfig, CodeUnitType, IAnalyzer, JavaAnalyzer, Language, OverlayProject, Project,
     ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, TestProject, WorkspaceAnalyzer,
 };
+use common::InlineTestProject;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -149,6 +152,67 @@ fn cold_then_warm_python_identical_results() {
         cold.0, warm,
         "warm-start declarations should match cold-start"
     );
+}
+
+#[test]
+fn python_declaration_only_metadata_round_trips_through_storage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "command.py",
+            r#"from typing import overload as ov
+
+class Command:
+    @ov
+    def main(self, value: str) -> str: ...
+
+    @ov
+    def main(self, value: int) -> int: ...
+
+    def main(self, value):
+        return value
+"#,
+        )
+        .build();
+    let db_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(AnalyzerStorage::open(db_dir.path().join("analyzer.db")).unwrap());
+    let project_arc = project.project_arc();
+
+    let flags = |analyzer: &PythonAnalyzer| {
+        let mut definitions = analyzer.get_definitions("command.Command.main");
+        definitions.sort_by_key(|unit| {
+            analyzer
+                .ranges(unit)
+                .into_iter()
+                .map(|range| range.start_line)
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        definitions
+            .iter()
+            .map(|unit| {
+                analyzer
+                    .signature_metadata(unit)
+                    .first()
+                    .is_some_and(|metadata| metadata.is_declaration_only())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let cold = PythonAnalyzer::new_with_config_and_storage(
+        project_arc.clone() as Arc<dyn Project>,
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+    let cold_flags = flags(&cold);
+    assert_eq!(vec![true, true, false], cold_flags);
+    drop(cold);
+
+    let warm = PythonAnalyzer::new_with_config_and_storage(
+        project_arc as Arc<dyn Project>,
+        AnalyzerConfig::default(),
+        storage,
+    );
+    assert_eq!(cold_flags, flags(&warm));
 }
 
 #[test]
