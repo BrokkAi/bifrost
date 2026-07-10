@@ -16,6 +16,7 @@ Bifrost currently asks editors to resend an entire open document after every key
 - [x] (2026-07-10 07:09Z) Integrated document versions and incremental changes into the LSP server while preserving downstream refresh behavior.
 - [x] (2026-07-10 07:09Z) Updated capability advertisement, integration coverage, and public LSP documentation.
 - [x] (2026-07-10 07:25Z) Ran formatting, focused and full tests, doctests, no-CUDA clippy, and a final diff review; added a transactional rollback regression found during review.
+- [x] (2026-07-10 07:28Z) Rebased all checkpoints onto current `origin/master` (`1b28944c`) and reran the ten text-sync and 160 LSP tests successfully.
 
 ## Surprises & Discoveries
 
@@ -33,6 +34,9 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 - Observation: the sandbox blocks the existing uv cache used by the voyage-sidecar lifecycle test, and this machine places Homebrew `rustdoc` and `clippy-driver` before the Rustup tools even though both report Rust 1.96.
   Evidence: the sandboxed full suite failed only when uv could not open `~/.cache/uv`; the host rerun passed every test binary. Doctests and clippy initially reported incompatible compiler metadata until run with `/Users/dave/.cargo/bin` tools and an isolated clippy target directory.
+
+- Observation: `origin/master` advanced after the planning snapshot while the issue branch's configured upstream remained at the old base, so plain `git rebase` did not incorporate the new master commit.
+  Evidence: the final graph audit found merge base `3b4d1081` and current master `1b28944c`; `git rebase origin/master` applied all four checkpoints without conflicts.
 
 ## Decision Log
 
@@ -137,6 +141,14 @@ Final validation evidence:
       CARGO_TARGET_DIR=/private/tmp/bifrost-clippy-575 cargo clippy-no-cuda
     # passed
 
+After rebasing onto `origin/master`:
+
+    cargo test lsp::text_sync::tests --lib
+    # 10 passed
+
+    cargo test --features nlp --test bifrost_lsp_server
+    # 160 passed
+
 ## Interfaces and Dependencies
 
 The only public interface change is the LSP initialize response: `textDocumentSync.change` changes from `FULL` (`1`) to `INCREMENTAL` (`2`). No public Rust API or new dependency is needed.
@@ -155,3 +167,5 @@ Plan revision note (2026-07-10 07:00Z): Marked the pure text-sync milestone comp
 Plan revision note (2026-07-10 07:09Z): Marked server, capability, docs, and integration work complete after the focused cases and the full LSP integration target passed.
 
 Plan revision note (2026-07-10 07:25Z): Closed the plan after full validation and recorded the host toolchain-path workaround so later runs can reproduce the green doctest and clippy results.
+
+Plan revision note (2026-07-10 07:28Z): Recorded the final master rebase and post-rebase focused validation so the completed plan matches the delivered branch graph.
