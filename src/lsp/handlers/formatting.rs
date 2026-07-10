@@ -899,12 +899,7 @@ mod tests {
             command.args,
             vec![
                 "--stdin-filename",
-                &root
-                    .clone()
-                    .normalize()
-                    .join("pkg/src/lib.rs")
-                    .display()
-                    .to_string(),
+                &file.abs_path().display().to_string(),
                 "pkg/src/lib.rs",
                 "rust",
             ]
