@@ -22,6 +22,7 @@ Useful starting points:
 - [MCP server and toolsets](docs/src/content/docs/mcp.md)
 - [LSP server](docs/src/content/docs/lsp.md)
 - [CLI usage](docs/src/content/docs/cli.md)
+- [Code querying](docs/src/content/docs/code-querying.md)
 - [Rust library usage](docs/src/content/docs/rust-library.md)
 - [Python client usage](docs/src/content/docs/python-client.md)
 - [Semantic search](docs/src/content/docs/semantic-search.md)

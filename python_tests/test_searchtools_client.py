@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bifrost_searchtools import (
-    SearchAstResult,
+    CodeQueryResult,
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
@@ -147,17 +147,17 @@ class SearchToolsClientTest(unittest.TestCase):
             [("b.py", 14), ("b.py", 15)],
         )
 
-    def test_search_ast_returns_typed_matches(self) -> None:
+    def test_query_code_returns_typed_matches(self) -> None:
         absolute_where = str(self.fixture_root / "*.java")
         with SearchToolsClient(root=self.fixture_root) as client:
-            result = client.search_ast(
+            result = client.query_code(
                 {"kind": "class", "name": "A"},
                 where=[absolute_where],
                 languages=["java"],
                 schema_version=1,
             )
 
-        self.assertIsInstance(result, SearchAstResult)
+        self.assertIsInstance(result, CodeQueryResult)
         self.assertEqual(result.count, 1)
         self.assertEqual(result.matches[0].path, "A.java")
         self.assertEqual(result.matches[0].kind, "class")
@@ -168,7 +168,7 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertEqual(result.diagnostics, [])
 
         with SearchToolsClient(root=self.fixture_root) as client:
-            detailed = client.search_ast(
+            detailed = client.query_code(
                 {"kind": "class", "name": "A", "capture": "klass"},
                 where=[absolute_where],
                 languages=["java"],

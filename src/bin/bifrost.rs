@@ -2,8 +2,8 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[path = "bifrost/search_ast_repl.rs"]
-mod search_ast_repl;
+#[path = "bifrost/code_query_repl.rs"]
+mod code_query_repl;
 
 use brokk_bifrost::ToolOutput;
 use brokk_bifrost::lsp::run_lsp_stdio_server;
@@ -17,7 +17,7 @@ use brokk_bifrost::skill_install::{
     InstallMode, InstallSkillsOptions, InstallTarget, SkillSet, install_skills,
 };
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
-use search_ast_repl::run_search_ast_repl;
+use code_query_repl::run_code_query_repl;
 use serde_json::{Value, json};
 
 fn main() -> ExitCode {
@@ -228,7 +228,7 @@ fn run() -> Result<(), String> {
     }
 
     if run_repl {
-        return run_search_ast_repl(root);
+        return run_code_query_repl(root);
     }
 
     let mode = mcp_mode.as_deref().unwrap_or("searchtools");
@@ -338,7 +338,7 @@ USAGE:
     bifrost                  Run an MCP server over stdio (default: --mcp searchtools)
     bifrost --mcp TOOLSETS     Run an MCP server over stdio (e.g. --mcp core)
     bifrost --lsp              Run a Language Server (LSP) over stdio
-    bifrost --repl             Run an interactive search_ast REPL
+    bifrost --repl             Run the interactive code-query REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --install-skills   Install Bifrost Agent Skills into a .agents/skills root
     bifrost --version | --help [TOOL]
@@ -398,7 +398,7 @@ EXAMPLES:
     # One-shot: run a single tool and print its JSON result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
 
-    # Human search_ast exploration with S-expressions, completion, docs, and history:
+    # Human code-query exploration with S-expressions, completion, docs, and history:
     bifrost --root /path/to/project --repl
 
     # Install generic Agent Skills for Zed/Antigravity-style hosts:

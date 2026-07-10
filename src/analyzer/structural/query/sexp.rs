@@ -1,4 +1,4 @@
-use super::ir::{AstQuery, SearchAstResultDetail};
+use super::ir::{CodeQuery, CodeQueryResultDetail};
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Number, Value, json};
@@ -6,7 +6,7 @@ use serde_json::{Map, Number, Value, json};
 const MAX_SEXP_INPUT_BYTES: usize = 64 * 1024;
 const MAX_SEXP_DEPTH: usize = 128;
 
-impl AstQuery {
+impl CodeQuery {
     pub fn from_sexp(input: &str) -> Result<Self, String> {
         let value = sexp_to_json(input)?;
         Self::from_json(&value).map_err(|error| error.to_string())
@@ -454,7 +454,7 @@ fn language_arg(expr: &Expr) -> Result<String, String> {
 
 fn result_detail_arg(expr: &Expr) -> Result<String, String> {
     let label = symbol_or_string(expr)?;
-    SearchAstResultDetail::from_label(&label)
+    CodeQueryResultDetail::from_label(&label)
         .map(|detail| detail.label().to_string())
         .ok_or_else(|| format!("unknown result detail `{label}`"))
 }
@@ -526,11 +526,11 @@ mod tests {
     use serde_json::json;
 
     fn canonical(input: &str) -> Value {
-        AstQuery::from_sexp(input).unwrap().to_canonical_json()
+        CodeQuery::from_sexp(input).unwrap().to_canonical_json()
     }
 
     fn canonical_json(value: Value) -> Value {
-        AstQuery::from_json(&value).unwrap().to_canonical_json()
+        CodeQuery::from_json(&value).unwrap().to_canonical_json()
     }
 
     #[test]
@@ -575,8 +575,8 @@ mod tests {
 
     #[test]
     fn structural_query_sexp_rejects_result_detail_as_pattern_field() {
-        let error =
-            AstQuery::from_sexp(r#"(call :callee (name "eval") :result-detail full)"#).unwrap_err();
+        let error = CodeQuery::from_sexp(r#"(call :callee (name "eval") :result-detail full)"#)
+            .unwrap_err();
         assert!(
             error.contains("unknown pattern field `:result-detail`"),
             "{error}"
@@ -609,13 +609,13 @@ mod tests {
 
     #[test]
     fn structural_query_sexp_reports_parser_errors() {
-        let error = AstQuery::from_sexp(r#"(call :callee (name "eval")"#).unwrap_err();
+        let error = CodeQuery::from_sexp(r#"(call :callee (name "eval")"#).unwrap_err();
         assert!(error.contains("missing `)`"), "{error}");
     }
 
     #[test]
     fn structural_query_sexp_reports_unknown_forms() {
-        let error = AstQuery::from_sexp("(banana)").unwrap_err();
+        let error = CodeQuery::from_sexp("(banana)").unwrap_err();
         assert!(
             error.contains("unknown S-expression form `banana`"),
             "{error}"
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn structural_query_sexp_reports_bad_language() {
-        let error = AstQuery::from_sexp("(language klingon (call))").unwrap_err();
+        let error = CodeQuery::from_sexp("(language klingon (call))").unwrap_err();
         assert!(
             error.contains("unknown language label `klingon`"),
             "{error}"
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn structural_query_sexp_reports_duplicate_keyword_fields() {
-        let error = AstQuery::from_sexp(r#"(class :name "A" :name "B")"#).unwrap_err();
+        let error = CodeQuery::from_sexp(r#"(class :name "A" :name "B")"#).unwrap_err();
         assert!(
             error.contains("duplicate S-expression field `name`"),
             "{error}"
@@ -650,7 +650,7 @@ mod tests {
         for _ in 0..=MAX_SEXP_DEPTH + 1 {
             input.push(')');
         }
-        let error = AstQuery::from_sexp(&input).unwrap_err();
+        let error = CodeQuery::from_sexp(&input).unwrap_err();
         assert!(
             error.contains("S-expression nesting exceeds maximum depth"),
             "{error}"
@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn structural_query_sexp_preserves_pathful_validation_errors() {
-        let error = AstQuery::from_sexp("(assignment :callee (name \"run\"))").unwrap_err();
+        let error = CodeQuery::from_sexp("(assignment :callee (name \"run\"))").unwrap_err();
         assert!(error.contains("match.callee"), "{error}");
     }
 }

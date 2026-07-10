@@ -82,7 +82,7 @@ fn tool_get_summaries_prints_structured_json_without_content() {
 }
 
 #[test]
-fn search_ast_repl_accepts_piped_sexp_commands() {
+fn code_query_repl_accepts_piped_sexp_commands() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
@@ -552,6 +552,48 @@ fn tool_unknown_tool_is_reported() {
 }
 
 #[test]
+fn removed_search_ast_tool_name_is_reported_as_unknown() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(fixture_root())
+        .arg("--tool")
+        .arg("search_ast")
+        .arg("--args")
+        .arg(r#"{"match":{"kind":"class","name":"A"}}"#)
+        .output()
+        .expect("run bifrost with removed search_ast tool name");
+
+    assert!(!output.status.success(), "status should fail");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("Unknown tool: search_ast"), "{stderr}");
+}
+
+#[test]
+fn query_code_tool_returns_structural_matches() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(fixture_root())
+        .arg("--tool")
+        .arg("query_code")
+        .arg("--args")
+        .arg(r#"{"match":{"kind":"class","name":"A"}}"#)
+        .output()
+        .expect("run bifrost --tool query_code");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("query_code JSON output");
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        payload["structuredContent"]["matches"][0]["kind"], "class",
+        "{payload}"
+    );
+}
+
+#[test]
 fn tool_cannot_be_combined_with_mcp() {
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
@@ -606,4 +648,32 @@ fn help_mentions_tool_mode() {
     assert!(stdout.contains("--tool NAME"), "{stdout}");
     assert!(stdout.contains("--args"), "{stdout}");
     assert!(stdout.contains("--sources PATH"), "{stdout}");
+    assert!(!stdout.contains("search_ast"), "{stdout}");
+}
+
+#[test]
+fn query_code_help_includes_boundary_example_and_guide() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--help")
+        .arg("query_code")
+        .output()
+        .expect("run bifrost --help query_code");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("query_code  (toolset: extended)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("does not traverse call graphs"), "{stdout}");
+    assert!(stdout.contains(r#"{"match":{"kind":"call""#), "{stdout}");
+    assert!(!stdout.contains("search_ast"), "{stdout}");
+    assert!(
+        stdout.contains("https://brokkai.github.io/bifrost/code-querying/"),
+        "{stdout}"
+    );
 }

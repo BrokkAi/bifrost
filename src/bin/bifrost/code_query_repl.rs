@@ -1,6 +1,6 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::{
-    AstQuery, Pattern, SearchAstMatch, SearchAstOutput, StringPredicate,
+    CodeQuery, CodeQueryMatch, CodeQueryResult, Pattern, StringPredicate,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
@@ -31,7 +31,7 @@ const COMMANDS: &[MetadataEntry] = &[
         ":validate",
         "Validate the current query without running it.",
     ),
-    MetadataEntry::new(":run", "Run the current query through search_ast."),
+    MetadataEntry::new(":run", "Run the current query through query_code."),
     MetadataEntry::new(":clear", "Clear the current query."),
     MetadataEntry::new(":quit", "Exit the REPL."),
 ];
@@ -251,7 +251,7 @@ impl ReplSession {
                 None => (ReplFlow::Continue, "No current query.".to_string()),
             },
             ":validate" => match self.current_query.as_ref() {
-                Some(value) => match AstQuery::from_json(value) {
+                Some(value) => match CodeQuery::from_json(value) {
                     Ok(_) => (ReplFlow::Continue, "Query is valid.".to_string()),
                     Err(error) => (
                         ReplFlow::Continue,
@@ -294,7 +294,7 @@ impl Default for ReplSession {
     }
 }
 
-pub fn run_search_ast_repl(root: PathBuf) -> Result<(), String> {
+pub fn run_code_query_repl(root: PathBuf) -> Result<(), String> {
     let canonical_root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
@@ -450,7 +450,7 @@ fn configured_reedline() -> Reedline {
 fn history_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| home.join(".bifrost_search_ast_repl_history"))
+        .map(|home| home.join(".bifrost_code_query_repl_history"))
 }
 
 fn prepare_history_path() -> Option<PathBuf> {
@@ -496,11 +496,11 @@ fn parse_query_input(line: &str) -> Result<Value, String> {
     if line.trim_start().starts_with('{') {
         let value =
             serde_json::from_str(line).map_err(|error| format!("invalid JSON query: {error}"))?;
-        AstQuery::from_json(&value)
+        CodeQuery::from_json(&value)
             .map(|query| query.to_canonical_json())
             .map_err(|error| error.to_string())
     } else {
-        AstQuery::from_sexp(line).map(|query| query.to_canonical_json())
+        CodeQuery::from_sexp(line).map(|query| query.to_canonical_json())
     }
 }
 
@@ -509,7 +509,7 @@ fn should_colorize_repl() -> bool {
 }
 
 fn loaded_query_text(value: &Value) -> String {
-    match AstQuery::from_json(value) {
+    match CodeQuery::from_json(value) {
         Ok(query) => format!(
             "Loaded {}.\nUse :run to execute it, or :json to inspect canonical JSON.",
             query_summary_text(&query)
@@ -519,14 +519,14 @@ fn loaded_query_text(value: &Value) -> String {
 }
 
 fn canonical_json_text(value: &Value) -> String {
-    match AstQuery::from_json(value) {
+    match CodeQuery::from_json(value) {
         Ok(query) => serde_json::to_string_pretty(&query.to_canonical_json())
             .unwrap_or_else(|error| format!("error: failed to render canonical JSON: {error}")),
         Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
     }
 }
 
-fn query_summary_text(query: &AstQuery) -> String {
+fn query_summary_text(query: &CodeQuery) -> String {
     let mut parts = vec![format!("{} query", pattern_summary(&query.root))];
     if !query.where_globs.is_empty() {
         let globs = query
@@ -606,13 +606,13 @@ fn predicate_summary(field: &str, predicate: &StringPredicate) -> String {
 }
 
 fn run_query(service: &SearchToolsService, value: &Value, use_color: bool) -> String {
-    match service.search_ast_output(value.clone()) {
-        Ok(output) => render_search_ast_repl_output(&output, use_color),
+    match service.query_code_result(value.clone()) {
+        Ok(output) => render_code_query_repl_output(&output, use_color),
         Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
     }
 }
 
-fn render_search_ast_repl_output(output: &SearchAstOutput, use_color: bool) -> String {
+fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> String {
     let mut out = String::new();
     if output.matches.is_empty() {
         out.push_str("No structural matches.\n");
@@ -620,7 +620,7 @@ fn render_search_ast_repl_output(output: &SearchAstOutput, use_color: bool) -> S
         out.push_str(&format!("{}\n", output.match_count_line()));
         for matched in &output.matches {
             out.push('\n');
-            render_search_ast_match(&mut out, matched, use_color);
+            render_code_query_match(&mut out, matched, use_color);
         }
     }
 
@@ -634,7 +634,7 @@ fn render_search_ast_repl_output(output: &SearchAstOutput, use_color: bool) -> S
     out
 }
 
-fn render_search_ast_match(out: &mut String, matched: &SearchAstMatch, use_color: bool) {
+fn render_code_query_match(out: &mut String, matched: &CodeQueryMatch, use_color: bool) {
     let path = sanitize_terminal_text(&matched.path);
     let kind = sanitize_terminal_text(matched.kind);
     let text = sanitize_terminal_text(&matched.text);
@@ -720,7 +720,7 @@ fn paint(style: Style, text: &str, use_color: bool) -> String {
 }
 
 fn welcome_text() -> String {
-    "Bifrost search_ast REPL. Type :help for commands. S-expressions are the human query syntax."
+    "Bifrost code-query REPL. Type :help for commands. S-expressions are the human query syntax."
         .to_string()
 }
 
@@ -811,7 +811,7 @@ fn doc_text(name: &str) -> String {
         .iter()
         .any(|language| language.config_label() == normalized)
     {
-        return format!("{normalized} — language filter label for search_ast.");
+        return format!("{normalized} — language filter label for query_code.");
     }
     format!("No docs for `{name}`.")
 }
@@ -967,10 +967,10 @@ fn balanced_delimiters(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost::analyzer::structural::SearchAstCapture;
+    use brokk_bifrost::analyzer::structural::CodeQueryCapture;
 
     #[test]
-    fn search_ast_repl_loads_sexp_with_human_summary() {
+    fn code_query_repl_loads_sexp_with_human_summary() {
         let mut session = ReplSession::new();
         let (_flow, output) = session.process_line(r#"(call :callee (name "eval"))"#, None);
         assert!(output.contains("Loaded call query"), "{output}");
@@ -986,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_sanitizes_loaded_query_summary() {
+    fn code_query_repl_sanitizes_loaded_query_summary() {
         let mut session = ReplSession::new();
         let (_flow, output) =
             session.process_line(r#"(function :name "\u001b]52;c;secret\u0007")"#, None);
@@ -997,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_validates_current_query() {
+    fn code_query_repl_validates_current_query() {
         let mut session = ReplSession::new();
         session.process_line(r#"(call :callee (name "eval"))"#, None);
         let (_flow, output) = session.process_line(":validate", None);
@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_exposes_doc_metadata() {
+    fn code_query_repl_exposes_doc_metadata() {
         assert!(doc_text(":run").contains("Run"));
         assert!(doc_text("call").contains("Match call"));
         assert!(doc_text("callee").contains("call target"));
@@ -1013,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_examples_all_parse() {
+    fn code_query_repl_examples_all_parse() {
         for example in EXAMPLES {
             parse_query_input(example.query)
                 .unwrap_or_else(|error| panic!("example `{}` should parse: {error}", example.name));
@@ -1021,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_completes_commands_and_roles_with_descriptions() {
+    fn code_query_repl_completes_commands_and_roles_with_descriptions() {
         let mut completer = ReplCompleter::new();
         let suggestions = completer.complete(":r", 2);
         assert!(
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_validator_accepts_multiline_until_balanced() {
+    fn code_query_repl_validator_accepts_multiline_until_balanced() {
         let validator = ReplValidator;
         assert!(matches!(
             validator.validate(r#"(call :callee (name "eval")"#),
@@ -1057,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_accumulates_scripted_multiline_queries() {
+    fn code_query_repl_accumulates_scripted_multiline_queries() {
         let mut pending = String::new();
         assert_eq!(accumulate_scripted_input(&mut pending, "(class"), None);
         assert_eq!(
@@ -1071,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_ctrl_c_quits_only_after_second_consecutive_signal() {
+    fn code_query_repl_ctrl_c_quits_only_after_second_consecutive_signal() {
         let mut guard = CtrlCQuitGuard::default();
         assert_eq!(guard.record_ctrl_c(), ReplFlow::Continue);
         guard.reset();
@@ -1080,10 +1080,10 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_renders_search_ast_matches_as_multiline_entries() {
-        let output = render_search_ast_repl_output(
-            &SearchAstOutput {
-                matches: vec![SearchAstMatch {
+    fn code_query_repl_renders_query_code_matches_as_multiline_entries() {
+        let output = render_code_query_repl_output(
+            &CodeQueryResult {
+                matches: vec![CodeQueryMatch {
                     path: "editors/vscode/src/provisioning.ts".to_string(),
                     language: "typescript",
                     kind: "function",
@@ -1094,7 +1094,7 @@ mod tests {
                     node_range: None,
                     decorated_range: None,
                     decorator_ranges: Vec::new(),
-                    captures: vec![SearchAstCapture {
+                    captures: vec![CodeQueryCapture {
                         name: "callee".to_string(),
                         text: "probe".to_string(),
                         start_line: 260,
@@ -1127,10 +1127,10 @@ mod tests {
     }
 
     #[test]
-    fn search_ast_repl_sanitizes_terminal_control_sequences() {
-        let output = render_search_ast_repl_output(
-            &SearchAstOutput {
-                matches: vec![SearchAstMatch {
+    fn code_query_repl_sanitizes_terminal_control_sequences() {
+        let output = render_code_query_repl_output(
+            &CodeQueryResult {
+                matches: vec![CodeQueryMatch {
                     path: "src/\u{1b}]52;c;secret\u{07}.rs".to_string(),
                     language: "rust",
                     kind: "function",

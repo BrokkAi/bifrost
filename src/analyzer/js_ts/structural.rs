@@ -1,4 +1,4 @@
-//! Shared JavaScript/TypeScript structural specs for `search_ast`.
+//! Shared JavaScript/TypeScript structural specs for `query_code`.
 
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{

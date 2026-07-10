@@ -1,9 +1,9 @@
-//! Cross-language `search_ast` tests for Java and JS/TS structural adapters
+//! Cross-language `query_code` tests for Java and JS/TS structural adapters
 //! (issue #328, ExecPlan milestone 4).
 
 mod common;
 
-use brokk_bifrost::analyzer::structural::{AstQuery, SearchAstOutput, execute};
+use brokk_bifrost::analyzer::structural::{CodeQuery, CodeQueryResult, execute};
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 use common::InlineTestProject;
 use serde_json::json;
@@ -79,7 +79,7 @@ class TsController {
 }
 "#;
 
-fn run_query(query: serde_json::Value) -> SearchAstOutput {
+fn run_query(query: serde_json::Value) -> CodeQueryResult {
     let project = InlineTestProject::new()
         .file("python/app.py", APP_PY)
         .file("java/App.java", APP_JAVA)
@@ -87,18 +87,18 @@ fn run_query(query: serde_json::Value) -> SearchAstOutput {
         .file("typescript/app.ts", APP_TS)
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
-    let query = AstQuery::from_json(&query).expect("query should parse");
+    let query = CodeQuery::from_json(&query).expect("query should parse");
     execute(workspace.analyzer(), &query)
 }
 
-fn run_query_with_files(files: &[(&str, &str)], query: serde_json::Value) -> SearchAstOutput {
+fn run_query_with_files(files: &[(&str, &str)], query: serde_json::Value) -> CodeQueryResult {
     let mut project = InlineTestProject::new();
     for (path, source) in files {
         project = project.file(*path, *source);
     }
     let project = project.build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
-    let query = AstQuery::from_json(&query).expect("query should parse");
+    let query = CodeQuery::from_json(&query).expect("query should parse");
     execute(workspace.analyzer(), &query)
 }
 

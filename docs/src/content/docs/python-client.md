@@ -67,7 +67,7 @@ Use `manual=True` with `update_paths(...)` when the caller wants to control incr
 | Symbols and summaries | `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `contains_tests(...)` |
 | Definitions and types | `get_definitions_by_location(...)`, `get_definitions_by_reference(...)`, `get_type_by_location(...)` |
 | Usages and graph | `scan_usages(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)`, `analyze_commit(...)` |
-| Structural search | `search_ast(...)` |
+| Code query | `query_code(...)` |
 | Semantic search | `semantic_search(...)`, `semantic_search_status()` |
 | Files | `get_file_contents(...)`, `find_filenames(...)`, `search_file_contents(...)`, `find_files_containing(...)`, `list_files(...)` |
 | Git | `get_git_log(...)`, `get_commit_diff(...)`, `search_git_commit_messages(...)` |
@@ -80,9 +80,9 @@ The many per-rule tuning knobs on code-quality smell reports are accepted throug
 
 `get_summaries(...)` is directory-aware for MCP callers: directory targets surface a `compact_symbols` inventory alongside ordinary summaries when mixed with file or class targets. The direct Rust `brokk_bifrost::searchtools::get_summaries(...)` API and the Python client are narrower and report directory targets in `not_found` instead of embedding directory inventory in `SummaryResult`.
 
-## Search AST
+## Code Query
 
-`search_ast(...)` is the experimental v1 structural search surface. Omit `schema_version` for v1 or pass `schema_version=1` explicitly.
+`query_code(...)` is the version-1 normalized structural query surface. Omit `schema_version` for v1 or pass `schema_version=1` explicitly. Version 1 is syntactic: it does not traverse call graphs, resolve types, or perform control/data-flow analysis. See [Code Querying](../code-querying/) for tool selection and [JSON CodeQuery](../code-query-json/) for the complete pattern schema.
 
 Compact output is the default and includes project-relative path, language, normalized kind, line range, a short snippet, captures, and an enclosing symbol when available. Pass `result_detail="full"` when a rule, refactoring step, or follow-up tool call needs deterministic match ids, byte offsets, 1-based character columns, decorator ranges, and capture ranges.
 

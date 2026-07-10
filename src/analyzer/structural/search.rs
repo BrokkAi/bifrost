@@ -1,4 +1,4 @@
-//! Workspace-level execution of a structural query (`search_ast`): scope by
+//! Workspace-level execution of a structural query (`query_code`): scope by
 //! path globs and languages, derive the planner's positive anchors and query
 //! requirements, run the matcher over deterministic candidates until `limit+1`
 //! global matches prove truncation (facts come from the per-analyzer cache,
@@ -10,7 +10,7 @@ use super::facts::{FileFacts, Span};
 use super::kinds::Role;
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
-use super::query::{AstQuery, SearchAstResultDetail};
+use super::query::{CodeQuery, CodeQueryResultDetail};
 use crate::analyzer::structural::capabilities::QueryFeature;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::path_utils::rel_path_string;
@@ -27,15 +27,15 @@ const MAX_FACT_NODES: usize = 2_000_000;
 const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
 
 #[derive(Debug, Serialize)]
-pub struct SearchAstOutput {
-    pub matches: Vec<SearchAstMatch>,
+pub struct CodeQueryResult {
+    pub matches: Vec<CodeQueryMatch>,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<SearchAstDiagnostic>,
+    pub diagnostics: Vec<CodeQueryDiagnostic>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SearchAstMatch {
+pub struct CodeQueryMatch {
     pub path: String,
     pub language: &'static str,
     pub kind: &'static str,
@@ -45,30 +45,30 @@ pub struct SearchAstMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_range: Option<SearchAstRange>,
+    pub node_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decorated_range: Option<SearchAstRange>,
+    pub decorated_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub decorator_ranges: Vec<SearchAstRange>,
+    pub decorator_ranges: Vec<CodeQueryRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub captures: Vec<SearchAstCapture>,
+    pub captures: Vec<CodeQueryCapture>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enclosing_symbol: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SearchAstCapture {
+pub struct CodeQueryCapture {
     pub name: String,
     pub text: String,
     pub start_line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub range: Option<SearchAstRange>,
+    pub range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-pub struct SearchAstRange {
+pub struct CodeQueryRange {
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: usize,
@@ -78,7 +78,7 @@ pub struct SearchAstRange {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SearchAstDiagnostic {
+pub struct CodeQueryDiagnostic {
     pub language: &'static str,
     pub message: String,
 }
@@ -88,18 +88,18 @@ pub struct SearchAstDiagnostic {
 type PendingMatch = (Language, ProjectFile, Arc<FileFacts>, FactMatch);
 
 /// Run `query` across every language provider the analyzer exposes.
-pub fn execute(analyzer: &dyn IAnalyzer, query: &AstQuery) -> SearchAstOutput {
-    execute_with_limits(analyzer, query, SearchAstExecutionLimits::default())
+pub fn execute(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResult {
+    execute_with_limits(analyzer, query, CodeQueryExecutionLimits::default())
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SearchAstExecutionLimits {
+pub struct CodeQueryExecutionLimits {
     pub max_scanned_files: usize,
     pub max_scanned_source_bytes: usize,
     pub max_fact_nodes: usize,
 }
 
-impl Default for SearchAstExecutionLimits {
+impl Default for CodeQueryExecutionLimits {
     fn default() -> Self {
         Self {
             max_scanned_files: MAX_SCANNED_FILES,
@@ -110,7 +110,7 @@ impl Default for SearchAstExecutionLimits {
 }
 
 #[derive(Debug, Default)]
-struct SearchAstExecutionBudget {
+struct CodeQueryExecutionBudget {
     scanned_files: usize,
     scanned_source_bytes: usize,
     fact_nodes: usize,
@@ -119,9 +119,9 @@ struct SearchAstExecutionBudget {
 #[doc(hidden)]
 pub fn execute_with_limits(
     analyzer: &dyn IAnalyzer,
-    query: &AstQuery,
-    limits: SearchAstExecutionLimits,
-) -> SearchAstOutput {
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResult {
     let plan = QueryPlan::for_query(query);
     let source_index = plan.build_source_index();
     let mut providers = analyzer.structural_search_providers();
@@ -161,7 +161,7 @@ pub fn execute_with_limits(
                     .unsupported_by(|feature| provider_supports_feature(provider, feature))
                     .into_diagnostics(language)
                     .into_iter()
-                    .map(|diagnostic| SearchAstDiagnostic {
+                    .map(|diagnostic| CodeQueryDiagnostic {
                         language: diagnostic.language().config_label(),
                         message: diagnostic.message(),
                     }),
@@ -178,7 +178,7 @@ pub fn execute_with_limits(
             && !supported.contains(&language)
             && (explicitly_requested || scoped_languages.contains(&language))
         {
-            diagnostics.push(SearchAstDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic {
                 language: language.config_label(),
                 message: format!(
                     "no structural adapter for {} yet; its files were not searched",
@@ -207,7 +207,7 @@ pub fn execute_with_limits(
 
     let global_cap = query.limit.saturating_add(1);
     let mut pending: Vec<PendingMatch> = Vec::new();
-    let mut budget = SearchAstExecutionBudget::default();
+    let mut budget = CodeQueryExecutionBudget::default();
     let mut budget_exhausted = false;
     for (_path, language, provider, file) in candidates {
         let Some(source) = provider.structural_source(&file) else {
@@ -268,7 +268,7 @@ pub fn execute_with_limits(
         })
         .collect();
 
-    SearchAstOutput {
+    CodeQueryResult {
         matches,
         truncated,
         diagnostics,
@@ -286,27 +286,27 @@ fn provider_supports_feature(
 }
 
 fn push_budget_diagnostic(
-    diagnostics: &mut Vec<SearchAstDiagnostic>,
-    budget: &SearchAstExecutionBudget,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    budget: &CodeQueryExecutionBudget,
 ) {
-    diagnostics.push(SearchAstDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "search_ast execution budget exhausted after scanning {} files, {} bytes, and {} facts; refine the query with where, languages, kind/name anchors, or a narrower pattern",
+            "query_code execution budget exhausted after scanning {} files, {} bytes, and {} facts; refine the query with where, languages, kind/name anchors, or a narrower pattern",
             budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
         ),
     });
 }
 
 fn push_truncation_diagnostic(
-    diagnostics: &mut Vec<SearchAstDiagnostic>,
-    budget: &SearchAstExecutionBudget,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    budget: &CodeQueryExecutionBudget,
     limit: usize,
 ) {
-    diagnostics.push(SearchAstDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "search_ast returned the first {limit} matches after scanning {} files, {} bytes, and {} facts; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+            "query_code returned the first {limit} matches after scanning {} files, {} bytes, and {} facts; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
             budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
         ),
     });
@@ -314,8 +314,8 @@ fn push_truncation_diagnostic(
 
 fn should_report_broad_query(
     plan: &QueryPlan,
-    query: &AstQuery,
-    budget: &SearchAstExecutionBudget,
+    query: &CodeQuery,
+    budget: &CodeQueryExecutionBudget,
     truncated: bool,
 ) -> bool {
     !plan.has_source_anchors()
@@ -325,19 +325,19 @@ fn should_report_broad_query(
 }
 
 fn push_broad_query_diagnostic(
-    diagnostics: &mut Vec<SearchAstDiagnostic>,
-    budget: &SearchAstExecutionBudget,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    budget: &CodeQueryExecutionBudget,
 ) {
-    diagnostics.push(SearchAstDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "broad unanchored search_ast query scanned {} files, {} bytes, and {} facts; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",
+            "broad unanchored query_code query scanned {} files, {} bytes, and {} facts; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",
             budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
         ),
     });
 }
 
-fn file_matches_globs(file: &ProjectFile, query: &AstQuery) -> bool {
+fn file_matches_globs(file: &ProjectFile, query: &CodeQuery) -> bool {
     if query.where_globs.is_empty() {
         return true;
     }
@@ -351,15 +351,15 @@ fn render_match(
     file: &ProjectFile,
     facts: &FileFacts,
     fact_match: &FactMatch,
-    detail: SearchAstResultDetail,
-) -> SearchAstMatch {
+    detail: CodeQueryResultDetail,
+) -> CodeQueryMatch {
     let fact = facts.node(fact_match.node);
-    let full_detail = matches!(detail, SearchAstResultDetail::Full);
+    let full_detail = matches!(detail, CodeQueryResultDetail::Full);
     let path = rel_path_string(file);
     let captures = fact_match
         .captures
         .iter()
-        .map(|capture| SearchAstCapture {
+        .map(|capture| CodeQueryCapture {
             name: capture.name.clone(),
             text: snippet(capture.span.text(facts.source())),
             start_line: facts.line_of_byte(capture.span.start_byte),
@@ -393,7 +393,7 @@ fn render_match(
     } else {
         None
     };
-    SearchAstMatch {
+    CodeQueryMatch {
         id: full_detail.then(|| match_id(&path, fact.kind.label(), fact.span())),
         path,
         language: language.config_label(),
@@ -415,10 +415,10 @@ fn match_id(path: &str, kind: &str, span: Span) -> String {
     format!("{path}:{kind}:{}-{}", span.start_byte, span.end_byte)
 }
 
-fn range_for_span(facts: &FileFacts, span: Span) -> SearchAstRange {
+fn range_for_span(facts: &FileFacts, span: Span) -> CodeQueryRange {
     let (start_line, start_column) = facts.line_column_of_byte(span.start_byte);
     let (end_line, end_column) = facts.line_column_of_byte(span.end_byte);
-    SearchAstRange {
+    CodeQueryRange {
         start_byte: span.start_byte,
         end_byte: span.end_byte,
         start_line,
@@ -443,7 +443,7 @@ fn snippet(text: &str) -> String {
     result
 }
 
-impl SearchAstOutput {
+impl CodeQueryResult {
     pub fn match_count_line(&self) -> String {
         format!(
             "{} match{}{}",
@@ -488,7 +488,7 @@ impl SearchAstOutput {
     }
 }
 
-impl SearchAstMatch {
+impl CodeQueryMatch {
     pub fn line_span_label(&self) -> String {
         if self.start_line == self.end_line {
             self.start_line.to_string()
@@ -501,12 +501,12 @@ impl SearchAstMatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::structural::AstQuery;
+    use crate::analyzer::structural::CodeQuery;
     use serde_json::json;
 
     #[test]
     fn where_globs_match_slash_normalized_paths() {
-        let query = AstQuery::from_json(&json!({
+        let query = CodeQuery::from_json(&json!({
             "where": ["src/**/*.py"],
             "match": { "kind": "call" }
         }))

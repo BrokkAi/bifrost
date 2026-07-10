@@ -1,4 +1,4 @@
-//! Java structural spec for `search_ast`.
+//! Java structural spec for `query_code`.
 //!
 //! This maps tree-sitter-java node types to Bifrost's normalized structural
 //! vocabulary and extracts role edges from AST fields.

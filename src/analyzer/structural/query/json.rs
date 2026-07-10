@@ -1,8 +1,8 @@
-use super::ir::{AstQuery, Pattern, StringPredicate};
+use super::ir::{CodeQuery, Pattern, StringPredicate};
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Value, json};
 
-impl AstQuery {
+impl CodeQuery {
     /// The canonical JSON form of this query. Used by `--print-json` style
     /// debugging and by tests asserting that both frontends parse to the same
     /// query (`parse(json).to_canonical_json() == parse(sexp).to_canonical_json()`).

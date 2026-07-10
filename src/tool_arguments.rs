@@ -33,7 +33,7 @@ pub fn normalize_tool_arguments(
         "find_filenames" => {
             normalize_string_array_field(&mut arguments, "patterns", workspace_root)?
         }
-        "search_ast" => normalize_string_array_field(&mut arguments, "where", workspace_root)?,
+        "query_code" => normalize_string_array_field(&mut arguments, "where", workspace_root)?,
         "search_file_contents" | "jq" | "xml_skim" | "xml_select" => {
             normalize_optional_string_field(&mut arguments, "file_path", workspace_root)?
         }
@@ -131,7 +131,7 @@ pub fn normalize_tool_arguments_for_cli(
             workspace_root,
             &mut overlays,
         )?,
-        "search_ast" => normalize_cli_string_array_field(
+        "query_code" => normalize_cli_string_array_field(
             &mut arguments,
             "where",
             workspace_root,
@@ -713,12 +713,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_search_ast_absolute_where_globs() {
+    fn normalizes_query_code_absolute_where_globs() {
         let root = TempDir::new().expect("temp dir");
         let raw = format!("{}/src/**/*.py", root.path().display());
 
         let normalized = normalize_tool_arguments(
-            "search_ast",
+            "query_code",
             json!({
                 "where": [raw],
                 "match": { "kind": "call" }
@@ -731,12 +731,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_search_ast_absolute_where_globs_for_cli() {
+    fn normalizes_query_code_absolute_where_globs_for_cli() {
         let root = TempDir::new().expect("temp dir");
         let raw = format!("{}/src/**/*.py", root.path().display());
 
         let (normalized, overlays) = normalize_tool_arguments_for_cli(
-            "search_ast",
+            "query_code",
             json!({
                 "where": [raw],
                 "match": { "kind": "call" }
@@ -797,11 +797,11 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_search_ast_windows_absolute_where_globs_against_verbatim_root() {
+    fn normalizes_query_code_windows_absolute_where_globs_against_verbatim_root() {
         let root = Path::new(r"\\?\C:\work\root");
 
         let normalized = normalize_tool_arguments(
-            "search_ast",
+            "query_code",
             json!({
                 "where": [r"C:\work\root\src\*.java"],
                 "match": { "kind": "class" }

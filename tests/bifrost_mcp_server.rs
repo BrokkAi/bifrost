@@ -177,7 +177,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "refresh",
             "activate_workspace",
             "get_active_workspace",
-            "search_ast",
+            "query_code",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "find_filenames",
@@ -220,7 +220,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "refresh",
             "activate_workspace",
             "get_active_workspace",
-            "search_ast",
+            "query_code",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "find_filenames",
@@ -814,7 +814,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_file_contents",
             "search_file_contents",
             "find_files_containing",
-            "search_ast",
+            "query_code",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "find_filenames",
@@ -832,7 +832,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         &fixture_root,
         "extended",
         &[
-            "search_ast",
+            "query_code",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "find_filenames",
@@ -1038,6 +1038,12 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
         "slopcop",
         "get_file_contents",
         json!({ "file_paths": ["A.java"] }),
+    );
+    assert_unknown_tool(
+        &fixture_root,
+        "searchtools",
+        "search_ast",
+        json!({ "match": { "kind": "class", "name": "A" } }),
     );
 }
 

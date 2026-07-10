@@ -1,4 +1,4 @@
-//! Normalized structural search (`search_ast`, issue #328).
+//! Normalized structural search (`query_code`, issue #328).
 //!
 //! Layering, language-independent unless noted:
 //! - [`adapter_helpers`]: small shared mechanics for language adapters.
@@ -17,7 +17,8 @@
 //!   source-hash-validated facts cache behind it.
 //! - [`search`]: parallel workspace execution and the tool-facing output.
 //!
-//! See `.agent/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the plan and decisions.
+//! See `.agents/plans/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the original plan
+//! and `.agents/plans/issue-449-query-code-reference.md` for the public rename.
 
 pub(crate) mod adapter_helpers;
 pub(crate) mod capabilities;
@@ -35,13 +36,13 @@ pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
 pub use provider::{StructuralFactsCache, StructuralSearchProvider};
 pub use query::{
-    AstQuery, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
-    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
-    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
-    SCHEMA_VERSION, SearchAstResultDetail, StringPredicate,
+    CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    Pattern, QueryError, SCHEMA_VERSION, StringPredicate,
 };
 pub use search::{
-    SearchAstCapture, SearchAstExecutionLimits, SearchAstMatch, SearchAstOutput, SearchAstRange,
+    CodeQueryCapture, CodeQueryExecutionLimits, CodeQueryMatch, CodeQueryRange, CodeQueryResult,
     execute, execute_with_limits,
 };
 pub use spec::{RoleSink, StructuralSpec};

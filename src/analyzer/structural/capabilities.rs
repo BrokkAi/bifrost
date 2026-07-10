@@ -1,12 +1,12 @@
 //! Query feature requirements and capability diagnostics.
 //!
-//! `AstQuery` remains the semantic matcher input. This module is the narrower
+//! `CodeQuery` remains the semantic matcher input. This module is the narrower
 //! planning surface for asking whether a language adapter can evaluate the
 //! kinds and roles a query references, and for turning unsupported features
 //! into stable diagnostics.
 
 use super::kinds::{NormalizedKind, Role};
-use super::query::AstQuery;
+use super::query::CodeQuery;
 use crate::analyzer::Language;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -21,7 +21,7 @@ pub(crate) struct QueryFeatures {
 }
 
 impl QueryFeatures {
-    pub(crate) fn for_query(query: &AstQuery) -> Self {
+    pub(crate) fn for_query(query: &CodeQuery) -> Self {
         let features = query
             .referenced_kinds()
             .into_iter()
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn query_features_are_grouped_and_sorted() {
-        let query = AstQuery::from_json(&json!({
+        let query = CodeQuery::from_json(&json!({
             "match": {
                 "kind": "call",
                 "callee": { "name": "eval" },

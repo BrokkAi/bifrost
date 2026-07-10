@@ -1,4 +1,4 @@
-//! PHP structural spec for `search_ast`.
+//! PHP structural spec for `query_code`.
 
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{

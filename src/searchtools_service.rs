@@ -451,8 +451,8 @@ impl SearchToolsService {
                 render_options,
                 |workspace, params| usage_graph(workspace.analyzer(), params),
             ),
-            "search_ast" => {
-                let output = Self::search_ast_output_for_snapshot(&snapshot, arguments)?;
+            "query_code" => {
+                let output = Self::query_code_result_for_snapshot(&snapshot, arguments)?;
                 let rendered_text = output.render_text();
                 let structured = serde_json::to_value(&output).map_err(|err| {
                     SearchToolsServiceError::internal(format!(
@@ -566,20 +566,20 @@ impl SearchToolsService {
         }
     }
 
-    pub fn search_ast_output(
+    pub fn query_code_result(
         &self,
         arguments: Value,
-    ) -> Result<crate::analyzer::structural::SearchAstOutput, SearchToolsServiceError> {
-        let arguments = self.normalize_arguments_for_current_workspace("search_ast", arguments)?;
+    ) -> Result<crate::analyzer::structural::CodeQueryResult, SearchToolsServiceError> {
+        let arguments = self.normalize_arguments_for_current_workspace("query_code", arguments)?;
         let snapshot = self.snapshot_for_query()?;
-        Self::search_ast_output_for_snapshot(&snapshot, arguments)
+        Self::query_code_result_for_snapshot(&snapshot, arguments)
     }
 
-    fn search_ast_output_for_snapshot(
+    fn query_code_result_for_snapshot(
         snapshot: &WorkspaceAnalyzer,
         arguments: Value,
-    ) -> Result<crate::analyzer::structural::SearchAstOutput, SearchToolsServiceError> {
-        let query = crate::analyzer::structural::AstQuery::from_json(&arguments)
+    ) -> Result<crate::analyzer::structural::CodeQueryResult, SearchToolsServiceError> {
+        let query = crate::analyzer::structural::CodeQuery::from_json(&arguments)
             .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
         Ok(crate::analyzer::structural::execute(
             snapshot.analyzer(),

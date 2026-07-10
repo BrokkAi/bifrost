@@ -101,6 +101,7 @@ that matches the thing you are looking for.
 |---|---|
 | Find a symbol by name | `search_symbols` |
 | Find callers, references, or usages | `scan_usages` |
+| Find language-neutral code shapes | `query_code` |
 | Find files by path or glob | `find_filenames` |
 | List files under a directory | `list_files` |
 | Expand from seed files to related code | `most_relevant_files` |
@@ -113,6 +114,11 @@ that matches the thing you are looking for.
   declarations are relevant.
 - Use `scan_usages` for references and call sites. It is the structured
   analyzer-backed path and should be preferred over grep for code references.
+- Use `query_code` for normalized syntactic shapes such as calls by callee,
+  assignments by left/right roles, imports, decorators, containment, or
+  captures. Version 1 is syntactic; use `scan_usages` or `usage_graph` when
+  symbol identity or resolved caller/callee edges matter. The schema reference
+  is https://brokkai.github.io/bifrost/code-query-json/.
 - Use `find_filenames` for path globs, basename searches, and repository file
   discovery.
 - Use `list_files` when you need a bounded directory listing that respects the

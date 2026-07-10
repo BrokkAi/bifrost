@@ -12,7 +12,7 @@
 
 use super::facts::{FileFacts, RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
-use super::query::{AstQuery, Pattern};
+use super::query::{CodeQuery, Pattern};
 
 #[derive(Debug)]
 pub(crate) struct CaptureBinding {
@@ -33,7 +33,7 @@ pub(crate) struct FactMatch {
 /// `max_matches` hits. Callers pass one more than they can return so global
 /// truncation stays detectable without collecting unbounded per-file results.
 pub(crate) fn match_query(
-    query: &AstQuery,
+    query: &CodeQuery,
     facts: &FileFacts,
     max_matches: usize,
 ) -> Vec<FactMatch> {

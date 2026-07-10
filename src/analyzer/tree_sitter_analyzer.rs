@@ -127,7 +127,7 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         None
     }
     /// Optional structural-search spec (issue #328). Languages that return
-    /// `Some` expose `search_ast` support through
+    /// `Some` expose `query_code` support through
     /// [`crate::analyzer::structural::StructuralSearchProvider`].
     fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
         None

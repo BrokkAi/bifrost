@@ -1,15 +1,15 @@
 use super::ir::{
-    AstQuery, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
-    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    Pattern, QueryError, SCHEMA_VERSION, SearchAstResultDetail, StringPredicate,
+    CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
+    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
+    MAX_WHERE_GLOBS, Pattern, QueryError, SCHEMA_VERSION, StringPredicate,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
 use regex::Regex;
 use serde_json::{Map, Value};
 
-impl AstQuery {
+impl CodeQuery {
     pub fn from_json(value: &Value) -> Result<Self, QueryError> {
         let object = as_object(value, "")?;
         let mut budget = QueryBudget::default();
@@ -80,7 +80,7 @@ impl AstQuery {
             Some(value) => decode_limit(value, "limit")?,
         };
         let result_detail = match object.get("result_detail") {
-            None => SearchAstResultDetail::Compact,
+            None => CodeQueryResultDetail::Compact,
             Some(value) => decode_result_detail(value, "result_detail")?,
         };
 
@@ -226,11 +226,11 @@ fn decode_schema_version(value: &Value, path: &str) -> Result<u64, QueryError> {
     Ok(version)
 }
 
-fn decode_result_detail(value: &Value, path: &str) -> Result<SearchAstResultDetail, QueryError> {
+fn decode_result_detail(value: &Value, path: &str) -> Result<CodeQueryResultDetail, QueryError> {
     let label = value
         .as_str()
         .ok_or_else(|| QueryError::new(path, "expected \"compact\" or \"full\""))?;
-    SearchAstResultDetail::from_label(label).ok_or_else(|| {
+    CodeQueryResultDetail::from_label(label).ok_or_else(|| {
         QueryError::new(
             path,
             format!("unknown result detail {label:?}; expected \"compact\" or \"full\""),

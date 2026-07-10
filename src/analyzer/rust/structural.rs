@@ -1,4 +1,4 @@
-//! Rust structural spec for `search_ast`.
+//! Rust structural spec for `query_code`.
 
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
