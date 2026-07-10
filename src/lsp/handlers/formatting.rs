@@ -904,10 +904,7 @@ mod tests {
                 "rust",
             ]
         );
-        assert_eq!(
-            command.cwd.canonicalize().unwrap(),
-            root.clone().normalize().join("pkg")
-        );
+        assert_eq!(command.cwd, root.clone().normalize().join("pkg"));
     }
 
     #[test]
