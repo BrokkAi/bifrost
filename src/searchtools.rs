@@ -20,6 +20,7 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
+use crate::lsp::conversion::percent_decode;
 use crate::model_context;
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, has_drive_letter_prefix,
@@ -525,6 +526,25 @@ fn anchor_not_found_input(input: impl Into<String>, anchor: &str, name: &str) ->
             "`{name}` resolved, but no definition is in `{anchor}`; re-call with the bare name to list valid selectors"
         )),
     )
+}
+
+fn symbol_source_anchor_not_found_input(
+    input: impl Into<String>,
+    anchor: &str,
+    name: &str,
+    candidate_names: &[String],
+) -> NotFoundInput {
+    if looks_like_extensionless_path_anchor(anchor)
+        && let [canonical] = candidate_names
+    {
+        return not_found_input(
+            input,
+            Some(format!(
+                "`{anchor}` looks like a source path missing its extension; retry with the canonical workspace symbol `{canonical}`"
+            )),
+        );
+    }
+    anchor_not_found_input(input, anchor, name)
 }
 
 fn renderable_not_found_input(input: impl Into<String>) -> NotFoundInput {
@@ -1584,7 +1604,7 @@ fn resolve_definition_context_symbol(
             kind: "ambiguous_symbol".to_string(),
             message: format!(
                 "`{symbol}` is ambiguous; matches: {}",
-                code_unit_match_names(matches).join(", ")
+                code_unit_match_names(&matches).join(", ")
             ),
         }]),
         CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
@@ -2008,14 +2028,19 @@ fn resolve_selectable_definitions(
 
     let code_units = match anchor {
         Some(anchor) => {
+            let candidate_names = if looks_like_extensionless_path_anchor(&anchor) {
+                code_unit_match_names(&code_units)
+            } else {
+                Vec::new()
+            };
             let narrowed: Vec<CodeUnit> = code_units
                 .into_iter()
                 .filter(|unit| rel_path_string(unit.source()) == anchor)
                 .collect();
             if narrowed.is_empty() {
-                return SelectableDefinitionResolution::NotFound(anchor_not_found_input(
-                    input, &anchor, lookup,
-                ));
+                return SelectableDefinitionResolution::NotFound(
+                    symbol_source_anchor_not_found_input(input, &anchor, lookup, &candidate_names),
+                );
             }
             narrowed
         }
@@ -3036,13 +3061,8 @@ fn prefer_exact_lookup_matches(overloads: Vec<CodeUnit>, lookup: &str) -> Vec<Co
     }
 }
 
-fn code_unit_match_names(matches: Vec<CodeUnit>) -> Vec<String> {
-    dedupe_preserving_order(
-        matches
-            .into_iter()
-            .map(|unit| definition_selector(&unit))
-            .collect(),
-    )
+fn code_unit_match_names(matches: &[CodeUnit]) -> Vec<String> {
+    dedupe_preserving_order(matches.iter().map(definition_selector).collect())
 }
 
 fn ambiguous_usage_symbol_from_groups(
@@ -6616,6 +6636,18 @@ fn unsupported_selector_shape_guidance(analyzer: &dyn IAnalyzer, input: &str) ->
             anchor.anchor, anchor.file_path
         ));
     }
+    let decoded = percent_decode(trimmed);
+    if decoded != trimmed
+        && let Some(anchor) = line_range_anchor_selector(&decoded)
+    {
+        return Some(format!(
+            "`{trimmed}` contains a URL-encoded line/range anchor; decode it to `{decoded}`. Line/range anchors are not symbol selectors; use get_summaries or `{}` as a file target for an outline, or retry as path#symbol with a real symbol name.",
+            anchor.file_path
+        ));
+    }
+    if let Some(note) = invalid_file_anchored_selector_guidance(analyzer, trimmed) {
+        return Some(note);
+    }
     if let Some(name) = signature_string_selector_name(trimmed) {
         return Some(format!(
             "signature strings are not supported as symbol selectors; retry with the bare function name `{name}`"
@@ -6643,7 +6675,10 @@ struct LineRangeAnchorSelector<'a> {
 }
 
 fn line_range_anchor_selector(input: &str) -> Option<LineRangeAnchorSelector<'_>> {
-    let (file_path, anchor) = input.rsplit_once('#').or_else(|| input.rsplit_once(':'))?;
+    let (file_path, anchor) = input
+        .rsplit_once("::")
+        .or_else(|| input.rsplit_once('#'))
+        .or_else(|| input.rsplit_once(':'))?;
     if file_path.is_empty() || anchor.is_empty() {
         return None;
     }
@@ -6651,10 +6686,57 @@ fn line_range_anchor_selector(input: &str) -> Option<LineRangeAnchorSelector<'_>
 }
 
 fn is_line_range_anchor(anchor: &str) -> bool {
+    if let Some(line) = anchor
+        .strip_prefix("line ")
+        .or_else(|| anchor.strip_prefix("Line "))
+    {
+        return !line.is_empty() && line.chars().all(|ch| ch.is_ascii_digit());
+    }
     let Some((start, end)) = anchor.split_once('-') else {
         return is_line_anchor_part(anchor);
     };
     is_line_anchor_part(start) && is_line_anchor_part(end)
+}
+
+fn invalid_file_anchored_selector_guidance(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+) -> Option<String> {
+    let (path, selector) = input.split_once('#')?;
+    if path.is_empty() || selector.is_empty() {
+        return None;
+    }
+    let file = match WorkspaceFileResolver::new(analyzer.project()).resolve_literal(path) {
+        ResolvedFileInput::File(file) => file,
+        ResolvedFileInput::Ambiguous(_) | ResolvedFileInput::NotFound(_) => return None,
+    };
+    let path = rel_path_string(&file);
+    if let Some(shorter) = redundant_filename_selector(&file, selector) {
+        return Some(format!(
+            "`{selector}` redundantly repeats the file name; retry `{path}#{shorter}`"
+        ));
+    }
+    Some(format!(
+        "`{selector}` is not a symbol selector for existing file `{path}`; use `{path}` as a file target for an outline, or retry `{path}#<symbol>` with a real symbol name"
+    ))
+}
+
+fn redundant_filename_selector<'a>(file: &ProjectFile, selector: &'a str) -> Option<&'a str> {
+    let filename = file.rel_path().file_name()?.to_str()?;
+    selector
+        .strip_prefix(filename)?
+        .strip_prefix('.')
+        .filter(|shorter| !shorter.is_empty())
+}
+
+fn looks_like_extensionless_path_anchor(anchor: &str) -> bool {
+    let Some(path) = workspace_rel_path(anchor) else {
+        return false;
+    };
+    (anchor.contains('/') || anchor.contains('\\'))
+        && path
+            .file_name()
+            .is_some_and(|name| std::path::Path::new(name).extension().is_none())
 }
 
 fn is_line_anchor_part(part: &str) -> bool {

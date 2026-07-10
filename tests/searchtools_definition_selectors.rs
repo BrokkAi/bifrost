@@ -1007,6 +1007,65 @@ fn line_range_selectors_report_symbol_selector_guidance() {
 }
 
 #[test]
+fn selector_shaped_invalid_inputs_report_specific_recovery_guidance() {
+    let project = InlineTestProject::new()
+        .file(
+            "src/MudBlazor/Components/Tabs/MudTabs.cs",
+            "class MudTabs {}\n",
+        )
+        .file(
+            "tests/Tests/ORM/Query/ExprTest.php",
+            "<?php class ExprTest {}\n",
+        )
+        .file(
+            "src/plugin/duration/index.js",
+            "export function duration() {}\n",
+        )
+        .file("src/core.ts", "export class ProcessPromise {}\n")
+        .file(
+            "core-common/src/main/java/org/zalando/nakadi/util/CompressionBodyRequestFilter.java",
+            "package org.zalando.nakadi.util;\nclass CompressionBodyRequestFilter {}\n",
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["src/MudBlazor/Components/Tabs/MudTabs.cs::line 60","tests/Tests/ORM/Query/ExprTest.php%3A1-12","src/plugin/duration/index.js#index.js","src/core.ts#core.ts.ProcessPromise","core-common/src/main/java/org/zalando/nakadi/util/CompressionBodyRequestFilter#CompressionBodyRequestFilter"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    let not_found = result["not_found"].as_array().unwrap();
+    assert_eq!(5, not_found.len(), "{result}");
+    let notes: Vec<_> = not_found.iter().map(not_found_note).collect();
+    assert!(
+        notes[0].contains("`line 60` is a line/range anchor")
+            && notes[0].contains("src/MudBlazor/Components/Tabs/MudTabs.cs"),
+        "{result}"
+    );
+    assert!(
+        notes[1].contains("URL-encoded line/range anchor")
+            && notes[1].contains("ExprTest.php:1-12"),
+        "{result}"
+    );
+    assert!(
+        notes[2].contains("not a symbol selector for existing file")
+            && notes[2].contains("src/plugin/duration/index.js#<symbol>"),
+        "{result}"
+    );
+    assert_eq!(
+        "`core.ts.ProcessPromise` redundantly repeats the file name; retry `src/core.ts#ProcessPromise`",
+        notes[3],
+        "{result}"
+    );
+    assert_eq!(
+        "`core-common/src/main/java/org/zalando/nakadi/util/CompressionBodyRequestFilter` looks like a source path missing its extension; retry with the canonical workspace symbol `org.zalando.nakadi.util.CompressionBodyRequestFilter`",
+        notes[4],
+        "{result}"
+    );
+}
+
+#[test]
 fn unsupported_selector_shapes_report_specific_recovery_guidance() {
     let project = InlineTestProject::new()
         .file("src/unix/pipe.c", "int includes_nul(void) { return 0; }\n")
