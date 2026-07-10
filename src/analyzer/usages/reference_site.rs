@@ -96,12 +96,10 @@ pub(crate) fn resolve_reference_site_with_line_starts(
             }
             let point =
                 byte_offset_for_character_column(source, line_start, line_end, line, column)?;
-            token_bounds_at(
-                source,
-                point.min(source.len().saturating_sub(1)),
-                allow_at_ident,
-            )
-            .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
+            let point = point.min(source.len().saturating_sub(1));
+            token_bounds_at(source, point, allow_at_ident)
+                .or_else(|| single_non_whitespace_character_at(source, point))
+                .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
         }
         _ => return Err("provide either start_byte or line/column".to_string()),
     };
@@ -132,6 +130,11 @@ pub(crate) fn resolve_reference_site_with_line_starts(
         focus_start_byte: selection_start,
         focus_end_byte: selection_end,
     })
+}
+
+fn single_non_whitespace_character_at(source: &str, byte: usize) -> Option<(usize, usize)> {
+    let character = source.get(byte..)?.chars().next()?;
+    (!character.is_whitespace()).then_some((byte, byte + character.len_utf8()))
 }
 
 pub(crate) fn byte_offset_for_character_column(

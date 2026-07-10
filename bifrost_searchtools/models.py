@@ -152,8 +152,6 @@ class SearchSymbolsResult:
 
 @dataclass(frozen=True)
 class CodeQueryRange:
-    start_byte: int
-    end_byte: int
     start_line: int
     start_column: int
     end_line: int
@@ -162,8 +160,6 @@ class CodeQueryRange:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryRange:
         return cls(
-            start_byte=int(data["start_byte"]),
-            end_byte=int(data["end_byte"]),
             start_line=int(data["start_line"]),
             start_column=int(data["start_column"]),
             end_line=int(data["end_line"]),
@@ -595,8 +591,6 @@ class RenameSymbolTarget:
 @dataclass(frozen=True)
 class RenameTextEdit:
     old_text: str
-    start_byte: int
-    end_byte: int
     start_line: int
     start_column: int
     end_line: int
@@ -607,8 +601,6 @@ class RenameTextEdit:
     def from_dict(cls, data: dict) -> RenameTextEdit:
         return cls(
             old_text=data["old_text"],
-            start_byte=int(data["start_byte"]),
-            end_byte=int(data["end_byte"]),
             start_line=int(data["start_line"]),
             start_column=int(data["start_column"]),
             end_line=int(data["end_line"]),
@@ -912,6 +904,7 @@ class ScanUsagesResult:
     def render_text(self) -> str:
         if self.rendered_text is not None:
             return self.rendered_text
+        tool_name = _scan_usages_tool_name(self.structured)
         usages = self.structured.get("usages", [])
         blocks: list[str] = []
         for usage in usages:
@@ -927,7 +920,7 @@ class ScanUsagesResult:
                 )
             if usage.get("candidate_files_truncated"):
                 lines.append(
-                    "  note: candidate file set was truncated; re-call scan_usages with narrower paths."
+                    f"  note: candidate file set was truncated; re-call {tool_name} with narrower paths."
                 )
             if usage.get("definition_sites_excluded") is not None:
                 lines.append(
@@ -986,7 +979,13 @@ class ScanUsagesResult:
                 matches = ", ".join(item.get("candidate_targets", []))
                 note = item.get(
                     "note",
-                    "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
+                    (
+                        "Ambiguous; re-call scan_usages_by_location with a refined "
+                        "line/column target from candidate_details."
+                        if tool_name == "scan_usages_by_location"
+                        else "Ambiguous; re-call scan_usages_by_reference with one "
+                        "symbolic selector from candidate_targets."
+                    ),
                 )
                 lines.append(
                     f"| `{item.get('symbol', '<unknown>')}` | {matches} | {note} |"
@@ -998,7 +997,7 @@ class ScanUsagesResult:
             for item in too_many:
                 note = item.get(
                     "note",
-                    "Re-call scan_usages with narrower paths to reduce the scan scope.",
+                    f"Re-call {tool_name} with narrower paths to reduce the scan scope.",
                 )
                 lines.append(
                     f"- `{item.get('symbol', '<unknown>')}`: {item.get('total_callsites', '?')} "
@@ -1013,6 +1012,13 @@ class ScanUsagesResult:
                 )
             return "No usages found."
         return "\n\n".join(blocks)
+
+
+def _scan_usages_tool_name(structured: dict) -> str:
+    for result in structured.get("results", []):
+        if result.get("input_kind") == "target":
+            return "scan_usages_by_location"
+    return "scan_usages_by_reference"
 
 
 def _append_usage_hits(lines: list[str], file_group: dict, prefix: str) -> None:
@@ -1257,7 +1263,7 @@ class UsageGraphCallSite:
     """One concrete reference site behind a :class:`UsageGraphEdge`.
 
     ``path`` is workspace-relative and ``line`` is 1-based, matching the
-    ``line`` of a ``scan_usages`` hit and a node's ``start_line``.
+    ``line`` of a scan-usages hit and a node's ``start_line``.
     """
 
     path: str

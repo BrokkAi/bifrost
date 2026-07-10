@@ -35,7 +35,7 @@ default plugin install.
 |---|---|
 | `search_symbols` | Find classes, methods, fields, functions, modules, and other indexed declarations by name |
 | `get_symbol_locations` | Get project-relative file paths and line ranges for known symbols |
-| `scan_usages` | Find references, call sites, usages, callers, and related tests for known symbols or declaration locations |
+| `scan_usages_by_location` | Find references, call sites, usages, callers, and related tests for known symbols or declaration locations |
 | `most_relevant_files` | Rank project files related to a set of seed files using imports and git history |
 
 #### Tips
@@ -44,7 +44,7 @@ default plugin install.
   names and accepts `include_tests: true` when tests matter.
 - Use `get_symbol_locations` when you need exact definition coordinates before
   opening or editing a declaration.
-- Use `scan_usages` instead of text search when changing behavior and callers
+- Use `scan_usages_by_location` instead of text search when changing behavior and callers
   or references matter. Pass fully qualified symbols from `search_symbols`
   where possible, or use source-location targets when you only know the file
   and declaration line.
@@ -100,7 +100,7 @@ that matches the thing you are looking for.
 | Goal | Tool |
 |---|---|
 | Find a symbol by name | `search_symbols` |
-| Find callers, references, or usages | `scan_usages` |
+| Find callers, references, or usages | `scan_usages_by_location` |
 | Find language-neutral code shapes | `query_code` |
 | Find files by path or glob | `find_filenames` |
 | List files under a directory | `list_files` |
@@ -112,11 +112,11 @@ that matches the thing you are looking for.
 - Use `search_symbols` for questions like "where is `parseRequest` defined?"
   or "which services match `.*Service`?". Pass `include_tests: true` when test
   declarations are relevant.
-- Use `scan_usages` for references and call sites. It is the structured
+- Use `scan_usages_by_location` for references and call sites. It is the structured
   analyzer-backed path and should be preferred over grep for code references.
 - Use `query_code` for normalized syntactic shapes such as calls by callee,
   assignments by left/right roles, imports, decorators, containment, or
-  captures. Version 1 is syntactic; use `scan_usages` or `usage_graph` when
+  captures. Version 1 is syntactic; use `scan_usages_by_location` or `usage_graph` when
   symbol identity or resolved caller/callee edges matter. The schema reference
   is https://brokkai.github.io/bifrost/code-query-json/.
 - Use `find_filenames` for path globs, basename searches, and repository file

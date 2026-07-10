@@ -291,7 +291,7 @@ impl RenderText for MostRelevantFilesResult {
 impl RenderText for ScanUsagesResult {
     fn render_text(&self, _options: RenderOptions) -> String {
         if self.results.is_empty() {
-            return "No scan_usages requests were provided.".to_string();
+            return format!("No {} requests were provided.", self.surface.tool_name());
         }
         let mut sections = Vec::new();
         if self.results.iter().any(|entry| {
@@ -318,7 +318,7 @@ impl RenderText for ScanUsagesResult {
 }
 
 impl RenderText for UsageGraphResult {
-    fn render_text(&self, _options: RenderOptions) -> String {
+    fn render_text(&self, options: RenderOptions) -> String {
         let mut lines = vec![format!(
             "{} nodes, {} edges",
             self.nodes.len(),
@@ -326,8 +326,13 @@ impl RenderText for UsageGraphResult {
         )];
         if !self.truncated_symbols.is_empty() {
             lines.push(format!(
-                "{} truncated symbol(s); re-call scan_usages with narrower paths for call-site detail:",
-                self.truncated_symbols.len()
+                "{} truncated symbol(s); re-call {} with narrower paths for call-site detail:",
+                self.truncated_symbols.len(),
+                if options.render_line_numbers {
+                    "scan_usages_by_location"
+                } else {
+                    "scan_usages_by_reference"
+                }
             ));
             lines.extend(self.truncated_symbols.iter().map(|symbol| {
                 format!(
@@ -493,8 +498,9 @@ fn render_scan_usages_summary_banner(result: &ScanUsagesResult) -> String {
         "requests"
     };
     let mut lines = vec![format!(
-        "{} scan_usages {request_label}: {}; see per-request sections.",
+        "{} {} {request_label}: {}; see per-request sections.",
         summary.requested,
+        result.surface.tool_name(),
         parts.join("; ")
     )];
 

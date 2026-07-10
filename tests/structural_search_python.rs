@@ -101,7 +101,7 @@ fn full_result_detail_includes_stable_ranges_and_capture_kind() {
     let id = first.id.as_deref().expect("full detail match id");
     assert!(id.contains("src/app.py:call:"), "{id}");
     let range = first.node_range.expect("full detail node range");
-    assert!(range.start_byte < range.end_byte);
+    assert!((range.start_line, range.start_column) < (range.end_line, range.end_column));
     assert_eq!(range.start_line, first.start_line);
     assert_eq!(range.end_line, first.end_line);
     assert!(range.start_column >= 1);

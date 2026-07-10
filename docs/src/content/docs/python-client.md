@@ -66,7 +66,7 @@ Use `manual=True` with `update_paths(...)` when the caller wants to control incr
 | Workspace | `refresh()`, `update_paths(...)`, `activate_workspace(...)`, `get_active_workspace()` |
 | Symbols and summaries | `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `contains_tests(...)` |
 | Definitions and types | `get_definitions_by_location(...)`, `get_definitions_by_reference(...)`, `get_type_by_location(...)` |
-| Usages and graph | `scan_usages(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)`, `analyze_commit(...)` |
+| Usages and graph | `scan_usages_by_reference(...)`, `scan_usages_by_location(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)`, `analyze_commit(...)` |
 | Code query | `query_code(...)` |
 | Semantic search | `semantic_search(...)`, `semantic_search_status()` |
 | Files | `get_file_contents(...)`, `find_filenames(...)`, `search_file_contents(...)`, `find_files_containing(...)`, `list_files(...)` |
@@ -84,7 +84,7 @@ The many per-rule tuning knobs on code-quality smell reports are accepted throug
 
 `query_code(...)` is the version-1 normalized structural query surface. Omit `schema_version` for v1 or pass `schema_version=1` explicitly. Version 1 is syntactic: it does not traverse call graphs, resolve types, or perform control/data-flow analysis. See [Code Querying](../code-querying/) for tool selection and [JSON CodeQuery](../code-query-json/) for the complete pattern schema.
 
-Compact output is the default and includes project-relative path, language, normalized kind, line range, a short snippet, captures, and an enclosing symbol when available. Pass `result_detail="full"` when a rule, refactoring step, or follow-up tool call needs deterministic match ids, byte offsets, 1-based character columns, decorator ranges, and capture ranges.
+Compact output is the default and includes project-relative path, language, normalized kind, line range, a short snippet, captures, and an enclosing symbol when available. Pass `result_detail="full"` when a rule, refactoring step, or follow-up tool call needs deterministic match ids, 1-based character columns, decorator ranges, and capture ranges.
 
 ## Tests
 

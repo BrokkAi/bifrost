@@ -177,7 +177,16 @@ class SearchToolsClientTest(unittest.TestCase):
 
         self.assertIsNotNone(detailed.matches[0].id)
         self.assertIsNotNone(detailed.matches[0].node_range)
-        self.assertGreater(detailed.matches[0].node_range.end_byte, detailed.matches[0].node_range.start_byte)
+        self.assertGreater(
+            (
+                detailed.matches[0].node_range.end_line,
+                detailed.matches[0].node_range.end_column,
+            ),
+            (
+                detailed.matches[0].node_range.start_line,
+                detailed.matches[0].node_range.start_column,
+            ),
+        )
         self.assertEqual(detailed.matches[0].captures[0].kind, "class")
         self.assertIsNotNone(detailed.matches[0].captures[0].range)
         self.assertGreaterEqual(detailed.matches[0].captures[0].range.end_line, detailed.matches[0].captures[0].start_line)
@@ -271,7 +280,17 @@ class SearchToolsClientTest(unittest.TestCase):
 
     def test_scan_usages_returns_rendered_native_payload(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
-            usages = client.scan_usages(["A.method2"])
+            usages = client.scan_usages_by_reference(["A.method2"])
+            text = usages.render_text()
+
+        self.assertIn("A.method2", text)
+        self.assertIsInstance(usages.structured, dict)
+
+    def test_scan_usages_by_location_returns_rendered_native_payload(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            usages = client.scan_usages_by_location(
+                [{"path": "A.java", "line": 8, "column": 19}]
+            )
             text = usages.render_text()
 
         self.assertIn("A.method2", text)

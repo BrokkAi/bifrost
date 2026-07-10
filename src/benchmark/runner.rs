@@ -100,38 +100,24 @@ fn run_repo(
             )
         })
         .collect();
-    if !mcp_scenarios.is_empty() {
-        match McpSession::start(&workspace_path).and_then(|mut session| {
-            session.initialize()?;
-            Ok(session)
-        }) {
-            Ok(mut session) => {
-                for scenario in mcp_scenarios {
-                    scenario_reports.push(run_mcp_scenario(
-                        target,
-                        manifest,
-                        &mut session,
-                        scenario,
-                    ));
-                }
-            }
-            Err(err) => {
-                for scenario in mcp_scenarios {
-                    scenario_reports.push(ScenarioReport::from_timings(
-                        scenario,
-                        ScenarioTransport::Mcp,
-                        false,
-                        Vec::new(),
-                        Vec::new(),
-                        Some(format!(
-                            "failed to start MCP session for `{}`: {err}",
-                            target.name
-                        )),
-                    ));
-                }
-            }
-        }
-    }
+    let (reference_scan_scenarios, location_mode_scenarios): (Vec<_>, Vec<_>) =
+        mcp_scenarios.into_iter().partition(|scenario| {
+            *scenario == BenchmarkScenario::ScanUsages && target.usage_targets.is_empty()
+        });
+    scenario_reports.extend(run_mcp_scenarios(
+        target,
+        manifest,
+        &workspace_path,
+        location_mode_scenarios,
+        false,
+    ));
+    scenario_reports.extend(run_mcp_scenarios(
+        target,
+        manifest,
+        &workspace_path,
+        reference_scan_scenarios,
+        true,
+    ));
 
     if target
         .scenario_set()
@@ -157,6 +143,14 @@ fn run_repo(
         ));
     }
 
+    scenario_reports.sort_by_key(|report| {
+        target
+            .scenarios
+            .iter()
+            .position(|scenario| *scenario == report.name)
+            .unwrap_or(usize::MAX)
+    });
+
     Ok(BenchmarkRepoReport {
         name: target.name.clone(),
         url: target.url.clone(),
@@ -166,6 +160,44 @@ fn run_repo(
         subset_max_files: request.max_files,
         scenarios: scenario_reports,
     })
+}
+
+fn run_mcp_scenarios(
+    target: &BenchmarkRepoTarget,
+    manifest: &BenchmarkManifest,
+    workspace_path: &Path,
+    scenarios: Vec<BenchmarkScenario>,
+    no_line_numbers: bool,
+) -> Vec<ScenarioReport> {
+    if scenarios.is_empty() {
+        return Vec::new();
+    }
+
+    match McpSession::start(workspace_path, no_line_numbers).and_then(|mut session| {
+        session.initialize()?;
+        Ok(session)
+    }) {
+        Ok(mut session) => scenarios
+            .into_iter()
+            .map(|scenario| run_mcp_scenario(target, manifest, &mut session, scenario))
+            .collect(),
+        Err(err) => scenarios
+            .into_iter()
+            .map(|scenario| {
+                ScenarioReport::from_timings(
+                    scenario,
+                    ScenarioTransport::Mcp,
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(format!(
+                        "failed to start MCP session for `{}`: {err}",
+                        target.name
+                    )),
+                )
+            })
+            .collect(),
+    }
 }
 
 fn run_hierarchy_scenario(
@@ -592,7 +624,10 @@ fn run_mcp_scenario(
     for _ in 0..manifest.warmup_iterations {
         let start = Instant::now();
         let outcome = session
-            .call_tool(scenario.tool_name(), tool_arguments(target, scenario))
+            .call_tool(
+                scenario_tool_name(target, scenario),
+                tool_arguments(target, scenario),
+            )
             .and_then(|result| assert_scenario_result(target, scenario, &result));
         match outcome {
             Ok(()) => warmup_durations_ms.push(elapsed_ms(start)),
@@ -612,7 +647,10 @@ fn run_mcp_scenario(
     for _ in 0..manifest.measured_iterations {
         let start = Instant::now();
         let outcome = session
-            .call_tool(scenario.tool_name(), tool_arguments(target, scenario))
+            .call_tool(
+                scenario_tool_name(target, scenario),
+                tool_arguments(target, scenario),
+            )
             .and_then(|result| assert_scenario_result(target, scenario, &result));
         match outcome {
             Ok(()) => measured_durations_ms.push(elapsed_ms(start)),
@@ -637,6 +675,14 @@ fn run_mcp_scenario(
         measured_durations_ms,
         None,
     )
+}
+
+fn scenario_tool_name(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> &'static str {
+    if scenario == BenchmarkScenario::ScanUsages && !target.usage_targets.is_empty() {
+        "scan_usages_by_location"
+    } else {
+        scenario.tool_name()
+    }
 }
 
 fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> Value {
@@ -696,9 +742,7 @@ fn location_selector_arguments(selector: &BenchmarkLocationSelector) -> Value {
     json!({
         "path": selector.path,
         "line": selector.line,
-        "column": selector.column,
-        "start_byte": selector.start_byte,
-        "end_byte": selector.end_byte
+        "column": selector.column
     })
 }
 

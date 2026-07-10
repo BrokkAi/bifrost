@@ -27,6 +27,18 @@ fn character_column_of(line: &str, needle: &str) -> usize {
         + 1
 }
 
+fn location_reference(path: &str, source: &str, start: usize) -> String {
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current_line)| current_line)
+        .chars()
+        .count()
+        + 1;
+    json!({"references": [{"path": path, "line": line, "column": column}]}).to_string()
+}
+
 #[test]
 fn ruby_get_definition_resolves_constant_reference_to_class() {
     let project = InlineTestProject::with_language(Language::Ruby)
@@ -5359,7 +5371,7 @@ pub fn run() {
 }
 
 #[test]
-fn invalid_utf8_byte_range_returns_diagnostic_instead_of_panicking() {
+fn legacy_byte_range_is_rejected_without_exposing_byte_guidance() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file("lib.rs", "pub fn helper() { let café = 1; }\n")
         .build();
@@ -5376,6 +5388,7 @@ fn invalid_utf8_byte_range_returns_diagnostic_instead_of_panicking() {
     );
 
     assert_eq!(value["results"][0]["status"], "invalid_location", "{value}");
+    assert!(!value.to_string().contains("byte"), "{value}");
 }
 
 #[test]
@@ -13007,11 +13020,7 @@ object App:
     let renderer_start = app_source.find("renderer.render").expect("renderer token");
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            renderer_start,
-            renderer_start + "renderer".len()
-        ),
+        &location_reference("app/App.scala", app_source, renderer_start),
     );
 
     let result = &value["results"][0];
@@ -13024,11 +13033,7 @@ object App:
     let render_start = app_source.find("render(\"ok\")").expect("render token");
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            render_start,
-            render_start + "render".len()
-        ),
+        &location_reference("app/App.scala", app_source, render_start),
     );
 
     let result = &value["results"][0];
@@ -13088,11 +13093,7 @@ object App:
     let render_start = app_source.find("render(\"ok\")").expect("render token");
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            render_start,
-            render_start + "render".len()
-        ),
+        &location_reference("app/App.scala", app_source, render_start),
     );
 
     let result = &value["results"][0];
@@ -13138,11 +13139,7 @@ object App:
     let slug_start = app_source.find(".slug").expect("slug token") + 1;
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            slug_start,
-            slug_start + "slug".len()
-        ),
+        &location_reference("app/App.scala", app_source, slug_start),
     );
 
     let result = &value["results"][0];
@@ -13174,11 +13171,7 @@ object App:
     let slug_start = source.find(".slug").expect("slug token") + 1;
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"src/main/scala/example/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            slug_start,
-            slug_start + "slug".len()
-        ),
+        &location_reference("src/main/scala/example/Workflow.scala", source, slug_start),
     );
 
     let result = &value["results"][0];
@@ -13211,11 +13204,7 @@ object Workflow:
     let slug_start = source.find("u.slug").expect("slug call") + "u.".len();
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            slug_start,
-            slug_start + "slug".len()
-        ),
+        &location_reference("app/Workflow.scala", source, slug_start),
     );
 
     let result = &value["results"][0];
@@ -13243,11 +13232,7 @@ object Workflow:
     let slug_start = source.find("i.slug").expect("slug call") + "i.".len();
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            slug_start,
-            slug_start + "slug".len()
-        ),
+        &location_reference("app/Workflow.scala", source, slug_start),
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
@@ -13281,11 +13266,7 @@ object Workflow:
     let slug_start = app_source.find("u.slug").expect("slug call") + "u.".len();
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            slug_start,
-            slug_start + "slug".len()
-        ),
+        &location_reference("app/Workflow.scala", app_source, slug_start),
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
@@ -13314,11 +13295,7 @@ object Workflow:
     let slug_start = source.find("u.slug").expect("slug call") + "u.".len();
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            slug_start,
-            slug_start + "slug".len()
-        ),
+        &location_reference("app/Workflow.scala", source, slug_start),
     );
 
     let result = &value["results"][0];
@@ -13354,11 +13331,7 @@ object Workflow:
     let slug_start = source.find("s.slug").expect("slug call") + "s.".len();
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Workflow.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            slug_start,
-            slug_start + "slug".len()
-        ),
+        &location_reference("app/Workflow.scala", source, slug_start),
     );
 
     let result = &value["results"][0];
@@ -13765,11 +13738,7 @@ fn scala_postfix_operator_method_resolves_to_definition() {
     let start = controller.find('!').expect("operator");
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Controller.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            start,
-            start + "!".len()
-        ),
+        &location_reference("app/Controller.scala", controller, start),
     );
 
     let result = &value["results"][0];
@@ -13942,11 +13911,7 @@ class Repository {
         + "    ".len();
     let value = lookup(
         project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"example/Service.scala","start_byte":{},"end_byte":{}}}]}}"#,
-            read_start,
-            read_start + "last".len()
-        ),
+        &location_reference("example/Service.scala", service_source, read_start),
     );
 
     let result = &value["results"][0];

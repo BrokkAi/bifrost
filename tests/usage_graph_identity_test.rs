@@ -30,13 +30,13 @@ fn usage_graph(fixture: &str) -> Value {
     serde_json::from_str(&payload).expect("usage_graph returned invalid JSON")
 }
 
-fn scan_usages(fixture: &str, args: &str) -> Value {
+fn scan_usages_by_reference(fixture: &str, args: &str) -> Value {
     let service =
         SearchToolsService::new_without_semantic_index(fixture_root(fixture)).expect("service");
     let payload = service
-        .call_tool_json("scan_usages", args)
-        .expect("scan_usages call failed");
-    serde_json::from_str(&payload).expect("scan_usages returned invalid JSON")
+        .call_tool_json("scan_usages_by_reference", args)
+        .expect("scan_usages_by_reference call failed");
+    serde_json::from_str(&payload).expect("scan_usages_by_reference returned invalid JSON")
 }
 
 /// All `(fqn, path)` pairs for nodes whose fqn equals `fqn`.
@@ -84,7 +84,7 @@ fn same_name_classes_are_distinct_nodes() {
 // candidate_targets, so a caller can pick one rather than scan a conflation.
 #[test]
 fn same_name_classes_are_distinguishable_in_scan_usages() {
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         "usage-graph-ts-samename",
         r#"{"symbols":["Anchor"],"include_tests":true}"#,
     );
@@ -117,7 +117,7 @@ fn same_name_classes_are_distinguishable_in_scan_usages() {
         .find(|target| target.contains("charts/Anchor.ts"))
         .expect("a candidate_target anchored to charts/Anchor.ts");
     let args = format!(r#"{{"symbols":[{chosen:?}],"include_tests":true}}"#);
-    let resolved = scan_usages("usage-graph-ts-samename", &args);
+    let resolved = scan_usages_by_reference("usage-graph-ts-samename", &args);
     assert!(
         resolved["results"]
             .as_array()

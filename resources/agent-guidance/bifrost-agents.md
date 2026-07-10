@@ -9,8 +9,9 @@ plan or modifying code.
 - Use `search_symbols` to find relevant classes, functions, methods, fields, and
   modules by name before opening files manually.
 - Use `get_symbol_sources` when you need the exact body of a known symbol.
-- Use `scan_usages` before changing existing behavior so callers, references,
-  and related tests are considered.
+- Use the available `scan_usages_by_location` or `scan_usages_by_reference`
+  tool before changing existing behavior so callers, references, and related
+  tests are considered.
 - Prefer analyzer-backed summaries, symbols, definitions, and usages over raw
   grep or repeated file reads for code navigation decisions.
 - Trust Bifrost for alias-aware and import-aware resolution. Text search may

@@ -8,8 +8,8 @@ mod common;
 use brokk_bifrost::{
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
     searchtools::{
-        ScanUsagesParams, ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams,
-        get_symbol_locations, get_symbol_sources, scan_usages, search_symbols,
+        ScanUsagesByReferenceParams, ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams,
+        get_symbol_locations, get_symbol_sources, scan_usages_by_reference, search_symbols,
     },
 };
 use common::InlineTestProject;
@@ -238,11 +238,10 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
     let project = canonical_project();
     let analyzer = GoAnalyzer::from_project(project.project().clone());
 
-    let canonical = scan_usages(
+    let canonical = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["example.com/repo/a/list.Run".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["example.com/repo/a/list.Run".to_string()],
             include_tests: true,
             paths: None,
         },
@@ -257,11 +256,10 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
         "{canonical:#?}"
     );
 
-    let bare = scan_usages(
+    let bare = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["list.Run".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["list.Run".to_string()],
             include_tests: true,
             paths: None,
         },

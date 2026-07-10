@@ -47,7 +47,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     vec![
         tool_descriptor(
             "query_code",
-            "Query code structure across languages using normalized node kinds instead of grammar-specific node names. Version 1 is syntactic structural matching: it does not traverse call graphs, resolve types or aliases, or perform control-flow or data-flow analysis. It finds shapes like calls, assignments, decorated declarations, or imports, with named captures and enclosing symbols. Constructor calls are included where adapters support them, positional args match as an ordered subsequence, and unsupported roles/kinds are reported in diagnostics. Use scan_usages when you already know the exact symbol. Minimal query: {\"match\":{\"kind\":\"call\",\"callee\":{\"name\":\"eval\"}}}. Guide: https://brokkai.github.io/bifrost/code-querying/",
+            "Query code structure across languages using normalized node kinds instead of grammar-specific node names. Version 1 is syntactic structural matching: it does not traverse call graphs, resolve types or aliases, or perform control-flow or data-flow analysis. It finds shapes like calls, assignments, decorated declarations, or imports, with named captures and enclosing symbols. Constructor calls are included where adapters support them, positional args match as an ordered subsequence, and unsupported roles/kinds are reported in diagnostics. Use the mode-appropriate scan_usages_by_reference or scan_usages_by_location tool when you already know the exact declaration. Minimal query: {\"match\":{\"kind\":\"call\",\"callee\":{\"name\":\"eval\"}}}. Guide: https://brokkai.github.io/bifrost/code-querying/",
             json!({
                 "type": "object",
                 "properties": {
@@ -86,7 +86,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "type": "string",
                         "enum": ["compact", "full"],
                         "default": "compact",
-                        "description": "Use compact for context-efficient snippets and line ranges. Use full when follow-up tools need deterministic match IDs, byte/line/column ranges, decorator ranges, and capture ranges."
+                        "description": "Use compact for context-efficient snippets and line ranges. Use full when follow-up tools need deterministic match IDs, line/column ranges, decorator ranges, and capture ranges."
                     },
                     "schema_version": {
                         "type": "integer",

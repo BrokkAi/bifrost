@@ -2706,12 +2706,27 @@ fn full_detail_reports_decorator_ranges_for_decorated_callables() {
             "expected one decorator range for {m:?}"
         );
         let decorated_range = m.decorated_range.expect("decorated range");
-        assert!(decorated_range.start_byte <= node_range.start_byte);
-        assert!(decorated_range.end_byte >= node_range.end_byte);
+        assert!(
+            (decorated_range.start_line, decorated_range.start_column)
+                <= (node_range.start_line, node_range.start_column)
+        );
+        assert!(
+            (decorated_range.end_line, decorated_range.end_column)
+                >= (node_range.end_line, node_range.end_column)
+        );
         let decorator_range = m.decorator_ranges[0];
-        assert!(decorator_range.start_byte < decorator_range.end_byte);
-        assert!(decorator_range.start_byte >= decorated_range.start_byte);
-        assert!(decorator_range.end_byte <= decorated_range.end_byte);
+        assert!(
+            (decorator_range.start_line, decorator_range.start_column)
+                < (decorator_range.end_line, decorator_range.end_column)
+        );
+        assert!(
+            (decorator_range.start_line, decorator_range.start_column)
+                >= (decorated_range.start_line, decorated_range.start_column)
+        );
+        assert!(
+            (decorator_range.end_line, decorator_range.end_column)
+                <= (decorated_range.end_line, decorated_range.end_column)
+        );
     }
 }
 

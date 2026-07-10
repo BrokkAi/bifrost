@@ -71,7 +71,8 @@ exposes:
 | `get_type_by_location(path, *, line=..., column=...)` | Resolve the type of an expression or identifier at a known file location. |
 | `get_summaries(targets)` | Signature-level outline of files / classes / directories. |
 | `list_symbols(file_patterns)` | Skim the symbols declared in matching files. |
-| `scan_usages(symbols, *, include_tests=False, paths=None)` | Find references to a symbol. |
+| `scan_usages_by_reference(symbols, *, include_tests=False, paths=None)` | Find references to known symbols. |
+| `scan_usages_by_location(targets, *, include_tests=False, paths=None)` | Find references from declaration line/column targets. |
 | `rename_symbol(path, *, line=..., column=..., new_name=...)` | Return a non-mutating edit plan for a symbol rename. |
 | `usage_graph(*, include_tests=False, paths=None)` | Whole-workspace caller/callee graph; each edge carries its `{path, line}` call sites. |
 | `most_relevant_files(seed_files, *, limit=20, ...)` | Rank files related to seed files. |
@@ -121,7 +122,7 @@ Compact output is the default: matches include project-relative path, language,
 normalized kind, line range, a short snippet, captures, and an enclosing symbol
 when available. Pass `result_detail="full"` when a rule, refactoring step, or
 follow-up tool call needs precise locations. Full detail adds deterministic
-match ids plus byte offsets and 1-based character columns for matches and
+match ids plus 1-based character columns for matches and
 captures.
 
 For decorated or annotated declarations, `node_range` is the matched normalized

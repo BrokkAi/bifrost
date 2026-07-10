@@ -197,8 +197,8 @@ class SearchToolsClient:
         traverse call graphs, control flow, or data flow. ``pattern`` is
         sent as the tool's ``match`` object. ``where`` accepts project-relative
         globs or absolute in-workspace paths/globs.
-        ``result_detail="full"`` includes byte/line/column ranges and stable
-        match ids for follow-up tooling; the default compact mode is optimized
+        ``result_detail="full"`` includes line/column ranges and stable match
+        ids for follow-up tooling; the default compact mode is optimized
         for small LLM contexts.
         """
         arguments: dict[str, Any] = {"match": pattern}
@@ -298,18 +298,12 @@ class SearchToolsClient:
         *,
         line: int | None = None,
         column: int | None = None,
-        start_byte: int | None = None,
-        end_byte: int | None = None,
     ) -> TypeLookupResult:
         reference: dict[str, Any] = {"path": path}
         if line is not None:
             reference["line"] = line
         if column is not None:
             reference["column"] = column
-        if start_byte is not None:
-            reference["start_byte"] = start_byte
-        if end_byte is not None:
-            reference["end_byte"] = end_byte
         result = self._call_tool(
             "get_type_by_location",
             {"references": [reference]},
@@ -323,18 +317,12 @@ class SearchToolsClient:
         new_name: str,
         line: int | None = None,
         column: int | None = None,
-        start_byte: int | None = None,
-        end_byte: int | None = None,
     ) -> RenameSymbolResult:
         arguments: dict[str, Any] = {"path": path, "new_name": new_name}
         if line is not None:
             arguments["line"] = line
         if column is not None:
             arguments["column"] = column
-        if start_byte is not None:
-            arguments["start_byte"] = start_byte
-        if end_byte is not None:
-            arguments["end_byte"] = end_byte
         result = self._call_tool("rename_symbol", arguments)
         return RenameSymbolResult.from_dict(result)
 
@@ -369,24 +357,39 @@ class SearchToolsClient:
             )
         return {str(path): bool(flag) for path, flag in result.items()}
 
-    def scan_usages(
+    def scan_usages_by_reference(
         self,
-        symbols: list[str] | None = None,
+        symbols: list[str],
         *,
-        targets: list[dict[str, Any]] | None = None,
         include_tests: bool = False,
         paths: list[str] | None = None,
     ) -> ScanUsagesResult:
         arguments: dict[str, Any] = {
             "include_tests": include_tests,
         }
-        if symbols is not None:
-            arguments["symbols"] = symbols
-        if targets is not None:
-            arguments["targets"] = targets
+        arguments["symbols"] = symbols
         if paths is not None:
             arguments["paths"] = paths
-        payload = self._call_tool_payload("scan_usages", arguments)
+        payload = self._call_tool_payload("scan_usages_by_reference", arguments)
+        return ScanUsagesResult.from_dict(
+            payload.structured,
+            rendered_text=payload.rendered_text,
+        )
+
+    def scan_usages_by_location(
+        self,
+        targets: list[dict[str, Any]],
+        *,
+        include_tests: bool = False,
+        paths: list[str] | None = None,
+    ) -> ScanUsagesResult:
+        arguments: dict[str, Any] = {
+            "targets": targets,
+            "include_tests": include_tests,
+        }
+        if paths is not None:
+            arguments["paths"] = paths
+        payload = self._call_tool_payload("scan_usages_by_location", arguments)
         return ScanUsagesResult.from_dict(
             payload.structured,
             rendered_text=payload.rendered_text,
@@ -463,7 +466,7 @@ class SearchToolsClient:
         PageRank for a code map). Each edge carries its reference locations in
         ``UsageGraphEdge.sites`` (``{path, line}``, with ``len(edge.sites) ==
         edge.weight``), so a consumer can map call sites without re-scanning.
-        This is the bulk counterpart to a per-symbol ``scan_usages``; expect to
+        This is the bulk counterpart to a per-symbol usage scan; expect to
         cache the result and rebuild on change.
 
         Args:

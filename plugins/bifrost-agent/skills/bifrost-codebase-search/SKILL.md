@@ -2,7 +2,7 @@
 name: bifrost-codebase-search
 description: >-
   Discover symbols, structural code shapes, and files with Bifrost's
-  search_symbols, query_code, find_filenames, list_files, scan_usages, and
+  search_symbols, query_code, find_filenames, list_files, scan_usages_by_location, and
   most_relevant_files tools, with shell grep for arbitrary text.
 ---
 
@@ -16,7 +16,7 @@ that matches the thing you are looking for.
 | Goal | Tool |
 |---|---|
 | Find a symbol by name | `search_symbols` |
-| Find callers, references, or usages | `scan_usages` |
+| Find callers, references, or usages | `scan_usages_by_location` |
 | Find language-neutral code shapes | `query_code` |
 | Find files by path or glob | `find_filenames` |
 | List files under a directory | `list_files` |
@@ -28,11 +28,11 @@ that matches the thing you are looking for.
 - Use `search_symbols` for questions like "where is `parseRequest` defined?"
   or "which services match `.*Service`?". Pass `include_tests: true` when test
   declarations are relevant.
-- Use `scan_usages` for references and call sites. It is the structured
+- Use `scan_usages_by_location` for references and call sites. It is the structured
   analyzer-backed path and should be preferred over grep for code references.
 - Use `query_code` for normalized syntactic shapes such as calls by callee,
   assignments by left/right roles, imports, decorators, containment, or
-  captures. Version 1 is syntactic; use `scan_usages` or `usage_graph` when
+  captures. Version 1 is syntactic; use `scan_usages_by_location` or `usage_graph` when
   symbol identity or resolved caller/callee edges matter. The schema reference
   is https://brokkai.github.io/bifrost/code-query-json/.
 - Use `find_filenames` for path globs, basename searches, and repository file
