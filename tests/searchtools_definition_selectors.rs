@@ -393,8 +393,22 @@ object InputArtifact {
         companion["not_found"].as_array().unwrap().len(),
         "{companion}"
     );
-    assert_eq!(
-        "file_listing", companion["sources"][0]["presentation"],
+    assert!(
+        companion["sources"][0]["presentation"].is_null(),
+        "{companion}"
+    );
+    assert!(
+        companion["sources"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("object InputArtifact"),
+        "{companion}"
+    );
+    assert!(
+        companion["sources"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("def writes"),
         "{companion}"
     );
 }
@@ -723,12 +737,17 @@ fn java_package_module_round_trips_through_search_source_and_location_tools() {
         )
         .build();
 
-    let source = assert_symbol_source_contains(
-        &project,
-        "org.example",
-        "Module/object lookup returns defining files",
-    );
+    let source = assert_symbol_source_contains(&project, "org.example", "Thing");
     assert_eq!("file_listing", source["sources"][0]["presentation"]);
+    let note = source["sources"][0]["note"].as_str().expect("source note");
+    assert!(note.contains("module target"), "{source}");
+    assert!(note.contains("get_summaries"), "{source}");
+    assert!(
+        !source
+            .to_string()
+            .contains("Module/object lookup returns defining files"),
+        "{source}"
+    );
 
     let locations = call_tool(
         &project,
@@ -739,6 +758,151 @@ fn java_package_module_round_trips_through_search_source_and_location_tools() {
     assert_eq!(1, locations["locations"].as_array().unwrap().len());
     assert_eq!("org.example", locations["locations"][0]["symbol"]);
     assert_eq!(1, locations["locations"][0]["start_line"]);
+}
+
+#[test]
+fn python_dotted_module_selector_returns_outline_and_guidance() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/utils.py",
+            "CONSTANT = 1\n\ndef normalize(value):\n    return value\n\nclass Helper:\n    pass\n",
+        )
+        .build();
+
+    let payload = call_tool_payload(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["pkg.utils"]}"#,
+    );
+    let result = &payload["structured"];
+    assert_eq!(
+        0,
+        result["not_found"].as_array().unwrap().len(),
+        "{payload}"
+    );
+    assert_eq!(
+        0,
+        result["ambiguous"].as_array().unwrap().len(),
+        "{payload}"
+    );
+    assert_eq!(1, result["sources"].as_array().unwrap().len(), "{payload}");
+
+    let source = &result["sources"][0];
+    assert_eq!("file_listing", source["presentation"], "{payload}");
+    let text = source["text"].as_str().expect("source text");
+    assert!(text.contains("normalize"), "{payload}");
+    assert!(text.contains("Helper"), "{payload}");
+    let note = source["note"].as_str().expect("source note");
+    assert!(note.contains("module target"), "{payload}");
+    assert!(note.contains("get_summaries"), "{payload}");
+    assert!(
+        !payload
+            .to_string()
+            .contains("Module/object lookup returns defining files"),
+        "{payload}"
+    );
+}
+
+#[test]
+fn bare_js_filename_module_selector_returns_outline_and_path_symbol_guidance() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("tests/unit/components/setup.js", "export const seed = 1;\n")
+        .file(
+            "tests/unit/components/widget.spec.js",
+            "import { seed } from './setup.js';\nexport const subject = 'widget';\nexport function buildsWidget() {\n  return seed + subject.length;\n}\n",
+        )
+        .build();
+
+    let payload = call_tool_payload(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["widget.spec.js"]}"#,
+    );
+    let result = &payload["structured"];
+    assert_eq!(
+        0,
+        result["not_found"].as_array().unwrap().len(),
+        "{payload}"
+    );
+    assert_eq!(
+        0,
+        result["ambiguous"].as_array().unwrap().len(),
+        "{payload}"
+    );
+    assert_eq!(1, result["sources"].as_array().unwrap().len(), "{payload}");
+
+    let source = &result["sources"][0];
+    assert_eq!("file_listing", source["presentation"], "{payload}");
+    assert!(
+        source["text"]
+            .as_str()
+            .expect("source text")
+            .contains("buildsWidget"),
+        "{payload}"
+    );
+    let note = source["note"].as_str().expect("source note");
+    assert!(note.contains("path#symbol"), "{payload}");
+    assert!(note.contains("get_summaries"), "{payload}");
+    assert!(
+        !payload
+            .to_string()
+            .contains("Module/object lookup returns defining files"),
+        "{payload}"
+    );
+}
+
+#[test]
+fn java_package_module_returns_deduped_outline_blocks_for_each_defining_file() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/org/example/Alpha.java",
+            "package org.example;\nclass Alpha {}\n",
+        )
+        .file(
+            "src/main/java/org/example/Beta.java",
+            "package org.example;\nclass Beta {}\n",
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["org.example"]}"#,
+    );
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(2, result["sources"].as_array().unwrap().len(), "{result}");
+
+    let sources = result["sources"].as_array().unwrap();
+    let paths = sources
+        .iter()
+        .map(|source| source["path"].as_str().expect("source path"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(2, paths.len(), "{result}");
+    assert!(
+        sources
+            .iter()
+            .all(|source| source["presentation"] == "file_listing"),
+        "{result}"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|source| source["text"].as_str().unwrap().contains("Alpha")),
+        "{result}"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|source| source["text"].as_str().unwrap().contains("Beta")),
+        "{result}"
+    );
+    assert!(
+        sources
+            .iter()
+            .all(|source| source["note"].as_str().unwrap().contains("get_summaries")),
+        "{result}"
+    );
 }
 
 #[test]

@@ -581,13 +581,16 @@ object InstanceChoiceControl {
 
     let case_object = source_for(&analyzer, "ai.brokk.ir$.PrimOp$.AsClockOp");
     assert_eq!("ai.brokk.ir.PrimOp.AsClockOp", case_object.sources[0].label);
-    assert_eq!(
-        Some("file_listing"),
-        case_object.sources[0].presentation.as_deref()
-    );
+    assert_eq!(None, case_object.sources[0].presentation.as_deref());
     assert_eq!(
         "src/ai/brokk/ScalaObjects.scala",
         case_object.sources[0].path
+    );
+    assert!(
+        case_object.sources[0]
+            .text
+            .contains("case object AsClockOp"),
+        "{case_object:#?}"
     );
 
     let object_method = source_for(&analyzer, "ai.brokk.InstanceChoiceControl$.select");

@@ -2288,16 +2288,25 @@ fn source_blocks_for_resolved_units(
     analyzer: &dyn IAnalyzer,
     code_units: &[CodeUnit],
 ) -> Vec<SourceBlock> {
-    code_units
-        .iter()
-        .flat_map(|code_unit| {
-            if is_file_listing_target(code_unit) {
-                module_file_listing_blocks(code_unit)
-            } else {
-                source_blocks_for_code_unit(analyzer, code_unit, true)
-            }
-        })
-        .collect()
+    let mut blocks = Vec::new();
+    let mut module_units = Vec::new();
+
+    for code_unit in code_units {
+        if is_file_listing_target(code_unit) {
+            module_units.push(code_unit.clone());
+            continue;
+        }
+
+        let source_blocks = source_blocks_for_code_unit(analyzer, code_unit, true);
+        if source_blocks.is_empty() && is_scala_object_like(code_unit) {
+            module_units.push(code_unit.clone());
+        } else {
+            blocks.extend(source_blocks);
+        }
+    }
+
+    blocks.extend(module_file_listing_blocks(analyzer, &module_units));
+    blocks
 }
 
 pub(crate) fn symbol_source_candidate_files(
@@ -6574,20 +6583,14 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
     files
         .into_iter()
         .filter_map(|file| {
-            let text = analyzer.list_top_level_symbols(&file);
-            if !text.trim().is_empty() {
-                let end_line = text.lines().count().max(1);
-                let path = rel_path_string(&file);
-                let note = file_outline_source_note(&file);
-                return Some(SourceBlock {
-                    label: path.clone(),
-                    path,
-                    start_line: 1,
-                    end_line,
-                    text,
-                    presentation: None,
-                    note: Some(note),
-                });
+            if let Some(block) = file_outline_source_block(
+                analyzer,
+                &file,
+                file_outline_source_note(&file),
+                None,
+                None,
+            ) {
+                return Some(block);
             }
 
             if let Some(block) = include_fallback_source_block(analyzer, &file) {
@@ -6597,6 +6600,30 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
             excerpt_fallback_source_block(analyzer, &file)
         })
         .collect()
+}
+
+fn file_outline_source_block(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    note: String,
+    label: Option<String>,
+    presentation: Option<String>,
+) -> Option<SourceBlock> {
+    let text = analyzer.list_top_level_symbols(file);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let end_line = text.lines().count().max(1);
+    let path = rel_path_string(file);
+    Some(SourceBlock {
+        label: label.unwrap_or_else(|| path.clone()),
+        path,
+        start_line: 1,
+        end_line,
+        text,
+        presentation,
+        note: Some(note),
+    })
 }
 
 fn file_outline_source_note(file: &ProjectFile) -> String {
@@ -6664,17 +6691,76 @@ fn excerpt_fallback_source_block(
     })
 }
 
-fn module_file_listing_blocks(code_unit: &CodeUnit) -> Vec<SourceBlock> {
-    vec![SourceBlock {
-        label: display_symbol_for_target(code_unit),
-        path: rel_path_string(code_unit.source()),
-        start_line: 0,
-        end_line: 0,
-        text: "Module/object lookup returns defining files instead of the full source body."
-            .to_string(),
-        presentation: Some("file_listing".to_string()),
-        note: None,
-    }]
+const MAX_MODULE_OUTLINE_FILES: usize = 10;
+
+fn module_file_listing_blocks(
+    analyzer: &dyn IAnalyzer,
+    code_units: &[CodeUnit],
+) -> Vec<SourceBlock> {
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    for code_unit in code_units {
+        let mut definitions = analyzer
+            .all_declarations()
+            .filter(|definition| {
+                (definition.is_module() || is_scala_object_like(definition))
+                    && definition.fq_name() == code_unit.fq_name()
+            })
+            .collect::<Vec<_>>();
+        if definitions.is_empty() {
+            definitions.push(code_unit.clone());
+        }
+        for definition in definitions {
+            let file = definition.source().clone();
+            if seen.insert(file.clone()) {
+                files.push((file, display_symbol_for_target(code_unit)));
+            }
+        }
+    }
+
+    let omitted = files.len().saturating_sub(MAX_MODULE_OUTLINE_FILES);
+    files
+        .into_iter()
+        .take(MAX_MODULE_OUTLINE_FILES)
+        .map(|(file, label)| {
+            let note = module_outline_source_note(&file, omitted);
+            file_outline_source_block(
+                analyzer,
+                &file,
+                note.clone(),
+                Some(label.clone()),
+                Some("file_listing".to_string()),
+            )
+            .unwrap_or_else(|| {
+                let path = rel_path_string(&file);
+                SourceBlock {
+                    label,
+                    path,
+                    start_line: 1,
+                    end_line: 1,
+                    text: String::new(),
+                    presentation: Some("file_listing".to_string()),
+                    note: Some(note),
+                }
+            })
+        })
+        .collect()
+}
+
+fn module_outline_source_note(file: &ProjectFile, omitted_defining_files: usize) -> String {
+    let mut note = if Ecosystem::of(language_for_file(file)).is_module_scoped() {
+        "module target: showing an outline of top-level symbols, not a full source body; pass a member symbol using path#symbol for module-scoped JS/TS, or use get_summaries for structured summaries"
+            .to_string()
+    } else {
+        "module target: showing an outline of top-level symbols, not a full source body; pass a member symbol for its full body, or use get_summaries for structured summaries"
+            .to_string()
+    };
+    if omitted_defining_files > 0 {
+        note.push_str(&format!(
+            "; omitted {omitted_defining_files} additional defining files, so pass a more specific member symbol or file path to target them"
+        ));
+    }
+    note
 }
 
 fn dedup_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
@@ -6697,7 +6783,7 @@ fn dedup_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
 }
 
 fn is_file_listing_target(code_unit: &CodeUnit) -> bool {
-    code_unit.is_module() || is_scala_object_like(code_unit)
+    code_unit.is_module()
 }
 
 fn is_ancestor_target(code_unit: &CodeUnit) -> bool {

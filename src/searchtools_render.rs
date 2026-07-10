@@ -788,14 +788,6 @@ impl SummaryElement {
 
 impl SourceBlock {
     fn render_text(&self, options: RenderOptions) -> String {
-        if self.presentation.as_deref() == Some("file_listing") {
-            return format!(
-                "## {}\n\n- Defining file: {}\n- Note: {}",
-                escape_markdown_heading(&self.label),
-                self.path,
-                self.text
-            );
-        }
         let mut header = if options.render_line_numbers {
             format!(
                 "## {}\n\n- Location: {}:{}..{}",
