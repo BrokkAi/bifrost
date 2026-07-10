@@ -299,9 +299,14 @@ fn delete_legacy_cache_files(db_path: &Path) {
     if checkpoint_busy != 0 {
         return;
     }
-    let Ok(_exclusive) = legacy.transaction_with_behavior(TransactionBehavior::Exclusive) else {
+    let Ok(exclusive) = legacy.transaction_with_behavior(TransactionBehavior::Exclusive) else {
         return;
     };
+    // Windows does not allow unlinking a SQLite database while this connection
+    // still owns file handles. The successful exclusive claim proves no live
+    // legacy writer was present; close it before best-effort cleanup.
+    drop(exclusive);
+    drop(legacy);
     for suffix in ["", "-wal", "-shm"] {
         let path = parent.join(format!("{LEGACY_SEMANTIC_DB_FILE_NAME}{suffix}"));
         let _ = std::fs::remove_file(path);

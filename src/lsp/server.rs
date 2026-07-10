@@ -54,6 +54,8 @@ use crate::lsp::handlers::{
 use crate::lsp::progress::work_done_progress_message;
 use crate::lsp::request_context::{RequestCancelled, RequestContext};
 use crate::lsp::text_sync::apply_content_changes;
+#[cfg(test)]
+use crate::path_normalization::NormalizePath;
 use crate::util::throttled_log::ThrottledLog;
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -2868,7 +2870,7 @@ mod tests {
         let scoped = ScopedProject::new(inner, vec![outer.join("ignored")]);
         let file = scoped.file_by_abs_path(&nested.join("src/app.ts")).unwrap();
 
-        assert_eq!(scoped.workspace_root_for_file(&file), nested);
+        assert_eq!(scoped.workspace_root_for_file(&file), nested.normalize());
     }
 
     #[test]

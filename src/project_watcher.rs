@@ -1,4 +1,5 @@
 use crate::hash::HashSet;
+use crate::path_normalization::NormalizePath;
 use crate::{Project, ProjectFile};
 use notify::{
     Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
@@ -121,6 +122,7 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
 }
 
 fn normalize_project_file(project: &dyn Project, path: &Path) -> Option<ProjectFile> {
+    let path = path.to_path_buf().normalize();
     let rel_path = path.strip_prefix(project.root()).ok()?;
     if rel_path.as_os_str().is_empty() {
         return None;
@@ -189,6 +191,7 @@ fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::watch_roots;
+    use crate::path_normalization::NormalizePath;
     use crate::{FilesystemProject, Project};
     use std::fs;
     use std::sync::Arc;
@@ -233,6 +236,6 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         let project = FilesystemProject::new(root.clone()).unwrap();
         let roots = watch_roots(&project).unwrap();
-        assert_eq!(roots, vec![root]);
+        assert_eq!(roots, vec![root.normalize()]);
     }
 }

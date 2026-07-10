@@ -797,6 +797,7 @@ fn stub_command(path: &Path, body: &str) {
 mod tests {
     use super::*;
     use crate::analyzer::{FilesystemProject, MultiRootProject, Project};
+    use crate::path_normalization::NormalizePath;
 
     fn project(root: &Path) -> FilesystemProject {
         FilesystemProject::new(root).expect("filesystem project")
@@ -898,14 +899,19 @@ mod tests {
             command.args,
             vec![
                 "--stdin-filename",
-                &root.join("pkg/src/lib.rs").display().to_string(),
+                &root
+                    .clone()
+                    .normalize()
+                    .join("pkg/src/lib.rs")
+                    .display()
+                    .to_string(),
                 "pkg/src/lib.rs",
                 "rust",
             ]
         );
         assert_eq!(
             command.cwd.canonicalize().unwrap(),
-            root.join("pkg").canonicalize().unwrap()
+            root.clone().normalize().join("pkg")
         );
     }
 
@@ -940,7 +946,7 @@ mod tests {
         let command = discover_builtin_formatter(&ctx).unwrap();
         assert_command_invokes(&command.command, "rustfmt");
         assert_eq!(command.args, vec!["--edition", "2024", "--emit", "stdout"]);
-        assert_eq!(command.cwd, root);
+        assert_eq!(command.cwd, root.normalize());
     }
 
     #[test]
@@ -959,7 +965,7 @@ mod tests {
         let ctx = context(&project, &file, Language::Rust);
         let command = discover_builtin_formatter(&ctx).unwrap();
         assert_eq!(command.args, vec!["--edition", "2021", "--emit", "stdout"]);
-        assert_eq!(command.cwd, root.join("crate"));
+        assert_eq!(command.cwd, root.normalize().join("crate"));
     }
 
     #[test]
@@ -1006,10 +1012,13 @@ mod tests {
 
         assert!(rule_matches(&rule, &ctx));
         let command = formatter_command_from_rule(&rule, &ctx).unwrap();
-        assert_eq!(command.cwd, service_a.join("tools"));
+        assert_eq!(command.cwd, service_a.clone().normalize().join("tools"));
         assert_eq!(
             command.args,
-            vec!["src/app.ts".to_string(), service_a.display().to_string()]
+            vec![
+                "src/app.ts".to_string(),
+                service_a.clone().normalize().display().to_string()
+            ]
         );
     }
 
@@ -1038,10 +1047,13 @@ mod tests {
 
         assert!(rule_matches(&rule, &ctx));
         let command = formatter_command_from_rule(&rule, &ctx).unwrap();
-        assert_eq!(command.cwd, nested.join("tools"));
+        assert_eq!(command.cwd, nested.clone().normalize().join("tools"));
         assert_eq!(
             command.args,
-            vec!["src/app.ts".to_string(), nested.display().to_string()]
+            vec![
+                "src/app.ts".to_string(),
+                nested.clone().normalize().display().to_string()
+            ]
         );
     }
 

@@ -46,11 +46,13 @@ pub trait Project: Send + Sync {
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile>;
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let abs_path = abs_path.to_path_buf().normalize();
         let rel_path = abs_path.strip_prefix(self.root()).ok()?;
         self.file_by_rel_path(rel_path)
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let abs_path = abs_path.to_path_buf().normalize();
         let rel_path = abs_path.strip_prefix(self.root()).ok()?;
         Some(ProjectFile::new(
             self.root().to_path_buf(),
@@ -423,6 +425,7 @@ impl Project for MultiRootProject {
     }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let abs_path = abs_path.to_path_buf().normalize();
         for root in &self.roots {
             let Ok(root_rel_path) = abs_path.strip_prefix(root.root()) else {
                 continue;
@@ -435,6 +438,7 @@ impl Project for MultiRootProject {
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let abs_path = abs_path.to_path_buf().normalize();
         let rel_path = abs_path.strip_prefix(&self.root).ok()?;
         for root in &self.roots {
             if abs_path.strip_prefix(root.root()).is_ok() {
@@ -598,6 +602,7 @@ impl OverlayProject {
     /// case any prior overlay for the path is cleared so subsequent reads
     /// fall through to disk rather than serving stale content.
     pub fn set(&self, abs_path: PathBuf, content: String) -> bool {
+        let abs_path = abs_path.normalize();
         if content.len() > self.max_overlay_bytes {
             self.log_rejection(&abs_path, content.len());
             // Drop any stale overlay so reads return disk content rather than
@@ -618,10 +623,11 @@ impl OverlayProject {
     /// Remove an overlay, if present. Returns `true` when an overlay was
     /// actually removed — callers use this to decide whether reparse is needed.
     pub fn clear(&self, abs_path: &Path) -> bool {
+        let abs_path = abs_path.to_path_buf().normalize();
         self.overlays
             .write()
             .expect("overlay lock poisoned")
-            .remove(abs_path)
+            .remove(&abs_path)
             .is_some()
     }
 
@@ -815,7 +821,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let project = FileSetProject::new(root.clone(), [PathBuf::from("A.java")]);
-        assert_eq!(project.root(), root.as_path());
+        assert_eq!(project.root(), root.normalize());
         assert!(project.persistence_root().is_none());
     }
 
