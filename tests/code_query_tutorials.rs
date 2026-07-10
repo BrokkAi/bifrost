@@ -96,6 +96,11 @@ fn rust_tutorial() {
     verify_tutorial("docs/src/content/docs/code-query-tutorials/rust.md");
 }
 
+#[test]
+fn php_tutorial() {
+    verify_tutorial("docs/src/content/docs/code-query-tutorials/php.md");
+}
+
 #[allow(dead_code)]
 fn verify_tutorial(relative: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
