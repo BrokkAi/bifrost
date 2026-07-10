@@ -13,6 +13,61 @@ pub(crate) fn resolve_codeunit_fuzzy(analyzer: &dyn IAnalyzer, input: &str) -> C
     resolve_codeunit_fuzzy_with(analyzer, input, |_| true)
 }
 
+/// Resolve the deepest indexed symbol that encloses an unresolved descendant
+/// selector. This lets callers associate a newly-added member with its
+/// already-indexed owner without guessing at language-specific separators.
+pub(crate) fn resolve_enclosing_codeunits(analyzer: &dyn IAnalyzer, input: &str) -> Vec<CodeUnit> {
+    let trimmed = strip_trailing_call_suffix(input.trim());
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut best_depth = 0;
+    let mut matches = BTreeMap::new();
+    for language in analyzer.languages() {
+        for query_path in query_symbol_interpretations(language, &trimmed) {
+            if query_path.len() < 2 {
+                continue;
+            }
+            for depth in (1..query_path.len()).rev() {
+                if depth < best_depth {
+                    break;
+                }
+                let owner_path = &query_path[..depth];
+                let pattern = suffix_search_pattern(owner_path);
+                if pattern.is_empty() {
+                    continue;
+                }
+
+                let mut found_at_depth = false;
+                for candidate in analyzer.search_definitions(&pattern, false) {
+                    if code_unit_language(&candidate) != language
+                        || !codeunit_lookup_aliases(&candidate)
+                            .iter()
+                            .any(|alias| alias == owner_path || path_ends_with(alias, owner_path))
+                    {
+                        continue;
+                    }
+                    if depth > best_depth {
+                        best_depth = depth;
+                        matches.clear();
+                    }
+                    insert_match(&mut matches, &candidate);
+                    found_at_depth = true;
+                }
+                if found_at_depth {
+                    break;
+                }
+            }
+        }
+    }
+
+    match resolution_from_matches(analyzer, matches, |_| true) {
+        Some(CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units)) => units,
+        Some(CodeUnitResolution::NotFound) | None => Vec::new(),
+    }
+}
+
 /// Exact, non-fuzzy definition lookup for a fully-qualified name. Returns the
 /// matching definitions verbatim (empty if none). Used to short-circuit before
 /// file-pattern resolution so canonical names containing `/` (e.g. Go import

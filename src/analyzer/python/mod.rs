@@ -527,6 +527,10 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.is_analyzed(file)
     }
 
+    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
+        self.inner.indexed_source(file)
+    }
+
     fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
         self.inner.all_declarations()
     }

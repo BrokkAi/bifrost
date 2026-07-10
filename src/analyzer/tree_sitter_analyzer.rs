@@ -1444,6 +1444,10 @@ where
         Box::new(self.state.files.keys())
     }
 
+    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
+        self.file_source(file)
+    }
+
     fn is_analyzed(&self, file: &ProjectFile) -> bool {
         self.state.files.contains_key(file)
     }

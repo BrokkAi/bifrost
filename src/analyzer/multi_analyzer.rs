@@ -307,6 +307,11 @@ impl IAnalyzer for MultiAnalyzer {
         )
     }
 
+    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().indexed_source(file))
+    }
+
     fn is_analyzed(&self, file: &ProjectFile) -> bool {
         self.delegates
             .values()

@@ -18,10 +18,11 @@ use crate::{
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
-        MostRelevantFilesParams, RefreshParams, contains_tests, get_definitions_by_location,
-        get_definitions_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
-        get_symbol_sources, get_type_by_location, list_symbols, most_relevant_files,
-        refresh_result, rename_symbol, scan_usages, search_symbols, usage_graph,
+        MostRelevantFilesParams, RefreshParams, SymbolLookupParams, SymbolSourcesResult,
+        contains_tests, get_definitions_by_location, get_definitions_by_reference, get_summaries,
+        get_symbol_ancestors, get_symbol_locations, get_symbol_sources, get_type_by_location,
+        list_symbols, most_relevant_files, refresh_result, rename_symbol, scan_usages,
+        search_symbols, symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
@@ -30,6 +31,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -149,6 +151,25 @@ struct WorkspaceSession {
     watcher: Option<ProjectChangeWatcher>,
     #[cfg(feature = "nlp")]
     semantic: Option<Arc<SemanticIndexer>>,
+}
+
+enum ObservedSource {
+    Present(String),
+    Missing,
+}
+
+fn classify_source_read(
+    file: &ProjectFile,
+    result: io::Result<String>,
+) -> Result<ObservedSource, SearchToolsServiceError> {
+    match result {
+        Ok(source) => Ok(ObservedSource::Present(source)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ObservedSource::Missing),
+        Err(err) => Err(SearchToolsServiceError::internal(format!(
+            "Failed to verify source freshness for {}: {err}",
+            file.rel_path().display()
+        ))),
+    }
 }
 
 impl WorkspaceSession {
@@ -347,6 +368,10 @@ impl SearchToolsService {
         }
 
         let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
+        if name == "get_symbol_sources" {
+            return self
+                .handle_get_symbol_sources(strip_legacy_kind_filter(arguments), render_options);
+        }
         let snapshot = self.snapshot_for_query()?;
         match name {
             "search_symbols" => Self::decode_render_and_run(
@@ -366,12 +391,6 @@ impl SearchToolsService {
                 strip_legacy_kind_filter(arguments),
                 render_options,
                 |workspace, params| get_symbol_ancestors(workspace.analyzer(), params),
-            ),
-            "get_symbol_sources" => Self::decode_render_and_run(
-                &snapshot,
-                strip_legacy_kind_filter(arguments),
-                render_options,
-                |workspace, params| get_symbol_sources(workspace.analyzer(), params),
             ),
             "get_summaries" => Self::decode_render_and_run(
                 &snapshot,
@@ -939,6 +958,71 @@ impl SearchToolsService {
         Ok(Arc::clone(&session.snapshot))
     }
 
+    fn handle_get_symbol_sources(
+        &self,
+        arguments: Value,
+        render_options: RenderOptions,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let params = serde_json::from_value::<SymbolLookupParams>(arguments).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+        })?;
+        let initial_snapshot = self.snapshot_for_query()?;
+        let mut result = get_symbol_sources(initial_snapshot.analyzer(), params.clone());
+        if self.update_strategy == UpdateStrategy::WatchFiles {
+            let observed_sources =
+                symbol_source_candidate_files(initial_snapshot.analyzer(), &result)
+                    .into_iter()
+                    .map(|file| {
+                        let current = initial_snapshot.analyzer().project().read_source(&file);
+                        classify_source_read(&file, current).map(|source| (file, source))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+            let final_snapshot = {
+                let mut guard = self.write_session()?;
+                let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+                Self::apply_watcher_delta(session);
+                let analyzer = session.snapshot.analyzer();
+                let stale_files = observed_sources
+                    .iter()
+                    .filter_map(|(file, observed)| {
+                        let indexed = analyzer.indexed_source(file);
+                        match (indexed, observed) {
+                            (Some(indexed), ObservedSource::Present(current))
+                                if indexed == current =>
+                            {
+                                None
+                            }
+                            (None, ObservedSource::Missing) => None,
+                            _ => Some(file.clone()),
+                        }
+                    })
+                    .collect();
+                Self::apply_changed_files(session, stale_files);
+                Arc::clone(&session.snapshot)
+            };
+
+            if !Arc::ptr_eq(&initial_snapshot, &final_snapshot) {
+                result = get_symbol_sources(final_snapshot.analyzer(), params);
+            }
+        }
+        Self::symbol_sources_output(result, render_options)
+    }
+
+    fn symbol_sources_output(
+        result: SymbolSourcesResult,
+        render_options: RenderOptions,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let rendered_text = result.render_text(render_options);
+        let structured = serde_json::to_value(result).map_err(|err| {
+            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })?;
+        Ok(ToolOutput::Structured {
+            structured,
+            rendered_text: Some(rendered_text),
+        })
+    }
+
     #[cfg(feature = "nlp")]
     fn semantic_snapshot_for_query(
         &self,
@@ -973,6 +1057,13 @@ impl SearchToolsService {
         }
 
         let changed_files: BTreeSet<ProjectFile> = delta.files.into_iter().collect();
+        Self::apply_changed_files(session, changed_files);
+    }
+
+    fn apply_changed_files(session: &mut WorkspaceSession, changed_files: BTreeSet<ProjectFile>) {
+        if changed_files.is_empty() {
+            return;
+        }
         session.snapshot = Arc::new(session.snapshot.update(&changed_files));
         #[cfg(feature = "nlp")]
         if let Some(semantic) = &session.semantic {
@@ -1301,6 +1392,249 @@ fn active_workspace_result(root: &Path) -> Result<ToolOutput, SearchToolsService
         structured,
         rendered_text: None,
     })
+}
+
+#[cfg(test)]
+mod source_generation_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::fs;
+
+    const INITIAL_SOURCE: &str = r#"namespace MudBlazor;
+
+public partial class MudDialogContainer
+{
+    protected string BackgroundClassname => "mud-overlay-dark";
+}
+"#;
+
+    const UPDATED_SOURCE: &str = r#"namespace MudBlazor;
+
+public partial class MudDialogContainer
+{
+    protected string BackgroundClassname => "mud-overlay-dark";
+
+    private string GetBackgroundClass()
+    {
+        return BackgroundClassname;
+    }
+}
+"#;
+
+    const SHIFTED_SOURCE: &str = r#"namespace MudBlazor;
+
+public partial class MudDialogContainer
+{
+    // This edit shifts the old BackgroundClassname byte range.
+    protected string BackgroundClassname => "mud-overlay-light";
+}
+"#;
+
+    fn write_project() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("MudDialogContainer.cs"), INITIAL_SOURCE).unwrap();
+        (temp, root)
+    }
+
+    fn write_ambiguous_project() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(
+            root.join("First.cs"),
+            "namespace First; class Container { string Value => \"first\"; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Second.cs"),
+            "namespace Second; class Container { string Value => \"second\"; }\n",
+        )
+        .unwrap();
+        (temp, root)
+    }
+
+    fn watching_service_without_watcher(root: PathBuf) -> SearchToolsService {
+        let (project, workspace) = build_transient_workspace(root).unwrap();
+        SearchToolsService {
+            root: RwLock::new(project.root().to_path_buf()),
+            session: RwLock::new(Some(WorkspaceSession {
+                snapshot: Arc::new(workspace),
+                watcher: None,
+                #[cfg(feature = "nlp")]
+                semantic: None,
+            })),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy: UpdateStrategy::WatchFiles,
+            semantic_indexing: false,
+        }
+    }
+
+    fn call_sources(service: &SearchToolsService, symbols: &[&str]) -> Value {
+        let arguments = serde_json::json!({ "symbols": symbols });
+        let payload = service
+            .call_tool_json("get_symbol_sources", &arguments.to_string())
+            .unwrap();
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    fn source_texts(value: &Value) -> Vec<&str> {
+        value["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["text"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn get_symbol_sources_refreshes_combined_stale_member_request() {
+        let (_temp, root) = write_project();
+        let service = watching_service_without_watcher(root.clone());
+        fs::write(root.join("MudDialogContainer.cs"), UPDATED_SOURCE).unwrap();
+
+        let value = call_sources(
+            &service,
+            &[
+                "MudBlazor.MudDialogContainer.BackgroundClassname",
+                "MudBlazor.MudDialogContainer.GetBackgroundClass",
+            ],
+        );
+
+        assert_eq!(0, value["not_found"].as_array().unwrap().len(), "{value}");
+        let texts = source_texts(&value);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("protected string BackgroundClassname")),
+            "{value}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("private string GetBackgroundClass()")),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn get_symbol_sources_refreshes_new_member_from_indexed_owner() {
+        let (_temp, root) = write_project();
+        let service = watching_service_without_watcher(root.clone());
+        fs::write(root.join("MudDialogContainer.cs"), UPDATED_SOURCE).unwrap();
+
+        let value = call_sources(
+            &service,
+            &["MudBlazor.MudDialogContainer.GetBackgroundClass"],
+        );
+
+        assert_eq!(0, value["not_found"].as_array().unwrap().len(), "{value}");
+        assert!(
+            source_texts(&value)
+                .iter()
+                .any(|text| text.contains("private string GetBackgroundClass()")),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn stale_analyzer_and_manual_service_keep_generation_consistent_source() {
+        let (_temp, root) = write_project();
+        let (project, workspace) = build_transient_workspace(root.clone()).unwrap();
+        let manual = SearchToolsService::new_manual_for_project(project).unwrap();
+        fs::write(root.join("MudDialogContainer.cs"), SHIFTED_SOURCE).unwrap();
+
+        let direct = get_symbol_sources(
+            workspace.analyzer(),
+            SymbolLookupParams {
+                symbols: vec!["MudBlazor.MudDialogContainer.BackgroundClassname".to_string()],
+            },
+        );
+        assert_eq!(1, direct.sources.len());
+        assert_eq!(
+            "protected string BackgroundClassname => \"mud-overlay-dark\";",
+            direct.sources[0].text
+        );
+
+        let manual_value = call_sources(
+            &manual,
+            &[
+                "MudBlazor.MudDialogContainer.BackgroundClassname",
+                "MudBlazor.MudDialogContainer.GetBackgroundClass",
+            ],
+        );
+        assert_eq!(1, manual_value["sources"].as_array().unwrap().len());
+        assert_eq!(1, manual_value["not_found"].as_array().unwrap().len());
+        assert_eq!(
+            "protected string BackgroundClassname => \"mud-overlay-dark\";",
+            manual_value["sources"][0]["text"]
+        );
+    }
+
+    #[test]
+    fn transient_source_read_errors_are_not_classified_as_deletion() {
+        let (_temp, root) = write_project();
+        let file = ProjectFile::new(root, PathBuf::from("MudDialogContainer.cs"));
+
+        let transient = io::Error::new(io::ErrorKind::PermissionDenied, "temporary denial");
+        assert!(classify_source_read(&file, Err(transient)).is_err());
+        assert!(matches!(
+            classify_source_read(&file, Err(io::Error::from(io::ErrorKind::NotFound))).unwrap(),
+            ObservedSource::Missing
+        ));
+    }
+
+    #[test]
+    fn get_symbol_sources_refreshes_deleted_target_to_not_found() {
+        let (_temp, root) = write_project();
+        let service = watching_service_without_watcher(root.clone());
+        fs::remove_file(root.join("MudDialogContainer.cs")).unwrap();
+
+        let value = call_sources(
+            &service,
+            &["MudBlazor.MudDialogContainer.BackgroundClassname"],
+        );
+
+        assert_eq!(0, value["sources"].as_array().unwrap().len(), "{value}");
+        assert_eq!(1, value["not_found"].as_array().unwrap().len(), "{value}");
+    }
+
+    #[test]
+    fn get_symbol_sources_refreshes_stale_ambiguity_after_deletion() {
+        let (_temp, root) = write_ambiguous_project();
+        let service = watching_service_without_watcher(root.clone());
+        let initial = call_sources(&service, &["Container.Value"]);
+        assert_eq!(
+            1,
+            initial["ambiguous"].as_array().unwrap().len(),
+            "{initial}"
+        );
+
+        fs::remove_file(root.join("First.cs")).unwrap();
+        let refreshed = call_sources(&service, &["Container.Value"]);
+
+        assert_eq!(
+            0,
+            refreshed["ambiguous"].as_array().unwrap().len(),
+            "{refreshed}"
+        );
+        assert_eq!(
+            0,
+            refreshed["not_found"].as_array().unwrap().len(),
+            "{refreshed}"
+        );
+        assert_eq!(
+            1,
+            refreshed["sources"].as_array().unwrap().len(),
+            "{refreshed}"
+        );
+        assert!(
+            refreshed["sources"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("second")),
+            "{refreshed}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "nlp"))]

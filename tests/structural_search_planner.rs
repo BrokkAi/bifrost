@@ -75,6 +75,10 @@ impl NoProviderAnalyzer {
 }
 
 impl IAnalyzer for NoProviderAnalyzer {
+    fn indexed_source<'a>(&'a self, _file: &ProjectFile) -> Option<&'a str> {
+        None
+    }
+
     fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
         Box::new(self.files.iter())
     }

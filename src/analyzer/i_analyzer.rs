@@ -22,6 +22,9 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
         Box::new(std::iter::empty())
     }
+    /// Source text retained by the analyzer generation that produced this
+    /// file's declarations and byte ranges.
+    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str>;
     /// Whether `file` is one this analyzer has indexed. The default scans
     /// `analyzed_files`; concrete analyzers override with an O(1) lookup so
     /// incremental callers don't pay O(repo) per changed file.

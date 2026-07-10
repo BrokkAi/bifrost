@@ -2,7 +2,7 @@ use crate::analyzer::persistence::AnalyzerStorage;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
     IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, Project,
-    PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    ProjectFile, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +20,10 @@ impl EmptyAnalyzer {
 }
 
 impl IAnalyzer for EmptyAnalyzer {
+    fn indexed_source<'a>(&'a self, _file: &ProjectFile) -> Option<&'a str> {
+        None
+    }
+
     fn all_declarations<'a>(
         &'a self,
     ) -> Box<dyn Iterator<Item = &'a crate::analyzer::CodeUnit> + 'a> {

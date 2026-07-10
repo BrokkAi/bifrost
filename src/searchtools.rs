@@ -6,7 +6,8 @@ use crate::analyzer::declaration_range::{
     DeclarationNameRangeContext, code_unit_declaration_name_range,
 };
 use crate::analyzer::symbol_lookup::{
-    CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
+    CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
+    resolve_enclosing_codeunits, strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::get_definition::{
     SCALA_UNSUPPORTED_CALL_TARGET_SHAPE, SCALA_UNSUPPORTED_RECEIVER,
@@ -2181,6 +2182,78 @@ fn source_blocks_for_resolved_units(
             }
         })
         .collect()
+}
+
+pub(crate) fn symbol_source_candidate_files(
+    analyzer: &dyn IAnalyzer,
+    result: &SymbolSourcesResult,
+) -> BTreeSet<ProjectFile> {
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let mut files = BTreeSet::new();
+
+    for source in &result.sources {
+        if let Some(rel_path) = workspace_rel_path(&source.path) {
+            files.insert(ProjectFile::new(
+                analyzer.project().root().to_path_buf(),
+                rel_path,
+            ));
+        }
+    }
+
+    for selector in result.ambiguous.iter().flat_map(|item| item.matches.iter()) {
+        if let SelectableDefinitionResolution::Resolved(units) =
+            resolve_selectable_definitions(analyzer, selector, exact_then_fuzzy_codeunit_resolution)
+        {
+            extend_candidate_unit_files(&mut files, units, None);
+        }
+    }
+
+    for symbol in result
+        .not_found
+        .iter()
+        .map(|item| item.input.trim())
+        .filter(|symbol| !symbol.is_empty())
+    {
+        let (mut anchor, mut lookup) = match split_definition_selector(symbol) {
+            DefinitionSelector::Name(name) => (None, name),
+            DefinitionSelector::FileAnchored { anchor, lookup } => {
+                if let ResolvedFileInput::File(file) = resolver.resolve_literal(&anchor) {
+                    files.insert(file);
+                }
+                (Some(anchor), lookup)
+            }
+        };
+
+        if anchor.is_none()
+            && let Some(PathQualifiedSelector::Resolved {
+                anchor: path_anchor,
+                lookup: path_lookup,
+            }) = split_path_qualified_definition_selector(analyzer, symbol)
+        {
+            if let ResolvedFileInput::File(file) = resolver.resolve_literal(&path_anchor) {
+                files.insert(file);
+            }
+            anchor = Some(path_anchor);
+            lookup = path_lookup;
+        }
+
+        let resolved = resolve_enclosing_codeunits(analyzer, lookup);
+        extend_candidate_unit_files(&mut files, resolved, anchor.as_deref());
+    }
+
+    files
+}
+
+fn extend_candidate_unit_files(
+    files: &mut BTreeSet<ProjectFile>,
+    units: Vec<CodeUnit>,
+    anchor: Option<&str>,
+) {
+    files.extend(units.into_iter().filter_map(|unit| {
+        anchor
+            .is_none_or(|anchor| rel_path_string(unit.source()) == anchor)
+            .then(|| unit.source().clone())
+    }));
 }
 
 fn resolve_file_anchored_symbol_sources(
@@ -6151,7 +6224,7 @@ fn source_blocks_for_code_unit(
     code_unit: &CodeUnit,
     include_comments: bool,
 ) -> Vec<SourceBlock> {
-    let Ok(content) = analyzer.project().read_source(code_unit.source()) else {
+    let Some(content) = analyzer.indexed_source(code_unit.source()) else {
         return Vec::new();
     };
 
@@ -6174,7 +6247,7 @@ fn source_blocks_for_code_unit(
         .into_iter()
         .filter_map(|range| {
             let start_byte = if include_comments {
-                expanded_comment_start(language, &content, range.start_byte)
+                expanded_comment_start(language, content, range.start_byte)
             } else {
                 range.start_byte
             };
@@ -6182,7 +6255,7 @@ fn source_blocks_for_code_unit(
             if text.is_empty() {
                 return None;
             }
-            let start_line = line_number_at_offset(&content, start_byte);
+            let start_line = line_number_at_offset(content, start_byte);
             Some(SourceBlock {
                 label: display_symbol_for_target(code_unit),
                 path: rel_path_string(code_unit.source()),
@@ -6885,6 +6958,10 @@ mod tests {
     }
 
     impl IAnalyzer for CountingAnalyzer {
+        fn indexed_source<'a>(&'a self, _file: &ProjectFile) -> Option<&'a str> {
+            None
+        }
+
         fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
             self.analyzed_files_calls.fetch_add(1, Ordering::Relaxed);
             Box::new(self.project.files.iter())
