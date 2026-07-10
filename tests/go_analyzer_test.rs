@@ -218,7 +218,8 @@ fn go_method_signature_metadata_offsets_start_after_receiver() {
     let method = definition(&analyzer, "main.Box.Use");
     let metadata = analyzer
         .signature_metadata(&method)
-        .first()
+        .into_iter()
+        .next()
         .unwrap_or_else(|| panic!("missing signature metadata for {}", method.fq_name()));
     let label = metadata.label();
     assert!(
@@ -250,7 +251,8 @@ fn go_signature_metadata_keeps_anonymous_variadic_marker() {
     let function = definition(&analyzer, "main.collect");
     let metadata = analyzer
         .signature_metadata(&function)
-        .first()
+        .into_iter()
+        .next()
         .unwrap_or_else(|| panic!("missing signature metadata for {}", function.fq_name()));
     let label = metadata.label();
     let parameter = metadata

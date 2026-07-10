@@ -192,7 +192,6 @@ impl VisibilityIndex {
         let declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = files
             .iter()
             .map(|file| (file.clone(), analyzer.declarations(file)))
-            .into_iter()
             .collect();
         let mut visible_by_file = HashMap::default();
         for file in roots {

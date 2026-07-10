@@ -385,7 +385,8 @@ fn test_signature_metadata_keeps_rust_pattern_parameters() {
     let function = definition(&analyzer, "consume");
     let metadata = analyzer
         .signature_metadata(&function)
-        .first()
+        .into_iter()
+        .next()
         .unwrap_or_else(|| panic!("missing signature metadata for {}", function.fq_name()));
     let labels: Vec<_> = metadata
         .parameters()

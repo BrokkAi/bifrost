@@ -302,7 +302,6 @@ impl IAnalyzer for MultiAnalyzer {
             .delegates
             .values()
             .flat_map(|delegate| delegate.analyzer().analyzed_files())
-            .into_iter()
             .collect();
         files.sort();
         files.dedup();
@@ -393,7 +392,6 @@ impl IAnalyzer for MultiAnalyzer {
             .delegates
             .values()
             .flat_map(|delegate| delegate.analyzer().definitions(fq_name))
-            .into_iter()
             .collect();
         Box::new(matches.into_iter())
     }

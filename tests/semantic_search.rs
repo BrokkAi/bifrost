@@ -427,8 +427,8 @@ fn revert_reuses_cached_blob_vectors() {
     let file = snapshot
         .analyzer()
         .analyzed_files()
+        .into_iter()
         .next()
-        .cloned()
         .expect("one analyzed file");
     let changed: BTreeSet<_> = [file].into_iter().collect();
 

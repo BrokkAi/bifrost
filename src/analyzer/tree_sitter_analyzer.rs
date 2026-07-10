@@ -1397,8 +1397,8 @@ where
             .collect();
         let field_children: Vec<_> = all_children
             .iter()
-            .cloned()
             .filter(|child| child.is_field())
+            .cloned()
             .collect();
         let parent_start = crate::analyzer::IAnalyzer::ranges(self, code_unit)
             .iter()
@@ -1407,8 +1407,8 @@ where
             .unwrap_or(usize::MAX);
         let non_field_children: Vec<_> = all_children
             .iter()
-            .cloned()
             .filter(|child| !child.is_field())
+            .cloned()
             .collect();
         let children = if header_only {
             field_children.clone()

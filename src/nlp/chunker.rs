@@ -239,8 +239,8 @@ mod tests {
     fn chunks_for(analyzer: &dyn IAnalyzer, name: &str) -> FileChunks {
         let file = analyzer
             .analyzed_files()
+            .into_iter()
             .find(|file| rel_path_string(file) == name)
-            .cloned()
             .unwrap_or_else(|| panic!("fixture file {name} not analyzed"));
         extract_file_chunks(analyzer, &file, &word_count)
     }

@@ -15,8 +15,8 @@ This issue does not add a database, cache schema, Git blob liveness, a persisted
 - [x] (2026-07-10) Converted the storage-sensitive analyzer query primitives to owned result types and centralized all convenience aliases on those primitives.
 - [x] (2026-07-10) Added the crate-internal storage-adapter contract and path-sensitive language overrides without activating it.
 - [x] (2026-07-10) Added and passed focused parity coverage for owned queries and adapter semantics.
-- [ ] Run final formatting, `cargo clippy-no-cuda`, and diff checks; focused behavioral tests already pass.
-- [ ] Record final outcomes and checkpoint commits on the existing branch.
+- [x] (2026-07-10) Ran final formatting, non-CUDA all-target clippy, focused behavioral tests, and diff checks.
+- [x] (2026-07-10) Recorded final outcomes and checkpoint commits on the existing branch without pushing.
 
 ## Surprises & Discoveries
 
@@ -31,6 +31,9 @@ This issue does not add a database, cache schema, Git blob liveness, a persisted
 
 - Observation: Rust's public-bound lints require the companion trait and `FileState` to be lexically public because `TreeSitterAnalyzer` is public, even though both live in a crate-private module and the trait is re-exported only as `pub(crate)`.
   Evidence: More restrictive declarations produced `private_bounds`/private-interface warnings during `cargo check`; the current module boundary keeps the contract crate-internal without lint suppression.
+
+- Observation: This machine has matching-version Rust and Clippy installations built against different LLVM patch releases, so the repository alias initially rejected dependency metadata even in a separate target directory.
+  Evidence: Homebrew `clippy-driver` reported LLVM 22.1.6 while the selected Rust toolchain reported LLVM 22.1.2. Running the alias with the Rustup toolchain directory first in `PATH` and an isolated `CARGO_TARGET_DIR` completed successfully.
 
 ## Decision Log
 
@@ -56,7 +59,11 @@ This issue does not add a database, cache schema, Git blob liveness, a persisted
 
 ## Outcomes & Retrospective
 
-Implementation and focused behavioral validation are complete. `IAnalyzer`, `TreeSitterAnalyzer`, every language delegate, and `MultiAnalyzer` now expose owned storage-sensitive query results; `all_declarations_with_primary_ranges` provides the future bulk range seam; and all convenience aliases are centralized defaults. The storage adapter remains inert and has no database, liveness, cache, or backend-selection dependency. Final clippy and repository hygiene checks remain before completion.
+Implementation and validation are complete. `IAnalyzer`, `TreeSitterAnalyzer`, every language delegate, and `MultiAnalyzer` now expose owned storage-sensitive query results; `all_declarations_with_primary_ranges` provides the future bulk range seam; and all convenience aliases are centralized defaults. The storage adapter remains inert and has no database, liveness, cache, or backend-selection dependency.
+
+The focused validation passed 4 storage-adapter unit tests, 7 query-parity tests (including the shared harness tests), 158 LSP tests, 397 definition tests, 17 multi-analyzer tests, 104 SearchTools tests with one pre-existing expensive smoke test ignored, and 5 usage-identity tests. `cargo clippy-no-cuda` passed all non-CUDA targets with warnings denied, `cargo fmt --all` completed, and `git diff --check` reported no errors.
+
+Checkpoint `7200eecf` records the owned query and adapter implementation plus its primary parity coverage. A final validation checkpoint accompanies this completed ExecPlan and the all-target ownership-boundary fixes. No changes were made to dependencies, analyzer persistence, `search_definitions_persisted`, backend activation, cache/liveness code, or SQLite store modules.
 
 ## Context and Orientation
 

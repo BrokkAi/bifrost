@@ -75,7 +75,6 @@ pub fn implementation(
                 descendants
                     .into_iter()
                     .flat_map(|descendant| analyzer.direct_children(&descendant))
-                    .into_iter()
                     .filter(|child| implementation_member_matches(child, &name, kind))
                     .collect()
             }

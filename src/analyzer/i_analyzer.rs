@@ -147,7 +147,7 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.definitions(fq_name).into_iter().collect()
+        self.definitions(fq_name).collect()
     }
 
     fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -381,7 +381,6 @@ pub trait IAnalyzer: Send + Sync + Any {
         let mut modules: Vec<_> = files
             .iter()
             .flat_map(|file| self.top_level_declarations(file))
-            .into_iter()
             .map(|code_unit| {
                 if code_unit.is_module() {
                     code_unit.fq_name()
@@ -400,7 +399,6 @@ pub trait IAnalyzer: Send + Sync + Any {
         files
             .iter()
             .flat_map(|file| self.top_level_declarations(file))
-            .into_iter()
             .filter(|code_unit| {
                 code_unit.is_class() || code_unit.is_function() || code_unit.is_module()
             })

@@ -879,7 +879,8 @@ fn python_signature_metadata_labels_typed_default_and_rest_parameters() {
         .unwrap();
     let metadata = analyzer
         .signature_metadata(&function)
-        .first()
+        .into_iter()
+        .next()
         .unwrap_or_else(|| panic!("missing metadata for {}", function.fq_name()));
     assert_eq!(
         analyzer.get_skeleton_header(&function).as_deref(),

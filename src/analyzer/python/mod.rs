@@ -440,11 +440,11 @@ impl PythonAnalyzer {
             }
         }
 
-        let all_children: Vec<_> = self.inner.direct_children(code_unit).into_iter().collect();
+        let all_children = self.inner.direct_children(code_unit);
         let field_children: Vec<_> = all_children
             .iter()
-            .cloned()
             .filter(|child| child.is_field())
+            .cloned()
             .collect();
         let children = if header_only {
             field_children.clone()

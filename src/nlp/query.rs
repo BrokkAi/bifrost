@@ -362,7 +362,7 @@ fn bm25_symbol_candidates(
     let paths: Vec<String> = analyzer
         .analyzed_files()
         .into_iter()
-        .map(rel_path_string)
+        .map(|file| rel_path_string(&file))
         .collect();
     let symbols: Vec<String> = analyzer
         .all_declarations()
