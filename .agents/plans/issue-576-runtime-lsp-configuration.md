@@ -16,7 +16,7 @@ Users can observe the result without restarting Bifrost: a new formatter command
 - [x] (2026-07-10 07:27Z) Inspected the current LSP loop, workspace rebuild path, formatter lifecycle, diagnostics tracking, VS Code configuration flow, and LSP 3.18 configuration contract.
 - [x] (2026-07-10 07:43Z) Implemented dynamic registration, configuration pulls, legacy pushed snapshots, newest-response-wins handling, and strict full-snapshot parsing. Evidence: six `lsp::server::tests` unit tests and `bifrost_lsp_server_runtime_configuration_registers_and_pulls_bifrost_section` pass.
 - [x] (2026-07-10 07:43Z) Refactored runtime state to preserve editor roots separately, normalize configuration, prepare replacement analyzers transactionally, replay overlays, cancel formatter jobs before commit, and clear stale diagnostic state.
-- [ ] Add Rust unit and end-to-end coverage for protocol, rebuild, diagnostics, overlay, formatter, failure, and Windows cleanup behavior.
+- [x] (2026-07-10 07:49Z) Added Rust unit and end-to-end coverage for registration/pull, direct and nested legacy snapshots, newest-pull ordering, malformed/error retention, editor-root restoration, exclusions, stale diagnostics, overlay replay, formatter replacement, formatter cancellation, and Windows handle cleanup. Evidence: six server unit tests and seven macOS runtime-configuration integration tests pass; the Windows-only `cmd.exe` cleanup case is compiled and exercised by Windows CI.
 - [ ] Update the VS Code extension to return trusted runtime snapshots and avoid restart prompts for live settings.
 - [ ] Update public and internal documentation.
 - [ ] Run focused and full validation, perform self-review, and record the final outcome.
@@ -37,6 +37,9 @@ Users can observe the result without restarting Bifrost: a new formatter command
 
 - Observation: `lsp_server::Connection::initialize_finish` consumes the client's `initialized` notification before returning.
   Evidence: the first end-to-end registration test waited indefinitely when registration was dispatched from `handle_notification`; `lsp-server` 0.7.9 receives and validates `initialized` inside `initialize_finish`. Registration now runs immediately after `ServerState` construction, which is already after that protocol boundary.
+
+- Observation: populating a fresh `OverlayProject` before `WorkspaceAnalyzer::build_persisted` does not always make persisted reconciliation reparse an open file whose disk metadata is unchanged.
+  Evidence: the overlay replay integration test rebuilt successfully but returned only the disk snapshot until the replacement analyzer explicitly called `update` with every replayed open `ProjectFile`. The rebuild preparation now performs that update after the persisted build.
 
 ## Decision Log
 
@@ -185,3 +188,5 @@ The protocol tracker should own pull capability flags, a monotonic request gener
 The VS Code settings builder returns a complete `BifrostInitializationOptions` with all three arrays present. Initialization and pull middleware both call it; only the extension layer may inspect setting scope and supply trusted formatter rules.
 
 Plan update (2026-07-10 07:43Z): recorded completion of the protocol and state milestones plus the `initialize_finish` lifecycle discovery that moved dynamic registration out of ordinary notification dispatch.
+
+Plan update (2026-07-10 07:49Z): recorded the completed behavioral test matrix and the persisted-overlay replay fix discovered by the end-to-end rebuild test.

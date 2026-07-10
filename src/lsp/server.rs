@@ -1576,16 +1576,21 @@ impl ServerState {
         };
         let overlay = Arc::new(OverlayProject::new(project));
         let mut open_document_paths = HashMap::new();
+        let mut replayed_files = BTreeSet::new();
         for (key, document) in &self.open_documents {
             if let Some(file) = resolve_project_file(overlay.as_ref(), &document.uri)
                 .or_else(|| project_file_for_abs_path(overlay.as_ref(), &document.abs_path))
             {
                 open_document_paths.insert(key.clone(), file.abs_path());
                 overlay.set(file.abs_path(), document.text.clone());
+                replayed_files.insert(file);
             }
         }
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
-        let workspace = build_workspace_for_lsp(project, None);
+        let mut workspace = build_workspace_for_lsp(project, None);
+        if !replayed_files.is_empty() {
+            workspace = workspace.update(&replayed_files);
+        }
         let mut stale = Vec::new();
         let mut retained_diagnostics = Vec::new();
         for uri in &self.published_diagnostic_uris {
