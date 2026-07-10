@@ -16,10 +16,10 @@ Users can observe the result without restarting Bifrost: a new formatter command
 - [x] (2026-07-10 07:27Z) Inspected the current LSP loop, workspace rebuild path, formatter lifecycle, diagnostics tracking, VS Code configuration flow, and LSP 3.18 configuration contract.
 - [x] (2026-07-10 07:43Z) Implemented dynamic registration, configuration pulls, legacy pushed snapshots, newest-response-wins handling, and strict full-snapshot parsing. Evidence: six `lsp::server::tests` unit tests and `bifrost_lsp_server_runtime_configuration_registers_and_pulls_bifrost_section` pass.
 - [x] (2026-07-10 07:43Z) Refactored runtime state to preserve editor roots separately, normalize configuration, prepare replacement analyzers transactionally, replay overlays, cancel formatter jobs before commit, and clear stale diagnostic state.
-- [x] (2026-07-10 07:49Z) Added Rust unit and end-to-end coverage for registration/pull, direct and nested legacy snapshots, newest-pull ordering, malformed/error retention, editor-root restoration, exclusions, stale diagnostics, overlay replay, formatter replacement, formatter cancellation, and Windows handle cleanup. Evidence: six server unit tests and seven macOS runtime-configuration integration tests pass; the Windows-only `cmd.exe` cleanup case is compiled and exercised by Windows CI.
+- [x] (2026-07-10 07:49Z) Added Rust unit and end-to-end coverage for registration/pull, direct and nested legacy snapshots, newest-pull ordering, malformed/error retention, editor-root restoration, exclusions, stale diagnostics, overlay replay, formatter replacement, formatter cancellation, and Windows handle cleanup. Evidence: six server unit tests and seven macOS runtime-configuration integration tests pass; the Windows-only `cmd.exe` cleanup case is included for Windows CI.
 - [x] (2026-07-10 07:55Z) Updated the VS Code extension so startup and `workspace/configuration` pulls share one complete settings builder, workspace-scoped formatter rules remain excluded, and only launch-setting changes prompt for restart. Evidence: all 29 extension tests pass.
 - [x] (2026-07-10 07:55Z) Documented full-snapshot precedence, pull/legacy shapes, rebuild and diagnostic behavior, live VS Code settings, and the LSP 3.18 reference; updated the API audit. Evidence: Astro check and production build pass, and both changed pages were inspected in the rendered local preview.
-- [ ] Run focused and full validation, perform self-review, and record the final outcome.
+- [x] (2026-07-10 08:04Z) Ran focused and regression validation, completed a diff self-review, and confirmed formatting, Rust linting, extension tests, documentation checks/build, and rendered documentation. Evidence: every command listed under `Outcomes & Retrospective` passes.
 
 ## Surprises & Discoveries
 
@@ -40,6 +40,9 @@ Users can observe the result without restarting Bifrost: a new formatter command
 
 - Observation: populating a fresh `OverlayProject` before `WorkspaceAnalyzer::build_persisted` does not always make persisted reconciliation reparse an open file whose disk metadata is unchanged.
   Evidence: the overlay replay integration test rebuilt successfully but returned only the disk snapshot until the replacement analyzer explicitly called `update` with every replayed open `ProjectFile`. The rebuild preparation now performs that update after the persisted build.
+
+- Observation: the default shell exposed Cargo/Rustc from the user toolchain but `cargo-clippy` from Homebrew, whose Rust compiler used a different LLVM patch release and rejected dependency metadata with `E0514`.
+  Evidence: both a normal and a fresh-target `cargo clippy-no-cuda` failed until Cargo, Rustc, Rustdoc, and the target directory were pinned consistently. `RUSTC=/opt/homebrew/bin/rustc RUSTDOC=/opt/homebrew/bin/rustdoc CARGO_TARGET_DIR=/tmp/bifrost-clippy-homebrew-explicit-576 /opt/homebrew/bin/cargo clippy-no-cuda` passes.
 
 ## Decision Log
 
@@ -77,7 +80,24 @@ Users can observe the result without restarting Bifrost: a new formatter command
 
 ## Outcomes & Retrospective
 
-The protocol, transactional runtime state, behavioral regressions, VS Code integration, and documentation milestones are complete. Bifrost now applies the three existing editor settings without a restart while retaining initialization options as startup state and preserving the formatter trust boundary. Final full-repository formatting, linting, and self-review remain before completion.
+Issue #576 is implemented. Bifrost dynamically registers for configuration changes, pulls complete `bifrost` snapshots when supported, retains legacy pushed-snapshot compatibility, and prevents stale pull responses from rolling configuration backward. Formatter-only changes apply to later requests without rebuilding. Roots and exclusions rebuild transactionally, replay open overlays, cancel and reap formatter processes before the swap, restore the latest editor roots when explicit roots are cleared, and clear diagnostics for files that leave the project.
+
+The VS Code client now uses one trusted full-snapshot builder for initialization and pulls. Runtime settings apply without a restart prompt, while launch-only settings still request one. The public LSP and VS Code documentation and the internal LSP audit describe the protocol, precedence, rebuild behavior, trust boundary, and LSP 3.18 reference.
+
+Final validation completed successfully:
+
+    cargo fmt --check
+    cargo test lsp::server::tests --lib
+    cargo test --test bifrost_lsp_server runtime_configuration
+    cargo test --test bifrost_lsp_server workspace_folder
+    cargo test --test bifrost_lsp_server formatting
+    cargo test --test bifrost_lsp_server configured_roots
+    cargo test --test bifrost_lsp_server excluded_paths
+    RUSTC=/opt/homebrew/bin/rustc RUSTDOC=/opt/homebrew/bin/rustdoc CARGO_TARGET_DIR=/tmp/bifrost-clippy-homebrew-explicit-576 /opt/homebrew/bin/cargo clippy-no-cuda
+    cd editors/vscode && npm test
+    cd docs && npm run check && npm run build
+
+The seven macOS runtime-configuration integration cases pass locally. The Windows-only `cmd.exe` cancellation and removable-handle case is included for Windows CI but was not executed on this macOS host. `git diff --check origin/master...HEAD` also passes, and the final self-review found no remaining correctness or scope issues.
 
 ## Context and Orientation
 
@@ -192,3 +212,5 @@ Plan update (2026-07-10 07:43Z): recorded completion of the protocol and state m
 Plan update (2026-07-10 07:49Z): recorded the completed behavioral test matrix and the persisted-overlay replay fix discovered by the end-to-end rebuild test.
 
 Plan update (2026-07-10 07:55Z): recorded the completed VS Code and documentation milestones, including extension tests, Astro validation, and rendered-page inspection.
+
+Plan update (2026-07-10 08:04Z): recorded successful final validation and self-review, the mixed Rust toolchain discovery and pinned clippy invocation, and the completed outcome for issue #576.
