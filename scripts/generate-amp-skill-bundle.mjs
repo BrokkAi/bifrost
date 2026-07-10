@@ -39,6 +39,7 @@ const INCLUDED_TOOLS = [
   "get_type_by_location",
   "usage_graph",
   "get_symbol_ancestors",
+  "query_code",
 ];
 
 export function buildAmpSkillBundleFiles(repoRoot = REPO_ROOT) {

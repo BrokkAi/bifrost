@@ -62,7 +62,7 @@ exposes:
 | Method | Purpose |
 | --- | --- |
 | `search_symbols(patterns, *, include_tests=False, limit=20)` | Find symbols by name pattern. |
-| `query_code(pattern, *, inside=None, not_inside=None, where=None, languages=None, limit=None, result_detail=None, schema_version=None)` | Search normalized AST structure across supported languages. |
+| `query_code(pattern, *, inside=None, not_inside=None, where=None, languages=None, limit=None, result_detail=None, schema_version=None)` | Query normalized code structure across supported languages. |
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
@@ -113,8 +113,10 @@ passed through `options` (keys map 1:1 to the Rust tool arguments).
 
 ## `query_code` detail and ranges
 
-`query_code` is an experimental v1 query surface. Omit `schema_version` for v1
-or pass `schema_version=1` explicitly when callers want to pin the shape.
+`query_code` is the version-1 normalized structural query surface. Omit
+`schema_version` for v1 or pass `schema_version=1` explicitly when callers want
+to pin the shape. Version 1 is syntactic: it does not traverse call graphs,
+resolve types or aliases, or perform control/data-flow analysis.
 Compact output is the default: matches include project-relative path, language,
 normalized kind, line range, a short snippet, captures, and an enclosing symbol
 when available. Pass `result_detail="full"` when a rule, refactoring step, or
@@ -130,14 +132,16 @@ requesting full detail; these fields only make the span policy explicit.
 
 ### Current structural precision
 
-`query_code` normalizes common syntax across Python, Java, JavaScript, and
-TypeScript, but it is still a syntactic structural search tool. Use these
-caveats when writing reusable rules or prompts:
+`query_code` normalizes common syntax across Python, Java, JavaScript,
+TypeScript, Go, C/C++, Rust, PHP, Scala, C#, and Ruby, but it is still a
+syntactic structural query tool. Use these caveats when writing reusable rules
+or prompts; the [public Code Querying guide](https://brokkai.github.io/bifrost/code-querying/)
+is the canonical reference:
 
 | Area | Current behavior |
 | --- | --- |
 | Constructor calls | Java object creation and JS/TS `new` expressions are normalized as `call`; constructors are also refined as `constructor` declarations where the adapter can identify them. |
-| Keyword arguments | Python supports `kwargs`; Java, JavaScript, and TypeScript currently report unsupported-role diagnostics for `kwargs`. |
+| Keyword arguments | Python, PHP, Scala, C#, and Ruby support normalized `kwargs`; other adapters report unsupported-role diagnostics. |
 | Imports and aliases | Import matching is based on syntactic module/import spans. It does not resolve aliases or follow re-exports. |
 | Receiver and callee | `callee.name` and `receiver.name` are derived from AST fields and terminal names, not type resolution. Chained calls stay syntactic. |
 | Decorators and annotations | Decorators/annotations are exposed through the `decorators` role. Full detail reports `node_range`, `decorator_ranges`, and `decorated_range`. |

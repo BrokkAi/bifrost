@@ -338,7 +338,7 @@ USAGE:
     bifrost                  Run an MCP server over stdio (default: --mcp searchtools)
     bifrost --mcp TOOLSETS     Run an MCP server over stdio (e.g. --mcp core)
     bifrost --lsp              Run a Language Server (LSP) over stdio
-    bifrost --repl             Run an interactive query_code REPL
+    bifrost --repl             Run the interactive code-query REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --install-skills   Install Bifrost Agent Skills into a .agents/skills root
     bifrost --version | --help [TOOL]
@@ -398,7 +398,7 @@ EXAMPLES:
     # One-shot: run a single tool and print its JSON result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
 
-    # Human query_code exploration with S-expressions, completion, docs, and history:
+    # Human code-query exploration with S-expressions, completion, docs, and history:
     bifrost --root /path/to/project --repl
 
     # Install generic Agent Skills for Zed/Antigravity-style hosts:

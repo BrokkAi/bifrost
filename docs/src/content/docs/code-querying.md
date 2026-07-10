@@ -3,7 +3,24 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's structural code-querying engine is `search_ast`. It searches source code through a normalized schema instead of exposing raw parser nodes from each language.
+Bifrost's composable code-query engine is `query_code`. Version 1 searches normalized syntactic structure instead of exposing raw parser nodes from each language. It answers questions such as “find calls to this callee,” “find assignments of string literals,” or “find annotated methods” across supported languages.
+
+The broader name is intentional. Future versions may add optional predicates backed by Bifrost's existing usage and type analyses or by future control-flow and data-flow analyses. Those expensive facets can be computed lazily only after cheaper path, language, name, and structural constraints narrow the candidates. They are a direction, not part of the version-1 contract: `query_code` does not currently traverse call graphs, resolve types or aliases, or prove control/data flow.
+
+## Choose The Right Tool
+
+Use the narrowest tool that directly answers the question:
+
+| Question | Tool | Why |
+| --- | --- | --- |
+| “Where is `Parser.parse` declared?” | `search_symbols` | Searches indexed declarations by name. |
+| “Who references this exact symbol?” | `scan_usages` | Resolves a known declaration to reference sites. |
+| “What is the workspace caller/callee graph?” | `usage_graph` | Returns the existing whole-workspace resolved usage graph. |
+| “Which code has this language-neutral syntactic shape?” | `query_code` | Matches normalized kinds, roles, containment, and captures. |
+| “Which code is conceptually about retry policy?” | `semantic_search` | Retrieves code by meaning rather than exact structure. |
+| “Where does this literal text occur?” | `search_file_contents` | Searches source text without structural interpretation. |
+
+Start with `search_symbols` or `scan_usages` when you already know the symbol. Use `query_code` when the shape matters more than symbol identity. A useful workflow is to capture structural candidates with `query_code`, then pass their locations or enclosing symbols to the more semantic tools.
 
 Each language adapter starts from tree-sitter parses, then maps grammar-specific nodes and fields into a shared structural model:
 
@@ -13,24 +30,26 @@ Each language adapter starts from tree-sitter parses, then maps grammar-specific
 
 The matcher only sees this normalized fact arena. Language-specific tree-sitter node names stop at the adapter boundary, so a query can ask for a `call` with a `callee` across supported languages without knowing each grammar's internal node labels.
 
-## Query Engine
+## Version 1 Structural Facet
 
-`search_ast` is the engine and MCP tool. It validates a query, chooses candidate files and facts, checks normalized kinds and roles, applies containment constraints, and returns structural matches with file ranges and optional captures.
+`query_code` validates a query, chooses candidate files and facts, checks normalized kinds and roles, applies containment constraints, and returns structural matches with file ranges and optional captures.
 
-The engine has one semantic query model: `AstQuery`. Different input formats must lower into that same model before execution.
+The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
 
 ## Query Representations
 
-Bifrost currently has two representations for `AstQuery`:
+Bifrost currently has two representations for `CodeQuery`:
 
-- [Rune Query Language](/search-ast-repl/) is the experimental S-expression syntax used by the human REPL.
-- [JSON AstQuery](/search-ast-json/) is the canonical JSON representation used by `search_ast` over MCP and by `:json` output in the REPL.
+- [Rune Query Language](/rune-query-language/) is the experimental S-expression syntax used by the human REPL.
+- [JSON CodeQuery](/code-query-json/) is the canonical JSON representation used by `query_code` over MCP and by `:json` output in the REPL.
 
-JSON is not a separate query language. It is the stable serialization of the `AstQuery` model. RQL is a convenience language that compiles to that JSON-shaped model.
+JSON is not a separate query language. It is the stable serialization of the `CodeQuery` model. RQL is a convenience language that compiles to that JSON-shaped model.
+
+See [JSON CodeQuery](/code-query-json/) for the complete schema, validation rules, result model, and copy-paste examples. See [Rune Query Language](/rune-query-language/) for interactive authoring and canonical JSON inspection.
 
 ## Adapter Mapping Notes
 
-These notes describe how the current tree-sitter adapters feed the normalized `search_ast` model. They are not query syntax. Query against normalized kinds and roles such as `call`, `assignment`, `callee`, and `right`; tree-sitter node names stay behind the adapter boundary.
+These notes describe how the current tree-sitter adapters feed the normalized `query_code` model. They are not query syntax. Query against normalized kinds and roles such as `call`, `assignment`, `callee`, and `right`; tree-sitter node names stay behind the adapter boundary.
 
 Every adapter follows the same basic pattern:
 
@@ -116,9 +135,9 @@ func run(code string) {
 }
 ```
 
-### C++
+### C And C++
 
-C++ maps `call_expression` and `new_expression` to `call`, `field_expression` to `field_access`, `function_definition` to `function`, `lambda_expression` to `lambda`, class/struct/union specifiers to `class`, `alias_declaration` to `declaration`, and `assignment_expression` / `init_declarator` to `assignment`.
+C and C++ files share the `cpp` analyzer, structural adapter, and language-filter label. C++ maps `call_expression` and `new_expression` to `call`, `field_expression` to `field_access`, `function_definition` to `function`, `lambda_expression` to `lambda`, class/struct/union specifiers to `class`, `alias_declaration` to `declaration`, and `assignment_expression` / `init_declarator` to `assignment`. C files naturally expose only the subset their syntax contains.
 
 Role extraction uses the `function` field of `call_expression` or `type` field of `new_expression` as `callee`. Field calls use the field expression's `argument` as `receiver`, and qualified calls expose the qualified scope as `receiver`. Class-contained or scoped function definitions are refined to `method`, and matching scope/name constructor definitions are refined to `constructor`. `preproc_include` maps to `import`. C++ does not model `kwargs` or decorators.
 
@@ -212,12 +231,12 @@ end
 
 ## CLI Mini Tutorial
 
-The examples below use one-shot CLI mode. They were validated against a toy workspace containing the small per-language shapes shown above, with one file for each supported language.
+The examples below use one-shot CLI mode. They were validated against a toy workspace containing the small per-language shapes shown above, with one file for each supported language. The [JSON reference](/code-query-json/) contains the complete, test-parsed input examples.
 
 Find calls to `audit` across every structural adapter:
 
 ```bash
-bifrost --root ./search-ast-toy --tool search_ast --args '{"match":{"kind":"call","callee":{"name":"audit"}},"limit":20}'
+bifrost --root ./code-query-toy --tool query_code --args '{"match":{"kind":"call","callee":{"name":"audit"}},"limit":20}'
 ```
 
 The result contains one `call` match for each current analyzable language and no diagnostics. Representative rows look like:
@@ -231,7 +250,7 @@ The result contains one `call` match for each current analyzable language and no
 Find assignments to `password` whose right-hand side is a string literal, and capture the value:
 
 ```bash
-bifrost --root ./search-ast-toy --tool search_ast --args '{"match":{"kind":"assignment","left":{"name":"password"},"right":{"kind":"string_literal","capture":"value"}},"limit":20}'
+bifrost --root ./code-query-toy --tool query_code --args '{"match":{"kind":"assignment","left":{"name":"password"},"right":{"kind":"string_literal","capture":"value"}},"limit":20}'
 ```
 
 The result contains one assignment match per language. The captured `value` is `"hunter2"` in each match, even though the source syntax varies:
@@ -245,7 +264,7 @@ The result contains one assignment match per language. The captured `value` is `
 Limit a query to one adapter while debugging a mapping:
 
 ```bash
-bifrost --root ./search-ast-toy --tool search_ast --args '{"languages":["typescript"],"match":{"kind":"call","callee":{"name":"audit"},"args":[{"capture":"argument"}]},"result_detail":"full"}'
+bifrost --root ./code-query-toy --tool query_code --args '{"languages":["typescript"],"match":{"kind":"call","callee":{"name":"audit"},"args":[{"capture":"argument"}]},"result_detail":"full"}'
 ```
 
 This searches only TypeScript files and returns the matched call plus deterministic byte and line ranges because `result_detail` is `full`.
@@ -258,4 +277,4 @@ Use RQL when you are exploring a repository interactively:
 bifrost --root /path/to/project --repl
 ```
 
-Use JSON `AstQuery` when a host, script, or MCP client needs a stable machine-facing payload for the `search_ast` tool.
+Use JSON `CodeQuery` when a host, script, or MCP client needs a stable machine-facing payload for the `query_code` tool.

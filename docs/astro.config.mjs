@@ -61,8 +61,8 @@ export default defineConfig({
           items: [
             { label: 'Overview', slug: 'code-querying' },
             { label: 'Semantic Search', slug: 'semantic-search' },
-            { label: 'Rune Query Language', slug: 'search-ast-repl' },
-            { label: 'JSON AstQuery', slug: 'search-ast-json' },
+            { label: 'Rune Query Language', slug: 'rune-query-language' },
+            { label: 'JSON CodeQuery', slug: 'code-query-json' },
           ],
         },
         {

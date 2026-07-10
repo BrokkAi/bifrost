@@ -147,7 +147,7 @@ const codexSkillsRoot = CODEX_SKILL_BUNDLE_ROOT;
 const expectedSkills = [
   ["bifrost-code-navigation", "bifrost-code-navigation", "search_symbols", "scan_usages", "get_symbol_locations"],
   ["bifrost-code-reading", "bifrost-code-reading", "get_summaries", "get_symbol_sources"],
-  ["bifrost-codebase-search", "bifrost-codebase-search", "search_symbols", "find_filenames", "list_files"],
+  ["bifrost-codebase-search", "bifrost-codebase-search", "search_symbols", "query_code", "find_filenames", "list_files"],
   ["git-exploration", "brokk-git-exploration", "git log", "git diff", "gh pr view"],
   ["guided-issue", "brokk-guided-issue", "Guided Issue Resolution", "brokk:issue-diagnostician"],
   ["guided-review", "brokk-guided-review", "Guided Code Review", "brokk:security-reviewer"],

@@ -14,9 +14,9 @@ After the change, a caller can run `bifrost --tool query_code --args '{"match":{
 - [x] (2026-07-10 09:56Z) Audited the MCP, CLI, Rust, Python, REPL, docs, tests, and generated skill surfaces carrying the old name.
 - [x] (2026-07-10 10:07Z) Renamed the MCP/CLI, Rust, Python, and REPL surfaces to `query_code` / `CodeQuery` without an alias; added explicit old-name rejection and one-shot success coverage.
 - [x] (2026-07-10 10:07Z) Validated the executable rename: 55 structural lib tests, 106 service tests, 75 structural integration tests, 35 MCP/CLI tests, and all 37 Python tests passed.
-- [ ] Complete the #449 reference pages, help discoverability, and agent-skill guidance.
-- [ ] Add executable documentation-example validation and checkpoint the documentation milestone.
-- [ ] Run the full Rust, Python, plugin, docs-build, clippy, and rendered-preview gates.
+- [x] (2026-07-10 10:18Z) Completed the #449 overview, JSON reference, RQL guide, help discoverability, Python/README links, and canonical agent-skill guidance; regenerated the Codex and Amp bundles.
+- [x] (2026-07-10 10:18Z) Added marked JSON/RQL example validation through `CodeQuery::from_json` / `CodeQuery::from_sexp`; all required example categories parse and current public docs reject stale names.
+- [x] (2026-07-10 10:28Z) Passed the full Rust, Python, plugin, docs-build, and clippy gates; visually inspected `/code-querying/`, `/code-query-json/`, and `/rune-query-language/` from a fresh preview and verified navigation and rendered code blocks.
 - [ ] Update GitHub issues #328, #449, and #598 after all local validation passes.
 
 ## Surprises & Discoveries
@@ -32,6 +32,12 @@ After the change, a caller can run `bifrost --tool query_code --args '{"match":{
 
 - Observation: the Python test script uses a separate PyO3 target and host-level `uv` cache, so a cold validation rebuild is substantially longer than the focused Rust rename tests.
   Evidence: `scripts/test_python.sh` rebuilt the wheel in 2m52s, then passed all 37 tests; sandboxed access to `~/.cache/uv` required the normal approved escalation.
+
+- Observation: this shell resolves rustup's `cargo` and `rustc` before Homebrew, but resolves Homebrew's `clippy-driver` before rustup's driver. The binaries report the same version while producing incompatible crate metadata.
+  Evidence: `cargo clippy-no-cuda` failed with E0514 even in an isolated target; `which cargo`, `which rustc`, and `which clippy-driver` identified the mixed toolchain. The authoritative rerun prepends `~/.cargo/bin` and uses a fresh target directory.
+
+- Observation: the worktree did not contain `docs/node_modules`, while the main checkout had an existing compatible installation.
+  Evidence: the first Astro check reported `astro: command not found`; copying the ignored dependency directory from the main checkout allowed both `astro check` and the production build to pass without changing lockfiles.
 
 ## Decision Log
 

@@ -720,7 +720,7 @@ fn paint(style: Style, text: &str, use_color: bool) -> String {
 }
 
 fn welcome_text() -> String {
-    "Bifrost query_code REPL. Type :help for commands. S-expressions are the human query syntax."
+    "Bifrost code-query REPL. Type :help for commands. S-expressions are the human query syntax."
         .to_string()
 }
 
