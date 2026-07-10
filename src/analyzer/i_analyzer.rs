@@ -22,6 +22,18 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// Source text retained by the analyzer generation that produced this
     /// file's declarations and byte ranges.
     fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str>;
+    /// Applies language-specific rendering to an extracted source fragment.
+    /// `declaration_start` is the byte offset of the declaration inside the
+    /// fragment, after any attached comments. The default preserves the
+    /// indexed text unchanged.
+    fn render_source_fragment(
+        &self,
+        _code_unit: &CodeUnit,
+        source: String,
+        _declaration_start: usize,
+    ) -> String {
+        source
+    }
     /// Whether `file` is one this analyzer has indexed. The default scans
     /// `analyzed_files`; concrete analyzers override with an O(1) lookup so
     /// incremental callers don't pay O(repo) per changed file.

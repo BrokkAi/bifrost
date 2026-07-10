@@ -342,6 +342,22 @@ impl IAnalyzer for MultiAnalyzer {
             .and_then(|delegate| delegate.analyzer().indexed_source(file))
     }
 
+    fn render_source_fragment(
+        &self,
+        code_unit: &CodeUnit,
+        source: String,
+        declaration_start: usize,
+    ) -> String {
+        match self.delegate_for_code_unit(code_unit) {
+            Some(delegate) => {
+                delegate
+                    .analyzer()
+                    .render_source_fragment(code_unit, source, declaration_start)
+            }
+            None => source,
+        }
+    }
+
     fn is_analyzed(&self, file: &ProjectFile) -> bool {
         self.delegates
             .values()
