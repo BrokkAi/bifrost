@@ -2982,6 +2982,93 @@ void entry(Target target) {
 }
 
 #[test]
+fn scan_usages_cpp_macro_failure_is_actionable_and_hides_strategy_details() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("defs.h", "#define TEST_DECLARE(name) int name\n")
+        .file(
+            "uses.cpp",
+            r#"
+#include "defs.h"
+
+void run() {
+    TEST_DECLARE(value);
+}
+"#,
+        )
+        .file("actual.cpp", "void callable() {}\n")
+        .file("wrong.h", "#define OTHER_MACRO 1\n")
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["TEST_DECLARE"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let failure = only_result(&value);
+
+    assert_eq!("failure", failure["status"], "payload: {value}");
+    assert_eq!(
+        "unsupported_target_shape", failure["reason_kind"],
+        "payload: {value}"
+    );
+    let message = failure["message"].as_str().expect("failure message");
+    assert!(message.contains("C/C++ macro"), "payload: {value}");
+    assert!(message.contains("query_code"), "payload: {value}");
+    assert!(
+        message.contains("syntactic invocation candidates"),
+        "payload: {value}"
+    );
+    assert!(
+        !message.contains("CppUsageGraphStrategy"),
+        "payload: {value}"
+    );
+    assert!(failure.get("strategy").is_none(), "payload: {value}");
+
+    let anchored_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["wrong.h#TEST_DECLARE"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let anchored_value: Value = serde_json::from_str(&anchored_payload).unwrap();
+    let anchored = only_result(&anchored_value);
+    assert_eq!("not_found", anchored["status"], "payload: {anchored_value}");
+    let anchored_message = anchored["message"].as_str().expect("not-found message");
+    assert!(
+        anchored_message.contains("C/C++ macro"),
+        "payload: {anchored_value}"
+    );
+    assert!(
+        anchored_message.contains("query_code"),
+        "payload: {anchored_value}"
+    );
+    assert!(
+        !anchored_message.contains("bare name"),
+        "macro retry must not recommend the known-bad bare selector: {anchored_value}"
+    );
+
+    let ordinary_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["wrong.h#callable"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let ordinary_value: Value = serde_json::from_str(&ordinary_payload).unwrap();
+    let ordinary = only_result(&ordinary_value);
+    assert_eq!("not_found", ordinary["status"], "payload: {ordinary_value}");
+    assert!(
+        ordinary["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("bare name")),
+        "ordinary wrong-file selector should keep its recovery hint: {ordinary_value}"
+    );
+}
+
+#[test]
 fn scan_usages_accepts_location_target_without_symbols() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

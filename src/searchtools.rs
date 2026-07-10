@@ -762,8 +762,6 @@ pub struct ScanUsagesEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
@@ -896,8 +894,6 @@ pub struct UsageFailureInfo {
     pub symbol: String,
     /// Fully qualified symbol reported by the analyzer failure, when available.
     pub fq_name: String,
-    /// Graph strategy that produced the failure, when available.
-    pub strategy: String,
     /// Stable machine-readable failure category, when available.
     pub reason_kind: String,
     /// Analyzer-provided reason. This is separate from `not_found` because the symbol
@@ -3255,11 +3251,10 @@ fn location_selector_failure(
     reason_kind: &str,
     reason: impl Into<String>,
 ) -> ScanUsageTargetResolution {
-    let hint = usage_failure_hint(reason_kind, true, false);
+    let hint = usage_failure_hint(reason_kind, None, true, false);
     ScanUsageTargetResolution::Failure(UsageFailureInfo {
         symbol: scan_usages_target_label(target),
         fq_name: String::new(),
-        strategy: "location_selector".to_string(),
         reason_kind: reason_kind.to_string(),
         reason: reason.into(),
         candidate_files_truncated: false,
@@ -3270,9 +3265,14 @@ fn location_selector_failure(
 
 fn usage_failure_hint(
     reason_kind: &str,
+    target: Option<&CodeUnit>,
     location_selected: bool,
     candidate_files_truncated: bool,
 ) -> Option<String> {
+    if reason_kind == "unsupported_target_shape" {
+        return Some(unsupported_target_shape_guidance(target));
+    }
+
     if candidate_files_truncated {
         return Some(
             "The candidate file set exceeded the per-query cap; re-call scan_usages with narrower `paths` to reduce the scan scope."
@@ -3294,6 +3294,90 @@ fn usage_failure_hint(
         | ("unsupported_target_shape", _) => None,
         _ => None,
     }
+}
+
+fn unsupported_target_shape_message(target: Option<&CodeUnit>) -> String {
+    let Some(target) = target else {
+        return "`scan_usages` cannot resolve this declaration kind yet".to_string();
+    };
+    format!(
+        "`scan_usages` cannot resolve {} {} declarations yet",
+        scan_usages_language_name(language_for_target(target)),
+        target.kind().display_lowercase(),
+    )
+}
+
+const UNSUPPORTED_TARGET_SHAPE_GUIDANCE: &str = "Use `get_symbol_sources` to inspect the declaration, then `query_code` to find syntactic candidates; `query_code` does not resolve references.";
+
+fn unsupported_target_shape_guidance(target: Option<&CodeUnit>) -> String {
+    let Some(target) = target else {
+        return UNSUPPORTED_TARGET_SHAPE_GUIDANCE.to_string();
+    };
+
+    if target.is_macro() {
+        return function_like_macro_query_guidance(
+            language_for_target(target),
+            target.identifier(),
+        );
+    }
+
+    UNSUPPORTED_TARGET_SHAPE_GUIDANCE.to_string()
+}
+
+fn function_like_macro_query_guidance(language: Language, identifier: &str) -> String {
+    let query = function_like_macro_query(language, identifier);
+    format!(
+        "Use `get_symbol_sources` to inspect the macro. For a function-like macro, call `query_code` with `{query}` to find syntactic invocation candidates; `query_code` does not resolve references."
+    )
+}
+
+fn function_like_macro_query(language: Language, identifier: &str) -> String {
+    serde_json::json!({
+        "languages": [language.config_label()],
+        "match": { "kind": "call", "callee": { "name": identifier } }
+    })
+    .to_string()
+}
+
+fn scan_usages_language_name(language: Language) -> &'static str {
+    match language {
+        Language::None => "this language",
+        Language::Java => "Java",
+        Language::Go => "Go",
+        Language::Cpp => "C/C++",
+        Language::JavaScript => "JavaScript",
+        Language::TypeScript => "TypeScript",
+        Language::Python => "Python",
+        Language::Rust => "Rust",
+        Language::Php => "PHP",
+        Language::Scala => "Scala",
+        Language::CSharp => "C#",
+        Language::Ruby => "Ruby",
+    }
+}
+
+fn scan_usages_anchor_not_found_input(
+    input: impl Into<String>,
+    anchor: &str,
+    name: &str,
+    resolved_targets: &[CodeUnit],
+) -> NotFoundInput {
+    if resolved_targets
+        .iter()
+        .all(|target| language_for_target(target) == Language::Cpp && target.is_macro())
+        && !resolved_targets.is_empty()
+    {
+        let target = &resolved_targets[0];
+        return not_found_input(
+            input,
+            Some(format!(
+                "`{name}` has no definition in `{anchor}`. It resolves elsewhere as a C/C++ macro, which `scan_usages` cannot resolve. {}",
+                unsupported_target_shape_guidance(Some(target)),
+            )),
+        );
+    }
+
+    anchor_not_found_input(input, anchor, name)
 }
 
 fn declaration_start_column(unit: &CodeUnit, range: Range) -> Option<usize> {
@@ -3776,6 +3860,8 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             // A file-anchored selector picks one definition from a prior
             // ambiguous result; narrow to that file before scanning.
             Some(anchor) => {
+                let not_found =
+                    scan_usages_anchor_not_found_input(symbol.clone(), &anchor, lookup, &overloads);
                 let narrowed: Vec<CodeUnit> = overloads
                     .into_iter()
                     .filter(|unit| rel_path_string(unit.source()) == anchor)
@@ -3784,7 +3870,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 if narrowed.is_empty() {
                     work_entries.push(ScanUsagesWorkEntry::NotFound {
                         request,
-                        item: anchor_not_found_input(symbol.clone(), &anchor, lookup),
+                        item: not_found,
                     });
                     continue;
                 }
@@ -3980,13 +4066,20 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 let reason_kind = diagnostic
                     .map(|diagnostic| diagnostic.reason_kind.clone())
                     .unwrap_or_default();
+                let reason = if reason_kind == "unsupported_target_shape" {
+                    unsupported_target_shape_message(overloads.first())
+                } else {
+                    reason
+                };
                 let failure = UsageFailureInfo {
                     symbol,
                     fq_name,
-                    strategy: diagnostic
-                        .map(|diagnostic| diagnostic.strategy.clone())
-                        .unwrap_or_default(),
-                    hint: usage_failure_hint(&reason_kind, location_selected, truncated),
+                    hint: usage_failure_hint(
+                        &reason_kind,
+                        overloads.first(),
+                        location_selected,
+                        truncated,
+                    ),
                     reason_kind,
                     reason,
                     candidate_files_truncated: truncated,
@@ -4827,7 +4920,6 @@ fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
             );
             result.symbol = Some(failure.symbol.clone());
             result.fq_name = Some(failure.fq_name.clone());
-            result.strategy = Some(failure.strategy.clone());
             result.reason_kind = Some(failure.reason_kind.clone());
             result.candidate_files_sample = failure.candidate_files_sample.clone();
             result.message = Some(match failure.hint.as_deref() {
@@ -5010,7 +5102,6 @@ fn scan_usages_entry_base(
         fq_name: None,
         definition_path: None,
         definition_line: None,
-        strategy: None,
         reason_kind: None,
         candidate_files_sample: None,
         total_callsites: None,
@@ -6950,13 +7041,13 @@ fn language_name(language: Language) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::usage_failure_hint;
     use super::{
         ScanUsageRequest, ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample,
         ScanUsagesStatus, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState,
         UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
         list_symbols, resolve_file_patterns, trim_summary_signature,
     };
+    use super::{function_like_macro_query, usage_failure_hint};
     use crate::analyzer::{
         CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
     };
@@ -7346,17 +7437,24 @@ def gamma():
 
     #[test]
     fn no_graph_seed_hint_does_not_repeat_targets_for_anchored_queries() {
-        let anchored = usage_failure_hint("no_graph_seed", true, false).unwrap();
+        let anchored = usage_failure_hint("no_graph_seed", None, true, false).unwrap();
         assert!(
             !anchored.contains("targets"),
             "anchored query must not suggest another targets re-call: {anchored}"
         );
 
-        let unanchored = usage_failure_hint("no_graph_seed", false, false).unwrap();
+        let unanchored = usage_failure_hint("no_graph_seed", None, false, false).unwrap();
         assert!(
             unanchored.contains("targets"),
             "unanchored query should suggest the targets selector: {unanchored}"
         );
+    }
+
+    #[test]
+    fn function_like_macro_guidance_escapes_identifier_for_query_code() {
+        let query = function_like_macro_query(Language::Cpp, r"\U000003B1");
+        let value: serde_json::Value = serde_json::from_str(&query).expect("valid query_code JSON");
+        assert_eq!(r"\U000003B1", value["match"]["callee"]["name"]);
     }
 
     fn scan_usage_request(symbol: &str) -> ScanUsageRequest {
@@ -7596,7 +7694,6 @@ def gamma():
             failure: UsageFailureInfo {
                 symbol: "target".to_string(),
                 fq_name: "target".to_string(),
-                strategy: "UsageFinder".to_string(),
                 reason_kind: "no_graph_seed".to_string(),
                 reason: "no graph seed".to_string(),
                 candidate_files_truncated: true,
