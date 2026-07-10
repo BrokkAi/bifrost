@@ -184,17 +184,13 @@ impl RenderText for SummaryResult {
 
 impl RenderText for SymbolSourcesResult {
     fn render_text(&self, options: RenderOptions) -> String {
-        let mut blocks: Vec<String> = self
-            .sources
-            .iter()
-            .map(|source| source.render_text(options))
-            .collect();
+        let mut blocks = Vec::new();
         if !self.sources.is_empty()
             && (!self.not_found.is_empty()
                 || !self.ambiguous.is_empty()
                 || !self.ambiguous_paths.is_empty())
         {
-            blocks.insert(0, render_symbol_sources_mixed_status(self));
+            blocks.push(render_symbol_sources_mixed_status(self));
         }
         if !self.not_found.is_empty() {
             blocks.push(render_not_found(&self.not_found));
@@ -205,6 +201,11 @@ impl RenderText for SymbolSourcesResult {
         if !self.ambiguous_paths.is_empty() {
             blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
         }
+        blocks.extend(
+            self.sources
+                .iter()
+                .map(|source| source.render_text(options)),
+        );
         if blocks.is_empty() {
             "No matching sources found.".to_string()
         } else {
@@ -214,9 +215,6 @@ impl RenderText for SymbolSourcesResult {
 }
 
 fn render_symbol_sources_mixed_status(result: &SymbolSourcesResult) -> String {
-    let resolved = result.sources.len();
-    let total =
-        resolved + result.not_found.len() + result.ambiguous.len() + result.ambiguous_paths.len();
     let unresolved = result
         .not_found
         .iter()
@@ -229,7 +227,7 @@ fn render_symbol_sources_mixed_status(result: &SymbolSourcesResult) -> String {
                 .map(|item| item.input.as_str()),
         );
     format!(
-        "Resolved {resolved} of {total} requested symbols; unresolved: {} (see sections below)",
+        "Some requested symbols were unresolved: {} (see recovery guidance below)",
         render_inline_list(unresolved)
     )
 }

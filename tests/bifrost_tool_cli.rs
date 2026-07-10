@@ -223,7 +223,7 @@ fn tool_get_symbol_sources_accepts_git_history_path() {
         .arg("--tool")
         .arg("get_symbol_sources")
         .arg("--args")
-        .arg(r#"{"symbols":["HEAD~1:Demo.java","OldDemo"]}"#)
+        .arg(r#"{"symbols":["HEAD~1:Demo.java#OldDemo"]}"#)
         .output()
         .expect("run bifrost --tool get_symbol_sources with git history path");
 
@@ -245,6 +245,56 @@ fn tool_get_symbol_sources_accepts_git_history_path() {
     assert!(source_text.contains("OldDemo"), "{payload}");
     assert!(source_text.contains("value() { return 1; }"), "{payload}");
     assert!(!source_text.contains("NewDemo"), "{payload}");
+}
+
+#[test]
+fn tool_get_symbol_sources_does_not_treat_colon_selectors_as_git_history() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(fixture_root())
+        .arg("--tool")
+        .arg("get_symbol_sources")
+        .arg("--args")
+        .arg(r#"{"symbols":["A.java:A.method2","A.java:A.rs","A.java:1-32"]}"#)
+        .output()
+        .expect("run bifrost --tool get_symbol_sources with colon selectors");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
+    let structured = &payload["structuredContent"];
+
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        2,
+        structured["sources"].as_array().unwrap().len(),
+        "{payload}"
+    );
+    assert_eq!(
+        2,
+        structured["not_found"].as_array().unwrap().len(),
+        "{payload}"
+    );
+    let not_found = structured["not_found"].as_array().unwrap();
+    assert!(
+        not_found.iter().any(|item| item["input"] == "A.java:A.rs"),
+        "{payload}"
+    );
+    let range = not_found
+        .iter()
+        .find(|item| item["input"] == "A.java:1-32")
+        .expect("line/range selector result");
+    assert!(
+        range["note"]
+            .as_str()
+            .unwrap()
+            .contains("line/range anchor, not a symbol selector"),
+        "{payload}"
+    );
 }
 
 #[test]

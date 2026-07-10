@@ -6216,7 +6216,7 @@ fn file_outline_source_note(file: &ProjectFile) -> String {
         "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for JS/TS module-scoped symbols, use the full relative path selector such as src/plugin/relativeTime/index.js#default), or use get_summaries for structured summaries"
             .to_string()
     } else {
-        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for example, <path>#<symbol>), or use get_summaries for structured summaries"
+        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body, or use get_summaries for structured summaries"
             .to_string()
     }
 }

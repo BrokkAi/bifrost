@@ -828,7 +828,7 @@ fn unsupported_selector_shapes_report_specific_recovery_guidance() {
 }
 
 #[test]
-fn mixed_symbol_sources_render_lead_in_before_unresolved_sections() {
+fn mixed_symbol_sources_render_recovery_before_source_bodies() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file("src/a.js", "export class Widget {}\n")
         .build();
@@ -842,7 +842,7 @@ fn mixed_symbol_sources_render_lead_in_before_unresolved_sections() {
     let rendered = payload["rendered_text"].as_str().expect("rendered text");
     assert!(
         rendered.starts_with(
-            "Resolved 1 of 2 requested symbols; unresolved: `MissingWidget` (see sections below)"
+            "Some requested symbols were unresolved: `MissingWidget` (see recovery guidance below)"
         ),
         "{rendered}"
     );
@@ -853,4 +853,7 @@ fn mixed_symbol_sources_render_lead_in_before_unresolved_sections() {
         ),
         "{rendered}"
     );
+    let recovery = rendered.find("## Not found").expect("not-found section");
+    let source = rendered.find("## Widget").expect("source body");
+    assert!(recovery < source, "{rendered}");
 }

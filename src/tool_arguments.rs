@@ -1,3 +1,4 @@
+use crate::analyzer::Language;
 use crate::git_file::parse_rev_path;
 use crate::git_file::{read_git_file, resolve_git_file_path};
 use serde_json::Value;
@@ -70,7 +71,7 @@ pub fn normalize_tool_arguments_for_cli(
             workspace_root,
             &mut overlays,
         )?,
-        "get_symbol_sources" => normalize_cli_string_array_field(
+        "get_symbol_sources" => normalize_cli_symbol_source_field(
             &mut arguments,
             "symbols",
             workspace_root,
@@ -271,19 +272,73 @@ fn normalize_cli_string_array_field(
     workspace_root: &Path,
     overlays: &mut GitHistoryOverlays,
 ) -> Result<(), String> {
-    let Some(array) = arguments.get_mut(field).and_then(Value::as_array_mut) else {
-        return Ok(());
-    };
+    normalize_string_array_field_with(arguments, field, |raw| {
+        normalize_cli_path_argument(raw, workspace_root, overlays)
+    })
+}
 
-    for item in array {
-        let Some(raw) = item.as_str() else {
-            continue;
-        };
-        if let Some(normalized) = normalize_cli_path_argument(raw, workspace_root, overlays)? {
-            *item = Value::String(normalized);
+fn normalize_cli_symbol_source_field(
+    arguments: &mut Value,
+    field: &str,
+    workspace_root: &Path,
+    overlays: &mut GitHistoryOverlays,
+) -> Result<(), String> {
+    normalize_string_array_field_with(arguments, field, |raw| {
+        normalize_cli_symbol_source_argument(raw, workspace_root, overlays)
+    })
+}
+
+fn normalize_cli_symbol_source_argument(
+    raw: &str,
+    workspace_root: &Path,
+    overlays: &mut GitHistoryOverlays,
+) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if let Some((rev, path)) = parse_rev_path(trimmed) {
+        let (history_path, selector) = split_git_history_source_selector(path);
+        if !is_analyzable_source_path(rev) && is_analyzable_source_path(history_path) {
+            let normalized = normalize_cli_revision_path_argument(
+                raw,
+                rev,
+                history_path,
+                workspace_root,
+                overlays,
+            )?;
+            return Ok(Some(match selector {
+                Some(selector) => format!("{normalized}#{selector}"),
+                None => normalized,
+            }));
         }
     }
-    Ok(())
+
+    if !looks_like_absolute_path(trimmed) {
+        return Ok(None);
+    }
+
+    // An absolute path inside the active workspace remains a supported file or
+    // path-qualified symbol selector. Keep external absolute paths unchanged so
+    // get_symbol_sources can return its syntax-specific relative-path recovery
+    // guidance instead of failing CLI argument normalization first.
+    match normalize_mcp_path_argument(raw, workspace_root) {
+        Ok(normalized) => Ok(normalized),
+        Err(_) => Ok(None),
+    }
+}
+
+fn split_git_history_source_selector(path: &str) -> (&str, Option<&str>) {
+    match path.split_once('#') {
+        Some((path, selector)) if !path.is_empty() && !selector.is_empty() => {
+            (path, Some(selector))
+        }
+        _ => (path, None),
+    }
+}
+
+fn is_analyzable_source_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| Language::from_extension(extension) != Language::None)
 }
 
 fn normalize_cli_optional_string_field(
@@ -331,11 +386,21 @@ fn normalize_cli_path_argument(
         return normalize_mcp_path_argument(raw, workspace_root);
     };
 
+    normalize_cli_revision_path_argument(raw, rev, path, workspace_root, overlays).map(Some)
+}
+
+fn normalize_cli_revision_path_argument(
+    raw: &str,
+    rev: &str,
+    path: &str,
+    workspace_root: &Path,
+    overlays: &mut GitHistoryOverlays,
+) -> Result<String, String> {
     let normalized_path = normalize_rev_path_part_inside_workspace(path, workspace_root)?;
     let rel_path = PathBuf::from(&normalized_path);
     let abs_path = resolve_git_file_path(&normalized_path, workspace_root);
-    overlays.add(trimmed, rev, rel_path, abs_path)?;
-    Ok(Some(normalized_path))
+    overlays.add(raw, rev, rel_path, abs_path)?;
+    Ok(normalized_path)
 }
 
 fn normalize_rev_path_part_inside_workspace(
@@ -360,6 +425,16 @@ fn normalize_string_array_field(
     field: &str,
     workspace_root: &Path,
 ) -> Result<(), String> {
+    normalize_string_array_field_with(arguments, field, |raw| {
+        normalize_mcp_path_argument(raw, workspace_root)
+    })
+}
+
+fn normalize_string_array_field_with(
+    arguments: &mut Value,
+    field: &str,
+    mut normalize: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<(), String> {
     let Some(array) = arguments.get_mut(field).and_then(Value::as_array_mut) else {
         return Ok(());
     };
@@ -368,7 +443,7 @@ fn normalize_string_array_field(
         let Some(raw) = item.as_str() else {
             continue;
         };
-        if let Some(normalized) = normalize_mcp_path_argument(raw, workspace_root)? {
+        if let Some(normalized) = normalize(raw)? {
             *item = Value::String(normalized);
         }
     }
@@ -672,6 +747,53 @@ mod tests {
 
         assert!(overlays.is_empty());
         assert_eq!(normalized["where"][0], "src/**/*.py");
+    }
+
+    #[test]
+    fn get_symbol_sources_cli_leaves_colon_selectors_for_tool_recovery() {
+        let root = TempDir::new().expect("temp dir");
+        let symbols = json!([
+            "src/A.java:1-32",
+            "src/A.java:A.method2",
+            "src/A.java:A.rs",
+            "void ns::helper(int value)"
+        ]);
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": symbols.clone() }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert!(overlays.is_empty());
+        assert_eq!(normalized["symbols"], symbols);
+    }
+
+    #[test]
+    fn get_symbol_sources_cli_normalizes_only_in_workspace_absolute_paths() {
+        let root = TempDir::new().expect("root dir");
+        let source = root.path().join("src").join("A.java");
+        fs::create_dir_all(source.parent().unwrap()).expect("src dir");
+        fs::write(&source, "class A {}\n").expect("write source");
+
+        let outside = TempDir::new().expect("outside dir");
+        let external = outside.path().join("src").join("A.java");
+        fs::create_dir_all(external.parent().unwrap()).expect("external src dir");
+        fs::write(&external, "class A {}\n").expect("write external source");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({
+                "symbols": [source.display().to_string(), external.display().to_string()]
+            }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert!(overlays.is_empty());
+        assert_eq!(normalized["symbols"][0], "src/A.java");
+        assert_eq!(normalized["symbols"][1], external.display().to_string());
     }
 
     #[test]
