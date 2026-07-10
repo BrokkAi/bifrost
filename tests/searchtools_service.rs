@@ -2480,7 +2480,7 @@ fn scan_usages_python_payload_includes_rendered_diagnostics_and_zero_notes() {
         "{rendered}"
     );
     assert!(
-        rendered.contains("scanned all code including tests; scope covered the whole workspace"),
+        rendered.contains("Scope: analyzed source including test files; whole analyzed workspace."),
         "{rendered}"
     );
 }
@@ -2516,9 +2516,12 @@ fn scan_usages_verified_absent_names_filters_and_followups() {
 
     let structured = &value["structured"];
     assert_eq!("verified_absent", only_result(structured)["status"]);
+    assert_eq!(false, structured["scope"]["include_tests"]);
+    assert_eq!(false, structured["scope"]["whole_workspace"]);
+    assert_eq!("src/Scoped.java", structured["scope"]["paths"][0]);
     assert!(
         rendered.contains(
-            "scanned production code only (include_tests=false); scope restricted to paths: src/Scoped.java."
+            "Scope: production analyzed source only (include_tests=false); effective paths: src/Scoped.java."
         ),
         "{rendered}"
     );
@@ -2527,13 +2530,81 @@ fn scan_usages_verified_absent_names_filters_and_followups() {
         "{rendered}"
     );
     assert!(
-        rendered.contains("drop or widen paths to search the whole workspace."),
+        rendered.contains("drop or widen paths to search the whole analyzed workspace."),
         "{rendered}"
     );
     assert!(
         rendered.contains("framework-invoked entrypoint"),
         "{rendered}"
     );
+}
+
+#[test]
+fn scan_usages_scope_reports_effective_filters_and_ignored_inputs() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Target.java",
+            "public class Target {\n    public void unused() {}\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_payload_json(
+            "scan_usages",
+            r#"{"symbols":["Target.unused"],"include_tests":true,"paths":["   ","["]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let structured = &value["structured"];
+
+    assert_eq!(true, structured["scope"]["whole_workspace"], "{value}");
+    assert_eq!(2, structured["scope"]["ignored_paths"], "{value}");
+    assert!(structured["scope"]["paths"].is_null(), "{value}");
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(rendered.contains("whole analyzed workspace"), "{rendered}");
+    assert!(
+        rendered
+            .contains("2 supplied path filters were ignored because they were blank or invalid"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn scan_usages_scope_paths_are_bounded_by_the_response_budget() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Target.java",
+            "public class Target {\n    public void unused() {}\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let mut paths = (0..200)
+        .map(|index| format!("missing/{index:03}-{}.java", "x".repeat(80)))
+        .collect::<Vec<_>>();
+    paths[0] = format!("missing/{}.java", "x".repeat(20_000));
+    let arguments = serde_json::json!({
+        "symbols": ["Target.unused"],
+        "include_tests": true,
+        "paths": paths,
+    })
+    .to_string();
+
+    let payload = service.call_tool_json("scan_usages", &arguments).unwrap();
+    assert!(
+        payload.len() <= SCAN_USAGES_RESPONSE_BUDGET_BYTES,
+        "payload should stay within scan_usages budget, got {} bytes",
+        payload.len()
+    );
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let scope_paths = value["scope"]["paths"].as_array().unwrap();
+    assert_eq!(5, scope_paths.len());
+    assert!(scope_paths[0].as_str().unwrap().ends_with('…'));
+    assert!(scope_paths[0].as_str().unwrap().len() < 300);
+    assert_eq!(195, value["scope"]["paths_omitted"]);
 }
 
 #[test]
@@ -2604,6 +2675,21 @@ fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sampl
             .as_u64()
             .is_some_and(|count| count > 0),
         "payload: {value}"
+    );
+    assert!(
+        failure["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("candidate files were truncated")),
+        "payload: {value}"
+    );
+    assert!(
+        failure["notes"]
+            .as_array()
+            .is_none_or(|notes| notes.iter().all(|note| !note
+                .as_str()
+                .unwrap_or_default()
+                .contains("Candidate file set was truncated"))),
+        "truncation recovery should have one prose owner: {value}"
     );
 }
 
@@ -2846,11 +2932,10 @@ public class Caller {
         "{rendered}"
     );
     assert!(
-        rendered.contains(
-            "absence caveat detail: unproven_matches: candidate usages matched structurally"
-        ),
+        rendered.contains("narrow `paths` to a relevant candidate file"),
         "{rendered}"
     );
+    assert!(!rendered.contains("intended caller"), "{rendered}");
     assert!(
         rendered.find("message: no PROVEN usage sites").unwrap()
             < rendered.find("unproven matches:").unwrap(),
@@ -3238,7 +3323,7 @@ fn scan_usages_multi_symbol_rendered_banner_names_not_found_member() {
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(
         rendered.starts_with(
-            "1/2 symbols with usages; 1 not_found; see per-symbol sections.\nNot found: Target.missing."
+            "2 scan_usages requests: 1 found; 1 not_found; see per-request sections.\nNot found: Target.missing."
         ),
         "{rendered}"
     );

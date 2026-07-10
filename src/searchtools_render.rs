@@ -5,8 +5,7 @@ use crate::searchtools::{
     ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile, SearchSymbolsResult,
     SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement, SummaryResult,
     SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
-    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation,
-    scan_usages_absence_caveat_prose, scan_usages_target_label,
+    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +296,21 @@ impl RenderText for ScanUsagesResult {
             return "No scan_usages requests were provided.".to_string();
         }
         let mut sections = Vec::new();
+        if self.results.iter().any(|entry| {
+            matches!(
+                entry.status,
+                ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::UnverifiedAbsent
+            )
+        }) {
+            let truncated_absence = self.results.iter().any(|entry| {
+                entry.status == ScanUsagesStatus::UnverifiedAbsent
+                    && entry.absence_caveats.iter().any(|caveat| {
+                        *caveat
+                            == crate::searchtools::ScanUsagesAbsenceCaveat::CandidateFilesTruncated
+                    })
+            });
+            sections.push(render_scan_usages_scope(&self.scope, truncated_absence));
+        }
         if self.results.len() > 1 {
             sections.push(render_scan_usages_summary_banner(self));
         }
@@ -330,11 +344,7 @@ impl RenderText for UsageGraphResult {
 
 fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
     let label = render_scan_usages_input(&entry.input);
-    let mut lines = vec![format!(
-        "{}: {}",
-        label,
-        render_scan_usages_status(entry.status)
-    )];
+    let mut lines = vec![format!("{}: {}", label, entry.status.as_str())];
     if !entry.complete {
         lines.push("  note: incomplete result; narrow paths or use a more specific selector for exhaustive detail.".to_string());
     }
@@ -363,16 +373,10 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
         let caveats = entry
             .absence_caveats
             .iter()
-            .map(render_absence_caveat)
+            .map(|caveat| caveat.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!("  absence caveat(s): {caveats}"));
-        for caveat in &entry.absence_caveats {
-            lines.push(format!(
-                "  absence caveat detail: {}",
-                scan_usages_absence_caveat_prose(*caveat)
-            ));
-        }
     }
     if let Some(count) = entry.definition_sites_excluded {
         lines.push(format!(
@@ -419,19 +423,82 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
     lines.join("\n")
 }
 
+fn render_scan_usages_scope(
+    scope: &crate::searchtools::ScanUsagesScope,
+    truncated_absence: bool,
+) -> String {
+    let source_scope = if scope.include_tests {
+        "analyzed source including test files"
+    } else {
+        "production analyzed source only (include_tests=false)"
+    };
+    let path_scope = if scope.whole_workspace {
+        "whole analyzed workspace".to_string()
+    } else {
+        let mut rendered = format!("effective paths: {}", scope.paths.join(", "));
+        if let Some(omitted) = scope.paths_omitted {
+            rendered.push_str(&format!(" (+{omitted} more)"));
+        }
+        rendered
+    };
+    let mut lines = vec![format!("Scope: {source_scope}; {path_scope}.")];
+    if let Some(ignored) = scope.ignored_paths {
+        let label = if ignored == 1 {
+            "filter was ignored because it was"
+        } else {
+            "filters were ignored because they were"
+        };
+        lines.push(format!(
+            "Note: {ignored} supplied path {label} blank or invalid."
+        ));
+    }
+    if !scope.include_tests {
+        lines.push(
+            "Next step for absent results: retry with include_tests=true to include test usages."
+                .to_string(),
+        );
+    }
+    if !scope.whole_workspace && !truncated_absence {
+        lines.push(
+            "Next step for a broader absence check: drop or widen paths to search the whole analyzed workspace."
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
 fn render_scan_usages_summary_banner(result: &ScanUsagesResult) -> String {
     let summary = &result.summary;
-    let mut parts = vec![format!(
-        "{}/{} symbols with usages",
-        summary.found, summary.requested
+    let mut parts = Vec::new();
+    push_scan_usages_status_count(&mut parts, summary.found, ScanUsagesStatus::Found);
+    push_scan_usages_status_count(
+        &mut parts,
+        summary.verified_absent,
+        ScanUsagesStatus::VerifiedAbsent,
+    );
+    push_scan_usages_status_count(
+        &mut parts,
+        summary.unverified_absent,
+        ScanUsagesStatus::UnverifiedAbsent,
+    );
+    push_scan_usages_status_count(&mut parts, summary.not_found, ScanUsagesStatus::NotFound);
+    push_scan_usages_status_count(&mut parts, summary.ambiguous, ScanUsagesStatus::Ambiguous);
+    push_scan_usages_status_count(&mut parts, summary.failure, ScanUsagesStatus::Failure);
+    push_scan_usages_status_count(
+        &mut parts,
+        summary.too_many_callsites,
+        ScanUsagesStatus::TooManyCallsites,
+    );
+    let request_label = if summary.requested == 1 {
+        "request"
+    } else {
+        "requests"
+    };
+    let mut lines = vec![format!(
+        "{} scan_usages {request_label}: {}; see per-request sections.",
+        summary.requested,
+        parts.join("; ")
     )];
-    push_scan_usages_status_count(&mut parts, summary.verified_absent, "verified_absent");
-    push_scan_usages_status_count(&mut parts, summary.unverified_absent, "unverified_absent");
-    push_scan_usages_status_count(&mut parts, summary.not_found, "not_found");
-    push_scan_usages_status_count(&mut parts, summary.ambiguous, "ambiguous");
-    push_scan_usages_status_count(&mut parts, summary.failure, "failure");
-    push_scan_usages_status_count(&mut parts, summary.too_many_callsites, "too_many_callsites");
-    let mut lines = vec![format!("{}; see per-symbol sections.", parts.join("; "))];
 
     let zero_members = result
         .results
@@ -446,7 +513,7 @@ fn render_scan_usages_summary_banner(result: &ScanUsagesResult) -> String {
             format!(
                 "{} ({})",
                 render_scan_usages_input(&entry.input),
-                render_scan_usages_status(entry.status)
+                entry.status.as_str()
             )
         })
         .collect::<Vec<_>>();
@@ -467,9 +534,9 @@ fn render_scan_usages_summary_banner(result: &ScanUsagesResult) -> String {
     lines.join("\n")
 }
 
-fn push_scan_usages_status_count(parts: &mut Vec<String>, count: usize, label: &str) {
+fn push_scan_usages_status_count(parts: &mut Vec<String>, count: usize, status: ScanUsagesStatus) {
     if count > 0 {
-        parts.push(format!("{count} {label}"));
+        parts.push(format!("{count} {}", status.as_str()));
     }
 }
 
@@ -489,30 +556,6 @@ fn render_scan_usages_input(input: &ScanUsagesInput) -> String {
     match input {
         ScanUsagesInput::Symbol(symbol) => symbol.clone(),
         ScanUsagesInput::Target(target) => scan_usages_target_label(target),
-    }
-}
-
-fn render_scan_usages_status(status: ScanUsagesStatus) -> &'static str {
-    match status {
-        ScanUsagesStatus::Found => "found",
-        ScanUsagesStatus::VerifiedAbsent => "verified_absent",
-        ScanUsagesStatus::UnverifiedAbsent => "unverified_absent",
-        ScanUsagesStatus::NotFound => "not_found",
-        ScanUsagesStatus::Ambiguous => "ambiguous",
-        ScanUsagesStatus::Failure => "failure",
-        ScanUsagesStatus::TooManyCallsites => "too_many_callsites",
-    }
-}
-
-fn render_absence_caveat(caveat: &crate::searchtools::ScanUsagesAbsenceCaveat) -> &'static str {
-    match caveat {
-        crate::searchtools::ScanUsagesAbsenceCaveat::UnprovenMatches => "unproven_matches",
-        crate::searchtools::ScanUsagesAbsenceCaveat::CandidateFilesTruncated => {
-            "candidate_files_truncated"
-        }
-        crate::searchtools::ScanUsagesAbsenceCaveat::ReferenceOnlySiblings => {
-            "reference_only_siblings"
-        }
     }
 }
 
@@ -1037,5 +1080,22 @@ mod tests {
             "// line 1\n\n----- OMITTED 10 LINES -----\n\n// line 60",
             rendered
         );
+    }
+
+    #[test]
+    fn truncated_absence_scope_does_not_recommend_widening_paths() {
+        let scope = crate::searchtools::ScanUsagesScope {
+            include_tests: true,
+            whole_workspace: false,
+            paths: vec!["src/**/*.rs".to_string()],
+            paths_omitted: None,
+            ignored_paths: None,
+        };
+
+        let ordinary = render_scan_usages_scope(&scope, false);
+        assert!(ordinary.contains("drop or widen paths"), "{ordinary}");
+
+        let truncated = render_scan_usages_scope(&scope, true);
+        assert!(!truncated.contains("drop or widen paths"), "{truncated}");
     }
 }
