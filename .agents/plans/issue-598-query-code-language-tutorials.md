@@ -17,12 +17,12 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 - [x] (2026-07-10 13:31Z) Milestone 4: published and verified TypeScript-only declarations/class-like forms, decorated callable exclusions, and TSX path/language scoping.
 - [x] (2026-07-10 13:34Z) Milestone 5: published and verified Go call exclusion with `not_has`, multi-value assignment roles, grouped import paths, and keyword/decorator diagnostics.
 - [x] (2026-07-10 13:36Z) Milestone 6: published and verified shared C/C++ filtering, initializer roles/literals, C++ member calls, out-of-line constructors, and includes through `cpp`.
-- [ ] Milestone 7: publish and verify the Rust tutorial.
-- [ ] Milestone 8: publish and verify the PHP tutorial.
-- [ ] Milestone 9: publish and verify the Scala tutorial.
-- [ ] Milestone 10: publish and verify the C# tutorial.
-- [ ] Milestone 11: publish and verify the Ruby tutorial.
-- [ ] Milestone 12: enforce aggregate kind/role/page coverage and complete publication validation.
+- [x] (2026-07-10 15:40Z) Milestone 7: published and verified the Rust tutorial with receiver/turbofish calls, grouped imports, signed assignments, closures, and the unsupported-kwargs diagnostic.
+- [x] (2026-07-10 15:44Z) Milestone 8: published and verified the PHP tutorial with named arguments, static calls, attributes, namespace imports, and the trait-import boundary.
+- [x] (2026-07-10 15:46Z) Milestone 9: published and verified the Scala tutorial with named/block arguments, annotations, grouped imports, and assignment precision.
+- [x] (2026-07-10 15:48Z) Milestone 10: published and verified the C# tutorial with null-conditional calls, named arguments, attributes, and alias-import precision.
+- [x] (2026-07-10 15:52Z) Milestone 11: published and verified the Ruby tutorial with keyword/receiver calls, static/dynamic imports, lambdas, and unsupported decorators.
+- [x] (2026-07-10 15:53Z) Milestone 12: added aggregate assertions for the exact 11-page set, all 24 normalized kinds, and all ten roles; updated sidebar/public-surface checks; focused suites and production docs build passed.
 
 ## Surprises & Discoveries
 
@@ -40,6 +40,9 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 
 - Observation: Go import `module` roles expose the imported path, not the local alias.
   Evidence: The grouped `log "fmt"` fixture did not match module `log`; module `fmt` matched the enclosing grouped import exactly.
+
+- Observation: Rust doctests require the rustup toolchain to match the compiled dependency artifacts.
+  Evidence: An initial `cargo test` with the Homebrew toolchain reported E0514 incompatible-crate errors; rerunning with `PATH=/Users/dave/.cargo/bin:$PATH` passed the complete suite, including doctests.
 
 ## Decision Log
 
@@ -74,6 +77,18 @@ Milestone 4 published TypeScript's tutorial with exact type-alias, interface/enu
 Milestone 5 published Go's tutorial with exact `not_has` call exclusion, ordered captures, structured multi-value assignment left/right roles, grouped import-path matching, and separate unsupported kwargs/decorators diagnostics. Focused/docs tests, production and root-preview builds, and the fresh rendered Go route passed.
 
 Milestone 6 published the shared C/C++ tutorial with exact cross-extension `cpp` results, C and C++ initializer assignments with identifier/numeric roles, a `.cpp`-scoped member call, an out-of-line constructor, and a preprocessor include. Focused/docs tests, production/root-preview builds, and the fresh C/C++ route/navigation/date inspection passed.
+
+Milestone 7 published Rust's tutorial with exact receiver/turbofish call, grouped import, signed assignment, closure, and unsupported-kwargs cases. Focused/docs tests, formatting, and Astro checks passed.
+
+Milestone 8 published PHP's tutorial with exact named-argument, static-call, attribute, grouped-import, and trait-not-import cases. Focused/docs tests, formatting, and Astro checks passed.
+
+Milestone 9 published Scala's tutorial with exact named/block call, assignment, annotation, and grouped-import cases. The named-argument assignment-shaped syntax is proven not to create a false assignment. Focused/docs tests, formatting, and Astro checks passed.
+
+Milestone 10 published C#'s tutorial with exact null-conditional call, named argument, attribute, alias, and alias-target exclusion cases. Focused/docs tests, formatting, and Astro checks passed.
+
+Milestone 11 published Ruby's tutorial with exact keyword/receiver call, static/dynamic import, lambda, and unsupported-decorator cases, plus null-literal and literal-supertype probes. Focused/docs tests, formatting, and Astro checks passed.
+
+Milestone 12 added the aggregate vocabulary/page assertion and completed sidebar/public-surface registration. The focused structural suite (17 tutorial tests, 26 cross-language tests, 19 planner tests, 14 Python tests) passed; the production Astro build emitted all 11 tutorial routes; the complete Rust test suite passed with semantic indexing disabled under the rustup-first toolchain; and no-CUDA clippy passed.
 
 ## Context and Orientation
 
@@ -163,3 +178,7 @@ Revision note, 2026-07-10: Updated after Milestone 4 with TypeScript declaration
 Revision note, 2026-07-10: Updated after Milestone 5 with Go's exact results, import-path/alias boundary, and rendered-page evidence.
 
 Revision note, 2026-07-10: Updated after Milestone 6 with the shared `cpp` filter, exact C/C++ results, and rendered-page evidence.
+
+Revision note, 2026-07-10: Updated after Milestones 7–12 with the Rust, PHP, Scala, C#, and Ruby pages; exact aggregate vocabulary/page coverage; sidebar/public-surface registration; and final focused/full-suite/build evidence.
+
+Revision note, 2026-07-10: Final validation reran the complete semantic-off Rust suite with the rustup-first PATH, no-CUDA clippy, focused structural/tutorial suites, Astro check/build, formatting, and diff checks. A fresh static preview inspected all eleven routes for navigation, dates, headings, and code-block rendering.

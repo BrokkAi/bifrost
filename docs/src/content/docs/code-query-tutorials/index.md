@@ -7,7 +7,7 @@ These tutorials start from recognizable source code and show the same query in [
 
 Each page builds from a broad structural query to narrower filters and exclusions. The examples stay within version 1's normalized syntax model: they do not claim type resolution, call-graph traversal, or data-flow reasoning.
 
-Language pages will be added and marked with their last successful end-to-end verification date as their milestones complete.
+All language pages below are marked with the date of their last successful end-to-end verification.
 
 ## Tutorials
 
@@ -21,8 +21,12 @@ Language pages will be added and marked with their last successful end-to-end ve
 - [PHP](./php/)
 - [Scala](./scala/)
 - [C#](./csharp/)
-- Ruby (planned)
+- [Ruby](./ruby/)
 
 ## What “Every Kind” Means
 
-`query_code` works with a public language-neutral vocabulary, not raw tree-sitter grammar node names. The completed tutorial suite will exercise every normalized kind and role from that public vocabulary, including abstract subtype-aware queries such as `callable`, `declaration`, and `literal`.
+`query_code` works with a public language-neutral vocabulary, not raw tree-sitter grammar node names. The completed tutorial suite exercises every normalized kind and role from that public vocabulary, including abstract subtype-aware queries such as `callable`, `declaration`, and `literal`. The aggregate integration test fails if a future vocabulary addition is not taught here.
+
+## Coverage map
+
+The pages deliberately spread the vocabulary across languages: calls and assignments appear in every adapter, decorators are demonstrated where the grammar exposes them, `kwargs` appears in Python, PHP, Scala, C#, and Ruby, and C/C++ share the `cpp` adapter. The executable coverage test is the authoritative map because it checks the canonical JSON cases and their exact results.

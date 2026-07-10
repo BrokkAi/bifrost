@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_bifrost::analyzer::structural::{CodeQuery, execute};
+use brokk_bifrost::analyzer::structural::{ALL_KINDS, CodeQuery, execute};
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
 use common::InlineTestProject;
 use pretty_assertions::assert_eq;
@@ -109,6 +109,77 @@ fn scala_tutorial() {
 #[test]
 fn csharp_tutorial() {
     verify_tutorial("docs/src/content/docs/code-query-tutorials/csharp.md");
+}
+
+#[test]
+fn ruby_tutorial() {
+    verify_tutorial("docs/src/content/docs/code-query-tutorials/ruby.md");
+}
+
+#[test]
+fn tutorials_cover_all_public_kinds_roles_and_pages() {
+    const PAGES: &[&str] = &[
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "go",
+        "cpp",
+        "rust",
+        "php",
+        "scala",
+        "csharp",
+        "ruby",
+    ];
+    const ROLES: &[&str] = &[
+        "callee",
+        "receiver",
+        "args",
+        "kwargs",
+        "left",
+        "right",
+        "module",
+        "decorators",
+        "object",
+        "field",
+    ];
+
+    let mut seen_pages = std::collections::BTreeSet::new();
+    let mut seen_kinds = std::collections::BTreeSet::new();
+    let mut seen_roles = std::collections::BTreeSet::new();
+    for page in PAGES {
+        let relative = format!("docs/src/content/docs/code-query-tutorials/{page}.md");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(&relative);
+        let markdown = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let tutorial = parse_tutorial(&path, &markdown);
+        assert_valid_date(&path, &tutorial.verified_on);
+        assert!(seen_pages.insert(*page), "duplicate tutorial page {page}");
+        for case in tutorial.cases.values() {
+            let json = case
+                .json
+                .as_deref()
+                .unwrap_or_else(|| panic!("{relative} has a case without JSON"));
+            let value: Value = serde_json::from_str(json)
+                .unwrap_or_else(|error| panic!("invalid JSON in {relative}: {error}"));
+            collect_vocabulary(&value, &mut seen_kinds, &mut seen_roles);
+        }
+    }
+
+    assert_eq!(seen_pages, PAGES.iter().copied().collect());
+    for kind in ALL_KINDS {
+        assert!(
+            seen_kinds.contains(kind.label()),
+            "tutorials do not contain a positive query for normalized kind {}",
+            kind.label()
+        );
+    }
+    for role in ROLES {
+        assert!(
+            seen_roles.contains(*role),
+            "tutorials do not exercise public role {role}"
+        );
+    }
 }
 
 #[allow(dead_code)]
@@ -325,4 +396,44 @@ fn assert_valid_date(path: &Path, date: &str) {
         "invalid verification date {date:?} in {}",
         path.display()
     );
+}
+
+fn collect_vocabulary(
+    value: &Value,
+    kinds: &mut std::collections::BTreeSet<String>,
+    roles: &mut std::collections::BTreeSet<String>,
+) {
+    const ROLES: &[&str] = &[
+        "callee",
+        "receiver",
+        "args",
+        "kwargs",
+        "left",
+        "right",
+        "module",
+        "decorators",
+        "object",
+        "field",
+    ];
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                if key == "kind"
+                    && let Some(kind) = child.as_str()
+                {
+                    kinds.insert(kind.to_string());
+                }
+                if ROLES.contains(&key.as_str()) {
+                    roles.insert(key.clone());
+                }
+                collect_vocabulary(child, kinds, roles);
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_vocabulary(entry, kinds, roles);
+            }
+        }
+        _ => {}
+    }
 }
