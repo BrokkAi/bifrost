@@ -39,6 +39,108 @@ fn completion_initialize_params(root_uri: String) -> Value {
     })
 }
 
+fn semantic_token_client_capabilities() -> Value {
+    json!({
+        "textDocument": {
+            "semanticTokens": {
+                "requests": {"full": true, "range": true},
+                "tokenTypes": ["namespace", "type", "function", "property", "macro"],
+                "tokenModifiers": ["declaration"],
+                "formats": ["relative"]
+            }
+        }
+    })
+}
+
+fn semantic_token_initialize_params(root_uri: String) -> Value {
+    json!({
+        "processId": null,
+        "rootUri": root_uri,
+        "capabilities": semantic_token_client_capabilities()
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedSemanticToken {
+    line: u64,
+    start: u64,
+    length: u64,
+    token_type: u64,
+    modifiers: u64,
+}
+
+fn decode_semantic_tokens(response: &Value) -> Vec<DecodedSemanticToken> {
+    assert!(
+        response["error"].is_null(),
+        "unexpected semantic token error: {response}"
+    );
+    let data = response["result"]["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected semantic token data array: {response}"));
+    assert_eq!(data.len() % 5, 0, "invalid semantic token payload");
+
+    let mut line = 0;
+    let mut start = 0;
+    data.chunks_exact(5)
+        .map(|chunk| {
+            let delta_line = chunk[0].as_u64().expect("delta line");
+            let delta_start = chunk[1].as_u64().expect("delta start");
+            line += delta_line;
+            start = if delta_line == 0 {
+                start + delta_start
+            } else {
+                delta_start
+            };
+            DecodedSemanticToken {
+                line,
+                start,
+                length: chunk[2].as_u64().expect("length"),
+                token_type: chunk[3].as_u64().expect("token type"),
+                modifiers: chunk[4].as_u64().expect("modifiers"),
+            }
+        })
+        .collect()
+}
+
+fn semantic_token_text(source: &str, token: &DecodedSemanticToken) -> String {
+    let line = source
+        .lines()
+        .nth(token.line as usize)
+        .unwrap_or_else(|| panic!("missing line {} in {source:?}", token.line));
+    let mut utf16_position = 0_u64;
+    let mut start_byte = None;
+    let mut end_byte = None;
+    for (byte, ch) in line.char_indices() {
+        if utf16_position == token.start {
+            start_byte = Some(byte);
+        }
+        utf16_position += ch.len_utf16() as u64;
+        if utf16_position == token.start + token.length {
+            end_byte = Some(byte + ch.len_utf8());
+            break;
+        }
+    }
+    if token.start == utf16_position && start_byte.is_none() {
+        start_byte = Some(line.len());
+    }
+    let start_byte = start_byte.unwrap_or_else(|| panic!("invalid token start: {token:?}"));
+    let end_byte = end_byte.unwrap_or_else(|| panic!("invalid token end: {token:?}"));
+    line[start_byte..end_byte].to_string()
+}
+
+fn semantic_token_facts(source: &str, response: &Value) -> Vec<(String, u64, u64)> {
+    decode_semantic_tokens(response)
+        .into_iter()
+        .map(|token| {
+            (
+                semantic_token_text(source, &token),
+                token.token_type,
+                token.modifiers,
+            )
+        })
+        .collect()
+}
+
 struct JvmTypeContextFixtures {
     java_path: PathBuf,
     java_source: &'static str,
@@ -137,6 +239,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["documentFormattingProvider"].is_object(),
         "documentFormattingProvider should be advertised: {initialize}"
     );
+    assert!(
+        initialize["result"]["capabilities"]["semanticTokensProvider"].is_null(),
+        "semanticTokensProvider should be omitted for clients without semantic-token support: {initialize}"
+    );
     server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
 
     server.notify_value(json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}));
@@ -176,6 +282,138 @@ fn bifrost_lsp_server_advertises_completion_when_client_supports_completion_item
     assert!(shutdown["error"].is_null(), "unexpected error: {shutdown}");
 
     server.exit();
+}
+
+#[test]
+fn bifrost_lsp_server_semantic_tokens_advertises_stable_full_legend() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+    let mut server = LspServer::spawn(&fixture_root);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": semantic_token_initialize_params(uri_for(&fixture_root))
+    }));
+    let initialize = server.read_message();
+    let provider = &initialize["result"]["capabilities"]["semanticTokensProvider"];
+    assert_eq!(
+        provider["legend"]["tokenTypes"],
+        json!(["namespace", "type", "function", "property", "macro"])
+    );
+    assert_eq!(provider["legend"]["tokenModifiers"], json!(["declaration"]));
+    assert_eq!(provider["full"], true);
+    assert!(provider["range"].is_null(), "range must remain deferred");
+
+    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    server.shutdown();
+}
+
+#[test]
+fn bifrost_lsp_server_semantic_tokens_classifies_multi_language_symbols() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let java_source = "class Widget {\n    Widget field;\n    void run() {}\n    void call() { run(); Widget local = field; }\n}\n";
+    let typescript_source = "export class Gadget {\n  value = 1;\n  run() { return this.value; }\n}\nconst gadget = new Gadget();\ngadget.run();\n";
+    let rust_source = "struct Thing { value: i32 }\nimpl Thing { fn run(&self) -> i32 { self.value } }\nfn call(item: Thing) -> i32 { item.run() }\n";
+    let java_path = root.join("Widget.java");
+    let typescript_path = root.join("gadget.ts");
+    let rust_path = root.join("thing.rs");
+    fs::write(&java_path, java_source).expect("write Java fixture");
+    fs::write(&typescript_path, typescript_source).expect("write TypeScript fixture");
+    fs::write(&rust_path, rust_source).expect("write Rust fixture");
+
+    let mut server =
+        LspServer::start_with_params(&root, semantic_token_initialize_params(uri_for(&root)));
+    let java = semantic_token_facts(java_source, &server.semantic_tokens(&uri_for(&java_path)));
+    let typescript = semantic_token_facts(
+        typescript_source,
+        &server.semantic_tokens(&uri_for(&typescript_path)),
+    );
+    let rust = semantic_token_facts(rust_source, &server.semantic_tokens(&uri_for(&rust_path)));
+
+    assert!(java.contains(&("Widget".to_string(), 1, 1)), "{java:?}");
+    assert!(java.contains(&("field".to_string(), 3, 1)), "{java:?}");
+    assert!(java.contains(&("run".to_string(), 2, 1)), "{java:?}");
+    assert!(java.contains(&("run".to_string(), 2, 0)), "{java:?}");
+    assert!(
+        typescript.contains(&("Gadget".to_string(), 1, 1)),
+        "{typescript:?}"
+    );
+    assert!(
+        typescript.contains(&("run".to_string(), 2, 0)),
+        "{typescript:?}"
+    );
+    assert!(rust.contains(&("Thing".to_string(), 1, 1)), "{rust:?}");
+    assert!(rust.contains(&("run".to_string(), 2, 0)), "{rust:?}");
+
+    server.shutdown();
+}
+
+#[test]
+fn bifrost_lsp_server_semantic_tokens_use_unicode_crlf_overlay() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file_path = root.join("Overlay.java");
+    fs::write(&file_path, "class Disk { void disk() {} }\n").expect("write disk fixture");
+    let overlay = "class Overlay {\r\n    void overlayOnly() {}\r\n    void call() { String emoji = \"😀\"; overlayOnly(); }\r\n}\r\n";
+    let file_uri = uri_for(&file_path);
+    let mut server =
+        LspServer::start_with_params(&root, semantic_token_initialize_params(uri_for(&root)));
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "java",
+                "version": 1,
+                "text": overlay
+            }
+        }),
+    );
+    let response = server.semantic_tokens(&file_uri);
+    let facts = semantic_token_facts(overlay, &response);
+    assert!(
+        facts.contains(&("Overlay".to_string(), 1, 1)),
+        "overlay declaration missing: {facts:?}"
+    );
+    assert!(
+        facts.contains(&("overlayOnly".to_string(), 2, 1)),
+        "overlay function declaration missing: {facts:?}"
+    );
+    assert!(
+        facts.contains(&("overlayOnly".to_string(), 2, 0)),
+        "overlay function reference missing or UTF-16 position is wrong: {facts:?}"
+    );
+    assert!(
+        facts
+            .iter()
+            .all(|(text, _, _)| text != "Disk" && text != "disk"),
+        "disk-only symbols leaked through overlay: {facts:?}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn bifrost_lsp_server_semantic_tokens_return_empty_for_unsupported_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    fs::write(root.join("Anchor.java"), "class Anchor {}\n").expect("write anchor");
+    let unsupported = root.join("notes.txt");
+    fs::write(&unsupported, "Anchor is plain text.\n").expect("write unsupported file");
+    let mut server =
+        LspServer::start_with_params(&root, semantic_token_initialize_params(uri_for(&root)));
+
+    let response = server.semantic_tokens(&uri_for(&unsupported));
+    assert!(response["error"].is_null(), "unexpected error: {response}");
+    assert_eq!(response["result"]["data"], json!([]));
+
+    server.shutdown();
 }
 
 #[test]

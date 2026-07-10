@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tree_sitter::{Node, Tree};
 
 use crate::analyzer::common::language_for_file;
@@ -5,14 +7,15 @@ use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 
 pub(crate) struct DeclarationNameRangeContext {
-    content: String,
+    content: Arc<String>,
     tree: Option<Tree>,
 }
 
 impl DeclarationNameRangeContext {
     pub(crate) fn new(file: &ProjectFile, content: String) -> Self {
         let language = language_for_file(file);
-        let tree = parse_tree_for_language(file, language, &content);
+        let content = Arc::new(content);
+        let tree = parse_tree_for_language(file, language, content.as_str());
         Self { content, tree }
     }
 
@@ -20,18 +23,27 @@ impl DeclarationNameRangeContext {
         &self.content
     }
 
+    pub(crate) fn shared_content(&self) -> Arc<String> {
+        Arc::clone(&self.content)
+    }
+
+    pub(crate) fn root_node(&self) -> Option<Node<'_>> {
+        self.tree.as_ref().map(Tree::root_node)
+    }
+
     pub(crate) fn name_range(
         &self,
         analyzer: &dyn IAnalyzer,
         code_unit: &CodeUnit,
     ) -> Option<Range> {
-        let tree = self.tree.as_ref()?;
-        code_unit_declaration_name_range_in_tree(
-            analyzer,
-            &self.content,
-            tree.root_node(),
-            code_unit,
-        )
+        self.name_ranges(analyzer, code_unit).into_iter().next()
+    }
+
+    pub(crate) fn name_ranges(&self, analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Range> {
+        let Some(root) = self.root_node() else {
+            return Vec::new();
+        };
+        code_unit_declaration_name_ranges_in_tree(analyzer, &self.content, root, code_unit)
     }
 }
 
@@ -52,7 +64,35 @@ fn code_unit_declaration_name_range_in_tree(
     root: Node<'_>,
     code_unit: &CodeUnit,
 ) -> Option<Range> {
-    let declaration_range = analyzer.ranges(code_unit).iter().min().copied()?;
+    code_unit_declaration_name_ranges_in_tree(analyzer, content, root, code_unit)
+        .into_iter()
+        .next()
+}
+
+fn code_unit_declaration_name_ranges_in_tree(
+    analyzer: &dyn IAnalyzer,
+    content: &str,
+    root: Node<'_>,
+    code_unit: &CodeUnit,
+) -> Vec<Range> {
+    let mut declaration_ranges = analyzer.ranges(code_unit).to_vec();
+    declaration_ranges.sort_unstable();
+    declaration_ranges.dedup();
+
+    declaration_ranges
+        .into_iter()
+        .filter_map(|declaration_range| {
+            code_unit_declaration_name_range_for_range(content, root, code_unit, declaration_range)
+        })
+        .collect()
+}
+
+fn code_unit_declaration_name_range_for_range(
+    content: &str,
+    root: Node<'_>,
+    code_unit: &CodeUnit,
+    declaration_range: Range,
+) -> Option<Range> {
     let declaration_node = node_for_exact_range(root, &declaration_range)
         .or_else(|| node_for_smallest_containing_range(root, &declaration_range))?;
     let name_node = declaration_name_node(declaration_node, code_unit.identifier(), content)?;

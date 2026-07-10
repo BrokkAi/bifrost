@@ -50,9 +50,11 @@ Changing only `formatterCommands` affects later formatting requests without rebu
 
 Bifrost advertises LSP capabilities only after the matching handler exists. Unsupported requests return JSON-RPC `MethodNotFound`; unsupported notifications are ignored.
 
-Current support includes incremental and whole-document text synchronization, save notifications, diagnostics, definition/type-definition/implementation, hover, signature help, completion, references, rename, document highlights, document symbols, formatting, folding ranges, workspace symbols, type and call hierarchy, workspace folder and runtime configuration changes, watched-file notifications, startup progress, and formatting cancellation.
+Current support includes incremental and whole-document text synchronization, save notifications, diagnostics, definition/type-definition/implementation, hover, signature help, completion, references, rename, document highlights, document symbols, full-document semantic tokens, formatting, folding ranges, workspace symbols, type and call hierarchy, workspace folder and runtime configuration changes, watched-file notifications, startup progress, and formatting cancellation.
 
-Semantic tokens and broader cancellation/progress support are intentional follow-up areas. Code actions, server-side execute commands, and pre-save hooks are not advertised until Bifrost has concrete safe edits or commands to expose.
+Semantic tokens color analyzer-known declarations and structured references from the current overlay-aware document snapshot. Bifrost advertises a stable high-level legend to compatible clients and leaves ordinary syntax coloring to the editor; semantic-token range and delta requests are not currently advertised.
+
+Broader cancellation/progress support remains an intentional follow-up area. Code actions, server-side execute commands, and pre-save hooks are not advertised until Bifrost has concrete safe edits or commands to expose.
 
 ## CLI Tooling
 

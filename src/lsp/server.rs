@@ -22,9 +22,9 @@ use lsp_types::request::{
     DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
     HoverRequest, PrepareRenameRequest, References, RegisterCapability, Rename,
-    Request as LspRequestTrait, SignatureHelpRequest, TypeHierarchyPrepare, TypeHierarchySubtypes,
-    TypeHierarchySupertypes, WorkDoneProgressCreate, WorkspaceConfiguration,
-    WorkspaceSymbolRequest,
+    Request as LspRequestTrait, SemanticTokensFullRequest, SignatureHelpRequest,
+    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate,
+    WorkspaceConfiguration, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CancelParams, ConfigurationItem, ConfigurationParams, DidChangeConfigurationParams,
@@ -48,8 +48,8 @@ use crate::lsp::handlers::util::{
 };
 use crate::lsp::handlers::{
     call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
-    folding_range, formatting, hover, references, rename, signature_help, type_definition,
-    type_hierarchy, workspace_symbol,
+    folding_range, formatting, hover, references, rename, semantic_tokens, signature_help,
+    type_definition, type_hierarchy, workspace_symbol,
 };
 use crate::lsp::text_sync::apply_content_changes;
 use crate::util::throttled_log::ThrottledLog;
@@ -750,6 +750,15 @@ fn handle_request(
         DocumentHighlightRequest::METHOD => {
             decode_and_run::<DocumentHighlightRequest, _>(req, |params| {
                 Ok(document_highlight::handle(
+                    &state.workspace,
+                    state.project(),
+                    &params,
+                ))
+            })
+        }
+        SemanticTokensFullRequest::METHOD => {
+            decode_and_run::<SemanticTokensFullRequest, _>(req, |params| {
+                Ok(semantic_tokens::handle(
                     &state.workspace,
                     state.project(),
                     &params,

@@ -12,15 +12,21 @@ Bifrost currently provides navigation and diagnostics through its LSP server but
 
 - [x] (2026-07-10 09:38Z) Confirmed the issue branch and worktree are clean and aligned with their configured upstream.
 - [x] (2026-07-10 09:38Z) Recorded the implementation contract, milestones, and validation requirements in this ExecPlan.
-- [ ] Implement the semantic-token collector, stable legend, UTF-16 relative encoding, capability negotiation, and request dispatch.
-- [ ] Add focused unit coverage and real LSP subprocess coverage for multi-language symbols, overlays, Unicode, line endings, and unsupported files.
-- [ ] Update the public LSP documentation and internal API-surface audit.
+- [x] (2026-07-10 09:49Z) Implemented the semantic-token collector, stable legend, UTF-16 relative encoding, capability negotiation, and request dispatch.
+- [x] (2026-07-10 09:49Z) Added four focused unit tests and four real LSP subprocess tests covering all grammar candidate predicates, multi-language symbols, overlays, Unicode, line endings, and unsupported files.
+- [x] (2026-07-10 09:49Z) Updated the public LSP documentation and internal API-surface audit.
 - [ ] Run formatting, focused and complete tests, no-CUDA clippy, review the final diff, and record validation evidence.
 
 ## Surprises & Discoveries
 
 - Observation: The Bifrost code-intelligence skill instructions are installed, but their MCP tools are not exposed in this session.
   Evidence: tool discovery found no `search_symbols`, `get_symbol_sources`, or `scan_usages` callable, so repository exploration used the skills' documented `rg` and source-reading fallback.
+
+- Observation: `DeclarationNameRangeContext` was the natural owner for both the parsed root and the exact source snapshot, but the resolver also needs shared ownership of that source.
+  Evidence: storing the context content as `Arc<String>` lets semantic tokens reuse the same bytes with a refcount bump instead of cloning the full document before batch resolution; all existing callers continue to borrow `&str`.
+
+- Observation: Every supported grammar exposes reference candidates through named leaf nodes called `identifier`, an `_identifier` variant, or the PHP/Ruby `name`/variable forms.
+  Evidence: the table-driven unit test parses tiny Java, Go, C++, JavaScript, TypeScript, Python, Rust, PHP, Scala, C#, and Ruby sources and finds at least one candidate without source scanning.
 
 ## Decision Log
 
@@ -35,6 +41,10 @@ Bifrost currently provides navigation and diagnostics through its LSP server but
 - Decision: Advertise only full-document tokens, without result IDs, range requests, delta requests, refresh requests, or per-request progress.
   Rationale: This is the focused first milestone from issue #577; each deferred capability needs independent state and protocol behavior.
   Date/Author: 2026-07-10 / user and Codex.
+
+- Decision: Advertise the fixed legend only when the client announces full requests, relative encoding, every legend type, and the declaration modifier.
+  Rationale: Keeping one immutable server legend avoids per-client token-index state and prevents sending types or modifiers the client says it cannot consume.
+  Date/Author: 2026-07-10 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -91,6 +101,14 @@ The collector is read-only and request-local. It does not cache result IDs or mu
 
 The synchronized starting commit is `a1e952e0`, which is also the configured remote branch and `origin/master` at the start of implementation.
 
+Focused implementation evidence:
+
+    cargo test lsp::handlers::semantic_tokens --lib
+    # 4 passed
+
+    cargo test --test bifrost_lsp_server semantic_tokens -- --nocapture
+    # 4 passed
+
 ## Interfaces and Dependencies
 
 No new dependency or public Rust API is required. The public interface addition is the negotiated LSP capability and `textDocument/semanticTokens/full` request.
@@ -108,3 +126,5 @@ The handler exposes within the LSP crate:
 `handle` always returns `Some(SemanticTokensResult::Tokens(...))`; error-like document states use an empty `data` vector. The declaration-range context gains an internal all-name-ranges operation while retaining existing behavior for current callers.
 
 Plan revision note (2026-07-10 09:38Z): Created the self-contained implementation plan before changing production code.
+
+Plan revision note (2026-07-10 09:49Z): Marked the core handler, integration coverage, and documentation milestones complete after focused unit and subprocess tests passed.
