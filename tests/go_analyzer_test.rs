@@ -612,6 +612,52 @@ fn test_go_sources_and_symbols() {
 }
 
 #[test]
+fn go_module_scope_source_ranges_include_enclosing_declarations() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "decls.go",
+        r#"
+        package main
+
+        type Target string
+        type Alias = Target
+
+        var someVar = SomeCall("arg")
+        const someConst = ConstCall()
+
+        var (
+            groupedVar = GroupedCall()
+            siblingVar = 1
+        )
+        "#,
+    )]));
+
+    assert_code_eq(
+        r#"var someVar = SomeCall("arg")"#,
+        &analyzer
+            .get_source(&definition(&analyzer, "main._module_.someVar"), false)
+            .unwrap(),
+    );
+    assert_code_eq(
+        "const someConst = ConstCall()",
+        &analyzer
+            .get_source(&definition(&analyzer, "main._module_.someConst"), false)
+            .unwrap(),
+    );
+    assert_code_eq(
+        "type Alias = Target",
+        &analyzer
+            .get_source(&definition(&analyzer, "main._module_.Alias"), false)
+            .unwrap(),
+    );
+
+    let grouped = analyzer
+        .get_source(&definition(&analyzer, "main._module_.groupedVar"), false)
+        .unwrap();
+    assert_code_eq("groupedVar = GroupedCall()", &grouped);
+    assert!(!grouped.contains("siblingVar"), "{grouped}");
+}
+
+#[test]
 fn test_go_package_name_in_fqns_and_inline_field_cases() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "mypkg/mypkg.go");

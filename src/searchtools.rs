@@ -18,7 +18,9 @@ use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
 };
-use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{
+    CodeUnit, CodeUnitType, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language, ProjectFile, Range,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::lsp::conversion::percent_decode;
 use crate::model_context;
@@ -6951,6 +6953,11 @@ fn unsupported_selector_shape_guidance(analyzer: &dyn IAnalyzer, input: &str) ->
     if let Some(note) = invalid_file_anchored_selector_guidance(analyzer, trimmed) {
         return Some(note);
     }
+    if selector_ends_with_go_module_scope_segment(trimmed) {
+        return Some(format!(
+            "`{GO_MODULE_SCOPE_SEGMENT}` is an outline grouping for Go module-scope declarations, not a selectable symbol. Use a file path as a file target for an outline, or select a member as `pkg.{GO_MODULE_SCOPE_SEGMENT}.<name>` or `pkg.<name>`."
+        ));
+    }
     if let Some(name) = signature_string_selector_name(trimmed) {
         return Some(format!(
             "signature strings are not supported as symbol selectors; retry with the bare function name `{name}`"
@@ -6970,6 +6977,12 @@ fn unsupported_selector_shape_guidance(analyzer: &dyn IAnalyzer, input: &str) ->
         return Some(absolute_path_selector_guidance(analyzer, trimmed));
     }
     None
+}
+
+fn selector_ends_with_go_module_scope_segment(input: &str) -> bool {
+    input
+        .rsplit_once('.')
+        .is_some_and(|(_, segment)| segment == GO_MODULE_SCOPE_SEGMENT)
 }
 
 struct LineRangeAnchorSelector<'a> {

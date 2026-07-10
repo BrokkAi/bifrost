@@ -1354,7 +1354,12 @@ fn owner_name(target: &CodeUnit) -> Option<String> {
 }
 
 fn is_module_field(target: &CodeUnit) -> bool {
-    target.is_field() && target.short_name().starts_with("_module_.")
+    target.is_field()
+        && target
+            .short_name()
+            .split('.')
+            .next()
+            .is_some_and(|segment| segment == crate::analyzer::GO_MODULE_SCOPE_SEGMENT)
 }
 
 pub(crate) fn go_indexed_member_candidates_at_nearest_depth<T: Clone>(

@@ -360,7 +360,10 @@ impl GoDiagnosticCollector<'_> {
         !self.support.fqn(&format!("{package}.{name}")).is_empty()
             || !self
                 .support
-                .fqn(&format!("{package}._module_.{name}"))
+                .fqn(&format!(
+                    "{package}.{}.{name}",
+                    crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+                ))
                 .is_empty()
     }
 
@@ -392,7 +395,10 @@ impl GoImportNamespaces {
         self.dot_packages.iter().any(|package| {
             !support.fqn(&format!("{package}.{name}")).is_empty()
                 || !support
-                    .fqn(&format!("{package}._module_.{name}"))
+                    .fqn(&format!(
+                        "{package}.{}.{name}",
+                        crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+                    ))
                     .is_empty()
         })
     }

@@ -276,7 +276,11 @@ fn scan_top_level_value_initializers(node: Node<'_>, ctx: &mut FileScan<'_, '_>)
             return;
         }
         for (name, value) in names.into_iter().zip(values) {
-            let caller = format!("{}._module_.{name}", ctx.file_pkg);
+            let caller = format!(
+                "{}.{}.{name}",
+                ctx.file_pkg,
+                crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+            );
             scan_top_level_initializer_value(value, caller.as_str(), ctx);
         }
     });

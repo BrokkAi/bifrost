@@ -1,6 +1,7 @@
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, ImportInfo, ParameterMetadata, ProjectFile, SignatureMetadata,
+    CodeUnit, CodeUnitType, GO_MODULE_SCOPE_SEGMENT, ImportInfo, ParameterMetadata, ProjectFile,
+    SignatureMetadata,
 };
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -320,11 +321,12 @@ fn visit_go_type_alias(
         file.clone(),
         CodeUnitType::Field,
         package_name.to_string(),
-        format!("_module_.{name}"),
+        format!("{GO_MODULE_SCOPE_SEGMENT}.{name}"),
     );
+    let range_node = sole_spec_declaration_node(node, "type_alias", "type_declaration");
     parsed.add_code_unit(
         code_unit.clone(),
-        node,
+        range_node,
         source,
         None,
         Some(code_unit.clone()),
@@ -333,13 +335,8 @@ fn visit_go_type_alias(
         code_unit.clone(),
         go_node_text(node, source).trim().to_string(),
     );
-    parsed.mark_type_alias(code_unit);
-    Some(CodeUnit::new(
-        file.clone(),
-        CodeUnitType::Field,
-        package_name.to_string(),
-        format!("_module_.{name}"),
-    ))
+    parsed.mark_type_alias(code_unit.clone());
+    Some(code_unit)
 }
 
 fn visit_go_struct_fields(
@@ -594,11 +591,13 @@ fn visit_go_value_spec(
             file.clone(),
             CodeUnitType::Field,
             package_name.to_string(),
-            format!("_module_.{name}"),
+            format!("{GO_MODULE_SCOPE_SEGMENT}.{name}"),
         );
+        let declaration_kind = format!("{keyword}_declaration");
+        let range_node = sole_spec_declaration_node(node, node.kind(), &declaration_kind);
         parsed.add_code_unit(
             code_unit.clone(),
-            child,
+            range_node,
             source,
             None,
             Some(code_unit.clone()),
@@ -608,6 +607,27 @@ fn visit_go_value_spec(
             go_value_signature(node, source, keyword, name, identifier_count),
         );
     }
+}
+
+fn sole_spec_declaration_node<'tree>(
+    spec: Node<'tree>,
+    spec_kind: &str,
+    declaration_kind: &str,
+) -> Node<'tree> {
+    let Some(parent) = spec.parent() else {
+        return spec;
+    };
+    if parent.kind() != declaration_kind {
+        return spec;
+    }
+
+    let mut cursor = parent.walk();
+    let spec_count = parent
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == spec_kind)
+        .take(2)
+        .count();
+    if spec_count == 1 { parent } else { spec }
 }
 
 fn go_type_signature(node: Node<'_>, source: &str) -> String {

@@ -1,5 +1,5 @@
 use crate::analyzer::common::language_for_target as code_unit_language;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language};
+use crate::analyzer::{CodeUnit, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -34,7 +34,7 @@ pub(crate) fn resolve_enclosing_codeunits(analyzer: &dyn IAnalyzer, input: &str)
                     break;
                 }
                 let owner_path = &query_path[..depth];
-                let pattern = suffix_search_pattern(owner_path);
+                let pattern = suffix_search_pattern(language, owner_path);
                 if pattern.is_empty() {
                     continue;
                 }
@@ -209,7 +209,7 @@ fn suffix_resolution_from_index(
         }
 
         for query_path in &query_paths {
-            let pattern = suffix_search_pattern(query_path);
+            let pattern = suffix_search_pattern(language, query_path);
             if pattern.is_empty() {
                 continue;
             }
@@ -245,7 +245,7 @@ fn unique_resolution_from_matches(
         .flatten()
 }
 
-fn suffix_search_pattern(query_path: &[String]) -> String {
+fn suffix_search_pattern(language: Language, query_path: &[String]) -> String {
     let Some((last, prefix)) = query_path.split_last() else {
         return String::new();
     };
@@ -261,6 +261,13 @@ fn suffix_search_pattern(query_path: &[String]) -> String {
         pattern.push_str(&regex::escape(segment));
         pattern.push_str(r"\$?");
         pattern.push_str(delimiter);
+        if language == Language::Go {
+            pattern.push_str(r"(?:");
+            pattern.push_str(&regex::escape(GO_MODULE_SCOPE_SEGMENT));
+            pattern.push_str(r"\$?");
+            pattern.push_str(delimiter);
+            pattern.push_str(r")?");
+        }
     }
     pattern.push_str(&regex::escape(last));
     pattern.push_str(r"\$?");
@@ -567,7 +574,22 @@ fn go_receiver_type_segment(segment: &str) -> Option<&str> {
 }
 
 fn path_ends_with(candidate: &[String], query: &[String]) -> bool {
-    !query.is_empty()
-        && query.len() <= candidate.len()
-        && candidate[candidate.len() - query.len()..] == *query
+    if query.is_empty() {
+        return false;
+    }
+
+    let mut candidate_index = candidate.len();
+    let mut query_index = query.len();
+    while query_index > 0 {
+        if candidate_index == 0 {
+            return false;
+        }
+        candidate_index -= 1;
+        if candidate[candidate_index] == query[query_index - 1] {
+            query_index -= 1;
+        } else if candidate[candidate_index] != GO_MODULE_SCOPE_SEGMENT {
+            return false;
+        }
+    }
+    true
 }

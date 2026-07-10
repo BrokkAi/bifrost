@@ -24,6 +24,8 @@ use declarations::determine_go_package_name;
 use tests::detect_go_test_assertion_smells;
 use tree_sitter::Node;
 
+pub(crate) const GO_MODULE_SCOPE_SEGMENT: &str = "_module_";
+
 #[derive(Clone)]
 pub struct GoAnalyzer {
     inner: TreeSitterAnalyzer<GoAdapter>,

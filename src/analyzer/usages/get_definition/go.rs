@@ -219,7 +219,10 @@ fn go_package_member_candidates(
     name: &str,
 ) -> Vec<CodeUnit> {
     let mut candidates = support.fqn(&format!("{package}.{name}"));
-    candidates.extend(support.fqn(&format!("{package}._module_.{name}")));
+    candidates.extend(support.fqn(&format!(
+        "{package}.{}.{name}",
+        crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+    )));
     sort_units(&mut candidates);
     candidates.dedup();
     candidates

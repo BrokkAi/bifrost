@@ -1077,6 +1077,141 @@ type prefs struct {
 }
 
 #[test]
+fn go_module_scope_symbol_sources_include_full_declarations() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "decls.go",
+            r#"package pkg
+
+type Target string
+type Alias = Target
+
+var someVar = SomeCall("arg")
+const someConst = ConstCall()
+
+var (
+    groupedVar = GroupedCall()
+    siblingVar = 1
+)
+"#,
+        )
+        .build();
+
+    for (selector, expected) in [
+        ("pkg._module_.someVar", r#"var someVar = SomeCall("arg")"#),
+        ("pkg._module_.someConst", "const someConst = ConstCall()"),
+        ("pkg._module_.Alias", "type Alias = Target"),
+    ] {
+        let result = assert_symbol_source_contains(&project, selector, expected);
+        assert!(
+            result["sources"][0]["text"]
+                .as_str()
+                .expect("source text")
+                .contains(expected),
+            "{result}"
+        );
+    }
+
+    let short = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["pkg.someVar"]}"#,
+    );
+    assert_eq!(0, short["not_found"].as_array().unwrap().len(), "{short}");
+    assert_eq!(0, short["ambiguous"].as_array().unwrap().len(), "{short}");
+    assert_eq!(1, short["sources"].as_array().unwrap().len(), "{short}");
+    assert!(
+        short["sources"][0]["text"]
+            .as_str()
+            .expect("source text")
+            .contains(r#"var someVar = SomeCall("arg")"#),
+        "{short}"
+    );
+
+    let grouped = assert_symbol_source_contains(
+        &project,
+        "pkg._module_.groupedVar",
+        "groupedVar = GroupedCall()",
+    );
+    let text = grouped["sources"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("siblingVar"), "{grouped}");
+}
+
+#[test]
+fn go_module_scope_heading_selector_reports_grouping_guidance() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("decls.go", "package pkg\n\nvar someVar = 1\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["pkg._module_"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["not_found"].as_array().unwrap().len(), "{result}");
+    let note = not_found_note(&result["not_found"][0]);
+    assert!(note.contains("outline grouping"), "{result}");
+    assert!(note.contains("pkg._module_.<name>"), "{result}");
+    assert!(note.contains("pkg.<name>"), "{result}");
+}
+
+#[test]
+fn go_file_anchored_module_scope_heading_keeps_file_selector_guidance() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("decls.go", "package pkg\n\nvar someVar = 1\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["decls.go#_module_"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["not_found"].as_array().unwrap().len(), "{result}");
+    let note = not_found_note(&result["not_found"][0]);
+    assert!(
+        note.contains("not a symbol selector for existing file"),
+        "{result}"
+    );
+    assert!(!note.contains("no symbol matched"), "{result}");
+}
+
+#[test]
+fn go_module_scope_infix_skip_preserves_real_ambiguity() {
+    let project = InlineTestProject::new()
+        .file("go.mod", "module example.com/root\n")
+        .file("a/pkg/name.go", "package pkg\n\ntype Name struct{}\n")
+        .file("b/pkg/name.go", "package pkg\n\nvar Name = 1\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["pkg.Name"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    let matches = string_array(&result["ambiguous"][0]["matches"]);
+    assert!(
+        matches
+            .iter()
+            .any(|selector| selector.contains("example.com/root/a/pkg.Name")),
+        "{result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|selector| selector.contains("example.com/root/b/pkg._module_.Name")),
+        "{result}"
+    );
+}
+
+#[test]
 fn explicit_java_constructor_selector_returns_constructor_source() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
