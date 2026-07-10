@@ -200,9 +200,164 @@ pub(crate) fn trimmed_snippet_around_range(
     source[snippet_start..snippet_end].trim().to_string()
 }
 
+const LOCATION_CONTEXT_LINES: usize = 2;
+const LOCATION_LINE_MAX_CHARS: usize = 160;
+
+pub(crate) fn render_location_diagnostic(
+    source: &str,
+    path: &str,
+    line: usize,
+    column: Option<usize>,
+    reason: &str,
+    recovery: &str,
+) -> String {
+    let line_starts = compute_line_starts(source);
+    let line_count = line_starts.len();
+    let number_width = line_count.max(line).to_string().len();
+    let requested = match column {
+        Some(column) => format!("{path}:{line}:{column}"),
+        None => format!("{path}:{line} (column not supplied)"),
+    };
+    let mut rendered = format!("{reason}\nRequested location: {requested}\nSource context:");
+
+    if (1..=line_count).contains(&line) {
+        let first = line.saturating_sub(LOCATION_CONTEXT_LINES).max(1);
+        let last = line.saturating_add(LOCATION_CONTEXT_LINES).min(line_count);
+        for current in first..=last {
+            let raw = source_line(source, &line_starts, current);
+            let requested_character = (current == line).then(|| {
+                column
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(raw.chars().count())
+            });
+            let (display, caret) = render_bounded_source_line(raw, requested_character);
+            let marker = if current == line { '>' } else { ' ' };
+            rendered.push_str(&format!("\n{marker} {current:>number_width$} | {display}"));
+            if let Some(caret) = caret {
+                rendered.push_str(&format!(
+                    "\n  {:>number_width$} | {}^ {}",
+                    "",
+                    " ".repeat(caret),
+                    requested_location_label(line, column, raw.chars().count())
+                ));
+            }
+        }
+    } else if line == 0 {
+        render_virtual_requested_line(
+            &mut rendered,
+            number_width,
+            line,
+            column,
+            "requested line is before the first source line",
+        );
+        for current in 1..=line_count.min(LOCATION_CONTEXT_LINES + 1) {
+            let (display, _) =
+                render_bounded_source_line(source_line(source, &line_starts, current), None);
+            rendered.push_str(&format!("\n  {current:>number_width$} | {display}"));
+        }
+    } else {
+        let first = line_count.saturating_sub(LOCATION_CONTEXT_LINES).max(1);
+        for current in first..=line_count {
+            let (display, _) =
+                render_bounded_source_line(source_line(source, &line_starts, current), None);
+            rendered.push_str(&format!("\n  {current:>number_width$} | {display}"));
+        }
+        render_virtual_requested_line(
+            &mut rendered,
+            number_width,
+            line,
+            column,
+            "requested line is after the last source line",
+        );
+    }
+
+    rendered.push_str("\nRecovery: ");
+    rendered.push_str(recovery);
+    rendered
+}
+
+fn source_line<'a>(source: &'a str, line_starts: &[usize], line: usize) -> &'a str {
+    let start = line_starts
+        .get(line.saturating_sub(1))
+        .copied()
+        .unwrap_or(0);
+    let end = line_starts.get(line).copied().unwrap_or(source.len());
+    source
+        .get(start..end)
+        .unwrap_or_default()
+        .trim_end_matches(['\r', '\n'])
+}
+
+fn render_bounded_source_line(
+    line: &str,
+    requested_character: Option<usize>,
+) -> (String, Option<usize>) {
+    let characters: Vec<char> = line
+        .chars()
+        .map(|character| if character == '\t' { '→' } else { character })
+        .collect();
+    let requested_character = requested_character.map(|index| index.min(characters.len()));
+    let (start, end) = if characters.len() <= LOCATION_LINE_MAX_CHARS {
+        (0, characters.len())
+    } else if let Some(requested) = requested_character {
+        let start = requested
+            .saturating_sub(LOCATION_LINE_MAX_CHARS / 3)
+            .min(characters.len() - LOCATION_LINE_MAX_CHARS);
+        (start, start + LOCATION_LINE_MAX_CHARS)
+    } else {
+        (0, LOCATION_LINE_MAX_CHARS)
+    };
+    let has_prefix = start > 0;
+    let has_suffix = end < characters.len();
+    let mut display = String::new();
+    if has_prefix {
+        display.push('…');
+    }
+    display.extend(&characters[start..end]);
+    if has_suffix {
+        display.push('…');
+    }
+    let caret = requested_character.map(|requested| {
+        usize::from(has_prefix) + requested.saturating_sub(start).min(end - start)
+    });
+    (display, caret)
+}
+
+fn requested_location_label(line: usize, column: Option<usize>, line_chars: usize) -> String {
+    match column {
+        Some(0) => {
+            format!("requested line {line}, column 0 (before column 1)")
+        }
+        Some(column) if column > line_chars.saturating_add(1) => format!(
+            "requested line {line}, column {column} (past line end at column {})",
+            line_chars + 1
+        ),
+        Some(column) => format!("requested line {line}, column {column}"),
+        None => format!("requested line {line}; column not supplied (marker at column 1)"),
+    }
+}
+
+fn render_virtual_requested_line(
+    rendered: &mut String,
+    number_width: usize,
+    line: usize,
+    column: Option<usize>,
+    boundary_note: &str,
+) {
+    rendered.push_str(&format!(
+        "\n> {line:>number_width$} | [{boundary_note}]\n  {:>number_width$} | ^ {}",
+        "",
+        match column {
+            Some(column) => format!("requested line {line}, column {column}"),
+            None => format!("requested line {line}; column not supplied"),
+        }
+    ));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compute_line_starts, find_line_index_for_offset};
+    use super::{compute_line_starts, find_line_index_for_offset, render_location_diagnostic};
 
     #[test]
     fn compute_line_starts_handles_mixed_line_endings() {
@@ -226,5 +381,79 @@ mod tests {
                 "offset {offset}"
             );
         }
+    }
+
+    #[test]
+    fn location_diagnostic_marks_unicode_character_column_with_context() {
+        let rendered = render_location_diagnostic(
+            "one\nαβ target\nthree\nfour\n",
+            "src/demo.rs",
+            2,
+            Some(4),
+            "no target at location",
+            "move the target to a declaration token",
+        );
+
+        assert!(rendered.contains("Requested location: src/demo.rs:2:4"));
+        assert!(rendered.contains("  1 | one"));
+        assert!(rendered.contains("> 2 | αβ target"));
+        assert!(rendered.contains("|    ^ requested line 2, column 4"));
+        assert!(rendered.contains("  3 | three"));
+        assert!(rendered.contains("Recovery: move the target"));
+    }
+
+    #[test]
+    fn location_diagnostic_marks_omitted_and_past_end_columns_truthfully() {
+        let line_only = render_location_diagnostic(
+            "first\nsecond\nthird",
+            "demo.rs",
+            2,
+            None,
+            "no declaration",
+            "retry",
+        );
+        assert!(line_only.contains("demo.rs:2 (column not supplied)"));
+        assert!(line_only.contains("column not supplied (marker at column 1)"));
+
+        let past_end =
+            render_location_diagnostic("short", "demo.rs", 1, Some(99), "invalid column", "retry");
+        assert!(past_end.contains("requested line 1, column 99 (past line end at column 6)"));
+    }
+
+    #[test]
+    fn location_diagnostic_shows_nearest_boundary_for_invalid_line() {
+        let before = render_location_diagnostic(
+            "one\ntwo\nthree",
+            "demo.rs",
+            0,
+            Some(1),
+            "invalid line",
+            "retry",
+        );
+        assert!(before.contains("> 0 | [requested line is before the first source line]"));
+        assert!(before.contains("  1 | one"));
+
+        let after = render_location_diagnostic(
+            "one\ntwo\nthree",
+            "demo.rs",
+            8,
+            Some(2),
+            "invalid line",
+            "retry",
+        );
+        assert!(after.contains("  2 | two"));
+        assert!(after.contains("  3 | three"));
+        assert!(after.contains("> 8 | [requested line is after the last source line]"));
+    }
+
+    #[test]
+    fn location_diagnostic_bounds_long_lines_around_requested_column() {
+        let source = "x".repeat(500);
+        let rendered =
+            render_location_diagnostic(&source, "generated.rs", 1, Some(400), "no target", "retry");
+
+        assert!(rendered.contains("…"));
+        assert!(rendered.contains("requested line 1, column 400"));
+        assert!(rendered.len() < 400, "{rendered}");
     }
 }

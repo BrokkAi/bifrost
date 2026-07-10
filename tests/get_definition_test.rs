@@ -2283,6 +2283,22 @@ fn javascript_type_lookup_reports_no_declared_type() {
         result["diagnostics"][0]["kind"], "javascript_declared_type_unsupported",
         "{value}"
     );
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("type diagnostic");
+    assert!(
+        message.contains("Requested location: app.js:1:7"),
+        "{message}"
+    );
+    assert!(
+        message.contains("> 1 | const value = new Widget();"),
+        "{message}"
+    );
+    assert!(
+        message.contains("^ requested line 1, column 7"),
+        "{message}"
+    );
+    assert!(message.contains("retry get_type_by_location"), "{message}");
 }
 
 #[test]
@@ -2301,6 +2317,18 @@ fn type_lookup_reports_invalid_location_before_language_diagnostics() {
     assert_eq!(
         result["diagnostics"][0]["kind"], "invalid_location",
         "{value}"
+    );
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("invalid-location diagnostic");
+    assert!(
+        message.contains("Requested location: app.js:99:1"),
+        "{message}"
+    );
+    assert!(message.contains("  2 | class Widget {}"), "{message}");
+    assert!(
+        message.contains("> 99 | [requested line is after the last source line]"),
+        "{message}"
     );
 }
 
@@ -14188,7 +14216,21 @@ fn scala_local_value_returns_no_definition() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("definition diagnostic");
+    assert!(
+        message.contains("Requested location: App.scala:1:"),
+        "{message}"
+    );
+    assert!(message.contains("> 1 | object App"), "{message}");
+    assert!(message.contains("^ requested line 1, column"), "{message}");
+    assert!(
+        message.contains("retry get_definitions_by_location"),
+        "{message}"
+    );
 }
 
 #[test]

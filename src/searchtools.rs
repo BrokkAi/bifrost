@@ -31,7 +31,9 @@ use crate::relevance::{
     DEFAULT_RECENCY_HALF_LIFE, most_important_project_files, most_relevant_project_files,
     most_relevant_project_files_with_half_life,
 };
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::{
+    compute_line_starts, find_line_index_for_offset, render_location_diagnostic,
+};
 use glob::MatchOptions;
 use glob::Pattern;
 use rayon::prelude::*;
@@ -1223,10 +1225,11 @@ pub fn get_definitions_by_location(
         crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
 
     let mut render_cache = DefinitionCandidateRenderCache::default();
-    for ((index, query, _), outcome) in pending.into_iter().zip(outcomes) {
+    for ((index, query, request), outcome) in pending.into_iter().zip(outcomes) {
         results[index] = Some(render_definition_lookup(
             analyzer,
             query,
+            &request.file,
             outcome,
             &mut render_cache,
         ));
@@ -1318,8 +1321,8 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
         .collect();
     let outcomes = crate::analyzer::usages::get_type::resolve_type_batch(analyzer, requests);
 
-    for ((index, query, _), outcome) in pending.into_iter().zip(outcomes) {
-        results[index] = Some(render_type_lookup(analyzer, query, outcome));
+    for ((index, query, request), outcome) in pending.into_iter().zip(outcomes) {
+        results[index] = Some(render_type_lookup(analyzer, query, &request.file, outcome));
     }
 
     GetTypeResult {
@@ -1361,12 +1364,28 @@ pub fn rename_symbol(analyzer: &dyn IAnalyzer, params: RenameSymbolParams) -> Re
     match crate::symbol_rename::rename_symbol(
         analyzer,
         analyzer.project(),
-        file,
+        file.clone(),
         selection,
         &params.new_name,
     ) {
         Ok(result) => render_rename_symbol_result(analyzer, params, result),
-        Err(err) => rename_symbol_failure(params, err.kind, err.message),
+        Err(err) => {
+            let message = if matches!(err.kind, "invalid_location" | "not_found") {
+                location_failure_message(
+                    analyzer,
+                    &file,
+                    &params.path,
+                    params.line,
+                    params.column,
+                    &err.message,
+                    "move the location to an identifier token and retry rename_symbol; use get_definitions_by_location first if the target is uncertain.",
+                )
+                .unwrap_or(err.message)
+            } else {
+                err.message
+            };
+            rename_symbol_failure(params, err.kind, message)
+        }
     }
 }
 
@@ -1729,25 +1748,43 @@ fn definition_candidate_key(candidate: &DefinitionCandidate) -> DefinitionCandid
 fn render_definition_lookup(
     analyzer: &dyn IAnalyzer,
     query: DefinitionReferenceQuery,
+    file: &ProjectFile,
     outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
+    let status = outcome.status.as_str().to_string();
+    let mut diagnostics: Vec<DefinitionDiagnostic> = outcome
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| DefinitionDiagnostic {
+            message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
+            kind: diagnostic.kind,
+        })
+        .collect();
+    if matches!(
+        status.as_str(),
+        "invalid_location" | "not_found" | "no_definition"
+    ) {
+        enrich_location_diagnostics(
+            analyzer,
+            file,
+            &query.path,
+            query.line,
+            query.column,
+            &mut diagnostics,
+            "the requested location did not resolve to a definition",
+            "move the location to the intended reference token and retry get_definitions_by_location; use get_summaries on the file or search_symbols if the target is uncertain.",
+        );
+    }
     DefinitionLookupResult {
         query,
-        status: outcome.status.as_str().to_string(),
+        status,
         reference: outcome.reference.map(|site| DefinitionReferenceSite {
             path: site.path,
             target: site.text,
         }),
         definitions: definition_candidates_with_cache(analyzer, &outcome.definitions, render_cache),
-        diagnostics: outcome
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| DefinitionDiagnostic {
-                message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
-                kind: diagnostic.kind,
-            })
-            .collect(),
+        diagnostics,
     }
 }
 
@@ -1772,11 +1809,36 @@ impl DefinitionCandidateRenderCache {
 fn render_type_lookup(
     analyzer: &dyn IAnalyzer,
     query: TypeReferenceQuery,
+    file: &ProjectFile,
     outcome: crate::analyzer::usages::get_type::TypeLookupOutcome,
 ) -> TypeLookupResult {
+    let status = outcome.status.as_str().to_string();
+    let mut diagnostics: Vec<DefinitionDiagnostic> = outcome
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| DefinitionDiagnostic {
+            message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
+            kind: diagnostic.kind,
+        })
+        .collect();
+    if matches!(
+        status.as_str(),
+        "invalid_location" | "not_found" | "no_type"
+    ) {
+        enrich_location_diagnostics(
+            analyzer,
+            file,
+            &query.path,
+            query.line,
+            query.column,
+            &mut diagnostics,
+            "the requested location did not resolve to a type",
+            "move the location to the intended reference token and retry get_type_by_location; use get_definitions_by_location or get_summaries if the target is uncertain.",
+        );
+    }
     TypeLookupResult {
         query,
-        status: outcome.status.as_str().to_string(),
+        status,
         reference: outcome.reference.map(|site| DefinitionReferenceSite {
             path: site.path,
             target: site.text,
@@ -1786,15 +1848,55 @@ fn render_type_lookup(
             .iter()
             .map(|item| type_lookup_candidate(analyzer, item))
             .collect(),
-        diagnostics: outcome
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| DefinitionDiagnostic {
-                message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
-                kind: diagnostic.kind,
-            })
-            .collect(),
+        diagnostics,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enrich_location_diagnostics(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    path: &str,
+    line: Option<usize>,
+    column: Option<usize>,
+    diagnostics: &mut Vec<DefinitionDiagnostic>,
+    fallback_reason: &str,
+    recovery: &str,
+) {
+    let reason = diagnostics
+        .first()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .unwrap_or(fallback_reason);
+    let Some(message) =
+        location_failure_message(analyzer, file, path, line, column, reason, recovery)
+    else {
+        return;
+    };
+    if let Some(diagnostic) = diagnostics.first_mut() {
+        diagnostic.message = message;
+    } else {
+        diagnostics.push(DefinitionDiagnostic {
+            kind: "location_context".to_string(),
+            message,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn location_failure_message(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    path: &str,
+    line: Option<usize>,
+    column: Option<usize>,
+    reason: &str,
+    recovery: &str,
+) -> Option<String> {
+    let line = line?;
+    let source = analyzer.project().read_source(file).ok()?;
+    Some(render_location_diagnostic(
+        &source, path, line, column, reason, recovery,
+    ))
 }
 
 fn type_lookup_candidate(
@@ -3448,10 +3550,6 @@ fn resolve_scan_usages_target(
         }
     };
 
-    if target.column == Some(0) {
-        return location_selector_failure(&target, "invalid_location", "column must be 1-based");
-    }
-
     let source = match file.read_to_string() {
         Ok(source) => source,
         Err(err) => {
@@ -3463,15 +3561,27 @@ fn resolve_scan_usages_target(
         }
     };
 
+    if target.column == Some(0) {
+        return location_selector_failure(
+            &target,
+            "invalid_location",
+            scan_usages_location_diagnostic(&target, &source, "column must be 1-based"),
+        );
+    }
+
     let line_starts = compute_line_starts(&source);
     let line = target.line;
     if line == 0 || line > line_starts.len() {
         return location_selector_failure(
             &target,
             "invalid_location",
-            format!(
-                "line {line} is outside 1..={} for this file",
-                line_starts.len()
+            scan_usages_location_diagnostic(
+                &target,
+                &source,
+                &format!(
+                    "line {line} is outside 1..={} for this file",
+                    line_starts.len()
+                ),
             ),
         );
     }
@@ -3483,7 +3593,11 @@ fn resolve_scan_usages_target(
         ) {
             Ok(point) => ScanUsagesLocationSelection::Point(point),
             Err(reason) => {
-                return location_selector_failure(&target, "invalid_location", reason);
+                return location_selector_failure(
+                    &target,
+                    "invalid_location",
+                    scan_usages_location_diagnostic(&target, &source, &reason),
+                );
             }
         }
     } else {
@@ -3506,10 +3620,14 @@ fn resolve_scan_usages_target(
         .collect();
 
     if matching_units.is_empty() {
-        return ScanUsageTargetResolution::NotFound(renderable_not_found_input(format!(
-            "{} (no declaration at location)",
-            scan_usages_target_label(&target)
-        )));
+        return ScanUsageTargetResolution::NotFound(not_found_input(
+            scan_usages_target_label(&target),
+            Some(scan_usages_location_diagnostic(
+                &target,
+                range_context.content(),
+                "no declaration at location",
+            )),
+        ));
     }
 
     let narrowest_span = matching_units
@@ -3545,6 +3663,21 @@ fn resolve_scan_usages_target(
     let (_, overloads) = groups.into_iter().next().expect("non-empty target groups");
     let symbol = definition_selector(&overloads[0]);
     ScanUsageTargetResolution::Resolved { symbol, overloads }
+}
+
+fn scan_usages_location_diagnostic(
+    target: &ScanUsagesTarget,
+    source: &str,
+    reason: &str,
+) -> String {
+    render_location_diagnostic(
+        source,
+        &target.path,
+        target.line,
+        target.column,
+        reason,
+        "move the target to a declaration name token and retry scan_usages_by_location; use get_summaries on the file or search_symbols if the declaration location is unknown.",
+    )
 }
 
 fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<CodeUnit> {

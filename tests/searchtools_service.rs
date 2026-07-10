@@ -826,6 +826,39 @@ fn rename_symbol_requires_line_and_column() {
 }
 
 #[test]
+fn rename_symbol_bad_target_includes_marked_source_context() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "rename_symbol",
+            r#"{"path":"A.java","line":2,"column":1,"new_name":"renamed"}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let message = value["diagnostics"][0]["message"]
+        .as_str()
+        .expect("rename diagnostic");
+
+    assert_eq!("not_found", value["status"], "payload: {value}");
+    assert!(
+        message.contains("Requested location: A.java:2:1"),
+        "{message}"
+    );
+    assert!(
+        message.contains("1 | import java.util.function.Function;"),
+        "{message}"
+    );
+    assert!(message.contains(">  2 |"), "{message}");
+    assert!(message.contains("3 | public class A"), "{message}");
+    assert!(
+        message.contains("^ requested line 2, column 1"),
+        "{message}"
+    );
+    assert!(message.contains("Recovery:"), "{message}");
+    assert!(message.contains("identifier token"), "{message}");
+}
+
+#[test]
 fn rename_symbol_rejects_file_coupled_java_class() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
@@ -3396,11 +3429,57 @@ fn scan_usages_location_rejects_arbitrary_body_lines() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(1, status_count(&value, "not_found"), "payload: {value}");
+    let message = only_result(&value)["message"]
+        .as_str()
+        .expect("not-found message");
+    assert!(message.contains("no declaration at location"), "{message}");
     assert!(
-        only_result(&value)["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("no declaration at location")),
-        "payload: {value}"
+        message.contains("Requested location: app.js:2 (column not supplied)"),
+        "{message}"
+    );
+    assert!(message.contains("  1 | export function run()"), "{message}");
+    assert!(message.contains("> 2 |   const value = 1;"), "{message}");
+    assert!(message.contains("  3 |   return value;"), "{message}");
+    assert!(
+        message.contains("^ requested line 2; column not supplied"),
+        "{message}"
+    );
+    assert!(message.contains("Recovery:"), "{message}");
+    assert!(message.contains("declaration name token"), "{message}");
+    assert!(message.contains("search_symbols"), "{message}");
+}
+
+#[test]
+fn scan_usages_invalid_line_includes_nearest_source_boundary() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", "const value = 1;\nvalue;\n")
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app.js","line":9,"column":3}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+    let message = result["message"].as_str().expect("failure message");
+
+    assert_eq!("failure", result["status"], "payload: {value}");
+    assert!(
+        message.contains("Requested location: app.js:9:3"),
+        "{message}"
+    );
+    assert!(message.contains("  2 | value;"), "{message}");
+    assert!(
+        message.contains("> 9 | [requested line is after the last source line]"),
+        "{message}"
+    );
+    assert!(
+        message.contains("^ requested line 9, column 3"),
+        "{message}"
     );
 }
 
