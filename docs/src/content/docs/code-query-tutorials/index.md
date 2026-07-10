@@ -20,7 +20,7 @@ Language pages will be added and marked with their last successful end-to-end ve
 - [Rust](./rust/)
 - [PHP](./php/)
 - [Scala](./scala/)
-- C# (planned)
+- [C#](./csharp/)
 - Ruby (planned)
 
 ## What “Every Kind” Means
