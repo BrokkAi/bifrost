@@ -1,0 +1,19 @@
+; A complete nested query and deliberately incomplete trailing input.
+(result-detail full
+  (limit 25
+    (language python
+      (where "src/**/*.py"
+        (not-inside
+          (function :name "test")
+          (call
+            :callee (name/regex "eval\\(")
+            :args [(capture "argument")]
+            :not_kind lambda
+            (has (string_literal :text/regex "secret.*"))
+            (not-has (call :callee (name "debug"))))))))
+
+; Semicolons are comments only after whitespace, never inside a string.
+(call :callee (name "semi;colon")) ; trailing comment
+
+; Unsupported values and unknown forms must remain safely tokenizable and plain.
+(custom_identifier :unexpected true false null 7

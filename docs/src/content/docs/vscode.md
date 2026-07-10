@@ -26,6 +26,16 @@ npm test
 
 Use the extension setting `bifrost.serverPath` when testing a locally built Bifrost binary.
 
+## RQL Highlighting
+
+The extension automatically recognizes `.rql` files as **Bifrost RQL** and
+highlights RQL query structure, known forms, literals, and comments. It is a
+TextMate grammar only, so opening a query file does not start the Bifrost
+language server or validate the query. If another extension owns `.rql` in a
+workspace, use VS Code's language-mode picker to select **Bifrost RQL**.
+The Bifrost helmet is its default file icon when the active VS Code icon theme
+does not provide a more specific `.rql` icon.
+
 ## Extension Settings
 
 | Setting | Default | Description |

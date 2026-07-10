@@ -1,0 +1,84 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Bifrost Rune Query Language",
+  "scopeName": "source.bifrost-rql",
+  "patterns": [
+    {
+      "match": "(^|\\s)(;.*$)",
+      "captures": {
+        "2": {
+          "name": "comment.line.semicolon.bifrost-rql"
+        }
+      }
+    },
+    {
+      "name": "meta.regex-predicate.bifrost-rql",
+      "match": "(\\(|:)(?:\\s*)((?:name|text)/regex)(?:\\s*)(\\\")((?:\\\\.|[^\\\"\\\\])*)(\\\")",
+      "captures": {
+        "1": {
+          "name": "punctuation.section.parens.begin.bifrost-rql"
+        },
+        "2": {
+          "name": "support.function.predicate.bifrost-rql"
+        },
+        "3": {
+          "name": "punctuation.definition.string.begin.bifrost-rql"
+        },
+        "4": {
+          "name": "string.regexp.bifrost-rql"
+        },
+        "5": {
+          "name": "punctuation.definition.string.end.bifrost-rql"
+        }
+      }
+    },
+    {
+      "name": "string.quoted.double.bifrost-rql",
+      "match": "\\\"(?:\\\\.|[^\\\"\\\\])*\\\""
+    },
+    {
+      "name": "punctuation.section.brackets.bifrost-rql",
+      "match": "(?:\\((?!\\s*(?:limit|result-detail)\\s)|[)\\[\\]])"
+    },
+    {
+      "name": "variable.parameter.role.bifrost-rql",
+      "match": ":(?:args|callee|capture|decorators|field|has|kwargs|left|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|receiver|right|text/regex)(?=$|[\\s()\\[\\]])"
+    },
+    {
+      "name": "entity.name.type.kind.bifrost-rql",
+      "match": "\\b(?:assignment|boolean_literal|call|callable|catch|class|constructor|declaration|decorator|field_access|function|identifier|if|import|lambda|literal|loop|method|null_literal|numeric_literal|return|string_literal|throw)\\b"
+    },
+    {
+      "name": "support.function.wrapper.bifrost-rql",
+      "match": "\\b(?:inside|language|languages|limit|not-inside|result-detail|where)\\b"
+    },
+    {
+      "name": "support.function.predicate.bifrost-rql",
+      "match": "\\b(?:capture|has|name(?:/regex)?|not-has|not-kind|text/regex)\\b"
+    },
+    {
+      "name": "meta.limit.bifrost-rql",
+      "match": "(\\(\\s*limit\\s+)([0-9]+)(?=\\s)",
+      "captures": {
+        "1": {
+          "name": "support.function.wrapper.bifrost-rql"
+        },
+        "2": {
+          "name": "constant.numeric.integer.decimal.bifrost-rql"
+        }
+      }
+    },
+    {
+      "name": "meta.result-detail.bifrost-rql",
+      "match": "(\\(\\s*result-detail\\s+)(compact|full)(?=\\s)",
+      "captures": {
+        "1": {
+          "name": "support.function.wrapper.bifrost-rql"
+        },
+        "2": {
+          "name": "constant.language.result-detail.bifrost-rql"
+        }
+      }
+    }
+  ]
+}

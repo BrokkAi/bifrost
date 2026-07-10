@@ -84,6 +84,10 @@ set:
 }
 ```
 
+The extension also associates `.rql` files with **Bifrost RQL** and provides
+syntax highlighting for the Rune Query Language. This is a lexical grammar
+only: it does not start the Bifrost language server or validate a query.
+
 The extension starts Bifrost with:
 
 ```bash

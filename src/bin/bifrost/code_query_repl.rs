@@ -75,6 +75,10 @@ const FORMS: &[MetadataEntry] = &[
         "not-kind",
         "Predicate form: (not-kind constructor), excluding a normalized kind.",
     ),
+    MetadataEntry::new(
+        "comments",
+        "Use ; after whitespace for a comment through the next newline; RQL has no block comments.",
+    ),
     MetadataEntry::new("where", "Wrapper: (where \"src/**/*.py\" query)."),
     MetadataEntry::new("language", "Wrapper: (language python query)."),
     MetadataEntry::new("limit", "Wrapper: (limit 25 query)."),
@@ -1008,6 +1012,7 @@ mod tests {
     fn code_query_repl_exposes_doc_metadata() {
         assert!(doc_text(":run").contains("Run"));
         assert!(doc_text("call").contains("Match call"));
+        assert!(doc_text("comments").contains("comment"));
         assert!(doc_text("callee").contains("call target"));
         assert!(doc_text("calls").contains("eval"));
     }
