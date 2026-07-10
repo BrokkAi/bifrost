@@ -48,6 +48,8 @@ const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
 const SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT: usize = 3;
 const SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT: usize = 5;
+const SCAN_USAGES_SCOPE_PATH_LIMIT: usize = 5;
+const SCAN_USAGES_SCOPE_PATH_MAX_BYTES: usize = 256;
 pub const TYPE_LOOKUP_MAX_REFERENCES: usize = 100;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
@@ -618,8 +620,21 @@ pub struct SkimFile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanUsagesResult {
+    pub scope: ScanUsagesScope,
     pub summary: ScanUsagesSummary,
     pub results: Vec<ScanUsagesEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesScope {
+    pub include_tests: bool,
+    pub whole_workspace: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths_omitted: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored_paths: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -663,12 +678,36 @@ pub enum ScanUsagesStatus {
     TooManyCallsites,
 }
 
+impl ScanUsagesStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Found => "found",
+            Self::VerifiedAbsent => "verified_absent",
+            Self::UnverifiedAbsent => "unverified_absent",
+            Self::NotFound => "not_found",
+            Self::Ambiguous => "ambiguous",
+            Self::Failure => "failure",
+            Self::TooManyCallsites => "too_many_callsites",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanUsagesAbsenceCaveat {
     UnprovenMatches,
     CandidateFilesTruncated,
     ReferenceOnlySiblings,
+}
+
+impl ScanUsagesAbsenceCaveat {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UnprovenMatches => "unproven_matches",
+            Self::CandidateFilesTruncated => "candidate_files_truncated",
+            Self::ReferenceOnlySiblings => "reference_only_siblings",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2777,12 +2816,12 @@ fn excluded_test_files(
 /// `scan_usages` and `usage_graph` run before querying call sites.
 fn scoped_usage_finder(
     test_files: Option<&Arc<HashSet<ProjectFile>>>,
-    path_filter: &Option<ScanUsagesPathFilter>,
+    path_filter: Option<&Arc<ScanUsagesPathFilter>>,
 ) -> UsageFinder {
     let mut finder = UsageFinder::new();
     if let Some(test_files) = test_files {
         let test_files = Arc::clone(test_files);
-        let path_filter = path_filter.clone();
+        let path_filter = path_filter.map(Arc::clone);
         finder = finder.with_file_filter(move |file| {
             !test_files.contains(file)
                 && path_filter
@@ -2790,7 +2829,7 @@ fn scoped_usage_finder(
                     .map(|filter| filter.matches(file))
                     .unwrap_or(true)
         });
-    } else if let Some(path_filter) = path_filter.clone() {
+    } else if let Some(path_filter) = path_filter.map(Arc::clone) {
         finder = finder.with_file_filter(move |file| path_filter.matches(file));
     }
     finder.with_authoritative_scope(path_filter.is_some())
@@ -3033,48 +3072,63 @@ struct ScanUsageRequest {
     input: ScanUsagesInput,
     input_kind: ScanUsagesInputKind,
     label: String,
-    scope: ScanUsagesQueryScope,
 }
 
 impl ScanUsageRequest {
-    fn symbol(index: usize, symbol: String, scope: ScanUsagesQueryScope) -> Self {
+    fn symbol(index: usize, symbol: String) -> Self {
         Self {
             index,
             input: ScanUsagesInput::Symbol(symbol.clone()),
             input_kind: ScanUsagesInputKind::Symbol,
             label: symbol,
-            scope,
         }
     }
 
-    fn target(index: usize, target: ScanUsagesTarget, scope: ScanUsagesQueryScope) -> Self {
+    fn target(index: usize, target: ScanUsagesTarget) -> Self {
         let label = scan_usages_target_label(&target);
         Self {
             index,
             input: ScanUsagesInput::Target(target),
             input_kind: ScanUsagesInputKind::Target,
             label,
-            scope,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct ScanUsagesQueryScope {
-    paths: Vec<String>,
+    path_filter: Option<Arc<ScanUsagesPathFilter>>,
     include_tests: bool,
+    ignored_paths: usize,
 }
 
 impl ScanUsagesQueryScope {
-    fn new(paths: Option<&[String]>, include_tests: bool) -> Self {
+    fn new(analyzer: &dyn IAnalyzer, paths: Option<&[String]>, include_tests: bool) -> Self {
+        let built = build_scan_usages_path_filter(analyzer, paths);
         Self {
-            paths: paths.unwrap_or_default().to_vec(),
+            path_filter: built.filter,
             include_tests,
+            ignored_paths: built.ignored_paths,
         }
     }
 
     fn whole_workspace(&self) -> bool {
-        self.paths.is_empty()
+        self.path_filter.is_none()
+    }
+
+    fn result_scope(&self) -> ScanUsagesScope {
+        let (paths, paths_omitted) = self
+            .path_filter
+            .as_deref()
+            .map(ScanUsagesPathFilter::summarized_paths)
+            .unwrap_or_default();
+        ScanUsagesScope {
+            include_tests: self.include_tests,
+            whole_workspace: self.whole_workspace(),
+            paths,
+            paths_omitted,
+            ignored_paths: some_if_nonzero(self.ignored_paths),
+        }
     }
 }
 
@@ -3550,31 +3604,29 @@ fn reference_only_absence_note(
         .collect::<Vec<_>>()
         .join("/");
     Some(format!(
-        "workspace contains {extension_list} files that may reference this symbol but are not analyzed; absence not verified"
+        "workspace contains {extension_list} files that may reference this symbol but are not analyzed; inspect or analyze those files separately before concluding absence"
     ))
 }
 
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages");
 
-    let query_scope = ScanUsagesQueryScope::new(params.paths.as_deref(), params.include_tests);
+    let query_scope =
+        ScanUsagesQueryScope::new(analyzer, params.paths.as_deref(), params.include_tests);
     let symbols: Vec<ScanUsageRequest> = params
         .symbols
         .unwrap_or_default()
         .into_iter()
         .enumerate()
-        .map(|(index, symbol)| ScanUsageRequest::symbol(index, symbol, query_scope.clone()))
+        .map(|(index, symbol)| ScanUsageRequest::symbol(index, symbol))
         .collect();
     let symbol_count = symbols.len();
     let targets: Vec<ScanUsageRequest> = params
         .targets
         .into_iter()
         .enumerate()
-        .map(|(offset, target)| {
-            ScanUsageRequest::target(symbol_count + offset, target, query_scope.clone())
-        })
+        .map(|(offset, target)| ScanUsageRequest::target(symbol_count + offset, target))
         .collect();
-    let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
     let reference_only_sibling_extensions =
         present_reference_only_sibling_extensions_by_language(analyzer);
 
@@ -3584,7 +3636,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     // `paths`, not by how common the symbols are — a single high-fan-in name (`Context`, `func`)
     // no longer drags an O(workspace) reference scan behind it. The set is built once and reused
     // for every symbol; the finder's file filter still drops excluded test files on top.
-    let path_scoped_candidates = path_filter.as_ref().map(|filter| {
+    let path_scoped_candidates = query_scope.path_filter.as_ref().map(|filter| {
         let files: HashSet<ProjectFile> = analyzer
             .analyzed_files()
             .filter(|file| filter.matches(file))
@@ -3726,7 +3778,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         let target_is_method = overloads
             .iter()
             .any(|unit| unit.is_function() && display_parent_symbol_for_target(unit).is_some());
-        let finder = scoped_usage_finder(test_files.as_ref(), &path_filter);
+        let finder = scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref());
         let max_candidate_files = if path_scoped_candidates.is_some() {
             SCAN_USAGES_PATH_SCOPED_MAX_FILES
         } else {
@@ -3923,7 +3975,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     }
 
     work_entries.sort_by_key(ScanUsagesWorkEntry::index);
-    render_scan_usages_with_budget(work_entries)
+    render_scan_usages_with_budget(work_entries, query_scope.result_scope())
 }
 
 /// A definition node in the workspace usage graph.
@@ -4030,7 +4082,7 @@ pub struct UsageGraphResult {
 pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageGraphResult {
     let _scope = profiling::scope("searchtools::usage_graph");
 
-    let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
+    let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref()).filter;
     let test_files = excluded_test_files(analyzer, params.include_tests);
 
     // Group the definitions that become nodes by `(ecosystem, fqn, module
@@ -4573,13 +4625,20 @@ fn ranges_overlap(range: &Range, hit: &UsageHit) -> bool {
     range.start_byte < hit.end_offset && hit.start_offset < range.end_byte
 }
 
-fn render_scan_usages_with_budget(entries: Vec<ScanUsagesWorkEntry>) -> ScanUsagesResult {
+fn render_scan_usages_with_budget(
+    entries: Vec<ScanUsagesWorkEntry>,
+    scope: ScanUsagesScope,
+) -> ScanUsagesResult {
     let mut entries = entries;
     loop {
         let results: Vec<ScanUsagesEntry> =
             entries.iter().map(classify_scan_usages_entry).collect();
         let summary = build_scan_usages_summary(&results);
-        let result = ScanUsagesResult { summary, results };
+        let result = ScanUsagesResult {
+            scope: scope.clone(),
+            summary,
+            results,
+        };
         if serde_json::to_string(&result)
             .map(|text| text.len() <= SCAN_USAGES_RESPONSE_BUDGET_BYTES)
             .unwrap_or(true)
@@ -4743,7 +4802,7 @@ fn classify_usage_entry(
         let (short_name, total_callsites, limit) =
             callsite_cap.expect("too_many_callsites entry includes cap details");
         let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites, false);
-        populate_usage_payload(&mut result, usage, &request.scope, target_is_method, &[]);
+        populate_usage_payload(&mut result, usage, target_is_method, &[]);
         result.short_name = Some(short_name);
         result.total_callsites = Some(total_callsites);
         result.limit = Some(limit);
@@ -4774,13 +4833,7 @@ fn classify_usage_entry(
     if usage.candidate_files_truncated {
         result.candidate_files_sample = candidate_files_sample;
     }
-    populate_usage_payload(
-        &mut result,
-        usage,
-        &request.scope,
-        target_is_method,
-        &caveats,
-    );
+    populate_usage_payload(&mut result, usage, target_is_method, &caveats);
     if status == ScanUsagesStatus::UnverifiedAbsent {
         result.absence_caveats = caveats;
     }
@@ -4790,17 +4843,11 @@ fn classify_usage_entry(
 fn populate_usage_payload(
     entry: &mut ScanUsagesEntry,
     usage: SymbolUsages,
-    scope: &ScanUsagesQueryScope,
     target_is_method: bool,
     absence_caveats: &[ScanUsagesAbsenceCaveat],
 ) {
-    let guidance = scan_usages_absence_guidance(
-        entry.status,
-        scope,
-        target_is_method,
-        &usage,
-        absence_caveats,
-    );
+    let guidance =
+        scan_usages_absence_guidance(entry.status, target_is_method, &usage, absence_caveats);
     entry.symbol = Some(usage.symbol);
     entry.fq_name = usage.fq_name;
     entry.definition_path = usage.definition_path;
@@ -4816,13 +4863,11 @@ fn populate_usage_payload(
     if let Some(note) = usage.note {
         entry.notes.push(note);
     }
-    if usage.candidate_files_truncated {
-        let note = if usage.total_hits == 0 {
-            "Candidate file set was truncated; zero-hit absence is not authoritative. Re-call scan_usages with narrower `paths`."
-        } else {
+    if usage.candidate_files_truncated && entry.status == ScanUsagesStatus::Found {
+        entry.notes.push(
             "Candidate file set was truncated; additional usage sites may exist. Re-call scan_usages with narrower `paths` for exhaustive coverage."
-        };
-        entry.notes.push(note.to_string());
+                .to_string(),
+        );
     }
     if entry.message.is_none() {
         entry.message = guidance.message;
@@ -4837,58 +4882,29 @@ struct ScanUsagesAbsenceGuidance {
 
 fn scan_usages_absence_guidance(
     status: ScanUsagesStatus,
-    scope: &ScanUsagesQueryScope,
     target_is_method: bool,
     usage: &SymbolUsages,
     caveats: &[ScanUsagesAbsenceCaveat],
 ) -> ScanUsagesAbsenceGuidance {
-    let mut notes = Vec::new();
+    let notes = if matches!(
+        status,
+        ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::UnverifiedAbsent
+    ) && target_is_method
+    {
+        vec!["if this is a framework-invoked entrypoint (e.g. servlet filters, DI callbacks), direct callers may not exist: scan the enclosing type or search for its registration.".to_string()]
+    } else {
+        Vec::new()
+    };
     let message = match status {
         ScanUsagesStatus::VerifiedAbsent => {
-            notes.extend(scan_usages_scope_and_followup_notes(
-                scope,
-                target_is_method,
-            ));
             Some("resolved symbol; no external usage sites found.".to_string())
         }
         ScanUsagesStatus::UnverifiedAbsent => {
-            notes.extend(scan_usages_scope_and_followup_notes(
-                scope,
-                target_is_method,
-            ));
             scan_usages_unverified_absence_message(usage, caveats)
         }
         _ => None,
     };
     ScanUsagesAbsenceGuidance { message, notes }
-}
-
-fn scan_usages_scope_and_followup_notes(
-    scope: &ScanUsagesQueryScope,
-    target_is_method: bool,
-) -> Vec<String> {
-    let mut notes = Vec::new();
-    let test_scope = if scope.include_tests {
-        "scanned all code including tests"
-    } else {
-        "scanned production code only (include_tests=false)"
-    };
-    let path_scope = if scope.whole_workspace() {
-        "scope covered the whole workspace".to_string()
-    } else {
-        format!("scope restricted to paths: {}", scope.paths.join(", "))
-    };
-    notes.push(format!("{test_scope}; {path_scope}."));
-    if !scope.include_tests {
-        notes.push("retry with include_tests=true to include test usages.".to_string());
-    }
-    if !scope.whole_workspace() {
-        notes.push("drop or widen paths to search the whole workspace.".to_string());
-    }
-    if target_is_method {
-        notes.push("if this is a framework-invoked entrypoint (e.g. servlet filters, DI callbacks), direct callers may not exist: scan the enclosing type or search for its registration.".to_string());
-    }
-    notes
 }
 
 fn scan_usages_unverified_absence_message(
@@ -4898,7 +4914,7 @@ fn scan_usages_unverified_absence_message(
     if usage.unproven_hits > 0 {
         let file_count = usage.unproven_files.len();
         return Some(format!(
-            "no PROVEN usage sites, but {} unproven candidate usage(s) found across {} file(s); inspect these before concluding absence. Next step: review the unproven matches and choose a location-anchored target if one is the intended caller.",
+            "no PROVEN usage sites, but {} unproven candidate usage(s) found across {} file(s); inspect these before concluding absence. Next step: narrow `paths` to a relevant candidate file, or use a location-anchored target for the callee declaration.",
             usage.unproven_hits, file_count
         ));
     }
@@ -4908,27 +4924,7 @@ fn scan_usages_unverified_absence_message(
                 .to_string(),
         );
     }
-    if caveats.contains(&ScanUsagesAbsenceCaveat::ReferenceOnlySiblings) {
-        return Some(
-            "no PROVEN usage sites, but reference-only sibling files prevent a verified absence; inspect the sibling-source note before concluding absence."
-                .to_string(),
-        );
-    }
     None
-}
-
-pub(crate) fn scan_usages_absence_caveat_prose(caveat: ScanUsagesAbsenceCaveat) -> &'static str {
-    match caveat {
-        ScanUsagesAbsenceCaveat::UnprovenMatches => {
-            "unproven_matches: candidate usages matched structurally, but receiver/type proof was incomplete; inspect the candidate snippets before concluding absence."
-        }
-        ScanUsagesAbsenceCaveat::CandidateFilesTruncated => {
-            "candidate_files_truncated: the candidate file set was capped, so zero proven hits are not exhaustive; retry with narrower paths."
-        }
-        ScanUsagesAbsenceCaveat::ReferenceOnlySiblings => {
-            "reference_only_siblings: related files are visible only as references, so analyzer coverage cannot prove absence across the full symbol family."
-        }
-    }
 }
 
 fn scan_usages_entry_base(
@@ -5122,12 +5118,6 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
     if files_truncated.is_some() {
         notes.push("Summary file list truncated to fit the response budget.".to_string());
     }
-    if state.unproven_hits > 0 {
-        notes.push(
-            "Unproven usages matched structurally, but receiver/type proof was incomplete."
-                .to_string(),
-        );
-    }
     let reference_only_siblings = state.reference_only_absence_note.is_some();
     let absence_would_be_verified =
         !state.candidate_files_truncated && state.total_hits == 0 && state.unproven_hits == 0;
@@ -5275,6 +5265,11 @@ struct ScanUsagesPathFilter {
     rules: Vec<ScanUsagesPathRule>,
 }
 
+struct BuiltScanUsagesPathFilter {
+    filter: Option<Arc<ScanUsagesPathFilter>>,
+    ignored_paths: usize,
+}
+
 #[derive(Debug, Clone)]
 enum ScanUsagesPathRule {
     Glob(Pattern),
@@ -5289,23 +5284,66 @@ impl ScanUsagesPathFilter {
             ScanUsagesPathRule::Exact(path) => rel == *path,
         })
     }
+
+    fn summarized_paths(&self) -> (Vec<String>, Option<usize>) {
+        let mut seen = HashSet::default();
+        let mut paths = Vec::new();
+        let mut unique_count = 0usize;
+        for rule in &self.rules {
+            let path = match rule {
+                ScanUsagesPathRule::Glob(glob) => glob.as_str(),
+                ScanUsagesPathRule::Exact(path) => path.as_str(),
+            };
+            if !seen.insert(path) {
+                continue;
+            }
+            unique_count += 1;
+            if paths.len() < SCAN_USAGES_SCOPE_PATH_LIMIT {
+                paths.push(truncate_scan_usages_scope_path(path));
+            }
+        }
+        let paths_omitted = unique_count
+            .checked_sub(paths.len())
+            .and_then(some_if_nonzero);
+        (paths, paths_omitted)
+    }
+}
+
+fn truncate_scan_usages_scope_path(path: &str) -> String {
+    if path.len() <= SCAN_USAGES_SCOPE_PATH_MAX_BYTES {
+        return path.to_string();
+    }
+    let mut cut = SCAN_USAGES_SCOPE_PATH_MAX_BYTES;
+    while !path.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &path[..cut])
 }
 
 fn build_scan_usages_path_filter(
     analyzer: &dyn IAnalyzer,
     paths: Option<&[String]>,
-) -> Option<ScanUsagesPathFilter> {
-    let paths = paths?;
+) -> BuiltScanUsagesPathFilter {
+    let Some(paths) = paths else {
+        return BuiltScanUsagesPathFilter {
+            filter: None,
+            ignored_paths: 0,
+        };
+    };
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut rules = Vec::new();
+    let mut ignored_paths = 0;
     for raw in paths {
         let normalized = normalize_pattern(raw.trim());
         if normalized.is_empty() {
+            ignored_paths += 1;
             continue;
         }
         if is_glob_pattern(&normalized) {
             if let Ok(glob) = Pattern::new(&normalized) {
                 rules.push(ScanUsagesPathRule::Glob(glob));
+            } else {
+                ignored_paths += 1;
             }
             continue;
         }
@@ -5321,7 +5359,10 @@ fn build_scan_usages_path_filter(
             }
         }
     }
-    (!rules.is_empty()).then_some(ScanUsagesPathFilter { rules })
+    BuiltScanUsagesPathFilter {
+        filter: (!rules.is_empty()).then(|| Arc::new(ScanUsagesPathFilter { rules })),
+        ignored_paths,
+    }
 }
 
 fn strict_separator_options() -> MatchOptions {
@@ -6801,9 +6842,9 @@ mod tests {
     use super::usage_failure_hint;
     use super::{
         ScanUsageRequest, ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample,
-        ScanUsagesQueryScope, ScanUsagesStatus, ScanUsagesWorkEntry, SourceBlock, SummaryElement,
-        SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
-        classify_scan_usages_entry, list_symbols, resolve_file_patterns, trim_summary_signature,
+        ScanUsagesStatus, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState,
+        UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
+        list_symbols, resolve_file_patterns, trim_summary_signature,
     };
     use crate::analyzer::{
         CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
@@ -7204,7 +7245,7 @@ def gamma():
     }
 
     fn scan_usage_request(symbol: &str) -> ScanUsageRequest {
-        ScanUsageRequest::symbol(0, symbol.to_string(), ScanUsagesQueryScope::new(None, true))
+        ScanUsageRequest::symbol(0, symbol.to_string())
     }
 
     fn usage_row(path: &str, line: usize) -> UsageHitRow {
