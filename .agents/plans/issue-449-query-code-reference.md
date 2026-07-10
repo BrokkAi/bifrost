@@ -17,7 +17,7 @@ After the change, a caller can run `bifrost --tool query_code --args '{"match":{
 - [x] (2026-07-10 10:18Z) Completed the #449 overview, JSON reference, RQL guide, help discoverability, Python/README links, and canonical agent-skill guidance; regenerated the Codex and Amp bundles.
 - [x] (2026-07-10 10:18Z) Added marked JSON/RQL example validation through `CodeQuery::from_json` / `CodeQuery::from_sexp`; all required example categories parse and current public docs reject stale names.
 - [x] (2026-07-10 10:28Z) Passed the full Rust, Python, plugin, docs-build, and clippy gates; visually inspected `/code-querying/`, `/code-query-json/`, and `/rune-query-language/` from a fresh preview and verified navigation and rendered code blocks.
-- [ ] Update GitHub issues #328, #449, and #598 after all local validation passes.
+- [x] (2026-07-10 10:31Z) Retitled #328 and recorded the public-name/future-facet decision; updated and closed #449 as completed; retitled #598 for per-language `query_code` tutorials and left it open.
 
 ## Surprises & Discoveries
 
@@ -63,7 +63,13 @@ After the change, a caller can run `bifrost --tool query_code --args '{"match":{
 
 ## Outcomes & Retrospective
 
-Not yet complete. At completion, summarize the renamed public surfaces, documentation coverage, validation evidence, GitHub issue updates, and any deferred follow-ups.
+The public surface is now consistently `query_code` / `CodeQuery` across MCP, CLI, Rust, Python, REPL terminology, generated agent skills, and current product documentation. The old MCP/CLI name is deliberately rejected rather than aliased. Schema version 1, RQL, result serialization, and structural matching behavior remain unchanged, and the docs explicitly bound version 1 to normalized syntactic matching.
+
+Issue #449 now has a complete three-page reference: the overview selects among Bifrost's search and graph tools, the JSON page specifies every field and matching/result behavior, and the RQL page explains the interactive frontend. Explicit Markdown markers feed an integration test that parses every published query with the real decoders and checks the required example categories. The MCP descriptor and CLI help carry a minimal valid example and guide URL, while regenerated Codex and Amp skills teach agents when to use the tool.
+
+Validation passed across formatting, 55 structural library tests, 203 focused integration tests, all 37 Python tests, plugin generation/manifest checks, Astro checking and production build, `git diff --check`, and no-CUDA clippy. A fresh local preview was inspected at all three new routes for navigation, tables, and code rendering. The only validation complication was a host PATH that mixed rustup's compiler with Homebrew's clippy driver; pinning the matching rustup driver and using an isolated target produced the authoritative clean run.
+
+GitHub now reflects the outcome: #328 is the normalized cross-language code-query engine and contains the naming/facet decision, #449 is closed as completed, and #598 remains open for the intentionally deferred per-language tutorials. The two implementation checkpoints are `582e0447` and `b543f5ca`; this final plan checkpoint records the external tracking outcome.
 
 ## Context and Orientation
 
