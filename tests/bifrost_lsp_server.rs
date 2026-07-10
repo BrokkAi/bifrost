@@ -482,6 +482,78 @@ fn bifrost_lsp_server_honors_excluded_paths() {
 }
 
 #[test]
+fn bifrost_lsp_server_runtime_configuration_registers_and_pulls_bifrost_section() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("Main.java"), "class Main {}\n").expect("write Main.java");
+    let mut server = LspServer::spawn(&root);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {
+                "workspace": {
+                    "configuration": true,
+                    "didChangeConfiguration": {"dynamicRegistration": true}
+                }
+            }
+        }
+    }));
+    let initialize = server.read_response_for_id(1);
+    assert!(initialize["error"].is_null(), "{initialize}");
+    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    let registration = server.read_message();
+    assert_eq!(registration["method"], "client/registerCapability");
+    assert_eq!(
+        registration["params"]["registrations"][0]["method"],
+        "workspace/didChangeConfiguration"
+    );
+    assert_eq!(
+        registration["params"]["registrations"][0]["registerOptions"]["section"],
+        "bifrost"
+    );
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": registration["id"].clone(),
+        "result": null
+    }));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": null}
+    }));
+    let pull = server.read_message();
+    assert_eq!(pull["method"], "workspace/configuration");
+    assert_eq!(pull["params"]["items"], json!([{"section": "bifrost"}]));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": pull["id"].clone(),
+        "result": [{"roots": [], "exclude": [], "formatterCommands": []}]
+    }));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "workspace/symbol",
+        "params": {"query": "Main"}
+    }));
+    let response = server.read_response_for_id(20);
+    assert!(response["error"].is_null(), "{response}");
+    assert!(
+        response["result"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == "Main")),
+        "pulled runtime snapshot should leave the workspace usable: {response}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_adds_workspace_folder_dynamically() {
     let temp = TempDir::new().expect("tempdir");
     let parent = temp.path().canonicalize().expect("canon temp");

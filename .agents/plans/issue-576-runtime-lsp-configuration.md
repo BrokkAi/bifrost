@@ -14,8 +14,8 @@ Users can observe the result without restarting Bifrost: a new formatter command
 
 - [x] (2026-07-10 07:27Z) Refreshed the existing `576-support-runtime-lsp-configuration-changes` branch with `git fetch && git rebase`; it was already current.
 - [x] (2026-07-10 07:27Z) Inspected the current LSP loop, workspace rebuild path, formatter lifecycle, diagnostics tracking, VS Code configuration flow, and LSP 3.18 configuration contract.
-- [ ] Implement dynamic registration, configuration pulls, legacy pushed snapshots, and newest-response-wins handling.
-- [ ] Refactor runtime state so roots and exclusions rebuild transactionally while formatter-only changes avoid rebuilding.
+- [x] (2026-07-10 07:43Z) Implemented dynamic registration, configuration pulls, legacy pushed snapshots, newest-response-wins handling, and strict full-snapshot parsing. Evidence: six `lsp::server::tests` unit tests and `bifrost_lsp_server_runtime_configuration_registers_and_pulls_bifrost_section` pass.
+- [x] (2026-07-10 07:43Z) Refactored runtime state to preserve editor roots separately, normalize configuration, prepare replacement analyzers transactionally, replay overlays, cancel formatter jobs before commit, and clear stale diagnostic state.
 - [ ] Add Rust unit and end-to-end coverage for protocol, rebuild, diagnostics, overlay, formatter, failure, and Windows cleanup behavior.
 - [ ] Update the VS Code extension to return trusted runtime snapshots and avoid restart prompts for live settings.
 - [ ] Update public and internal documentation.
@@ -34,6 +34,9 @@ Users can observe the result without restarting Bifrost: a new formatter command
 
 - Observation: explicit startup roots currently replace and discard the editor workspace-root set, which prevents an empty runtime root list from restoring the latest editor folders.
   Evidence: `collect_workspace_config` chooses either configured roots or client roots and `ServerState` stores only the chosen `active_roots`.
+
+- Observation: `lsp_server::Connection::initialize_finish` consumes the client's `initialized` notification before returning.
+  Evidence: the first end-to-end registration test waited indefinitely when registration was dispatched from `handle_notification`; `lsp-server` 0.7.9 receives and validates `initialized` inside `initialize_finish`. Registration now runs immediately after `ServerState` construction, which is already after that protocol boundary.
 
 ## Decision Log
 
@@ -180,3 +183,5 @@ The internal Rust runtime snapshot should be equality-comparable and contain the
 The protocol tracker should own pull capability flags, a monotonic request generation, the newest requested generation, and pending request IDs. Registration uses a separate stable string request ID so responses cannot collide with configuration pulls or startup progress.
 
 The VS Code settings builder returns a complete `BifrostInitializationOptions` with all three arrays present. Initialization and pull middleware both call it; only the extension layer may inspect setting scope and supply trusted formatter rules.
+
+Plan update (2026-07-10 07:43Z): recorded completion of the protocol and state milestones plus the `initialize_finish` lifecycle discovery that moved dynamic registration out of ordinary notification dispatch.

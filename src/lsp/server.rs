@@ -13,24 +13,26 @@ use lsp_server::{
     Response,
 };
 use lsp_types::notification::{
-    Cancel, DidChangeTextDocument, DidChangeWatchedFiles, DidChangeWorkspaceFolders,
-    DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+    Cancel, DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles,
+    DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
     Notification as LspNotificationTrait, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
     DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
-    HoverRequest, PrepareRenameRequest, References, Rename, Request as LspRequestTrait,
-    SignatureHelpRequest, TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes,
-    WorkDoneProgressCreate, WorkspaceSymbolRequest,
+    HoverRequest, PrepareRenameRequest, References, RegisterCapability, Rename,
+    Request as LspRequestTrait, SignatureHelpRequest, TypeHierarchyPrepare, TypeHierarchySubtypes,
+    TypeHierarchySupertypes, WorkDoneProgressCreate, WorkspaceConfiguration,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CancelParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, FileChangeType, InitializeParams, NumberOrString, ProgressParams,
-    ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, Uri, WorkDoneProgress,
-    WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
+    CancelParams, ConfigurationItem, ConfigurationParams, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    FileChangeType, InitializeParams, NumberOrString, ProgressParams, ProgressParamsValue,
+    ProgressToken, PublishDiagnosticsParams, Registration, RegistrationParams, Uri,
+    WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
     WorkDoneProgressReport,
 };
 
@@ -121,6 +123,7 @@ pub(crate) fn run_with_connection(
         progress.end(message)?;
     }
     let mut state = state_result?;
+    state.register_runtime_configuration(&connection)?;
 
     let result = main_loop(&connection, &mut state, pending_messages);
     state.formatting_jobs.cancel_all();
@@ -219,12 +222,7 @@ fn handle_message(
             }
         }
         Message::Notification(note) => handle_notification(connection, state, note).map(|()| false),
-        Message::Response(_) => {
-            // We do not currently send server→client requests outside the
-            // startup-progress token handshake, so any inbound Response that
-            // reaches the main loop is unsolicited and safe to ignore.
-            Ok(false)
-        }
+        Message::Response(response) => handle_response(connection, state, response).map(|()| false),
     };
     let elapsed = started.elapsed();
     match &result {
@@ -236,6 +234,56 @@ fn handle_message(
         Ok(_) => {}
     }
     result
+}
+
+fn handle_response(
+    connection: &Connection,
+    state: &mut ServerState,
+    response: Response,
+) -> Result<(), String> {
+    if response.id == runtime_configuration_registration_request_id() {
+        if let Some(error) = response.error {
+            eprintln!(
+                "[bifrost-lsp] runtime configuration registration failed: {}",
+                error.message
+            );
+        }
+        return Ok(());
+    }
+
+    let Some(generation) = state
+        .configuration_protocol
+        .pending_pulls
+        .remove(&response.id)
+    else {
+        return Ok(());
+    };
+    if generation != state.configuration_protocol.latest_pull_generation {
+        return Ok(());
+    }
+    let value = match response.error {
+        Some(error) => {
+            eprintln!(
+                "[bifrost-lsp] runtime configuration pull failed: {}",
+                error.message
+            );
+            return Ok(());
+        }
+        None => match response.result {
+            Some(serde_json::Value::Array(mut values)) if values.len() == 1 => values.remove(0),
+            Some(value) => {
+                eprintln!(
+                    "[bifrost-lsp] ignoring runtime configuration response: expected one-element array, got {value}"
+                );
+                return Ok(());
+            }
+            None => {
+                eprintln!("[bifrost-lsp] ignoring runtime configuration response without a result");
+                return Ok(());
+            }
+        },
+    };
+    apply_runtime_configuration_value(connection, state, &value)
 }
 
 #[derive(Clone)]
@@ -798,7 +846,7 @@ fn handle_formatting_request(
     };
     let document_generation = state.document_generation(&params.text_document.uri);
     let document_uri = params.text_document.uri.clone();
-    let rules = state.formatter_commands.clone();
+    let rules = state.runtime_configuration.formatter_commands.clone();
     let prepared = match formatting::prepare(state.project(), &params, &rules) {
         Ok(Some(prepared)) => prepared,
         Ok(None) => {
@@ -926,6 +974,20 @@ fn handle_notification(
     note: Notification,
 ) -> Result<(), String> {
     match note.method.as_str() {
+        DidChangeConfiguration::METHOD => {
+            let params: DidChangeConfigurationParams = serde_json::from_value(note.params)
+                .map_err(|err| {
+                    format!(
+                        "Failed to decode {} params: {err}",
+                        DidChangeConfiguration::METHOD
+                    )
+                })?;
+            if state.configuration_protocol.supports_pull {
+                state.request_runtime_configuration(connection)
+            } else {
+                apply_runtime_configuration_value(connection, state, &params.settings)
+            }
+        }
         DidOpenTextDocument::METHOD => {
             let params: DidOpenTextDocumentParams =
                 serde_json::from_value(note.params).map_err(|err| {
@@ -1159,11 +1221,41 @@ fn publish_empty_diagnostics(connection: &Connection, uri: &Uri) -> Result<(), S
         .map_err(|err| format!("Failed to clear publishDiagnostics: {err}"))
 }
 
+fn apply_runtime_configuration_value(
+    connection: &Connection,
+    state: &mut ServerState,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let configuration = match parse_runtime_configuration(value, &state.configuration_base) {
+        Ok(configuration) => configuration,
+        Err(err) => {
+            eprintln!("[bifrost-lsp] ignoring runtime configuration: {err}");
+            return Ok(());
+        }
+    };
+    let stale_diagnostics = match state.apply_runtime_configuration(configuration) {
+        Ok(stale) => stale,
+        Err(err) => {
+            eprintln!("[bifrost-lsp] runtime configuration was not applied: {err}");
+            return Ok(());
+        }
+    };
+    for uri in stale_diagnostics {
+        publish_empty_diagnostics(connection, &uri)?;
+    }
+    Ok(())
+}
+
+fn runtime_configuration_registration_request_id() -> RequestId {
+    RequestId::from("bifrost-runtime-configuration-register".to_string())
+}
+
 pub(crate) struct ServerState {
     active_roots: Vec<WorkspaceRoot>,
-    configured_roots: bool,
-    excluded_paths: Vec<PathBuf>,
-    formatter_commands: Vec<formatting::FormatterCommandRule>,
+    editor_roots: Vec<WorkspaceRoot>,
+    configuration_base: PathBuf,
+    runtime_configuration: BifrostRuntimeConfiguration,
+    configuration_protocol: RuntimeConfigurationProtocol,
     workspace: WorkspaceAnalyzer,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
@@ -1197,10 +1289,36 @@ struct WorkspaceRoot {
 
 #[derive(Clone, Debug, Default)]
 struct LspWorkspaceConfig {
-    roots: Vec<WorkspaceRoot>,
-    configured_roots: bool,
+    editor_roots: Vec<WorkspaceRoot>,
+    configuration_base: PathBuf,
+    runtime_configuration: BifrostRuntimeConfiguration,
+    configuration_protocol: RuntimeConfigurationProtocol,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BifrostRuntimeConfiguration {
+    configured_roots: Vec<WorkspaceRoot>,
     excluded_paths: Vec<PathBuf>,
     formatter_commands: Vec<formatting::FormatterCommandRule>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeConfigurationProtocol {
+    supports_pull: bool,
+    supports_dynamic_registration: bool,
+    registration_sent: bool,
+    next_pull_generation: u64,
+    latest_pull_generation: u64,
+    pending_pulls: HashMap<RequestId, u64>,
+}
+
+struct PreparedWorkspaceRebuild {
+    active_roots: Vec<WorkspaceRoot>,
+    workspace: WorkspaceAnalyzer,
+    overlay: Arc<OverlayProject>,
+    open_document_paths: HashMap<String, PathBuf>,
+    retained_diagnostics: Vec<Uri>,
+    stale_diagnostics: Vec<Uri>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -1301,23 +1419,30 @@ impl FormattingJobs {
         }
     }
 
-    fn wait_for_empty(&self, timeout: Duration) {
+    fn wait_for_empty(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         while self.active.load(Ordering::Acquire) > 0 && started.elapsed() < timeout {
             thread::sleep(Duration::from_millis(10));
         }
+        self.active.load(Ordering::Acquire) == 0
     }
 }
 
 impl ServerState {
     fn new(config: LspWorkspaceConfig, progress: Option<&StartupProgress>) -> Result<Self, String> {
         let LspWorkspaceConfig {
-            roots,
-            configured_roots,
-            excluded_paths,
-            formatter_commands,
+            editor_roots,
+            configuration_base,
+            runtime_configuration,
+            configuration_protocol,
         } = config;
-        let (project, active_roots) = build_project_for_roots(roots, &excluded_paths)?;
+        let roots = if runtime_configuration.configured_roots.is_empty() {
+            editor_roots.clone()
+        } else {
+            runtime_configuration.configured_roots.clone()
+        };
+        let (project, active_roots) =
+            build_project_for_roots(roots, &runtime_configuration.excluded_paths)?;
         let overlay = Arc::new(OverlayProject::new(project));
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
         if let Some(progress) = progress {
@@ -1326,9 +1451,10 @@ impl ServerState {
         let workspace = build_workspace_for_lsp(project, progress);
         Ok(Self {
             active_roots,
-            configured_roots,
-            excluded_paths,
-            formatter_commands,
+            editor_roots,
+            configuration_base,
+            runtime_configuration,
+            configuration_protocol,
             workspace,
             overlay,
             completion_cache: completion::CompletionCache::new(),
@@ -1347,14 +1473,64 @@ impl ServerState {
         self.overlay.as_ref()
     }
 
+    fn register_runtime_configuration(&mut self, connection: &Connection) -> Result<(), String> {
+        if !self.configuration_protocol.supports_dynamic_registration
+            || self.configuration_protocol.registration_sent
+        {
+            return Ok(());
+        }
+        self.configuration_protocol.registration_sent = true;
+        let request = Request::new(
+            runtime_configuration_registration_request_id(),
+            RegisterCapability::METHOD.to_string(),
+            RegistrationParams {
+                registrations: vec![Registration {
+                    id: "bifrost-runtime-configuration".to_string(),
+                    method: DidChangeConfiguration::METHOD.to_string(),
+                    register_options: Some(serde_json::json!({"section": "bifrost"})),
+                }],
+            },
+        );
+        connection
+            .sender
+            .send(Message::Request(request))
+            .map_err(|err| format!("Failed to register runtime configuration: {err}"))
+    }
+
+    fn request_runtime_configuration(&mut self, connection: &Connection) -> Result<(), String> {
+        self.configuration_protocol.next_pull_generation = self
+            .configuration_protocol
+            .next_pull_generation
+            .saturating_add(1);
+        let generation = self.configuration_protocol.next_pull_generation;
+        self.configuration_protocol.latest_pull_generation = generation;
+        let id = RequestId::from(format!("bifrost-runtime-configuration-{generation}"));
+        let request = Request::new(
+            id.clone(),
+            WorkspaceConfiguration::METHOD.to_string(),
+            ConfigurationParams {
+                items: vec![ConfigurationItem {
+                    scope_uri: None,
+                    section: Some("bifrost".to_string()),
+                }],
+            },
+        );
+        connection
+            .sender
+            .send(Message::Request(request))
+            .map_err(|err| format!("Failed to request runtime configuration: {err}"))?;
+        self.configuration_protocol.pending_pulls.clear();
+        self.configuration_protocol
+            .pending_pulls
+            .insert(id, generation);
+        Ok(())
+    }
+
     fn apply_workspace_folder_change(
         &mut self,
         params: DidChangeWorkspaceFoldersParams,
     ) -> Result<Vec<Uri>, String> {
-        if self.configured_roots {
-            return Ok(Vec::new());
-        }
-        let mut roots = self.active_roots.clone();
+        let mut roots = self.editor_roots.clone();
         for folder in params.event.removed {
             if let Some(path) = workspace_folder_identity_path(&folder.uri) {
                 let identity_uri = folder.uri.as_str();
@@ -1371,47 +1547,115 @@ impl ServerState {
             }
         }
         normalize_roots(&mut roots);
-        if roots == self.active_roots {
+        if roots == self.editor_roots {
             return Ok(Vec::new());
         }
-        self.rebuild_workspace(roots)
+        if !self.runtime_configuration.configured_roots.is_empty() {
+            self.editor_roots = roots;
+            return Ok(Vec::new());
+        }
+        let prepared = self
+            .prepare_workspace_rebuild(roots.clone(), &self.runtime_configuration.excluded_paths)?;
+        let stale = self.commit_workspace_rebuild(prepared)?;
+        self.editor_roots = roots;
+        Ok(stale)
     }
 
-    fn rebuild_workspace(&mut self, roots: Vec<WorkspaceRoot>) -> Result<Vec<Uri>, String> {
-        let previous_diagnostics = self.published_diagnostic_uris.clone();
+    fn prepare_workspace_rebuild(
+        &self,
+        roots: Vec<WorkspaceRoot>,
+        excluded_paths: &[PathBuf],
+    ) -> Result<PreparedWorkspaceRebuild, String> {
         let (project, active_roots): (Arc<dyn Project>, Vec<WorkspaceRoot>) = if roots.is_empty() {
             (
                 Arc::new(NoWorkspaceProject::new(self.project().root().to_path_buf())),
                 Vec::new(),
             )
         } else {
-            build_project_for_roots(roots, &self.excluded_paths)?
+            build_project_for_roots(roots, excluded_paths)?
         };
         let overlay = Arc::new(OverlayProject::new(project));
-        for document in self.open_documents.values_mut() {
+        let mut open_document_paths = HashMap::new();
+        for (key, document) in &self.open_documents {
             if let Some(file) = resolve_project_file(overlay.as_ref(), &document.uri)
                 .or_else(|| project_file_for_abs_path(overlay.as_ref(), &document.abs_path))
             {
-                document.abs_path = file.abs_path();
+                open_document_paths.insert(key.clone(), file.abs_path());
                 overlay.set(file.abs_path(), document.text.clone());
             }
         }
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
         let workspace = build_workspace_for_lsp(project, None);
-        self.active_roots = active_roots;
-        self.workspace = workspace;
-        self.overlay = overlay;
-        self.completion_cache.clear();
-
         let mut stale = Vec::new();
-        self.published_diagnostic_uris.clear();
-        for uri in previous_diagnostics {
-            if uri_belongs_to_project(self.project(), &uri) {
-                self.remember_published_diagnostic_uri(&uri);
+        let mut retained_diagnostics = Vec::new();
+        for uri in &self.published_diagnostic_uris {
+            if uri_belongs_to_project(overlay.as_ref(), uri) {
+                retained_diagnostics.push(uri.clone());
             } else {
-                stale.push(uri);
+                stale.push(uri.clone());
             }
         }
+        Ok(PreparedWorkspaceRebuild {
+            active_roots,
+            workspace,
+            overlay,
+            open_document_paths,
+            retained_diagnostics,
+            stale_diagnostics: stale,
+        })
+    }
+
+    fn commit_workspace_rebuild(
+        &mut self,
+        prepared: PreparedWorkspaceRebuild,
+    ) -> Result<Vec<Uri>, String> {
+        self.formatting_jobs.cancel_all();
+        if !self
+            .formatting_jobs
+            .wait_for_empty(FORMATTER_SHUTDOWN_GRACE)
+        {
+            return Err(format!(
+                "formatter cleanup did not finish within {} before workspace rebuild",
+                FORMATTER_SHUTDOWN_GRACE.as_secs_f64()
+            ));
+        }
+        for (key, abs_path) in prepared.open_document_paths {
+            if let Some(document) = self.open_documents.get_mut(&key) {
+                document.abs_path = abs_path;
+            }
+        }
+        self.active_roots = prepared.active_roots;
+        let old_workspace = std::mem::replace(&mut self.workspace, prepared.workspace);
+        let old_overlay = std::mem::replace(&mut self.overlay, prepared.overlay);
+        self.completion_cache.clear();
+        self.published_diagnostic_uris = prepared.retained_diagnostics;
+        drop(old_workspace);
+        drop(old_overlay);
+        Ok(prepared.stale_diagnostics)
+    }
+
+    fn apply_runtime_configuration(
+        &mut self,
+        configuration: BifrostRuntimeConfiguration,
+    ) -> Result<Vec<Uri>, String> {
+        if configuration == self.runtime_configuration {
+            return Ok(Vec::new());
+        }
+        let rebuild_required = configuration.configured_roots
+            != self.runtime_configuration.configured_roots
+            || configuration.excluded_paths != self.runtime_configuration.excluded_paths;
+        if !rebuild_required {
+            self.runtime_configuration = configuration;
+            return Ok(Vec::new());
+        }
+        let roots = if configuration.configured_roots.is_empty() {
+            self.editor_roots.clone()
+        } else {
+            configuration.configured_roots.clone()
+        };
+        let prepared = self.prepare_workspace_rebuild(roots, &configuration.excluded_paths)?;
+        let stale = self.commit_workspace_rebuild(prepared)?;
+        self.runtime_configuration = configuration;
         Ok(stale)
     }
 
@@ -1698,6 +1942,11 @@ fn normalize_roots(roots: &mut Vec<WorkspaceRoot>) {
     });
 }
 
+fn normalize_paths(paths: &mut Vec<PathBuf>) {
+    paths.sort();
+    paths.dedup();
+}
+
 fn workspace_root_for_folder(folder: &lsp_types::WorkspaceFolder) -> Option<WorkspaceRoot> {
     let uri = &folder.uri;
     let Some(path) = uri_to_path(uri) else {
@@ -1787,35 +2036,56 @@ fn collect_workspace_config(
     params: &InitializeParams,
     fallback: &Path,
 ) -> Result<LspWorkspaceConfig, String> {
-    let options = bifrost_initialization_options(params);
-    let fallback_base = fallback
+    let BifrostInitializationOptions {
+        roots,
+        exclude,
+        formatter_commands,
+    } = bifrost_initialization_options(params);
+    let configuration_base = fallback
         .canonicalize()
         .unwrap_or_else(|_| fallback.to_path_buf());
-    let configured_roots = !options.roots.is_empty();
-    let roots = if configured_roots {
-        let roots: Vec<WorkspaceRoot> = options
-            .roots
+    let mut editor_roots = collect_workspace_roots(params, fallback)?;
+    normalize_roots(&mut editor_roots);
+    let mut configured_roots = if roots.is_empty() {
+        Vec::new()
+    } else {
+        let roots: Vec<WorkspaceRoot> = roots
             .into_iter()
-            .filter_map(|root| workspace_root_for_config_path(&root, &fallback_base))
+            .filter_map(|root| workspace_root_for_config_path(&root, &configuration_base))
             .collect();
         if roots.is_empty() {
             return Err("bifrost.roots did not contain any usable directories".to_string());
         }
         roots
-    } else {
-        collect_workspace_roots(params, fallback)?
     };
-    let excluded_paths = options
-        .exclude
+    normalize_roots(&mut configured_roots);
+    let mut excluded_paths: Vec<PathBuf> = exclude
         .into_iter()
-        .filter_map(|path| scoped_config_path(&path, &fallback_base))
+        .filter_map(|path| scoped_config_path(&path, &configuration_base))
         .map(|path| path.canonicalize().unwrap_or(path))
         .collect();
+    normalize_paths(&mut excluded_paths);
+    let workspace_capabilities = params.capabilities.workspace.as_ref();
+    let supports_pull = workspace_capabilities
+        .and_then(|workspace| workspace.configuration)
+        .unwrap_or(false);
+    let supports_dynamic_registration = workspace_capabilities
+        .and_then(|workspace| workspace.did_change_configuration.as_ref())
+        .and_then(|configuration| configuration.dynamic_registration)
+        .unwrap_or(false);
     Ok(LspWorkspaceConfig {
-        roots,
-        configured_roots,
-        excluded_paths,
-        formatter_commands: options.formatter_commands,
+        editor_roots,
+        configuration_base,
+        runtime_configuration: BifrostRuntimeConfiguration {
+            configured_roots,
+            excluded_paths,
+            formatter_commands,
+        },
+        configuration_protocol: RuntimeConfigurationProtocol {
+            supports_pull,
+            supports_dynamic_registration,
+            ..RuntimeConfigurationProtocol::default()
+        },
     })
 }
 
@@ -1872,6 +2142,68 @@ fn bifrost_initialization_options(params: &InitializeParams) -> BifrostInitializ
     }
 }
 
+fn parse_runtime_configuration(
+    value: &serde_json::Value,
+    base: &Path,
+) -> Result<BifrostRuntimeConfiguration, String> {
+    let outer = value
+        .as_object()
+        .ok_or_else(|| "settings must be an object".to_string())?;
+    let object = match outer.get("bifrost") {
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| "settings.bifrost must be an object".to_string())?,
+        None => outer,
+    };
+    let roots = strict_optional_string_array(object, "roots")?;
+    let exclude = strict_optional_string_array(object, "exclude")?;
+    let formatter_commands = match object.get("formatterCommands") {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|err| format!("formatterCommands is invalid: {err}"))?,
+        None => Vec::new(),
+    };
+    let mut configured_roots = roots
+        .iter()
+        .map(|root| runtime_workspace_root_for_config_path(root, base))
+        .collect::<Result<Vec<_>, _>>()?;
+    normalize_roots(&mut configured_roots);
+    let mut excluded_paths = exclude
+        .iter()
+        .map(|path| {
+            scoped_config_path(path, base)
+                .ok_or_else(|| "exclude entries must not be empty".to_string())
+                .map(|path| path.canonicalize().unwrap_or(path))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    normalize_paths(&mut excluded_paths);
+    Ok(BifrostRuntimeConfiguration {
+        configured_roots,
+        excluded_paths,
+        formatter_commands,
+    })
+}
+
+fn strict_optional_string_array(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let Some(value) = object.get(key) else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{key} must be an array of strings"))?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{key}[{index}] must be a string"))
+        })
+        .collect()
+}
+
 fn optional_string_array(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1925,6 +2257,25 @@ fn workspace_root_for_config_path(raw: &str, base: &Path) -> Option<WorkspaceRoo
     }
 }
 
+fn runtime_workspace_root_for_config_path(raw: &str, base: &Path) -> Result<WorkspaceRoot, String> {
+    let path = scoped_config_path(raw, base)
+        .ok_or_else(|| "roots entries must not be empty".to_string())?;
+    let analyzer_path = path
+        .canonicalize()
+        .map_err(|err| format!("runtime root {} is unavailable: {err}", path.display()))?;
+    if !analyzer_path.is_dir() {
+        return Err(format!(
+            "runtime root is not a directory: {}",
+            analyzer_path.display()
+        ));
+    }
+    Ok(WorkspaceRoot {
+        identity_uri: path_to_uri_string(&path),
+        identity_path: path,
+        analyzer_path,
+    })
+}
+
 fn scoped_config_path(raw: &str, base: &Path) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1968,6 +2319,79 @@ fn path_is_within_any(path: &Path, candidates: &[PathBuf]) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn runtime_configuration_accepts_direct_and_nested_full_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let settings = json!({
+            "roots": ["source"],
+            "exclude": ["target", "target"],
+            "formatterCommands": [{"include": ["*.rs"], "command": "rustfmt"}]
+        });
+
+        let direct = parse_runtime_configuration(&settings, &base).unwrap();
+        let nested = parse_runtime_configuration(&json!({"bifrost": settings}), &base).unwrap();
+
+        assert_eq!(direct, nested);
+        assert_eq!(direct.configured_roots.len(), 1);
+        assert_eq!(direct.excluded_paths, vec![base.join("target")]);
+        assert_eq!(direct.formatter_commands.len(), 1);
+    }
+
+    #[test]
+    fn runtime_configuration_missing_fields_clear_previous_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+
+        let configuration =
+            parse_runtime_configuration(&json!({"unrelatedLaunchSetting": true}), &base).unwrap();
+
+        assert!(configuration.configured_roots.is_empty());
+        assert!(configuration.excluded_paths.is_empty());
+        assert!(configuration.formatter_commands.is_empty());
+    }
+
+    #[test]
+    fn runtime_configuration_rejects_malformed_recognized_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+
+        let roots_error = parse_runtime_configuration(&json!({"roots": "src"}), &base)
+            .expect_err("roots must be rejected atomically");
+        assert!(roots_error.contains("roots must be an array"));
+
+        let formatter_error = parse_runtime_configuration(
+            &json!({"exclude": [], "formatterCommands": [{"include": ["*.rs"]}]}),
+            &base,
+        )
+        .expect_err("invalid formatter rule must reject the snapshot");
+        assert!(formatter_error.contains("formatterCommands is invalid"));
+    }
+
+    #[test]
+    fn workspace_config_captures_runtime_configuration_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let params: InitializeParams = serde_json::from_value(json!({
+            "processId": null,
+            "rootUri": path_to_uri_string(&root),
+            "capabilities": {
+                "workspace": {
+                    "configuration": true,
+                    "didChangeConfiguration": {"dynamicRegistration": true}
+                }
+            }
+        }))
+        .unwrap();
+
+        let config = collect_workspace_config(&params, &root).unwrap();
+
+        assert!(config.configuration_protocol.supports_pull);
+        assert!(config.configuration_protocol.supports_dynamic_registration);
+    }
 
     #[test]
     fn invalid_formatter_commands_do_not_discard_roots_or_exclude() {
