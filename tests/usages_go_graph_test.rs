@@ -1100,7 +1100,7 @@ func FromConstructors() string {
 }
 
 #[test]
-fn go_graph_strategy_finds_pointer_receiver_method_calls_through_interface_fields() {
+fn go_graph_strategy_classifies_concrete_method_calls_through_interface_fields_as_unproven() {
     let (project, analyzer) = go_analyzer_with_files(&[
         (
             "example/service.go",
@@ -1158,22 +1158,45 @@ func ExampleService() {
 
     let target = definition(&analyzer, "example.com/app/example.MemoryRepository.Save");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let hits = GoUsageGraphStrategy::new()
-        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
-        .into_either()
-        .expect("pointer-receiver method calls through interface fields should resolve");
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
 
-    assert_eq!(2, hits.len(), "expected both Save calls: {hits:?}");
-    assert!(
-        hits.iter()
-            .any(|hit| hit.file == project.file("example/service.go")),
-        "same-file interface-field call should be included: {hits:?}",
-    );
-    assert!(
-        hits.iter()
-            .any(|hit| hit.file == project.file("example/service_test.go")),
-        "test-file concrete pointer call should be included: {hits:?}",
-    );
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => {
+            let hits = hits_by_overload
+                .get(&target)
+                .expect("concrete receiver call should remain proven");
+            assert_eq!(1, hits.len(), "proven hits: {hits:?}");
+            assert!(
+                hits.iter()
+                    .all(|hit| hit.file == project.file("example/service_test.go")),
+                "only the concrete pointer receiver should be proven: {hits:?}",
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&target),
+                "interface dispatch must be counted as unproven",
+            );
+            assert!(
+                unproven_by_overload
+                    .get(&target)
+                    .is_some_and(|hits| hits.iter().any(|hit| {
+                        hit.file == project.file("example/service.go")
+                            && hit.snippet.contains("s.repository.Save(name)")
+                    })),
+                "expected the interface-dispatch call to be unproven: {unproven_by_overload:#?}",
+            );
+        }
+        other => panic!("expected proof-tier result, got {other:#?}"),
+    }
 }
 
 #[test]
@@ -1333,7 +1356,7 @@ func (c *Client) Publish(ctx string) error {
 }
 
 #[test]
-fn go_graph_strategy_finds_unexported_impl_method_calls_through_imported_interface_fields() {
+fn go_graph_strategy_classifies_imported_interface_calls_to_unexported_impls_as_unproven() {
     let (project, analyzer) = go_analyzer_with_files(&[
         (
             "registry/app/pkg/base/base.go",
@@ -1378,22 +1401,137 @@ func (c *Client) Publish(ctx string) error {
         "example.com/app/registry/app/pkg/base.localBase.MoveTempFileAndCreateArtifact",
     );
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let hits = GoUsageGraphStrategy::new()
-        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
-        .into_either()
-        .expect("unexported implementation method usage through imported interface field should resolve");
-
-    assert_eq!(
-        1,
-        hits.len(),
-        "expected imported interface field hit: {hits:?}"
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
     );
-    assert!(hits.iter().all(|hit| {
-        hit.file == project.file("registry/app/pkg/npm/local.go")
-            && hit
-                .snippet
-                .contains("c.localBase.MoveTempFileAndCreateArtifact")
-    }));
+
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&target)
+                    .is_none_or(|hits| hits.is_empty()),
+                "interface dispatch must not be a proven implementation hit: {hits_by_overload:#?}",
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&target),
+                "imported interface dispatch must be counted as unproven",
+            );
+            assert!(
+                unproven_by_overload
+                    .get(&target)
+                    .is_some_and(|hits| hits.iter().any(|hit| {
+                        hit.file == project.file("registry/app/pkg/npm/local.go")
+                            && hit
+                                .snippet
+                                .contains("c.localBase.MoveTempFileAndCreateArtifact")
+                    })),
+                "expected the imported interface dispatch to be unproven: {unproven_by_overload:#?}",
+            );
+        }
+        other => panic!("expected proof-tier result, got {other:#?}"),
+    }
+}
+
+#[test]
+fn go_graph_strategy_classifies_gocache_style_interface_wrappers_as_unproven() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "cache/chain.go",
+            r#"
+package cache
+
+type CacheInterface interface {
+    Set(key string) error
+}
+
+type ChainCache struct{}
+
+func (c *ChainCache) Set(key string) error {
+    return nil
+}
+"#,
+        ),
+        (
+            "cache/wrappers.go",
+            r#"
+package cache
+
+type LoadableCache struct {
+    cache CacheInterface
+}
+
+func (c *LoadableCache) Set(key string) error {
+    return c.cache.Set(key)
+}
+
+type MetricCache struct {
+    cache CacheInterface
+}
+
+func (c *MetricCache) Set(key string) error {
+    return c.cache.Set(key)
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/cache.ChainCache.Set");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&target)
+                    .is_none_or(|hits| hits.is_empty()),
+                "interface wrappers must not be proven concrete-method calls: {hits_by_overload:#?}",
+            );
+            assert_eq!(
+                Some(&2),
+                unproven_total_by_overload.get(&target),
+                "both interface wrapper calls should be unproven",
+            );
+            let unproven = unproven_by_overload
+                .get(&target)
+                .expect("capped unproven wrapper hits");
+            assert!(
+                unproven.iter().any(|hit| {
+                    hit.file == project.file("cache/wrappers.go")
+                        && hit.snippet.contains("return c.cache.Set(key)")
+                        && hit.enclosing.fq_name().ends_with("LoadableCache.Set")
+                }),
+                "expected LoadableCache.Set to be unproven: {unproven:#?}",
+            );
+            assert!(
+                unproven.iter().any(|hit| {
+                    hit.file == project.file("cache/wrappers.go")
+                        && hit.snippet.contains("return c.cache.Set(key)")
+                        && hit.enclosing.fq_name().ends_with("MetricCache.Set")
+                }),
+                "expected MetricCache.Set to be unproven: {unproven:#?}",
+            );
+        }
+        other => panic!("expected proof-tier result, got {other:#?}"),
+    }
 }
 
 // Regression for #232: a value-receiver method called on a local that is bound to
