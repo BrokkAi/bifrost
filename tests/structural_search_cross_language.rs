@@ -156,6 +156,25 @@ fn remaining_languages_search_without_unsupported_adapter_diagnostics_during_iss
 }
 
 #[test]
+fn cpp_function_like_macro_invocation_matches_call_callee_query() {
+    let output = run_query_with_files(
+        &[(
+            "cpp/macros.cpp",
+            "#define TEST_DECLARE(name) int name\nvoid run() { TEST_DECLARE(value); }\n",
+        )],
+        json!({
+            "languages": ["cpp"],
+            "match": { "kind": "call", "callee": { "name": "TEST_DECLARE" } }
+        }),
+    );
+
+    assert!(output.diagnostics.is_empty(), "{output:?}");
+    assert_eq!(1, output.matches.len(), "{output:?}");
+    assert_eq!("cpp/macros.cpp", output.matches[0].path);
+    assert_eq!("TEST_DECLARE(value)", output.matches[0].text);
+}
+
+#[test]
 fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnostics() {
     let cases = [
         (
