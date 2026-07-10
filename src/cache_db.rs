@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::path_normalization::NormalizePath;
 
@@ -268,7 +268,38 @@ pub(crate) fn now_unix_seconds() -> i64 {
 }
 
 fn delete_legacy_cache_files(db_path: &Path) {
+    if db_path.file_name() != Some(std::ffi::OsStr::new(CACHE_DB_FILE_NAME)) {
+        return;
+    }
     let Some(parent) = db_path.parent() else {
+        return;
+    };
+    let legacy_path = parent.join(LEGACY_SEMANTIC_DB_FILE_NAME);
+    if !legacy_path.exists() {
+        return;
+    }
+    let Ok(mut legacy) = Connection::open_with_flags(
+        &legacy_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    ) else {
+        return;
+    };
+    if legacy.busy_timeout(Duration::ZERO).is_err()
+        || legacy
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .is_err()
+    {
+        return;
+    }
+    let checkpoint_busy = legacy
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(1);
+    if checkpoint_busy != 0 {
+        return;
+    }
+    let Ok(_exclusive) = legacy.transaction_with_behavior(TransactionBehavior::Exclusive) else {
         return;
     };
     for suffix in ["", "-wal", "-shm"] {
@@ -453,6 +484,12 @@ mod tests {
         .unwrap()
     }
 
+    fn create_legacy_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
+            .unwrap();
+    }
+
     #[test]
     fn creates_only_semantic_namespace_and_reserves_analyzer_zero() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -544,13 +581,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = temp.path().join(".brokk");
         std::fs::create_dir(&cache_dir).unwrap();
-        for suffix in ["", "-wal", "-shm"] {
-            std::fs::write(
-                cache_dir.join(format!("{LEGACY_SEMANTIC_DB_FILE_NAME}{suffix}")),
-                b"legacy",
-            )
-            .unwrap();
-        }
+        create_legacy_db(&cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME));
         let unrelated = cache_dir.join("analyzer_cache.db");
         std::fs::write(&unrelated, b"unrelated").unwrap();
 
@@ -574,10 +605,50 @@ mod tests {
         let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
         let _conn = open_unified_connection(&db_path).unwrap();
         let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
-        std::fs::write(&legacy, b"legacy").unwrap();
+        create_legacy_db(&legacy);
 
         let _second = open_unified_connection(&db_path).unwrap();
         assert!(legacy.exists());
+    }
+
+    #[test]
+    fn arbitrary_or_legacy_db_path_never_triggers_legacy_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join(".brokk");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
+        create_legacy_db(&legacy);
+
+        let custom = cache_dir.join("custom.db");
+        let _custom = open_unified_connection(&custom).unwrap();
+        assert!(legacy.exists());
+
+        let _legacy = open_unified_connection(&legacy).unwrap();
+        assert!(legacy.exists());
+    }
+
+    #[test]
+    fn live_legacy_writer_prevents_first_open_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join(".brokk");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let legacy_path = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
+        let mut legacy = Connection::open(&legacy_path).unwrap();
+        legacy.pragma_update(None, "journal_mode", "WAL").unwrap();
+        legacy
+            .execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
+            .unwrap();
+        let writer = legacy
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        writer
+            .execute("INSERT INTO legacy_cache(value) VALUES('active')", [])
+            .unwrap();
+
+        let unified = cache_dir.join(CACHE_DB_FILE_NAME);
+        let _conn = open_unified_connection(&unified).unwrap();
+        assert!(legacy_path.exists());
+        writer.rollback().unwrap();
     }
 
     #[test]
@@ -592,7 +663,7 @@ mod tests {
             .unwrap();
         drop(partial);
         let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
-        std::fs::write(&legacy, b"legacy").unwrap();
+        create_legacy_db(&legacy);
 
         let conn = open_unified_connection(&db_path).unwrap();
         assert!(table_exists(&conn, "semantic_blobs"));

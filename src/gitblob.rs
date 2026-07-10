@@ -72,14 +72,6 @@ pub(crate) fn working_tree_oids(
     Ok(out)
 }
 
-/// Explicit incremental-update API. Resolution remains per requested path.
-pub(crate) fn working_tree_oids_targeted(
-    repo: &Repository,
-    rel_paths: &[String],
-) -> Result<HashMap<String, String>> {
-    working_tree_oids(repo, rel_paths)
-}
-
 /// Resolve every indexed path to the OID of its current working-tree bytes.
 pub(crate) fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, String>> {
     let workdir = workdir(repo)?;
@@ -87,6 +79,9 @@ pub(crate) fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String
     let mut out = HashMap::with_capacity(index.len());
     for entry in index.iter() {
         let rel = index_path_to_string(&entry)?;
+        if !workdir.join(&rel).is_file() {
+            continue;
+        }
         let oid = resolve_index_entry_oid(workdir, &entry)?;
         out.insert(rel, oid.to_string());
     }
@@ -190,6 +185,19 @@ pub(crate) fn worktree_roots(repo: &Repository) -> Result<Vec<PathBuf>> {
     Ok(roots)
 }
 
+/// Exact-byte OIDs held by every worktree: all present indexed files plus
+/// untracked files. This is the shared working-tree liveness root for caches.
+pub(crate) fn worktree_live_oids(repo: &Repository) -> Result<HashSet<String>> {
+    let mut oids = HashSet::new();
+    for root in worktree_roots(repo)? {
+        let worktree_repo = Repository::open(&root)
+            .map_err(|err| format!("opening worktree {}: {err}", root.display()))?;
+        oids.extend(working_tree_oids_full(&worktree_repo)?.into_values());
+        oids.extend(uncommitted_oids(&root)?);
+    }
+    Ok(oids)
+}
+
 fn worktree_porcelain(repo: &Repository) -> Result<String> {
     let workdir = workdir(repo)?;
     let output = Command::new("git")
@@ -214,9 +222,12 @@ pub(crate) fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
     let workdir = workdir(&repo)?.to_path_buf();
     let mut out = HashSet::new();
     for rel in dirty_paths(&repo)? {
-        if let Ok(oid) = hash_working_file(&workdir, &rel) {
-            out.insert(oid.to_string());
+        let path = workdir.join(&rel);
+        if !path.is_file() {
+            continue;
         }
+        let oid = hash_working_file(&workdir, &rel)?;
+        out.insert(oid.to_string());
     }
     Ok(out)
 }
@@ -339,10 +350,6 @@ pub(crate) mod tests {
             expected.to_string()
         );
         assert_eq!(
-            working_tree_oids_targeted(&repo, &paths).unwrap()["a.txt"],
-            expected.to_string()
-        );
-        assert_eq!(
             working_tree_oids_full(&repo).unwrap()["a.txt"],
             expected.to_string()
         );
@@ -380,10 +387,6 @@ pub(crate) mod tests {
             crlf_oid.to_string()
         );
         assert_eq!(
-            working_tree_oids_targeted(&repo, &paths).unwrap()["a.txt"],
-            crlf_oid.to_string()
-        );
-        assert_eq!(
             working_tree_oids_full(&repo).unwrap()["a.txt"],
             crlf_oid.to_string()
         );
@@ -404,9 +407,7 @@ pub(crate) mod tests {
 
         let paths = vec!["dirty.txt".to_string(), "new.txt".to_string()];
         let bulk = working_tree_oids(&repo, &paths).unwrap();
-        let targeted = working_tree_oids_targeted(&repo, &paths).unwrap();
         let full = working_tree_oids_full(&repo).unwrap();
-        assert_eq!(bulk, targeted);
         assert_eq!(full["dirty.txt"], bulk["dirty.txt"]);
         assert_eq!(
             working_tree_oid_for_path(&repo, Path::new("dirty.txt")).unwrap(),
@@ -459,6 +460,13 @@ pub(crate) mod tests {
         assert!(roots.contains(&repo_root.canonicalize().unwrap().normalize()));
         assert!(roots.contains(&linked.canonicalize().unwrap().normalize()));
         assert_eq!(worktree_heads(&repo).unwrap().len(), 1);
+        assert!(
+            worktree_live_oids(&repo).unwrap().contains(
+                &Oid::hash_object(ObjectType::Blob, b"hello\n")
+                    .unwrap()
+                    .to_string()
+            )
+        );
     }
 
     #[cfg(windows)]

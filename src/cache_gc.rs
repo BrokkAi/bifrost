@@ -85,12 +85,8 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
 
 fn live_bloom(repo: &Repository) -> Result<GrowableBloom, String> {
     let mut live = gitblob::reachable_bloom(repo)?;
-    for root in gitblob::worktree_roots(repo)? {
-        if let Ok(dirty) = gitblob::uncommitted_oids(&root) {
-            for oid in dirty {
-                live.insert(oid);
-            }
-        }
+    for oid in gitblob::worktree_live_oids(repo)? {
+        live.insert(oid);
     }
     Ok(live)
 }
@@ -228,6 +224,53 @@ mod tests {
 
     fn is_present(store: &SemanticStore, oid: Oid) -> bool {
         store.missing_blobs(&[oid.to_string()]).unwrap().is_empty()
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn forced_gc_preserves_clean_crlf_working_tree_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let repo = init_repo(&root);
+        repo.config()
+            .unwrap()
+            .set_str("core.autocrlf", "true")
+            .unwrap();
+        std::fs::write(root.join("clean.txt"), b"clean\r\n").unwrap();
+        run_git(&root, &["add", "clean.txt"]);
+        run_git(&root, &["commit", "-m", "base"]);
+
+        let working_oid = Oid::hash_object(ObjectType::Blob, b"clean\r\n").unwrap();
+        let index_oid = repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("clean.txt"), 0)
+            .unwrap()
+            .id;
+        assert_ne!(working_oid, index_oid);
+        assert!(repo.status_file(Path::new("clean.txt")).unwrap().is_empty());
+
+        let db_path = gitblob::cache_db_path(&root);
+        let store = SemanticStore::open(&db_path).unwrap();
+        put_oid(&store, working_oid);
+
+        let outcome = force_gc_for_semantic(&store, &repo).unwrap();
+        assert!(outcome.ran);
+        assert_eq!(outcome.semantic_dropped, 0);
+        assert!(is_present(&store, working_oid));
     }
 
     #[test]

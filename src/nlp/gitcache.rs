@@ -27,7 +27,7 @@ pub fn working_tree_oids_targeted(
     repo: &Repository,
     rel_paths: &[String],
 ) -> Result<HashMap<String, String>> {
-    crate::gitblob::working_tree_oids_targeted(repo, rel_paths)
+    crate::gitblob::working_tree_oids(repo, rel_paths)
 }
 
 pub fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
