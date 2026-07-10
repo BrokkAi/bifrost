@@ -925,7 +925,11 @@ pub fn search_symbols(
     let filtered: Vec<_> = definitions
         .into_par_iter()
         .filter(|code_unit| {
-            params.include_tests || !is_test_candidate(analyzer, code_unit.source())
+            // A search result is an implicit selector offer for source/location tools. Internal
+            // graph identities without a unique range (for example replicated Go inline-struct
+            // members) must not be advertised even when they intentionally remain resolvable.
+            !analyzer.ranges(code_unit).is_empty()
+                && (params.include_tests || !is_test_candidate(analyzer, code_unit.source()))
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -2133,10 +2137,6 @@ fn source_blocks_for_resolved_units(
         .flat_map(|code_unit| {
             if is_file_listing_target(code_unit) {
                 module_file_listing_blocks(code_unit)
-            } else if let Some(blocks) =
-                source_blocks_for_synthetic_java_constructor(analyzer, code_unit)
-            {
-                blocks
             } else {
                 source_blocks_for_code_unit(analyzer, code_unit, true)
             }
@@ -2190,33 +2190,6 @@ fn resolve_file_anchored_symbol_sources(
             })
         }
     }
-}
-
-const SYNTHETIC_JAVA_CONSTRUCTOR_SOURCE_NOTE: &str =
-    "synthetic Java default constructor; showing declaring class source";
-
-fn source_blocks_for_synthetic_java_constructor(
-    analyzer: &dyn IAnalyzer,
-    code_unit: &CodeUnit,
-) -> Option<Vec<SourceBlock>> {
-    if language_for_target(code_unit) != Language::Java
-        || !code_unit.is_synthetic()
-        || !code_unit.is_function()
-        || !analyzer.ranges(code_unit).is_empty()
-    {
-        return None;
-    }
-
-    let parent = analyzer.parent_of(code_unit)?;
-    if !parent.is_class() || parent.identifier() != code_unit.identifier() {
-        return None;
-    }
-
-    let mut blocks = source_blocks_for_code_unit(analyzer, &parent, true);
-    for block in &mut blocks {
-        block.note = Some(SYNTHETIC_JAVA_CONSTRUCTOR_SOURCE_NOTE.to_string());
-    }
-    Some(blocks)
 }
 
 pub fn get_symbol_sources(

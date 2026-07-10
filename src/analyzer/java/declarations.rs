@@ -256,7 +256,6 @@ pub(super) fn visit_class_like(
             );
         }
 
-        let mut has_explicit_constructor = false;
         if let Some(body) = node.child_by_field_name("body") {
             for child in class_like_body_children_rev(body) {
                 match child.kind() {
@@ -264,9 +263,6 @@ pub(super) fn visit_class_like(
                         stack.push((child, Some(code_unit.clone()), Some(top_level.clone())));
                     }
                     "method_declaration" | "constructor_declaration" => {
-                        if child.kind() == "constructor_declaration" {
-                            has_explicit_constructor = true;
-                        }
                         visit_callable(
                             file,
                             source,
@@ -302,19 +298,6 @@ pub(super) fn visit_class_like(
                     _ => {}
                 }
             }
-        }
-
-        if should_create_implicit_constructor(node.kind(), has_explicit_constructor) {
-            let ctor = CodeUnit::with_signature(
-                file.clone(),
-                crate::analyzer::CodeUnitType::Function,
-                package_name.to_string(),
-                format!("{}.{}", code_unit.short_name(), simple_name),
-                None,
-                true,
-            );
-            parsed.declarations.insert(ctor.clone());
-            parsed.add_child(code_unit.clone(), ctor);
         }
     }
 
@@ -989,10 +972,6 @@ pub(super) fn module_code_unit(file: &ProjectFile, package_name: &str) -> CodeUn
             package_name.to_string(),
         ),
     }
-}
-
-fn should_create_implicit_constructor(node_kind: &str, has_explicit_constructor: bool) -> bool {
-    node_kind == "class_declaration" && !has_explicit_constructor
 }
 
 pub(super) fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String> {

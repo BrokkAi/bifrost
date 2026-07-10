@@ -48,6 +48,75 @@ fn not_found_note(value: &Value) -> &str {
     value["note"].as_str().expect("not_found note")
 }
 
+fn searched_function_symbols(result: &Value) -> Vec<String> {
+    result["files"]
+        .as_array()
+        .expect("search files")
+        .iter()
+        .flat_map(|file| file["functions"].as_array().expect("search functions"))
+        .map(|function| {
+            function["symbol"]
+                .as_str()
+                .expect("function symbol")
+                .to_string()
+        })
+        .collect()
+}
+
+fn searched_symbols(result: &Value) -> Vec<String> {
+    const BUCKETS: [&str; 5] = ["classes", "functions", "fields", "modules", "macros"];
+    result["files"]
+        .as_array()
+        .expect("search files")
+        .iter()
+        .flat_map(|file| {
+            BUCKETS.into_iter().flat_map(move |bucket| {
+                file[bucket]
+                    .as_array()
+                    .expect("search symbol bucket")
+                    .iter()
+            })
+        })
+        .map(|symbol| {
+            symbol["symbol"]
+                .as_str()
+                .expect("searched symbol")
+                .to_string()
+        })
+        .collect()
+}
+
+fn assert_symbol_source_contains(
+    project: &common::BuiltInlineTestProject,
+    selector: &str,
+    expected_source: &str,
+) -> Value {
+    let search_args =
+        serde_json::json!({ "patterns": [selector], "include_tests": true, "limit": 5 })
+            .to_string();
+    let search = call_tool(project, "search_symbols", &search_args);
+    assert!(
+        searched_symbols(&search)
+            .iter()
+            .any(|symbol| symbol == selector),
+        "{search}"
+    );
+
+    let args = serde_json::json!({ "symbols": [selector] }).to_string();
+    let result = call_tool(project, "get_symbol_sources", &args);
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+    assert!(
+        result["sources"][0]["text"]
+            .as_str()
+            .expect("source text")
+            .contains(expected_source),
+        "{result}"
+    );
+    result
+}
+
 #[test]
 fn symbol_sources_disambiguates_anonymous_js_default_exports_by_file_selector() {
     let project = InlineTestProject::with_language(Language::JavaScript)
@@ -603,7 +672,7 @@ fn anchored_selector_wrong_path_reports_anchor_recovery_note() {
 }
 
 #[test]
-fn synthetic_java_constructor_selector_returns_declaring_class_source() {
+fn java_class_without_explicit_constructor_does_not_advertise_constructor_symbol() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
             "src/main/java/org/example/EventPublisherTest.java",
@@ -616,11 +685,10 @@ fn synthetic_java_constructor_selector_returns_declaring_class_source() {
         "search_symbols",
         r#"{"patterns":["EventPublisherTest"],"include_tests":true,"limit":5}"#,
     );
-    let functions = search["files"][0]["functions"].as_array().unwrap();
     assert!(
-        functions
+        !searched_function_symbols(&search)
             .iter()
-            .any(|hit| hit["symbol"] == "org.example.EventPublisherTest.EventPublisherTest"),
+            .any(|symbol| symbol == "org.example.EventPublisherTest.EventPublisherTest"),
         "{search}"
     );
 
@@ -629,47 +697,219 @@ fn synthetic_java_constructor_selector_returns_declaring_class_source() {
         "get_symbol_sources",
         r#"{"symbols":["EventPublisherTest"]}"#,
     );
-    assert_eq!(0, bare["sources"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(1, bare["sources"].as_array().unwrap().len(), "{bare}");
     assert_eq!(0, bare["not_found"].as_array().unwrap().len(), "{bare}");
-    assert_eq!(1, bare["ambiguous"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(0, bare["ambiguous"].as_array().unwrap().len(), "{bare}");
     assert_eq!(
-        "EventPublisherTest", bare["ambiguous"][0]["target"],
+        "org.example.EventPublisherTest", bare["sources"][0]["label"],
         "{bare}"
     );
-    assert_eq!(
-        vec![
-            "org.example.EventPublisherTest".to_string(),
-            "org.example.EventPublisherTest.EventPublisherTest".to_string(),
-        ],
-        string_array(&bare["ambiguous"][0]["matches"]),
-        "{bare}"
-    );
-
-    let exact = call_tool(
-        &project,
-        "get_symbol_sources",
-        r#"{"symbols":["org.example.EventPublisherTest.EventPublisherTest"]}"#,
-    );
-
-    assert_eq!(0, exact["not_found"].as_array().unwrap().len(), "{exact}");
-    assert_eq!(0, exact["ambiguous"].as_array().unwrap().len(), "{exact}");
-    assert_eq!(1, exact["sources"].as_array().unwrap().len(), "{exact}");
-    assert_eq!(
-        "org.example.EventPublisherTest", exact["sources"][0]["label"],
-        "{exact}"
-    );
-    assert_eq!(
-        "synthetic Java default constructor; showing declaring class source",
-        exact["sources"][0]["note"],
-        "{exact}"
-    );
+    assert!(bare["sources"][0]["note"].is_null(), "{bare}");
     assert!(
-        exact["sources"][0]["text"]
+        bare["sources"][0]["text"]
             .as_str()
             .unwrap()
             .contains("class EventPublisherTest {}"),
-        "{exact}"
+        "{bare}"
     );
+}
+
+#[test]
+fn java_package_module_round_trips_through_search_source_and_location_tools() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/org/example/Thing.java",
+            "package org.example;\nclass Thing {}\n",
+        )
+        .build();
+
+    let source = assert_symbol_source_contains(
+        &project,
+        "org.example",
+        "Module/object lookup returns defining files",
+    );
+    assert_eq!("file_listing", source["sources"][0]["presentation"]);
+
+    let locations = call_tool(
+        &project,
+        "get_symbol_locations",
+        r#"{"symbols":["org.example"]}"#,
+    );
+    assert_eq!(0, locations["not_found"].as_array().unwrap().len());
+    assert_eq!(1, locations["locations"].as_array().unwrap().len());
+    assert_eq!("org.example", locations["locations"][0]["symbol"]);
+    assert_eq!(1, locations["locations"][0]["start_line"]);
+}
+
+#[test]
+fn scala_primary_constructor_symbol_round_trips_to_class_source() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/main/scala/app/Service.scala",
+            "package app\n\nclass Service(name: String)\n",
+        )
+        .build();
+
+    let search = call_tool(
+        &project,
+        "search_symbols",
+        r#"{"patterns":["Service"],"include_tests":true,"limit":5}"#,
+    );
+    assert!(
+        searched_function_symbols(&search)
+            .iter()
+            .any(|symbol| symbol == "app.Service.Service"),
+        "{search}"
+    );
+    assert_symbol_source_contains(
+        &project,
+        "app.Service.Service",
+        "class Service(name: String)",
+    );
+}
+
+#[test]
+fn cpp_constructor_declaration_symbol_round_trips_to_its_source() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/service.h",
+            "class Service {\npublic:\n    Service() = default;\n};\n",
+        )
+        .build();
+
+    let search = call_tool(
+        &project,
+        "search_symbols",
+        r#"{"patterns":["Service"],"include_tests":true,"limit":5}"#,
+    );
+    assert!(
+        searched_function_symbols(&search)
+            .iter()
+            .any(|symbol| symbol == "Service.Service"),
+        "{search}"
+    );
+    assert_symbol_source_contains(&project, "Service.Service", "Service() = default;");
+}
+
+#[test]
+fn explicit_only_language_constructors_round_trip_without_implicit_symbols() {
+    let cases = [
+        (
+            InlineTestProject::with_language(Language::CSharp)
+                .file(
+                    "Service.cs",
+                    "namespace App { class Service { public Service() {} } class Plain {} }\n",
+                )
+                .build(),
+            "App.Service.Service",
+            "public Service() {}",
+            "App.Plain.Plain",
+        ),
+        (
+            InlineTestProject::with_language(Language::Python)
+                .file(
+                    "service.py",
+                    "class Service:\n    def __init__(self):\n        pass\n\nclass Plain:\n    pass\n",
+                )
+                .build(),
+            "service.Service.__init__",
+            "def __init__(self):",
+            "service.Plain.__init__",
+        ),
+        (
+            InlineTestProject::with_language(Language::JavaScript)
+                .file(
+                    "service.js",
+                    "class Service { constructor() {} }\nclass Plain {}\n",
+                )
+                .build(),
+            "Service.constructor",
+            "constructor() {}",
+            "Plain.constructor",
+        ),
+        (
+            InlineTestProject::with_language(Language::TypeScript)
+                .file(
+                    "service.ts",
+                    "class Service { constructor() {} }\nclass Plain {}\n",
+                )
+                .build(),
+            "Service.constructor",
+            "constructor() {}",
+            "Plain.constructor",
+        ),
+        (
+            InlineTestProject::with_language(Language::Php)
+                .file(
+                    "Service.php",
+                    "<?php\nnamespace App;\nclass Service { public function __construct() {} }\nclass Plain {}\n",
+                )
+                .build(),
+            "App.Service.__construct",
+            "public function __construct() {}",
+            "App.Plain.__construct",
+        ),
+        (
+            InlineTestProject::with_language(Language::Ruby)
+                .file(
+                    "service.rb",
+                    "class Service\n  def initialize\n  end\nend\n\nclass Plain\nend\n",
+                )
+                .build(),
+            "Service.initialize",
+            "def initialize",
+            "Plain.initialize",
+        ),
+    ];
+
+    for (project, explicit_selector, source, implicit_selector) in cases {
+        assert_symbol_source_contains(&project, explicit_selector, source);
+
+        let search = call_tool(
+            &project,
+            "search_symbols",
+            r#"{"patterns":["Plain"],"include_tests":true,"limit":5}"#,
+        );
+        assert!(
+            !searched_function_symbols(&search)
+                .iter()
+                .any(|symbol| symbol == implicit_selector),
+            "{search}"
+        );
+    }
+}
+
+#[test]
+fn source_less_synthetic_go_replica_is_not_advertised_by_symbol_search() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "settings.go",
+            r#"package main
+
+type prefs struct {
+    Config, OldConfig struct {
+        NodeID string
+    }
+}
+"#,
+        )
+        .build();
+
+    let search = call_tool(
+        &project,
+        "search_symbols",
+        r#"{"patterns":["NodeID"],"include_tests":true,"limit":5}"#,
+    );
+    let fields: Vec<_> = search["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|file| file["fields"].as_array().unwrap())
+        .map(|field| field["symbol"].as_str().unwrap())
+        .collect();
+    assert!(fields.contains(&"main.prefs.Config.NodeID"), "{search}");
+    assert!(!fields.contains(&"main.prefs.OldConfig.NodeID"), "{search}");
+    assert_symbol_source_contains(&project, "main.prefs.Config.NodeID", "NodeID");
 }
 
 #[test]
@@ -681,10 +921,10 @@ fn explicit_java_constructor_selector_returns_constructor_source() {
         )
         .build();
 
-    let exact = call_tool(
+    let exact = assert_symbol_source_contains(
         &project,
-        "get_symbol_sources",
-        r#"{"symbols":["org.example.EventPublisherTest.EventPublisherTest"]}"#,
+        "org.example.EventPublisherTest.EventPublisherTest",
+        "EventPublisherTest() {}",
     );
 
     assert_eq!(0, exact["not_found"].as_array().unwrap().len(), "{exact}");

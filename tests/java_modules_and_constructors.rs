@@ -27,6 +27,7 @@ fn creates_package_module_with_top_level_children() {
 
     let module = analyzer.get_definitions("p1").into_iter().next().unwrap();
     assert!(module.is_module());
+    assert_eq!(1, analyzer.ranges(&module).len());
 
     let children: Vec<_> = analyzer
         .get_direct_children(&module)
@@ -95,7 +96,7 @@ fn file_scope_encloses_imports_without_stealing_class_references() {
 }
 
 #[test]
-fn synthesizes_implicit_constructor_for_plain_class_only() {
+fn classes_without_explicit_constructors_do_not_synthesize_constructor_units() {
     let analyzer = analyzer_for(&[
         ("Foo.java", "public class Foo {}"),
         ("I.java", "public interface I {}"),
@@ -104,19 +105,7 @@ fn synthesizes_implicit_constructor_for_plain_class_only() {
         ("A.java", "public @interface A {}"),
     ]);
 
-    let foo_ctors = analyzer.get_definitions("Foo.Foo");
-    assert!(
-        foo_ctors
-            .iter()
-            .any(|code_unit| code_unit.kind() == CodeUnitType::Function)
-    );
-    let foo_ctor = foo_ctors
-        .into_iter()
-        .find(|code_unit| code_unit.kind() == CodeUnitType::Function)
-        .unwrap();
-    assert!(foo_ctor.is_synthetic());
-    assert!(analyzer.get_source(&foo_ctor, true).is_none());
-
+    assert!(analyzer.get_definitions("Foo.Foo").is_empty());
     assert!(analyzer.get_definitions("I.I").is_empty());
     assert!(analyzer.get_definitions("E.E").is_empty());
     assert!(analyzer.get_definitions("R.R").is_empty());
@@ -124,7 +113,7 @@ fn synthesizes_implicit_constructor_for_plain_class_only() {
 }
 
 #[test]
-fn explicit_constructor_prevents_implicit_synthesis() {
+fn explicit_constructor_is_source_backed() {
     let analyzer = analyzer_for(&[("Bar.java", "public class Bar { public Bar(int x) {} }")]);
     let ctors = analyzer.get_definitions("Bar.Bar");
     assert_eq!(1, ctors.len());

@@ -263,6 +263,7 @@ fn java_graph_strategy_finds_method_constructor_field_and_type_usages() {
 package com.example;
 
 public class Target {
+    public Target() {}
     public String field;
     public void run() {}
 }

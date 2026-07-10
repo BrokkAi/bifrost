@@ -108,18 +108,24 @@ impl LanguageAdapter for JavaAdapter {
         let module_code_unit =
             (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
 
-        if let Some(module) = &module_code_unit {
-            parsed.top_level_declarations.push(module.clone());
-            parsed.declarations.insert(module.clone());
-            parsed.add_signature(module.clone(), format!("package {};", package_name));
-        }
-
         for index in 0..root.named_child_count() {
             let Some(child) = root.named_child(index) else {
                 continue;
             };
 
             match child.kind() {
+                "package_declaration" => {
+                    if let Some(module) = &module_code_unit {
+                        parsed.add_code_unit(
+                            module.clone(),
+                            child,
+                            source,
+                            None,
+                            Some(module.clone()),
+                        );
+                        parsed.add_signature(module.clone(), format!("package {};", package_name));
+                    }
+                }
                 "import_declaration" => {
                     let raw = node_text(child, source).trim().to_string();
                     parsed.import_statements.push(raw.clone());
