@@ -17,7 +17,7 @@ Language pages will be added and marked with their last successful end-to-end ve
 - [TypeScript](./typescript/)
 - [Go](./go/)
 - [C and C++ through the `cpp` adapter](./cpp/)
-- Rust (planned)
+- [Rust](./rust/)
 - PHP (planned)
 - Scala (planned)
 - C# (planned)
