@@ -594,6 +594,85 @@ fn query_code_tool_returns_structural_matches() {
 }
 
 #[test]
+fn query_file_runs_rql_from_the_current_workspace() {
+    let root = TempDir::new().expect("workspace");
+    fs::write(root.path().join("app.py"), "class App:\n    pass\n").expect("source file");
+    let queries = root.path().join("queries");
+    fs::create_dir(&queries).expect("query directory");
+    fs::write(queries.join("app.rql"), "(class :name \"App\")\n").expect("RQL query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .current_dir(root.path())
+        .arg("--query-file")
+        .arg("queries/app.rql")
+        .output()
+        .expect("run bifrost --query-file");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("query-file JSON output");
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        payload["structuredContent"]["matches"][0]["kind"], "class",
+        "{payload}"
+    );
+}
+
+#[test]
+fn query_file_runs_json_with_an_explicit_root() {
+    let root = TempDir::new().expect("workspace");
+    fs::write(root.path().join("app.py"), "class App:\n    pass\n").expect("source file");
+    let queries = root.path().join("queries");
+    fs::create_dir(&queries).expect("query directory");
+    fs::write(
+        queries.join("app.json"),
+        r#"{"match":{"kind":"class","name":"App"}}"#,
+    )
+    .expect("JSON query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root.path())
+        .arg("--query-file")
+        .arg("queries/app.json")
+        .output()
+        .expect("run bifrost --root --query-file");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("query-file JSON output");
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        payload["structuredContent"]["matches"][0]["path"], "app.py",
+        "{payload}"
+    );
+}
+
+#[test]
+fn query_file_rejects_tool_mode_flags() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--query-file")
+        .arg("query.rql")
+        .arg("--tool")
+        .arg("query_code")
+        .output()
+        .expect("run incompatible bifrost flags");
+
+    assert!(!output.status.success(), "status should fail");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("--query-file cannot be combined with --tool"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn tool_cannot_be_combined_with_mcp() {
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
@@ -646,6 +725,7 @@ fn help_mentions_tool_mode() {
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("--tool NAME"), "{stdout}");
+    assert!(stdout.contains("--query-file PATH"), "{stdout}");
     assert!(stdout.contains("--args"), "{stdout}");
     assert!(stdout.contains("--sources PATH"), "{stdout}");
     assert!(!stdout.contains("search_ast"), "{stdout}");

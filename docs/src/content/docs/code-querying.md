@@ -235,6 +235,17 @@ end
 
 The examples below use one-shot CLI mode. They were validated against a toy workspace containing the small per-language shapes shown above, with one file for each supported language. The [JSON reference](/code-query-json/) contains the complete, test-parsed input examples.
 
+### Saved Queries
+
+For a reusable query, save the complete RQL or canonical JSON query under the workspace and run it directly:
+
+```bash
+bifrost --query-file queries/audit.rql
+bifrost --root ./code-query-toy --query-file queries/audit.json
+```
+
+The current directory is the default workspace root. Query files must stay within that workspace after symlinks resolve. `--query-file` selects the complete query and does not merge command-line filters or inline JSON.
+
 Find calls to `audit` across every structural adapter:
 
 ```bash

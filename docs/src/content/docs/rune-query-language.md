@@ -17,6 +17,12 @@ RQL is only a query language. It is not a second matcher or query engine.
 
 Every RQL expression lowers into [JSON `CodeQuery`](/code-query-json/) before validation and execution. MCP hosts call the same engine through the `query_code` tool, using JSON `CodeQuery` directly. See [Code Querying](/code-querying/) for the schema and engine overview.
 
+Save a complete RQL expression in a workspace `.rql` file and run it without opening the REPL:
+
+```bash
+bifrost --query-file queries/audit.rql
+```
+
 For source-first examples across every structural adapter, see the [language tutorials](/code-query-tutorials/). Each page pairs executable RQL with its canonical JSON form and exact results.
 
 Use `:json` in the REPL to inspect the canonical JSON generated for the current RQL query.

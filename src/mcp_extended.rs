@@ -93,9 +93,33 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "default": SCHEMA_VERSION,
                         "enum": [SCHEMA_VERSION],
                         "description": "Optional query schema version. Omit for v1; non-v1 versions are rejected so callers do not accidentally rely on an incompatible query shape."
+                    },
+                    "query_file": {
+                        "type": "string",
+                        "description": "Workspace-relative query file. Use .rql for an RQL S-expression or .json for a complete canonical CodeQuery. Exclusive with inline query fields."
                     }
                 },
-                "required": ["match"]
+                "oneOf": [
+                    {
+                        "required": ["match"],
+                        "not": { "required": ["query_file"] }
+                    },
+                    {
+                        "required": ["query_file"],
+                        "not": {
+                            "anyOf": [
+                                { "required": ["where"] },
+                                { "required": ["languages"] },
+                                { "required": ["match"] },
+                                { "required": ["inside"] },
+                                { "required": ["not_inside"] },
+                                { "required": ["limit"] },
+                                { "required": ["result_detail"] },
+                                { "required": ["schema_version"] }
+                            ]
+                        }
+                    }
+                ]
             }),
         ),
         tool_descriptor(

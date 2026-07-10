@@ -13,6 +13,17 @@ bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyCl
 
 `--args` is inline JSON matching the selected tool's MCP argument object. Omit it for tools that accept an empty object, such as `get_active_workspace`.
 
+## Saved Code Queries
+
+Run a complete RQL or JSON `query_code` query from a workspace file without the generic tool wrapper:
+
+```bash
+bifrost --query-file queries/audit.rql
+bifrost --root /path/to/project --query-file queries/audit.json
+```
+
+`--query-file` accepts `.rql` and `.json` files only. The default workspace root is the current directory; query-file paths must stay inside that workspace, including after symlinks are resolved. The file contains the complete query, so it cannot be combined with `--tool`, `--args`, or `--sources`.
+
 For the available tool families and tool names, see [MCP Server](../mcp/). For a single tool's description and parameters, ask the CLI directly:
 
 ```bash
