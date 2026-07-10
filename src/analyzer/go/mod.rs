@@ -319,33 +319,68 @@ impl IAnalyzer for GoAnalyzer {
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         let skeleton = self.inner.get_skeleton(code_unit)?;
-        if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
-            Some(format!("type {skeleton}"))
-        } else {
-            Some(skeleton)
-        }
+        Some(self.render_source_fragment(code_unit, skeleton, 0))
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
         let skeleton = self.inner.get_skeleton_header(code_unit)?;
-        if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
-            Some(format!("type {skeleton}"))
-        } else {
-            Some(skeleton)
-        }
+        Some(self.render_source_fragment(code_unit, skeleton, 0))
     }
 
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        let source = self.inner.get_source(code_unit, include_comments)?;
-        if code_unit.is_class() && !source.trim_start().starts_with("type ") {
-            Some(format!("type {source}"))
-        } else {
-            Some(source)
+        let sources = self.get_sources(code_unit, include_comments);
+        (!sources.is_empty()).then(|| sources.into_iter().collect::<Vec<_>>().join("\n\n"))
+    }
+
+    fn render_source_fragment(
+        &self,
+        code_unit: &CodeUnit,
+        mut source: String,
+        declaration_start: usize,
+    ) -> String {
+        let Some(declaration) = source.get(declaration_start..) else {
+            return source;
+        };
+        let declaration_has_type_keyword = declaration.trim_start().starts_with("type ")
+            || source
+                .get(..declaration_start)
+                .is_some_and(|prefix| prefix.trim_end().ends_with("type"));
+        if code_unit.is_class() && !declaration_has_type_keyword {
+            source.insert_str(declaration_start, "type ");
         }
+        source
     }
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.inner.get_sources(code_unit, include_comments)
+        if !code_unit.is_class() {
+            return self.inner.get_sources(code_unit, include_comments);
+        }
+
+        let Some(content) = self.inner.indexed_source(code_unit.source()) else {
+            return BTreeSet::new();
+        };
+        let mut ranges = self.inner.ranges(code_unit);
+        ranges.sort_by_key(|range| range.start_byte);
+
+        ranges
+            .into_iter()
+            .filter_map(|range| {
+                let start_byte = if include_comments {
+                    crate::analyzer::tree_sitter_analyzer::expanded_comment_start(
+                        content,
+                        range.start_byte,
+                    )
+                } else {
+                    range.start_byte
+                };
+                let source = content.get(start_byte..range.end_byte)?.to_string();
+                Some(self.render_source_fragment(
+                    code_unit,
+                    source,
+                    range.start_byte.saturating_sub(start_byte),
+                ))
+            })
+            .collect()
     }
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {

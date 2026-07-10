@@ -6398,6 +6398,11 @@ fn source_blocks_for_code_unit(
             if text.is_empty() {
                 return None;
             }
+            let text = analyzer.render_source_fragment(
+                code_unit,
+                text,
+                range.start_byte.saturating_sub(start_byte),
+            );
             let start_line = line_number_at_offset(content, start_byte);
             Some(SourceBlock {
                 label: display_symbol_for_target(code_unit),

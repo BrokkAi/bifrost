@@ -21,13 +21,13 @@ fn canonical_project() -> common::BuiltInlineTestProject {
         .file("b/list/list.go", "package list\nfunc Run() string { return \"b\" }\n")
         .file(
             "a/srv/server.go",
-            "package srv\ntype Server struct{}\nfunc (s *Server) New() string { return \"method\" }\n",
+            "package srv\n// Server serves requests.\ntype Server struct{}\nfunc (s *Server) New() string { return \"method\" }\n",
         )
         .file("Server/pkg.go", "package Server\nfunc New() string { return \"package\" }\n")
         .file("gin/gin.go", "package gin\ntype Engine struct{}\nfunc New() *Engine { return &Engine{} }\n")
         .file(
             "cache/cache.go",
-            "package cache\n\ntype ChainCache[T any] struct{}\nfunc (c *ChainCache[T]) Set(value T) {}\n\ntype LoadableCache struct{}\nfunc (c *LoadableCache) Get() string { return \"value\" }\n\ntype Pair[A, B any] struct{}\nfunc (p *Pair[A, B]) Swap() {}\n",
+            "package cache\n\ntype ChainCache[T any] struct{}\nfunc (c *ChainCache[T]) Set(value T) {}\n\ntype LoadableCache struct{}\nfunc (c *LoadableCache) Get() string { return \"value\" }\n\n// Reader reads bytes.\ntype Reader interface { Read() error }\n\ntype Pair[A, B any] struct{}\nfunc (p *Pair[A, B]) Swap() {}\n",
         )
         .file(
             "a/list/list_test.go",
@@ -161,6 +161,54 @@ fn get_symbol_sources_normalizes_go_receiver_selectors() {
         assert!(result.ambiguous.is_empty(), "{symbol}: {result:#?}");
         assert_eq!(1, result.sources.len(), "{symbol}: {result:#?}");
         assert_eq!("cache/cache.go", result.sources[0].path, "{symbol}");
+    }
+}
+
+#[test]
+fn get_symbol_sources_renders_complete_go_type_declarations() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    for (symbol, expected_text, expected_start_line) in [
+        (
+            "example.com/repo/a/srv.Server",
+            "// Server serves requests.\ntype Server struct{}",
+            2,
+        ),
+        (
+            "example.com/repo/cache.Reader",
+            "// Reader reads bytes.\ntype Reader interface { Read() error }",
+            9,
+        ),
+    ] {
+        let result = get_symbol_sources(
+            &analyzer,
+            SymbolLookupParams {
+                symbols: vec![symbol.to_string()],
+            },
+        );
+
+        assert!(result.not_found.is_empty(), "{symbol}: {result:#?}");
+        assert!(result.ambiguous.is_empty(), "{symbol}: {result:#?}");
+        assert_eq!(1, result.sources.len(), "{symbol}: {result:#?}");
+        assert_eq!(
+            expected_start_line, result.sources[0].start_line,
+            "{symbol}"
+        );
+        assert_eq!(expected_text, result.sources[0].text, "{symbol}");
+
+        let code_unit = analyzer
+            .get_definitions(symbol)
+            .into_iter()
+            .next()
+            .expect("test symbol should resolve");
+        assert_eq!(
+            expected_text,
+            analyzer
+                .get_source(&code_unit, true)
+                .expect("source should render"),
+            "{symbol}"
+        );
     }
 }
 
