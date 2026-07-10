@@ -15,7 +15,7 @@ Bifrost currently asks editors to resend an entire open document after every key
 - [x] (2026-07-10 07:00Z) Implemented the private transactional text-change applicator and nine focused unit tests.
 - [x] (2026-07-10 07:09Z) Integrated document versions and incremental changes into the LSP server while preserving downstream refresh behavior.
 - [x] (2026-07-10 07:09Z) Updated capability advertisement, integration coverage, and public LSP documentation.
-- [ ] Run formatting, focused and full tests, no-CUDA clippy, and a final diff review.
+- [x] (2026-07-10 07:25Z) Ran formatting, focused and full tests, doctests, no-CUDA clippy, and a final diff review; added a transactional rollback regression found during review.
 
 ## Surprises & Discoveries
 
@@ -30,6 +30,9 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 - Observation: open-document state already survives workspace-root removal, so incremental edits received while a root is absent can be retained without analyzer work and replayed when the root returns.
   Evidence: the extended `bifrost_lsp_server_replays_open_document_after_workspace_folder_readd` test passes after editing the tracked document between root removal and re-addition.
+
+- Observation: the sandbox blocks the existing uv cache used by the voyage-sidecar lifecycle test, and this machine places Homebrew `rustdoc` and `clippy-driver` before the Rustup tools even though both report Rust 1.96.
+  Evidence: the sandboxed full suite failed only when uv could not open `~/.cache/uv`; the host rerun passed every test binary. Doctests and clippy initially reported incompatible compiler metadata until run with `/Users/dave/.cargo/bin` tools and an isolated clippy target directory.
 
 ## Decision Log
 
@@ -55,7 +58,7 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 ## Outcomes & Retrospective
 
-The implementation milestones are complete. The server advertises incremental sync, preserves whole-document changes, validates versions, applies ordered UTF-16 edits, retains out-of-root open documents, and rejects unsafe notifications without side effects. The 160-test LSP integration target passed before the final workspace-replay extension, whose focused test also passes. Full repository validation remains.
+Issue #575 is implemented and validated. The server advertises incremental sync, preserves whole-document changes, validates versions, applies ordered UTF-16 edits, retains out-of-root open documents, and rejects unsafe notifications without side effects. Ten pure text-sync tests pass, the 160-test LSP target passes, every full-suite unit and integration test binary passes, doctests pass with the matching Rustup `rustdoc`, formatting is clean, and the isolated no-CUDA all-target clippy run passes. No known work remains.
 
 ## Context and Orientation
 
@@ -112,6 +115,28 @@ The pure applicator mutates only an owned temporary string, so validation failur
 
 Pre-change focused tests passed for initialize capability shape, whole-document overlay/completion refresh, malformed ranged-change rejection, and UTF-16 conversions. The synchronized starting commit is `3b4d108105a8c35235d4a78e1385096111cd4d0c`.
 
+Final validation evidence:
+
+    cargo test lsp::text_sync::tests --lib
+    # 10 passed
+
+    cargo test --features nlp --test bifrost_lsp_server
+    # 160 passed
+
+    cargo test --features nlp
+    # every unit and integration test binary passed; the final doctest process
+    # required the matching Rustup rustdoc below because PATH selected Homebrew
+
+    RUSTDOC=/Users/dave/.cargo/bin/rustdoc cargo test --features nlp --doc
+    # passed
+
+    cargo fmt --check
+    # passed
+
+    PATH=/Users/dave/.cargo/bin:/Users/dave/.local/bin:/opt/homebrew/bin:/usr/bin:/bin \
+      CARGO_TARGET_DIR=/private/tmp/bifrost-clippy-575 cargo clippy-no-cuda
+    # passed
+
 ## Interfaces and Dependencies
 
 The only public interface change is the LSP initialize response: `textDocumentSync.change` changes from `FULL` (`1`) to `INCREMENTAL` (`2`). No public Rust API or new dependency is needed.
@@ -128,3 +153,5 @@ The private module must expose to its parent only:
 Plan revision note (2026-07-10 07:00Z): Marked the pure text-sync milestone complete and recorded the no-new-dependency result because its focused tests now pass.
 
 Plan revision note (2026-07-10 07:09Z): Marked server, capability, docs, and integration work complete after the focused cases and the full LSP integration target passed.
+
+Plan revision note (2026-07-10 07:25Z): Closed the plan after full validation and recorded the host toolchain-path workaround so later runs can reproduce the green doctest and clippy results.

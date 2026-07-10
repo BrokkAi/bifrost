@@ -255,6 +255,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_entire_batch_when_a_later_change_is_invalid() {
+        let current = "abc".to_owned();
+        let changes = [
+            ranged(position(0, 1), position(0, 1), "X"),
+            ranged(position(9, 0), position(9, 0), "invalid"),
+        ];
+
+        assert!(apply_content_changes(&current, &changes).is_err());
+        assert_eq!(
+            current, "abc",
+            "a later failure must not expose earlier intermediate edits"
+        );
+    }
+
+    #[test]
     fn rejects_reversed_ranges_after_character_clamping() {
         let changes = [ranged(position(0, 99), position(0, 1), "X")];
 
