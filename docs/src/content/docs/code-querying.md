@@ -47,6 +47,8 @@ JSON is not a separate query language. It is the stable serialization of the `Co
 
 See [JSON CodeQuery](/code-query-json/) for the complete schema, validation rules, result model, and copy-paste examples. See [Rune Query Language](/rune-query-language/) for interactive authoring and canonical JSON inspection.
 
+For source-first walkthroughs, see the [per-language `query_code` tutorials](/code-query-tutorials/). Their fixtures, RQL and JSON forms, and exact results are exercised against the real structural adapters.
+
 ## Adapter Mapping Notes
 
 These notes describe how the current tree-sitter adapters feed the normalized `query_code` model. They are not query syntax. Query against normalized kinds and roles such as `call`, `assignment`, `callee`, and `right`; tree-sitter node names stay behind the adapter boundary.

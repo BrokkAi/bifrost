@@ -7,6 +7,18 @@ const DOCS: &[&str] = &[
     "docs/src/content/docs/code-querying.md",
     "docs/src/content/docs/code-query-json.md",
     "docs/src/content/docs/rune-query-language.md",
+    "docs/src/content/docs/code-query-tutorials/index.md",
+    "docs/src/content/docs/code-query-tutorials/python.md",
+    "docs/src/content/docs/code-query-tutorials/java.md",
+    "docs/src/content/docs/code-query-tutorials/javascript.md",
+    "docs/src/content/docs/code-query-tutorials/typescript.md",
+    "docs/src/content/docs/code-query-tutorials/go.md",
+    "docs/src/content/docs/code-query-tutorials/cpp.md",
+    "docs/src/content/docs/code-query-tutorials/rust.md",
+    "docs/src/content/docs/code-query-tutorials/php.md",
+    "docs/src/content/docs/code-query-tutorials/scala.md",
+    "docs/src/content/docs/code-query-tutorials/csharp.md",
+    "docs/src/content/docs/code-query-tutorials/ruby.md",
 ];
 
 const PUBLIC_QUERY_SURFACES: &[&str] = &[
