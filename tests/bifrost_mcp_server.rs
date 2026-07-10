@@ -6,6 +6,15 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
+fn assert_same_canonical_path(actual: &str, expected: &std::path::Path) {
+    assert_eq!(
+        std::path::Path::new(actual)
+            .canonicalize()
+            .expect("canonicalize actual path"),
+        expected.canonicalize().expect("canonicalize expected path")
+    );
+}
+
 #[test]
 fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let fixture_root = TempDir::new().expect("temp dir");
@@ -685,14 +694,11 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
             }
         }),
     );
-    assert_eq!(
-        active_workspace["result"]["structuredContent"]["workspace_path"],
-        fixture_root
-            .path()
-            .canonicalize()
-            .expect("canonicalize fixture")
-            .display()
-            .to_string()
+    assert_same_canonical_path(
+        active_workspace["result"]["structuredContent"]["workspace_path"]
+            .as_str()
+            .expect("workspace path"),
+        fixture_root.path(),
     );
 
     let list_symbols = round_trip(
@@ -1188,8 +1194,7 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
     let initial_path = initial_active["result"]["structuredContent"]["workspace_path"]
         .as_str()
         .expect("initial workspace path");
-    let expected_initial = initial_root.canonicalize().expect("canon initial");
-    assert_eq!(initial_path, expected_initial.display().to_string());
+    assert_same_canonical_path(initial_path, &initial_root);
 
     let activate = round_trip(
         &mut stdin,
@@ -1205,9 +1210,11 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
             }
         }),
     );
-    assert_eq!(
-        activate["result"]["structuredContent"]["workspace_path"],
-        switched_root.display().to_string()
+    assert_same_canonical_path(
+        activate["result"]["structuredContent"]["workspace_path"]
+            .as_str()
+            .expect("workspace path"),
+        &switched_root,
     );
 
     let after_switch = round_trip(
