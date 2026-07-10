@@ -10,6 +10,7 @@
 mod capabilities;
 pub mod conversion;
 pub(crate) mod handlers;
+mod progress;
 mod request_context;
 mod server;
 mod text_sync;

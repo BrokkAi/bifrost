@@ -1,12 +1,12 @@
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionOptions, DiagnosticOptions,
     DiagnosticServerCapabilities, DocumentFormattingOptions, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability, OneOf, RenameOptions,
-    ReferencesOptions,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
-    ServerCapabilities, SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TokenFormat,
-    TypeDefinitionProviderCapability, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
+    HoverProviderCapability, ImplementationProviderCapability, OneOf, ReferencesOptions,
+    RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelpOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TokenFormat, TypeDefinitionProviderCapability,
+    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
 };
 
 use crate::lsp::handlers::semantic_tokens;

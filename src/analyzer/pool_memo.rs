@@ -47,6 +47,29 @@ impl<T> PoolSafeMemo<T> {
         built
     }
 
+    pub(crate) fn get_or_try_build<E>(
+        &self,
+        build_parallel: impl FnOnce() -> Result<T, E>,
+        build_serial: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Arc<T>, E> {
+        if let Some(value) = self.get() {
+            return Ok(value);
+        }
+
+        let built = Arc::new(if rayon::current_thread_index().is_some() {
+            build_serial()?
+        } else {
+            build_parallel()?
+        });
+
+        let mut slot = self.slot.lock().expect("pool memo poisoned");
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        *slot = Some(Arc::clone(&built));
+        Ok(built)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn invalidate(&self) {
         *self.slot.lock().expect("pool memo poisoned") = None;
@@ -134,6 +157,16 @@ mod tests {
         assert_eq!(*value, "serial");
         assert_eq!(parallel_calls.load(Ordering::SeqCst), 1);
         assert_eq!(serial_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_build_is_not_published() {
+        let memo = PoolSafeMemo::<usize>::new();
+
+        let result = memo.get_or_try_build(|| Err("cancelled"), || Err("cancelled"));
+
+        assert_eq!(result.unwrap_err(), "cancelled");
+        assert!(memo.get().is_none());
     }
 
     #[test]

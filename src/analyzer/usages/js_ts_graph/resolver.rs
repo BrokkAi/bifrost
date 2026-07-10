@@ -10,6 +10,7 @@ use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
     AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
@@ -40,19 +41,40 @@ pub(crate) fn build_jsts_usage_index(
     language: Language,
     parallel: bool,
 ) -> JsTsUsageIndex {
+    build_jsts_usage_index_with_cancellation(analyzer, language, parallel, None).unwrap_or_default()
+}
+
+pub(crate) fn build_jsts_usage_index_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    parallel: bool,
+    cancellation: Option<&CancellationToken>,
+) -> Option<JsTsUsageIndex> {
     let files = collect_jsts_files(analyzer, language);
     if tree_sitter_language_for(language).is_none() {
-        return JsTsUsageIndex::default();
+        return Some(JsTsUsageIndex::default());
     }
 
     let compute_file = |file: &ProjectFile| {
+        if is_cancelled(cancellation) {
+            return None;
+        }
         let source = file.read_to_string().ok()?;
+        if is_cancelled(cancellation) {
+            return None;
+        }
         let mut parser = Parser::new();
         let file_language = js_ts_tree_sitter_language_for_file(file, language)?;
         parser.set_language(&file_language).ok()?;
         let tree = parser.parse(source.as_str(), None)?;
+        if is_cancelled(cancellation) {
+            return None;
+        }
         let exports = compute_export_index(&source, &tree);
         let binder = compute_import_binder(&source, &tree);
+        if is_cancelled(cancellation) {
+            return None;
+        }
         // `tree`/`source` drop here — only the per-file indices outlive the parse.
         Some((file.clone(), exports, binder))
     };
@@ -61,10 +83,16 @@ pub(crate) fn build_jsts_usage_index(
     } else {
         files.iter().filter_map(compute_file).collect()
     };
+    if is_cancelled(cancellation) {
+        return None;
+    }
 
     let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = map_with_capacity(per_file.len());
     let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = map_with_capacity(per_file.len());
     for (file, exports, binder) in per_file {
+        if is_cancelled(cancellation) {
+            return None;
+        }
         exports_by_file.insert(file.clone(), exports);
         binders_by_file.insert(file, binder);
     }
@@ -74,7 +102,7 @@ pub(crate) fn build_jsts_usage_index(
         resolve_js_ts_module_specifier(file, module_specifier, language, Some(&aliases))
     };
     let (reexport_edges, direct_reexport_edges, star_reexports, direct_star_reexports) =
-        build_reexport_edges(&exports_by_file, &binders_by_file, &resolve);
+        build_reexport_edges(&exports_by_file, &binders_by_file, &resolve, cancellation)?;
     let importer_reverse = build_importer_reverse(
         &files,
         &binders_by_file,
@@ -82,9 +110,10 @@ pub(crate) fn build_jsts_usage_index(
         &direct_reexport_edges,
         &direct_star_reexports,
         &resolve,
-    );
+        cancellation,
+    )?;
 
-    JsTsUsageIndex {
+    Some(JsTsUsageIndex {
         exports_by_file,
         reexport_edges,
         direct_reexport_edges,
@@ -92,7 +121,11 @@ pub(crate) fn build_jsts_usage_index(
         direct_star_reexports,
         importer_reverse,
         binders_by_file,
-    }
+    })
+}
+
+fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
+    cancellation.is_some_and(CancellationToken::is_cancelled)
 }
 
 impl JsTsUsageIndex {
@@ -219,12 +252,13 @@ fn build_reexport_edges(
     exports_by_file: &HashMap<ProjectFile, ExportIndex>,
     binders_by_file: &HashMap<ProjectFile, ImportBinder>,
     resolve: &impl Fn(&ProjectFile, &str) -> Vec<ProjectFile>,
-) -> (
+    cancellation: Option<&CancellationToken>,
+) -> Option<(
     HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     HashMap<ProjectFile, Vec<ProjectFile>>,
     HashMap<ProjectFile, Vec<ProjectFile>>,
-) {
+)> {
     let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
         HashMap::default();
     let mut direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
@@ -232,7 +266,13 @@ fn build_reexport_edges(
     let mut star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
     let mut direct_star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
     for (file, exports) in exports_by_file {
+        if is_cancelled(cancellation) {
+            return None;
+        }
         for (exported_name, entry) in &exports.exports_by_name {
+            if is_cancelled(cancellation) {
+                return None;
+            }
             match entry {
                 ExportEntry::Local { local_name } => {
                     let Some(binder) = binders_by_file.get(file) else {
@@ -313,6 +353,9 @@ fn build_reexport_edges(
             }
         }
         for star in &exports.reexport_stars {
+            if is_cancelled(cancellation) {
+                return None;
+            }
             for resolved_file in resolve(file, &star.module_specifier) {
                 direct_star_reexports
                     .entry(file.clone())
@@ -325,12 +368,12 @@ fn build_reexport_edges(
             }
         }
     }
-    (
+    Some((
         reexport_edges,
         direct_reexport_edges,
         star_reexports,
         direct_star_reexports,
-    )
+    ))
 }
 
 fn imported_member_reexport_target<'a>(
@@ -354,13 +397,20 @@ fn build_importer_reverse(
     direct_reexport_edges: &HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     direct_star_reexports: &HashMap<ProjectFile, Vec<ProjectFile>>,
     resolve: &impl Fn(&ProjectFile, &str) -> Vec<ProjectFile>,
-) -> HashMap<ProjectFile, Vec<ImportEdge>> {
+    cancellation: Option<&CancellationToken>,
+) -> Option<HashMap<ProjectFile, Vec<ImportEdge>>> {
     let mut reverse: HashMap<ProjectFile, Vec<ImportEdge>> = HashMap::default();
     for file in files {
+        if is_cancelled(cancellation) {
+            return None;
+        }
         let Some(binder) = binders_by_file.get(file) else {
             continue;
         };
         for (local_name, binding) in &binder.bindings {
+            if is_cancelled(cancellation) {
+                return None;
+            }
             for target_file in resolve(file, &binding.module_specifier) {
                 if matches!(binding.kind, ImportKind::Glob) {
                     let Some(exports) = exports_by_file.get(&target_file) else {
@@ -464,7 +514,7 @@ fn build_importer_reverse(
             }
         }
     }
-    reverse
+    Some(reverse)
 }
 
 fn export_names_for_file(

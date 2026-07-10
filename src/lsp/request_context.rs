@@ -1,14 +1,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lsp_server::{Message, Notification};
-use lsp_types::notification::{Notification as LspNotification, Progress};
+use lsp_server::Message;
 use lsp_types::{
-    ProgressParams, ProgressParamsValue, ProgressToken, WorkDoneProgress, WorkDoneProgressBegin,
-    WorkDoneProgressEnd, WorkDoneProgressReport,
+    ProgressToken, WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressEnd,
+    WorkDoneProgressReport,
 };
 
 use crate::cancellation::CancellationToken;
+use crate::lsp::progress::work_done_progress_message;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestCancelled;
@@ -124,14 +124,7 @@ impl RequestProgress {
         let Some(token) = self.token.clone() else {
             return;
         };
-        let note = Notification::new(
-            Progress::METHOD.to_string(),
-            ProgressParams {
-                token,
-                value: ProgressParamsValue::WorkDone(value),
-            },
-        );
-        if let Err(err) = (self.send_message)(Message::Notification(note)) {
+        if let Err(err) = (self.send_message)(work_done_progress_message(token, value)) {
             eprintln!("[bifrost-lsp] failed to send request progress: {err}");
         }
     }
@@ -142,6 +135,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use lsp_types::ProgressParams;
 
     #[test]
     fn progress_is_absent_without_a_token() {

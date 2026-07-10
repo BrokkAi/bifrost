@@ -15,7 +15,7 @@ use lsp_server::{
 use lsp_types::notification::{
     Cancel, DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles,
     DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as LspNotificationTrait, Progress, PublishDiagnostics,
+    Notification as LspNotificationTrait, PublishDiagnostics,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
@@ -30,10 +30,9 @@ use lsp_types::{
     CancelParams, ConfigurationItem, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    FileChangeType, InitializeParams, NumberOrString, ProgressParams, ProgressParamsValue,
-    ProgressToken, PublishDiagnosticsParams, Registration, RegistrationParams, Uri,
-    WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
-    WorkDoneProgressReport,
+    FileChangeType, InitializeParams, NumberOrString, ProgressToken, PublishDiagnosticsParams,
+    Registration, RegistrationParams, Uri, WorkDoneProgress, WorkDoneProgressBegin,
+    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
 };
 
 use crate::analyzer::{
@@ -52,6 +51,7 @@ use crate::lsp::handlers::{
     folding_range, formatting, hover, references, rename, semantic_tokens, signature_help,
     type_definition, type_hierarchy, workspace_symbol,
 };
+use crate::lsp::progress::work_done_progress_message;
 use crate::lsp::request_context::{RequestCancelled, RequestContext};
 use crate::lsp::text_sync::apply_content_changes;
 use crate::util::throttled_log::ThrottledLog;
@@ -559,14 +559,7 @@ impl StartupProgress {
     }
 
     fn send(&self, value: WorkDoneProgress) -> Result<(), String> {
-        let note = Notification::new(
-            Progress::METHOD.to_string(),
-            ProgressParams {
-                token: self.token.clone(),
-                value: ProgressParamsValue::WorkDone(value),
-            },
-        );
-        (self.send_message)(Message::Notification(note))
+        (self.send_message)(work_done_progress_message(self.token.clone(), value))
     }
 }
 
@@ -935,39 +928,13 @@ fn handle_references_request(
         .name("bifrost-lsp-references".to_string())
         .spawn(move || {
             context.begin();
-            let result = references::handle(&workspace, project.as_ref(), &params, &context);
-            let response = match result {
-                Err(RequestCancelled) => {
-                    context.end("Cancelled");
-                    Response::new_err(
-                        worker_id.clone(),
-                        ErrorCode::RequestCanceled as i32,
-                        "reference request cancelled by client".to_string(),
-                    )
-                }
-                Ok(_) if worker_cancellation.is_cancelled() => {
-                    context.end("Cancelled");
-                    Response::new_err(
-                        worker_id.clone(),
-                        ErrorCode::RequestCanceled as i32,
-                        "reference request cancelled by client".to_string(),
-                    )
-                }
-                Ok(result) => match serde_json::to_value(result) {
-                    Ok(value) => {
-                        context.end("References ready");
-                        Response::new_ok(worker_id.clone(), value)
-                    }
-                    Err(err) => {
-                        context.end("Failed");
-                        Response::new_err(
-                            worker_id.clone(),
-                            ErrorCode::InternalError as i32,
-                            format!("Failed to serialize {worker_method} result: {err}"),
-                        )
-                    }
-                },
-            };
+            let response = finish_reference_request(
+                &worker_id,
+                &worker_method,
+                &context,
+                &worker_cancellation,
+                || references::handle(&workspace, project.as_ref(), &params, &context),
+            );
             if let Some(error) = response.error.as_ref() {
                 eprintln!(
                     "[bifrost-lsp] request error method={} id={:?} code={} message={}",
@@ -999,6 +966,57 @@ fn handle_references_request(
     };
     state.request_jobs.start(&id, handle);
     Ok(())
+}
+
+fn finish_reference_request<T: serde::Serialize>(
+    id: &RequestId,
+    method: &str,
+    context: &RequestContext,
+    cancellation: &CancellationToken,
+    run: impl FnOnce() -> Result<T, RequestCancelled>,
+) -> Response {
+    match panic::catch_unwind(panic::AssertUnwindSafe(run)) {
+        Err(_) => {
+            context.end("Failed");
+            Response::new_err(
+                id.clone(),
+                ErrorCode::InternalError as i32,
+                format!("{method} failed unexpectedly"),
+            )
+        }
+        Ok(result) => match result {
+            Err(RequestCancelled) => {
+                context.end("Cancelled");
+                Response::new_err(
+                    id.clone(),
+                    ErrorCode::RequestCanceled as i32,
+                    "reference request cancelled by client".to_string(),
+                )
+            }
+            Ok(_) if cancellation.is_cancelled() => {
+                context.end("Cancelled");
+                Response::new_err(
+                    id.clone(),
+                    ErrorCode::RequestCanceled as i32,
+                    "reference request cancelled by client".to_string(),
+                )
+            }
+            Ok(result) => match serde_json::to_value(result) {
+                Ok(value) => {
+                    context.end("References ready");
+                    Response::new_ok(id.clone(), value)
+                }
+                Err(err) => {
+                    context.end("Failed");
+                    Response::new_err(
+                        id.clone(),
+                        ErrorCode::InternalError as i32,
+                        format!("Failed to serialize {method} result: {err}"),
+                    )
+                }
+            },
+        },
+    }
 }
 
 fn handle_formatting_request(
@@ -1581,7 +1599,37 @@ const MAX_CONCURRENT_CANCELLABLE_REQUESTS: usize = 2;
 const MAX_CONCURRENT_FORMATTING_REQUESTS: usize = 2;
 const FORMATTER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
-struct RequestSlot {
+#[derive(Clone)]
+struct ConcurrencyLimiter {
+    active: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl ConcurrencyLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<ConcurrencySlot> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| ConcurrencySlot {
+                active: Arc::clone(&self.active),
+            })
+    }
+
+    fn active_count(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+struct ConcurrencySlot {
     active: Arc<AtomicUsize>,
 }
 
@@ -1618,7 +1666,7 @@ impl Drop for ActiveRequestReservation {
     }
 }
 
-impl Drop for RequestSlot {
+impl Drop for ConcurrencySlot {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1629,22 +1677,23 @@ struct RequestJob {
     handle: Option<JoinHandle<()>>,
 }
 
-#[derive(Default)]
 struct RequestJobs {
-    active: Arc<AtomicUsize>,
+    limiter: ConcurrencyLimiter,
     jobs: Mutex<HashMap<RequestId, RequestJob>>,
 }
 
+impl Default for RequestJobs {
+    fn default() -> Self {
+        Self {
+            limiter: ConcurrencyLimiter::new(MAX_CONCURRENT_CANCELLABLE_REQUESTS),
+            jobs: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 impl RequestJobs {
-    fn try_acquire(&self) -> Option<RequestSlot> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_CANCELLABLE_REQUESTS).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| RequestSlot {
-                active: Arc::clone(&self.active),
-            })
+    fn try_acquire(&self) -> Option<ConcurrencySlot> {
+        self.limiter.try_acquire()
     }
 
     fn reserve(&self, id: RequestId, cancellation: CancellationToken) -> bool {
@@ -1726,32 +1775,24 @@ impl RequestJobs {
     }
 }
 
-struct FormattingSlot {
-    active: Arc<AtomicUsize>,
-}
-
-impl Drop for FormattingSlot {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct FormattingJobs {
-    active: Arc<AtomicUsize>,
+    limiter: ConcurrencyLimiter,
     jobs: Arc<Mutex<HashMap<RequestId, formatting::FormatterCancellation>>>,
 }
 
+impl Default for FormattingJobs {
+    fn default() -> Self {
+        Self {
+            limiter: ConcurrencyLimiter::new(MAX_CONCURRENT_FORMATTING_REQUESTS),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
 impl FormattingJobs {
-    fn try_acquire(&self) -> Option<FormattingSlot> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_FORMATTING_REQUESTS).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| FormattingSlot {
-                active: Arc::clone(&self.active),
-            })
+    fn try_acquire(&self) -> Option<ConcurrencySlot> {
+        self.limiter.try_acquire()
     }
 
     fn insert(&self, id: RequestId, cancellation: formatting::FormatterCancellation) {
@@ -1795,10 +1836,10 @@ impl FormattingJobs {
 
     fn wait_for_empty(&self, timeout: Duration) -> bool {
         let started = Instant::now();
-        while self.active.load(Ordering::Acquire) > 0 && started.elapsed() < timeout {
+        while self.limiter.active_count() > 0 && started.elapsed() < timeout {
             thread::sleep(Duration::from_millis(10));
         }
-        self.active.load(Ordering::Acquire) == 0
+        self.limiter.active_count() == 0
     }
 }
 
@@ -2693,6 +2734,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+    use lsp_types::notification::Progress;
     use serde_json::json;
 
     #[test]
@@ -2854,7 +2896,7 @@ mod tests {
         release_tx.send(()).unwrap();
         jobs.cancel_all_and_join();
 
-        assert_eq!(jobs.active.load(Ordering::Acquire), 0);
+        assert_eq!(jobs.limiter.active_count(), 0);
     }
 
     #[test]
@@ -2890,7 +2932,7 @@ mod tests {
         jobs.cancel(&id);
 
         assert!(jobs.jobs.lock().unwrap().is_empty());
-        assert_eq!(jobs.active.load(Ordering::Acquire), 0);
+        assert_eq!(jobs.limiter.active_count(), 0);
     }
 
     #[test]
@@ -2918,7 +2960,7 @@ mod tests {
         jobs.cancel_all_and_join();
 
         assert!(jobs.jobs.lock().unwrap().is_empty());
-        assert_eq!(jobs.active.load(Ordering::Acquire), 0);
+        assert_eq!(jobs.limiter.active_count(), 0);
     }
 
     #[test]
@@ -2933,6 +2975,46 @@ mod tests {
 
         assert!(original.is_cancelled());
         jobs.remove(&id);
+    }
+
+    #[test]
+    fn panicking_reference_worker_ends_progress_and_returns_error() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&messages);
+        let cancellation = CancellationToken::default();
+        let context = RequestContext::new(
+            cancellation.clone(),
+            Some(ProgressToken::String("panic-progress".to_string())),
+            "Finding references",
+            "Resolving symbol",
+            Arc::new(move |message| {
+                sink.lock().unwrap().push(message);
+                Ok(())
+            }),
+        );
+        context.begin();
+
+        let response = finish_reference_request::<serde_json::Value>(
+            &RequestId::from(9),
+            References::METHOD,
+            &context,
+            &cancellation,
+            || panic!("injected reference failure"),
+        );
+
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::InternalError as i32)
+        );
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 2);
+        let Message::Notification(end) = &messages[1] else {
+            panic!("expected progress end notification");
+        };
+        assert_eq!(end.method, Progress::METHOD);
+        assert_eq!(end.params["token"], json!("panic-progress"));
+        assert_eq!(end.params["value"]["kind"], json!("end"));
+        assert_eq!(end.params["value"]["message"], json!("Failed"));
     }
 
     #[test]

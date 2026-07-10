@@ -104,6 +104,26 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             .filter(|unit| unit.kind() == CodeUnitType::Class)
             .map(|unit| unit.package_name().to_string())
             .collect();
+        let target_fq_names: HashSet<String> = self
+            .declarations(target)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .flat_map(|unit| {
+                let fq_name = unit.fq_name();
+                [fq_name.clone(), fq_name.replace('$', ".")]
+            })
+            .collect();
+        if self
+            .inner
+            .type_identifiers_of(source_file)
+            .is_some_and(|identifiers| {
+                identifiers
+                    .iter()
+                    .any(|identifier| target_fq_names.contains(identifier))
+            })
+        {
+            return true;
+        }
         let source_imports = self.using_namespaces_of(source_file);
         let source_aliases = self.using_aliases_of(source_file);
         imports

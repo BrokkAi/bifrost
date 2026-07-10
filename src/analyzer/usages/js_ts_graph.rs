@@ -39,7 +39,9 @@ mod resolver;
 /// The cacheable JS/TS resolution index and its tree-free builder, exposed so the
 /// TypeScript and JavaScript analyzers can cache one per language.
 pub(in crate::analyzer::usages) use receiver_analysis::JsTsReceiverFactProvider;
-pub(crate) use resolver::{JsTsUsageIndex, build_jsts_usage_index};
+pub(crate) use resolver::{
+    JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
+};
 
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
@@ -53,6 +55,7 @@ use crate::analyzer::{
     CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
     resolve_analyzer,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -86,14 +89,23 @@ where
 pub(in crate::analyzer::usages) fn cached_jsts_index(
     analyzer: &dyn IAnalyzer,
     language: Language,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<Arc<JsTsUsageIndex>> {
     match language {
-        Language::TypeScript => {
-            Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)?.jsts_usage_index())
-        }
-        Language::JavaScript => {
-            Some(resolve_analyzer::<JavascriptAnalyzer>(analyzer)?.jsts_usage_index())
-        }
+        Language::TypeScript => cancellation.map_or_else(
+            || Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)?.jsts_usage_index()),
+            |token| {
+                resolve_analyzer::<TypescriptAnalyzer>(analyzer)?
+                    .jsts_usage_index_with_cancellation(token)
+            },
+        ),
+        Language::JavaScript => cancellation.map_or_else(
+            || Some(resolve_analyzer::<JavascriptAnalyzer>(analyzer)?.jsts_usage_index()),
+            |token| {
+                resolve_analyzer::<JavascriptAnalyzer>(analyzer)?
+                    .jsts_usage_index_with_cancellation(token)
+            },
+        ),
         _ => None,
     }
 }
@@ -127,7 +139,11 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
             );
         }
 
-        let Some(index) = cached_jsts_index(analyzer, language) else {
+        let cancellation = scan_scope.cancellation();
+        let Some(index) = cached_jsts_index(analyzer, language, cancellation) else {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+            }
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -296,7 +312,7 @@ where
         if language_nodes.is_empty() {
             continue;
         }
-        let Some(index) = cached_jsts_index(analyzer, language) else {
+        let Some(index) = cached_jsts_index(analyzer, language, None) else {
             continue;
         };
         let result = inverted::build_jsts_scoped_edges(

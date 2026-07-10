@@ -836,7 +836,7 @@ fn jsts_module_export_candidates(
     exported_name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let Some(index) = cached_jsts_index(analyzer, language) else {
+    let Some(index) = cached_jsts_index(analyzer, language, None) else {
         return Vec::new();
     };
 

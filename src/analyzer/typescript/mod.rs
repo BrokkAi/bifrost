@@ -36,7 +36,10 @@ use crate::analyzer::js_ts::imports::{
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
+use crate::analyzer::usages::js_ts_graph::{
+    JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
+};
+use crate::cancellation::CancellationToken;
 #[derive(Debug, Clone, Default)]
 pub struct TypescriptAdapter;
 
@@ -270,6 +273,34 @@ impl TypescriptAnalyzer {
             || build_jsts_usage_index(self, Language::TypeScript, true),
             || build_jsts_usage_index(self, Language::TypeScript, false),
         )
+    }
+
+    pub(crate) fn jsts_usage_index_with_cancellation(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Option<Arc<JsTsUsageIndex>> {
+        self.jsts_usage_index
+            .get_or_try_build(
+                || {
+                    build_jsts_usage_index_with_cancellation(
+                        self,
+                        Language::TypeScript,
+                        true,
+                        Some(cancellation),
+                    )
+                    .ok_or(())
+                },
+                || {
+                    build_jsts_usage_index_with_cancellation(
+                        self,
+                        Language::TypeScript,
+                        false,
+                        Some(cancellation),
+                    )
+                    .ok_or(())
+                },
+            )
+            .ok()
     }
 
     pub fn new_with_config_and_storage(

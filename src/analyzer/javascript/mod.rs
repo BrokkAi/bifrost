@@ -23,7 +23,9 @@ use crate::analyzer::js_ts::imports::{
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
+use crate::analyzer::usages::js_ts_graph::{
+    JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
+};
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
     ImportInfo, Language, LanguageAdapter, ParameterMetadata, PoolSafeMemo, Project, ProjectFile,
@@ -31,6 +33,7 @@ use crate::analyzer::{
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
     build_reverse_import_index,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
@@ -236,6 +239,35 @@ impl JavascriptAnalyzer {
             || build_jsts_usage_index(self, Language::JavaScript, true),
             || build_jsts_usage_index(self, Language::JavaScript, false),
         )
+    }
+
+    pub(crate) fn jsts_usage_index_with_cancellation(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Option<Arc<JsTsUsageIndex>> {
+        self.memo_caches
+            .jsts_usage_index
+            .get_or_try_build(
+                || {
+                    build_jsts_usage_index_with_cancellation(
+                        self,
+                        Language::JavaScript,
+                        true,
+                        Some(cancellation),
+                    )
+                    .ok_or(())
+                },
+                || {
+                    build_jsts_usage_index_with_cancellation(
+                        self,
+                        Language::JavaScript,
+                        false,
+                        Some(cancellation),
+                    )
+                    .ok_or(())
+                },
+            )
+            .ok()
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {

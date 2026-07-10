@@ -55,7 +55,7 @@ where
     if tree_sitter_language_for(language).is_none() {
         return UsageEdges::default();
     }
-    let _index = super::cached_jsts_index(analyzer, language);
+    let _index = super::cached_jsts_index(analyzer, language, None);
     let files = collect_jsts_files(analyzer, language);
     build_edges(&files, keep_file, |file| {
         // The non-scoped scan needs only the file's own tree for its main binder +

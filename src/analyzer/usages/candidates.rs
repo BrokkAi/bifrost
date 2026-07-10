@@ -2,7 +2,7 @@ use crate::analyzer::usages::common::{
     analyzed_files_for_language, language_for_file, language_for_target,
 };
 use crate::analyzer::usages::traits::CandidateFileProvider;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashSet, set_with_capacity};
 use rayon::prelude::*;
@@ -98,16 +98,21 @@ fn find_import_graph_candidates(
 
     // (3) Direct importers — only if the analyzer exposes import analysis.
     if let Some(import_provider) = analyzer.import_analysis_provider() {
-        let snapshot: Vec<ProjectFile> = candidates.iter().cloned().collect();
-        for source_file in snapshot {
-            if is_cancelled(cancellation) {
-                return candidates;
-            }
-            for importer in import_provider.referencing_files_of(&source_file) {
+        if let Some(cancellation) = cancellation {
+            let importers = find_direct_importers_with_cancellation(
+                analyzer.analyzed_files(),
+                import_provider,
+                &source_files,
+                cancellation,
+            );
+            candidates.extend(importers);
+        } else {
+            let snapshot: Vec<ProjectFile> = candidates.iter().cloned().collect();
+            for source_file in snapshot {
                 if is_cancelled(cancellation) {
                     return candidates;
                 }
-                candidates.insert(importer);
+                candidates.extend(import_provider.referencing_files_of(&source_file));
             }
         }
     }
@@ -115,6 +120,47 @@ fn find_import_graph_candidates(
     add_scala_candidates_for_java_type(target, analyzer, &mut candidates, cancellation);
 
     candidates
+}
+
+fn find_direct_importers_with_cancellation(
+    files: impl IntoIterator<Item = ProjectFile>,
+    import_provider: &dyn ImportAnalysisProvider,
+    source_files: &BTreeSet<ProjectFile>,
+    cancellation: &CancellationToken,
+) -> HashSet<ProjectFile> {
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort();
+    let mut importers = HashSet::default();
+    for candidate in files {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if source_files.contains(&candidate) {
+            continue;
+        }
+        let imports = import_provider.import_info_of(&candidate);
+        let could_import_target = source_files
+            .iter()
+            .any(|target| import_provider.could_import_file(&candidate, imports, target));
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if could_import_target {
+            importers.insert(candidate);
+            continue;
+        }
+        let imported = import_provider.imported_code_units_of(&candidate);
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if imported
+            .iter()
+            .any(|unit| source_files.contains(unit.source()))
+        {
+            importers.insert(candidate);
+        }
+    }
+    importers
 }
 
 fn add_scala_candidates_for_java_type(
@@ -345,4 +391,57 @@ pub(crate) fn find_default_candidates_with_cancellation(
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
     cancellation.is_some_and(CancellationToken::is_cancelled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{CodeUnitType, ImportInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CancellingImportProvider {
+        cancellation: CancellationToken,
+        calls: Arc<AtomicUsize>,
+        imported: CodeUnit,
+    }
+
+    impl ImportAnalysisProvider for CancellingImportProvider {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.cancellation.cancel();
+            [self.imported.clone()].into_iter().collect()
+        }
+
+        fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
+            panic!("cancellable discovery must not build the global reverse index");
+        }
+
+        fn import_info_of<'a>(&'a self, _file: &ProjectFile) -> &'a [ImportInfo] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn cancellable_importer_scan_stops_after_current_file_without_recording_partial_work() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let importer = ProjectFile::new(root, "Importer.java");
+        let cancellation = CancellationToken::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CancellingImportProvider {
+            cancellation: cancellation.clone(),
+            calls: Arc::clone(&calls),
+            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
+        };
+
+        let importers = find_direct_importers_with_cancellation(
+            [importer],
+            &provider,
+            &[target_file].into_iter().collect(),
+            &cancellation,
+        );
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(importers.is_empty());
+    }
 }

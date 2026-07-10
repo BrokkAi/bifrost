@@ -21,6 +21,7 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
 - [x] (2026-07-10 09:57Z) Added deterministic worker/progress tests, stdio reference progress/cancellation coverage, and updated the public LSP documentation.
 - [x] (2026-07-10 10:50Z) Ran formatting, every planned focused test, `cargo clippy-no-cuda`, and the complete test suite successfully.
 - [x] (2026-07-10 10:50Z) Completed security, DRY, senior-engineer, architecture, and DevOps reviews; addressed all findings and obtained clean focused re-reviews.
+- [x] (2026-07-10 12:20Z) Rebased the completed milestone onto `origin/master`, ran the guided specialist review, and fixed all six findings: cancellable cold index construction, cheap overlay snapshots, panic-safe worker completion, shared concurrency limiting, stronger progress-order tests, and one shared progress envelope.
 
 ## Surprises & Discoveries
 
@@ -45,6 +46,15 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
 - Observation: The first full-suite run exposed a test-only completion race in the new reaping test.
   Evidence: the channel signaled immediately before the worker returned, so `JoinHandle::is_finished` could still be false. The test now yields until the handle reports completion, then reaps it; the complete rerun passes without sleeps.
 
+- Observation: Cancellation checkpoints around usage dispatch were insufficient when a first JS/TS query or reverse-import lookup lazily built a whole-workspace index.
+  Evidence: the guided review traced both cold paths. Cancellable candidate discovery now resolves direct imports per file, and `PoolSafeMemo::get_or_try_build` publishes a JS/TS index only after a complete uncancelled build.
+
+- Observation: Cloning an overlay map also cloned every open document body because values were owned `String`s.
+  Evidence: overlay values are now immutable `Arc<str>` instances. The snapshot test proves pointer sharing at capture time and isolation after the live overlay is replaced.
+
+- Observation: A direct imported-code-unit comparison is not equivalent to every analyzer's importer semantics.
+  Evidence: the full suite caught the C++ out-of-line declaration case, where `#include "model.h"` is resolved through the analyzer's indexed suffix policy. The cancellable per-file scan now calls structured `could_import_file` first and retains imported-code-unit matching as a secondary check; the exact click-around regression passes again.
+
 ## Decision Log
 
 - Decision: Implement the references-first milestone rather than all handlers named by issue #578.
@@ -64,7 +74,7 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
   Date/Author: 2026-07-10 / Codex
 
 - Decision: Use request-time clones of `WorkspaceAnalyzer` and `Arc<OverlayProject>` in workers.
-  Rationale: `OverlayProject::snapshot` copies the current overlay map, every analyzer delegate is rebound to that immutable project view, and the multi-analyzer's immutable definition index is shared through `Arc`. Snapshot capture therefore preserves one coherent request generation without workspace-sized work on the message loop.
+  Rationale: `OverlayProject::snapshot` copies paths and immutable `Arc<str>` handles without copying document bodies, every analyzer delegate is rebound to that frozen project view, and the multi-analyzer's immutable definition index is shared through `Arc`. Snapshot capture therefore preserves one coherent request generation without workspace-sized content copying on the message loop.
   Date/Author: 2026-07-10 / Codex
 
 - Decision: Reserve active JSON-RPC ids in one registry shared by reference and formatter workers.
@@ -75,13 +85,21 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
   Rationale: Sharing these lazy caches would allow an old snapshot request to populate values later consumed by a live post-edit analyzer. Immutable or source-validated caches remain shareable, while the project-sensitive caches are isolated and behavior-tested.
   Date/Author: 2026-07-10 / Codex
 
+- Decision: Treat a reference-worker panic as a completed failed request.
+  Rationale: Catching unwind at the worker boundary guarantees a `Failed` progress end and one `InternalError` response while RAII releases the request id and concurrency slot. The process-wide panic hook still records the failure for operators.
+  Date/Author: 2026-07-10 / Codex
+
+- Decision: Share one bounded concurrency-limiter implementation between reference and formatter registries.
+  Rationale: Both registries need the same atomic acquisition and RAII release semantics; only their job tracking and shutdown behavior differ.
+  Date/Author: 2026-07-10 / Codex
+
 ## Outcomes & Retrospective
 
 The references-first milestone is complete. `textDocument/references` now runs in a bounded two-worker registry, remains cancelable while the main loop processes messages, returns `-32800` after client cancellation, and emits begin/report/end work-done progress only when the request supplies a token. A third heavy request receives `-32802`. Shutdown cancels and joins reference workers before preserving the formatter cleanup path.
 
 Cancellation reaches default candidate discovery, graph preprocessing, and per-file structured scans for every language resolver used by references. Analyzer results produced after early cooperative abort are discarded by the LSP handler, so cancellation does not appear as a usage-analysis failure. Public Rust usage APIs and provider shapes remain unchanged.
 
-Review strengthened the implementation in four places: true immutable overlay/analyzer snapshots, cheap sharing of the immutable multi-language definition index, global async request-id reservation, and isolation of C++ project-sensitive caches. It also consolidated formatter cancellation on the shared token and unified ordinary/cancellable candidate fallback policy.
+Review strengthened the implementation in ten places across two passes: true immutable overlay/analyzer snapshots with shared buffer storage, cheap sharing of the immutable multi-language definition index, global async request-id reservation, isolation of C++ project-sensitive caches, cancellable cold import and JS/TS index construction, panic-safe reference completion, a shared bounded concurrency limiter, explicit progress-order integration assertions, and a shared work-done notification envelope. It also consolidated formatter cancellation on the shared token and unified ordinary/cancellable candidate fallback policy.
 
 Validation passed: `cargo fmt --check`; `cargo test --lib lsp::server::tests`; pre-cancelled finder/Python/Rust/mapping and snapshot/cache tests; `cargo test --test usages_finder_fallback_test`; all six filtered references integration tests; the exact formatter-cancellation integration test; `cargo clippy-no-cuda`; and the complete `cargo test` suite including doctests.
 

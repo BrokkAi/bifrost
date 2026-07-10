@@ -4203,7 +4203,12 @@ fn bifrost_lsp_server_references_reports_client_owned_work_done_progress() {
             "context": {"includeDeclaration": false}
         }
     }));
-    let next = server.read_response_for_id(3);
+    let next = server.read_message();
+    assert_ne!(
+        next["method"], "$/progress",
+        "request without workDoneToken emitted progress: {next}"
+    );
+    assert_eq!(next["id"], 3, "unexpected tokenless response: {next}");
     assert!(
         next["result"].is_array(),
         "late cancellation leaked: {next}"
@@ -4252,7 +4257,24 @@ fn bifrost_lsp_server_references_cancel_stops_active_search() {
         "params": {"id": 10}
     }));
 
-    let response = server.read_response_for_id(10);
+    let mut saw_cancelled_end = false;
+    let response = loop {
+        let message = server.read_message();
+        if message["id"] == 10 {
+            assert!(
+                saw_cancelled_end,
+                "cancellation response arrived before progress end: {message}"
+            );
+            break message;
+        }
+        assert_eq!(message["method"], "$/progress", "{message}");
+        assert_eq!(message["params"]["token"], "cancel-progress");
+        if message["params"]["value"]["kind"] == "end" {
+            assert_eq!(message["params"]["value"]["message"], "Cancelled");
+            assert!(!saw_cancelled_end, "duplicate progress end: {message}");
+            saw_cancelled_end = true;
+        }
+    };
     assert_eq!(response["error"]["code"], -32800, "{response}");
     assert!(
         response["error"]["message"]

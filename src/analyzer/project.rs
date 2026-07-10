@@ -547,7 +547,7 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
 /// writing to disk.
 pub struct OverlayProject {
     delegate: Arc<dyn Project>,
-    overlays: Arc<RwLock<HashMap<PathBuf, String>>>,
+    overlays: Arc<RwLock<HashMap<PathBuf, Arc<str>>>>,
     max_overlay_bytes: usize,
     /// Last instant we emitted a rejection log for a given path. Kept on a
     /// separate throttle helper so the per-keystroke read path doesn't
@@ -610,7 +610,7 @@ impl OverlayProject {
         self.overlays
             .write()
             .expect("overlay lock poisoned")
-            .insert(abs_path, content);
+            .insert(abs_path, Arc::from(content));
         true
     }
 
@@ -703,7 +703,7 @@ impl Project for OverlayProject {
             .expect("overlay lock poisoned")
             .get(&file.abs_path())
         {
-            return Ok(text.clone());
+            return Ok(text.to_string());
         }
         self.delegate.read_source(file)
     }
@@ -839,6 +839,14 @@ mod tests {
         assert!(overlay.set(file.abs_path(), "fn first() {}\n".to_string()));
 
         let snapshot = overlay.snapshot();
+        {
+            let live = overlay.overlays.read().expect("overlay lock poisoned");
+            let frozen = snapshot.overlays.read().expect("overlay lock poisoned");
+            assert!(Arc::ptr_eq(
+                live.get(&file.abs_path()).unwrap(),
+                frozen.get(&file.abs_path()).unwrap(),
+            ));
+        }
         assert!(overlay.set(file.abs_path(), "fn second() {}\n".to_string()));
 
         assert_eq!(snapshot.read_source(&file).unwrap(), "fn first() {}\n");
