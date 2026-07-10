@@ -11,7 +11,7 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 ## Progress
 
 - [x] (2026-07-10 13:17Z) Milestone 0: added this ExecPlan, the tutorial index/navigation, and the executable Markdown harness; focused Rust/docs tests, Astro check/build, and a fresh styled preview passed.
-- [ ] Milestone 1: publish and verify the Python tutorial.
+- [x] (2026-07-10 13:21Z) Milestone 1: published and verified the Python tutorial with exact filtered-call, decorated-assignment, and callable-exclusion results; focused/docs/build/render checks passed.
 - [ ] Milestone 2: publish and verify the Java tutorial.
 - [ ] Milestone 3: publish and verify the JavaScript tutorial.
 - [ ] Milestone 4: publish and verify the TypeScript tutorial.
@@ -31,6 +31,9 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 
 - Observation: `npm --prefix docs run dev` left a listening Astro process that served stale content even though `astro dev status` reported no active server.
   Evidence: The browser still showed a removed duplicate heading. Killing that process, rebuilding with `PUBLIC_DOCS_BASE=/`, and serving the fresh static output produced the current single-heading styled page.
+
+- Observation: Python does not advertise `constructor` precision, so putting `constructor` in `not_kind` produces a capability diagnostic even when the intended match is a method.
+  Evidence: The first callable example returned `structural adapter for python does not support kind(s): constructor`; narrowing the exclusion to `lambda` preserved the intended named-callable lesson without an unrelated diagnostic.
 
 ## Decision Log
 
@@ -53,6 +56,8 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 ## Outcomes & Retrospective
 
 Milestone 0 established the publication and proof infrastructure. The marker-contract test reached the real Python adapter and caught a deliberately omitted module-level `enclosing_symbol`, proving exact output comparison rather than parse-only validation. The tutorial index builds without diagnostics and was visually verified with current navigation, one page title, and loaded styles.
+
+Milestone 1 published Python's tutorial with three exact cases. The member-call case proves simultaneous path/language/receiver/callee/argument/keyword/containment filtering; the decorated method case proves decorators plus nested assignment left/right roles; the callable case proves subtype-aware matching and lambda exclusion. Its focused executable test, existing docs tests, Astro check/build, and fresh styled preview with ten non-overflowing code blocks passed.
 
 ## Context and Orientation
 
@@ -130,3 +135,5 @@ No production API or dependency changes are planned. The test-only Markdown cont
 Revision note, 2026-07-10: Initial ExecPlan created from issue #598, current adapter/reference sources, and the decisions to use separate pages, exhaustive normalized-kind coverage, exact executable outputs, and separately landed engine fixes.
 
 Revision note, 2026-07-10: Updated after Milestone 0 with the passing harness/docs evidence and stale-preview discovery.
+
+Revision note, 2026-07-10: Updated after Milestone 1 with Python's exact outputs, constructor-capability discovery, and rendered-page evidence.

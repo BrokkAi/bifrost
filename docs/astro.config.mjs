@@ -60,7 +60,13 @@ export default defineConfig({
           label: 'Code Querying',
           items: [
             { label: 'Overview', slug: 'code-querying' },
-            { label: 'Language Tutorials', slug: 'code-query-tutorials' },
+            {
+              label: 'Language Tutorials',
+              items: [
+                { label: 'Overview', slug: 'code-query-tutorials' },
+                { label: 'Python', slug: 'code-query-tutorials/python' },
+              ],
+            },
             { label: 'Semantic Search', slug: 'semantic-search' },
             { label: 'Rune Query Language', slug: 'rune-query-language' },
             { label: 'JSON CodeQuery', slug: 'code-query-json' },

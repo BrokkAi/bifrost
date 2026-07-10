@@ -11,7 +11,7 @@ Language pages will be added and marked with their last successful end-to-end ve
 
 ## Tutorials
 
-- Python (in progress)
+- [Python](./python/)
 - Java (planned)
 - JavaScript (planned)
 - TypeScript (planned)

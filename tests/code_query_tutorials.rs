@@ -61,6 +61,11 @@ audit("ok")
     verify_tutorial_contents(Path::new("embedded-marker-contract.md"), markdown);
 }
 
+#[test]
+fn python_tutorial() {
+    verify_tutorial("docs/src/content/docs/code-query-tutorials/python.md");
+}
+
 #[allow(dead_code)]
 fn verify_tutorial(relative: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
@@ -90,6 +95,7 @@ fn verify_tutorial_contents(path: &Path, markdown: &str) {
     let project = project.build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
 
+    let mut missing_expectations = Vec::new();
     for (id, case) in &tutorial.cases {
         let rql = required_block(path, id, "rql", &case.rql);
         let json = required_block(path, id, "json", &case.json);
@@ -137,6 +143,15 @@ fn verify_tutorial_contents(path: &Path, markdown: &str) {
                 path.display()
             )
         });
+        if expected_value.is_null() {
+            eprintln!(
+                "generated expectation for {id:?} in {}:\n{}",
+                path.display(),
+                serde_json::to_string_pretty(&json_result).expect("pretty-print result")
+            );
+            missing_expectations.push(id.as_str());
+            continue;
+        }
         assert_eq!(
             json_result,
             expected_value,
@@ -144,6 +159,12 @@ fn verify_tutorial_contents(path: &Path, markdown: &str) {
             path.display()
         );
     }
+    assert!(
+        missing_expectations.is_empty(),
+        "{} has generated but undocumented expectations for: {}",
+        path.display(),
+        missing_expectations.join(", ")
+    );
 }
 
 fn parse_tutorial(path: &Path, markdown: &str) -> Tutorial {
