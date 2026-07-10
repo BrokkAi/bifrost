@@ -9,6 +9,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub(crate) use crate::path_normalization::NormalizePath;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Language {
     None,
@@ -977,26 +979,6 @@ impl CodeBaseMetrics {
     }
 }
 
-pub(crate) trait NormalizePath {
-    fn normalize(self) -> PathBuf;
-}
-
-impl NormalizePath for PathBuf {
-    fn normalize(self) -> PathBuf {
-        let mut normalized = PathBuf::new();
-        for component in self.components() {
-            match component {
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    normalized.pop();
-                }
-                component => normalized.push(component.as_os_str()),
-            }
-        }
-        normalized
-    }
-}
-
 pub fn metrics_from_declarations(
     declarations: impl IntoIterator<Item = CodeUnit>,
 ) -> CodeBaseMetrics {
@@ -1007,4 +989,35 @@ pub fn metrics_from_declarations(
         .collect::<BTreeSet<_>>()
         .len();
     CodeBaseMetrics::new(file_count, declarations.len())
+}
+
+#[cfg(all(test, windows))]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn project_file_normalizes_ordinary_and_verbatim_roots_equally() {
+        let ordinary = ProjectFile::new(
+            PathBuf::from(r"C:\Users\runner\repo"),
+            PathBuf::from(r"src\..\A.java"),
+        );
+        let verbatim = ProjectFile::new(
+            PathBuf::from(r"\\?\C:\Users\runner\repo"),
+            PathBuf::from("A.java"),
+        );
+        assert_eq!(ordinary, verbatim);
+    }
+
+    #[test]
+    fn project_file_normalizes_ordinary_and_verbatim_unc_roots_equally() {
+        let ordinary = ProjectFile::new(
+            PathBuf::from(r"\\server\share\repo"),
+            PathBuf::from("A.java"),
+        );
+        let verbatim = ProjectFile::new(
+            PathBuf::from(r"\\?\UNC\server\share\repo"),
+            PathBuf::from("A.java"),
+        );
+        assert_eq!(ordinary, verbatim);
+    }
 }

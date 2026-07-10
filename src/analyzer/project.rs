@@ -1,5 +1,6 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, ProjectFile};
+use crate::path_normalization::NormalizePath;
 use crate::util::throttled_log::ThrottledLog;
 use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap};
@@ -93,7 +94,7 @@ impl TestProject {
     }
 
     pub fn with_languages(root: impl Into<PathBuf>, languages: BTreeSet<Language>) -> Self {
-        let root = root.into();
+        let root = root.into().normalize();
         assert!(root.is_absolute(), "test project root must be absolute");
         assert!(root.is_dir(), "test project root must exist");
         assert!(
@@ -105,7 +106,7 @@ impl TestProject {
     }
 
     pub fn from_root_with_inferred_languages(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let root = root.into();
+        let root = root.into().normalize();
         assert!(root.is_absolute(), "test project root must be absolute");
         assert!(root.is_dir(), "test project root must exist");
 
@@ -189,7 +190,7 @@ pub struct FilesystemProject {
 
 impl FilesystemProject {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let root = root.into().canonicalize()?;
+        let root = root.into().canonicalize()?.normalize();
         if !root.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -274,7 +275,7 @@ impl FileSetProject {
     /// file extensions; files of unsupported types stay listed but contribute
     /// no language (and so are never parsed).
     pub fn new(root: impl Into<PathBuf>, rel_paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        let root = root.into();
+        let root = root.into().normalize();
         let files: BTreeSet<ProjectFile> = rel_paths
             .into_iter()
             .map(|rel| ProjectFile::new(root.clone(), rel))
@@ -337,7 +338,7 @@ impl MultiRootProject {
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
         let mut roots = roots
             .into_iter()
-            .map(|root| root.canonicalize())
+            .map(|root| root.canonicalize().map(NormalizePath::normalize))
             .collect::<io::Result<Vec<_>>>()?;
         roots.sort();
         roots.dedup();
@@ -739,6 +740,27 @@ mod tests {
         }
         std::fs::write(&abs, contents).unwrap();
         ProjectFile::new(root.to_path_buf(), PathBuf::from(rel))
+    }
+
+    #[cfg(windows)]
+    fn verbatim(path: &Path) -> PathBuf {
+        PathBuf::from(format!(r"\\?\{}", path.display()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_constructors_normalize_verbatim_roots() {
+        let temp = TempDir::new().unwrap();
+        let ordinary = temp.path().canonicalize().unwrap().normalize();
+        std::fs::write(ordinary.join("main.rs"), "fn main() {}\n").unwrap();
+        let verbatim = verbatim(&ordinary);
+
+        let filesystem = FilesystemProject::new(&verbatim).unwrap();
+        let test = TestProject::new(&verbatim, Language::Rust);
+        let files = FileSetProject::new(&verbatim, [PathBuf::from("main.rs")]);
+        assert_eq!(filesystem.root(), ordinary);
+        assert_eq!(test.root(), ordinary);
+        assert_eq!(files.root(), ordinary);
     }
 
     #[test]
