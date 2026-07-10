@@ -17,6 +17,7 @@ Bifrost currently asks editors to resend an entire open document after every key
 - [x] (2026-07-10 07:09Z) Updated capability advertisement, integration coverage, and public LSP documentation.
 - [x] (2026-07-10 07:25Z) Ran formatting, focused and full tests, doctests, no-CUDA clippy, and a final diff review; added a transactional rollback regression found during review.
 - [x] (2026-07-10 07:28Z) Rebased all checkpoints onto current `origin/master` (`1b28944c`) and reran the ten text-sync and 160 LSP tests successfully.
+- [x] (2026-07-10 07:50Z) Completed an adversarial guided review, removed a redundant full-buffer clone, globally throttled unknown-document warnings without echoing untrusted URIs, and reran all 160 LSP tests successfully.
 
 ## Surprises & Discoveries
 
@@ -37,6 +38,12 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 - Observation: `origin/master` advanced after the planning snapshot while the issue branch's configured upstream remained at the old base, so plain `git rebase` did not incorporate the new master commit.
   Evidence: the final graph audit found merge base `3b4d1081` and current master `1b28944c`; `git rebase origin/master` applied all four checkpoints without conflicts.
+
+- Observation: keying unknown-document rejection logs by arbitrary client URIs allowed a high-cardinality client to repeatedly exhaust and reset the bounded throttle map.
+  Evidence: the guided security review traced the new unknown-document path through `ThrottledLog::should_log`; using one fixed key preserves observability while bounding log throughput and avoids printing untrusted URIs.
+
+- Observation: cloning the tracked document before calling the transactional applicator created an avoidable extra full-buffer allocation on every accepted edit.
+  Evidence: the applicator already owns its working copy, so borrowing `OpenDocument.text` directly keeps transactionality and passes the complete LSP integration suite.
 
 ## Decision Log
 
@@ -62,7 +69,7 @@ Bifrost currently asks editors to resend an entire open document after every key
 
 ## Outcomes & Retrospective
 
-Issue #575 is implemented and validated. The server advertises incremental sync, preserves whole-document changes, validates versions, applies ordered UTF-16 edits, retains out-of-root open documents, and rejects unsafe notifications without side effects. Ten pure text-sync tests pass, the 160-test LSP target passes, every full-suite unit and integration test binary passes, doctests pass with the matching Rustup `rustdoc`, formatting is clean, and the isolated no-CUDA all-target clippy run passes. No known work remains.
+Issue #575 is implemented, adversarially reviewed, and validated. The server advertises incremental sync, preserves whole-document changes, validates versions, applies ordered UTF-16 edits, retains out-of-root open documents, and rejects unsafe notifications without side effects. Unknown-document warnings are globally throttled without echoing untrusted URIs, and accepted edits avoid an unnecessary full-buffer copy. Ten pure text-sync tests pass, the 160-test LSP target passes, every full-suite unit and integration test binary passes, doctests pass with the matching Rustup `rustdoc`, formatting is clean, and the isolated no-CUDA all-target clippy run passes. No known work remains.
 
 ## Context and Orientation
 
@@ -169,3 +176,5 @@ Plan revision note (2026-07-10 07:09Z): Marked server, capability, docs, and int
 Plan revision note (2026-07-10 07:25Z): Closed the plan after full validation and recorded the host toolchain-path workaround so later runs can reproduce the green doctest and clippy results.
 
 Plan revision note (2026-07-10 07:28Z): Recorded the final master rebase and post-rebase focused validation so the completed plan matches the delivered branch graph.
+
+Plan revision note (2026-07-10 07:50Z): Recorded the guided-review fixes and post-review LSP validation before publishing the branch.

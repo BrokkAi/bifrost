@@ -963,7 +963,7 @@ fn handle_notification(
             let uri = params.text_document.uri;
             let version = params.text_document.version;
             let Some(document) = state.open_documents.get(uri.as_str()) else {
-                state.maybe_log_rejected_didchange(&uri, version, "document is not open");
+                state.maybe_log_unknown_document_didchange(version);
                 return Ok(());
             };
             if version <= document.version {
@@ -983,8 +983,8 @@ fn handle_notification(
                 return Ok(());
             }
 
-            let current_text = document.text.clone();
-            let updated_text = match apply_content_changes(&current_text, &params.content_changes) {
+            let updated_text = match apply_content_changes(&document.text, &params.content_changes)
+            {
                 Ok(text) => text,
                 Err(error) => {
                     state.maybe_log_rejected_didchange(&uri, version, &error.to_string());
@@ -1481,6 +1481,23 @@ impl ServerState {
             eprintln!(
                 "[bifrost-lsp] dropping didChange for {} at version {version}: {reason}",
                 uri.as_str(),
+            );
+        }
+    }
+
+    /// Unknown documents are keyed together so a client cannot bypass the
+    /// throttle by cycling through attacker-controlled URIs. Do not echo the
+    /// URI because it is neither trusted nor useful without tracked state.
+    fn maybe_log_unknown_document_didchange(&self, version: i32) {
+        const UNKNOWN_DOCUMENT_LOG_KEY: &str = "<unknown-document>";
+
+        let now = Instant::now();
+        if self
+            .rejected_didchange_log
+            .should_log(UNKNOWN_DOCUMENT_LOG_KEY, now)
+        {
+            eprintln!(
+                "[bifrost-lsp] dropping didChange for an unknown document at version {version}: document is not open"
             );
         }
     }
