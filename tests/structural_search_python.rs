@@ -1,11 +1,11 @@
-//! End-to-end tests for `search_ast` structural queries over Python
+//! End-to-end tests for `query_code` structural queries over Python
 //! (issue #328, ExecPlan milestone 2). Queries enter as JSON exactly as the
 //! tool receives them; assertions run against the structured output.
 
 mod common;
 
 use brokk_bifrost::AnalyzerConfig;
-use brokk_bifrost::analyzer::structural::{AstQuery, SearchAstOutput, execute};
+use brokk_bifrost::analyzer::structural::{CodeQuery, CodeQueryResult, execute};
 use brokk_bifrost::{Language, WorkspaceAnalyzer};
 use common::InlineTestProject;
 use serde_json::json;
@@ -42,12 +42,12 @@ def helper():
 compute = lambda x: x + retries
 "#;
 
-fn run_query(query: serde_json::Value) -> SearchAstOutput {
+fn run_query(query: serde_json::Value) -> CodeQueryResult {
     let project = InlineTestProject::with_language(Language::Python)
         .file("src/app.py", APP_PY)
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
-    let query = AstQuery::from_json(&query).expect("query should parse");
+    let query = CodeQuery::from_json(&query).expect("query should parse");
     execute(workspace.analyzer(), &query)
 }
 
@@ -127,7 +127,7 @@ def run(x, y):
         )
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
-    let query = AstQuery::from_json(&json!({
+    let query = CodeQuery::from_json(&json!({
         "match": {
             "kind": "call",
             "callee": { "name": "pair" },

@@ -4,11 +4,11 @@ use crate::analyzer::structural::kinds::ALL_ROLES;
 use crate::analyzer::structural::{NormalizedKind, Role};
 use serde_json::{Value, json};
 
-fn parse(json: Value) -> Result<AstQuery, QueryError> {
-    AstQuery::from_json(&json)
+fn parse(json: Value) -> Result<CodeQuery, QueryError> {
+    CodeQuery::from_json(&json)
 }
 
-fn parse_ok(json: Value) -> AstQuery {
+fn parse_ok(json: Value) -> CodeQuery {
     parse(json).expect("query should parse")
 }
 
@@ -105,10 +105,10 @@ fn parses_result_detail_mode() {
         "match": { "kind": "call" },
         "result_detail": "full"
     }));
-    assert_eq!(query.result_detail, SearchAstResultDetail::Full);
+    assert_eq!(query.result_detail, CodeQueryResultDetail::Full);
 
     let defaulted = parse_ok(json!({ "match": { "kind": "call" } }));
-    assert_eq!(defaulted.result_detail, SearchAstResultDetail::Compact);
+    assert_eq!(defaulted.result_detail, CodeQueryResultDetail::Compact);
 
     let error = error_of(json!({
         "match": { "kind": "call" },

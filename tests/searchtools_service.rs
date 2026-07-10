@@ -159,7 +159,7 @@ fn python_boundary_returns_structured_json() {
 }
 
 #[test]
-fn service_normalizes_search_ast_absolute_where_globs() {
+fn service_normalizes_query_code_absolute_where_globs() {
     let root = fixture_root();
     let service = SearchToolsService::new_without_semantic_index(root.clone()).unwrap();
     let arguments = serde_json::json!({
@@ -169,8 +169,8 @@ fn service_normalizes_search_ast_absolute_where_globs() {
     });
 
     let value = service
-        .call_tool_value("search_ast", arguments)
-        .expect("search_ast should accept an absolute where path");
+        .call_tool_value("query_code", arguments)
+        .expect("query_code should accept an absolute where path");
 
     assert_eq!(value["matches"][0]["path"], "A.java", "payload: {value}");
     assert_eq!(value["matches"][0]["kind"], "class", "payload: {value}");

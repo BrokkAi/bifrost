@@ -27,7 +27,7 @@ from .models import (
     MostRelevantFilesResult,
     RefreshResult,
     RenameSymbolResult,
-    SearchAstResult,
+    CodeQueryResult,
     SearchFileContentsResult,
     SemanticSearchResult,
     SemanticSearchStatus,
@@ -179,7 +179,7 @@ class SearchToolsClient:
             rendered_text=payload.rendered_text,
         )
 
-    def search_ast(
+    def query_code(
         self,
         pattern: dict[str, Any],
         *,
@@ -190,10 +190,11 @@ class SearchToolsClient:
         limit: int | None = None,
         result_detail: str | None = None,
         schema_version: int | None = None,
-    ) -> SearchAstResult:
-        """Search normalized AST structure across supported languages.
+    ) -> CodeQueryResult:
+        """Query normalized code structure across supported languages.
 
-        This is the experimental v1 ``search_ast`` surface. ``pattern`` is
+        Version 1 evaluates normalized syntactic structure. It does not yet
+        traverse call graphs, control flow, or data flow. ``pattern`` is
         sent as the tool's ``match`` object. ``where`` accepts project-relative
         globs or absolute in-workspace paths/globs.
         ``result_detail="full"`` includes byte/line/column ranges and stable
@@ -215,8 +216,8 @@ class SearchToolsClient:
             arguments["result_detail"] = result_detail
         if schema_version is not None:
             arguments["schema_version"] = schema_version
-        payload = self._call_tool_payload("search_ast", arguments)
-        return SearchAstResult.from_dict(
+        payload = self._call_tool_payload("query_code", arguments)
+        return CodeQueryResult.from_dict(
             payload.structured,
             rendered_text=payload.rendered_text,
         )

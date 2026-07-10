@@ -1,4 +1,4 @@
-//! Planner-level tests for `search_ast` (issue #328, ExecPlan milestone 3):
+//! Planner-level tests for `query_code` (issue #328, ExecPlan milestone 3):
 //! anchor pruning skips files that provably cannot match, the facts cache
 //! serves repeated queries without re-extraction, negation never prunes, and
 //! language scoping and capability diagnostics stay deterministic. Extraction counts
@@ -8,7 +8,7 @@
 mod common;
 
 use brokk_bifrost::analyzer::structural::{
-    AstQuery, SearchAstExecutionLimits, SearchAstOutput, execute, execute_with_limits,
+    CodeQuery, CodeQueryExecutionLimits, CodeQueryResult, execute, execute_with_limits,
 };
 use brokk_bifrost::{
     AnalyzerConfig, CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
@@ -37,17 +37,17 @@ fn python_workspace() -> (common::BuiltInlineTestProject, WorkspaceAnalyzer) {
     (project, workspace)
 }
 
-fn run(analyzer: &dyn IAnalyzer, query: serde_json::Value) -> SearchAstOutput {
-    let query = AstQuery::from_json(&query).expect("query should parse");
+fn run(analyzer: &dyn IAnalyzer, query: serde_json::Value) -> CodeQueryResult {
+    let query = CodeQuery::from_json(&query).expect("query should parse");
     execute(analyzer, &query)
 }
 
 fn run_with_limits(
     analyzer: &dyn IAnalyzer,
     query: serde_json::Value,
-    limits: SearchAstExecutionLimits,
-) -> SearchAstOutput {
-    let query = AstQuery::from_json(&query).expect("query should parse");
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResult {
+    let query = CodeQuery::from_json(&query).expect("query should parse");
     execute_with_limits(analyzer, &query, limits)
 }
 
@@ -166,7 +166,7 @@ impl IAnalyzer for NoProviderAnalyzer {
     }
 }
 
-fn assert_truncation_diagnostic(output: &SearchAstOutput, limit: usize) {
+fn assert_truncation_diagnostic(output: &CodeQueryResult, limit: usize) {
     assert!(
         output
             .diagnostics
@@ -185,7 +185,7 @@ fn assert_truncation_diagnostic(output: &SearchAstOutput, limit: usize) {
     );
 }
 
-fn has_broad_query_diagnostic(output: &SearchAstOutput) -> bool {
+fn has_broad_query_diagnostic(output: &CodeQueryResult) -> bool {
     output.diagnostics.iter().any(|diagnostic| {
         diagnostic.language == "workspace"
             && diagnostic.message.contains("broad unanchored")
@@ -195,7 +195,7 @@ fn has_broad_query_diagnostic(output: &SearchAstOutput) -> bool {
     })
 }
 
-fn assert_broad_query_diagnostic(output: &SearchAstOutput) {
+fn assert_broad_query_diagnostic(output: &CodeQueryResult) {
     assert!(
         has_broad_query_diagnostic(output),
         "missing broad-query diagnostic: {:?}",
@@ -203,7 +203,7 @@ fn assert_broad_query_diagnostic(output: &SearchAstOutput) {
     );
 }
 
-fn assert_no_broad_query_diagnostic(output: &SearchAstOutput) {
+fn assert_no_broad_query_diagnostic(output: &CodeQueryResult) {
     assert!(
         !has_broad_query_diagnostic(output),
         "unexpected broad-query diagnostic: {:?}",
@@ -424,7 +424,7 @@ fn execution_budget_bounds_unanchored_no_match_queries() {
             "match": { "kind": "call", "text": { "regex": "a^" } },
             "limit": 1
         }),
-        SearchAstExecutionLimits {
+        CodeQueryExecutionLimits {
             max_scanned_files: 1,
             max_scanned_source_bytes: usize::MAX,
             max_fact_nodes: usize::MAX,

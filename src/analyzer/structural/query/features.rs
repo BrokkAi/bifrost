@@ -1,7 +1,7 @@
-use super::ir::{AstQuery, Pattern};
+use super::ir::{CodeQuery, Pattern};
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 
-impl AstQuery {
+impl CodeQuery {
     pub(crate) fn referenced_kinds(&self) -> Vec<NormalizedKind> {
         let mut kinds = Vec::new();
         collect_referenced_kinds(&self.root, &mut kinds);

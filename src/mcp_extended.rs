@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
-    "search_ast",
+    "query_code",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "find_filenames",
@@ -46,7 +46,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     );
     vec![
         tool_descriptor(
-            "search_ast",
+            "query_code",
             "Search code structure across languages using normalized node kinds instead of grammar-specific node names. Finds shapes like calls to a named function, assignments of literals, decorated functions, or imports of a module, with named captures and enclosing symbols. This is syntactic structural search, not type or alias resolution: constructor calls are included in call searches where adapters support them, positional args match as an ordered subsequence, and unsupported roles/kinds are reported in diagnostics. Use scan_usages instead when you already know the exact symbol; use this for structural shapes.",
             json!({
                 "type": "object",

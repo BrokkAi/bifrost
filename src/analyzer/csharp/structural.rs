@@ -1,4 +1,4 @@
-//! C# structural spec for `search_ast`.
+//! C# structural spec for `query_code`.
 
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{

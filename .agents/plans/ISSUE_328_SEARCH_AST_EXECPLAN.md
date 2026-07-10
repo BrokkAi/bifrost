@@ -55,6 +55,10 @@ The query language is **JSON-first**. An S-expression surface for humans in a sh
 
 ## Decision Log
 
+- Decision: The public query engine is renamed from `search_ast` / `AstQuery` to `query_code` / `CodeQuery` as part of issue #449. The version-1 schema, structural matcher, RQL syntax, and structural provider boundary remain unchanged; no compatibility alias is retained. Future call/type/control/data-flow work may become lazily activated query facets, but those fields are outside the rename/reference work.
+  Rationale: normalized structural facts are already not raw AST nodes, and the user's long-term goal is one composable code-query surface. Renaming before completing the durable reference avoids teaching and propagating a name that would become inaccurate as richer facets arrive.
+  Date/Author: 2026-07-10 / dave + Codex. Implementation is tracked in `.agents/plans/issue-449-query-code-reference.md`.
+
 - Decision: One canonical typed IR (`AstQuery` / `Pattern`); JSON and (later) S-expressions are peer *frontends* that parse into it. Neither syntax is the semantic authority.
   Rationale: agreed in the issue thread; avoids two matchers and makes `parse(json) == parse(sexp)` a testable property.
   Date/Author: 2026-07-02 / dave + issue thread.

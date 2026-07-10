@@ -19,12 +19,12 @@ pub const MAX_KWARG_NAME_LENGTH: usize = 128;
 pub const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchAstResultDetail {
+pub enum CodeQueryResultDetail {
     Compact,
     Full,
 }
 
-impl SearchAstResultDetail {
+impl CodeQueryResultDetail {
     pub fn label(self) -> &'static str {
         match self {
             Self::Compact => "compact",
@@ -48,7 +48,7 @@ impl SearchAstResultDetail {
 /// A structural query: one root pattern plus containment constraints and
 /// workspace scoping. This is the semantic authority both syntaxes parse into.
 #[derive(Debug, Clone)]
-pub struct AstQuery {
+pub struct CodeQuery {
     pub schema_version: u64,
     /// Path globs relative to the workspace root; empty means all files.
     pub where_globs: Vec<glob::Pattern>,
@@ -60,7 +60,7 @@ pub struct AstQuery {
     /// Verifier-only negative containment: never used for candidate pruning.
     pub not_inside: Option<Pattern>,
     pub limit: usize,
-    pub result_detail: SearchAstResultDetail,
+    pub result_detail: CodeQueryResultDetail,
 }
 
 /// Predicate over a string attribute of a fact (its name or source text).

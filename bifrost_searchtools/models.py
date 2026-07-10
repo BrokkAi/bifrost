@@ -151,7 +151,7 @@ class SearchSymbolsResult:
 
 
 @dataclass(frozen=True)
-class SearchAstRange:
+class CodeQueryRange:
     start_byte: int
     end_byte: int
     start_line: int
@@ -160,7 +160,7 @@ class SearchAstRange:
     end_column: int
 
     @classmethod
-    def from_dict(cls, data: dict) -> SearchAstRange:
+    def from_dict(cls, data: dict) -> CodeQueryRange:
         return cls(
             start_byte=int(data["start_byte"]),
             end_byte=int(data["end_byte"]),
@@ -172,20 +172,20 @@ class SearchAstRange:
 
 
 @dataclass(frozen=True)
-class SearchAstCapture:
+class CodeQueryCapture:
     name: str
     text: str
     start_line: int
-    range: SearchAstRange | None = None
+    range: CodeQueryRange | None = None
     kind: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> SearchAstCapture:
+    def from_dict(cls, data: dict) -> CodeQueryCapture:
         return cls(
             name=data["name"],
             text=data["text"],
             start_line=int(data["start_line"]),
-            range=SearchAstRange.from_dict(data["range"]) if "range" in data else None,
+            range=CodeQueryRange.from_dict(data["range"]) if "range" in data else None,
             kind=data.get("kind"),
         )
 
@@ -194,22 +194,22 @@ class SearchAstCapture:
 
 
 @dataclass(frozen=True)
-class SearchAstMatch:
+class CodeQueryMatch:
     path: str
     language: str
     kind: str
     start_line: int
     end_line: int
     text: str
-    captures: list[SearchAstCapture]
+    captures: list[CodeQueryCapture]
     id: str | None = None
-    node_range: SearchAstRange | None = None
-    decorated_range: SearchAstRange | None = None
-    decorator_ranges: list[SearchAstRange] = field(default_factory=list)
+    node_range: CodeQueryRange | None = None
+    decorated_range: CodeQueryRange | None = None
+    decorator_ranges: list[CodeQueryRange] = field(default_factory=list)
     enclosing_symbol: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> SearchAstMatch:
+    def from_dict(cls, data: dict) -> CodeQueryMatch:
         return cls(
             path=data["path"],
             language=data["language"],
@@ -218,17 +218,17 @@ class SearchAstMatch:
             end_line=int(data["end_line"]),
             text=data["text"],
             captures=[
-                SearchAstCapture.from_dict(item) for item in data.get("captures", [])
+                CodeQueryCapture.from_dict(item) for item in data.get("captures", [])
             ],
             id=data.get("id"),
-            node_range=SearchAstRange.from_dict(data["node_range"])
+            node_range=CodeQueryRange.from_dict(data["node_range"])
             if "node_range" in data
             else None,
-            decorated_range=SearchAstRange.from_dict(data["decorated_range"])
+            decorated_range=CodeQueryRange.from_dict(data["decorated_range"])
             if "decorated_range" in data
             else None,
             decorator_ranges=[
-                SearchAstRange.from_dict(item)
+                CodeQueryRange.from_dict(item)
                 for item in data.get("decorator_ranges", [])
             ],
             enclosing_symbol=data.get("enclosing_symbol"),
@@ -250,12 +250,12 @@ class SearchAstMatch:
 
 
 @dataclass(frozen=True)
-class SearchAstDiagnostic:
+class CodeQueryDiagnostic:
     language: str
     message: str
 
     @classmethod
-    def from_dict(cls, data: dict) -> SearchAstDiagnostic:
+    def from_dict(cls, data: dict) -> CodeQueryDiagnostic:
         return cls(language=data["language"], message=data["message"])
 
     def render_text(self) -> str:
@@ -263,19 +263,19 @@ class SearchAstDiagnostic:
 
 
 @dataclass(frozen=True)
-class SearchAstResult:
-    matches: list[SearchAstMatch]
+class CodeQueryResult:
+    matches: list[CodeQueryMatch]
     truncated: bool
-    diagnostics: list[SearchAstDiagnostic] = field(default_factory=list)
+    diagnostics: list[CodeQueryDiagnostic] = field(default_factory=list)
     rendered_text: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict, rendered_text: str | None = None) -> SearchAstResult:
+    def from_dict(cls, data: dict, rendered_text: str | None = None) -> CodeQueryResult:
         return cls(
-            matches=[SearchAstMatch.from_dict(item) for item in data.get("matches", [])],
+            matches=[CodeQueryMatch.from_dict(item) for item in data.get("matches", [])],
             truncated=bool(data["truncated"]),
             diagnostics=[
-                SearchAstDiagnostic.from_dict(item)
+                CodeQueryDiagnostic.from_dict(item)
                 for item in data.get("diagnostics", [])
             ],
             rendered_text=rendered_text,
