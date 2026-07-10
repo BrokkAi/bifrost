@@ -17,8 +17,8 @@ Users can observe the result without restarting Bifrost: a new formatter command
 - [x] (2026-07-10 07:43Z) Implemented dynamic registration, configuration pulls, legacy pushed snapshots, newest-response-wins handling, and strict full-snapshot parsing. Evidence: six `lsp::server::tests` unit tests and `bifrost_lsp_server_runtime_configuration_registers_and_pulls_bifrost_section` pass.
 - [x] (2026-07-10 07:43Z) Refactored runtime state to preserve editor roots separately, normalize configuration, prepare replacement analyzers transactionally, replay overlays, cancel formatter jobs before commit, and clear stale diagnostic state.
 - [x] (2026-07-10 07:49Z) Added Rust unit and end-to-end coverage for registration/pull, direct and nested legacy snapshots, newest-pull ordering, malformed/error retention, editor-root restoration, exclusions, stale diagnostics, overlay replay, formatter replacement, formatter cancellation, and Windows handle cleanup. Evidence: six server unit tests and seven macOS runtime-configuration integration tests pass; the Windows-only `cmd.exe` cleanup case is compiled and exercised by Windows CI.
-- [ ] Update the VS Code extension to return trusted runtime snapshots and avoid restart prompts for live settings.
-- [ ] Update public and internal documentation.
+- [x] (2026-07-10 07:55Z) Updated the VS Code extension so startup and `workspace/configuration` pulls share one complete settings builder, workspace-scoped formatter rules remain excluded, and only launch-setting changes prompt for restart. Evidence: all 29 extension tests pass.
+- [x] (2026-07-10 07:55Z) Documented full-snapshot precedence, pull/legacy shapes, rebuild and diagnostic behavior, live VS Code settings, and the LSP 3.18 reference; updated the API audit. Evidence: Astro check and production build pass, and both changed pages were inspected in the rendered local preview.
 - [ ] Run focused and full validation, perform self-review, and record the final outcome.
 
 ## Surprises & Discoveries
@@ -77,7 +77,7 @@ Users can observe the result without restarting Bifrost: a new formatter command
 
 ## Outcomes & Retrospective
 
-Implementation has not started yet. Update this section after every milestone and at completion with behavior delivered, validation evidence, remaining gaps, and any follow-up issues.
+The protocol, transactional runtime state, behavioral regressions, VS Code integration, and documentation milestones are complete. Bifrost now applies the three existing editor settings without a restart while retaining initialization options as startup state and preserving the formatter trust boundary. Final full-repository formatting, linting, and self-review remain before completion.
 
 ## Context and Orientation
 
@@ -190,3 +190,5 @@ The VS Code settings builder returns a complete `BifrostInitializationOptions` w
 Plan update (2026-07-10 07:43Z): recorded completion of the protocol and state milestones plus the `initialize_finish` lifecycle discovery that moved dynamic registration out of ordinary notification dispatch.
 
 Plan update (2026-07-10 07:49Z): recorded the completed behavioral test matrix and the persisted-overlay replay fix discovered by the end-to-end rebuild test.
+
+Plan update (2026-07-10 07:55Z): recorded the completed VS Code and documentation milestones, including extension tests, Astro validation, and rendered-page inspection.

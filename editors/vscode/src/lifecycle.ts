@@ -20,9 +20,9 @@ export interface BifrostServerHandle {
 }
 
 export interface BifrostInitializationOptions {
-  roots?: string[];
-  exclude?: string[];
-  formatterCommands?: BifrostFormatterCommandRule[];
+  roots: string[];
+  exclude: string[];
+  formatterCommands: BifrostFormatterCommandRule[];
 }
 
 export interface BifrostFormatterCommandRule {
@@ -32,6 +32,17 @@ export interface BifrostFormatterCommandRule {
   command: string;
   args?: string[];
   cwd?: string;
+}
+
+export interface BifrostFormatterCommandInspection {
+  globalValue?: BifrostFormatterCommandRule[];
+  workspaceValue?: BifrostFormatterCommandRule[];
+  workspaceFolderValue?: BifrostFormatterCommandRule[];
+}
+
+export interface TrustedFormatterCommandSelection {
+  rules: BifrostFormatterCommandRule[];
+  ignoredWorkspaceRules: boolean;
 }
 
 export interface BifrostMcpConfig {
@@ -271,6 +282,42 @@ export function parsePathSettings(raw: string[], workspaceRoot: string): string[
     .map((value) => value.trim())
     .filter(Boolean)
     .map((value) => (path.isAbsolute(value) ? value : path.join(workspaceRoot, value)));
+}
+
+export function buildBifrostInitializationOptions(
+  workspaceRoot: string,
+  roots: string[],
+  exclude: string[],
+  formatterCommands: BifrostFormatterCommandRule[]
+): BifrostInitializationOptions {
+  return {
+    roots: parsePathSettings(roots, workspaceRoot),
+    exclude: parsePathSettings(exclude, workspaceRoot),
+    formatterCommands
+  };
+}
+
+export function selectTrustedFormatterCommands(
+  inspected: BifrostFormatterCommandInspection | undefined
+): TrustedFormatterCommandSelection {
+  if (!inspected) {
+    return { rules: [], ignoredWorkspaceRules: false };
+  }
+  const ignoredWorkspaceRules =
+    (inspected.workspaceValue?.length ?? 0) > 0 ||
+    (inspected.workspaceFolderValue?.length ?? 0) > 0;
+  return {
+    rules: inspected.globalValue ?? [],
+    ignoredWorkspaceRules
+  };
+}
+
+export function bifrostConfigurationChangeRequiresRestart(
+  affectsConfiguration: (section: string) => boolean
+): boolean {
+  return ["serverPath", "launchMode", "extraArgs", "debug", "slowRequestMs"].some((setting) =>
+    affectsConfiguration(`bifrost.${setting}`)
+  );
 }
 
 export function formatError(error: unknown): string {

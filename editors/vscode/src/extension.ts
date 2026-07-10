@@ -12,6 +12,8 @@ import {
   BifrostLaunchConfig,
   BifrostFormatterCommandRule,
   BifrostInitializationOptions,
+  bifrostConfigurationChangeRequiresRestart,
+  buildBifrostInitializationOptions,
   buildLaunchConfig,
   buildMcpConfig,
   buildMcpHostCommands,
@@ -20,7 +22,7 @@ import {
   LaunchMode,
   appendBifrostGitignoreEntry,
   parseExtraArgs,
-  parsePathSettings,
+  selectTrustedFormatterCommands,
   sourceFileWatchers,
   spawnBifrostServer,
   supportedWorkspaceRoot,
@@ -72,7 +74,12 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("bifrost") && client?.state === State.Running) {
+      if (
+        client?.state === State.Running &&
+        bifrostConfigurationChangeRequiresRestart((section) =>
+          event.affectsConfiguration(section)
+        )
+      ) {
         void promptRestartAfterConfigurationChange(context);
       }
     })
@@ -124,19 +131,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
   const debug = config.get<boolean>("debug") ?? false;
   const slowRequestMs = config.get<number>("slowRequestMs") ?? 2000;
   const extraArgs = parseExtraArgs(config.get<string[]>("extraArgs") ?? []);
-  const roots = parsePathSettings(config.get<string[]>("roots") ?? [], root);
-  const exclude = parsePathSettings(config.get<string[]>("exclude") ?? [], root);
-  const formatterCommands = trustedFormatterCommands(config);
-  const initializationOptions: BifrostInitializationOptions = {};
-  if (roots.length > 0) {
-    initializationOptions.roots = roots;
-  }
-  if (exclude.length > 0) {
-    initializationOptions.exclude = exclude;
-  }
-  if (formatterCommands.length > 0) {
-    initializationOptions.formatterCommands = formatterCommands;
-  }
+  const initializationOptions = currentBifrostRuntimeSettings(root, config);
 
   let launchConfig: BifrostLaunchConfig;
   try {
@@ -199,6 +194,22 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
     ],
     outputChannel,
     initializationOptions,
+    middleware: {
+      workspace: {
+        configuration: async (params, token, next) => {
+          if (params.items.length === 1 && params.items[0].section === "bifrost") {
+            const currentRoot = supportedWorkspaceRoot() ?? root;
+            return [
+              currentBifrostRuntimeSettings(
+                currentRoot,
+                vscode.workspace.getConfiguration("bifrost")
+              )
+            ];
+          }
+          return next(params, token);
+        }
+      }
+    },
     revealOutputChannelOn: RevealOutputChannelOn.Error,
     initializationFailedHandler: (error) => {
       const message = formatError(error);
@@ -250,18 +261,25 @@ function trustedFormatterCommands(
   config: vscode.WorkspaceConfiguration
 ): BifrostFormatterCommandRule[] {
   const inspected = config.inspect<BifrostFormatterCommandRule[]>("formatterCommands");
-  if (!inspected) {
-    return [];
-  }
-  const hasWorkspaceRules =
-    (inspected.workspaceValue?.length ?? 0) > 0 ||
-    (inspected.workspaceFolderValue?.length ?? 0) > 0;
-  if (hasWorkspaceRules) {
+  const selection = selectTrustedFormatterCommands(inspected);
+  if (selection.ignoredWorkspaceRules) {
     log(
       "Ignoring workspace-scoped bifrost.formatterCommands; configure formatter commands in user settings."
     );
   }
-  return inspected.globalValue ?? [];
+  return selection.rules;
+}
+
+function currentBifrostRuntimeSettings(
+  root: string,
+  config: vscode.WorkspaceConfiguration
+): BifrostInitializationOptions {
+  return buildBifrostInitializationOptions(
+    root,
+    config.get<string[]>("roots") ?? [],
+    config.get<string[]>("exclude") ?? [],
+    trustedFormatterCommands(config)
+  );
 }
 
 async function stopClient(options: { updateUi?: boolean } = {}): Promise<void> {
