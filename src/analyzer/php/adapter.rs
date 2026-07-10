@@ -7,6 +7,8 @@ use super::tests::php_contains_tests;
 #[derive(Debug, Clone, Default)]
 pub(super) struct PhpAdapter;
 
+impl crate::analyzer::StorageLanguageAdapter for PhpAdapter {}
+
 impl LanguageAdapter for PhpAdapter {
     fn language(&self) -> Language {
         Language::Php

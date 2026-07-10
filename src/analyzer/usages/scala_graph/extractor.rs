@@ -789,7 +789,7 @@ fn receiver_has_member(
         .definitions(receiver_owner)
         .find(|unit| unit.is_class())
         .is_some_and(|owner| {
-            ctx.scala.get_ancestors(owner).into_iter().any(|ancestor| {
+            ctx.scala.get_ancestors(&owner).into_iter().any(|ancestor| {
                 receiver_has_direct_member(&ancestor.fq_name(), member, call_arity, ctx)
             })
         })
@@ -804,7 +804,7 @@ fn receiver_has_direct_member(
     let member_fqn = format!("{}.{}", scala_normalized_fq_name(receiver_owner), member);
     ctx.analyzer
         .definitions(&member_fqn)
-        .any(|unit| receiver_member_applies(unit, call_arity, ctx))
+        .any(|unit| receiver_member_applies(&unit, call_arity, ctx))
 }
 
 fn receiver_member_applies(unit: &CodeUnit, call_arity: Option<usize>, ctx: &ScanCtx<'_>) -> bool {

@@ -215,14 +215,11 @@ impl<'a> RubySemanticIndex<'a> {
 
         candidates.into_iter().find_map(|candidate| {
             let autoload_files = self.ruby.autoload_visible_files_for_constant(&candidate);
-            self.analyzer
-                .definitions(&candidate)
-                .find(|unit| {
-                    visible_files.contains(unit.source())
-                        || unit.source() == file
-                        || autoload_files.contains(unit.source())
-                })
-                .cloned()
+            self.analyzer.definitions(&candidate).find(|unit| {
+                visible_files.contains(unit.source())
+                    || unit.source() == file
+                    || autoload_files.contains(unit.source())
+            })
         })
     }
 

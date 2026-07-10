@@ -30,7 +30,7 @@ pub(super) fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     if enclosing == ctx.spec.target
-        && range_within_any(ctx.analyzer.ranges(&ctx.spec.target), &range)
+        && range_within_any(&ctx.analyzer.ranges(&ctx.spec.target), &range)
     {
         return;
     }

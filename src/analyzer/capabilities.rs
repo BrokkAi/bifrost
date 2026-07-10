@@ -149,7 +149,7 @@ where
         .all_declarations()
         .filter(|candidate| candidate.is_class())
     {
-        for ancestor in provider.get_direct_ancestors(candidate) {
+        for ancestor in provider.get_direct_ancestors(&candidate) {
             reverse
                 .entry(ancestor.fq_name())
                 .or_default()

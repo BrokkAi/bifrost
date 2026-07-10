@@ -11,6 +11,8 @@ use super::{
 #[derive(Debug, Clone, Default)]
 pub(super) struct ScalaAdapter;
 
+impl crate::analyzer::StorageLanguageAdapter for ScalaAdapter {}
+
 impl LanguageAdapter for ScalaAdapter {
     fn language(&self) -> Language {
         Language::Scala

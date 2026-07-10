@@ -676,12 +676,12 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let mut units = self
             .analyzer
             .declarations(self.file)
+            .into_iter()
             .filter(|unit| {
                 unit.is_class()
                     && unit.identifier() == name
                     && crate::analyzer::common::language_for_file(unit.source()) == self.language
             })
-            .cloned()
             .collect::<Vec<_>>();
         sort_units(&mut units);
         units.dedup();
@@ -695,7 +695,6 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .definitions(&fqn)
             .filter(|unit| unit.source() == owner.source())
             .filter(|unit| unit.is_function() || unit.is_field())
-            .cloned()
             .collect::<Vec<_>>();
         sort_units(&mut units);
         units.dedup();

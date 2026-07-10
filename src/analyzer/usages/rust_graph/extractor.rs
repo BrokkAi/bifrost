@@ -867,11 +867,11 @@ fn resolved_type_node_fqn(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> Optio
 }
 
 fn fqn_matches_owner(rust: &RustAnalyzer, fqn: &str, owner: &CodeUnit) -> bool {
-    rust.definitions(fqn).any(|unit| unit == owner)
+    rust.definitions(fqn).any(|unit| &unit == owner)
 }
 
 fn field_declared_type_matches_receiver(member: &CodeUnit, ctx: &MemberScanCtx<'_>) -> bool {
-    let Some(range) = ctx.analyzer.ranges(member).iter().next() else {
+    let Some(range) = ctx.analyzer.ranges(member).into_iter().next() else {
         return false;
     };
     let Ok(source) = member.source().read_to_string() else {
@@ -1002,7 +1002,7 @@ fn self_like_constructor_returns(
             }
         })
         .filter_map(|code_unit| {
-            let range = rust.ranges(&code_unit).iter().next()?;
+            let range = rust.ranges(&code_unit).into_iter().next()?;
             let function =
                 node_for_exact_range(tree.root_node(), range.start_byte, range.end_byte)?;
             let return_type = function_return_type_node(function)?;

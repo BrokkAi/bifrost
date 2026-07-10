@@ -4,8 +4,9 @@ use super::declarations::{
 };
 use super::tests::python_source_contains_tests;
 use super::*;
-use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::{LanguageAdapter, Range, StorageLanguageAdapter};
+use crate::text_utils::compute_line_starts;
 use std::sync::LazyLock;
 use tree_sitter::{Language as TsLanguage, Tree};
 /// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
@@ -28,6 +29,54 @@ static PYTHON_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
 
 #[derive(Debug, Clone, Default)]
 pub struct PythonAdapter;
+
+impl StorageLanguageAdapter for PythonAdapter {
+    fn storage_content_qualifier(&self, _code_unit: &CodeUnit) -> String {
+        String::new()
+    }
+
+    fn storage_file_content_qualifier(&self, _package_name: &str) -> String {
+        String::new()
+    }
+
+    fn hydrate_content_qualifier(&self, _content_qualifier: &str, file: &ProjectFile) -> String {
+        python_module_name(file)
+    }
+
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        !code_unit.is_file_scope() && !code_unit.is_module()
+    }
+
+    fn synthesize_hydrated_units(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
+    ) {
+        let module_fq = python_module_name(file);
+        let Some(module) = module_code_unit(file, &module_fq) else {
+            return;
+        };
+        state.top_level_declarations.insert(0, module.clone());
+        state.declarations.insert(module.clone());
+        state.ranges.entry(module.clone()).or_default().push(Range {
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 1,
+            end_line: compute_line_starts(source).len(),
+        });
+        let module_children: Vec<_> = state
+            .top_level_declarations
+            .iter()
+            .filter(|unit| !unit.is_module() && !unit.is_file_scope())
+            .filter(|unit| !unit.short_name().contains(['.', '$']))
+            .cloned()
+            .collect();
+        if !module_children.is_empty() {
+            state.children.insert(module, module_children);
+        }
+    }
+}
 
 impl LanguageAdapter for PythonAdapter {
     fn language(&self) -> Language {

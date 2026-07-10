@@ -8,6 +8,8 @@ use super::{csharp_normalize_full_name, csharp_signature_arity, csharp_signature
 #[derive(Debug, Clone, Default)]
 pub(super) struct CSharpAdapter;
 
+impl crate::analyzer::StorageLanguageAdapter for CSharpAdapter {}
+
 impl LanguageAdapter for CSharpAdapter {
     fn language(&self) -> Language {
         Language::CSharp

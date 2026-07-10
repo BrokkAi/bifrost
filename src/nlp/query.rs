@@ -359,7 +359,11 @@ fn bm25_symbol_candidates(
     query: &str,
     limit: usize,
 ) -> Result<Vec<(String, f64)>, String> {
-    let paths: Vec<String> = analyzer.analyzed_files().map(rel_path_string).collect();
+    let paths: Vec<String> = analyzer
+        .analyzed_files()
+        .into_iter()
+        .map(rel_path_string)
+        .collect();
     let symbols: Vec<String> = analyzer
         .all_declarations()
         .map(|unit| unit.fq_name())

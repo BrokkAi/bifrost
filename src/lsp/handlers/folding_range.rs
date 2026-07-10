@@ -26,9 +26,10 @@ pub fn handle(
     let mut folds: BTreeSet<(u32, u32)> = BTreeSet::new();
     for cu in analyzer
         .top_level_declarations(&project_file)
+        .into_iter()
         .filter(|cu| !cu.is_anonymous())
     {
-        collect_folds(analyzer, cu, &content, &line_starts, &mut folds);
+        collect_folds(analyzer, &cu, &content, &line_starts, &mut folds);
     }
 
     Some(
@@ -56,7 +57,7 @@ fn collect_folds(
     let mut stack = vec![code_unit.clone()];
     while let Some(unit) = stack.pop() {
         for range in analyzer.ranges(&unit) {
-            let lsp = byte_range_to_lsp_range(content, line_starts, range);
+            let lsp = byte_range_to_lsp_range(content, line_starts, &range);
             // LSP foldingRange uses line numbers; single-line spans (block headers
             // like `class Foo {}` on one line) are not foldable and are dropped.
             if lsp.end.line > lsp.start.line {

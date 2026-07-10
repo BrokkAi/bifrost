@@ -142,8 +142,8 @@ fn signature_declared_type_fq_name(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
 ) -> Option<String> {
-    let raw = analyzer
-        .signatures(unit)
+    let signatures = analyzer.signatures(unit);
+    let raw = signatures
         .iter()
         .find_map(|signature| php_signature_return_type_text(signature))?;
     if matches!(raw, "self" | "static") {

@@ -2521,7 +2521,7 @@ pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>)
             let mut elements = Vec::new();
             for code_unit in analyzer.top_level_declarations(&file) {
                 elements.extend(summary_elements_for_code_unit_in_file(
-                    analyzer, code_unit, &file,
+                    analyzer, &code_unit, &file,
                 ));
             }
 
@@ -2851,8 +2851,8 @@ fn excluded_test_files(
     }
     let set: HashSet<ProjectFile> = analyzer
         .analyzed_files()
+        .into_iter()
         .filter(|file| analyzer.contains_tests(file))
-        .cloned()
         .collect();
     Some(Arc::new(set))
 }
@@ -3685,8 +3685,8 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     let path_scoped_candidates = query_scope.path_filter.as_ref().map(|filter| {
         let files: HashSet<ProjectFile> = analyzer
             .analyzed_files()
+            .into_iter()
             .filter(|file| filter.matches(file))
-            .cloned()
             .collect();
         ExplicitCandidateProvider::new(Arc::new(files))
     });
@@ -4145,7 +4145,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         if unit.is_synthetic() || !(unit.is_class() || unit.is_callable()) {
             continue;
         }
-        let ecosystem = Ecosystem::of(language_for_target(unit));
+        let ecosystem = Ecosystem::of(language_for_target(&unit));
         let scope = ecosystem
             .is_module_scoped()
             .then(|| rel_path_string(unit.source()));
@@ -6041,7 +6041,7 @@ fn summary_elements_for_code_unit(
             if child.is_anonymous() {
                 continue;
             }
-            elements.extend(summary_elements_for_code_unit(analyzer, child));
+            elements.extend(summary_elements_for_code_unit(analyzer, &child));
         }
     }
     elements
@@ -6059,7 +6059,7 @@ fn summary_elements_for_code_unit_in_file(
                 continue;
             }
             elements.extend(summary_elements_for_code_unit_in_file(
-                analyzer, child, file,
+                analyzer, &child, file,
             ));
         }
     }
@@ -6234,7 +6234,7 @@ fn source_blocks_for_code_unit(
         let mut grouped = Vec::new();
         for candidate in analyzer.definitions(&code_unit.fq_name()) {
             if candidate.source() == code_unit.source() {
-                grouped.extend(analyzer.ranges(candidate).iter().copied());
+                grouped.extend(analyzer.ranges(&candidate));
             }
         }
         grouped
@@ -6451,7 +6451,7 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Resol
     if !globs.is_empty() {
         let glob_matches: BTreeSet<_> = analyzer
             .analyzed_files()
-            .cloned()
+            .into_iter()
             .collect::<Vec<_>>()
             .into_par_iter()
             .filter(|file| {
@@ -6470,14 +6470,14 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Resol
 
 fn resolve_directory_target(analyzer: &dyn IAnalyzer, target: &str) -> Vec<ProjectFile> {
     if target == "." {
-        return analyzer.analyzed_files().cloned().collect();
+        return analyzer.analyzed_files().into_iter().collect();
     }
     let normalized = target.trim_end_matches('/');
     let prefix = format!("{normalized}/");
     let fs_matches: Vec<_> = analyzer
         .analyzed_files()
+        .into_iter()
         .filter(|file| rel_path_string(file).starts_with(&prefix))
-        .cloned()
         .collect();
     if !fs_matches.is_empty() {
         return fs_matches;
@@ -6662,7 +6662,8 @@ fn unique_absolute_suffix_match(analyzer: &dyn IAnalyzer, input: &str) -> Option
     let normalized = normalize_pattern(input);
     let matches: Vec<_> = analyzer
         .analyzed_files()
-        .map(rel_path_string)
+        .into_iter()
+        .map(|file| rel_path_string(&file))
         .filter(|relative| normalized.ends_with(relative))
         .collect();
     match matches.as_slice() {
@@ -6962,9 +6963,9 @@ mod tests {
             None
         }
 
-        fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        fn analyzed_files(&self) -> Vec<ProjectFile> {
             self.analyzed_files_calls.fetch_add(1, Ordering::Relaxed);
-            Box::new(self.project.files.iter())
+            self.project.files.iter().cloned().collect()
         }
 
         fn languages(&self) -> BTreeSet<Language> {
@@ -6995,7 +6996,7 @@ mod tests {
             &self.project
         }
 
-        fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
             Box::new(std::iter::empty())
         }
 

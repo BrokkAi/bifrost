@@ -472,7 +472,7 @@ fn full_build(
 ) -> BuildResult {
     check_cancelled(shared)?;
     let analyzer = snapshot.analyzer();
-    let files: Vec<ProjectFile> = analyzer.analyzed_files().cloned().collect();
+    let files: Vec<ProjectFile> = analyzer.analyzed_files().into_iter().collect();
     let rel_paths: Vec<String> = files.iter().map(rel_path_string).collect();
 
     let path_to_oid = gitcache::working_tree_oids(repo, &rel_paths).map_err(BuildError::Failed)?;

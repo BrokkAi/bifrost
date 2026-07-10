@@ -41,7 +41,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             return (*cached).clone();
         }
         let target_classes = self
-            .get_declarations(file)
+            .declarations(file)
             .into_iter()
             .filter(|unit| unit.kind() == CodeUnitType::Class)
             .collect::<Vec<_>>();
@@ -99,7 +99,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             return true;
         }
         let target_namespaces: HashSet<String> = self
-            .get_declarations(target)
+            .declarations(target)
             .into_iter()
             .filter(|unit| unit.kind() == CodeUnitType::Class)
             .map(|unit| unit.package_name().to_string())
@@ -113,7 +113,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             .any(|namespace| target_namespaces.contains(&namespace))
             || source_aliases.values().any(|alias_target| {
                 let candidates = self.visible_type_candidates(source_file, alias_target);
-                self.get_declarations(target)
+                self.declarations(target)
                     .into_iter()
                     .filter(|unit| unit.kind() == CodeUnitType::Class)
                     .any(|unit| candidates.contains(&unit))
@@ -140,6 +140,7 @@ impl CSharpAnalyzer {
             for unit in self
                 .inner
                 .top_level_declarations(target)
+                .into_iter()
                 .filter(|unit| unit.kind() == CodeUnitType::Class)
             {
                 by_namespace_and_name

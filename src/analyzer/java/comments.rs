@@ -21,7 +21,7 @@ pub(super) fn collect_java_comment_aggregates(
         let Some(cu) = enclosing_code_unit_by_comment_bytes(analyzer, source, file, cs, ce) else {
             continue;
         };
-        let ranges = analyzer.ranges_of(&cu);
+        let ranges = analyzer.ranges(&cu);
         let Some(range) = ranges
             .iter()
             .filter(|r| {
@@ -74,7 +74,7 @@ fn enclosing_code_unit_by_comment_bytes(
         return None;
     }
     let mut best: Option<(CodeUnit, usize)> = None;
-    for top in analyzer.get_top_level_declarations(file) {
+    for top in analyzer.top_level_declarations(file) {
         if let Some(cand) =
             find_deepest_enclosing_by_comment_bytes(analyzer, source, &top, cs, ce, 0)
             && best.as_ref().map(|b| cand.1 > b.1).unwrap_or(true)
@@ -93,7 +93,7 @@ fn find_deepest_enclosing_by_comment_bytes(
     ce: usize,
     depth: usize,
 ) -> Option<(CodeUnit, usize)> {
-    let ranges = analyzer.ranges_of(cu);
+    let ranges = analyzer.ranges(cu);
     let contains = ranges.iter().any(|r| {
         let cstart = expanded_comment_start(source, r.start_byte);
         cs >= cstart && ce <= r.end_byte
@@ -102,7 +102,7 @@ fn find_deepest_enclosing_by_comment_bytes(
         return None;
     }
     let mut best: (CodeUnit, usize) = (cu.clone(), depth);
-    for child in analyzer.get_direct_children(cu) {
+    for child in analyzer.direct_children(cu) {
         if let Some(cand) =
             find_deepest_enclosing_by_comment_bytes(analyzer, source, &child, cs, ce, depth + 1)
             && cand.1 > best.1
@@ -123,7 +123,7 @@ pub(super) fn build_java_roll_up_stats(
 ) -> CommentDensityStats {
     let own = aggs.get(&cu.fq_name()).copied().unwrap_or((0, 0));
     let span: u32 = analyzer
-        .ranges_of(cu)
+        .ranges(cu)
         .iter()
         .map(|r| (r.end_line.saturating_sub(r.start_line) + 1) as u32)
         .sum();
@@ -143,7 +143,7 @@ pub(super) fn build_java_roll_up_stats(
     let mut rh = own.0;
     let mut ri = own.1;
     let mut rs = span;
-    for child in analyzer.get_direct_children(cu) {
+    for child in analyzer.direct_children(cu) {
         let chs = build_java_roll_up_stats(analyzer, &child, aggs);
         rh += chs.rolled_up_header_comment_lines;
         ri += chs.rolled_up_inline_comment_lines;

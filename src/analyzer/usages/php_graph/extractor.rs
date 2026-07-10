@@ -517,7 +517,7 @@ fn assignment_receiver_type(
             if definitions.next().is_some() {
                 return None;
             }
-            declared_callable_return_type_fq_name(php, analyzer, callable)
+            declared_callable_return_type_fq_name(php, analyzer, &callable)
         }
         "scoped_call_expression" => {
             let (scope, name) = static_member_parts(node)?;
@@ -534,7 +534,7 @@ fn assignment_receiver_type(
             if definitions.next().is_some() {
                 return None;
             }
-            declared_callable_return_type_fq_name(php, analyzer, callable)
+            declared_callable_return_type_fq_name(php, analyzer, &callable)
         }
         "parenthesized_expression" => node
             .named_child(0)
@@ -700,7 +700,7 @@ fn receiver_member_access_type(
     let field = analyzer
         .definitions(&field_fqn)
         .find(|unit| unit.is_field())?;
-    declared_field_type_fq_name(php, analyzer, field)
+    declared_field_type_fq_name(php, analyzer, &field)
 }
 
 #[allow(clippy::too_many_arguments)]

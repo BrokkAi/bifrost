@@ -365,7 +365,6 @@ fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Op
         ctx.analyzer
             .definitions(&format!("{}.{}", owner.fq_name(), name))
             .find(|unit| unit.is_class())
-            .cloned()
     };
     nested(&qualifier_type).or_else(|| {
         ctx.analyzer

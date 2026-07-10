@@ -24,9 +24,7 @@ impl IAnalyzer for EmptyAnalyzer {
         None
     }
 
-    fn all_declarations<'a>(
-        &'a self,
-    ) -> Box<dyn Iterator<Item = &'a crate::analyzer::CodeUnit> + 'a> {
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::analyzer::CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }
 
@@ -55,22 +53,14 @@ impl IAnalyzer for EmptyAnalyzer {
         self.project.as_ref()
     }
 
-    fn get_all_declarations(&self) -> Vec<crate::analyzer::CodeUnit> {
-        Vec::new()
-    }
-
-    fn get_declarations(
+    fn declarations(
         &self,
         _file: &crate::analyzer::ProjectFile,
     ) -> std::collections::BTreeSet<crate::analyzer::CodeUnit> {
         std::collections::BTreeSet::new()
     }
 
-    fn get_definitions(&self, _fq_name: &str) -> Vec<crate::analyzer::CodeUnit> {
-        Vec::new()
-    }
-
-    fn get_direct_children(
+    fn direct_children(
         &self,
         _code_unit: &crate::analyzer::CodeUnit,
     ) -> Vec<crate::analyzer::CodeUnit> {
@@ -81,7 +71,7 @@ impl IAnalyzer for EmptyAnalyzer {
         None
     }
 
-    fn import_statements_of(&self, _file: &crate::analyzer::ProjectFile) -> Vec<String> {
+    fn import_statements(&self, _file: &crate::analyzer::ProjectFile) -> Vec<String> {
         Vec::new()
     }
 
@@ -121,7 +111,7 @@ impl IAnalyzer for EmptyAnalyzer {
         None
     }
 
-    fn ranges_of(&self, _code_unit: &crate::analyzer::CodeUnit) -> Vec<crate::analyzer::Range> {
+    fn ranges(&self, _code_unit: &crate::analyzer::CodeUnit) -> Vec<crate::analyzer::Range> {
         Vec::new()
     }
 

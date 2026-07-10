@@ -27,7 +27,7 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-use adapter::PythonAdapter;
+pub(super) use adapter::PythonAdapter;
 use cache::{
     weight_code_unit_set, weight_code_unit_set_by_unit, weight_code_unit_vec,
     weight_project_file_set,
@@ -146,7 +146,6 @@ impl PythonAnalyzer {
         self.inner
             .definitions(module_fq)
             .find(|code_unit| code_unit.is_module())
-            .cloned()
             .or_else(|| self.module_code_units.get(module_fq).cloned())
     }
 
@@ -393,8 +392,8 @@ impl PythonAnalyzer {
         };
         self.inner
             .direct_children(&module_code_unit)
+            .into_iter()
             .filter(|code_unit| !code_unit.identifier().starts_with('_'))
-            .cloned()
             .collect()
     }
 
@@ -410,9 +409,9 @@ impl PythonAnalyzer {
                 && bound.is_module()
             {
                 let fq_name = format!("{}.{}", bound.fq_name(), tail);
-                return self.inner.definitions(&fq_name).next().cloned();
+                return self.inner.definitions(&fq_name).next();
             }
-            return self.inner.definitions(trimmed).next().cloned();
+            return self.inner.definitions(trimmed).next();
         }
 
         if let Some(bound) = bindings.get(trimmed) {
@@ -423,8 +422,7 @@ impl PythonAnalyzer {
         self.inner
             .definitions(&local_fq_name)
             .next()
-            .cloned()
-            .or_else(|| self.inner.definitions(trimmed).next().cloned())
+            .or_else(|| self.inner.definitions(trimmed).next())
     }
 
     fn render_skeleton_recursive(
@@ -442,10 +440,10 @@ impl PythonAnalyzer {
             }
         }
 
-        let all_children: Vec<_> = self.inner.direct_children(code_unit).collect();
+        let all_children: Vec<_> = self.inner.direct_children(code_unit).into_iter().collect();
         let field_children: Vec<_> = all_children
             .iter()
-            .copied()
+            .cloned()
             .filter(|child| child.is_field())
             .collect();
         let children = if header_only {
@@ -456,7 +454,7 @@ impl PythonAnalyzer {
         if !children.is_empty() || code_unit.is_class() || code_unit.is_module() {
             let child_indent = format!("{indent}  ");
             for child in children {
-                self.render_skeleton_recursive(child, &child_indent, header_only, out);
+                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
             }
             if header_only && all_children.len() > field_children.len() {
                 out.push_str(&child_indent);
@@ -512,14 +510,11 @@ impl PythonAnalyzer {
 }
 
 impl IAnalyzer for PythonAnalyzer {
-    fn top_level_declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
 
-    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
@@ -531,18 +526,15 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.indexed_source(file)
     }
 
-    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
 
-    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
 
@@ -550,18 +542,15 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.definition_lookup_index()
     }
 
-    fn direct_children<'a>(
-        &'a self,
-        code_unit: &CodeUnit,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
     }
 
-    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
 
-    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
         self.inner.ranges(code_unit)
     }
 
@@ -569,20 +558,12 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
-    }
-
-    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.get_top_level_declarations(file)
-    }
-
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -631,22 +612,6 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.project()
     }
 
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.get_declarations(file)
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
-    }
-
-    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.get_direct_children(code_unit)
-    }
-
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
     }
@@ -660,10 +625,6 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         self.inner.extract_call_receiver(reference)
-    }
-
-    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements_of(file)
     }
 
     fn enclosing_code_unit(
@@ -699,10 +660,6 @@ impl IAnalyzer for PythonAnalyzer {
             .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
-    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges_of(code_unit)
-    }
-
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         let mut rendered = String::new();
         self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
@@ -735,12 +692,12 @@ impl IAnalyzer for PythonAnalyzer {
             let mut grouped = Vec::new();
             for candidate in self.inner.definitions(&code_unit.fq_name()) {
                 if candidate.source() == code_unit.source() {
-                    grouped.extend(self.inner.ranges(candidate).iter().copied());
+                    grouped.extend(self.inner.ranges(&candidate));
                 }
             }
             grouped
         } else {
-            self.inner.ranges(code_unit).to_vec()
+            self.inner.ranges(code_unit)
         };
 
         let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
@@ -763,10 +720,6 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions_persisted(pattern)
-    }
-
-    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures_of(code_unit).to_vec()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

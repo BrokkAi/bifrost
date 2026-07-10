@@ -722,7 +722,7 @@ fn ruby_factory_method_outcome(
         return FactoryMethodOutcome::Unknown;
     };
     let ranges = semantic.analyzer.ranges(&frame.method);
-    let Some(node) = ruby_method_node_for_ranges(tree.root_node(), ranges, &source) else {
+    let Some(node) = ruby_method_node_for_ranges(tree.root_node(), &ranges, &source) else {
         return FactoryMethodOutcome::Unknown;
     };
     let Some(expression) = ruby_tail_expression(node) else {

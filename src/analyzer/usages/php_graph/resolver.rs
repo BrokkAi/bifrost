@@ -89,6 +89,7 @@ impl PhpHierarchyIndex {
         let descendant_fq_names = files
             .iter()
             .flat_map(|file| php.declarations(file))
+            .into_iter()
             .filter(|unit| unit.is_class())
             .filter(|unit| unit.fq_name() != owner_fq_name)
             .filter(|unit| class_is_subtype_of_owner(php, unit, &owner_fq_name))
@@ -119,9 +120,11 @@ impl PhpHierarchyIndex {
         files
             .iter()
             .flat_map(|file| php.declarations(file))
+            .into_iter()
             .filter(|unit| unit.is_class())
             .filter(|unit| self.descendant_fq_names.contains(&unit.fq_name()))
-            .flat_map(|owner| php.get_direct_children(owner))
+            .flat_map(|owner| php.direct_children(&owner))
+            .into_iter()
             .filter(|child| child.is_function() && child.identifier() == spec.member_name)
             .collect()
     }

@@ -11,7 +11,9 @@ use super::extract::extract_file_facts;
 use super::facts::FileFacts;
 use super::kinds::{NormalizedKind, Role};
 use super::spec::StructuralSpec;
-use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
+use crate::analyzer::tree_sitter_analyzer::{
+    LanguageAdapter, StorageLanguageAdapter, TreeSitterAnalyzer,
+};
 use crate::analyzer::{Language, ProjectFile};
 use moka::sync::Cache;
 use std::hash::Hasher;
@@ -113,7 +115,9 @@ impl StructuralFactsCache {
     }
 }
 
-impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
+impl<A: LanguageAdapter + StorageLanguageAdapter> StructuralSearchProvider
+    for TreeSitterAnalyzer<A>
+{
     fn structural_language(&self) -> Language {
         self.adapter().language()
     }

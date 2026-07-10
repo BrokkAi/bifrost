@@ -100,7 +100,7 @@ impl ProjectTypes {
         call_arity: Option<usize>,
     ) -> Vec<String> {
         if let Some(owner) = scala.definitions(owner_fqn).find(|unit| unit.is_class()) {
-            for ancestor in scala.get_ancestors(owner) {
+            for ancestor in scala.get_ancestors(&owner) {
                 let targets =
                     self.method_targets_for_owner_member(&ancestor.fq_name(), member, call_arity);
                 if !targets.is_empty() {
@@ -246,14 +246,15 @@ impl ProjectTypes {
     ) -> Option<ExtensionMethod> {
         let signature = unit
             .signature()
-            .or_else(|| scala.signatures(unit).first().map(String::as_str))?;
+            .map(str::to_string)
+            .or_else(|| scala.signatures(unit).into_iter().next())?;
         if !signature.starts_with("extension ") {
             return None;
         }
         let _ = owner_fqn(unit)?;
         Some(ExtensionMethod {
             fqn: unit.fq_name(),
-            receiver_type: resolved_extension_receiver_type(scala, unit, signature),
+            receiver_type: resolved_extension_receiver_type(scala, unit, &signature),
         })
     }
 
@@ -278,7 +279,7 @@ impl ProjectTypes {
 
         let mut targets = Vec::new();
         if let Some(owner) = scala.definitions(owner_fqn).find(|unit| unit.is_class()) {
-            for ancestor in scala.get_ancestors(owner) {
+            for ancestor in scala.get_ancestors(&owner) {
                 if !scala.is_scala_trait_declaration(&ancestor) {
                     continue;
                 }

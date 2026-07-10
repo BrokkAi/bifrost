@@ -73,10 +73,13 @@ impl TargetSpec {
         });
         let signature = target
             .signature()
-            .or_else(|| scala.signatures(target).first().map(String::as_str));
-        let is_extension_method =
-            signature.is_some_and(|signature| signature.starts_with("extension "));
+            .map(str::to_string)
+            .or_else(|| scala.signatures(target).into_iter().next());
+        let is_extension_method = signature
+            .as_deref()
+            .is_some_and(|signature| signature.starts_with("extension "));
         let extension_receiver_type = signature
+            .as_deref()
             .and_then(|signature| resolved_extension_receiver_type(scala, target, signature));
         let member_name = if kind == TargetKind::Constructor {
             owner_name.clone()?
@@ -266,7 +269,7 @@ fn direct_member_state(
     if kind == TargetKind::Method
         && scala
             .definitions(&format!("{}.{}", owner.fq_name(), member_name))
-            .any(|unit| unit.is_function() && method_arity_matches(scala, unit, arity))
+            .any(|unit| unit.is_function() && method_arity_matches(scala, &unit, arity))
     {
         return DirectMemberState::RelatedOverride;
     }
@@ -286,7 +289,7 @@ fn owner_declares_matching_member(
 ) -> bool {
     scala
         .definitions(&format!("{}.{}", owner.fq_name(), member_name))
-        .any(|unit| member_matches_target_kind(scala, unit, kind, arity))
+        .any(|unit| member_matches_target_kind(scala, &unit, kind, arity))
 }
 
 fn member_matches_target_kind(
@@ -314,8 +317,9 @@ fn imported_factory_return_owner(
 ) -> Option<String> {
     let signature = unit
         .signature()
-        .or_else(|| scala.signatures(unit).first().map(String::as_str))?;
-    let return_type = signature_return_type(signature)?;
+        .map(str::to_string)
+        .or_else(|| scala.signatures(unit).into_iter().next())?;
+    let return_type = signature_return_type(&signature)?;
     spec.receiver_owners.iter().find_map(|owner| {
         return_type_matches_owner(return_type, unit.package_name(), owner)
             .then(|| scala_normalized_fq_name(&owner.fq_name()))
@@ -541,9 +545,12 @@ pub(in crate::analyzer::usages) fn method_signature_arity(
     scala: &ScalaAnalyzer,
     unit: &CodeUnit,
 ) -> Option<usize> {
-    unit.signature()
-        .or_else(|| scala.signatures(unit).first().map(String::as_str))
-        .and_then(signature_arity)
+    unit.signature().and_then(signature_arity).or_else(|| {
+        scala
+            .signatures(unit)
+            .first()
+            .and_then(|signature| signature_arity(signature))
+    })
 }
 
 fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
@@ -553,11 +560,7 @@ fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
         } else {
             format!("{}.{}", target.package_name(), owner_short)
         };
-        if let Some(owner) = scala
-            .definitions(&owner_fq)
-            .find(|unit| unit.is_class())
-            .cloned()
-        {
+        if let Some(owner) = scala.definitions(&owner_fq).find(|unit| unit.is_class()) {
             return Some(owner);
         }
     }
@@ -568,9 +571,9 @@ fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
         .find(|candidate| {
             scala
                 .direct_children(candidate)
-                .any(|child| child == target)
+                .into_iter()
+                .any(|child| &child == target)
         })
-        .cloned()
 }
 
 pub(super) struct Visibility {
@@ -789,7 +792,7 @@ impl Visibility {
                 .definitions(&candidate)
                 .filter(|unit| unit.is_function())
             {
-                if let Some(owner_fq_name) = imported_factory_return_owner(scala, unit, spec) {
+                if let Some(owner_fq_name) = imported_factory_return_owner(scala, &unit, spec) {
                     self.add_receiver_name(local_name, owner_fq_name);
                     return;
                 }
@@ -799,7 +802,7 @@ impl Visibility {
                 .definitions(&object_candidate)
                 .filter(|unit| unit.is_function())
             {
-                if let Some(owner_fq_name) = imported_factory_return_owner(scala, unit, spec) {
+                if let Some(owner_fq_name) = imported_factory_return_owner(scala, &unit, spec) {
                     self.add_receiver_name(local_name, owner_fq_name);
                     return;
                 }
@@ -1059,11 +1062,14 @@ fn wildcard_path_could_expose(
         return scala.all_declarations().any(|unit| {
             unit.is_function()
                 && unit.identifier() == spec.member_name
-                && unit
+                && (unit
                     .signature()
-                    .or_else(|| scala.signatures(unit).first().map(String::as_str))
                     .is_some_and(|signature| signature.starts_with("extension "))
-                && owner_of(scala, unit).is_some_and(|owner| {
+                    || scala
+                        .signatures(&unit)
+                        .first()
+                        .is_some_and(|signature| signature.starts_with("extension ")))
+                && owner_of(scala, &unit).is_some_and(|owner| {
                     normalized_candidates.contains(&scala_normalized_fq_name(&owner.fq_name()))
                 })
         });
@@ -1103,6 +1109,7 @@ pub(in crate::analyzer::usages) fn package_name_of(
 ) -> Option<String> {
     scala
         .declarations(file)
+        .into_iter()
         .find(|unit| !unit.is_file_scope())
         .map(|unit| unit.package_name().to_string())
 }

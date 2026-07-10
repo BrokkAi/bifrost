@@ -85,7 +85,7 @@ pub(super) fn selected_code_unit_declaration_at_cursor(
     }
 
     analyzer
-        .get_declarations(file)
+        .declarations(file)
         .into_iter()
         .filter(|code_unit| code_unit.source() == file && predicate(code_unit))
         .filter(|code_unit| {

@@ -13,14 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 pub trait IAnalyzer: Send + Sync + Any {
-    fn top_level_declarations<'a>(
-        &'a self,
-        _file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
-        Box::new(std::iter::empty())
+    fn top_level_declarations(&self, _file: &ProjectFile) -> Vec<CodeUnit> {
+        Vec::new()
     }
-    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
-        Box::new(std::iter::empty())
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
+        Vec::new()
     }
     /// Source text retained by the analyzer generation that produced this
     /// file's declarations and byte ranges.
@@ -29,7 +26,9 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// `analyzed_files`; concrete analyzers override with an O(1) lookup so
     /// incremental callers don't pay O(repo) per changed file.
     fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.analyzed_files().any(|candidate| candidate == file)
+        self.analyzed_files()
+            .iter()
+            .any(|candidate| candidate == file)
     }
     fn languages(&self) -> BTreeSet<Language>;
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
@@ -39,14 +38,22 @@ pub trait IAnalyzer: Send + Sync + Any {
     where
         Self: Sized;
     fn project(&self) -> &dyn Project;
-    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a>;
-    fn declarations<'a>(
-        &'a self,
-        _file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
-        Box::new(std::iter::empty())
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_>;
+    fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
+        self.all_declarations()
+            .map(|unit| {
+                let range = self
+                    .ranges(&unit)
+                    .into_iter()
+                    .min_by_key(|range| (range.start_line, range.start_byte));
+                (unit, range)
+            })
+            .collect()
     }
-    fn definitions<'a>(&'a self, _fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn declarations(&self, _file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        BTreeSet::new()
+    }
+    fn definitions(&self, _fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
@@ -57,11 +64,8 @@ pub trait IAnalyzer: Send + Sync + Any {
         static EMPTY: OnceLock<UsageFactsIndex> = OnceLock::new();
         EMPTY.get_or_init(UsageFactsIndex::default)
     }
-    fn direct_children<'a>(
-        &'a self,
-        _code_unit: &CodeUnit,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
-        Box::new(std::iter::empty())
+    fn direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        Vec::new()
     }
     /// Return the tree-sitter parse errors recorded for `file` during the
     /// most recent `analyze_file` pass. Returns `None` when the analyzer
@@ -85,8 +89,8 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
-    fn import_statements<'a>(&'a self, _file: &ProjectFile) -> &'a [String] {
-        &[]
+    fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
+        Vec::new()
     }
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit>;
     fn enclosing_code_unit_for_lines(
@@ -103,8 +107,8 @@ pub trait IAnalyzer: Send + Sync + Any {
         end_byte: usize,
         ident: &str,
     ) -> Option<DeclarationInfo>;
-    fn ranges<'a>(&'a self, _code_unit: &CodeUnit) -> &'a [Range] {
-        &[]
+    fn ranges(&self, _code_unit: &CodeUnit) -> Vec<Range> {
+        Vec::new()
     }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String>;
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
@@ -119,51 +123,51 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
         self.search_definitions(pattern, true)
     }
-    fn signatures<'a>(&'a self, _code_unit: &CodeUnit) -> &'a [String] {
-        &[]
+    fn signatures(&self, _code_unit: &CodeUnit) -> Vec<String> {
+        Vec::new()
     }
-    fn signature_metadata<'a>(&'a self, _code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
-        &[]
+    fn signature_metadata(&self, _code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        Vec::new()
     }
 
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.top_level_declarations(file).cloned().collect()
+        self.top_level_declarations(file)
     }
 
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.analyzed_files().cloned().collect()
+        self.analyzed_files().into_iter().collect()
     }
 
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.all_declarations().cloned().collect()
+        self.all_declarations().collect()
     }
 
     fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.declarations(file).cloned().collect()
+        self.declarations(file)
     }
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.definitions(fq_name).cloned().collect()
+        self.definitions(fq_name).into_iter().collect()
     }
 
     fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.direct_children(code_unit).cloned().collect()
+        self.direct_children(code_unit)
     }
 
     fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
-        self.import_statements(file).to_vec()
+        self.import_statements(file)
     }
 
     fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.ranges(code_unit).to_vec()
+        self.ranges(code_unit)
     }
 
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.signatures(code_unit).to_vec()
+        self.signatures(code_unit)
     }
 
     fn signature_metadata_of(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.signature_metadata(code_unit).to_vec()
+        self.signature_metadata(code_unit)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
@@ -265,7 +269,7 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn metrics(&self) -> CodeBaseMetrics {
-        metrics_from_declarations(self.all_declarations().cloned())
+        metrics_from_declarations(self.all_declarations())
     }
 
     fn is_empty(&self) -> bool {
@@ -355,8 +359,8 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_skeletons(&self, file: &ProjectFile) -> BTreeMap<CodeUnit, String> {
         let mut skeletons = BTreeMap::new();
         for symbol in self.top_level_declarations(file) {
-            if let Some(skeleton) = self.get_skeleton(symbol) {
-                skeletons.insert(symbol.clone(), skeleton);
+            if let Some(skeleton) = self.get_skeleton(&symbol) {
+                skeletons.insert(symbol, skeleton);
             }
         }
         skeletons
@@ -368,8 +372,8 @@ pub trait IAnalyzer: Send + Sync + Any {
         }
 
         self.direct_children(class_unit)
+            .into_iter()
             .filter(|child| child.is_class() || child.is_function() || child.is_field())
-            .cloned()
             .collect()
     }
 
@@ -377,6 +381,7 @@ pub trait IAnalyzer: Send + Sync + Any {
         let mut modules: Vec<_> = files
             .iter()
             .flat_map(|file| self.top_level_declarations(file))
+            .into_iter()
             .map(|code_unit| {
                 if code_unit.is_module() {
                     code_unit.fq_name()
@@ -395,10 +400,10 @@ pub trait IAnalyzer: Send + Sync + Any {
         files
             .iter()
             .flat_map(|file| self.top_level_declarations(file))
+            .into_iter()
             .filter(|code_unit| {
                 code_unit.is_class() || code_unit.is_function() || code_unit.is_module()
             })
-            .cloned()
             .collect()
     }
 
@@ -451,12 +456,12 @@ pub trait IAnalyzer: Send + Sync + Any {
         }
 
         let parent_name = fq_name.get(..last_index?)?;
-        self.definitions(parent_name).next().cloned()
+        self.definitions(parent_name).next()
     }
 }
 
 fn summary_root_units<A: IAnalyzer + ?Sized>(analyzer: &A, file: &ProjectFile) -> Vec<CodeUnit> {
-    let declarations: Vec<_> = analyzer.declarations(file).cloned().collect();
+    let declarations: Vec<_> = analyzer.declarations(file).into_iter().collect();
     let declaration_set: BTreeSet<_> = declarations.iter().cloned().collect();
     let mut roots: Vec<_> = declarations
         .into_iter()
@@ -476,8 +481,8 @@ fn summary_root_order<A: IAnalyzer + ?Sized>(
     left: &CodeUnit,
     right: &CodeUnit,
 ) -> Ordering {
-    let left_range = analyzer.ranges(left).iter().min();
-    let right_range = analyzer.ranges(right).iter().min();
+    let left_range = analyzer.ranges(left).into_iter().min();
+    let right_range = analyzer.ranges(right).into_iter().min();
     left_range.cmp(&right_range).then_with(|| left.cmp(right))
 }
 
@@ -573,8 +578,8 @@ fn render_symbol_summary<A: IAnalyzer + ?Sized>(
             code_unit,
             analyzer
                 .direct_children(code_unit)
+                .into_iter()
                 .filter(|child| types.contains(&child.kind()))
-                .cloned()
                 .collect(),
         );
         if !children.is_empty() {

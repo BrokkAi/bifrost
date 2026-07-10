@@ -513,8 +513,8 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
             candidates.extend(
                 analyzer
                     .declarations(file)
-                    .filter(|unit| unit.identifier() == "default")
-                    .cloned(),
+                    .into_iter()
+                    .filter(|unit| unit.identifier() == "default"),
             );
         }
         sort_units(&mut candidates);
@@ -1386,7 +1386,7 @@ fn jsts_enclosing_class(
     let fqn = ClassRangeIndex::build(analyzer, file)
         .enclosing(byte)?
         .to_string();
-    analyzer.definitions(&fqn).next().cloned()
+    analyzer.definitions(&fqn).next()
 }
 
 fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
@@ -2726,7 +2726,7 @@ fn ts_field_signature_type_owners(
 ) -> Vec<CodeUnit> {
     let mut owners = Vec::new();
     for signature in analyzer.signatures(field) {
-        if let Some(type_text) = ts_field_type_text(signature) {
+        if let Some(type_text) = ts_field_type_text(&signature) {
             owners.extend(ts_resolve_type_text_to_property_owners(
                 analyzer,
                 support,

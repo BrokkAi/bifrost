@@ -170,14 +170,11 @@ impl CppAnalyzer {
 }
 
 impl IAnalyzer for CppAnalyzer {
-    fn top_level_declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
 
-    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
@@ -189,18 +186,15 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.indexed_source(file)
     }
 
-    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations<'a>(
-        &'a self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
 
-    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
 
@@ -208,18 +202,15 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.definition_lookup_index()
     }
 
-    fn direct_children<'a>(
-        &'a self,
-        code_unit: &CodeUnit,
-    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
     }
 
-    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
 
-    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
         self.inner.ranges(code_unit)
     }
 
@@ -227,20 +218,12 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
-    }
-
-    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.get_top_level_declarations(file)
-    }
-
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -257,26 +240,6 @@ impl IAnalyzer for CppAnalyzer {
 
     fn project(&self) -> &dyn Project {
         self.inner.project()
-    }
-
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.get_declarations(file)
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
-    }
-
-    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.get_direct_children(code_unit)
-    }
-
-    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements_of(file)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -320,10 +283,6 @@ impl IAnalyzer for CppAnalyzer {
             .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
-    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges_of(code_unit)
-    }
-
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.inner.get_skeleton(code_unit)
     }
@@ -346,10 +305,6 @@ impl IAnalyzer for CppAnalyzer {
 
     fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions_persisted(pattern)
-    }
-
-    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures_of(code_unit).to_vec()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

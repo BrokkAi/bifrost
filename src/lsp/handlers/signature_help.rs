@@ -84,7 +84,8 @@ fn signature_information(
     if label.is_empty() {
         return None;
     }
-    let metadata = matching_signature_metadata(analyzer.signature_metadata(candidate), &label);
+    let signature_metadata = analyzer.signature_metadata(candidate);
+    let metadata = matching_signature_metadata(&signature_metadata, &label);
     Some(SignatureInformation {
         parameters: metadata.and_then(|metadata| parameter_information(&label, metadata)),
         documentation: leading_doc_comment_for_code_unit(analyzer, candidate).map(|value| {

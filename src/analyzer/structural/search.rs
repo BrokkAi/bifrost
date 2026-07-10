@@ -133,9 +133,9 @@ pub fn execute_with_limits(
     let mut diagnostics = Vec::new();
     let mut scoped_languages = BTreeSet::new();
     for file in analyzer.analyzed_files() {
-        let language = crate::analyzer::common::language_for_file(file);
+        let language = crate::analyzer::common::language_for_file(&file);
         let requested = query.languages.is_empty() || query.languages.contains(&language);
-        if requested && file_matches_globs(file, query) {
+        if requested && file_matches_globs(&file, query) {
             scoped_languages.insert(language);
         }
     }

@@ -46,7 +46,7 @@ impl ScalaAnalyzer {
         let traits = self.scala_trait_fqns();
         self.all_declarations()
             .filter(|unit| unit.is_class())
-            .flat_map(|unit| self.resolve_direct_ancestor_relations(unit, &types, &traits))
+            .flat_map(|unit| self.resolve_direct_ancestor_relations(&unit, &types, &traits))
             .collect()
     }
 
@@ -74,7 +74,7 @@ impl ScalaAnalyzer {
             if !seen.insert(fqn.clone()) {
                 continue;
             }
-            if let Some(definition) = self.definitions(&fqn).find(|unit| unit.is_class()).cloned() {
+            if let Some(definition) = self.definitions(&fqn).find(|unit| unit.is_class()) {
                 ancestors.push(definition);
             }
         }

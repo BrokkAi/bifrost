@@ -49,11 +49,12 @@ impl ClassRangeIndex {
     pub(crate) fn build(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Self {
         let ranges = analyzer
             .declarations(file)
+            .into_iter()
             .filter(|unit| unit.is_class())
             .flat_map(|unit| {
                 analyzer
-                    .ranges(unit)
-                    .iter()
+                    .ranges(&unit)
+                    .into_iter()
                     .map(move |range| (range.start_byte, range.end_byte, unit.fq_name()))
             })
             .collect();
@@ -245,8 +246,8 @@ pub(crate) fn build_file_declarations<K: NodeKey>(
     let mut enclosers = Vec::new();
     let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
     for unit in analyzer.declarations(file) {
-        let key = K::from_unit(unit);
-        for unit_range in analyzer.ranges(unit) {
+        let key = K::from_unit(&unit);
+        for unit_range in analyzer.ranges(&unit) {
             let span = (unit_range.start_byte, unit_range.end_byte);
             enclosers.push((span.0, span.1, key.clone()));
             definitions.entry(key.clone()).or_default().push(span);

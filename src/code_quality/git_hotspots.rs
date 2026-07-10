@@ -440,12 +440,12 @@ fn create_file_info(
 fn max_file_complexity(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> u32 {
     let mut max_complexity = 0u32;
     let mut work = VecDeque::new();
-    work.extend(analyzer.get_top_level_declarations(file));
+    work.extend(analyzer.top_level_declarations(file));
     while let Some(code_unit) = work.pop_front() {
         if code_unit.is_function() {
             max_complexity = max_complexity.max(cyclomatic_complexity_for(analyzer, &code_unit));
         }
-        for child in analyzer.get_direct_children(&code_unit) {
+        for child in analyzer.direct_children(&code_unit) {
             work.push_back(child);
         }
     }
