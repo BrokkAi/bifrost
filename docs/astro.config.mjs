@@ -68,6 +68,7 @@ export default defineConfig({
                 { label: 'Java', slug: 'code-query-tutorials/java' },
                 { label: 'JavaScript', slug: 'code-query-tutorials/javascript' },
                 { label: 'TypeScript', slug: 'code-query-tutorials/typescript' },
+                { label: 'Go', slug: 'code-query-tutorials/go' },
               ],
             },
             { label: 'Semantic Search', slug: 'semantic-search' },

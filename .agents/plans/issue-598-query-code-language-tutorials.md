@@ -15,7 +15,7 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 - [x] (2026-07-10 13:25Z) Milestone 2: published and verified the Java tutorial with member-call narrowing, annotated constructors, exception/control-flow descendants, and the exact unsupported-kwargs diagnostic.
 - [x] (2026-07-10 13:28Z) Milestone 3: published and verified the JavaScript tutorial with receiver/context narrowing, arrow/new matching, anonymous class-expression field access, and unsupported kwargs.
 - [x] (2026-07-10 13:31Z) Milestone 4: published and verified TypeScript-only declarations/class-like forms, decorated callable exclusions, and TSX path/language scoping.
-- [ ] Milestone 5: publish and verify the Go tutorial.
+- [x] (2026-07-10 13:34Z) Milestone 5: published and verified Go call exclusion with `not_has`, multi-value assignment roles, grouped import paths, and keyword/decorator diagnostics.
 - [ ] Milestone 6: publish and verify the shared C/C++ tutorial.
 - [ ] Milestone 7: publish and verify the Rust tutorial.
 - [ ] Milestone 8: publish and verify the PHP tutorial.
@@ -37,6 +37,9 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 
 - Observation: JavaScript class expressions assigned to variables are emitted as `class` facts but do not inherit the variable binding as their normalized `name`.
   Evidence: `kind: class, name: Inline` returned no match, while `text: {regex: "^class \\{"}` plus a structured field-access descendant matched the class expression and returned enclosing symbol `app.js.Inline`.
+
+- Observation: Go import `module` roles expose the imported path, not the local alias.
+  Evidence: The grouped `log "fmt"` fixture did not match module `log`; module `fmt` matched the enclosing grouped import exactly.
 
 ## Decision Log
 
@@ -67,6 +70,8 @@ Milestone 2 published Java's tutorial with six exact cases. It distinguishes two
 Milestone 3 published JavaScript's tutorial with four exact cases: same-name call narrowing by receiver and enclosing method, a captured arrow containing a normalized `new` call, an anonymous class expression containing a specific field access, and the unsupported-kwargs diagnostic. Focused/docs tests, Astro check/build, and a fresh route/navigation/date/code-block inspection passed.
 
 Milestone 4 published TypeScript's tutorial with exact type-alias, interface/enum/abstract-class, decorated callable, and TSX call results. It proves `.tsx` participates in the `typescript` filter and uses path scoping to isolate it. Focused/docs tests, both production and root-based preview builds, and a fresh rendered route/navigation/date/code-block inspection passed.
+
+Milestone 5 published Go's tutorial with exact `not_has` call exclusion, ordered captures, structured multi-value assignment left/right roles, grouped import-path matching, and separate unsupported kwargs/decorators diagnostics. Focused/docs tests, production and root-preview builds, and the fresh rendered Go route passed.
 
 ## Context and Orientation
 
@@ -152,3 +157,5 @@ Revision note, 2026-07-10: Updated after Milestone 2 with Java's exact call/cons
 Revision note, 2026-07-10: Updated after Milestone 3 with JavaScript's exact outputs, anonymous-class name boundary, and rendered-page evidence.
 
 Revision note, 2026-07-10: Updated after Milestone 4 with TypeScript declaration/refinement/TSX results and rendered-page evidence.
+
+Revision note, 2026-07-10: Updated after Milestone 5 with Go's exact results, import-path/alias boundary, and rendered-page evidence.

@@ -15,7 +15,7 @@ Language pages will be added and marked with their last successful end-to-end ve
 - [Java](./java/)
 - [JavaScript](./javascript/)
 - [TypeScript](./typescript/)
-- Go (planned)
+- [Go](./go/)
 - C and C++ through the `cpp` adapter (planned)
 - Rust (planned)
 - PHP (planned)
