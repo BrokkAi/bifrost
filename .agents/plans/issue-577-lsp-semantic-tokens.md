@@ -15,7 +15,7 @@ Bifrost currently provides navigation and diagnostics through its LSP server but
 - [x] (2026-07-10 09:49Z) Implemented the semantic-token collector, stable legend, UTF-16 relative encoding, capability negotiation, and request dispatch.
 - [x] (2026-07-10 09:49Z) Added four focused unit tests and four real LSP subprocess tests covering all grammar candidate predicates, multi-language symbols, overlays, Unicode, line endings, and unsupported files.
 - [x] (2026-07-10 09:49Z) Updated the public LSP documentation and internal API-surface audit.
-- [ ] Run formatting, focused and complete tests, no-CUDA clippy, review the final diff, and record validation evidence.
+- [x] (2026-07-10 09:59Z) Ran formatting, focused and complete tests, matching-toolchain doctests, no-CUDA clippy, reviewed the final diff, and recorded validation evidence.
 
 ## Surprises & Discoveries
 
@@ -27,6 +27,9 @@ Bifrost currently provides navigation and diagnostics through its LSP server but
 
 - Observation: Every supported grammar exposes reference candidates through named leaf nodes called `identifier`, an `_identifier` variant, or the PHP/Ruby `name`/variable forms.
   Evidence: the table-driven unit test parses tiny Java, Go, C++, JavaScript, TypeScript, Python, Rust, PHP, Scala, C#, and Ruby sources and finds at least one candidate without source scanning.
+
+- Observation: This machine selects Homebrew `rustdoc` after Rustup `rustc` built the dependency artifacts, even though both report Rust 1.96, so the final doctest step rejects otherwise compatible metadata.
+  Evidence: every unit and integration binary passed before doctests failed with E0514; rerunning `cargo test --doc` with `RUSTDOC=/Users/dave/.cargo/bin/rustdoc` passed. The matching Rustup-first path and isolated target directory also let no-CUDA clippy pass cleanly.
 
 ## Decision Log
 
@@ -48,7 +51,7 @@ Bifrost currently provides navigation and diagnostics through its LSP server but
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. This section will be updated after the behavior and validation commands are complete.
+Issue #577 is implemented and validated. Compatible LSP clients receive the stable five-type legend and can request full-document tokens for analyzer-known declarations and structured references. The handler reads unsaved overlays, returns an empty successful result for unsupported inputs, uses iterative tree-sitter candidate discovery and structured batch resolution, and emits deterministic UTF-16 relative tokens without range/delta state or lexical fallback. Four focused unit tests, four new real-server scenarios, the complete 173-test LSP target, every full-suite unit and integration binary, doctests, formatting, and no-CUDA clippy pass. No known implementation work remains.
 
 ## Context and Orientation
 
@@ -109,6 +112,25 @@ Focused implementation evidence:
     cargo test --test bifrost_lsp_server semantic_tokens -- --nocapture
     # 4 passed
 
+Final validation evidence:
+
+    cargo test --test bifrost_lsp_server
+    # 173 passed
+
+    cargo test
+    # every unit and integration binary passed; the final doctest command
+    # needed the matching Rustup rustdoc below
+
+    RUSTDOC=/Users/dave/.cargo/bin/rustdoc cargo test --doc
+    # passed
+
+    cargo fmt --check
+    # passed
+
+    PATH=/Users/dave/.cargo/bin:/Users/dave/.local/bin:/opt/homebrew/bin:/usr/bin:/bin \
+      CARGO_TARGET_DIR=/private/tmp/bifrost-clippy-577 cargo clippy-no-cuda
+    # passed
+
 ## Interfaces and Dependencies
 
 No new dependency or public Rust API is required. The public interface addition is the negotiated LSP capability and `textDocument/semanticTokens/full` request.
@@ -128,3 +150,5 @@ The handler exposes within the LSP crate:
 Plan revision note (2026-07-10 09:38Z): Created the self-contained implementation plan before changing production code.
 
 Plan revision note (2026-07-10 09:49Z): Marked the core handler, integration coverage, and documentation milestones complete after focused unit and subprocess tests passed.
+
+Plan revision note (2026-07-10 09:59Z): Closed the plan after complete LSP, full-suite, doctest, formatting, and no-CUDA clippy validation, and documented the reproducible Rustup/Homebrew toolchain workaround.
