@@ -12,7 +12,7 @@ Language pages will be added and marked with their last successful end-to-end ve
 ## Tutorials
 
 - [Python](./python/)
-- Java (planned)
+- [Java](./java/)
 - JavaScript (planned)
 - TypeScript (planned)
 - Go (planned)

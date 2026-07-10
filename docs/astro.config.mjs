@@ -65,6 +65,7 @@ export default defineConfig({
               items: [
                 { label: 'Overview', slug: 'code-query-tutorials' },
                 { label: 'Python', slug: 'code-query-tutorials/python' },
+                { label: 'Java', slug: 'code-query-tutorials/java' },
               ],
             },
             { label: 'Semantic Search', slug: 'semantic-search' },

@@ -9,6 +9,7 @@ const DOCS: &[&str] = &[
     "docs/src/content/docs/rune-query-language.md",
     "docs/src/content/docs/code-query-tutorials/index.md",
     "docs/src/content/docs/code-query-tutorials/python.md",
+    "docs/src/content/docs/code-query-tutorials/java.md",
 ];
 
 const PUBLIC_QUERY_SURFACES: &[&str] = &[
