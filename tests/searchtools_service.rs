@@ -9,6 +9,8 @@ use git2::{Repository, Signature};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -191,6 +193,183 @@ fn service_normalizes_query_code_absolute_where_globs() {
     assert_eq!(
         value["matches"][0]["enclosing_symbol"], "A",
         "payload: {value}"
+    );
+}
+
+#[test]
+fn query_code_loads_workspace_rql_and_json_files() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "class App:\n    pass\n")
+        .build();
+    let queries = project.root().join("queries");
+    fs::create_dir(&queries).expect("query directory");
+    let absolute_where = project
+        .root()
+        .join("app.py")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    fs::write(
+        queries.join("app.rql"),
+        format!("(where \"{absolute_where}\" (class :name \"App\"))\n"),
+    )
+    .expect("RQL query");
+    fs::write(
+        queries.join("app.json"),
+        serde_json::json!({
+            "where": [absolute_where],
+            "match": { "kind": "class", "name": "App" }
+        })
+        .to_string(),
+    )
+    .expect("JSON query");
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let rql = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "query_file": "queries/app.rql" }),
+        )
+        .expect("RQL query should run");
+    let json = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "query_file": "queries/app.json" }),
+        )
+        .expect("JSON query should run");
+    assert_eq!(
+        rql, json,
+        "equivalent query files should return the same result"
+    );
+
+    let inline = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({
+                "where": [project.root().join("app.py").display().to_string()],
+                "match": { "kind": "class", "name": "App" }
+            }),
+        )
+        .expect("inline query should remain supported");
+    assert_eq!(rql, inline, "file input must use the existing query engine");
+}
+
+#[test]
+fn query_code_file_input_reports_validation_and_workspace_errors() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "class App:\n    pass\n")
+        .build();
+    let queries = project.root().join("queries");
+    fs::create_dir(&queries).expect("query directory");
+    fs::write(queries.join("broken.rql"), "(class").expect("broken RQL query");
+    fs::write(queries.join("broken.json"), "{").expect("broken JSON query");
+    fs::write(queries.join("invalid.json"), r#"{"match":{}}"#).expect("invalid JSON query");
+    fs::write(queries.join("query.txt"), vec![b'x'; 64 * 1024 + 1]).expect("unsupported query");
+    fs::write(queries.join("too-large.rql"), vec![b'x'; 64 * 1024 + 1])
+        .expect("oversized RQL query");
+    fs::write(queries.join("too-large.json"), vec![b'x'; 64 * 1024 + 1])
+        .expect("oversized JSON query");
+    fs::create_dir(queries.join("directory.rql")).expect("non-regular query path");
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for (path, expected) in [
+        (
+            "queries/missing.rql",
+            "failed to read query file `queries/missing.rql`",
+        ),
+        (
+            "queries/broken.rql",
+            "failed to parse RQL query file `queries/broken.rql`",
+        ),
+        (
+            "queries/broken.json",
+            "failed to parse JSON query file `queries/broken.json`",
+        ),
+        (
+            "queries/invalid.json",
+            "invalid CodeQuery in `queries/invalid.json`: invalid query at match",
+        ),
+        (
+            "queries/query.txt",
+            "unsupported query file extension `.txt`",
+        ),
+        (
+            "queries/too-large.rql",
+            "query file `queries/too-large.rql` is too large",
+        ),
+        (
+            "queries/too-large.json",
+            "query file `queries/too-large.json` is too large",
+        ),
+        (
+            "queries/directory.rql",
+            "query file `queries/directory.rql` must be a regular file",
+        ),
+    ] {
+        let error = service
+            .call_tool_value("query_code", serde_json::json!({ "query_file": path }))
+            .expect_err("invalid query file should fail");
+        assert_eq!(
+            error.code,
+            SearchToolsServiceErrorCode::InvalidParams,
+            "{error}"
+        );
+        assert!(error.message.contains(expected), "{error}");
+    }
+
+    let mixed = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({
+                "query_file": "queries/broken.rql",
+                "match": { "kind": "class" }
+            }),
+        )
+        .expect_err("mixed query inputs should fail");
+    assert!(mixed.message.contains("query_file is exclusive"), "{mixed}");
+
+    let outside = TempDir::new().expect("outside workspace");
+    let outside_query = outside.path().join("outside.rql");
+    fs::write(&outside_query, "(class :name \"App\")").expect("outside query");
+    let outside = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "query_file": outside_query.display().to_string() }),
+        )
+        .expect_err("outside path should fail");
+    assert!(
+        outside.message.contains("outside active workspace"),
+        "{outside}"
+    );
+
+    #[cfg(unix)]
+    {
+        symlink(&outside_query, queries.join("outside-link.rql")).expect("outside symlink");
+        let symlink = service
+            .call_tool_value(
+                "query_code",
+                serde_json::json!({ "query_file": "queries/outside-link.rql" }),
+            )
+            .expect_err("outside symlink should fail");
+        assert!(
+            symlink.message.contains("outside active workspace"),
+            "{symlink}"
+        );
+    }
+
+    let escaping = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "query_file": "../outside.rql" }),
+        )
+        .expect_err("parent traversal should fail");
+    assert!(
+        escaping
+            .message
+            .contains("query file path escapes active workspace"),
+        "{escaping}"
     );
 }
 

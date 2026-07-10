@@ -39,6 +39,8 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 Unknown fields are rejected rather than ignored.
 
+When calling `query_code`, MCP clients may instead send a tool-call envelope such as `{ "query_file": "queries/audit.json" }`. That selector is not a `CodeQuery` field and must not be written inside the JSON file itself: the file contains the complete canonical query shown in this reference. The same tool-call input accepts `.rql` files, which lower through RQL before validation.
+
 ## Pattern Fields
 
 A pattern combines all supplied constraints with logical AND.

@@ -32,7 +32,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io;
+use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -43,6 +44,8 @@ pub enum SearchToolsServiceErrorCode {
     UnknownTool,
     Internal,
 }
+
+const MAX_QUERY_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SearchToolsServiceError {
@@ -591,12 +594,110 @@ impl SearchToolsService {
         snapshot: &WorkspaceAnalyzer,
         arguments: Value,
     ) -> Result<crate::analyzer::structural::CodeQueryResult, SearchToolsServiceError> {
-        let query = crate::analyzer::structural::CodeQuery::from_json(&arguments)
-            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let query = Self::decode_query_code_input(snapshot, arguments)?;
         Ok(crate::analyzer::structural::execute(
             snapshot.analyzer(),
             &query,
         ))
+    }
+
+    fn decode_query_code_input(
+        snapshot: &WorkspaceAnalyzer,
+        arguments: Value,
+    ) -> Result<crate::analyzer::structural::CodeQuery, SearchToolsServiceError> {
+        let Some(query_file) = arguments.get("query_file") else {
+            return crate::analyzer::structural::CodeQuery::from_json(&arguments)
+                .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()));
+        };
+
+        let object = arguments.as_object().ok_or_else(|| {
+            SearchToolsServiceError::invalid_params("query_code arguments must be an object")
+        })?;
+        if object.len() != 1 {
+            return Err(SearchToolsServiceError::invalid_params(
+                "query_file is exclusive; put the complete query in the referenced file",
+            ));
+        }
+        let query_file = query_file.as_str().ok_or_else(|| {
+            SearchToolsServiceError::invalid_params("query_file must be a string path")
+        })?;
+        let root = snapshot.analyzer().project().root();
+        let path = root.join(query_file);
+        let extension = match path.extension().and_then(|extension| extension.to_str()) {
+            Some("rql") | Some("json") => path.extension().and_then(|extension| extension.to_str()),
+            Some(extension) => {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "unsupported query file extension `.{extension}` for `{query_file}`; expected .rql or .json"
+                )));
+            }
+            None => {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "query file `{query_file}` has no extension; expected .rql or .json"
+                )));
+            }
+        };
+        let contents = Self::read_query_file(&path, query_file)?;
+        let value = match extension {
+            Some("rql") => crate::analyzer::structural::query::sexp::sexp_to_json(&contents)
+                .map_err(|error| {
+                    SearchToolsServiceError::invalid_params(format!(
+                        "failed to parse RQL query file `{query_file}`: {error}"
+                    ))
+                }),
+            Some("json") => serde_json::from_str::<Value>(&contents).map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "failed to parse JSON query file `{query_file}`: {error}"
+                ))
+            }),
+            _ => unreachable!("query file extension was validated before reading"),
+        }?;
+        let value = crate::tool_arguments::normalize_tool_arguments("query_code", value, root)
+            .map_err(SearchToolsServiceError::invalid_params)?;
+        crate::analyzer::structural::CodeQuery::from_json(&value).map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "invalid CodeQuery in `{query_file}`: {error}"
+            ))
+        })
+    }
+
+    fn read_query_file(path: &Path, query_file: &str) -> Result<String, SearchToolsServiceError> {
+        let metadata = fs::metadata(path).map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "failed to read query file `{query_file}`: {error}"
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "query file `{query_file}` must be a regular file"
+            )));
+        }
+        if metadata.len() > MAX_QUERY_FILE_BYTES {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "query file `{query_file}` is too large: {} bytes exceeds {MAX_QUERY_FILE_BYTES}",
+                metadata.len()
+            )));
+        }
+
+        let file = fs::File::open(path).map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "failed to read query file `{query_file}`: {error}"
+            ))
+        })?;
+        let mut contents = String::new();
+        file.take(MAX_QUERY_FILE_BYTES + 1)
+            .read_to_string(&mut contents)
+            .map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "failed to read query file `{query_file}`: {error}"
+                ))
+            })?;
+        if contents.len() as u64 > MAX_QUERY_FILE_BYTES {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "query file `{query_file}` is too large: more than {MAX_QUERY_FILE_BYTES} bytes"
+            )));
+        }
+
+        Ok(contents)
     }
 
     pub fn active_workspace_root(&self) -> PathBuf {

@@ -48,7 +48,9 @@ fn run() -> Result<(), String> {
     let mut dry_run_install = false;
     let mut tool_name: Option<String> = None;
     let mut tool_args = json!({});
+    let mut tool_args_seen = false;
     let mut tool_sources = Vec::new();
+    let mut query_file: Option<String> = None;
     let mut render_options = McpRenderOptions::default();
 
     while let Some(arg) = args.next() {
@@ -139,6 +141,15 @@ fn run() -> Result<(), String> {
                     .ok_or_else(|| "--args requires inline JSON".to_string())?;
                 tool_args = serde_json::from_str(&value)
                     .map_err(|err| format!("--args must be valid JSON: {err}"))?;
+                tool_args_seen = true;
+            }
+            "--query-file" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--query-file requires a path".to_string())?;
+                if query_file.replace(value).is_some() {
+                    return Err("--query-file may only be provided once".to_string());
+                }
             }
             "--sources" => {
                 let value = args
@@ -168,6 +179,32 @@ fn run() -> Result<(), String> {
                 return Err(format!("Unknown argument: {other}"));
             }
         }
+    }
+
+    if let Some(query_file) = query_file {
+        if tool_name.is_some()
+            || tool_args_seen
+            || run_lsp
+            || run_repl
+            || run_skill_install
+            || install_option_seen
+            || mcp_mode.is_some()
+        {
+            return Err(
+                "--query-file cannot be combined with --tool, --args, --mcp, --lsp, --repl, or skill-install options"
+                    .to_string(),
+            );
+        }
+        if !tool_sources.is_empty() {
+            return Err("--query-file cannot be combined with --sources".to_string());
+        }
+        return run_tool(
+            root,
+            "query_code",
+            json!({ "query_file": query_file }),
+            &[],
+            render_options,
+        );
     }
 
     if let Some(tool_name) = tool_name {
@@ -340,6 +377,7 @@ USAGE:
     bifrost --lsp              Run a Language Server (LSP) over stdio
     bifrost --repl             Run the interactive code-query REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
+    bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
     bifrost --install-skills   Install Bifrost Agent Skills into a .agents/skills root
     bifrost --version | --help [TOOL]
 
@@ -349,6 +387,7 @@ OPTIONS:
                            File path arguments may use <commit-ish>:<path> in --tool mode.
                            Required for tools that take arguments; omit for those that don't
                            (defaults to {}, which suits e.g. get_active_workspace).
+    --query-file PATH      Run a workspace-relative .rql or .json CodeQuery directly.
     --sources PATH         Restrict one-shot --tool workspace construction to selected files,
                            directories, or globs. Repeatable; valid only with --tool.
     --no-line-numbers      Render source output without leading line numbers
@@ -397,6 +436,9 @@ EXAMPLES:
 
     # One-shot: run a single tool and print its JSON result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
+
+    # Run a saved RQL or JSON code query (current directory is the default root):
+    bifrost --query-file queries/audit.rql
 
     # Human code-query exploration with S-expressions, completion, docs, and history:
     bifrost --root /path/to/project --repl
