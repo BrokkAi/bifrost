@@ -62,12 +62,17 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             limit_exceeded: &mut limit_exceeded,
         };
         for file in files {
+            if scan_scope.is_cancelled() {
+                break;
+            }
             scan_file(self.java, analyzer, &file, &spec, &mut state);
             if *state.limit_exceeded {
                 break;
             }
         }
-        scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state);
+        if !scan_scope.is_cancelled() {
+            scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state);
+        }
 
         if limit_exceeded || hits.len() > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {

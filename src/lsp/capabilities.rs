@@ -2,6 +2,7 @@ use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionOptions, DiagnosticOptions,
     DiagnosticServerCapabilities, DocumentFormattingOptions, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability, OneOf, RenameOptions,
+    ReferencesOptions,
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
     ServerCapabilities, SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TokenFormat,
@@ -44,7 +45,11 @@ pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCa
         })),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
-        references_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Right(ReferencesOptions {
+            work_done_progress_options: WorkDoneProgressOptions {
+                work_done_progress: Some(true),
+            },
+        })),
         rename_provider: Some(OneOf::Right(RenameOptions {
             prepare_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),

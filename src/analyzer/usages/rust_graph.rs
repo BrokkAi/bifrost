@@ -84,7 +84,15 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             let scan_files: HashSet<ProjectFile> = [target.source().clone()].into_iter().collect();
             let graph = build_rust_graph_for_files(scan_files.clone());
             (
-                scan_files_for_target(analyzer, rust, &graph, scan_files, target, None),
+                scan_files_for_target(
+                    analyzer,
+                    rust,
+                    &graph,
+                    scan_files,
+                    target,
+                    None,
+                    scan_scope.cancellation(),
+                ),
                 BTreeSet::new(),
             )
         } else if is_member_target(rust, target) {
@@ -119,6 +127,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 scan_files,
                 scan_target,
                 &seeds,
+                scan_scope.cancellation(),
             );
             (result.hits, result.unproven_hits)
         } else {
@@ -137,7 +146,15 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             }
             let graph = build_rust_graph_for_files(scan_files.clone());
             (
-                scan_files_for_target(analyzer, rust, &graph, scan_files, target, Some(&seeds)),
+                scan_files_for_target(
+                    analyzer,
+                    rust,
+                    &graph,
+                    scan_files,
+                    target,
+                    Some(&seeds),
+                    scan_scope.cancellation(),
+                ),
                 BTreeSet::new(),
             )
         };

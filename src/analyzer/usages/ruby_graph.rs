@@ -107,6 +107,9 @@ impl RubyUsageGraphStrategy {
         let mut hits = BTreeSet::new();
         let mut unproven_hits = BTreeSet::new();
         for file in &scan_files {
+            if scan_scope.is_cancelled() {
+                break;
+            }
             if language_for_file(file) != Language::Ruby {
                 continue;
             }

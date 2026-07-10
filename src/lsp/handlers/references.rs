@@ -4,8 +4,9 @@ use crate::analyzer::usages::UsageHit;
 use crate::analyzer::{Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
 use crate::lsp::handlers::broad_symbol::broad_symbol_target_at_position;
-use crate::lsp::handlers::usage_hits::usage_hits_for_candidates;
+use crate::lsp::handlers::usage_hits::usage_hits_for_candidates_with_cancellation;
 use crate::lsp::handlers::util::{FileContentCache, code_unit_location_from_content};
+use crate::lsp::request_context::{RequestCancelled, RequestContext};
 
 /// Resolve `textDocument/references`. Strategy:
 /// 1. Prove the cursor is on a real declaration or structured reference.
@@ -17,24 +18,41 @@ pub fn handle(
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     params: &ReferenceParams,
-) -> Option<Vec<Location>> {
+    context: &RequestContext,
+) -> Result<Option<Vec<Location>>, RequestCancelled> {
+    context.check_cancelled()?;
     let uri = &params.text_document_position.text_document.uri;
     let analyzer = workspace.analyzer();
-    let target = broad_symbol_target_at_position(
+    let Some(target) = broad_symbol_target_at_position(
         analyzer,
         project,
         uri,
         &params.text_document_position.position,
-    )?;
+    ) else {
+        return Ok(None);
+    };
+    context.check_cancelled()?;
+    context.report("Searching workspace");
 
     let mut content_cache = FileContentCache::default();
-    let mut locations: Vec<Location> = usage_hits_for_candidates(analyzer, &target.candidates)
-        .into_iter()
-        .filter_map(|hit| usage_hit_to_location(&hit, &mut content_cache))
-        .collect();
+    let hits = usage_hits_for_candidates_with_cancellation(
+        analyzer,
+        &target.candidates,
+        context.cancellation_token(),
+    );
+    context.check_cancelled()?;
+    context.report("Preparing locations");
+    let mut locations = Vec::new();
+    for hit in hits {
+        context.check_cancelled()?;
+        if let Some(location) = usage_hit_to_location(&hit, &mut content_cache) {
+            locations.push(location);
+        }
+    }
 
     if params.context.include_declaration {
         for cu in &target.candidates {
+            context.check_cancelled()?;
             let entry = content_cache.read_disk(&cu.source().abs_path());
             locations.extend(entry.and_then(|entry| {
                 code_unit_location_from_content(
@@ -48,6 +66,7 @@ pub fn handle(
         }
     }
 
+    context.check_cancelled()?;
     locations.sort_by(|a, b| {
         a.uri
             .as_str()
@@ -56,8 +75,9 @@ pub fn handle(
             .then_with(|| a.range.start.character.cmp(&b.range.start.character))
     });
     locations.dedup_by(|a, b| a.uri.as_str() == b.uri.as_str() && a.range == b.range);
+    context.check_cancelled()?;
 
-    Some(locations)
+    Ok(Some(locations))
 }
 
 fn usage_hit_to_location(hit: &UsageHit, cache: &mut FileContentCache) -> Option<Location> {

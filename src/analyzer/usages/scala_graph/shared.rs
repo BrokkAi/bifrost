@@ -61,6 +61,9 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut limit_exceeded = false;
         for file in files {
+            if scan_scope.is_cancelled() {
+                break;
+            }
             scan_file(
                 self.scala,
                 analyzer,

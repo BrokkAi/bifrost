@@ -2,14 +2,17 @@ use crate::analyzer::usages::{
     DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, ExplicitCandidateProvider, UsageFinder, UsageHit,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::sync::Arc;
 
-pub(super) fn usage_hits_for_candidates(
+pub(super) fn usage_hits_for_candidates_with_cancellation(
     analyzer: &dyn IAnalyzer,
     candidates: &[CodeUnit],
+    cancellation: CancellationToken,
 ) -> Vec<UsageHit> {
     UsageFinder::new()
+        .with_cancellation(cancellation)
         .find_usages(analyzer, candidates, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
         .all_hits_including_imports()
         .into_iter()

@@ -7,6 +7,7 @@ use crate::analyzer::usages::go_graph::resolver::{
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -21,12 +22,16 @@ pub(super) fn scan_files_for_target(
     graph: &GoProjectGraph,
     files: HashSet<ProjectFile>,
     spec: &TargetSpec,
+    cancellation: Option<&CancellationToken>,
 ) -> GoScanResult {
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
     let files: Vec<_> = files.into_iter().collect();
 
     files.par_iter().for_each(|file| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let Some(parsed) = graph.parsed.get(file) else {
             return;
         };
@@ -39,6 +44,9 @@ pub(super) fn scan_files_for_target(
         if !source.contains(spec.identifier())
             && !spec.owner().is_some_and(|owner| source.contains(owner))
         {
+            return;
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
         let scan_bindings = ScanBindings::new(graph, file, spec);

@@ -4066,8 +4066,8 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     }));
     let init = server.read_message();
     assert_eq!(
-        init["result"]["capabilities"]["referencesProvider"], true,
-        "referencesProvider should be advertised: {init}"
+        init["result"]["capabilities"]["referencesProvider"]["workDoneProgress"], true,
+        "referencesProvider should advertise work-done progress: {init}"
     );
     server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
 
@@ -4123,6 +4123,135 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     server.notify_value(json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}));
     let _ = server.read_message();
     server.exit();
+}
+
+#[test]
+fn bifrost_lsp_server_references_reports_client_owned_work_done_progress() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+    let canonical_root = fixture_root.canonicalize().expect("canon fixture");
+    let root_uri = uri_for(&canonical_root);
+    let a_uri = uri_for(&canonical_root.join("A.java"));
+    let mut server = LspServer::spawn(&fixture_root);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+    }));
+    let _ = server.read_response_for_id(1);
+    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/references",
+        "params": {
+            "textDocument": {"uri": a_uri},
+            "position": {"line": 2, "character": 13},
+            "context": {"includeDeclaration": false},
+            "workDoneToken": "reference-progress"
+        }
+    }));
+
+    let mut progress_kinds = Vec::new();
+    let response = loop {
+        let message = server.read_message();
+        if message["id"] == 2 {
+            break message;
+        }
+        assert_eq!(
+            message["method"], "$/progress",
+            "unexpected message: {message}"
+        );
+        assert_eq!(message["params"]["token"], "reference-progress");
+        progress_kinds.push(
+            message["params"]["value"]["kind"]
+                .as_str()
+                .expect("progress kind")
+                .to_string(),
+        );
+    };
+
+    assert!(
+        response["result"].is_array(),
+        "expected references: {response}"
+    );
+    assert_eq!(progress_kinds, ["begin", "report", "report", "end"]);
+
+    // A cancellation received after the response, or for an unknown request,
+    // is a protocol no-op and must not affect the next request.
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancelRequest",
+        "params": {"id": 2}
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancelRequest",
+        "params": {"id": 999}
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/references",
+        "params": {
+            "textDocument": {"uri": a_uri},
+            "position": {"line": 2, "character": 13},
+            "context": {"includeDeclaration": false}
+        }
+    }));
+    let next = server.read_response_for_id(3);
+    assert!(
+        next["result"].is_array(),
+        "late cancellation leaked: {next}"
+    );
+
+    server.shutdown_with_id(4);
+}
+
+#[test]
+fn bifrost_lsp_server_references_cancel_stops_active_search() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let target_path = root.join("Target.java");
+    fs::write(&target_path, "public class Target {}\n").expect("write target");
+    let mut consumer = String::from("class Consumer {\n");
+    for index in 0..5_000 {
+        consumer.push_str(&format!("    Target field{index};\n"));
+    }
+    consumer.push_str("}\n");
+    fs::write(root.join("Consumer.java"), consumer).expect("write large consumer");
+
+    let mut server = LspServer::start(&root);
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "textDocument/references",
+        "params": {
+            "textDocument": {"uri": uri_for(&target_path)},
+            "position": {"line": 0, "character": 13},
+            "context": {"includeDeclaration": false}
+        }
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancelRequest",
+        "params": {"id": 10}
+    }));
+
+    let response = server.read_response_for_id(10);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cancelled")),
+        "{response}"
+    );
+
+    server.shutdown_with_id(11);
 }
 
 const COMMENT_TARGETS_SOURCE: &str = "class CommentTargets {\n    // target\n    void target() {}\n    void caller() {\n        target();\n    }\n}\n";

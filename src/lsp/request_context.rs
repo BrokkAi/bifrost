@@ -1,0 +1,185 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use lsp_server::{Message, Notification};
+use lsp_types::notification::{Notification as LspNotification, Progress};
+use lsp_types::{
+    ProgressParams, ProgressParamsValue, ProgressToken, WorkDoneProgress, WorkDoneProgressBegin,
+    WorkDoneProgressEnd, WorkDoneProgressReport,
+};
+
+use crate::cancellation::CancellationToken;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestCancelled;
+
+pub(crate) struct RequestContext {
+    cancellation: CancellationToken,
+    progress: RequestProgress,
+}
+
+impl RequestContext {
+    pub(crate) fn new(
+        cancellation: CancellationToken,
+        work_done_token: Option<ProgressToken>,
+        send_message: Arc<dyn Fn(Message) -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        Self {
+            cancellation,
+            progress: RequestProgress::new(work_done_token, send_message),
+        }
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn check_cancelled(&self) -> Result<(), RequestCancelled> {
+        if self.cancellation.is_cancelled() {
+            Err(RequestCancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn begin(&self) {
+        self.progress.begin();
+    }
+
+    pub(crate) fn report(&self, message: &str) {
+        self.progress.report(message);
+    }
+
+    pub(crate) fn end(&self, message: &str) {
+        self.progress.end(message);
+    }
+}
+
+struct RequestProgress {
+    token: Option<ProgressToken>,
+    send_message: Arc<dyn Fn(Message) -> Result<(), String> + Send + Sync>,
+    started: AtomicBool,
+    ended: AtomicBool,
+}
+
+impl RequestProgress {
+    fn new(
+        token: Option<ProgressToken>,
+        send_message: Arc<dyn Fn(Message) -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        Self {
+            token,
+            send_message,
+            started: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+        }
+    }
+
+    fn begin(&self) {
+        if self.token.is_none() || self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.send(WorkDoneProgress::Begin(WorkDoneProgressBegin {
+            title: "Finding references".to_string(),
+            cancellable: Some(true),
+            message: Some("Resolving symbol".to_string()),
+            percentage: None,
+        }));
+    }
+
+    fn report(&self, message: &str) {
+        if !self.started.load(Ordering::Acquire) || self.ended.load(Ordering::Acquire) {
+            return;
+        }
+        self.send(WorkDoneProgress::Report(WorkDoneProgressReport {
+            cancellable: Some(true),
+            message: Some(message.to_string()),
+            percentage: None,
+        }));
+    }
+
+    fn end(&self, message: &str) {
+        if !self.started.load(Ordering::Acquire) || self.ended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.send(WorkDoneProgress::End(WorkDoneProgressEnd {
+            message: Some(message.to_string()),
+        }));
+    }
+
+    fn send(&self, value: WorkDoneProgress) {
+        let Some(token) = self.token.clone() else {
+            return;
+        };
+        let note = Notification::new(
+            Progress::METHOD.to_string(),
+            ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(value),
+            },
+        );
+        if let Err(err) = (self.send_message)(Message::Notification(note)) {
+            eprintln!("[bifrost-lsp] failed to send request progress: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn progress_is_absent_without_a_token() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&messages);
+        let context = RequestContext::new(
+            CancellationToken::default(),
+            None,
+            Arc::new(move |message| {
+                sink.lock().unwrap().push(message);
+                Ok(())
+            }),
+        );
+
+        context.begin();
+        context.report("Searching workspace");
+        context.end("References ready");
+
+        assert!(messages.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_uses_one_begin_report_end_sequence() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&messages);
+        let context = RequestContext::new(
+            CancellationToken::default(),
+            Some(ProgressToken::String("reference-progress".to_string())),
+            Arc::new(move |message| {
+                sink.lock().unwrap().push(message);
+                Ok(())
+            }),
+        );
+
+        context.begin();
+        context.begin();
+        context.report("Searching workspace");
+        context.end("References ready");
+        context.end("Ignored");
+
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 3);
+        for message in messages.iter() {
+            let Message::Notification(note) = message else {
+                panic!("expected progress notification");
+            };
+            let params: ProgressParams = serde_json::from_value(note.params.clone()).unwrap();
+            assert_eq!(
+                params.token,
+                ProgressToken::String("reference-progress".to_string())
+            );
+        }
+    }
+}

@@ -5,7 +5,7 @@ use std::panic;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use lsp_server::{
@@ -40,6 +40,7 @@ use crate::analyzer::{
     AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
     OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
 };
+use crate::cancellation::CancellationToken;
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::{path_to_uri_string, uri_to_path};
 use crate::lsp::handlers::util::{
@@ -51,6 +52,7 @@ use crate::lsp::handlers::{
     folding_range, formatting, hover, references, rename, semantic_tokens, signature_help,
     type_definition, type_hierarchy, workspace_symbol,
 };
+use crate::lsp::request_context::{RequestCancelled, RequestContext};
 use crate::lsp::text_sync::apply_content_changes;
 use crate::util::throttled_log::ThrottledLog;
 
@@ -126,6 +128,7 @@ pub(crate) fn run_with_connection(
     state.register_runtime_configuration(&connection)?;
 
     let result = main_loop(&connection, &mut state, pending_messages);
+    state.request_jobs.cancel_all_and_join();
     state.formatting_jobs.cancel_all();
     state
         .formatting_jobs
@@ -204,6 +207,7 @@ fn handle_message(
     state: &mut ServerState,
     msg: Message,
 ) -> Result<bool, String> {
+    state.request_jobs.reap_finished();
     let meta = LspMessageMeta::from_message(&msg);
     let _scope = LspDebugScope::enter(meta.clone());
     if lsp_debug_enabled() {
@@ -667,6 +671,9 @@ fn handle_request(
     if req.method == Formatting::METHOD {
         return handle_formatting_request(connection, state, req);
     }
+    if req.method == References::METHOD {
+        return handle_references_request(connection, state, req);
+    }
 
     let id = req.id.clone();
     let id_for_log = format!("{id:?}");
@@ -731,13 +738,6 @@ fn handle_request(
                 &mut state.completion_cache,
                 &state.workspace,
                 state.overlay.as_ref(),
-                &params,
-            ))
-        }),
-        References::METHOD => decode_and_run::<References, _>(req, |params| {
-            Ok(references::handle(
-                &state.workspace,
-                state.project(),
                 &params,
             ))
         }),
@@ -840,6 +840,137 @@ fn handle_request(
         .sender
         .send(Message::Response(response))
         .map_err(|err| format!("Failed to send LSP response: {err}"))
+}
+
+fn handle_references_request(
+    connection: &Connection,
+    state: &ServerState,
+    req: Request,
+) -> Result<(), String> {
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let params = match req.extract::<lsp_types::ReferenceParams>(References::METHOD) {
+        Ok((_, params)) => params,
+        Err(ExtractError::JsonError { error, .. }) => {
+            let response = Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("Failed to decode params for {method}: {error}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+        Err(ExtractError::MethodMismatch(_)) => {
+            let response = Response::new_err(
+                id,
+                ErrorCode::MethodNotFound as i32,
+                format!("Method not implemented: {method}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+    };
+
+    let Some(slot) = state.request_jobs.try_acquire() else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::ServerCancelled as i32,
+            "too many concurrent cancellable requests".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+
+    let cancellation = CancellationToken::default();
+    let worker_cancellation = cancellation.clone();
+    let workspace = state.workspace.clone();
+    let project = Arc::clone(&state.overlay);
+    let sender = connection.sender.clone();
+    let progress_sender = sender.clone();
+    let work_done_token = params.work_done_progress_params.work_done_token.clone();
+    let worker_id = id.clone();
+    let worker_method = method.clone();
+    let context = RequestContext::new(
+        worker_cancellation.clone(),
+        work_done_token,
+        Arc::new(move |message| {
+            progress_sender
+                .send(message)
+                .map_err(|err| format!("Failed to send LSP progress: {err}"))
+        }),
+    );
+    let handle = match thread::Builder::new()
+        .name("bifrost-lsp-references".to_string())
+        .spawn(move || {
+            context.begin();
+            let result = references::handle(&workspace, project.as_ref(), &params, &context);
+            let response = match result {
+                Err(RequestCancelled) => {
+                    context.end("Cancelled");
+                    Response::new_err(
+                        worker_id.clone(),
+                        ErrorCode::RequestCanceled as i32,
+                        "reference request cancelled by client".to_string(),
+                    )
+                }
+                Ok(_) if worker_cancellation.is_cancelled() => {
+                    context.end("Cancelled");
+                    Response::new_err(
+                        worker_id.clone(),
+                        ErrorCode::RequestCanceled as i32,
+                        "reference request cancelled by client".to_string(),
+                    )
+                }
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(value) => {
+                        context.end("References ready");
+                        Response::new_ok(worker_id.clone(), value)
+                    }
+                    Err(err) => {
+                        context.end("Failed");
+                        Response::new_err(
+                            worker_id.clone(),
+                            ErrorCode::InternalError as i32,
+                            format!("Failed to serialize {worker_method} result: {err}"),
+                        )
+                    }
+                },
+            };
+            if let Some(error) = response.error.as_ref() {
+                eprintln!(
+                    "[bifrost-lsp] request error method={} id={:?} code={} message={}",
+                    worker_method, worker_id, error.code, error.message
+                );
+            }
+            if let Err(err) = sender.send(Message::Response(response)) {
+                eprintln!(
+                    "[bifrost-lsp] failed to send reference response method={} id={:?}: {err}",
+                    worker_method, worker_id
+                );
+            }
+            drop(slot);
+        }) {
+        Ok(handle) => handle,
+        Err(err) => {
+            let response = Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                format!("Failed to start reference worker: {err}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|send_err| format!("Failed to send LSP response: {send_err}"));
+        }
+    };
+    state.request_jobs.insert(id, cancellation, handle);
+    Ok(())
 }
 
 fn handle_formatting_request(
@@ -1219,6 +1350,7 @@ fn handle_notification(
             let params: CancelParams = serde_json::from_value(note.params)
                 .map_err(|err| format!("Failed to decode {} params: {err}", Cancel::METHOD))?;
             let id = request_id_from_number_or_string(params.id);
+            state.request_jobs.cancel(&id);
             state.formatting_jobs.cancel(&id);
             Ok(())
         }
@@ -1331,6 +1463,7 @@ pub(crate) struct ServerState {
     published_diagnostic_uris: Vec<Uri>,
     open_documents: HashMap<String, OpenDocument>,
     document_generations: Arc<Mutex<HashMap<String, u64>>>,
+    request_jobs: RequestJobs,
     formatting_jobs: FormattingJobs,
 }
 
@@ -1403,8 +1536,108 @@ const REJECTED_DIDCHANGE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 /// `OVERLAY_REJECTION_LOG_MAX_ENTRIES`: a sloppy or hostile client could
 /// otherwise send a stream of distinct URIs and grow the map without bound.
 const REJECTED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
+const MAX_CONCURRENT_CANCELLABLE_REQUESTS: usize = 2;
 const MAX_CONCURRENT_FORMATTING_REQUESTS: usize = 2;
 const FORMATTER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+struct RequestSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for RequestSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct RequestJob {
+    cancellation: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct RequestJobs {
+    active: Arc<AtomicUsize>,
+    jobs: Mutex<HashMap<RequestId, RequestJob>>,
+}
+
+impl RequestJobs {
+    fn try_acquire(&self) -> Option<RequestSlot> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_CANCELLABLE_REQUESTS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| RequestSlot {
+                active: Arc::clone(&self.active),
+            })
+    }
+
+    fn insert(&self, id: RequestId, cancellation: CancellationToken, handle: JoinHandle<()>) {
+        let previous = self.jobs.lock().expect("request job lock poisoned").insert(
+            id,
+            RequestJob {
+                cancellation,
+                handle,
+            },
+        );
+        if let Some(previous) = previous {
+            previous.cancellation.cancel();
+            if previous.handle.join().is_err() {
+                eprintln!("[bifrost-lsp] replaced request worker panicked");
+            }
+        }
+    }
+
+    fn cancel(&self, id: &RequestId) {
+        let cancellation = self
+            .jobs
+            .lock()
+            .expect("request job lock poisoned")
+            .get(id)
+            .map(|job| job.cancellation.clone());
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
+    }
+
+    fn reap_finished(&self) {
+        let finished = {
+            let mut jobs = self.jobs.lock().expect("request job lock poisoned");
+            let ids: Vec<_> = jobs
+                .iter()
+                .filter(|(_, job)| job.handle.is_finished())
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| jobs.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for job in finished {
+            if job.handle.join().is_err() {
+                eprintln!("[bifrost-lsp] request worker panicked");
+            }
+        }
+    }
+
+    fn cancel_all_and_join(&self) {
+        let jobs: Vec<_> = self
+            .jobs
+            .lock()
+            .expect("request job lock poisoned")
+            .drain()
+            .map(|(_, job)| job)
+            .collect();
+        for job in &jobs {
+            job.cancellation.cancel();
+        }
+        for job in jobs {
+            if job.handle.join().is_err() {
+                eprintln!("[bifrost-lsp] request worker panicked during shutdown");
+            }
+        }
+    }
+}
 
 struct FormattingSlot {
     active: Arc<AtomicUsize>,
@@ -1519,6 +1752,7 @@ impl ServerState {
             published_diagnostic_uris: Vec::new(),
             open_documents: HashMap::new(),
             document_generations: Arc::new(Mutex::new(HashMap::new())),
+            request_jobs: RequestJobs::default(),
             formatting_jobs: FormattingJobs::default(),
         })
     }
@@ -2367,6 +2601,9 @@ fn path_is_within_any(path: &Path, candidates: &[PathBuf]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::sync::mpsc;
+
     use super::*;
     use serde_json::json;
 
@@ -2502,5 +2739,83 @@ mod tests {
         let file = scoped.file_by_abs_path(&nested.join("src/app.ts")).unwrap();
 
         assert_eq!(scoped.workspace_root_for_file(&file), nested);
+    }
+
+    #[test]
+    fn request_jobs_cancel_registered_worker_and_ignore_unknown_ids() {
+        let jobs = RequestJobs::default();
+        jobs.cancel(&RequestId::from(404));
+
+        let slot = jobs.try_acquire().expect("first request slot");
+        let token = CancellationToken::default();
+        let worker_token = token.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            assert!(worker_token.is_cancelled());
+            drop(slot);
+        });
+        let id = RequestId::from(1);
+        jobs.insert(id.clone(), token, handle);
+
+        ready_rx.recv().unwrap();
+        jobs.cancel(&id);
+        release_tx.send(()).unwrap();
+        jobs.cancel_all_and_join();
+
+        assert_eq!(jobs.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn request_jobs_bound_and_reap_completed_workers() {
+        let jobs = RequestJobs::default();
+        let first = jobs.try_acquire().expect("first request slot");
+        let second = jobs.try_acquire().expect("second request slot");
+        assert!(jobs.try_acquire().is_none());
+        drop(first);
+        drop(second);
+
+        let slot = jobs.try_acquire().expect("reused request slot");
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            drop(slot);
+            done_tx.send(()).unwrap();
+        });
+        let id = RequestId::from(2);
+        jobs.insert(id.clone(), CancellationToken::default(), handle);
+        done_rx.recv().unwrap();
+        jobs.reap_finished();
+        jobs.cancel(&id);
+
+        assert!(jobs.jobs.lock().unwrap().is_empty());
+        assert_eq!(jobs.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn request_jobs_shutdown_cancels_and_joins_all_workers() {
+        let jobs = RequestJobs::default();
+        let barrier = Arc::new(Barrier::new(MAX_CONCURRENT_CANCELLABLE_REQUESTS + 1));
+        for id in 0..MAX_CONCURRENT_CANCELLABLE_REQUESTS {
+            let slot = jobs.try_acquire().expect("request slot");
+            let token = CancellationToken::default();
+            let worker_token = token.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            let handle = thread::spawn(move || {
+                worker_barrier.wait();
+                while !worker_token.is_cancelled() {
+                    thread::yield_now();
+                }
+                drop(slot);
+            });
+            jobs.insert(RequestId::from(id as i32), token, handle);
+        }
+
+        barrier.wait();
+        jobs.cancel_all_and_join();
+
+        assert!(jobs.jobs.lock().unwrap().is_empty());
+        assert_eq!(jobs.active.load(Ordering::Acquire), 0);
     }
 }

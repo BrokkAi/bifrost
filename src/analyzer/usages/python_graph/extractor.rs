@@ -11,6 +11,7 @@ use crate::analyzer::usages::python_graph::resolver::{
     resolve_receiver_type, target_owner_code_unit, top_level_identifier,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer, Range};
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -169,6 +170,7 @@ pub(super) fn scan_files_for_seeds(
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
+    cancellation: Option<&CancellationToken>,
 ) -> ScanResult {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
@@ -191,6 +193,9 @@ pub(super) fn scan_files_for_seeds(
     let parser_language = tree_sitter_python::LANGUAGE.into();
 
     files_vec.par_iter().for_each(|file| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let owned_source: Option<Arc<String>>;
         let owned_tree: Option<Tree>;
         let (source_str, tree_ref) = if let Some(parsed) = graph.parsed.get(*file) {
@@ -216,6 +221,9 @@ pub(super) fn scan_files_for_seeds(
                 owned_tree.as_ref().unwrap(),
             )
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
 
         let edges = py.usage_matching_edges(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);

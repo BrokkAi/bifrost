@@ -187,7 +187,13 @@ fn resolve_with_graph(
     if scan_scope.is_authoritative() {
         scan_files.retain(|file| scan_scope.allows(file));
     }
-    let scan_result = scan_files_for_target(analyzer, graph, scan_files, &target_spec);
+    let scan_result = scan_files_for_target(
+        analyzer,
+        graph,
+        scan_files,
+        &target_spec,
+        scan_scope.cancellation(),
+    );
     let hits: BTreeSet<_> = scan_result
         .hits
         .into_iter()

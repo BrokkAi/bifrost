@@ -14,6 +14,7 @@ use crate::analyzer::{
     CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer,
     RustReferenceContext,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -111,6 +112,7 @@ pub(super) fn scan_files_for_target(
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: Option<&BTreeSet<(ProjectFile, String)>>,
+    cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
     let target_short = target.identifier().to_string();
     let target_fqn = target.fq_name();
@@ -119,6 +121,9 @@ pub(super) fn scan_files_for_target(
     let files_vec: Vec<_> = files.into_iter().collect();
 
     files_vec.par_iter().for_each(|file| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let owned_source: Option<Arc<String>>;
         let owned_tree: Option<Tree>;
         let (source, tree) = if let Some(parsed) = graph.parsed.get(file) {
@@ -141,6 +146,9 @@ pub(super) fn scan_files_for_target(
                 owned_tree.as_ref().expect("owned tree"),
             )
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
 
         let line_starts = compute_line_starts(source);
         let (mut direct_names, namespace_names) = match seeds {
@@ -375,6 +383,7 @@ pub(super) fn scan_files_for_member_target(
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
+    cancellation: Option<&CancellationToken>,
 ) -> RustMemberScanResult {
     let Some(owner) = rust.parent_of(target) else {
         return RustMemberScanResult::default();
@@ -388,6 +397,9 @@ pub(super) fn scan_files_for_member_target(
     let support = analyzer.definition_lookup_index();
 
     files.par_iter().for_each(|file| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let owned_source: Option<Arc<String>>;
         let owned_tree: Option<Tree>;
         let (source, tree) = if let Some(parsed) = graph.parsed.get(file) {
@@ -410,6 +422,9 @@ pub(super) fn scan_files_for_member_target(
                 owned_tree.as_ref().expect("owned tree"),
             )
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let line_starts = compute_line_starts(source);
         let owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()

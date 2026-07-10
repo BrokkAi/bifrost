@@ -160,6 +160,7 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 target,
                 &BTreeSet::new(),
                 language,
+                scan_scope.cancellation(),
             )
         } else {
             let candidate_files = scan_scope.candidate_files();
@@ -177,6 +178,7 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 target,
                 &seeds,
                 language,
+                scan_scope.cancellation(),
             )
         };
         let (hits, unproven_hits): (BTreeSet<UsageHit>, BTreeSet<UsageHit>) = scan_hits

@@ -63,6 +63,9 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         };
 
         for file in files {
+            if scan_scope.is_cancelled() {
+                break;
+            }
             scan_file(analyzer, &visibility, &file, &spec, &mut state);
             if *state.limit_exceeded {
                 break;

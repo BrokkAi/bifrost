@@ -1,7 +1,4 @@
-use crate::analyzer::usages::candidates::{
-    FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
-    default_provider,
-};
+use crate::analyzer::usages::candidates::find_default_candidates_with_cancellation;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
 use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
 use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
@@ -17,11 +14,9 @@ use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
-
-type DefaultCandidateProvider =
-    FallbackCandidateProvider<ImportGraphCandidateProvider, TextSearchCandidateProvider>;
 
 type FileFilter = Box<dyn Fn(&ProjectFile) -> bool + Send + Sync>;
 
@@ -53,18 +48,24 @@ pub struct CandidateFilesSample {
 ///
 /// JDT-based Java analysis is intentionally omitted; bifrost is tree-sitter only.
 pub struct UsageFinder {
-    fallback_candidate_provider: DefaultCandidateProvider,
     file_filter: Option<FileFilter>,
     authoritative_scope: bool,
+    cancellation: CancellationToken,
 }
 
 impl UsageFinder {
     pub fn new() -> Self {
+        let cancellation = CancellationToken::default();
         Self {
-            fallback_candidate_provider: default_provider(),
             file_filter: None,
             authoritative_scope: false,
+            cancellation,
         }
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     pub fn with_file_filter<F>(mut self, filter: F) -> Self
@@ -98,7 +99,7 @@ impl UsageFinder {
         max_files: usize,
         max_usages: usize,
     ) -> QueryResult {
-        if overloads.is_empty() {
+        if overloads.is_empty() || self.cancellation.is_cancelled() {
             return QueryResult {
                 candidate_files: HashSet::default(),
                 candidate_files_truncated: false,
@@ -111,20 +112,27 @@ impl UsageFinder {
         let target = &overloads[0];
         let mut candidates: HashSet<ProjectFile> = match explicit_provider {
             Some(provider) => provider.find_candidates(target, analyzer),
-            None => self
-                .fallback_candidate_provider
-                .find_candidates(target, analyzer),
+            None => find_default_candidates_with_cancellation(target, analyzer, &self.cancellation),
         };
+        if self.cancellation.is_cancelled() {
+            return cancelled_query_result();
+        }
         let mut protected_candidates = candidates.clone();
 
         if explicit_provider.is_none() {
             add_php_composer_candidates(target, analyzer, &mut candidates);
+            if self.cancellation.is_cancelled() {
+                return cancelled_query_result();
+            }
             add_php_import_alias_candidates(target, analyzer, &mut candidates);
         }
 
         if let Some(filter) = self.file_filter.as_ref() {
-            candidates.retain(|file| filter(file));
-            protected_candidates.retain(|file| filter(file));
+            candidates.retain(|file| !self.cancellation.is_cancelled() && filter(file));
+            protected_candidates.retain(|file| !self.cancellation.is_cancelled() && filter(file));
+        }
+        if self.cancellation.is_cancelled() {
+            return cancelled_query_result();
         }
 
         let candidate_files_truncated = candidates.len() > max_files;
@@ -137,7 +145,11 @@ impl UsageFinder {
             .map(|all_candidates| candidate_files_sample(all_candidates, &candidates));
 
         let mut graph_failure = None;
-        let scan_scope = UsageScanScope::new(&candidates, self.authoritative_scope);
+        let scan_scope = UsageScanScope::with_cancellation(
+            &candidates,
+            self.authoritative_scope,
+            &self.cancellation,
+        );
         let result = match graph_find_usages(
             language_for_target(target),
             analyzer,
@@ -161,6 +173,9 @@ impl UsageFinder {
                 }
             }
         };
+        if self.cancellation.is_cancelled() {
+            return cancelled_query_result();
+        }
 
         QueryResult {
             candidate_files: candidates,
@@ -188,6 +203,16 @@ impl UsageFinder {
         overloads: &[CodeUnit],
     ) -> FuzzyResult {
         self.find_usages(analyzer, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
+    }
+}
+
+fn cancelled_query_result() -> QueryResult {
+    QueryResult {
+        candidate_files: HashSet::default(),
+        candidate_files_truncated: false,
+        candidate_files_sample: None,
+        result: FuzzyResult::empty_success(),
+        graph_failure: None,
     }
 }
 

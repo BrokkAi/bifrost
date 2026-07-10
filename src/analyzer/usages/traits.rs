@@ -2,6 +2,7 @@ use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 
 /// Files a usage query is allowed to scan.
@@ -13,6 +14,7 @@ use crate::hash::HashSet;
 pub(crate) struct UsageScanScope<'a> {
     candidate_files: &'a HashSet<ProjectFile>,
     authoritative: bool,
+    cancellation: Option<&'a CancellationToken>,
 }
 
 impl<'a> UsageScanScope<'a> {
@@ -20,6 +22,19 @@ impl<'a> UsageScanScope<'a> {
         Self {
             candidate_files,
             authoritative,
+            cancellation: None,
+        }
+    }
+
+    pub(crate) fn with_cancellation(
+        candidate_files: &'a HashSet<ProjectFile>,
+        authoritative: bool,
+        cancellation: &'a CancellationToken,
+    ) -> Self {
+        Self {
+            candidate_files,
+            authoritative,
+            cancellation: Some(cancellation),
         }
     }
 
@@ -33,6 +48,15 @@ impl<'a> UsageScanScope<'a> {
 
     pub(crate) fn allows(&self, file: &ProjectFile) -> bool {
         !self.authoritative || self.candidate_files.contains(file)
+    }
+
+    pub(crate) fn cancellation(&self) -> Option<&'a CancellationToken> {
+        self.cancellation
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
     }
 }
 

@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod benchmark;
+mod cancellation;
 pub mod code_quality;
 pub mod commit_analysis;
 pub mod file_tools;

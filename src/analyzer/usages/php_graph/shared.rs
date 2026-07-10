@@ -56,9 +56,15 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
         let hierarchy = hierarchy.as_ref().unwrap_or(&empty_hierarchy);
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
         for override_declaration in hierarchy.overriding_methods(self.php, &spec, &files) {
+            if scan_scope.is_cancelled() {
+                break;
+            }
             push_override_declaration_hit(self.php, analyzer, &override_declaration, &mut hits);
         }
         for file in files {
+            if scan_scope.is_cancelled() {
+                break;
+            }
             scan_file(self.php, analyzer, &file, &spec, hierarchy, &mut hits);
             if hits.len() > max_usages {
                 return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {

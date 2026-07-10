@@ -22,6 +22,7 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverFactProvider,
 };
 use crate::analyzer::{AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -38,6 +39,7 @@ pub(super) fn scan_files_for_seeds(
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
     language: Language,
+    cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
@@ -54,6 +56,9 @@ pub(super) fn scan_files_for_seeds(
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
 
     files_vec.par_iter().for_each(|file| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         // The resolution maps are analyzer-cached, but the syntax trees are not — parse
         // each scan file here and drop it when this closure returns, so a repeated query
         // re-parses only its candidate closure, never the whole workspace.
@@ -79,6 +84,9 @@ pub(super) fn scan_files_for_seeds(
         let Some(tree) = parser.parse(source.as_str(), None) else {
             return;
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let source_str = source.as_str();
         let tree_ref = &tree;
 

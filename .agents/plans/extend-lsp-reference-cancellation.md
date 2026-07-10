@@ -16,10 +16,10 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
 
 - [x] (2026-07-10 09:38Z) Rebased the existing `578-extend-lsp-cancellation-and-request-progress` branch onto current `origin/master` and confirmed the worktree is clean.
 - [x] (2026-07-10 09:38Z) Re-read `.agents/PLANS.md`, the issue plan, current LSP dispatch, formatting cancellation, progress support, reference handling, and usage-finder architecture.
-- [ ] Add the crate-private cooperative cancellation token and propagate it through the default usage candidate providers and every language query loop used by references.
-- [ ] Add the bounded LSP request-worker registry, request-scoped progress reporter, and asynchronous references dispatch.
-- [ ] Add deterministic unit/integration coverage and update the public LSP documentation.
-- [ ] Run formatting, focused tests, `cargo clippy-no-cuda`, and the full test suite.
+- [x] (2026-07-10 09:57Z) Added the crate-private cooperative cancellation token and propagated it through default candidate discovery and every language query loop used by references.
+- [x] (2026-07-10 09:57Z) Added the two-worker LSP request registry, request-scoped progress reporter, asynchronous references dispatch, `-32800` cancellation mapping, and shutdown joins.
+- [x] (2026-07-10 09:57Z) Added deterministic worker/progress tests, stdio reference progress/cancellation coverage, and updated the public LSP documentation.
+- [ ] Run formatting, focused tests, `cargo clippy-no-cuda`, and the full test suite. Completed: formatting and every planned focused test. Remaining: clippy and full suite.
 - [ ] Run specialist reviews, address actionable findings, and record final outcomes.
 
 ## Surprises & Discoveries
@@ -33,14 +33,20 @@ The behavior is observable through the integration tests in `tests/bifrost_lsp_s
 - Observation: `lsp-types` 0.97 already models client-supplied `workDoneToken` on `ReferenceParams` and supports the work-done begin/report/end payloads needed by this milestone.
   Evidence: the local dependency sources define `ReferenceParams.work_done_progress_params` and `WorkDoneProgress::{Begin,Report,End}`. No dependency update is required.
 
+- Observation: Running the complete `lsp::` unit-test subset in parallel caused three existing formatter-executor tests to hit their two-second timeout, while each failed test passed individually.
+  Evidence: `cargo test --lib lsp::` reported three timeouts; exact reruns of `formatter_executor_passes_stdin_and_returns_stdout`, `formatter_executor_drains_stdout_while_writing_large_stdin`, and `formatter_executor_reports_failure_stderr` all passed. The reference and formatter-cancellation integration tests also pass.
+
+- Observation: Client cancellation can be tested end to end without a production test hook.
+  Evidence: the integration test sends a reference request for a large structured Java fixture followed immediately by `$/cancelRequest`; registration completes before the main loop reads the notification, and the response is deterministically `-32800`.
+
 ## Decision Log
 
 - Decision: Implement the references-first milestone rather than all handlers named by issue #578.
   Rationale: References exercises the deepest required cancellation seam through candidate discovery and every language usage resolver. Proving the shared infrastructure here keeps the first change reviewable and leaves request-specific progress/streaming policy to later milestones.
   Date/Author: 2026-07-10 / Codex
 
-- Decision: Keep existing public Rust `UsageFinder` and `CandidateFileProvider` APIs unchanged.
-  Rationale: Cancellation is currently an LSP execution concern. A crate-private `UsageFinder::with_cancellation` path and cancellation stored in internal default providers can stop the real work without forcing every external/custom provider to adopt a new public type.
+- Decision: Keep existing public Rust `UsageFinder` and `CandidateFileProvider` APIs, including the public unit-provider struct shapes, unchanged.
+  Rationale: Cancellation is currently an LSP execution concern. A crate-private `UsageFinder::with_cancellation` path calls shared internal candidate helper functions with the token, while public provider constructors and trait signatures remain byte-for-byte source-compatible.
   Date/Author: 2026-07-10 / Codex
 
 - Decision: Keep references partial results disabled in this milestone.
@@ -75,7 +81,7 @@ Client-initiated work-done progress differs from Bifrost's existing startup prog
 
 First, add a crate-private cancellation module containing `CancellationToken`. The default constructor creates a live, not-canceled token. Clones share one atomic flag. Add `cancel` and `is_cancelled`; do not expose this module from the public crate API.
 
-Teach `UsageFinder` to accept a token through a crate-private builder while keeping `new`, `query`, `find_usages`, the public provider trait, and all external callers source-compatible. Store the token in the finder. Construct the default import-graph and text-search providers with the same token, and store it in `UsageScanScope`. Check it before and after candidate discovery, filtering/truncation, and graph dispatch. Candidate providers should stop at their existing file-loop boundaries; the Rayon closure must test the flag before file I/O and before recording a match. An early-aborted internal search may construct an empty intermediate result because the LSP handler will check the same token and discard it.
+Teach `UsageFinder` to accept a token through a crate-private builder while keeping `new`, `query`, `find_usages`, the public provider trait, public unit-provider struct shapes, and all external callers source-compatible. Store the token in the finder. Route default candidate discovery through shared internal import-graph and text-search helper functions that accept the token, and store it in `UsageScanScope`. Check it before and after candidate discovery, filtering/truncation, and graph dispatch. Candidate helpers stop at their existing file-loop boundaries; the Rayon closure tests the flag before file I/O and before recording a match. An early-aborted internal search may construct an empty intermediate result because the LSP handler checks the same token and discards it.
 
 Add cancellation checks at file/batch boundaries in the JS/TS, Python, PHP, Rust, Java, C#, C++, Go, Scala, and Ruby query implementations. Where a strategy delegates a whole file set to an extractor helper, pass the shared token or a cancellation predicate into that helper so cancellation can stop between files rather than only after the whole helper returns. Do not change usage proof rules, candidate limits, structured resolver behavior, or public result shapes.
 

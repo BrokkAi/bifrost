@@ -61,6 +61,9 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
             limit_exceeded: &mut limit_exceeded,
         };
         for file in files {
+            if scan_scope.is_cancelled() {
+                break;
+            }
             scan_file(self.csharp, analyzer, &file, &spec, &mut state);
             if *state.limit_exceeded {
                 break;
