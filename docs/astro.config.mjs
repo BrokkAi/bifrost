@@ -69,6 +69,7 @@ export default defineConfig({
                 { label: 'JavaScript', slug: 'code-query-tutorials/javascript' },
                 { label: 'TypeScript', slug: 'code-query-tutorials/typescript' },
                 { label: 'Go', slug: 'code-query-tutorials/go' },
+                { label: 'C and C++', slug: 'code-query-tutorials/cpp' },
               ],
             },
             { label: 'Semantic Search', slug: 'semantic-search' },

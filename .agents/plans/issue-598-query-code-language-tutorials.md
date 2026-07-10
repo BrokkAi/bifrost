@@ -16,7 +16,7 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 - [x] (2026-07-10 13:28Z) Milestone 3: published and verified the JavaScript tutorial with receiver/context narrowing, arrow/new matching, anonymous class-expression field access, and unsupported kwargs.
 - [x] (2026-07-10 13:31Z) Milestone 4: published and verified TypeScript-only declarations/class-like forms, decorated callable exclusions, and TSX path/language scoping.
 - [x] (2026-07-10 13:34Z) Milestone 5: published and verified Go call exclusion with `not_has`, multi-value assignment roles, grouped import paths, and keyword/decorator diagnostics.
-- [ ] Milestone 6: publish and verify the shared C/C++ tutorial.
+- [x] (2026-07-10 13:36Z) Milestone 6: published and verified shared C/C++ filtering, initializer roles/literals, C++ member calls, out-of-line constructors, and includes through `cpp`.
 - [ ] Milestone 7: publish and verify the Rust tutorial.
 - [ ] Milestone 8: publish and verify the PHP tutorial.
 - [ ] Milestone 9: publish and verify the Scala tutorial.
@@ -72,6 +72,8 @@ Milestone 3 published JavaScript's tutorial with four exact cases: same-name cal
 Milestone 4 published TypeScript's tutorial with exact type-alias, interface/enum/abstract-class, decorated callable, and TSX call results. It proves `.tsx` participates in the `typescript` filter and uses path scoping to isolate it. Focused/docs tests, both production and root-based preview builds, and a fresh rendered route/navigation/date/code-block inspection passed.
 
 Milestone 5 published Go's tutorial with exact `not_has` call exclusion, ordered captures, structured multi-value assignment left/right roles, grouped import-path matching, and separate unsupported kwargs/decorators diagnostics. Focused/docs tests, production and root-preview builds, and the fresh rendered Go route passed.
+
+Milestone 6 published the shared C/C++ tutorial with exact cross-extension `cpp` results, C and C++ initializer assignments with identifier/numeric roles, a `.cpp`-scoped member call, an out-of-line constructor, and a preprocessor include. Focused/docs tests, production/root-preview builds, and the fresh C/C++ route/navigation/date inspection passed.
 
 ## Context and Orientation
 
@@ -159,3 +161,5 @@ Revision note, 2026-07-10: Updated after Milestone 3 with JavaScript's exact out
 Revision note, 2026-07-10: Updated after Milestone 4 with TypeScript declaration/refinement/TSX results and rendered-page evidence.
 
 Revision note, 2026-07-10: Updated after Milestone 5 with Go's exact results, import-path/alias boundary, and rendered-page evidence.
+
+Revision note, 2026-07-10: Updated after Milestone 6 with the shared `cpp` filter, exact C/C++ results, and rendered-page evidence.

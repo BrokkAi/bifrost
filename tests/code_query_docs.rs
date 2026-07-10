@@ -13,6 +13,7 @@ const DOCS: &[&str] = &[
     "docs/src/content/docs/code-query-tutorials/javascript.md",
     "docs/src/content/docs/code-query-tutorials/typescript.md",
     "docs/src/content/docs/code-query-tutorials/go.md",
+    "docs/src/content/docs/code-query-tutorials/cpp.md",
 ];
 
 const PUBLIC_QUERY_SURFACES: &[&str] = &[

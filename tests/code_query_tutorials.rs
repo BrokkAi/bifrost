@@ -86,6 +86,11 @@ fn go_tutorial() {
     verify_tutorial("docs/src/content/docs/code-query-tutorials/go.md");
 }
 
+#[test]
+fn cpp_tutorial() {
+    verify_tutorial("docs/src/content/docs/code-query-tutorials/cpp.md");
+}
+
 #[allow(dead_code)]
 fn verify_tutorial(relative: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
