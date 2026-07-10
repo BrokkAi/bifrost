@@ -19,7 +19,7 @@ Language pages will be added and marked with their last successful end-to-end ve
 - [C and C++ through the `cpp` adapter](./cpp/)
 - [Rust](./rust/)
 - [PHP](./php/)
-- Scala (planned)
+- [Scala](./scala/)
 - C# (planned)
 - Ruby (planned)
 
