@@ -4,9 +4,9 @@ use brokk_bifrost::{
     CSharpAnalyzer, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language,
     PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
     searchtools::{
-        ScanUsagesEntry, ScanUsagesParams, ScanUsagesResult, ScanUsagesStatus, SearchSymbolsParams,
-        SymbolLookupParams, SymbolSourcesResult, get_symbol_ancestors, get_symbol_locations,
-        get_symbol_sources, scan_usages, search_symbols,
+        ScanUsagesByReferenceParams, ScanUsagesEntry, ScanUsagesResult, ScanUsagesStatus,
+        SearchSymbolsParams, SymbolLookupParams, SymbolSourcesResult, get_symbol_ancestors,
+        get_symbol_locations, get_symbol_sources, scan_usages_by_reference, search_symbols,
     },
 };
 use common::InlineTestProject;
@@ -151,11 +151,10 @@ const direct = ApiClient.create("/direct");
         "expected public static method symbol without internal suffix: {search:#?}"
     );
 
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["ApiClient.create".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["ApiClient.create".to_string()],
             include_tests: true,
             paths: None,
         },
@@ -196,13 +195,10 @@ object Service {
         .build();
     let analyzer = ScalaAnalyzer::from_project(project.project().clone());
 
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec![
-                "src/main/scala/example/Service.scala#example.Service".to_string(),
-            ]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["src/main/scala/example/Service.scala#example.Service".to_string()],
             include_tests: true,
             paths: None,
         },
@@ -417,11 +413,10 @@ func caller(options *Options, box *Box[int]) bool {
             "box.Empty()",
         ),
     ] {
-        let result = scan_usages(
+        let result = scan_usages_by_reference(
             &analyzer,
-            ScanUsagesParams {
-                symbols: Some(vec![symbol.to_string()]),
-                targets: Vec::new(),
+            ScanUsagesByReferenceParams {
+                symbols: vec![symbol.to_string()],
                 include_tests: true,
                 paths: None,
             },
@@ -450,11 +445,10 @@ fn scan_usages_reports_path_qualified_symbol_selector_as_unsupported() {
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
 
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["src/cli.ts::main".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["src/cli.ts::main".to_string()],
             include_tests: true,
             paths: None,
         },
@@ -479,11 +473,10 @@ fn scan_usages_reports_plain_path_symbol_with_path_guidance() {
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
 
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["src/cli.ts".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["src/cli.ts".to_string()],
             include_tests: true,
             paths: None,
         },
@@ -497,8 +490,9 @@ fn scan_usages_reports_plain_path_symbol_with_path_guidance() {
         message.contains("expects workspace symbols, not file paths"),
         "{message}"
     );
-    assert!(message.contains("Use `paths` only to narrow"), "{message}");
-    assert!(message.contains("use `targets`"), "{message}");
+    assert!(message.contains("use `paths` only to narrow"), "{message}");
+    assert!(message.contains("scan_usages_by_reference"), "{message}");
+    assert!(!message.contains("`targets`"), "{message}");
 }
 
 #[test]
@@ -513,11 +507,10 @@ fn scan_usages_bounds_ambiguous_path_qualified_selector_message() {
     let project = builder.build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
 
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["index.ts::missing".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["index.ts::missing".to_string()],
             include_tests: true,
             paths: None,
         },
@@ -1310,11 +1303,10 @@ fn scan_usages_uses_the_common_fuzzy_symbol_resolver() {
         .build();
     let analyzer = JavaAnalyzer::from_project(project.project().clone());
 
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["A::method".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["A::method".to_string()],
             include_tests: true,
             paths: None,
         },
@@ -1339,11 +1331,10 @@ fn scan_usages_finds_c_function_callers_through_header_declaration() {
         .build();
     let analyzer = CppAnalyzer::from_project(project.project().clone());
 
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["initialize_the_repository".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["initialize_the_repository".to_string()],
             include_tests: true,
             paths: None,
         },

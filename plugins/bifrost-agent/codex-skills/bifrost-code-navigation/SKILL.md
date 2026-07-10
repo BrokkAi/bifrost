@@ -2,7 +2,7 @@
 name: bifrost-code-navigation
 description: >-
   Find symbol definitions, references, call sites, and related files using
-  Bifrost's search_symbols, get_symbol_locations, scan_usages, and
+  Bifrost's search_symbols, get_symbol_locations, scan_usages_by_location, and
   most_relevant_files tools.
 ---
 
@@ -24,7 +24,7 @@ default plugin install.
 |---|---|
 | `search_symbols` | Find classes, methods, fields, functions, modules, and other indexed declarations by name |
 | `get_symbol_locations` | Get project-relative file paths and line ranges for known symbols |
-| `scan_usages` | Find references, call sites, usages, callers, and related tests for known symbols or declaration locations |
+| `scan_usages_by_location` | Find references, call sites, usages, callers, and related tests for known symbols or declaration locations |
 | `most_relevant_files` | Rank project files related to a set of seed files using imports and git history |
 
 ## Tips
@@ -33,7 +33,7 @@ default plugin install.
   names and accepts `include_tests: true` when tests matter.
 - Use `get_symbol_locations` when you need exact definition coordinates before
   opening or editing a declaration.
-- Use `scan_usages` instead of text search when changing behavior and callers
+- Use `scan_usages_by_location` instead of text search when changing behavior and callers
   or references matter. Pass fully qualified symbols from `search_symbols`
   where possible, or use source-location targets when you only know the file
   and declaration line.

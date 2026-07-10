@@ -29,7 +29,7 @@ const CANONICAL_SKILLS = [
 const INCLUDED_TOOLS = [
   "search_symbols",
   "get_symbol_locations",
-  "scan_usages",
+  "scan_usages_by_location",
   "most_relevant_files",
   "get_summaries",
   "get_symbol_sources",

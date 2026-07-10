@@ -100,10 +100,16 @@ pub struct MostRelevantFilesParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScanUsagesParams {
+pub struct ScanUsagesByReferenceParams {
+    pub symbols: Vec<String>,
     #[serde(default)]
-    pub symbols: Option<Vec<String>>,
+    pub include_tests: bool,
     #[serde(default)]
+    pub paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanUsagesByLocationParams {
     pub targets: Vec<ScanUsagesTarget>,
     #[serde(default)]
     pub include_tests: bool,
@@ -114,22 +120,14 @@ pub struct ScanUsagesParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanUsagesTarget {
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<usize>,
+    pub line: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_byte: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_byte: Option<usize>,
 }
 
 /// Parameters for [`usage_graph`].
 ///
-/// Both fields mirror [`ScanUsagesParams`] so the whole-workspace graph can be
-/// scoped the same way a single-symbol scan is: callers can drop test files or
-/// restrict the search to a subset of paths. Both default off, so an empty
-/// `{}` request returns the full workspace graph.
+/// These fields mirror the scope controls on the scan-usage APIs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageGraphParams {
     /// Include references that live in detected test files.
@@ -158,10 +156,6 @@ pub struct RenameSymbolParams {
     pub line: Option<usize>,
     #[serde(default)]
     pub column: Option<usize>,
-    #[serde(default)]
-    pub start_byte: Option<usize>,
-    #[serde(default)]
-    pub end_byte: Option<usize>,
     pub new_name: String,
 }
 
@@ -172,10 +166,6 @@ pub struct DefinitionReferenceQuery {
     pub line: Option<usize>,
     #[serde(default)]
     pub column: Option<usize>,
-    #[serde(default)]
-    pub start_byte: Option<usize>,
-    #[serde(default)]
-    pub end_byte: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,10 +175,6 @@ pub struct TypeReferenceQuery {
     pub line: Option<usize>,
     #[serde(default)]
     pub column: Option<usize>,
-    #[serde(default)]
-    pub start_byte: Option<usize>,
-    #[serde(default)]
-    pub end_byte: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,8 +229,6 @@ pub struct RenameFileEdits {
 #[derive(Debug, Clone, Serialize)]
 pub struct RenameTextEdit {
     pub old_text: String,
-    pub start_byte: usize,
-    pub end_byte: usize,
     pub start_line: usize,
     pub start_column: usize,
     pub end_line: usize,
@@ -504,7 +488,7 @@ fn path_like_symbol_guidance(
                 .to_string()
         }
         PathLikeSymbolGuidanceContext::ScanUsages => {
-            "`symbols` expects workspace symbols, not file paths. Use `paths` only to narrow a real symbol scan, or use `targets` when you know the declaration location."
+            "`symbols` expects workspace symbols, not file paths. Use list_symbols or search_symbols to identify the declaration, then call scan_usages_by_reference with that symbol; use `paths` only to narrow where usages are searched."
                 .to_string()
         }
         PathLikeSymbolGuidanceContext::SymbolLookup => {
@@ -622,9 +606,26 @@ pub struct SkimFile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanUsagesResult {
+    #[serde(skip)]
+    pub(crate) surface: ScanUsagesSurface,
     pub scope: ScanUsagesScope,
     pub summary: ScanUsagesSummary,
     pub results: Vec<ScanUsagesEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanUsagesSurface {
+    Reference,
+    Location,
+}
+
+impl ScanUsagesSurface {
+    pub(crate) fn tool_name(self) -> &'static str {
+        match self {
+            Self::Reference => "scan_usages_by_reference",
+            Self::Location => "scan_usages_by_location",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -871,7 +872,7 @@ pub struct AmbiguousUsageCandidateDetail {
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
-    pub scan_usages_target: ScanUsagesTargetSuggestion,
+    pub scan_usages_by_location_target: ScanUsagesTargetSuggestion,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1158,8 +1159,8 @@ pub fn get_definitions_by_location(
                         file,
                         line: query.line,
                         column: query.column,
-                        start_byte: query.start_byte,
-                        end_byte: query.end_byte,
+                        start_byte: None,
+                        end_byte: None,
                     },
                 ));
             }
@@ -1226,8 +1227,6 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
                     path: String::new(),
                     line: None,
                     column: None,
-                    start_byte: None,
-                    end_byte: None,
                 },
                 status: "invalid_location".to_string(),
                 reference: None,
@@ -1257,8 +1256,8 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
                         source: None,
                         line: query.line,
                         column: query.column,
-                        start_byte: query.start_byte,
-                        end_byte: query.end_byte,
+                        start_byte: None,
+                        end_byte: None,
                     },
                 ));
             }
@@ -1354,29 +1353,13 @@ pub fn rename_symbol(analyzer: &dyn IAnalyzer, params: RenameSymbolParams) -> Re
 fn rename_selection_from_params(
     params: &RenameSymbolParams,
 ) -> Result<crate::symbol_rename::RenameSelection, String> {
-    if let Some(start) = params.start_byte {
-        if params.line.is_some() || params.column.is_some() {
-            return Err(
-                "rename_symbol accepts either byte offsets or line and column, not both"
-                    .to_string(),
-            );
-        }
-        return Ok(if let Some(end) = params.end_byte {
-            crate::symbol_rename::RenameSelection::ByteRange { start, end }
-        } else {
-            crate::symbol_rename::RenameSelection::ByteOffset(start)
-        });
-    }
-    if params.end_byte.is_some() {
-        return Err("rename_symbol requires start_byte when end_byte is provided".to_string());
-    }
     match (params.line, params.column) {
         (Some(line), Some(column)) => {
             Ok(crate::symbol_rename::RenameSelection::LineColumn { line, column })
         }
         (Some(_), None) => Err("rename_symbol requires column when line is provided".to_string()),
         (None, Some(_)) => Err("rename_symbol requires line when column is provided".to_string()),
-        _ => Err("rename_symbol requires either start_byte or line and column".to_string()),
+        _ => Err("rename_symbol requires line and column".to_string()),
     }
 }
 
@@ -1421,8 +1404,6 @@ fn render_rename_symbol_result(
                 );
                 RenameTextEdit {
                     old_text,
-                    start_byte: edit.start_byte,
-                    end_byte: edit.end_byte,
                     start_line,
                     start_column,
                     end_line,
@@ -1668,6 +1649,9 @@ fn definition_by_reference_diagnostic(
             "target must identify a single reference token; for qualified expressions, set target to the member or name token inside the expression rather than the whole qualified expression"
                 .to_string()
         }
+        "invalid_location" if diagnostic.message == "provide either start_byte or line/column" => {
+            "provide a positive line and, when needed, a positive character column".to_string()
+        }
         SCALA_UNSUPPORTED_CALL_TARGET_SHAPE => {
             format!(
                 "{}. The reference tool cannot follow this Scala call target shape yet. Try search_symbols for the callable/member name or owner/member selector when known, then use get_symbol_sources on the owner or resolved member symbol.",
@@ -1681,11 +1665,19 @@ fn definition_by_reference_diagnostic(
                 diagnostic.message
             )
         }
-        _ => diagnostic.message,
+        _ => external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
     };
     DefinitionDiagnostic {
         kind: diagnostic.kind,
         message,
+    }
+}
+
+fn external_location_diagnostic_message(kind: &str, message: String) -> String {
+    if kind == "invalid_location" && (message.contains("byte") || message.contains("offset")) {
+        "provide a positive line and, when needed, a positive character column".to_string()
+    } else {
+        message
     }
 }
 
@@ -1732,8 +1724,8 @@ fn render_definition_lookup(
             .diagnostics
             .into_iter()
             .map(|diagnostic| DefinitionDiagnostic {
+                message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
                 kind: diagnostic.kind,
-                message: diagnostic.message,
             })
             .collect(),
     }
@@ -1778,8 +1770,8 @@ fn render_type_lookup(
             .diagnostics
             .into_iter()
             .map(|diagnostic| DefinitionDiagnostic {
+                message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
                 kind: diagnostic.kind,
-                message: diagnostic.message,
             })
             .collect(),
     }
@@ -2958,14 +2950,14 @@ fn unsupported_path_qualified_scan_symbol(
             Some(not_found_input(
                 input,
                 Some(format!(
-                    "unsupported path::symbol selector; re-call scan_usages with symbols:[\"{symbol}\"] and paths:[\"{path}\"], or use targets with the declaration location"
+                    "unsupported path::symbol selector; re-call scan_usages_by_reference with symbols:[\"{symbol}\"] and paths:[\"{path}\"]"
                 )),
             ))
         }
         ResolvedFileInput::Ambiguous(item) => Some(not_found_input(
             input,
             Some(format!(
-                "unsupported path::symbol selector; `{}` is ambiguous; choose one path from {} and re-call scan_usages with symbols:[\"{symbol}\"] and paths:[\"chosen/path\"], or use targets with the declaration location",
+                "unsupported path::symbol selector; `{}` is ambiguous; choose one path from {} and re-call scan_usages_by_reference with symbols:[\"{symbol}\"] and paths:[\"chosen/path\"]",
                 item.input,
                 path_match_sample(&item.matches)
             )),
@@ -3043,6 +3035,7 @@ fn code_unit_match_names(matches: Vec<CodeUnit>) -> Vec<String> {
 
 fn ambiguous_usage_symbol_from_groups(
     analyzer: &dyn IAnalyzer,
+    surface: ScanUsagesSurface,
     symbol: String,
     short_name: String,
     groups: Vec<(String, Vec<CodeUnit>)>,
@@ -3054,46 +3047,70 @@ fn ambiguous_usage_symbol_from_groups(
         .iter()
         .map(|(selector, _)| selector.clone())
         .collect();
-    let candidate_details: Vec<AmbiguousUsageCandidateDetail> = groups
-        .iter()
-        .take(SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT)
-        .filter_map(|(selector, units)| {
-            let unit = units.first()?;
-            let range = primary_range(analyzer, unit)?;
-            let path = rel_path_string(unit.source());
-            let column = declaration_start_column(unit, range);
-            Some(AmbiguousUsageCandidateDetail {
-                target: selector.clone(),
-                path: path.clone(),
-                start_line: range.start_line,
-                end_line: range.end_line,
-                scan_usages_target: ScanUsagesTargetSuggestion {
-                    path,
-                    line: range.start_line,
-                    column,
-                },
-            })
-        })
-        .collect();
+    let candidate_details: Vec<AmbiguousUsageCandidateDetail> =
+        if surface == ScanUsagesSurface::Location {
+            groups
+                .iter()
+                .take(SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT)
+                .filter_map(|(selector, units)| {
+                    let unit = units.first()?;
+                    let source = unit.source().read_to_string().ok()?;
+                    let range =
+                        code_unit_declaration_name_range(analyzer, unit.source(), &source, unit)?;
+                    let path = rel_path_string(unit.source());
+                    let line = range.start_line + 1;
+                    let column = character_column_for_byte(&source, line, range.start_byte);
+                    Some(AmbiguousUsageCandidateDetail {
+                        target: selector.clone(),
+                        path: path.clone(),
+                        start_line: line,
+                        end_line: range.end_line + 1,
+                        scan_usages_by_location_target: ScanUsagesTargetSuggestion {
+                            path,
+                            line,
+                            column,
+                        },
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
+    let has_candidate_details = !candidate_details.is_empty();
     AmbiguousUsageSymbol {
         symbol,
         short_name,
         candidate_targets,
         candidate_details,
-        candidate_details_total: (total > 0).then_some(total),
-        candidate_details_truncated: total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT,
+        candidate_details_total: has_candidate_details.then_some(total),
+        candidate_details_truncated: has_candidate_details
+            && total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT,
         candidates: Vec::new(),
         candidate_files_truncated: false,
         definition_sites_excluded: None,
-        note: Some(if total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT {
-            format!(
-                "{} Showing first {} of {total} candidate locations.",
-                note, SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT
-            )
-        } else {
-            note
-        }),
+        note: Some(
+            if surface == ScanUsagesSurface::Location && total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT
+            {
+                format!(
+                    "{} Showing first {} of {total} candidate locations.",
+                    note, SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT
+                )
+            } else {
+                note
+            },
+        ),
+    }
+}
+
+fn scan_usages_ambiguity_note(surface: ScanUsagesSurface) -> &'static str {
+    match surface {
+        ScanUsagesSurface::Reference => {
+            "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets."
+        }
+        ScanUsagesSurface::Location => {
+            "Ambiguous location; refine the line/column target and re-call scan_usages_by_location."
+        }
     }
 }
 
@@ -3109,8 +3126,7 @@ enum ScanUsageTargetResolution {
 
 #[derive(Debug, Clone, Copy)]
 enum ScanUsagesLocationSelection {
-    ByteRange { start: usize, end: usize },
-    BytePoint(usize),
+    Point(usize),
     Line(usize),
 }
 
@@ -3120,6 +3136,7 @@ struct ScanUsageRequest {
     input: ScanUsagesInput,
     input_kind: ScanUsagesInputKind,
     label: String,
+    surface: ScanUsagesSurface,
 }
 
 impl ScanUsageRequest {
@@ -3129,6 +3146,7 @@ impl ScanUsageRequest {
             input: ScanUsagesInput::Symbol(symbol.clone()),
             input_kind: ScanUsagesInputKind::Symbol,
             label: symbol,
+            surface: ScanUsagesSurface::Reference,
         }
     }
 
@@ -3139,6 +3157,7 @@ impl ScanUsageRequest {
             input: ScanUsagesInput::Target(target),
             input_kind: ScanUsagesInputKind::Target,
             label,
+            surface: ScanUsagesSurface::Location,
         }
     }
 }
@@ -3231,18 +3250,9 @@ impl ScanUsagesWorkEntry {
 }
 
 pub(crate) fn scan_usages_target_label(target: &ScanUsagesTarget) -> String {
-    if let Some(start) = target.start_byte {
-        match target.end_byte {
-            Some(end) => format!("{}@bytes:{start}..{end}", target.path),
-            None => format!("{}@byte:{start}", target.path),
-        }
-    } else if let Some(line) = target.line {
-        match target.column {
-            Some(column) => format!("{}:{line}:{column}", target.path),
-            None => format!("{}:{line}", target.path),
-        }
-    } else {
-        target.path.clone()
+    match target.column {
+        Some(column) => format!("{}:{}:{column}", target.path, target.line),
+        None => format!("{}:{}", target.path, target.line),
     }
 }
 
@@ -3251,7 +3261,7 @@ fn location_selector_failure(
     reason_kind: &str,
     reason: impl Into<String>,
 ) -> ScanUsageTargetResolution {
-    let hint = usage_failure_hint(reason_kind, None, true, false);
+    let hint = usage_failure_hint(ScanUsagesSurface::Location, reason_kind, None, true, false);
     ScanUsageTargetResolution::Failure(UsageFailureInfo {
         symbol: scan_usages_target_label(target),
         fq_name: String::new(),
@@ -3264,6 +3274,7 @@ fn location_selector_failure(
 }
 
 fn usage_failure_hint(
+    surface: ScanUsagesSurface,
     reason_kind: &str,
     target: Option<&CodeUnit>,
     location_selected: bool,
@@ -3274,10 +3285,10 @@ fn usage_failure_hint(
     }
 
     if candidate_files_truncated {
-        return Some(
-            "The candidate file set exceeded the per-query cap; re-call scan_usages with narrower `paths` to reduce the scan scope."
-                .to_string(),
-        );
+        return Some(format!(
+            "The candidate file set exceeded the per-query cap; re-call {} with narrower `paths` to reduce the scan scope.",
+            surface.tool_name()
+        ));
     }
 
     match (reason_kind, location_selected) {
@@ -3286,7 +3297,7 @@ fn usage_failure_hint(
                 .to_string(),
         ),
         ("no_graph_seed", false) => Some(
-            "No export seed was resolved for this symbol. Use search_symbols or get_symbol_sources to choose an exported declaration, or re-call scan_usages with a location-anchored `targets` selector for the definition site."
+            "No export seed was resolved for this symbol. Use search_symbols or get_symbol_sources to choose an exported declaration, then re-call scan_usages_by_reference with that symbol."
                 .to_string(),
         ),
         ("unsupported_target_language", _)
@@ -3380,11 +3391,6 @@ fn scan_usages_anchor_not_found_input(
     anchor_not_found_input(input, anchor, name)
 }
 
-fn declaration_start_column(unit: &CodeUnit, range: Range) -> Option<usize> {
-    let source = unit.source().read_to_string().ok()?;
-    character_column_for_byte(&source, range.start_line, range.start_byte)
-}
-
 fn character_column_for_byte(source: &str, line: usize, byte: usize) -> Option<usize> {
     if line == 0 || byte > source.len() || !source.is_char_boundary(byte) {
         return None;
@@ -3422,13 +3428,6 @@ fn resolve_scan_usages_target(
         }
     };
 
-    if target.line.is_none() && target.start_byte.is_none() {
-        return location_selector_failure(
-            &target,
-            "invalid_location",
-            "provide either start_byte or line for a scan_usages target",
-        );
-    }
     if target.column == Some(0) {
         return location_selector_failure(&target, "invalid_location", "column must be 1-based");
     }
@@ -3445,80 +3444,39 @@ fn resolve_scan_usages_target(
     };
 
     let line_starts = compute_line_starts(&source);
-    let mut line_selection = None;
-    if let Some(line) = target.line {
-        if line == 0 || line > line_starts.len() {
-            return location_selector_failure(
-                &target,
-                "invalid_location",
-                format!(
-                    "line {line} is outside 1..={} for this file",
-                    line_starts.len()
-                ),
-            );
-        }
-        if let Some(column) = target.column {
-            let line_start = line_starts[line - 1];
-            let line_end = line_starts.get(line).copied().unwrap_or(source.len());
-            match crate::analyzer::usages::get_definition::byte_offset_for_character_column(
-                &source, line_start, line_end, line, column,
-            ) {
-                Ok(point) => line_selection = Some(ScanUsagesLocationSelection::BytePoint(point)),
-                Err(reason) => {
-                    return location_selector_failure(&target, "invalid_location", reason);
-                }
-            }
-        } else {
-            line_selection = Some(ScanUsagesLocationSelection::Line(line));
-        }
+    let line = target.line;
+    if line == 0 || line > line_starts.len() {
+        return location_selector_failure(
+            &target,
+            "invalid_location",
+            format!(
+                "line {line} is outside 1..={} for this file",
+                line_starts.len()
+            ),
+        );
     }
+    let selection = if let Some(column) = target.column {
+        let line_start = line_starts[line - 1];
+        let line_end = line_starts.get(line).copied().unwrap_or(source.len());
+        match crate::analyzer::usages::get_definition::byte_offset_for_character_column(
+            &source, line_start, line_end, line, column,
+        ) {
+            Ok(point) => ScanUsagesLocationSelection::Point(point),
+            Err(reason) => {
+                return location_selector_failure(&target, "invalid_location", reason);
+            }
+        }
+    } else {
+        ScanUsagesLocationSelection::Line(line)
+    };
 
-    let mut selection = line_selection;
-    if let Some(start) = target.start_byte {
-        if start >= source.len() {
-            return location_selector_failure(
-                &target,
-                "invalid_location",
-                format!("start_byte {start} is outside {} byte file", source.len()),
-            );
-        }
-        if !source.is_char_boundary(start) {
-            return location_selector_failure(
-                &target,
-                "invalid_location",
-                format!("start_byte {start} does not align to a UTF-8 character boundary"),
-            );
-        }
-        if let Some(end) = target.end_byte {
-            if start >= end || end > source.len() {
-                return location_selector_failure(
-                    &target,
-                    "invalid_location",
-                    format!(
-                        "invalid byte range [{start}, {end}) for {} byte file",
-                        source.len()
-                    ),
-                );
-            }
-            if !source.is_char_boundary(end) {
-                return location_selector_failure(
-                    &target,
-                    "invalid_location",
-                    format!("end_byte {end} does not align to a UTF-8 character boundary"),
-                );
-            }
-            selection = Some(ScanUsagesLocationSelection::ByteRange { start, end });
-        } else {
-            selection = Some(ScanUsagesLocationSelection::BytePoint(start));
-        }
-    }
-    let selection = selection.expect("validated scan_usages target location");
+    let range_context = DeclarationNameRangeContext::new(&file, source);
 
     let matching_units: Vec<(CodeUnit, usize)> = declarations_in_file(analyzer, &file)
         .into_iter()
         .filter_map(|unit| {
-            let best_span = analyzer
-                .ranges_of(&unit)
+            let best_span = range_context
+                .name_ranges(analyzer, &unit)
                 .into_iter()
                 .filter(|range| scan_usages_target_matches_range(selection, *range))
                 .map(|range| range.end_byte.saturating_sub(range.start_byte))
@@ -3556,10 +3514,11 @@ fn resolve_scan_usages_target(
         let label = scan_usages_target_label(&target);
         return ScanUsageTargetResolution::Ambiguous(ambiguous_usage_symbol_from_groups(
             analyzer,
+            ScanUsagesSurface::Location,
             label.clone(),
             label,
             groups,
-            "Ambiguous location; refine line/column or byte target.",
+            "Ambiguous location; refine the line/column target.",
         ));
     }
 
@@ -3569,10 +3528,17 @@ fn resolve_scan_usages_target(
 }
 
 fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<CodeUnit> {
-    let mut declarations: Vec<CodeUnit> = analyzer.get_declarations(file).into_iter().collect();
+    let mut declarations: Vec<CodeUnit> = analyzer
+        .get_declarations(file)
+        .into_iter()
+        .filter(|unit| unit.source() == file)
+        .collect();
     let mut stack = declarations.clone();
     while let Some(unit) = stack.pop() {
         for child in analyzer.get_members_in_class(&unit) {
+            if child.source() != file {
+                continue;
+            }
             stack.push(child.clone());
             declarations.push(child);
         }
@@ -3582,14 +3548,12 @@ fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<Cod
 
 fn scan_usages_target_matches_range(selection: ScanUsagesLocationSelection, range: Range) -> bool {
     match selection {
-        ScanUsagesLocationSelection::ByteRange { start, end } => {
-            range.start_byte <= start && range.end_byte >= end
-        }
-        ScanUsagesLocationSelection::BytePoint(point) => {
+        ScanUsagesLocationSelection::Point(point) => {
             range.start_byte <= point && range.end_byte > point
         }
         ScanUsagesLocationSelection::Line(line) => {
-            range.start_line <= line && range.end_line >= line
+            let zero_based_line = line - 1;
+            range.start_line <= zero_based_line && range.end_line >= zero_based_line
         }
     }
 }
@@ -3744,25 +3708,57 @@ fn reference_only_absence_note(
     ))
 }
 
-pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
-    let _scope = profiling::scope("searchtools::scan_usages");
-
-    let query_scope =
-        ScanUsagesQueryScope::new(analyzer, params.paths.as_deref(), params.include_tests);
-    let symbols: Vec<ScanUsageRequest> = params
+pub fn scan_usages_by_reference(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByReferenceParams,
+) -> ScanUsagesResult {
+    let symbols = params
         .symbols
-        .unwrap_or_default()
         .into_iter()
         .enumerate()
         .map(|(index, symbol)| ScanUsageRequest::symbol(index, symbol))
         .collect();
-    let symbol_count = symbols.len();
-    let targets: Vec<ScanUsageRequest> = params
+    scan_usages_backend(
+        analyzer,
+        ScanUsagesSurface::Reference,
+        params.include_tests,
+        params.paths.as_deref(),
+        symbols,
+        Vec::new(),
+    )
+}
+
+pub fn scan_usages_by_location(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByLocationParams,
+) -> ScanUsagesResult {
+    let targets = params
         .targets
         .into_iter()
         .enumerate()
-        .map(|(offset, target)| ScanUsageRequest::target(symbol_count + offset, target))
+        .map(|(index, target)| ScanUsageRequest::target(index, target))
         .collect();
+    scan_usages_backend(
+        analyzer,
+        ScanUsagesSurface::Location,
+        params.include_tests,
+        params.paths.as_deref(),
+        Vec::new(),
+        targets,
+    )
+}
+
+fn scan_usages_backend(
+    analyzer: &dyn IAnalyzer,
+    surface: ScanUsagesSurface,
+    include_tests: bool,
+    paths: Option<&[String]>,
+    symbols: Vec<ScanUsageRequest>,
+    targets: Vec<ScanUsageRequest>,
+) -> ScanUsagesResult {
+    let _scope = profiling::scope("searchtools::scan_usages_backend");
+
+    let query_scope = ScanUsagesQueryScope::new(analyzer, paths, include_tests);
     let reference_only_sibling_extensions =
         present_reference_only_sibling_extensions_by_language(analyzer);
 
@@ -3781,7 +3777,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         ExplicitCandidateProvider::new(Arc::new(files))
     });
 
-    let test_files = excluded_test_files(analyzer, params.include_tests);
+    let test_files = excluded_test_files(analyzer, include_tests);
 
     let mut work_entries = Vec::new();
     let mut resolved_targets = Vec::new();
@@ -3835,10 +3831,11 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 let groups = distinct_definitions(candidate_targets);
                 let item = ambiguous_usage_symbol_from_groups(
                     analyzer,
+                    ScanUsagesSurface::Reference,
                     symbol.clone(),
                     symbol,
                     groups,
-                    "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
+                    "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.",
                 );
                 work_entries.push(ScanUsagesWorkEntry::Ambiguous { request, item });
                 continue;
@@ -3885,10 +3882,11 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 if groups.len() > 1 {
                     let item = ambiguous_usage_symbol_from_groups(
                         analyzer,
+                        ScanUsagesSurface::Reference,
                         symbol.clone(),
                         symbol,
                         groups,
-                        "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
+                        "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.",
                     );
                     work_entries.push(ScanUsagesWorkEntry::Ambiguous { request, item });
                     continue;
@@ -4015,12 +4013,14 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     continue;
                 }
                 let groups = distinct_definitions(candidate_targets.iter().cloned().collect());
+                let surface = request.surface;
                 let detail_source = ambiguous_usage_symbol_from_groups(
                     analyzer,
+                    surface,
                     symbol.clone(),
                     short_name.clone(),
                     groups.clone(),
-                    "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
+                    scan_usages_ambiguity_note(surface),
                 );
                 let deduped_targets: Vec<String> = groups
                     .iter()
@@ -4075,6 +4075,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     symbol,
                     fq_name,
                     hint: usage_failure_hint(
+                        request.surface,
                         &reason_kind,
                         overloads.first(),
                         location_selected,
@@ -4120,7 +4121,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     }
 
     work_entries.sort_by_key(ScanUsagesWorkEntry::index);
-    render_scan_usages_with_budget(work_entries, query_scope.result_scope())
+    render_scan_usages_with_budget(work_entries, query_scope.result_scope(), surface)
 }
 
 /// A definition node in the workspace usage graph.
@@ -4773,6 +4774,7 @@ fn ranges_overlap(range: &Range, hit: &UsageHit) -> bool {
 fn render_scan_usages_with_budget(
     entries: Vec<ScanUsagesWorkEntry>,
     scope: ScanUsagesScope,
+    surface: ScanUsagesSurface,
 ) -> ScanUsagesResult {
     let mut entries = entries;
     loop {
@@ -4780,6 +4782,7 @@ fn render_scan_usages_with_budget(
             entries.iter().map(classify_scan_usages_entry).collect();
         let summary = build_scan_usages_summary(&results);
         let result = ScanUsagesResult {
+            surface,
             scope: scope.clone(),
             summary,
             results,
@@ -4907,8 +4910,10 @@ fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
             result.definition_sites_excluded = item.definition_sites_excluded;
             result.complete = !item.candidate_files_truncated;
             result.message = Some(item.note.clone().unwrap_or_else(|| {
-                "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target."
-                    .to_string()
+                match request.surface {
+                    ScanUsagesSurface::Reference => "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.".to_string(),
+                    ScanUsagesSurface::Location => "Ambiguous location; refine the line/column target and re-call scan_usages_by_location.".to_string(),
+                }
             }));
             result
         }
@@ -4946,7 +4951,7 @@ fn classify_usage_entry(
         let (short_name, total_callsites, limit) =
             callsite_cap.expect("too_many_callsites entry includes cap details");
         let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites, false);
-        populate_usage_payload(&mut result, usage, target_is_method, &[]);
+        populate_usage_payload(&mut result, usage, target_is_method, &[], request.surface);
         result.short_name = Some(short_name);
         result.total_callsites = Some(total_callsites);
         result.limit = Some(limit);
@@ -4977,7 +4982,13 @@ fn classify_usage_entry(
     if usage.candidate_files_truncated {
         result.candidate_files_sample = candidate_files_sample;
     }
-    populate_usage_payload(&mut result, usage, target_is_method, &caveats);
+    populate_usage_payload(
+        &mut result,
+        usage,
+        target_is_method,
+        &caveats,
+        request.surface,
+    );
     if status == ScanUsagesStatus::UnverifiedAbsent {
         result.absence_caveats = caveats;
     }
@@ -4989,9 +5000,15 @@ fn populate_usage_payload(
     usage: SymbolUsages,
     target_is_method: bool,
     absence_caveats: &[ScanUsagesAbsenceCaveat],
+    surface: ScanUsagesSurface,
 ) {
-    let guidance =
-        scan_usages_absence_guidance(entry.status, target_is_method, &usage, absence_caveats);
+    let guidance = scan_usages_absence_guidance(
+        entry.status,
+        target_is_method,
+        &usage,
+        absence_caveats,
+        surface,
+    );
     entry.symbol = Some(usage.symbol);
     entry.fq_name = usage.fq_name;
     entry.definition_path = usage.definition_path;
@@ -5008,10 +5025,10 @@ fn populate_usage_payload(
         entry.notes.push(note);
     }
     if usage.candidate_files_truncated && entry.status == ScanUsagesStatus::Found {
-        entry.notes.push(
-            "Candidate file set was truncated; additional usage sites may exist. Re-call scan_usages with narrower `paths` for exhaustive coverage."
-                .to_string(),
-        );
+        entry.notes.push(format!(
+            "Candidate file set was truncated; additional usage sites may exist. Re-call {} with narrower `paths` for exhaustive coverage.",
+            surface.tool_name()
+        ));
     }
     if entry.message.is_none() {
         entry.message = guidance.message;
@@ -5029,6 +5046,7 @@ fn scan_usages_absence_guidance(
     target_is_method: bool,
     usage: &SymbolUsages,
     caveats: &[ScanUsagesAbsenceCaveat],
+    surface: ScanUsagesSurface,
 ) -> ScanUsagesAbsenceGuidance {
     let notes = if matches!(
         status,
@@ -5044,7 +5062,7 @@ fn scan_usages_absence_guidance(
             Some("resolved symbol; no external usage sites found.".to_string())
         }
         ScanUsagesStatus::UnverifiedAbsent => {
-            scan_usages_unverified_absence_message(usage, caveats)
+            scan_usages_unverified_absence_message(usage, caveats, surface)
         }
         _ => None,
     };
@@ -5054,12 +5072,23 @@ fn scan_usages_absence_guidance(
 fn scan_usages_unverified_absence_message(
     usage: &SymbolUsages,
     caveats: &[ScanUsagesAbsenceCaveat],
+    surface: ScanUsagesSurface,
 ) -> Option<String> {
     if usage.unproven_hits > 0 {
         let file_count = usage.unproven_files.len();
+        let recovery = match surface {
+            ScanUsagesSurface::Reference => {
+                "narrow `paths` to a relevant candidate file or choose a more specific exported symbol"
+            }
+            ScanUsagesSurface::Location => {
+                "narrow `paths` to a relevant candidate file or refine the declaration line/column"
+            }
+        };
         return Some(format!(
-            "no PROVEN usage sites, but {} unproven candidate usage(s) found across {} file(s); inspect these before concluding absence. Next step: narrow `paths` to a relevant candidate file, or use a location-anchored target for the callee declaration.",
-            usage.unproven_hits, file_count
+            "no PROVEN usage sites, but {} unproven candidate usage(s) found across {} file(s); inspect these before concluding absence. Next step: {recovery} and re-call {}.",
+            usage.unproven_hits,
+            file_count,
+            surface.tool_name()
         ));
     }
     if caveats.contains(&ScanUsagesAbsenceCaveat::CandidateFilesTruncated) {
@@ -7002,9 +7031,9 @@ fn language_name(language: Language) -> String {
 mod tests {
     use super::{
         ScanUsageRequest, ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample,
-        ScanUsagesStatus, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState,
-        UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
-        list_symbols, resolve_file_patterns, trim_summary_signature,
+        ScanUsagesStatus, ScanUsagesSurface, ScanUsagesWorkEntry, SourceBlock, SummaryElement,
+        SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
+        classify_scan_usages_entry, list_symbols, resolve_file_patterns, trim_summary_signature,
     };
     use super::{function_like_macro_query, usage_failure_hint};
     use crate::analyzer::{
@@ -7395,17 +7424,33 @@ def gamma():
     }
 
     #[test]
-    fn no_graph_seed_hint_does_not_repeat_targets_for_anchored_queries() {
-        let anchored = usage_failure_hint("no_graph_seed", None, true, false).unwrap();
+    fn no_graph_seed_hint_uses_reference_arguments_for_symbol_queries() {
+        let anchored = usage_failure_hint(
+            ScanUsagesSurface::Reference,
+            "no_graph_seed",
+            None,
+            true,
+            false,
+        )
+        .unwrap();
         assert!(
-            !anchored.contains("targets"),
-            "anchored query must not suggest another targets re-call: {anchored}"
+            !anchored.contains("`targets`") && !anchored.contains("`symbols`"),
+            "anchored query must not suggest another selector re-call: {anchored}"
         );
 
-        let unanchored = usage_failure_hint("no_graph_seed", None, false, false).unwrap();
+        let unanchored = usage_failure_hint(
+            ScanUsagesSurface::Reference,
+            "no_graph_seed",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(
-            unanchored.contains("targets"),
-            "unanchored query should suggest the targets selector: {unanchored}"
+            unanchored.contains("scan_usages_by_reference")
+                && unanchored.contains("symbol")
+                && !unanchored.contains("`targets`"),
+            "unanchored reference query should suggest a symbolic retry: {unanchored}"
         );
     }
 

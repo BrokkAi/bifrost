@@ -13,13 +13,18 @@ pub struct McpSession {
 }
 
 impl McpSession {
-    pub fn start(root: &Path) -> Result<Self, String> {
+    pub fn start(root: &Path, no_line_numbers: bool) -> Result<Self, String> {
         let bifrost_binary = bifrost_binary_path()?;
-        let mut child = Command::new(&bifrost_binary)
+        let mut command = Command::new(&bifrost_binary);
+        command
             .arg("--root")
             .arg(root)
             .arg("--server")
-            .arg("searchtools")
+            .arg("searchtools");
+        if no_line_numbers {
+            command.arg("--no-line-numbers");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

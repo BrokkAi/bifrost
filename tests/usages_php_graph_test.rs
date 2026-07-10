@@ -1,6 +1,8 @@
 mod common;
 
-use brokk_bifrost::searchtools::{ScanUsagesParams, ScanUsagesStatus, scan_usages};
+use brokk_bifrost::searchtools::{
+    ScanUsagesByReferenceParams, ScanUsagesStatus, scan_usages_by_reference,
+};
 use brokk_bifrost::usages::{
     FuzzyResult, PhpUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHitKind,
 };
@@ -360,11 +362,10 @@ class NoCandidate {
         "expected typed receiver method usage hit, got {hits:?}"
     );
 
-    let scoped = scan_usages(
+    let scoped = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec!["App.Service.run".to_string()]),
-            targets: Vec::new(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["App.Service.run".to_string()],
             include_tests: true,
             paths: Some(vec!["tests/Consumer.php".to_string()]),
         },
@@ -795,14 +796,13 @@ $count = Mailer::$sent;
         ),
     ]);
 
-    let result = scan_usages(
+    let result = scan_usages_by_reference(
         &analyzer,
-        ScanUsagesParams {
-            symbols: Some(vec![
+        ScanUsagesByReferenceParams {
+            symbols: vec![
                 "App.Service.EmailNotifier.create".to_string(),
                 "App.Service.EmailNotifier.sent".to_string(),
-            ]),
-            targets: Vec::new(),
+            ],
             paths: None,
             include_tests: true,
         },

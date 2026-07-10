@@ -46,7 +46,7 @@ directory.
 
 `symbol|extended` exposes the analyzer-backed code-intelligence tools used by
 the Bifrost agent package, including `search_symbols`, `get_summaries`,
-`scan_usages`, `get_symbol_locations`, and related repository discovery tools.
+`scan_usages_by_location`, `get_symbol_locations`, and related repository discovery tools.
 Use a smaller or larger MCP toolset only when the host should see a different
 surface. See [MCP Server](/mcp/) for the available toolsets.
 

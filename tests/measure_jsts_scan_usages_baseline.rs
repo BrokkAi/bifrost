@@ -82,7 +82,7 @@ fn generate_ts_workspace(root: &Path, module_count: usize) {
 fn scan_symbol(service: &SearchToolsService, symbol: &str) -> Value {
     let args = format!(r#"{{"symbols":["{symbol}"],"include_tests":true}}"#);
     let payload = service
-        .call_tool_json("scan_usages", &args)
+        .call_tool_json("scan_usages_by_reference", &args)
         .expect("scan_usages call failed");
     serde_json::from_str(&payload).expect("scan_usages returned invalid JSON")
 }

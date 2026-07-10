@@ -24,7 +24,6 @@ pub(crate) const MAX_RENAME_IDENTIFIER_BYTES: usize = 256;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RenameSelection {
     ByteOffset(usize),
-    ByteRange { start: usize, end: usize },
     LineColumn { line: usize, column: usize },
 }
 
@@ -251,10 +250,6 @@ fn rename_cursor_for_selection(
             validate_byte_point(&content, offset)?;
             offset
         }
-        RenameSelection::ByteRange { start, end } => {
-            validate_byte_range(&content, start, end)?;
-            start
-        }
         RenameSelection::LineColumn { line, column } => {
             if line == 0 || line > line_starts.len() {
                 return Err(RenameFailure {
@@ -286,17 +281,6 @@ fn rename_cursor_for_selection(
             kind: "not_found",
             message: "no identifier at rename location".to_string(),
         })?;
-    if let RenameSelection::ByteRange {
-        start: selected_start,
-        end: selected_end,
-    } = selection
-        && (selected_start != start || selected_end != end)
-    {
-        return Err(RenameFailure {
-            kind: "invalid_location",
-            message: "byte range must select exactly one identifier".to_string(),
-        });
-    }
     let identifier = content
         .get(start..end)
         .ok_or_else(|| RenameFailure {
@@ -319,33 +303,13 @@ fn validate_byte_point(content: &str, offset: usize) -> Result<(), RenameFailure
     if offset > content.len() {
         return Err(RenameFailure {
             kind: "invalid_location",
-            message: format!("start_byte {offset} is outside {} byte file", content.len()),
+            message: "rename location is outside the file".to_string(),
         });
     }
     if !content.is_char_boundary(offset) {
         return Err(RenameFailure {
             kind: "invalid_location",
-            message: format!("start_byte {offset} does not align to a UTF-8 character boundary"),
-        });
-    }
-    Ok(())
-}
-
-fn validate_byte_range(content: &str, start: usize, end: usize) -> Result<(), RenameFailure> {
-    validate_byte_point(content, start)?;
-    if start >= end || end > content.len() {
-        return Err(RenameFailure {
-            kind: "invalid_location",
-            message: format!(
-                "invalid byte range [{start}, {end}) for {} byte file",
-                content.len()
-            ),
-        });
-    }
-    if !content.is_char_boundary(end) {
-        return Err(RenameFailure {
-            kind: "invalid_location",
-            message: format!("end_byte {end} does not align to a UTF-8 character boundary"),
+            message: "rename location does not align to a UTF-8 character boundary".to_string(),
         });
     }
     Ok(())
@@ -537,10 +501,12 @@ fn edit_for_byte_range(
 ) -> Result<EditCandidate, RenameFailure> {
     let entry = cache.ensure(project, file)?;
     if entry.body.get(start_byte..end_byte) != Some(old_name) {
+        let (line, column) =
+            line_column_for_byte_offset(&entry.body, &entry.line_starts, start_byte);
         return Err(RenameFailure {
             kind: "stale_location",
             message: format!(
-                "expected `{old_name}` at `{}` bytes [{start_byte}, {end_byte})",
+                "expected `{old_name}` at `{}:{line}:{column}`",
                 file.rel_path().display()
             ),
         });
@@ -630,7 +596,6 @@ impl FileContentCache {
 
 struct FileContent {
     body: String,
-    #[allow(dead_code)]
     line_starts: Vec<usize>,
 }
 

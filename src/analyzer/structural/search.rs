@@ -69,8 +69,6 @@ pub struct CodeQueryCapture {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CodeQueryRange {
-    pub start_byte: usize,
-    pub end_byte: usize,
     pub start_line: usize,
     pub start_column: usize,
     pub end_line: usize,
@@ -419,8 +417,6 @@ fn range_for_span(facts: &FileFacts, span: Span) -> CodeQueryRange {
     let (start_line, start_column) = facts.line_column_of_byte(span.start_byte);
     let (end_line, end_column) = facts.line_column_of_byte(span.end_byte);
     CodeQueryRange {
-        start_byte: span.start_byte,
-        end_byte: span.end_byte,
         start_line,
         start_column,
         end_line,

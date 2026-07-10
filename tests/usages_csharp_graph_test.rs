@@ -114,13 +114,22 @@ fn definition_lookup(
     root: &std::path::Path,
     path: &str,
     start_byte: usize,
-    end_byte: usize,
+    _end_byte: usize,
 ) -> Value {
+    let source = std::fs::read_to_string(root.join(path)).expect("definition lookup source");
+    let prefix = &source[..start_byte];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current_line)| current_line)
+        .chars()
+        .count()
+        + 1;
     let request = json!({
         "references": [{
             "path": path,
-            "start_byte": start_byte,
-            "end_byte": end_byte,
+            "line": line,
+            "column": column,
         }]
     });
     call_search_tool_json(root, "get_definitions_by_location", &request.to_string())
@@ -2446,7 +2455,7 @@ namespace NzbDrone.Core
 
     let result = call_search_tool_json(
         project.root(),
-        "scan_usages",
+        "scan_usages_by_location",
         &json!({
             "targets": [{
                 "path": "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
@@ -2513,7 +2522,7 @@ namespace NzbDrone.Core
 
     let result = call_search_tool_json(
         project.root(),
-        "scan_usages",
+        "scan_usages_by_location",
         &json!({
             "targets": [{
                 "path": "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
@@ -2564,7 +2573,7 @@ namespace App
 
     let result = call_search_tool_json(
         project.root(),
-        "scan_usages",
+        "scan_usages_by_reference",
         &json!({
             "symbols": ["App.Service.Run"],
             "include_tests": true
@@ -2605,7 +2614,7 @@ namespace App
 
     let result = call_search_tool_json(
         project.root(),
-        "scan_usages",
+        "scan_usages_by_reference",
         &json!({
             "symbols": ["App.Service.Run"],
             "include_tests": true
@@ -2658,7 +2667,7 @@ namespace App
 
     let result = call_search_tool_json(
         project.root(),
-        "scan_usages",
+        "scan_usages_by_reference",
         &json!({
             "symbols": ["App.Service.Target"],
             "include_tests": true

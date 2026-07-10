@@ -168,7 +168,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "scan_usages",
+            "scan_usages_by_location",
             "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
@@ -210,7 +210,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "scan_usages",
+            "scan_usages_by_location",
             "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
@@ -251,9 +251,8 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         expected
     });
     assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
-    assert_tool_schema_contains_property(tools, "scan_usages", "targets");
-    assert_tool_schema_contains_property(tools, "scan_usages", "anyOf");
-    assert_scan_usages_schema_requires_non_empty_selectors(tools);
+    assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");
+    assert_scan_usages_location_schema(tools);
     assert_type_lookup_schema_limits_and_requires_location(tools);
     assert_rename_symbol_schema_requires_location_and_new_name(tools);
 
@@ -310,7 +309,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(guidance.contains("get_summaries"), "{guidance}");
     assert!(guidance.contains("search_symbols"), "{guidance}");
     assert!(guidance.contains("get_symbol_sources"), "{guidance}");
-    assert!(guidance.contains("scan_usages"), "{guidance}");
+    assert!(guidance.contains("scan_usages_by_location"), "{guidance}");
 
     let missing_resource = round_trip(
         &mut stdin,
@@ -765,7 +764,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "search_symbols",
         "get_symbol_sources",
         "get_summaries",
-        "scan_usages",
+        "scan_usages_by_location",
         "get_definitions_by_location",
         "get_type_by_location",
         "rename_symbol",
@@ -777,6 +776,12 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
     core_expected.extend(["refresh", "activate_workspace", "get_active_workspace"]);
 
     assert_server_tool_names(&fixture_root, "core", &core_expected);
+    assert_unknown_tool(
+        &fixture_root,
+        "core",
+        "scan_usages",
+        json!({ "symbols": ["A"] }),
+    );
     assert_unknown_tool(
         &fixture_root,
         "core",
@@ -799,7 +804,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "scan_usages",
+            "scan_usages_by_location",
             "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
@@ -1303,12 +1308,20 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
     assert!(names.contains(&"get_definitions_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definitions_by_location"), "{names:?}");
     assert!(!names.contains(&"get_type_by_location"), "{names:?}");
+    assert!(names.contains(&"scan_usages_by_reference"), "{names:?}");
+    assert!(!names.contains(&"scan_usages_by_location"), "{names:?}");
+    assert!(!names.contains(&"scan_usages"), "{names:?}");
     assert_tool_schema_omits_property(
         list_tools["result"]["tools"]
             .as_array()
             .expect("tools array"),
         "get_definitions_by_reference",
         "include_tests",
+    );
+    assert_scan_usages_reference_schema(
+        list_tools["result"]["tools"]
+            .as_array()
+            .expect("tools array"),
     );
 
     let unavailable_location_tool = round_trip(
@@ -1399,6 +1412,9 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
     assert!(names.contains(&"get_definitions_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definitions_by_location"), "{names:?}");
     assert!(!names.contains(&"get_type_by_location"), "{names:?}");
+    assert!(names.contains(&"scan_usages_by_reference"), "{names:?}");
+    assert!(!names.contains(&"scan_usages_by_location"), "{names:?}");
+    assert!(!names.contains(&"scan_usages"), "{names:?}");
 
     let unavailable_location_tool = round_trip(
         &mut stdin,
@@ -1976,24 +1992,37 @@ fn assert_tool_schema_contains_property(tools: &[Value], tool_name: &str, proper
     );
 }
 
-fn assert_scan_usages_schema_requires_non_empty_selectors(tools: &[Value]) {
+fn assert_scan_usages_location_schema(tools: &[Value]) {
     let tool = tools
         .iter()
-        .find(|tool| tool["name"] == "scan_usages")
-        .expect("missing scan_usages descriptor");
+        .find(|tool| tool["name"] == "scan_usages_by_location")
+        .expect("missing scan_usages_by_location descriptor");
     let schema = &tool["inputSchema"];
 
-    assert_eq!(schema["properties"]["symbols"]["minItems"], 1);
-    assert_eq!(schema["properties"]["symbols"]["items"]["pattern"], "\\S");
     assert_eq!(schema["properties"]["targets"]["minItems"], 1);
     assert_eq!(
         schema["properties"]["targets"]["items"]["required"],
-        json!(["path"])
+        json!(["path", "line"])
     );
-    assert_eq!(
-        schema["properties"]["targets"]["items"]["anyOf"],
-        json!([{ "required": ["line"] }, { "required": ["start_byte"] }])
-    );
+    let serialized = serde_json::to_string(schema).unwrap();
+    assert!(!serialized.contains("start_byte"), "{serialized}");
+    assert!(!serialized.contains("end_byte"), "{serialized}");
+}
+
+fn assert_scan_usages_reference_schema(tools: &[Value]) {
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "scan_usages_by_reference")
+        .expect("missing scan_usages_by_reference descriptor");
+    let schema = &tool["inputSchema"];
+
+    assert_eq!(schema["required"], json!(["symbols"]));
+    assert_eq!(schema["properties"]["symbols"]["minItems"], 1);
+    assert_eq!(schema["properties"]["symbols"]["items"]["pattern"], "\\S");
+    let serialized = serde_json::to_string(schema).unwrap();
+    assert!(!serialized.contains("targets"), "{serialized}");
+    assert!(!serialized.contains("start_byte"), "{serialized}");
+    assert!(!serialized.contains("end_byte"), "{serialized}");
 }
 
 fn assert_type_lookup_schema_limits_and_requires_location(tools: &[Value]) {
@@ -2006,12 +2035,11 @@ fn assert_type_lookup_schema_limits_and_requires_location(tools: &[Value]) {
     assert_eq!(schema["properties"]["references"]["maxItems"], 100);
     assert_eq!(
         schema["properties"]["references"]["items"]["required"],
-        json!(["path"])
+        json!(["path", "line"])
     );
-    assert_eq!(
-        schema["properties"]["references"]["items"]["anyOf"],
-        json!([{ "required": ["line"] }, { "required": ["start_byte"] }])
-    );
+    let serialized = serde_json::to_string(schema).unwrap();
+    assert!(!serialized.contains("start_byte"), "{serialized}");
+    assert!(!serialized.contains("end_byte"), "{serialized}");
 }
 
 fn assert_rename_symbol_schema_requires_location_and_new_name(tools: &[Value]) {
@@ -2021,8 +2049,13 @@ fn assert_rename_symbol_schema_requires_location_and_new_name(tools: &[Value]) {
         .expect("missing rename_symbol descriptor");
     let schema = &tool["inputSchema"];
 
-    assert_eq!(schema["required"], json!(["path", "new_name"]));
-    assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        schema["required"],
+        json!(["path", "line", "column", "new_name"])
+    );
+    let serialized = serde_json::to_string(schema).unwrap();
+    assert!(!serialized.contains("start_byte"), "{serialized}");
+    assert!(!serialized.contains("end_byte"), "{serialized}");
     assert_eq!(schema["properties"]["new_name"]["minLength"], 1);
     assert_eq!(schema["properties"]["new_name"]["maxLength"], json!(256));
 }

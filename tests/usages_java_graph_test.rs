@@ -789,7 +789,7 @@ public class Consumer {
 
     let scan = call_search_tool_json(
         project.root(),
-        "scan_usages",
+        "scan_usages_by_reference",
         &json!({
             "symbols": [
                 "org.example.ProcessOperationLockRegistry.notify",

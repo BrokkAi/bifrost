@@ -14,13 +14,13 @@ Use the narrowest tool that directly answers the question:
 | Question | Tool | Why |
 | --- | --- | --- |
 | “Where is `Parser.parse` declared?” | `search_symbols` | Searches indexed declarations by name. |
-| “Who references this exact symbol?” | `scan_usages` | Resolves a known declaration to reference sites. |
+| “Who references this exact symbol?” | `scan_usages_by_reference` or `scan_usages_by_location` | Resolves a known declaration to reference sites from a symbol or source location. |
 | “What is the workspace caller/callee graph?” | `usage_graph` | Returns the existing whole-workspace resolved usage graph. |
 | “Which code has this language-neutral syntactic shape?” | `query_code` | Matches normalized kinds, roles, containment, and captures. |
 | “Which code is conceptually about retry policy?” | `semantic_search` | Retrieves code by meaning rather than exact structure. |
 | “Where does this literal text occur?” | `search_file_contents` | Searches source text without structural interpretation. |
 
-Start with `search_symbols` or `scan_usages` when you already know the symbol. Use `query_code` when the shape matters more than symbol identity. A useful workflow is to capture structural candidates with `query_code`, then pass their locations or enclosing symbols to the more semantic tools.
+Start with `search_symbols` or the mode-appropriate scan-usages tool when you already know the symbol. Use `query_code` when the shape matters more than symbol identity. A useful workflow is to capture structural candidates with `query_code`, then pass their locations or enclosing symbols to the more semantic tools.
 
 Each language adapter starts from tree-sitter parses, then maps grammar-specific nodes and fields into a shared structural model:
 

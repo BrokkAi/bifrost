@@ -229,7 +229,7 @@ mod tests {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "scan_usages",
+            "scan_usages_by_location",
             "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",

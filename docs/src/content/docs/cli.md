@@ -16,7 +16,8 @@ bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyCl
 For the available tool families and tool names, see [MCP Server](../mcp/). For a single tool's description and parameters, ask the CLI directly:
 
 ```bash
-bifrost --help scan_usages
+bifrost --help scan_usages_by_location
+bifrost --help scan_usages_by_reference
 ```
 
 ## Output Shape

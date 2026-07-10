@@ -21,7 +21,10 @@ pub fn normalize_tool_arguments(
         "list_symbols" => {
             normalize_string_array_field(&mut arguments, "file_patterns", workspace_root)?
         }
-        "scan_usages" => {
+        "scan_usages_by_reference" => {
+            normalize_string_array_field(&mut arguments, "paths", workspace_root)?;
+        }
+        "scan_usages_by_location" => {
             normalize_string_array_field(&mut arguments, "paths", workspace_root)?;
             normalize_object_array_string_field(&mut arguments, "targets", "path", workspace_root)?;
         }
@@ -83,7 +86,15 @@ pub fn normalize_tool_arguments_for_cli(
             workspace_root,
             &mut overlays,
         )?,
-        "scan_usages" => {
+        "scan_usages_by_reference" => {
+            normalize_cli_string_array_field(
+                &mut arguments,
+                "paths",
+                workspace_root,
+                &mut overlays,
+            )?;
+        }
+        "scan_usages_by_location" => {
             normalize_cli_string_array_field(
                 &mut arguments,
                 "paths",
@@ -910,7 +921,7 @@ mod tests {
         let absolute_looking_symbol = format!("{}/src/A.java", root.path().display());
 
         let normalized = normalize_tool_arguments(
-            "scan_usages",
+            "scan_usages_by_reference",
             json!({ "symbols": [absolute_looking_symbol] }),
             root.path(),
         )
@@ -928,7 +939,7 @@ mod tests {
         fs::write(&file, "fn helper() {}\n").expect("write file");
 
         let normalized = normalize_tool_arguments(
-            "scan_usages",
+            "scan_usages_by_reference",
             json!({
                 "symbols": ["pkg.helper"],
                 "paths": [file.display().to_string()]
@@ -949,7 +960,7 @@ mod tests {
         fs::write(&file, "fn helper() {}\n").expect("write file");
 
         let normalized = normalize_tool_arguments(
-            "scan_usages",
+            "scan_usages_by_location",
             json!({
                 "targets": [{
                     "path": file.display().to_string(),

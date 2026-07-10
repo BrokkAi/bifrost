@@ -99,7 +99,7 @@ it installs, plus the broader Brokk/Bifrost workflow skills that build on those
 tools:
 
 - `bifrost-code-navigation`: definitions, references, call sites, and related
-  files with `search_symbols`, `get_symbol_locations`, `scan_usages`, and
+  files with `search_symbols`, `get_symbol_locations`, `scan_usages_by_location`, and
   `most_relevant_files`.
 - `bifrost-code-reading`: source summaries and exact symbol bodies with
   `get_summaries` and `get_symbol_sources`.

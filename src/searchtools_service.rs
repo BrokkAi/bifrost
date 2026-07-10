@@ -22,7 +22,8 @@ use crate::{
         classify_test_files, get_definitions_by_location, get_definitions_by_reference,
         get_summaries, get_symbol_ancestors, get_symbol_locations, get_symbol_sources,
         get_type_by_location, list_symbols, most_relevant_files, refresh_result, rename_symbol,
-        scan_usages, search_symbols, symbol_source_candidate_files, usage_graph,
+        scan_usages_by_location, scan_usages_by_reference, search_symbols,
+        symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
@@ -420,13 +421,22 @@ impl SearchToolsService {
                     most_relevant_files(workspace.analyzer(), params)
                 },
             ),
-            "scan_usages" => {
-                Self::validate_scan_usages_arguments(&arguments)?;
+            "scan_usages_by_reference" => {
+                Self::validate_scan_usages_by_reference_arguments(&arguments)?;
                 Self::decode_render_and_run(
                     &snapshot,
                     arguments,
                     render_options,
-                    |workspace, params| scan_usages(workspace.analyzer(), params),
+                    |workspace, params| scan_usages_by_reference(workspace.analyzer(), params),
+                )
+            }
+            "scan_usages_by_location" => {
+                Self::validate_scan_usages_by_location_arguments(&arguments)?;
+                Self::decode_render_and_run(
+                    &snapshot,
+                    arguments,
+                    render_options,
+                    |workspace, params| scan_usages_by_location(workspace.analyzer(), params),
                 )
             }
             "get_definitions_by_location" => {
@@ -1097,23 +1107,87 @@ impl SearchToolsService {
         }
     }
 
-    fn validate_scan_usages_arguments(arguments: &Value) -> Result<(), SearchToolsServiceError> {
-        let has_symbols = arguments
+    fn validate_scan_usages_by_reference_arguments(
+        arguments: &Value,
+    ) -> Result<(), SearchToolsServiceError> {
+        let valid_symbols = arguments
             .get("symbols")
             .and_then(Value::as_array)
-            .is_some_and(|symbols| symbols.iter().any(Value::is_string));
-        let has_targets = arguments
+            .is_some_and(|symbols| {
+                !symbols.is_empty()
+                    && symbols.iter().all(|symbol| {
+                        symbol
+                            .as_str()
+                            .is_some_and(|value| !value.trim().is_empty())
+                    })
+            });
+
+        if !valid_symbols {
+            return Err(SearchToolsServiceError::invalid_params(
+                "scan_usages_by_reference requires a non-empty `symbols` array of non-blank strings",
+            ));
+        }
+        Self::validate_scan_usages_scope_arguments(arguments, "scan_usages_by_reference")
+    }
+
+    fn validate_scan_usages_by_location_arguments(
+        arguments: &Value,
+    ) -> Result<(), SearchToolsServiceError> {
+        let targets = arguments
             .get("targets")
             .and_then(Value::as_array)
-            .is_some_and(|targets| !targets.is_empty());
-
-        if has_symbols || has_targets {
-            Ok(())
-        } else {
-            Err(SearchToolsServiceError::invalid_params(
-                "scan_usages requires a non-empty `symbols` array unless `targets` location selectors are supplied",
-            ))
+            .filter(|targets| !targets.is_empty())
+            .ok_or_else(|| {
+                SearchToolsServiceError::invalid_params(
+                    "scan_usages_by_location requires a non-empty `targets` array",
+                )
+            })?;
+        for (index, target) in targets.iter().enumerate() {
+            let valid = target.as_object().is_some_and(|target| {
+                target
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| !path.trim().is_empty())
+                    && target
+                        .get("line")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|line| line > 0)
+                    && target
+                        .get("column")
+                        .is_none_or(|column| column.as_u64().is_some_and(|column| column > 0))
+            });
+            if !valid {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "scan_usages_by_location target {} requires a non-blank `path`, a positive 1-based `line`, and an optional positive 1-based `column`",
+                    index + 1
+                )));
+            }
         }
+        Self::validate_scan_usages_scope_arguments(arguments, "scan_usages_by_location")
+    }
+
+    fn validate_scan_usages_scope_arguments(
+        arguments: &Value,
+        tool_name: &str,
+    ) -> Result<(), SearchToolsServiceError> {
+        if arguments
+            .get("include_tests")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "{tool_name} requires `include_tests` to be a boolean"
+            )));
+        }
+        if arguments.get("paths").is_some_and(|paths| {
+            !paths
+                .as_array()
+                .is_some_and(|paths| paths.iter().all(Value::is_string))
+        }) {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "{tool_name} requires `paths` to be an array of strings"
+            )));
+        }
+        Ok(())
     }
 
     fn decode_render_and_run<P, R>(

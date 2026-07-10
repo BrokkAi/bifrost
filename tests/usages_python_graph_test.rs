@@ -2330,7 +2330,7 @@ fn chained_attribute_receiver_method_match_is_unproven_not_verified_absent() {
 
     let result = call_search_tool_json(
         project.root(),
-        "scan_usages",
+        "scan_usages_by_reference",
         &json!({
             "symbols": ["pkg.service.Foo.bar"],
             "include_tests": true
@@ -2368,7 +2368,7 @@ fn unknown_simple_receiver_method_match_is_unproven_not_verified_absent() {
 
     let result = call_search_tool_json(
         project.root(),
-        "scan_usages",
+        "scan_usages_by_reference",
         &json!({
             "symbols": ["pkg.service.Foo.bar"],
             "include_tests": true

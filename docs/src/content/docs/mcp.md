@@ -22,7 +22,7 @@ By default, `bifrost` uses the current working directory as `--root` and `search
 
 | Toolset | Tools |
 | --- | --- |
-| `symbol` | `search_symbols`, `get_symbol_sources`, `get_summaries`, `scan_usages`, `get_definitions_by_location`, `get_type_by_location`, `rename_symbol`, `usage_graph`, `analyze_commit` |
+| `symbol` | `search_symbols`, `get_symbol_sources`, `get_summaries`, mode-specific usage and definition lookup tools, `get_type_by_location`, `rename_symbol`, `usage_graph`, `analyze_commit` |
 | `nlp` | `semantic_search` when Bifrost is built with `--features nlp`, the active root is a git repository, and semantic search is available for the session. `semantic_search_status` is accepted for diagnostics but hidden from the advertised tool list. |
 | `workspace` | `refresh`, `activate_workspace`, `get_active_workspace` |
 | `extended` | `query_code`, `get_symbol_locations`, `get_symbol_ancestors`, `find_filenames`, `list_files`, `most_relevant_files`, `search_git_commit_messages`, `get_git_log`, `get_commit_diff`, `jq`, `xml_skim`, `xml_select` |
@@ -31,6 +31,8 @@ By default, `bifrost` uses the current working directory as `--root` and `search
 | `cli` | `classify_test_files` |
 
 `core` expands to `symbol|nlp|workspace`. In a default build, `nlp` contributes no advertised tools, so `core` effectively publishes `symbol|workspace`. `searchtools` expands to every toolset above in registry order: `symbol|nlp|workspace|extended|text|slopcop|cli`.
+
+With line numbers enabled, `symbol` advertises `scan_usages_by_location` and `get_definitions_by_location`. With `--no-line-numbers`, it instead advertises `scan_usages_by_reference` and `get_definitions_by_reference`.
 
 `searchtools` is the compatibility mode and exposes the full current union of MCP tools in toolset order. Use a smaller composition such as `symbol|workspace` when a host should see fewer tools.
 

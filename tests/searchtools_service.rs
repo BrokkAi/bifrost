@@ -245,10 +245,10 @@ class Foo {
         .build();
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
-    let start_byte = source.find("target() {}").expect("target declaration");
     let args = serde_json::json!({
         "path": "service.ts",
-        "start_byte": start_byte,
+        "line": 3,
+        "column": 3,
         "new_name": "renamed"
     });
 
@@ -784,27 +784,30 @@ fn rename_symbol_rejects_oversized_identifier() {
 }
 
 #[test]
-fn rename_symbol_rejects_mixed_or_incomplete_locations() {
+fn rename_symbol_requires_line_and_column() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
-    let mixed_payload = service
+    let missing_column_payload = service
         .call_tool_json(
             "rename_symbol",
-            r#"{"path":"A.java","line":8,"column":19,"start_byte":120,"new_name":"renamedMethod2"}"#,
+            r#"{"path":"A.java","line":8,"new_name":"renamedMethod2"}"#,
         )
         .unwrap();
-    let mixed: Value = serde_json::from_str(&mixed_payload).unwrap();
-    assert_eq!("invalid_location", mixed["status"], "payload: {mixed}");
-
-    let incomplete_payload = service
-        .call_tool_json(
-            "rename_symbol",
-            r#"{"path":"A.java","line":8,"column":19,"end_byte":125,"new_name":"renamedMethod2"}"#,
-        )
-        .unwrap();
-    let incomplete: Value = serde_json::from_str(&incomplete_payload).unwrap();
+    let missing_column: Value = serde_json::from_str(&missing_column_payload).unwrap();
     assert_eq!(
-        "invalid_location", incomplete["status"],
-        "payload: {incomplete}"
+        "invalid_location", missing_column["status"],
+        "payload: {missing_column}"
+    );
+
+    let missing_line_payload = service
+        .call_tool_json(
+            "rename_symbol",
+            r#"{"path":"A.java","column":19,"new_name":"renamedMethod2"}"#,
+        )
+        .unwrap();
+    let missing_line: Value = serde_json::from_str(&missing_line_payload).unwrap();
+    assert_eq!(
+        "invalid_location", missing_line["status"],
+        "payload: {missing_line}"
     );
 }
 
@@ -1009,26 +1012,18 @@ pub fn caller() {
     assert!(reference_message.contains("target must identify a single reference token"));
     assert!(!reference_message.contains("start_byte"));
 
-    let start = source.find("crate::helper").expect("qualified reference");
-    let end = start + "crate::helper".len();
     let by_location_payload = service
         .call_tool_json(
             "get_definitions_by_location",
-            &format!(
-                r#"{{"references":[{{"path":"src/lib.rs","start_byte":{start},"end_byte":{end}}}]}}"#
-            ),
+            r#"{"references":[{"path":"src/lib.rs","line":4,"column":12}]}"#,
         )
         .unwrap();
     let by_location: Value = serde_json::from_str(&by_location_payload).unwrap();
-    let location_message = by_location["results"][0]["diagnostics"][0]["message"]
-        .as_str()
-        .expect("by-location diagnostic message");
-
     assert_eq!(
-        "invalid_location", by_location["results"][0]["status"],
+        "resolved", by_location["results"][0]["status"],
         "{by_location}"
     );
-    assert!(location_message.contains("use start_byte inside the token"));
+    assert_eq!("helper", by_location["results"][0]["definitions"][0]["fqn"]);
 }
 
 #[test]
@@ -2262,7 +2257,7 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["E.iMethod"],"include_tests":true}"#,
         )
         .unwrap();
@@ -2333,7 +2328,9 @@ public class Child extends Base {
         SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
 
     let args = r#"{"symbols":["com.example.Child.run"],"include_tests":true}"#;
-    let payload = service.call_tool_json("scan_usages", args).unwrap();
+    let payload = service
+        .call_tool_json("scan_usages_by_reference", args)
+        .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
     let usage = only_result(&value);
 
@@ -2372,7 +2369,7 @@ public class Child extends Base {
     );
 
     let rendered_payload = service
-        .call_tool_payload_json("scan_usages", args, RenderOptions::default())
+        .call_tool_payload_json("scan_usages_by_reference", args, RenderOptions::default())
         .unwrap();
     let rendered_value: Value = serde_json::from_str(&rendered_payload).unwrap();
     let rendered = rendered_value["rendered_text"]
@@ -2398,7 +2395,7 @@ fn scan_usages_distinguishes_resolved_zero_from_unresolved_symbol() {
 
     let resolved_payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.unused"],"include_tests":true}"#,
         )
         .unwrap();
@@ -2415,7 +2412,7 @@ fn scan_usages_distinguishes_resolved_zero_from_unresolved_symbol() {
 
     let unresolved_payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.missing"],"include_tests":true}"#,
         )
         .unwrap();
@@ -2450,7 +2447,7 @@ fn scan_usages_python_payload_includes_rendered_diagnostics_and_zero_notes() {
 
     let unresolved_payload = service
         .call_tool_payload_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.missing"],"include_tests":true}"#,
             RenderOptions::default(),
         )
@@ -2464,7 +2461,7 @@ fn scan_usages_python_payload_includes_rendered_diagnostics_and_zero_notes() {
 
     let zero_payload = service
         .call_tool_payload_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.unused"],"include_tests":true}"#,
             RenderOptions::default(),
         )
@@ -2506,7 +2503,7 @@ fn scan_usages_verified_absent_names_filters_and_followups() {
 
     let payload = service
         .call_tool_payload_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["src.Target.unused"],"include_tests":false,"paths":["src/Scoped.java"]}"#,
             RenderOptions::default(),
         )
@@ -2552,7 +2549,7 @@ fn scan_usages_scope_reports_effective_filters_and_ignored_inputs() {
 
     let payload = service
         .call_tool_payload_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Target.unused"],"include_tests":true,"paths":["   ","["]}"#,
             RenderOptions::default(),
         )
@@ -2593,7 +2590,9 @@ fn scan_usages_scope_paths_are_bounded_by_the_response_budget() {
     })
     .to_string();
 
-    let payload = service.call_tool_json("scan_usages", &arguments).unwrap();
+    let payload = service
+        .call_tool_json("scan_usages_by_reference", &arguments)
+        .unwrap();
     assert!(
         payload.len() <= SCAN_USAGES_RESPONSE_BUDGET_BYTES,
         "payload should stay within scan_usages budget, got {} bytes",
@@ -2635,7 +2634,7 @@ fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sampl
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["App.Service"],"include_tests":true}"#,
         )
         .unwrap();
@@ -2723,7 +2722,7 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Service.target"],"include_tests":true}"#,
         )
         .unwrap();
@@ -2794,7 +2793,7 @@ end
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["User.save"],"include_tests":true}"#,
         )
         .unwrap();
@@ -2855,7 +2854,7 @@ end
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["User.save"],"include_tests":true}"#,
         )
         .unwrap();
@@ -2902,7 +2901,7 @@ public class Caller {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Target.save"],"include_tests":true}"#,
         )
         .unwrap();
@@ -2916,7 +2915,7 @@ public class Caller {
 
     let rendered_payload = service
         .call_tool_payload_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Target.save"],"include_tests":true}"#,
             RenderOptions::default(),
         )
@@ -2969,7 +2968,7 @@ void entry(Target target) {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Target.save"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3003,7 +3002,7 @@ void run() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["TEST_DECLARE"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3030,7 +3029,7 @@ void run() {
 
     let anchored_payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["wrong.h#TEST_DECLARE"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3053,7 +3052,7 @@ void run() {
 
     let ordinary_payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["wrong.h#callable"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3085,7 +3084,7 @@ fn scan_usages_accepts_location_target_without_symbols() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_location",
             r#"{"targets":[{"path":"Greeter.java","line":2,"column":19}],"include_tests":true}"#,
         )
         .unwrap();
@@ -3097,17 +3096,41 @@ fn scan_usages_accepts_location_target_without_symbols() {
 }
 
 #[test]
-fn scan_usages_requires_symbols_unless_targets_are_supplied() {
+fn scan_usages_by_reference_requires_symbols() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
 
     for args in [r#"{}"#, r#"{"symbols":[]}"#] {
-        let err = service.call_tool_json("scan_usages", args).unwrap_err();
+        let err = service
+            .call_tool_json("scan_usages_by_reference", args)
+            .unwrap_err();
         assert_eq!(SearchToolsServiceErrorCode::InvalidParams, err.code);
         assert!(
             err.message.contains("requires a non-empty `symbols` array"),
             "unexpected error for {args}: {}",
             err.message
         );
+    }
+}
+
+#[test]
+fn scan_usages_by_location_validation_names_its_own_arguments() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+
+    for args in [
+        r#"{}"#,
+        r#"{"targets":[]}"#,
+        r#"{"targets":[{"path":"A.java"}]}"#,
+    ] {
+        let error = service
+            .call_tool_json("scan_usages_by_location", args)
+            .unwrap_err();
+        assert_eq!(SearchToolsServiceErrorCode::InvalidParams, error.code);
+        assert!(
+            error.message.contains("scan_usages_by_location") && error.message.contains("target"),
+            "unexpected error for {args}: {}",
+            error.message
+        );
+        assert!(!error.message.contains("symbols"), "{}", error.message);
     }
 }
 
@@ -3146,7 +3169,7 @@ function run() {
 
     let string_payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["accepts"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3158,7 +3181,7 @@ function run() {
 
     let dependency_payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_location",
             r#"{"targets":[{"path":"lib/request.js","line":2,"column":5}],"include_tests":true}"#,
         )
         .unwrap();
@@ -3184,7 +3207,7 @@ function run() {
 
     let method_payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_location",
             r#"{"targets":[{"path":"lib/request.js","line":6,"column":5}],"include_tests":true}"#,
         )
         .unwrap();
@@ -3226,8 +3249,8 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
-            r#"{"targets":[{"path":"app.js","line":1,"column":42}],"include_tests":true}"#,
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app.js","line":1,"column":44}],"include_tests":true}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
@@ -3253,7 +3276,7 @@ fn scan_usages_location_target_selects_js_object_literal_method() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_location",
             r#"{"targets":[{"path":"library.js","line":2,"column":3}],"include_tests":true}"#,
         )
         .unwrap();
@@ -3307,7 +3330,7 @@ fn scan_usages_location_target_does_not_select_nested_same_line_member() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_location",
             r#"{"targets":[{"path":"app.js","line":1,"column":14}],"include_tests":true}"#,
         )
         .unwrap();
@@ -3318,7 +3341,7 @@ fn scan_usages_location_target_does_not_select_nested_same_line_member() {
 }
 
 #[test]
-fn scan_usages_ambiguous_symbol_includes_capped_location_details() {
+fn scan_usages_by_reference_ambiguity_uses_symbolic_candidates_only() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file("a.js", "export function helper() {}\n")
         .file("b.js", "export function helper() {}\n")
@@ -3330,7 +3353,7 @@ fn scan_usages_ambiguous_symbol_includes_capped_location_details() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["helper"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3338,21 +3361,98 @@ fn scan_usages_ambiguous_symbol_includes_capped_location_details() {
     let ambiguous = only_result(&value);
 
     assert_eq!(4, ambiguous["candidate_targets"].as_array().unwrap().len());
-    assert_eq!(3, ambiguous["candidate_details"].as_array().unwrap().len());
-    assert_eq!(4, ambiguous["candidate_details_total"].as_u64().unwrap());
-    assert_eq!(true, ambiguous["candidate_details_truncated"]);
+    assert!(ambiguous["candidate_details"].is_null());
+    assert!(ambiguous["candidate_details_total"].is_null());
+    assert!(ambiguous["candidate_details_truncated"].is_null());
     assert!(
-        ambiguous["message"]
-            .as_str()
-            .unwrap()
-            .contains("Showing first 3 of 4 candidate locations"),
+        !ambiguous["message"].as_str().unwrap().contains("location"),
         "payload: {value}"
     );
-    for detail in ambiguous["candidate_details"].as_array().unwrap() {
-        assert!(detail["scan_usages_target"]["path"].as_str().is_some());
-        assert_eq!(1, detail["scan_usages_target"]["line"].as_u64().unwrap());
-        assert!(detail["scan_usages_target"]["column"].as_u64().is_some());
-    }
+}
+
+#[test]
+fn scan_usages_location_rejects_arbitrary_body_lines() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            "export function run() {\n  const value = 1;\n  return value;\n}\nrun();\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app.js","line":2}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(1, status_count(&value, "not_found"), "payload: {value}");
+    assert!(
+        only_result(&value)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no declaration at location")),
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn scan_usages_location_never_selects_a_declaration_from_another_file() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/First.java",
+            "package sample;\nclass Duplicate {\n  void local() {}\n}\n",
+        )
+        .file(
+            "src/Second.java",
+            "package sample;\nclass Duplicate {\n  void wrong() {}\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"src/First.java","line":3,"column":8}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+
+    assert_eq!(
+        "sample.Duplicate.local", result["symbol"],
+        "payload: {value}"
+    );
+    assert!(
+        result["definition_path"] == "src/First.java",
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn scan_usages_location_columns_count_unicode_characters() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", "export function café() {}\ncafé();\n")
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app.js","line":1,"column":20}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(
+        "app.js#café",
+        only_result(&value)["symbol"],
+        "payload: {value}"
+    );
 }
 
 #[test]
@@ -3360,7 +3460,7 @@ fn scan_usages_reports_unknown_symbol_as_not_found() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["does.not.Exist"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3395,7 +3495,7 @@ fn scan_usages_multi_symbol_rendered_banner_names_not_found_member() {
 
     let payload = service
         .call_tool_payload_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Target.hit","Target.missing"],"include_tests":true}"#,
             RenderOptions::default(),
         )
@@ -3410,7 +3510,7 @@ fn scan_usages_multi_symbol_rendered_banner_names_not_found_member() {
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(
         rendered.starts_with(
-            "2 scan_usages requests: 1 found; 1 not_found; see per-request sections.\nNot found: Target.missing."
+            "2 scan_usages_by_reference requests: 1 found; 1 not_found; see per-request sections.\nNot found: Target.missing."
         ),
         "{rendered}"
     );
@@ -3448,7 +3548,7 @@ namespace Domain {
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Domain.Target.Run"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3473,26 +3573,18 @@ namespace Domain {
 }
 
 #[test]
-fn scan_usages_emits_one_entry_for_blank_symbols() {
+fn scan_usages_by_reference_rejects_blank_symbols() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
-    let payload = service
+    let error = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["", "   ", "E.iMethod"],"include_tests":true}"#,
         )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
+        .unwrap_err();
 
-    let results = results(&value);
-    assert_eq!(3, results.len(), "payload: {value}");
-    assert_eq!("", results[0]["input"], "payload: {value}");
-    assert_eq!("not_found", results[0]["status"], "payload: {value}");
-    assert_eq!("   ", results[1]["input"], "payload: {value}");
-    assert_eq!("not_found", results[1]["status"], "payload: {value}");
-    assert_eq!("E.iMethod", results[2]["input"], "payload: {value}");
-    assert_eq!("found", results[2]["status"], "payload: {value}");
-    assert_eq!(2, status_count(&value, "not_found"));
-    assert_eq!(0, status_count(&value, "failure"));
+    assert_eq!(SearchToolsServiceErrorCode::InvalidParams, error.code);
+    assert!(error.message.contains("scan_usages_by_reference"));
+    assert!(error.message.contains("non-blank"));
 }
 
 #[test]
@@ -3531,7 +3623,7 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
 
     let production_only = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.hello"],"include_tests":false}"#,
         )
         .unwrap();
@@ -3557,7 +3649,7 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
 
     let with_tests = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.hello"],"include_tests":true}"#,
         )
         .unwrap();
@@ -3605,7 +3697,7 @@ fn scan_usages_paths_filter_limits_candidate_files() {
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.hello"],"include_tests":true,"paths":["nested/*.java"]}"#,
         )
         .unwrap();
@@ -3648,7 +3740,7 @@ fn scan_usages_paths_scope_is_independent_of_out_of_scope_callers() {
         SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Helper"],"include_tests":true,"paths":["want_caller.go"]}"#,
         )
         .unwrap();
@@ -3694,7 +3786,7 @@ fn scan_usages_paths_scope_returns_all_in_scope_callers() {
         SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.hello"],"include_tests":true,"paths":["scoped/*.java"]}"#,
         )
         .unwrap();
@@ -3731,7 +3823,7 @@ fn scan_usages_paths_scope_blocks_js_ts_importer_expansion() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["helper"],"include_tests":true,"paths":["scoped.ts"]}"#,
         )
         .unwrap();
@@ -3759,7 +3851,7 @@ fn scan_usages_paths_scope_blocks_csharp_target_source_leakage() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["App.Service.Run"],"include_tests":true,"paths":["Scoped.cs"]}"#,
         )
         .unwrap();
@@ -3782,7 +3874,7 @@ fn scan_usages_paths_scope_blocks_jvm_php_scala_target_source_leakage() {
         SearchToolsService::new_without_semantic_index(java_project.root().to_path_buf()).unwrap();
     let java_payload = java_service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Service.run"],"include_tests":true,"paths":["Scoped.java"]}"#,
         )
         .unwrap();
@@ -3804,7 +3896,7 @@ fn scan_usages_paths_scope_blocks_jvm_php_scala_target_source_leakage() {
         SearchToolsService::new_without_semantic_index(php_project.root().to_path_buf()).unwrap();
     let php_payload = php_service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Service.run"],"include_tests":true,"paths":["Scoped.php"]}"#,
         )
         .unwrap();
@@ -3826,7 +3918,7 @@ fn scan_usages_paths_scope_blocks_jvm_php_scala_target_source_leakage() {
         SearchToolsService::new_without_semantic_index(scala_project.root().to_path_buf()).unwrap();
     let scala_payload = scala_service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Service.run"],"include_tests":true,"paths":["Scoped.scala"]}"#,
         )
         .unwrap();
@@ -3852,7 +3944,7 @@ fn scan_usages_paths_scope_blocks_rust_empty_scope_fallback() {
 
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["target"],"include_tests":true,"paths":["missing.rs"]}"#,
         )
         .unwrap();
@@ -3885,7 +3977,7 @@ fn scan_usages_paths_scope_does_not_truncate_broad_glob_candidates_before_scanni
         SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Greeter.hello"],"include_tests":true,"paths":["scoped/*.java"]}"#,
         )
         .unwrap();
@@ -3924,7 +4016,7 @@ fn scan_usages_paths_scope_keeps_cross_language_scala_usages_of_java_type() {
         SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["com.example.Target"],"include_tests":true,"paths":["app/ScalaConsumer.scala"]}"#,
         )
         .unwrap();
@@ -3964,7 +4056,7 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Target.hit"],"include_tests":true}"#,
         )
         .unwrap();
@@ -4032,7 +4124,7 @@ fn scan_usages_too_many_callsites_returns_incomplete_summary_with_observed_files
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["Target.hit"],"paths":["Caller*.java"],"include_tests":true}"#,
         )
         .unwrap();
@@ -4103,7 +4195,7 @@ fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
-            "scan_usages",
+            "scan_usages_by_reference",
             r#"{"symbols":["A.AInner.AInnerInner.method7"],"include_tests":true}"#,
         )
         .unwrap();

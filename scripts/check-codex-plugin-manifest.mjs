@@ -145,7 +145,7 @@ fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK
 const skillsRoot = "plugins/bifrost-agent/skills";
 const codexSkillsRoot = CODEX_SKILL_BUNDLE_ROOT;
 const expectedSkills = [
-  ["bifrost-code-navigation", "bifrost-code-navigation", "search_symbols", "scan_usages", "get_symbol_locations"],
+  ["bifrost-code-navigation", "bifrost-code-navigation", "search_symbols", "scan_usages_by_location", "get_symbol_locations"],
   ["bifrost-code-reading", "bifrost-code-reading", "get_summaries", "get_symbol_sources"],
   ["bifrost-codebase-search", "bifrost-codebase-search", "search_symbols", "query_code", "find_filenames", "list_files"],
   ["git-exploration", "brokk-git-exploration", "git log", "git diff", "gh pr view"],
@@ -230,7 +230,7 @@ assert.deepStrictEqual(
   ["--root", ".", "--mcp", "symbol|extended"],
   `${AMP_SKILL_BUNDLE_ROOT}/mcp.json should launch Bifrost against Amp's current workspace`,
 );
-for (const tool of ["search_symbols", "get_summaries", "scan_usages", "find_filenames"]) {
+for (const tool of ["search_symbols", "get_summaries", "scan_usages_by_location", "find_filenames"]) {
   if (!ampMcpConfig.bifrost.includeTools?.includes(tool)) {
     throw new Error(`${AMP_SKILL_BUNDLE_ROOT}/mcp.json should include ${tool}`);
   }
