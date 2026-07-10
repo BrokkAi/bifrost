@@ -179,14 +179,13 @@ pub struct MultiAnalyzer {
 
 impl MultiAnalyzer {
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
-        let declarations: Vec<_> = delegates
-            .values()
-            .flat_map(|delegate| delegate.analyzer().all_declarations())
-            .collect();
-        let definition_lookup_index =
-            DefinitionLookupIndex::from_declarations(declarations.iter(), str::to_string, |unit| {
-                unit.identifier().to_string()
-            });
+        let definition_lookup_index = DefinitionLookupIndex::from_declarations(
+            delegates
+                .values()
+                .flat_map(|delegate| delegate.analyzer().all_declarations()),
+            str::to_string,
+            |unit| unit.identifier().to_string(),
+        );
         Self {
             delegates,
             definition_lookup_index,

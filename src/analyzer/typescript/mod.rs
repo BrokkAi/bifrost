@@ -63,20 +63,18 @@ impl StorageLanguageAdapter for TypescriptAdapter {
     }
 
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        !code_unit.is_file_scope() && !code_unit.is_module()
+        crate::analyzer::js_ts::should_persist_code_unit(code_unit)
     }
 
     fn storage_contains_tests(
         &self,
         state: &crate::analyzer::tree_sitter_analyzer::FileState,
     ) -> bool {
-        crate::analyzer::js_ts::source_contains_tests(&state.source)
+        crate::analyzer::js_ts::storage_contains_tests(state)
     }
 
     fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
-        stored
-            || crate::analyzer::js_ts::path_contains_tests(file)
-            || crate::analyzer::js_ts::source_contains_tests(source)
+        crate::analyzer::js_ts::hydrate_contains_tests(stored, file, source)
     }
 
     fn synthesize_hydrated_units(
@@ -85,22 +83,7 @@ impl StorageLanguageAdapter for TypescriptAdapter {
         source: &str,
         state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
     ) {
-        if state.imports.is_empty() {
-            return;
-        }
-        let module = module_code_unit(file);
-        state.top_level_declarations.push(module.clone());
-        state.declarations.insert(module.clone());
-        state
-            .ranges
-            .entry(module)
-            .or_default()
-            .push(crate::analyzer::Range {
-                start_byte: 0,
-                end_byte: source.len(),
-                start_line: 1,
-                end_line: crate::text_utils::compute_line_starts(source).len(),
-            });
+        crate::analyzer::js_ts::synthesize_hydrated_module(file, source, state);
     }
 }
 
@@ -393,11 +376,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                 Language::TypeScript,
                 Some(&self.alias_resolver),
             ) {
-                let top_level: Vec<_> = self
-                    .inner
-                    .top_level_declarations(&target)
-                    .into_iter()
-                    .collect();
+                let top_level = self.inner.top_level_declarations(&target);
                 if import.is_wildcard {
                     resolved.extend(
                         top_level
@@ -613,7 +592,18 @@ impl IAnalyzer for TypescriptAnalyzer {
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures(code_unit)
+        let is_type_alias = self.inner.is_type_alias(code_unit);
+        self.inner
+            .signatures(code_unit)
+            .into_iter()
+            .map(|signature| {
+                if is_type_alias && !signature.ends_with(';') {
+                    format!("{signature};")
+                } else {
+                    signature
+                }
+            })
+            .collect()
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {

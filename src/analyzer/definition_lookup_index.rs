@@ -1,6 +1,7 @@
 use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
+use std::borrow::Borrow;
 
 #[derive(Debug, Clone, Default)]
 pub struct DefinitionLookupIndex {
@@ -15,17 +16,20 @@ pub struct DefinitionLookupIndex {
 }
 
 impl DefinitionLookupIndex {
-    pub(crate) fn from_declarations<'a, N, S>(
-        declarations: impl IntoIterator<Item = &'a CodeUnit>,
+    pub(crate) fn from_declarations<I, N, S>(
+        declarations: I,
         normalize: N,
         simple_type_name: S,
     ) -> Self
     where
+        I: IntoIterator,
+        I::Item: Borrow<CodeUnit>,
         N: Fn(&str) -> String,
         S: Fn(&CodeUnit) -> String,
     {
         let mut index = Self::default();
         for unit in declarations {
+            let unit = unit.borrow();
             index.insert(unit, &normalize, &simple_type_name);
         }
         index.sort_entries();
@@ -369,5 +373,21 @@ mod tests {
         let normalized = index.members_for_owner_name("example.Helpers", "example.Helpers", "run");
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].fq_name(), "example.Helpers$.run");
+    }
+
+    #[test]
+    fn streams_owned_declarations_into_index() {
+        let root = std::env::temp_dir().join("bifrost-defindex-owned-test");
+        let foo = unit(&root, "src/Foo.java", "example", "Foo");
+        let bar = unit(&root, "src/Bar.java", "example", "Bar");
+
+        let index = DefinitionLookupIndex::from_declarations(
+            vec![foo.clone(), bar.clone()],
+            str::to_string,
+            |unit| unit.identifier().to_string(),
+        );
+
+        assert_eq!(index.fqn("example.Foo"), vec![foo]);
+        assert_eq!(index.fqn("example.Bar"), vec![bar]);
     }
 }

@@ -2333,6 +2333,17 @@ mod tests {
         let js_file = temp_file(&root, "src/widget.spec.js");
         let javascript = JavascriptAdapter;
         assert!(javascript.hydrate_contains_tests(false, &js_file, ""));
+        let mut js_state = empty_file_state(source, true);
+        js_state.imports = state.imports.clone();
+        javascript.synthesize_hydrated_units(&js_file, source, &mut js_state);
+        let js_module = js_state
+            .top_level_declarations
+            .iter()
+            .find(|unit| unit.is_module())
+            .expect("synthetic JavaScript module");
+        assert!(!javascript.should_persist_code_unit(js_module));
+        assert!(js_state.declarations.contains(js_module));
+        assert_eq!(js_state.ranges.get(js_module).map(Vec::len), Some(1));
     }
 
     #[test]

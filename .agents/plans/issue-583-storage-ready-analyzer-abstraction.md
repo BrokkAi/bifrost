@@ -17,6 +17,7 @@ This issue does not add a database, cache schema, Git blob liveness, a persisted
 - [x] (2026-07-10) Added and passed focused parity coverage for owned queries and adapter semantics.
 - [x] (2026-07-10) Ran final formatting, non-CUDA all-target clippy, focused behavioral tests, and diff checks.
 - [x] (2026-07-10) Recorded final outcomes and checkpoint commits on the existing branch without pushing.
+- [x] (2026-07-10) Ran guided branch review and addressed its TypeScript parity, JS/TS duplication, and `MultiAnalyzer` peak-memory findings.
 
 ## Surprises & Discoveries
 
@@ -34,6 +35,9 @@ This issue does not add a database, cache schema, Git blob liveness, a persisted
 
 - Observation: This machine has matching-version Rust and Clippy installations built against different LLVM patch releases, so the repository alias initially rejected dependency metadata even in a separate target directory.
   Evidence: Homebrew `clippy-driver` reported LLVM 22.1.6 while the selected Rust toolchain reported LLVM 22.1.2. Running the alias with the Rustup toolchain directory first in `PATH` and an isolated `CARGO_TARGET_DIR` completed successfully.
+
+- Observation: Removing language-specific convenience overrides requires moving any semantic transformation they performed onto the owned primitive, not merely deleting the override.
+  Evidence: Guided review reproduced `test_alias_signature_formatting` failing because TypeScript's former `signatures_of` override appended a required semicolon that the initial owned `signatures` primitive omitted.
 
 ## Decision Log
 
@@ -57,6 +61,10 @@ This issue does not add a database, cache schema, Git blob liveness, a persisted
   Rationale: It is outside the approved `IAnalyzer` API migration and does not need to support a future storage query in #583.
   Date/Author: 2026-07-10 / Codex.
 
+- Decision: Share JavaScript/TypeScript storage reconstruction helpers and allow `DefinitionLookupIndex::from_declarations` to consume owned or borrowed units.
+  Rationale: Shared JS/TS behavior avoids future hydration drift, while streaming owned declarations prevents `MultiAnalyzer` from retaining an avoidable workspace-sized temporary vector.
+  Date/Author: 2026-07-10 / Codex.
+
 ## Outcomes & Retrospective
 
 Implementation and validation are complete. `IAnalyzer`, `TreeSitterAnalyzer`, every language delegate, and `MultiAnalyzer` now expose owned storage-sensitive query results; `all_declarations_with_primary_ranges` provides the future bulk range seam; and all convenience aliases are centralized defaults. The storage adapter remains inert and has no database, liveness, cache, or backend-selection dependency.
@@ -64,6 +72,8 @@ Implementation and validation are complete. `IAnalyzer`, `TreeSitterAnalyzer`, e
 The focused validation passed 4 storage-adapter unit tests, 7 query-parity tests (including the shared harness tests), 158 LSP tests, 397 definition tests, 17 multi-analyzer tests, 104 SearchTools tests with one pre-existing expensive smoke test ignored, and 5 usage-identity tests. `cargo clippy-no-cuda` passed all non-CUDA targets with warnings denied, `cargo fmt --all` completed, and `git diff --check` reported no errors.
 
 Checkpoint `7200eecf` records the owned query and adapter implementation plus its primary parity coverage. A final validation checkpoint accompanies this completed ExecPlan and the all-target ownership-boundary fixes. No changes were made to dependencies, analyzer persistence, `search_definitions_persisted`, backend activation, cache/liveness code, or SQLite store modules.
+
+Guided review subsequently found and fixed three issues before publication: TypeScript alias signature formatting now lives on the owned primitive and is covered by primitive/alias parity; JavaScript and TypeScript share storage filtering, test-state, and synthetic-module reconstruction; and `MultiAnalyzer` streams owned declarations directly into `DefinitionLookupIndex`. Security and architecture reviewers found no additional concerns.
 
 ## Context and Orientation
 
