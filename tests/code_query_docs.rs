@@ -10,6 +10,7 @@ const DOCS: &[&str] = &[
     "docs/src/content/docs/code-query-tutorials/index.md",
     "docs/src/content/docs/code-query-tutorials/python.md",
     "docs/src/content/docs/code-query-tutorials/java.md",
+    "docs/src/content/docs/code-query-tutorials/javascript.md",
 ];
 
 const PUBLIC_QUERY_SURFACES: &[&str] = &[

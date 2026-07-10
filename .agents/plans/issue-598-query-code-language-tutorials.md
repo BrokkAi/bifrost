@@ -13,7 +13,7 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 - [x] (2026-07-10 13:17Z) Milestone 0: added this ExecPlan, the tutorial index/navigation, and the executable Markdown harness; focused Rust/docs tests, Astro check/build, and a fresh styled preview passed.
 - [x] (2026-07-10 13:21Z) Milestone 1: published and verified the Python tutorial with exact filtered-call, decorated-assignment, and callable-exclusion results; focused/docs/build/render checks passed.
 - [x] (2026-07-10 13:25Z) Milestone 2: published and verified the Java tutorial with member-call narrowing, annotated constructors, exception/control-flow descendants, and the exact unsupported-kwargs diagnostic.
-- [ ] Milestone 3: publish and verify the JavaScript tutorial.
+- [x] (2026-07-10 13:28Z) Milestone 3: published and verified the JavaScript tutorial with receiver/context narrowing, arrow/new matching, anonymous class-expression field access, and unsupported kwargs.
 - [ ] Milestone 4: publish and verify the TypeScript tutorial.
 - [ ] Milestone 5: publish and verify the Go tutorial.
 - [ ] Milestone 6: publish and verify the shared C/C++ tutorial.
@@ -34,6 +34,9 @@ The tutorial suite covers Python, Java, JavaScript, TypeScript, Go, C and C++ th
 
 - Observation: Python does not advertise `constructor` precision, so putting `constructor` in `not_kind` produces a capability diagnostic even when the intended match is a method.
   Evidence: The first callable example returned `structural adapter for python does not support kind(s): constructor`; narrowing the exclusion to `lambda` preserved the intended named-callable lesson without an unrelated diagnostic.
+
+- Observation: JavaScript class expressions assigned to variables are emitted as `class` facts but do not inherit the variable binding as their normalized `name`.
+  Evidence: `kind: class, name: Inline` returned no match, while `text: {regex: "^class \\{"}` plus a structured field-access descendant matched the class expression and returned enclosing symbol `app.js.Inline`.
 
 ## Decision Log
 
@@ -60,6 +63,8 @@ Milestone 0 established the publication and proof infrastructure. The marker-con
 Milestone 1 published Python's tutorial with three exact cases. The member-call case proves simultaneous path/language/receiver/callee/argument/keyword/containment filtering; the decorated method case proves decorators plus nested assignment left/right roles; the callable case proves subtype-aware matching and lambda exclusion. Its focused executable test, existing docs tests, Astro check/build, and fresh styled preview with ten non-overflowing code blocks passed.
 
 Milestone 2 published Java's tutorial with six exact cases. It distinguishes two same-name calls by receiver, captures an annotated constructor, queries catch/if/loop nodes by throw/return descendants, and records the adapter's precise unsupported-kwargs diagnostic. Focused and existing docs tests, Astro check/build, and a fresh rendered-page check passed; expected output was expanded from authoring-friendly one-line JSON to readable blocks, reducing horizontal overflow from seven blocks to two unavoidable source/query lines.
+
+Milestone 3 published JavaScript's tutorial with four exact cases: same-name call narrowing by receiver and enclosing method, a captured arrow containing a normalized `new` call, an anonymous class expression containing a specific field access, and the unsupported-kwargs diagnostic. Focused/docs tests, Astro check/build, and a fresh route/navigation/date/code-block inspection passed.
 
 ## Context and Orientation
 
@@ -141,3 +146,5 @@ Revision note, 2026-07-10: Updated after Milestone 0 with the passing harness/do
 Revision note, 2026-07-10: Updated after Milestone 1 with Python's exact outputs, constructor-capability discovery, and rendered-page evidence.
 
 Revision note, 2026-07-10: Updated after Milestone 2 with Java's exact call/constructor/control-flow/diagnostic results and rendered readability check.
+
+Revision note, 2026-07-10: Updated after Milestone 3 with JavaScript's exact outputs, anonymous-class name boundary, and rendered-page evidence.

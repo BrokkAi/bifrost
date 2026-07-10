@@ -13,7 +13,7 @@ Language pages will be added and marked with their last successful end-to-end ve
 
 - [Python](./python/)
 - [Java](./java/)
-- JavaScript (planned)
+- [JavaScript](./javascript/)
 - TypeScript (planned)
 - Go (planned)
 - C and C++ through the `cpp` adapter (planned)
