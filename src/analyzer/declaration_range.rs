@@ -158,15 +158,26 @@ fn declaration_name_node<'tree>(
 ) -> Option<Node<'tree>> {
     let mut stack = vec![declaration_node];
     while let Some(node) = stack.pop() {
-        if let Some(name) = node.child_by_field_name("name")
-            && let Some(identifier_node) = matching_identifier_node(name, identifier, content)
-        {
-            return Some(identifier_node);
+        for field in ["name", "left", "pattern"] {
+            if let Some(binding) = node.child_by_field_name(field)
+                && let Some(identifier_node) =
+                    matching_identifier_node(binding, identifier, content)
+            {
+                return Some(identifier_node);
+            }
         }
         for field in ["declarator", "declaration", "definition"] {
             if let Some(child) = node.child_by_field_name(field) {
                 stack.push(child);
             }
+        }
+        // Some grammars wrap an assignment declaration in a fieldless statement
+        // node. Descend through that unambiguous wrapper so the assignment's
+        // structured `left` field wins over the whole-node text fallback.
+        if node.named_child_count() == 1
+            && let Some(child) = node.named_child(0)
+        {
+            stack.push(child);
         }
     }
     matching_identifier_node(declaration_node, identifier, content)
@@ -196,5 +207,57 @@ fn node_byte_range(node: Node<'_>) -> Range {
         end_byte: node.end_byte(),
         start_line: node.start_position().row,
         end_line: node.end_position().row,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::usages::get_definition::parse_tree_for_language;
+    use crate::analyzer::{Language, ProjectFile};
+
+    fn first_node_of_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == kind {
+                return node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("missing {kind} node");
+    }
+
+    #[test]
+    fn repeated_assignment_name_uses_structured_binding_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let cases = [
+            (
+                Language::Python,
+                "value.py",
+                "x = x\n",
+                "expression_statement",
+            ),
+            (
+                Language::Scala,
+                "Value.scala",
+                "val x = x\n",
+                "val_definition",
+            ),
+            (Language::Ruby, "value.rb", "X = X\n", "assignment"),
+        ];
+
+        for (language, path, source, declaration_kind) in cases {
+            let file = ProjectFile::new(&root, path);
+            let tree = parse_tree_for_language(&file, language, source)
+                .unwrap_or_else(|| panic!("failed to parse {language:?}"));
+            let declaration = first_node_of_kind(tree.root_node(), declaration_kind);
+            let identifier = if language == Language::Ruby { "X" } else { "x" };
+            let name = declaration_name_node(declaration, identifier, source)
+                .unwrap_or_else(|| panic!("missing declaration name for {language:?}"));
+
+            assert_eq!(name.start_byte(), source.find(identifier).unwrap());
+        }
     }
 }

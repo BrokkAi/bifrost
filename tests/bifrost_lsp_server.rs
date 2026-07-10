@@ -417,6 +417,34 @@ fn bifrost_lsp_server_semantic_tokens_return_empty_for_unsupported_file() {
 }
 
 #[test]
+fn bifrost_lsp_server_semantic_tokens_bound_large_go_workspace_references() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let source = "package main\ntype Thing struct{}\nfunc run() { run() }\n";
+    let file_path = root.join("main.go");
+    fs::write(&file_path, source).expect("write main Go fixture");
+    for index in 0..64 {
+        fs::write(
+            root.join(format!("extra_{index}.go")),
+            format!("package main\nvar Value{index} = {index}\n"),
+        )
+        .expect("write extra Go fixture");
+    }
+    let mut server =
+        LspServer::start_with_params(&root, semantic_token_initialize_params(uri_for(&root)));
+
+    let facts = semantic_token_facts(source, &server.semantic_tokens(&uri_for(&file_path)));
+    assert!(facts.contains(&("Thing".to_string(), 1, 1)), "{facts:?}");
+    assert!(facts.contains(&("run".to_string(), 2, 1)), "{facts:?}");
+    assert!(
+        !facts.contains(&("run".to_string(), 2, 0)),
+        "large Go workspace should omit reference resolution: {facts:?}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
 fn bifrost_lsp_server_malformed_initialize_returns_error_response() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

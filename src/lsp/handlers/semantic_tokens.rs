@@ -9,7 +9,9 @@ use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, resolve_definition_batch_with_source,
 };
-use crate::analyzer::{CodeUnitType, Language, Project, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{
+    CodeUnitType, IAnalyzer, Language, Project, Range as ByteRange, WorkspaceAnalyzer,
+};
 use crate::hash::HashSet;
 use crate::lsp::conversion::byte_offset_to_position;
 use crate::lsp::handlers::util::read_document_for_uri;
@@ -20,6 +22,10 @@ const FUNCTION_TOKEN: u32 = 2;
 const PROPERTY_TOKEN: u32 = 3;
 const MACRO_TOKEN: u32 = 4;
 const DECLARATION_MODIFIER: u32 = 1;
+const MAX_SEMANTIC_TOKEN_SOURCE_BYTES: usize = 1_000_000;
+const MAX_SEMANTIC_TOKEN_CANDIDATES: usize = 10_000;
+const MAX_GO_REFERENCE_WORKSPACE_FILES: usize = 64;
+const MAX_GO_REFERENCE_WORKSPACE_SOURCE_BYTES: usize = 2_000_000;
 
 pub(crate) fn legend() -> SemanticTokensLegend {
     SemanticTokensLegend {
@@ -55,7 +61,10 @@ fn build_tokens(
         return empty_tokens();
     };
     let language = language_for_file(&file);
-    if language == Language::None || is_unparseable_source(&content) {
+    if language == Language::None
+        || !source_within_budget(&content)
+        || is_unparseable_source(&content)
+    {
         return empty_tokens();
     }
 
@@ -70,19 +79,25 @@ fn build_tokens(
         let Some(token_type) = token_type_for_kind(code_unit.kind()) else {
             continue;
         };
-        for range in context.name_ranges(analyzer, code_unit) {
+        for range in context.name_ranges(analyzer, &code_unit) {
             declarations.push(AbsoluteToken::new(range, token_type, DECLARATION_MODIFIER));
         }
     }
     declarations.sort_unstable();
     declarations.dedup();
 
-    let candidate_ranges = reference_candidate_ranges(root, language);
+    let Some(candidate_ranges) = reference_candidate_ranges(root, language) else {
+        return empty_tokens();
+    };
     let declaration_ranges: HashSet<_> = declarations.iter().map(AbsoluteToken::key).collect();
-    let unresolved_ranges: Vec<_> = candidate_ranges
-        .into_iter()
-        .filter(|range| !declaration_ranges.contains(&(range.start_byte, range.end_byte)))
-        .collect();
+    let unresolved_ranges: Vec<_> = if reference_resolution_within_budget(analyzer, language) {
+        candidate_ranges
+            .into_iter()
+            .filter(|range| !declaration_ranges.contains(&(range.start_byte, range.end_byte)))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let requests = unresolved_ranges
         .iter()
@@ -126,6 +141,45 @@ fn empty_tokens() -> SemanticTokens {
     }
 }
 
+fn source_within_budget(content: &str) -> bool {
+    content.len() <= MAX_SEMANTIC_TOKEN_SOURCE_BYTES
+}
+
+fn reference_resolution_within_budget(analyzer: &dyn IAnalyzer, language: Language) -> bool {
+    if language != Language::Go {
+        return true;
+    }
+    go_workspace_sizes_within_budget(
+        analyzer
+            .analyzed_files()
+            .into_iter()
+            .filter(|file| language_for_file(file) == Language::Go)
+            .map(|file| analyzer.indexed_source(&file).map(str::len)),
+    )
+}
+
+fn go_workspace_sizes_within_budget(sizes: impl IntoIterator<Item = Option<usize>>) -> bool {
+    let mut file_count = 0;
+    let mut source_bytes = 0_usize;
+    for size in sizes {
+        file_count += 1;
+        if file_count > MAX_GO_REFERENCE_WORKSPACE_FILES {
+            return false;
+        }
+        let Some(size) = size else {
+            return false;
+        };
+        let Some(next_source_bytes) = source_bytes.checked_add(size) else {
+            return false;
+        };
+        source_bytes = next_source_bytes;
+        if source_bytes > MAX_GO_REFERENCE_WORKSPACE_SOURCE_BYTES {
+            return false;
+        }
+    }
+    true
+}
+
 fn token_type_for_kind(kind: CodeUnitType) -> Option<u32> {
     match kind {
         CodeUnitType::Module => Some(NAMESPACE_TOKEN),
@@ -150,7 +204,7 @@ fn common_definition_token_type(definitions: &[crate::analyzer::CodeUnit]) -> Op
     common
 }
 
-fn reference_candidate_ranges(root: Node<'_>, language: Language) -> Vec<ByteRange> {
+fn reference_candidate_ranges(root: Node<'_>, language: Language) -> Option<Vec<ByteRange>> {
     let mut ranges = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -164,6 +218,9 @@ fn reference_candidate_ranges(root: Node<'_>, language: Language) -> Vec<ByteRan
                 start_line: node.start_position().row,
                 end_line: node.end_position().row,
             });
+            if ranges.len() > MAX_SEMANTIC_TOKEN_CANDIDATES {
+                return None;
+            }
         }
 
         let mut cursor = node.walk();
@@ -173,7 +230,7 @@ fn reference_candidate_ranges(root: Node<'_>, language: Language) -> Vec<ByteRan
     }
     ranges.sort_unstable();
     ranges.dedup();
-    ranges
+    Some(ranges)
 }
 
 fn is_reference_identifier_node(language: Language, kind: &str) -> bool {
@@ -425,7 +482,8 @@ mod tests {
             let file = crate::analyzer::ProjectFile::new(&root, PathBuf::from(path));
             let tree = parse_tree_for_language(&file, language, source)
                 .unwrap_or_else(|| panic!("failed to parse {language:?}"));
-            let ranges = reference_candidate_ranges(tree.root_node(), language);
+            let ranges = reference_candidate_ranges(tree.root_node(), language)
+                .unwrap_or_else(|| panic!("candidate budget exceeded for {language:?}"));
             assert!(
                 !ranges.is_empty(),
                 "expected structured identifier candidates for {language:?}"
@@ -438,5 +496,46 @@ mod tests {
             Language::Java,
             "string_literal"
         ));
+    }
+
+    #[test]
+    fn candidate_collection_stops_at_the_request_budget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = crate::analyzer::ProjectFile::new(&root, PathBuf::from("Many.java"));
+        let mut source = String::from("class Many { void f() {\n");
+        for _ in 0..=MAX_SEMANTIC_TOKEN_CANDIDATES {
+            source.push_str("f();\n");
+        }
+        source.push_str("} }\n");
+        let tree = parse_tree_for_language(&file, Language::Java, &source).expect("parse Java");
+
+        assert!(reference_candidate_ranges(tree.root_node(), Language::Java).is_none());
+    }
+
+    #[test]
+    fn source_budget_has_an_inclusive_boundary() {
+        assert!(source_within_budget(
+            &"x".repeat(MAX_SEMANTIC_TOKEN_SOURCE_BYTES)
+        ));
+        assert!(!source_within_budget(
+            &"x".repeat(MAX_SEMANTIC_TOKEN_SOURCE_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn go_reference_workspace_budget_bounds_files_bytes_and_read_failures() {
+        assert!(go_workspace_sizes_within_budget([Some(
+            MAX_GO_REFERENCE_WORKSPACE_SOURCE_BYTES
+        )]));
+        assert!(!go_workspace_sizes_within_budget([Some(
+            MAX_GO_REFERENCE_WORKSPACE_SOURCE_BYTES + 1
+        )]));
+        assert!(!go_workspace_sizes_within_budget(vec![
+            Some(1);
+            MAX_GO_REFERENCE_WORKSPACE_FILES
+                + 1
+        ]));
+        assert!(!go_workspace_sizes_within_budget([None]));
     }
 }

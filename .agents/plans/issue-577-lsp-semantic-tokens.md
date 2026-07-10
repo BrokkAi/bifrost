@@ -16,6 +16,7 @@ Bifrost currently provides navigation and diagnostics through its LSP server but
 - [x] (2026-07-10 09:49Z) Added four focused unit tests and four real LSP subprocess tests covering all grammar candidate predicates, multi-language symbols, overlays, Unicode, line endings, and unsupported files.
 - [x] (2026-07-10 09:49Z) Updated the public LSP documentation and internal API-surface audit.
 - [x] (2026-07-10 09:59Z) Ran formatting, focused and complete tests, matching-toolchain doctests, no-CUDA clippy, reviewed the final diff, and recorded validation evidence.
+- [x] (2026-07-10 10:40Z) Rebased onto current `origin/master`, completed the guided specialist review, fixed every accepted correctness and operational finding, reran the full validation matrix, and received clean post-fix reviews.
 
 ## Surprises & Discoveries
 
@@ -30,6 +31,15 @@ Bifrost currently provides navigation and diagnostics through its LSP server but
 
 - Observation: This machine selects Homebrew `rustdoc` after Rustup `rustc` built the dependency artifacts, even though both report Rust 1.96, so the final doctest step rejects otherwise compatible metadata.
   Evidence: every unit and integration binary passed before doctests failed with E0514; rerunning `cargo test --doc` with `RUSTDOC=/Users/dave/.cargo/bin/rustdoc` passed. The matching Rustup-first path and isolated target directory also let no-CUDA clippy pass cleanly.
+
+- Observation: Rebasing onto `origin/master` incorporated the storage-ready analyzer query refactor, which changed `declarations` iteration to yield owned `CodeUnit` values.
+  Evidence: the first post-rebase focused build failed with E0308 at the semantic-token declaration-range call; borrowing the owned value restored compilation.
+
+- Observation: The existing definition batch reused source and parse trees but recomputed the complete line-start table for every identifier request.
+  Evidence: the guided operational review traced every semantic-token candidate through `resolve_reference_site`; caching line starts per file in `DefinitionBatchContext` removes the resulting identifier-count times source-size scan.
+
+- Observation: Go definition lookup builds a workspace-wide parsed graph for each batch, so document-only limits do not bound work in large Go workspaces.
+  Evidence: post-fix operational review rejected an initially considered persistent graph cache because it would retain unbudgeted trees and risk disk/overlay snapshot drift. The final implementation uses allocation-free analyzer-generation source lengths to omit Go reference resolution above a bounded workspace size while preserving declaration tokens.
 
 ## Decision Log
 
@@ -49,9 +59,13 @@ Bifrost currently provides navigation and diagnostics through its LSP server but
   Rationale: Keeping one immutable server legend avoids per-client token-index state and prevents sending types or modifiers the client says it cannot consume.
   Date/Author: 2026-07-10 / Codex.
 
+- Decision: Bound synchronous semantic-token work to 1 MB per document and 10,000 structured identifier candidates; for Go, omit reference tokens above 64 indexed files or 2 MB of analyzer-generation source while retaining declarations.
+  Rationale: The LSP server dispatches ordinary requests serially. Explicit, tested budgets prevent automatic coloring requests from monopolizing the loop without introducing stale caches, persistent whole-workspace trees, lexical fallback, or new protocol state.
+  Date/Author: 2026-07-10 / Codex after guided review.
+
 ## Outcomes & Retrospective
 
-Issue #577 is implemented and validated. Compatible LSP clients receive the stable five-type legend and can request full-document tokens for analyzer-known declarations and structured references. The handler reads unsaved overlays, returns an empty successful result for unsupported inputs, uses iterative tree-sitter candidate discovery and structured batch resolution, and emits deterministic UTF-16 relative tokens without range/delta state or lexical fallback. Four focused unit tests, four new real-server scenarios, the complete 173-test LSP target, every full-suite unit and integration binary, doctests, formatting, and no-CUDA clippy pass. No known implementation work remains.
+Issue #577 is implemented, guided-reviewed, and validated. Compatible LSP clients receive the stable five-type legend and can request full-document tokens for analyzer-known declarations and structured references. The handler reads unsaved overlays, returns an empty successful result for unsupported inputs, uses iterative tree-sitter candidate discovery and structured batch resolution, and emits deterministic UTF-16 relative tokens without range/delta state or lexical fallback. Review follow-up corrected repeated-name assignment targeting, made definition batches reuse line indexes, and added explicit document, candidate, and Go-workspace work bounds. Seven focused semantic-token unit tests, the repeated-binding regression, five real-server semantic-token scenarios, the complete 174-test LSP target, every full-suite unit and integration binary, doctests, formatting, and no-CUDA clippy pass. Correctness and operational post-fix reviews found no remaining actionable issue.
 
 ## Context and Orientation
 
@@ -128,6 +142,30 @@ Final validation evidence:
     # passed
 
     PATH=/Users/dave/.cargo/bin:/Users/dave/.local/bin:/opt/homebrew/bin:/usr/bin:/bin \
+    CARGO_TARGET_DIR=/private/tmp/bifrost-clippy-577 cargo clippy-no-cuda
+    # passed
+
+Post-review validation evidence:
+
+    cargo test lsp::handlers::semantic_tokens --lib
+    # 7 passed
+
+    cargo test repeated_assignment_name_uses_structured_binding_target --lib
+    # 1 passed
+
+    cargo test --test bifrost_lsp_server semantic_tokens -- --nocapture
+    # 5 passed
+
+    cargo test --test bifrost_lsp_server
+    # 174 passed
+
+    cargo test --tests
+    # all unit and integration binaries passed; 570 library tests passed and 3 opt-in tests were ignored
+
+    RUSTDOC=/Users/dave/.cargo/bin/rustdoc cargo test --doc
+    # passed
+
+    PATH=/Users/dave/.cargo/bin:/Users/dave/.local/bin:/opt/homebrew/bin:/usr/bin:/bin \
       CARGO_TARGET_DIR=/private/tmp/bifrost-clippy-577 cargo clippy-no-cuda
     # passed
 
@@ -152,3 +190,5 @@ Plan revision note (2026-07-10 09:38Z): Created the self-contained implementatio
 Plan revision note (2026-07-10 09:49Z): Marked the core handler, integration coverage, and documentation milestones complete after focused unit and subprocess tests passed.
 
 Plan revision note (2026-07-10 09:59Z): Closed the plan after complete LSP, full-suite, doctest, formatting, and no-CUDA clippy validation, and documented the reproducible Rustup/Homebrew toolchain workaround.
+
+Plan revision note (2026-07-10 10:40Z): Reopened the living plan for guided review follow-up, documented the post-rebase compatibility fix, structured declaration-name correction, batch line-index reuse, synchronous-work budgets, full validation, and clean post-fix review.

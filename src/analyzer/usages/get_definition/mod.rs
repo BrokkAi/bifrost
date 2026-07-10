@@ -39,7 +39,7 @@ use crate::analyzer::usages::python_graph::{
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 pub(crate) use crate::analyzer::usages::reference_site::byte_offset_for_character_column;
 pub(crate) use crate::analyzer::usages::reference_site::{
-    ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
+    ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
     smallest_named_node_covering,
 };
 use crate::analyzer::usages::ruby_graph::{
@@ -268,6 +268,7 @@ struct DefinitionBatchContext<'a> {
     support: &'a DefinitionLookupIndex,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
+    line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
     scala_project_types: Option<Arc<ScalaProjectTypes>>,
     go_graph: Option<Option<Arc<GoProjectGraph>>>,
@@ -279,6 +280,7 @@ impl<'a> DefinitionBatchContext<'a> {
             support: analyzer.definition_lookup_index(),
             sources: HashMap::default(),
             trees: HashMap::default(),
+            line_starts: HashMap::default(),
             cpp_visibility: HashMap::default(),
             scala_project_types: None,
             go_graph: None,
@@ -300,6 +302,13 @@ impl<'a> DefinitionBatchContext<'a> {
         self.trees
             .entry((file.clone(), language))
             .or_insert_with(|| parse_tree_for_language(file, language, source))
+            .clone()
+    }
+
+    fn line_starts(&mut self, file: &ProjectFile, source: &str) -> Arc<Vec<usize>> {
+        self.line_starts
+            .entry(file.clone())
+            .or_insert_with(|| Arc::new(compute_line_starts(source)))
             .clone()
     }
 
@@ -369,7 +378,12 @@ fn resolve_one(
         }
     };
 
-    let site = match resolve_reference_site(&request.as_source_location(), &source) {
+    let line_starts = context.line_starts(&request.file, &source);
+    let site = match resolve_reference_site_with_line_starts(
+        &request.as_source_location(),
+        &source,
+        &line_starts,
+    ) {
         Ok(site) => site,
         Err(message) => {
             return diagnostic_outcome(
