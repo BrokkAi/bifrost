@@ -264,6 +264,13 @@ impl LspServer {
         )
     }
 
+    pub fn semantic_tokens(&mut self, file_uri: &str) -> Value {
+        self.request(
+            "textDocument/semanticTokens/full",
+            json!({"textDocument": {"uri": file_uri}}),
+        )
+    }
+
     pub fn prepare_type_hierarchy(&mut self, uri: &str, line: u64, character: u64) -> Value {
         self.prepare_hierarchy("textDocument/prepareTypeHierarchy", uri, (line, character))
     }

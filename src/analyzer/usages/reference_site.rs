@@ -27,6 +27,14 @@ pub(crate) fn resolve_reference_site(
     source: &str,
 ) -> Result<ResolvedReferenceSite, String> {
     let line_starts = compute_line_starts(source);
+    resolve_reference_site_with_line_starts(request, source, &line_starts)
+}
+
+pub(crate) fn resolve_reference_site_with_line_starts(
+    request: &SourceLocationRequest,
+    source: &str,
+    line_starts: &[usize],
+) -> Result<ResolvedReferenceSite, String> {
     let allow_at_ident = language_for_file(&request.file) == Language::Ruby;
     let (selection_start, selection_end) = match (
         request.start_byte,
@@ -110,8 +118,8 @@ pub(crate) fn resolve_reference_site(
     if text.is_empty() {
         return Err("reference selection is blank".to_string());
     }
-    let start_line = find_line_index_for_offset(&line_starts, start) + 1;
-    let end_line = find_line_index_for_offset(&line_starts, end.saturating_sub(1)) + 1;
+    let start_line = find_line_index_for_offset(line_starts, start) + 1;
+    let end_line = find_line_index_for_offset(line_starts, end.saturating_sub(1)) + 1;
     Ok(ResolvedReferenceSite {
         path: rel_path_string(&request.file),
         text,

@@ -2,10 +2,13 @@ use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionOptions, DiagnosticOptions,
     DiagnosticServerCapabilities, DocumentFormattingOptions, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability, OneOf, RenameOptions,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
     ServerCapabilities, SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
-    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TokenFormat,
+    TypeDefinitionProviderCapability, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
 };
+
+use crate::lsp::handlers::semantic_tokens;
 
 pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCapabilities {
     // Incremental changes are applied transactionally to the complete buffer
@@ -47,6 +50,7 @@ pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCa
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
         workspace_symbol_provider: Some(OneOf::Left(true)),
+        semantic_tokens_provider: semantic_tokens_provider(client_capabilities),
         diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
             identifier: Some("bifrost-tree-sitter".to_string()),
             inter_file_dependencies: false,
@@ -63,6 +67,44 @@ pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCa
         // Per-feature capabilities are turned on as their handlers land.
         ..ServerCapabilities::default()
     }
+}
+
+fn semantic_tokens_provider(
+    client_capabilities: &ClientCapabilities,
+) -> Option<SemanticTokensServerCapabilities> {
+    let client = client_capabilities
+        .text_document
+        .as_ref()
+        .and_then(|text_document| text_document.semantic_tokens.as_ref())?;
+    let supports_full = matches!(
+        client.requests.full,
+        Some(SemanticTokensFullOptions::Bool(true) | SemanticTokensFullOptions::Delta { .. })
+    );
+    if !supports_full || !client.formats.contains(&TokenFormat::RELATIVE) {
+        return None;
+    }
+
+    let legend = semantic_tokens::legend();
+    if !legend
+        .token_types
+        .iter()
+        .all(|token_type| client.token_types.contains(token_type))
+        || !legend
+            .token_modifiers
+            .iter()
+            .all(|modifier| client.token_modifiers.contains(modifier))
+    {
+        return None;
+    }
+
+    Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+        SemanticTokensOptions {
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+            legend,
+            range: None,
+            full: Some(SemanticTokensFullOptions::Bool(true)),
+        },
+    ))
 }
 
 fn completion_provider(client_capabilities: &ClientCapabilities) -> Option<CompletionOptions> {
