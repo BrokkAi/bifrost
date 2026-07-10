@@ -39,6 +39,10 @@ Use the extension setting `bifrost.serverPath` when testing a locally built Bifr
 | `bifrost.exclude` | `[]` | Workspace-relative or absolute files or directories to exclude from Bifrost indexing and LSP lookups. |
 | `bifrost.formatterCommands` | `[]` | Ordered formatter command rules passed to Bifrost from user settings only. Rules run without a shell, receive document text on stdin, and write the formatted document to stdout. |
 
+Changes to `bifrost.roots`, `bifrost.exclude`, and `bifrost.formatterCommands` apply to the running language server without a restart. Root and exclusion changes rebuild the workspace index; formatter changes affect subsequent formatting requests. Removing one of these settings sends an empty value so the previous runtime setting is cleared.
+
+Changes to process-launch settings still require a restart: `bifrost.launchMode`, `bifrost.serverPath`, `bifrost.debug`, `bifrost.slowRequestMs`, and `bifrost.extraArgs`. The extension prompts before restarting for those settings.
+
 Launch mode behavior:
 
 - `auto`: use `bifrost.serverPath` when explicitly configured, then the extension-managed binary when available, then a local development binary under `target/`, then `bifrost` on `PATH`.

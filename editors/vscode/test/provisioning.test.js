@@ -416,6 +416,57 @@ test("builds MCP host commands from config", () => {
   );
 });
 
+test("builds complete runtime settings snapshots for initialization and pulls", () => {
+  const formatter = { include: ["*.rs"], command: "rustfmt" };
+  const settings = lifecycle.buildBifrostInitializationOptions(
+    "/workspace",
+    ["src", "  ", "/absolute/root"],
+    ["target"],
+    [formatter]
+  );
+
+  assert.deepEqual(settings, {
+    roots: [path.join("/workspace", "src"), "/absolute/root"],
+    exclude: [path.join("/workspace", "target")],
+    formatterCommands: [formatter]
+  });
+  assert.deepEqual(
+    lifecycle.buildBifrostInitializationOptions("/workspace", [], [], []),
+    { roots: [], exclude: [], formatterCommands: [] }
+  );
+});
+
+test("selects formatter commands from user settings only", () => {
+  const globalRule = { command: "/user/formatter" };
+  const workspaceRule = { command: "/workspace/untrusted-formatter" };
+
+  assert.deepEqual(
+    lifecycle.selectTrustedFormatterCommands({
+      globalValue: [globalRule],
+      workspaceValue: [workspaceRule]
+    }),
+    { rules: [globalRule], ignoredWorkspaceRules: true }
+  );
+  assert.deepEqual(lifecycle.selectTrustedFormatterCommands(undefined), {
+    rules: [],
+    ignoredWorkspaceRules: false
+  });
+});
+
+test("requires restart only for process launch settings", () => {
+  const changed = (section) => section === "bifrost.serverPath";
+  assert.equal(lifecycle.bifrostConfigurationChangeRequiresRestart(changed), true);
+
+  for (const runtimeSetting of ["roots", "exclude", "formatterCommands"]) {
+    assert.equal(
+      lifecycle.bifrostConfigurationChangeRequiresRestart(
+        (section) => section === `bifrost.${runtimeSetting}`
+      ),
+      false
+    );
+  }
+});
+
 test("detects existing bifrost gitignore entries", () => {
   assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost\n"), true);
   assert.equal(lifecycle.gitignoreIncludesBifrostEntry("/.bifrost/\n"), true);

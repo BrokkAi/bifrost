@@ -482,6 +482,573 @@ fn bifrost_lsp_server_honors_excluded_paths() {
 }
 
 #[test]
+fn bifrost_lsp_server_runtime_configuration_registers_and_pulls_bifrost_section() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("Main.java"), "class Main {}\n").expect("write Main.java");
+    let mut server = LspServer::spawn(&root);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {
+                "workspace": {
+                    "configuration": true,
+                    "didChangeConfiguration": {"dynamicRegistration": true}
+                }
+            }
+        }
+    }));
+    let initialize = server.read_response_for_id(1);
+    assert!(initialize["error"].is_null(), "{initialize}");
+    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    let registration = server.read_message();
+    assert_eq!(registration["method"], "client/registerCapability");
+    assert_eq!(
+        registration["params"]["registrations"][0]["method"],
+        "workspace/didChangeConfiguration"
+    );
+    assert_eq!(
+        registration["params"]["registrations"][0]["registerOptions"]["section"],
+        "bifrost"
+    );
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": registration["id"].clone(),
+        "result": null
+    }));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {}
+    }));
+    let pull = server.read_message();
+    assert_eq!(pull["method"], "workspace/configuration");
+    assert_eq!(pull["params"]["items"], json!([{"section": "bifrost"}]));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": pull["id"].clone(),
+        "result": [{"roots": [], "exclude": [], "formatterCommands": []}]
+    }));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "workspace/symbol",
+        "params": {"query": "Main"}
+    }));
+    let response = server.read_response_for_id(20);
+    assert!(response["error"].is_null(), "{response}");
+    assert!(
+        response["result"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == "Main")),
+        "pulled runtime snapshot should leave the workspace usable: {response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_runtime_configuration_restores_latest_editor_roots_and_applies_excludes() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(
+        root_a.join("Alpha.java"),
+        "class AlphaRoot { void alphaRuntime() {} }\n",
+    )
+    .expect("write Alpha.java");
+    fs::write(
+        root_b.join("Beta.java"),
+        "class BetaRoot { void betaRuntime() {} }\n",
+    )
+    .expect("write Beta.java");
+
+    let mut server = LspServer::start_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&parent),
+            "workspaceFolders": [{"uri": uri_for(&root_a), "name": "service-a"}],
+            "initializationOptions": {"roots": [root_a.display().to_string()]},
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+    server.notify(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [{"uri": uri_for(&root_b), "name": "service-b"}],
+                "removed": []
+            }
+        }),
+    );
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {"bifrost": {"roots": [], "exclude": [], "formatterCommands": []}}
+        }),
+    );
+
+    let restored = server.workspace_symbol("betaRuntime");
+    assert!(
+        restored["result"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == "betaRuntime")),
+        "clearing configured roots should restore the latest editor roots: {restored}"
+    );
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {"roots": [], "exclude": ["service-b"], "formatterCommands": []}
+        }),
+    );
+    let excluded = server.workspace_symbol("Runtime");
+    let symbols = excluded["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {excluded}"));
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "alphaRuntime"),
+        "non-excluded editor root should remain indexed: {excluded}"
+    );
+    assert!(
+        symbols.iter().all(|symbol| symbol["name"] != "betaRuntime"),
+        "runtime exclude should remove the second editor root: {excluded}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_runtime_configuration_clears_departed_diagnostics() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file = root.join("Broken.java");
+    fs::write(&file, "class Broken {}\n").expect("write Broken.java");
+    let file_uri = uri_for(&file);
+    let mut server = LspServer::start(&root);
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "java",
+                "version": 1,
+                "text": "class Broken { void broken( { }\n"
+            }
+        }),
+    );
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| !diagnostics.is_empty()),
+        "fixture should publish a stale diagnostic before exclusion: {published}"
+    );
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {"roots": [], "exclude": ["Broken.java"], "formatterCommands": []}
+        }),
+    );
+    let cleared = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(cleared["params"]["uri"], file_uri);
+    assert_eq!(cleared["params"]["diagnostics"], json!([]));
+}
+
+#[test]
+fn bifrost_lsp_server_runtime_configuration_replays_open_overlay_across_rebuild() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file = root.join("Overlay.java");
+    fs::write(&file, "class Overlay { void diskOnly() {} }\n").expect("write Overlay.java");
+    let file_uri = uri_for(&file);
+    let mut server = LspServer::start(&root);
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "java",
+                "version": 1,
+            "text": "class Overlay { void overlayOnly() {} }\n"
+            }
+        }),
+    );
+    let _ = server.read_notification("textDocument/publishDiagnostics");
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {"roots": [], "exclude": ["generated"], "formatterCommands": []}
+        }),
+    );
+
+    let response = server.workspace_symbol("overlayOnly");
+    assert!(
+        response["result"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == "overlayOnly")),
+        "open overlay should be replayed into the replacement analyzer: {response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_runtime_configuration_replays_overlay_opened_outside_explicit_roots() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(root_a.join("Alpha.java"), "class Alpha {}\n").expect("write Alpha.java");
+    let file = root_b.join("Beta.java");
+    fs::write(&file, "class Beta { void diskOnly() {} }\n").expect("write Beta.java");
+    let file_uri = uri_for(&file);
+    let mut server = LspServer::start_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&parent),
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "initializationOptions": {"roots": [root_a.display().to_string()]},
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "java",
+                "version": 1,
+                "text": "class Beta { void inactiveOverlayOnly() {} }\n"
+            }
+        }),
+    );
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": file_uri, "version": 2},
+            "contentChanges": [{"text": "class Beta { void inactiveChangedOnly() {} }\n"}]
+        }),
+    );
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {"roots": [], "exclude": [], "formatterCommands": []}
+        }),
+    );
+
+    let response = server.workspace_symbol("inactiveChangedOnly");
+    assert!(
+        response["result"].as_array().is_some_and(|symbols| symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "inactiveChangedOnly")),
+        "an overlay changed outside explicit roots should be replayed when editor roots return: {response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_runtime_configuration_ignores_stale_and_malformed_pull_responses() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let hidden = root.join("hidden");
+    fs::create_dir_all(&hidden).expect("create hidden");
+    fs::write(
+        hidden.join("Hidden.java"),
+        "class Hidden { void hiddenRuntime() {} }\n",
+    )
+    .expect("write Hidden.java");
+    let mut server = LspServer::start_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {"workspace": {"configuration": true}}
+        }),
+    );
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({"settings": null}),
+    );
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({"settings": null}),
+    );
+    let first_pull = server.read_message();
+    let second_pull = server.read_message();
+    assert_eq!(first_pull["method"], "workspace/configuration");
+    assert_eq!(second_pull["method"], "workspace/configuration");
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": second_pull["id"].clone(),
+        "result": [{"roots": [], "exclude": ["hidden"], "formatterCommands": []}]
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": first_pull["id"].clone(),
+        "result": [{"roots": [], "exclude": [], "formatterCommands": []}]
+    }));
+    let after_newest = server.workspace_symbol("hiddenRuntime");
+    assert_eq!(after_newest["result"], json!([]), "{after_newest}");
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({"settings": null}),
+    );
+    let malformed_pull = server.read_message();
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": malformed_pull["id"].clone(),
+        "result": [{"roots": "not-an-array"}]
+    }));
+    let after_malformed = server.workspace_symbol("hiddenRuntime");
+    assert_eq!(
+        after_malformed["result"],
+        json!([]),
+        "malformed pull must preserve the last working exclusion: {after_malformed}"
+    );
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({"settings": null}),
+    );
+    let failed_pull = server.read_message();
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": failed_pull["id"].clone(),
+        "error": {"code": -32603, "message": "configuration unavailable"}
+    }));
+    let after_failure = server.workspace_symbol("hiddenRuntime");
+    assert_eq!(
+        after_failure["result"],
+        json!([]),
+        "failed pull must preserve the last working exclusion: {after_failure}"
+    );
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({"settings": null}),
+    );
+    let wrong_shape_pull = server.read_message();
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": wrong_shape_pull["id"].clone(),
+        "result": [
+            {"roots": [], "exclude": [], "formatterCommands": []},
+            {"roots": [], "exclude": [], "formatterCommands": []}
+        ]
+    }));
+    let after_wrong_shape = server.workspace_symbol("hiddenRuntime");
+    assert_eq!(
+        after_wrong_shape["result"],
+        json!([]),
+        "wrong-shaped pull response must preserve the last working exclusion: {after_wrong_shape}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_runtime_configuration_ignores_malformed_legacy_notification() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        root.join("Main.java"),
+        "class Main { void stillAlive() {} }\n",
+    )
+    .expect("write Main.java");
+    let mut server = LspServer::start(&root);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {}
+    }));
+
+    let response = server.workspace_symbol("stillAlive");
+    assert!(
+        response["result"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == "stillAlive")),
+        "malformed legacy configuration notification must not terminate the server: {response}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_runtime_configuration_changes_formatter_for_later_requests() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file = root.join("lib.rs");
+    let formatter = root.join("upper-runtime-format");
+    fs::write(&file, "fn lower() {}\n").expect("write lib.rs");
+    write_stub_command(&formatter, "#!/bin/sh\ntr '[:lower:]' '[:upper:]'\n");
+    let mut server = LspServer::start(&root);
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "roots": [],
+                "exclude": [],
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "language": "rust",
+                    "command": formatter.display().to_string()
+                }]
+            }
+        }),
+    );
+    let response = formatting_response(&mut server, &uri_for(&file));
+    assert_eq!(
+        response["result"][0]["newText"], "FN LOWER() {}\n",
+        "{response}"
+    );
+
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "roots": [],
+                "exclude": [],
+                "formatterCommands": [{"include": ["*.rs"], "command": ""}]
+            }
+        }),
+    );
+    let after_invalid = formatting_response(&mut server, &uri_for(&file));
+    assert_eq!(
+        after_invalid["result"][0]["newText"], "FN LOWER() {}\n",
+        "an invalid runtime formatter rule must preserve the last working snapshot: {after_invalid}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_runtime_configuration_rebuild_cancels_active_formatter() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file = root.join("lib.rs");
+    let formatter = root.join("slow-runtime-format");
+    fs::write(&file, "fn main() {}\n").expect("write lib.rs");
+    write_stub_command(&formatter, "#!/bin/sh\nsleep 10\ncat\n");
+    let mut server = LspServer::start_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "command": formatter.display().to_string()
+                }]
+            }
+        }),
+    );
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 40,
+        "method": "textDocument/formatting",
+        "params": {
+            "textDocument": {"uri": uri_for(&file)},
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }
+    }));
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {"roots": [], "exclude": ["generated"], "formatterCommands": []}
+        }),
+    );
+
+    let response = server.read_response_for_id(40);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    let synchronized = server.workspace_symbol("main");
+    assert!(synchronized["error"].is_null(), "{synchronized}");
+}
+
+#[cfg(windows)]
+#[test]
+fn bifrost_lsp_server_runtime_configuration_rebuild_releases_windows_children_and_handles() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let old_root = parent.join("old-root");
+    let new_root = parent.join("new-root");
+    fs::create_dir_all(&old_root).expect("create old root");
+    fs::create_dir_all(&new_root).expect("create new root");
+    let old_file = old_root.join("lib.rs");
+    fs::write(&old_file, "fn old_root() {}\n").expect("write old file");
+    fs::write(
+        new_root.join("New.java"),
+        "class NewRoot { void newRuntime() {} }\n",
+    )
+    .expect("write new file");
+    let mut server = LspServer::start_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&parent),
+            "capabilities": {},
+            "initializationOptions": {
+                "roots": [old_root.display().to_string()],
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "command": "cmd.exe",
+                    "args": ["/D", "/S", "/C", "ping -n 30 127.0.0.1 >nul & more"]
+                }]
+            }
+        }),
+    );
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "textDocument/formatting",
+        "params": {
+            "textDocument": {"uri": uri_for(&old_file)},
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }
+    }));
+    server.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "roots": [new_root.display().to_string()],
+                "exclude": [],
+                "formatterCommands": []
+            }
+        }),
+    );
+
+    let canceled = server.read_response_for_id(41);
+    assert_eq!(canceled["error"]["code"], -32800, "{canceled}");
+    let synchronized = server.workspace_symbol("newRuntime");
+    assert!(
+        synchronized["result"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == "newRuntime")),
+        "replacement workspace should be active before handle check: {synchronized}"
+    );
+    fs::remove_dir_all(&old_root)
+        .expect("old root and .bifrost cache should have no live Windows handles");
+}
+
+#[test]
 fn bifrost_lsp_server_adds_workspace_folder_dynamically() {
     let temp = TempDir::new().expect("tempdir");
     let parent = temp.path().canonicalize().expect("canon temp");

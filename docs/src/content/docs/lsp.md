@@ -26,13 +26,33 @@ Clients can also pass Bifrost-specific `initializationOptions`:
 
 `roots` limits indexing to selected directories under the fallback root. `exclude` removes generated output, dependency caches, or other directories from workspace symbols and document-level lookups.
 
+## Runtime Configuration
+
+Bifrost supports the LSP 3.18 [`workspace/didChangeConfiguration`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/) notification. When the client advertises `workspace.configuration`, Bifrost requests the complete `bifrost` section with `workspace/configuration`. Clients without configuration-pull support can push the complete settings object directly or nest it under `bifrost`:
+
+```json
+{
+  "settings": {
+    "bifrost": {
+      "roots": ["src", "tests"],
+      "exclude": ["target"],
+      "formatterCommands": []
+    }
+  }
+}
+```
+
+Each accepted runtime value is a full snapshot. It replaces the startup `initializationOptions` and the previous runtime value; omitted or empty `roots`, `exclude`, and `formatterCommands` fields therefore clear those settings. Unknown fields are ignored, while an invalid recognized field rejects the complete snapshot and leaves the last working configuration active.
+
+Changing only `formatterCommands` affects later formatting requests without rebuilding the analyzer. Changing `roots` or `exclude` rebuilds the workspace, preserves open editor buffers, cancels active formatter processes before swapping state, and clears published diagnostics for files that leave the workspace. Clearing `roots` restores the latest workspace folders reported by the editor.
+
 ## Protocol Surface
 
 Bifrost advertises LSP capabilities only after the matching handler exists. Unsupported requests return JSON-RPC `MethodNotFound`; unsupported notifications are ignored.
 
-Current support includes incremental and whole-document text synchronization, save notifications, diagnostics, definition/type-definition/implementation, hover, signature help, completion, references, rename, document highlights, document symbols, formatting, folding ranges, workspace symbols, type and call hierarchy, workspace folder changes, watched-file notifications, startup progress, and formatting cancellation.
+Current support includes incremental and whole-document text synchronization, save notifications, diagnostics, definition/type-definition/implementation, hover, signature help, completion, references, rename, document highlights, document symbols, formatting, folding ranges, workspace symbols, type and call hierarchy, workspace folder and runtime configuration changes, watched-file notifications, startup progress, and formatting cancellation.
 
-Runtime configuration changes, semantic tokens, and broader cancellation/progress support are intentional follow-up areas. Code actions, server-side execute commands, and pre-save hooks are not advertised until Bifrost has concrete safe edits or commands to expose.
+Semantic tokens and broader cancellation/progress support are intentional follow-up areas. Code actions, server-side execute commands, and pre-save hooks are not advertised until Bifrost has concrete safe edits or commands to expose.
 
 ## CLI Tooling
 
