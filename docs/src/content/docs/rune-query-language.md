@@ -33,6 +33,7 @@ This query finds calls to `eval` inside a function, captures the first positiona
 
 <!-- code-query-test:rql:complete -->
 ```lisp
+; Semicolon comments run to the end of the line.
 (result-detail full
   (limit 25
     (language python
@@ -60,6 +61,19 @@ RQL uses compact S-expressions. The following are independent forms, not one mul
 (limit 25 (call :callee (name "eval")))
 (result-detail full (call :callee (name "eval")))
 (inside (function :name "handler") (call :callee (name "eval")))
+```
+
+## Comments
+
+Start a comment with `;` at the beginning of a line or after whitespace; it
+continues to the next newline. RQL has no block-comment syntax. A semicolon in
+a quoted string is ordinary text, not a comment.
+
+<!-- code-query-test:rql:comments -->
+```lisp
+; Limit the search to production Python files.
+(where "src/**/*.py"
+  (call :callee (name "eval"))) ; exclude generated paths in a real query
 ```
 
 Head symbols such as `call`, `function`, `class`, and `import` map to normalized structural kinds. Keyword fields such as `:callee`, `:args`, `:module`, and `:decorators` map to normalized roles.
