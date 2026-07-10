@@ -2,14 +2,16 @@ use super::extractor::{ScanState, scan_file};
 use super::inverted;
 use super::jvm_scala::scan_scala_files_for_java_type;
 use super::resolver::TargetSpec;
+use super::return_type::{FileReturnCache, MethodReturnCache};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
+use std::sync::Mutex;
 
 pub(crate) struct JavaQueryResolver<'a> {
     java: &'a JavaAnalyzer,
@@ -61,11 +63,24 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
+        // Receiver-chain return types are independent of the candidate file being
+        // scanned. Keep these caches for the whole query so repeated chains do not
+        // reparse the same declaration files once per candidate.
+        let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
+        let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
         for file in files {
             if scan_scope.is_cancelled() {
                 break;
             }
-            scan_file(self.java, analyzer, &file, &spec, &mut state);
+            scan_file(
+                self.java,
+                analyzer,
+                &file,
+                &spec,
+                &method_return_cache,
+                &file_return_cache,
+                &mut state,
+            );
             if *state.limit_exceeded {
                 break;
             }

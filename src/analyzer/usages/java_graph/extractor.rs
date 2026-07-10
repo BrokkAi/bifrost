@@ -17,7 +17,6 @@ use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::sync::Mutex;
 use tree_sitter::{Node, Parser};
 
 pub(super) type MethodCallReturnCacheKey = (String, String, usize);
@@ -57,6 +56,8 @@ pub(super) fn scan_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     spec: &TargetSpec,
+    method_return_cache: &MethodReturnCache,
+    file_return_cache: &FileReturnCache,
     state: &mut ScanState<'_>,
 ) {
     if *state.limit_exceeded {
@@ -83,9 +84,6 @@ pub(super) fn scan_file(
 
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     seed_class_binding(java, file, spec, &mut bindings);
-    let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
-    let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
-
     let mut ctx = ScanCtx {
         java,
         analyzer,
@@ -102,8 +100,8 @@ pub(super) fn scan_file(
         limit_exceeded: state.limit_exceeded,
         class_ranges: ClassRangeIndex::build(analyzer, file),
         method_call_return_cache: RefCell::new(HashMap::default()),
-        method_return_cache: &method_return_cache,
-        file_return_cache: &file_return_cache,
+        method_return_cache,
+        file_return_cache,
         enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);
