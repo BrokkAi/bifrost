@@ -8,8 +8,34 @@
 //! from the nearest `go.mod` (falling back to directory layout when no module
 //! is present) so that `CodeUnit::fq_name()` is unique per declaration.
 
-use crate::analyzer::ProjectFile;
-use std::path::Path;
+use crate::analyzer::{Project, ProjectFile};
+use std::path::{Path, PathBuf};
+
+pub(crate) struct GoModuleRoot {
+    pub import_path: String,
+    pub workspace_dir: PathBuf,
+}
+
+pub(crate) fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {
+    project
+        .all_files()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|file| {
+            file.rel_path()
+                .file_name()
+                .is_some_and(|name| name == "go.mod")
+        })
+        .filter_map(|manifest| {
+            let contents = project.read_source(&manifest).ok()?;
+            let import_path = go_module_path_from_source(&contents)?;
+            Some(GoModuleRoot {
+                import_path,
+                workspace_dir: manifest.parent(),
+            })
+        })
+        .collect()
+}
 
 /// Canonical Go package identity (import path) for `file`, given the
 /// `declared_package` from its `package` clause.
@@ -84,6 +110,10 @@ fn join_import_path(module_path: &str, rel_dir: &str) -> String {
 /// Read the `module` path from the `go.mod` in `dir`, if present.
 pub(crate) fn read_go_module_path(dir: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(dir.join("go.mod")).ok()?;
+    go_module_path_from_source(&contents)
+}
+
+fn go_module_path_from_source(contents: &str) -> Option<String> {
     contents.lines().find_map(|line| {
         let trimmed = line.trim();
         trimmed

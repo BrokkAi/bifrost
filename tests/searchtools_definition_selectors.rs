@@ -1226,6 +1226,116 @@ var (
 }
 
 #[test]
+fn go_module_prefixed_file_paths_resolve_from_nested_module_root() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("lib/go.mod", "module github.com/eko/gocache/lib/v4\n")
+        .file(
+            "lib/cache/chain.go",
+            "package cache\n\ntype Chain struct{}\n",
+        )
+        .file(
+            "lib/cache/chain_test.go",
+            "package cache\n\nfunc TestChain() {}\n",
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["github.com/eko/gocache/lib/v4/cache/chain.go","github.com/eko/gocache/lib/v4/cache/chain_test.go"]}"#,
+    );
+
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert!(
+        result["ambiguous_paths"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{result}"
+    );
+    let paths = result["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| source["path"].as_str().expect("source path"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        std::collections::BTreeSet::from(["lib/cache/chain.go", "lib/cache/chain_test.go"]),
+        paths,
+        "{result}"
+    );
+}
+
+#[test]
+fn go_module_prefixed_file_paths_prefer_the_nested_module() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/root\n")
+        .file("child/pkg/value.go", "package pkg\n\nconst Parent = 1\n")
+        .file("nested/go.mod", "module example.com/root/child\n")
+        .file("nested/pkg/value.go", "package pkg\n\nconst Nested = 1\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["example.com/root/child/pkg/value.go"]}"#,
+    );
+
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(
+        "nested/pkg/value.go",
+        result["sources"][0]["path"].as_str().unwrap(),
+        "{result}"
+    );
+}
+
+#[test]
+fn duplicate_go_module_paths_report_ambiguous_files() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("first/go.mod", "module example.com/shared\n")
+        .file("first/pkg/value.go", "package pkg\n\nconst First = 1\n")
+        .file("second/go.mod", "module example.com/shared\n")
+        .file("second/pkg/value.go", "package pkg\n\nconst Second = 1\n")
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["example.com/shared/pkg/value.go"]}"#,
+    );
+
+    assert_eq!(
+        serde_json::json!([{
+            "input": "example.com/shared/pkg/value.go",
+            "matches": ["first/pkg/value.go", "second/pkg/value.go"]
+        }]),
+        result["ambiguous_paths"],
+        "{result}"
+    );
+}
+
+#[test]
+fn go_module_prefixed_file_paths_reject_parent_traversal() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("lib/go.mod", "module example.com/lib\n")
+        .file("cache/chain.go", "package cache\n\ntype Chain struct{}\n")
+        .build();
+    let input = "example.com/lib/../cache/chain.go";
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        &serde_json::json!({"symbols": [input]}).to_string(),
+    );
+
+    assert_eq!(
+        Some(input),
+        result["not_found"][0]["input"].as_str(),
+        "{result}"
+    );
+    assert!(result["sources"].as_array().unwrap().is_empty(), "{result}");
+}
+
+#[test]
 fn go_module_scope_heading_selector_reports_grouping_guidance() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("decls.go", "package pkg\n\nvar someVar = 1\n")

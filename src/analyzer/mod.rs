@@ -58,8 +58,11 @@ pub(crate) use csharp::{
     csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
 };
 pub use definition_lookup_index::DefinitionLookupIndex;
-pub(crate) use go::GO_MODULE_SCOPE_SEGMENT;
 pub use go::GoAnalyzer;
+pub(crate) use go::{
+    GO_MODULE_SCOPE_SEGMENT,
+    packages::{GoModuleRoot, go_module_roots},
+};
 pub use i_analyzer::IAnalyzer;
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;

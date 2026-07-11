@@ -19,7 +19,8 @@ use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language, ProjectFile, Range,
+    CodeUnit, CodeUnitType, GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language,
+    ProjectFile, Range, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::lsp::conversion::percent_decode;
@@ -42,7 +43,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const FILE_SEARCH_LIMIT: usize = 100;
 const FILE_SKIM_LIMIT: usize = 20;
@@ -6812,6 +6813,8 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Resol
     let mut matched = BTreeSet::new();
     let mut globs = Vec::new();
     let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let go_modules = OnceLock::new();
+    let has_go = analyzer.languages().contains(&Language::Go);
     let mut ambiguous_paths = Vec::new();
 
     for pattern in patterns {
@@ -6836,7 +6839,26 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Resol
                 ambiguous_paths.push(item);
                 continue;
             }
-            ResolvedFileInput::NotFound(_) => {}
+            ResolvedFileInput::NotFound(_) => {
+                let module_resolution = has_go
+                    .then(|| {
+                        let modules =
+                            go_modules.get_or_init(|| go_module_roots(analyzer.project()));
+                        resolve_go_module_prefixed_file(analyzer, modules, &normalized)
+                    })
+                    .flatten();
+                match module_resolution {
+                    Some(ResolvedFileInput::File(file)) => {
+                        matched.insert(file);
+                        continue;
+                    }
+                    Some(ResolvedFileInput::Ambiguous(item)) => {
+                        ambiguous_paths.push(item);
+                        continue;
+                    }
+                    Some(ResolvedFileInput::NotFound(_)) | None => {}
+                }
+            }
         }
 
         let directory_matches = resolve_directory_target(analyzer, &normalized);
@@ -6862,6 +6884,44 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Resol
     ResolvedFilePatterns {
         files: matched.into_iter().collect(),
         ambiguous_paths,
+    }
+}
+
+fn resolve_go_module_prefixed_file(
+    analyzer: &dyn IAnalyzer,
+    modules: &[GoModuleRoot],
+    input: &str,
+) -> Option<ResolvedFileInput> {
+    let longest_prefix = modules
+        .iter()
+        .filter(|module| {
+            input
+                .strip_prefix(&module.import_path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        .map(|module| module.import_path.len())
+        .max()?;
+    let mut matches = modules
+        .iter()
+        .filter(|module| module.import_path.len() == longest_prefix)
+        .filter_map(|module| {
+            let suffix = input.strip_prefix(&module.import_path)?.strip_prefix('/')?;
+            let suffix = workspace_rel_path(suffix)?;
+            analyzer
+                .project()
+                .file_by_rel_path(&module.workspace_dir.join(&suffix))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+
+    match matches.as_slice() {
+        [] => None,
+        [file] => Some(ResolvedFileInput::File(file.clone())),
+        _ => Some(ResolvedFileInput::Ambiguous(AmbiguousPathInput {
+            input: input.to_string(),
+            matches: matches.iter().map(rel_path_string).collect(),
+        })),
     }
 }
 
