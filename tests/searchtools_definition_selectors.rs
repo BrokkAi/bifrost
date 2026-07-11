@@ -852,6 +852,44 @@ fn bare_js_filename_module_selector_returns_outline_and_path_symbol_guidance() {
 }
 
 #[test]
+fn dotted_js_filename_selectors_resolve_fields_and_functions_consistently() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "packages/converters/src/utils/bruno-to-postman-translator.js",
+            "export const simpleTranslations = {};\nexport const complexTransformations = {};\nexport function processAllTransformations() { return simpleTranslations; }\n",
+        )
+        .build();
+
+    for (selector, expected) in [
+        (
+            "bruno-to-postman-translator.js.simpleTranslations",
+            "simpleTranslations = {}",
+        ),
+        (
+            "bruno-to-postman-translator.js.complexTransformations",
+            "complexTransformations = {}",
+        ),
+        (
+            "bruno-to-postman-translator.js.processAllTransformations",
+            "function processAllTransformations()",
+        ),
+    ] {
+        let args = serde_json::json!({ "symbols": [selector] }).to_string();
+        let result = call_tool(&project, "get_symbol_sources", &args);
+        assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+        assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+        assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+        assert!(
+            result["sources"][0]["text"]
+                .as_str()
+                .expect("source text")
+                .contains(expected),
+            "{result}"
+        );
+    }
+}
+
+#[test]
 fn java_package_module_returns_deduped_outline_blocks_for_each_defining_file() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

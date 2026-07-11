@@ -3060,6 +3060,10 @@ fn split_path_qualified_definition_selector<'a>(
         });
     }
 
+    if let Some(selector) = dotted_file_symbol_selector(analyzer, input) {
+        return Some(selector);
+    }
+
     None
 }
 
@@ -6972,9 +6976,13 @@ fn unsupported_selector_shape_guidance(analyzer: &dyn IAnalyzer, input: &str) ->
             "`symbol@path` selectors are not supported; retry with the bare symbol `{symbol}` plus the `paths` parameter `{path}`, or use `{path}#{symbol}`"
         ));
     }
-    if let Some((path, pseudo_symbol)) = file_pseudo_symbol_selector(analyzer, trimmed) {
+    if let Some(PathQualifiedSelector::Resolved {
+        anchor: path,
+        lookup: symbol,
+    }) = dotted_file_symbol_selector(analyzer, trimmed)
+    {
         return Some(format!(
-            "`{pseudo_symbol}` is not a symbol in `{path}`; use `{path}` as a file target for an outline, or call get_summaries on `{path}`"
+            "`{symbol}` is not a symbol in `{path}`; use `{path}` as a file target for an outline, or call get_summaries on `{path}`"
         ));
     }
     if looks_like_absolute_path(trimmed) {
@@ -7094,20 +7102,21 @@ fn malformed_at_joined_selector(input: &str) -> Option<(&str, &str)> {
         .then_some((symbol, path))
 }
 
-fn file_pseudo_symbol_selector<'a>(
+fn dotted_file_symbol_selector<'a>(
     analyzer: &dyn IAnalyzer,
     input: &'a str,
-) -> Option<(String, &'a str)> {
-    let (path_candidate, pseudo_symbol) = input.rsplit_once('.')?;
-    if path_candidate.is_empty()
-        || pseudo_symbol.is_empty()
-        || likely_file_target_extension(pseudo_symbol)
-    {
+) -> Option<PathQualifiedSelector<'a>> {
+    let (path_candidate, symbol) = input.rsplit_once('.')?;
+    if path_candidate.is_empty() || symbol.is_empty() || likely_file_target_extension(symbol) {
         return None;
     }
     match WorkspaceFileResolver::new(analyzer.project()).resolve_literal(path_candidate) {
-        ResolvedFileInput::File(file) => Some((rel_path_string(&file), pseudo_symbol)),
-        ResolvedFileInput::Ambiguous(_) | ResolvedFileInput::NotFound(_) => None,
+        ResolvedFileInput::File(file) => Some(PathQualifiedSelector::Resolved {
+            anchor: rel_path_string(&file),
+            lookup: symbol,
+        }),
+        ResolvedFileInput::Ambiguous(item) => Some(PathQualifiedSelector::AmbiguousPath(item)),
+        ResolvedFileInput::NotFound(_) => None,
     }
 }
 
