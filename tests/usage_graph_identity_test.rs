@@ -22,8 +22,10 @@ fn fixture_root(name: &str) -> PathBuf {
 }
 
 fn usage_graph(fixture: &str) -> Value {
-    let service =
-        SearchToolsService::new_without_semantic_index(fixture_root(fixture)).expect("service");
+    // These checked-in fixtures are immutable; keep parallel tests isolated
+    // from the parent repository's persisted cache and file watcher.
+    let service = SearchToolsService::new_manual_without_semantic_index(fixture_root(fixture))
+        .expect("service");
     let payload = service
         .call_tool_json("usage_graph", "{}")
         .expect("usage_graph call failed");
@@ -31,8 +33,8 @@ fn usage_graph(fixture: &str) -> Value {
 }
 
 fn scan_usages_by_reference(fixture: &str, args: &str) -> Value {
-    let service =
-        SearchToolsService::new_without_semantic_index(fixture_root(fixture)).expect("service");
+    let service = SearchToolsService::new_manual_without_semantic_index(fixture_root(fixture))
+        .expect("service");
     let payload = service
         .call_tool_json("scan_usages_by_reference", args)
         .expect("scan_usages_by_reference call failed");
