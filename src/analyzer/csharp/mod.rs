@@ -324,7 +324,23 @@ impl CSharpAnalyzer {
 }
 
 pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
-    fq_name.replace('$', ".")
+    let normalized = fq_name.replace('$', ".");
+    let Some(owner) = normalized.strip_suffix(".#ctor") else {
+        return normalized;
+    };
+    if owner.is_empty() {
+        return normalized;
+    }
+
+    let constructor_name = owner
+        .rfind('.')
+        .map(|separator| &owner[separator + 1..])
+        .unwrap_or(owner);
+    if constructor_name.is_empty() {
+        normalized
+    } else {
+        format!("{owner}.{constructor_name}")
+    }
 }
 
 pub(crate) fn csharp_signature_arity(signature: Option<&str>) -> usize {

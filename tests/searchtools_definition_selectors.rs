@@ -956,6 +956,56 @@ fn cpp_constructor_declaration_symbol_round_trips_to_its_source() {
 }
 
 #[test]
+fn csharp_metadata_constructor_selectors_resolve_explicit_overloads() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Service.cs",
+            "namespace App;\nclass Service {\n  public Service() {}\n  public Service(int value) {}\n}\nclass Plain {}\n",
+        )
+        .build();
+
+    for selector in ["App.Service.#ctor", "Service.cs#App.Service.#ctor"] {
+        let args = serde_json::json!({ "symbols": [selector] }).to_string();
+        let result = call_tool(&project, "get_symbol_sources", &args);
+
+        assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+        assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+        let sources = result["sources"].as_array().unwrap();
+        assert_eq!(2, sources.len(), "{result}");
+        assert!(
+            sources
+                .iter()
+                .all(|source| source["label"] == "App.Service.Service"),
+            "{result}"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|source| source["text"] == "public Service() {}"),
+            "{result}"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|source| source["text"] == "public Service(int value) {}"),
+            "{result}"
+        );
+    }
+
+    let missing = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["App.Plain.#ctor"]}"#,
+    );
+    assert_eq!(0, missing["sources"].as_array().unwrap().len(), "{missing}");
+    assert_eq!(
+        "App.Plain.#ctor",
+        not_found_input(&missing["not_found"][0]),
+        "{missing}"
+    );
+}
+
+#[test]
 fn explicit_only_language_constructors_round_trip_without_implicit_symbols() {
     let cases = [
         (

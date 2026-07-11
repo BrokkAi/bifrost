@@ -262,6 +262,95 @@ public class ConsoleHandler {
 }
 
 #[test]
+fn java_bare_type_prefers_type_over_its_owner_named_constructor() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/example/CompressionBodyRequestFilter.java",
+            r#"package example;
+
+public class CompressionBodyRequestFilter {
+    private final int level;
+
+    public CompressionBodyRequestFilter(int level) {
+        this.level = level;
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let bare = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["CompressionBodyRequestFilter".to_string()],
+        },
+    );
+    assert!(bare.not_found.is_empty(), "{bare:#?}");
+    assert!(bare.ambiguous.is_empty(), "{bare:#?}");
+    assert_eq!(1, bare.sources.len(), "{bare:#?}");
+    assert!(
+        bare.sources[0]
+            .text
+            .contains("public class CompressionBodyRequestFilter"),
+        "{bare:#?}"
+    );
+
+    let constructor = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec![
+                "example.CompressionBodyRequestFilter.CompressionBodyRequestFilter".to_string(),
+            ],
+        },
+    );
+    assert!(constructor.not_found.is_empty(), "{constructor:#?}");
+    assert!(constructor.ambiguous.is_empty(), "{constructor:#?}");
+    assert_eq!(1, constructor.sources.len(), "{constructor:#?}");
+    assert!(
+        constructor.sources[0]
+            .text
+            .contains("public CompressionBodyRequestFilter(int level)"),
+        "{constructor:#?}"
+    );
+    assert!(
+        !constructor.sources[0].text.contains("public class"),
+        "exact constructor selector returned the owner type: {constructor:#?}"
+    );
+}
+
+#[test]
+fn java_bare_type_remains_ambiguous_between_distinct_types() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/alpha/Service.java",
+            "package alpha;\npublic class Service { public Service() {} }\n",
+        )
+        .file(
+            "src/main/java/beta/Service.java",
+            "package beta;\npublic class Service { public Service() {} }\n",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["Service".to_string()],
+        },
+    );
+
+    assert!(result.sources.is_empty(), "{result:#?}");
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.ambiguous.len(), "{result:#?}");
+    assert_eq!(
+        vec!["alpha.Service".to_string(), "beta.Service".to_string()],
+        result.ambiguous[0].matches,
+        "constructors should be suppressed without collapsing real type ambiguity: {result:#?}"
+    );
+}
+
+#[test]
 fn php_symbol_sources_accept_common_foreign_delimiters() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

@@ -3019,7 +3019,11 @@ fn scoped_usage_finder(
 /// of several same-named definitions.
 fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
     match input.split_once('#') {
-        Some((anchor, name)) if !anchor.is_empty() && !name.is_empty() => {
+        Some((anchor, name))
+            if !anchor.is_empty()
+                && !name.is_empty()
+                && looks_like_path_selector_anchor(anchor) =>
+        {
             DefinitionSelector::FileAnchored {
                 anchor: anchor.to_string(),
                 lookup: name,
@@ -3068,7 +3072,7 @@ fn looks_like_path_selector_anchor(path: &str) -> bool {
     };
     rel.file_name()
         .and_then(|name| std::path::Path::new(name).extension())
-        .is_some()
+        .is_some_and(|extension| !extension.is_empty())
 }
 
 fn unsupported_path_qualified_scan_symbol(

@@ -325,9 +325,11 @@ fn insert_match(matches: &mut BTreeMap<String, CodeUnit>, candidate: &CodeUnit) 
 
 fn resolution_from_matches(
     analyzer: &dyn IAnalyzer,
-    matches: BTreeMap<String, CodeUnit>,
+    mut matches: BTreeMap<String, CodeUnit>,
     include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnitResolution> {
+    prefer_types_over_their_owner_named_constructors(analyzer, &mut matches);
+
     match matches.len() {
         0 => None,
         1 => {
@@ -345,6 +347,42 @@ fn resolution_from_matches(
             matches.into_values().collect(),
         )),
     }
+}
+
+/// A bare type name can also suffix-match that type's owner-named constructor
+/// (`pkg.Type` and `pkg.Type.Type`). Prefer the type when both declarations are
+/// present, while leaving an explicitly repeated constructor selector and
+/// ambiguity between independently declared types untouched.
+fn prefer_types_over_their_owner_named_constructors(
+    analyzer: &dyn IAnalyzer,
+    matches: &mut BTreeMap<String, CodeUnit>,
+) {
+    let competing_types: BTreeSet<_> = matches
+        .values()
+        .filter(|unit| unit.is_class())
+        .map(CodeUnit::fq_name)
+        .collect();
+    if competing_types.is_empty() {
+        return;
+    }
+
+    matches.retain(|_, unit| {
+        if !unit.is_function()
+            || !matches!(
+                code_unit_language(unit),
+                Language::Java | Language::CSharp | Language::Cpp
+            )
+        {
+            return true;
+        }
+
+        let Some(owner) = analyzer.parent_of(unit) else {
+            return true;
+        };
+        !(owner.is_class()
+            && unit.identifier() == owner.identifier()
+            && competing_types.contains(&owner.fq_name()))
+    });
 }
 
 fn codeunit_lookup_aliases(code_unit: &CodeUnit) -> BTreeSet<Vec<String>> {
