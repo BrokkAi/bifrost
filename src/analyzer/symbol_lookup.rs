@@ -200,6 +200,36 @@ fn suffix_resolution_from_index(
     symbol: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnitResolution> {
+    let mut exact_matches = BTreeMap::new();
+    let mut exact_suffix_matches = BTreeMap::new();
+    let query_paths_by_language: BTreeMap<_, BTreeSet<_>> = analyzer
+        .languages()
+        .into_iter()
+        .map(|language| (language, query_symbol_interpretations(language, symbol)))
+        .collect();
+    for candidate in analyzer.lookup_candidates_by_short_name(symbol) {
+        let language = code_unit_language(&candidate);
+        let Some(query_paths) = query_paths_by_language.get(&language) else {
+            continue;
+        };
+        if !include(&candidate) {
+            continue;
+        }
+        collect_fuzzy_matches(
+            analyzer,
+            &candidate,
+            include,
+            query_paths,
+            &mut exact_matches,
+            &mut exact_suffix_matches,
+        );
+    }
+    if let Some(CodeUnitResolution::Resolved(matches)) =
+        unique_resolution_from_matches(analyzer, exact_matches, include)
+    {
+        return Some(CodeUnitResolution::Resolved(matches));
+    }
+
     let mut full_matches = BTreeMap::new();
     let mut suffix_matches = BTreeMap::new();
     for language in analyzer.languages() {

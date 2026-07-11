@@ -152,6 +152,12 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
+    /// Candidate declarations whose persisted short names match a qualified
+    /// lookup input. Implementations return an empty set when they cannot
+    /// answer this cheaply; callers retain their broader lookup path then.
+    fn lookup_candidates_by_short_name(&self, _symbol: &str) -> BTreeSet<CodeUnit> {
+        BTreeSet::new()
+    }
     /// Search candidates with the metadata needed by `search_symbols`. The
     /// default preserves existing analyzer behavior; persisted analyzers
     /// override it with a projection that avoids full file hydration.

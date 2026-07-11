@@ -2245,6 +2245,41 @@ where
         Some(matches)
     }
 
+    fn sql_lookup_candidates_by_short_name(&self, symbol: &str) -> Option<BTreeSet<CodeUnit>> {
+        let normalized = self.adapter.normalize_full_name(symbol);
+        let candidate_names = self.definition_candidate_short_names(&normalized);
+        if candidate_names.is_empty() {
+            return Some(BTreeSet::new());
+        }
+
+        let candidate_name_set: HashSet<_> = candidate_names.iter().cloned().collect();
+        let langs = self.storage_language_keys_for_queries();
+        let mut rows = Vec::new();
+        for short_name in &candidate_names {
+            rows.extend(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_by_short_name_for_langs(&langs, short_name)
+                    .ok()?,
+            );
+        }
+
+        let mut matches: BTreeSet<_> = self
+            .resolve_candidate_rows(rows)
+            .into_iter()
+            .filter(|unit| candidate_name_set.contains(unit.short_name()))
+            .collect();
+        matches.extend(
+            self.dirty_units_matching(false, |unit| candidate_name_set.contains(unit.short_name())),
+        );
+        matches.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                candidate_name_set.contains(unit.short_name())
+            })?,
+        );
+        Some(matches)
+    }
+
     fn sql_search_definitions(
         &self,
         pattern: &str,
@@ -3103,6 +3138,11 @@ where
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.sql_search_definitions(pattern, auto_quote)
+            .unwrap_or_default()
+    }
+
+    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
+        self.sql_lookup_candidates_by_short_name(symbol)
             .unwrap_or_default()
     }
 

@@ -4,7 +4,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -479,16 +479,6 @@ fn degrade_get_summaries_value(
     original_bytes: usize,
     render_options: RenderOptions,
 ) -> Result<(Value, String), SearchToolsServiceError> {
-    let compact_paths = summary_paths_for_compaction(&structured);
-    let list_output = if compact_paths.is_empty() {
-        None
-    } else {
-        Some(service.call_tool_output(
-            "list_symbols",
-            json!({ "file_patterns": compact_paths }),
-            render_options,
-        )?)
-    };
     let mut compact_text = compact_text;
     if let Some(paths) = compact_symbols_paths(&structured) {
         if serialized_json_len(&structured) > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
@@ -498,12 +488,48 @@ fn degrade_get_summaries_value(
                 render_options,
             )?;
             compact_text = rendered_text_for_output(&compact_output);
+            let ToolOutput::Structured {
+                structured: compact_structured,
+                ..
+            } = compact_output
+            else {
+                return Err(SearchToolsServiceError {
+                    code: SearchToolsServiceErrorCode::Internal,
+                    message: "list_symbols returned non-structured output during MCP budgeting"
+                        .to_string(),
+                });
+            };
             structured =
-                compact_only_get_summaries_value(structured, compact_output, original_bytes)?;
+                compact_only_get_summaries_value(structured, compact_structured, original_bytes);
         }
-    } else if let Some(output) = list_output {
-        compact_text = rendered_text_for_output(&output);
-        structured = compact_only_get_summaries_value(structured, output, original_bytes)?;
+    } else if let Some((compact_structured, rendered)) = compact_symbols_from_summaries(&structured)
+    {
+        compact_text = Some(rendered);
+        structured =
+            compact_only_get_summaries_value(structured, compact_structured, original_bytes);
+    } else {
+        let compact_paths = summary_paths_for_compaction(&structured);
+        if !compact_paths.is_empty() {
+            let compact_output = service.call_tool_output(
+                "list_symbols",
+                json!({ "file_patterns": compact_paths }),
+                render_options,
+            )?;
+            compact_text = rendered_text_for_output(&compact_output);
+            let ToolOutput::Structured {
+                structured: compact_structured,
+                ..
+            } = compact_output
+            else {
+                return Err(SearchToolsServiceError {
+                    code: SearchToolsServiceErrorCode::Internal,
+                    message: "list_symbols returned non-structured output during MCP budgeting"
+                        .to_string(),
+                });
+            };
+            structured =
+                compact_only_get_summaries_value(structured, compact_structured, original_bytes);
+        }
     }
 
     let text = render_budgeted_get_summaries_text(&structured, compact_text);
@@ -539,19 +565,9 @@ fn compact_symbols_paths(structured: &Value) -> Option<Vec<String>> {
 
 fn compact_only_get_summaries_value(
     mut structured: Value,
-    compact_output: ToolOutput,
+    compact_structured: Value,
     original_bytes: usize,
-) -> Result<Value, SearchToolsServiceError> {
-    let ToolOutput::Structured {
-        structured: compact_structured,
-        ..
-    } = compact_output
-    else {
-        return Err(SearchToolsServiceError {
-            code: SearchToolsServiceErrorCode::Internal,
-            message: "list_symbols returned non-structured output during MCP budgeting".to_string(),
-        });
-    };
+) -> Value {
     if let Some(object) = structured.as_object_mut() {
         object.insert("summaries".to_string(), json!([]));
         object.insert("compact_symbols".to_string(), compact_structured);
@@ -568,7 +584,190 @@ fn compact_only_get_summaries_value(
             }),
         );
     }
-    Ok(structured)
+    structured
+}
+
+/// Builds the budgeted outline from the summary payload that was already
+/// assembled for this request. Re-running `list_symbols` here would re-resolve
+/// every parent and discard the persisted summary projection's work.
+fn compact_symbols_from_summaries(structured: &Value) -> Option<(Value, String)> {
+    let summaries = structured.get("summaries")?.as_array()?;
+    if summaries.is_empty() {
+        return None;
+    }
+
+    let mut files = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let path = summary.get("path")?.as_str()?;
+        if summary.get("label")?.as_str()? != path {
+            return None;
+        }
+        let elements = summary.get("elements")?.as_array()?;
+        let file = compact_file_from_summary(path, elements)?;
+        files.push(file);
+    }
+    files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+
+    let compact = json!({
+        "truncated": false,
+        "total_files": files.len(),
+        "files": files,
+    });
+    let text = render_compact_symbols_text(&compact);
+    Some((compact, text))
+}
+
+fn compact_file_from_summary(path: &str, elements: &[Value]) -> Option<Value> {
+    if elements.is_empty() {
+        return None;
+    }
+
+    let mut parents = HashMap::new();
+    for element in elements {
+        let symbol = element.get("symbol")?.as_str()?;
+        let parent = element
+            .get("parent_symbol")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let is_module = element.get("kind")?.as_str()? == "module";
+        parents
+            .entry(symbol.to_string())
+            .or_insert((parent, is_module));
+    }
+
+    let mut ordered = elements.to_vec();
+    ordered.sort_by(|left, right| {
+        left["start_line"]
+            .as_u64()
+            .cmp(&right["start_line"].as_u64())
+            .then_with(|| left["end_line"].as_u64().cmp(&right["end_line"].as_u64()))
+            .then_with(|| left["symbol"].as_str().cmp(&right["symbol"].as_str()))
+    });
+
+    let mut loc = 0;
+    let mut lines = Vec::with_capacity(ordered.len());
+    for element in ordered {
+        let symbol = element.get("symbol")?.as_str()?;
+        let kind = element.get("kind")?.as_str()?;
+        loc = loc.max(element.get("end_line")?.as_u64()? as usize);
+        if kind == "module" {
+            lines.push(format!("# {symbol}"));
+            continue;
+        }
+
+        let parent = element.get("parent_symbol").and_then(Value::as_str);
+        let depth = compact_symbol_depth(parent, &parents);
+        lines.push(format!(
+            "{}- {}",
+            "  ".repeat(depth),
+            compact_symbol_label(symbol)
+        ));
+    }
+    (loc > 0).then(|| json!({ "path": path, "loc": loc, "lines": lines }))
+}
+
+fn compact_symbol_depth(
+    parent: Option<&str>,
+    parents: &HashMap<String, (Option<String>, bool)>,
+) -> usize {
+    let mut depth = 0;
+    let mut current = parent;
+    for _ in 0..parents.len() {
+        let Some(symbol) = current else {
+            break;
+        };
+        let Some((next_parent, is_module)) = parents.get(symbol) else {
+            break;
+        };
+        if *is_module {
+            break;
+        }
+        depth += 1;
+        current = next_parent.as_deref();
+    }
+    depth
+}
+
+fn compact_symbol_label(symbol: &str) -> &str {
+    let mut start = 0;
+    for separator in [".", "::", "->", "$", "+"] {
+        if let Some(index) = symbol.rfind(separator) {
+            start = start.max(index + separator.len());
+        }
+    }
+    symbol
+        .get(start..)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(symbol)
+}
+
+fn render_compact_symbols_text(compact: &Value) -> String {
+    compact
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| {
+            let path = file.get("path")?.as_str()?;
+            let loc = file.get("loc")?.as_u64()?;
+            let lines = file
+                .get("lines")?
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            Some(format!("{path} ({loc} lines)\n{}", lines.join("\n")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_summary_reuses_parent_aware_elements() {
+        let structured = json!({
+            "summaries": [{
+                "label": "src/Thing.java",
+                "path": "src/Thing.java",
+                "elements": [
+                    { "symbol": "demo", "kind": "module", "start_line": 1, "end_line": 1 },
+                    { "symbol": "demo.Thing", "kind": "class", "start_line": 3, "end_line": 12 },
+                    { "symbol": "demo.Thing.value", "kind": "field", "parent_symbol": "demo.Thing", "start_line": 4, "end_line": 4 },
+                    { "symbol": "demo.Thing.Inner", "kind": "class", "parent_symbol": "demo.Thing", "start_line": 6, "end_line": 11 },
+                    { "symbol": "demo.Thing.Inner.run", "kind": "function", "parent_symbol": "demo.Thing.Inner", "start_line": 7, "end_line": 9 }
+                ]
+            }]
+        });
+
+        let (compact, text) = compact_symbols_from_summaries(&structured).expect("compact summary");
+        assert_eq!(
+            compact["files"][0]["lines"],
+            json!(["# demo", "- Thing", "  - value", "  - Inner", "    - run"])
+        );
+        assert_eq!(12, compact["files"][0]["loc"]);
+        assert!(text.contains("src/Thing.java (12 lines)"), "{text}");
+    }
+
+    #[test]
+    fn compact_summary_leaves_symbol_targets_on_the_legacy_path() {
+        let structured = json!({
+            "summaries": [{
+                "label": "demo.Thing",
+                "path": "src/Thing.java",
+                "elements": [{
+                    "symbol": "demo.Thing",
+                    "kind": "class",
+                    "start_line": 3,
+                    "end_line": 12
+                }]
+            }]
+        });
+
+        assert!(compact_symbols_from_summaries(&structured).is_none());
+    }
 }
 
 fn shrink_compact_symbols_value_to_budget(mut structured: Value) -> Value {

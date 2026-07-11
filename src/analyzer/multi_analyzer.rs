@@ -655,6 +655,18 @@ impl IAnalyzer for MultiAnalyzer {
             })
     }
 
+    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| delegate.analyzer().lookup_candidates_by_short_name(symbol))
+            .reduce(BTreeSet::new, |mut acc, candidates| {
+                acc.extend(candidates);
+                acc
+            })
+    }
+
     fn search_symbol_candidates(
         &self,
         pattern: &str,
