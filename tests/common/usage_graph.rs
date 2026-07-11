@@ -4,11 +4,14 @@ use brokk_bifrost::SearchToolsService;
 use serde_json::Value;
 use std::path::Path;
 
-/// Invoke the `usage_graph` tool without starting semantic indexing.
+/// Invoke `usage_graph` on a transient service without semantic indexing.
+///
+/// Checked-in fixture suites must not share the parent repository cache or watcher.
 #[allow(dead_code)]
 pub fn usage_graph_at(root: impl AsRef<Path>, args: &str) -> Value {
-    let service = SearchToolsService::new_without_semantic_index(root.as_ref().to_path_buf())
-        .expect("service");
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(root.as_ref().to_path_buf())
+            .expect("service");
     let payload = service
         .call_tool_json("usage_graph", args)
         .expect("usage_graph call failed");
