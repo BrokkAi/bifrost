@@ -46,6 +46,7 @@ pub(crate) enum WalkControl {
 #[derive(Clone)]
 pub(crate) struct AnalyzerStoreContext {
     pub(crate) store: Arc<AnalyzerStore>,
+    pub(crate) gc: Arc<crate::analyzer::store::gc::AnalyzerGcCoordinator>,
     pub(crate) liveness: Option<Arc<Liveness>>,
     pub(crate) live_paths: Arc<LivePathMap>,
 }
@@ -76,6 +77,7 @@ fn store_context(project: &dyn Project, persisted: bool) -> AnalyzerStoreContext
         .map(Arc::new);
     AnalyzerStoreContext {
         store: Arc::new(store),
+        gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
         liveness,
         live_paths: Arc::new(LivePathMap::default()),
     }
@@ -1194,10 +1196,9 @@ where
                 None,
             ));
         }
-        crate::analyzer::store::gc::maybe_gc_in_background(
-            project.root(),
-            Arc::clone(&store_context.store),
-        );
+        store_context
+            .gc
+            .schedule(project.root(), Arc::clone(&store_context.store));
         state
     }
 
@@ -2801,10 +2802,9 @@ where
                 dirty_file_states,
             },
         );
-        crate::analyzer::store::gc::maybe_gc_in_background(
-            self.project.root(),
-            Arc::clone(&store_context.store),
-        );
+        store_context
+            .gc
+            .schedule(self.project.root(), Arc::clone(&store_context.store));
         Self::from_state(
             Arc::clone(&self.project),
             Arc::clone(&self.adapter),
@@ -3381,6 +3381,7 @@ mod tests {
         let store = Arc::new(AnalyzerStore::open_in_memory().unwrap());
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
+            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             live_paths,
         };
@@ -3444,6 +3445,7 @@ mod tests {
         let store = Arc::new(AnalyzerStore::open_in_memory().unwrap());
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
+            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             live_paths,
         };
