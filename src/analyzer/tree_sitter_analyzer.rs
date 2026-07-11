@@ -336,6 +336,11 @@ pub struct FileState {
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
 }
 
+pub(crate) struct ImportFileFacts {
+    pub(crate) package_name: String,
+    pub(crate) imports: Vec<ImportInfo>,
+}
+
 #[derive(Debug, Clone)]
 struct DirtyFileState {
     state: FileState,
@@ -1669,6 +1674,16 @@ where
         &self,
         files: impl IntoIterator<Item = ProjectFile>,
     ) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+        self.bulk_import_facts(files)
+            .into_iter()
+            .map(|(file, facts)| (file, facts.imports))
+            .collect()
+    }
+
+    pub(crate) fn bulk_import_facts(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+    ) -> HashMap<ProjectFile, ImportFileFacts> {
         let mut entries = Vec::new();
         let mut seen = HashSet::default();
         for file in files {
@@ -1692,7 +1707,13 @@ where
         for (file, oid, storage_key) in entries {
             let key = Self::transient_cache_key(oid, &file);
             if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
-                out.insert(file, state.imports);
+                out.insert(
+                    file,
+                    ImportFileFacts {
+                        package_name: state.package_name,
+                        imports: state.imports,
+                    },
+                );
             } else {
                 clean_entries.push((file, oid, storage_key));
             }
@@ -1701,24 +1722,41 @@ where
         if entries.is_empty() {
             return out;
         }
-        let mut imports = self
+        let mut facts: HashMap<ProjectFile, ImportFileFacts> = self
             .store_context
             .store
-            .hydrate_import_infos_by_key(&entries, self.adapter.as_ref())
-            .unwrap_or_default();
+            .hydrate_import_facts_by_key(&entries, self.adapter.as_ref())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(file, facts)| {
+                (
+                    file,
+                    ImportFileFacts {
+                        package_name: facts.package_name,
+                        imports: facts.imports,
+                    },
+                )
+            })
+            .collect();
         self.bulk_hydration_count
-            .fetch_add(imports.len(), Ordering::Relaxed);
+            .fetch_add(facts.len(), Ordering::Relaxed);
         for (file, oid, _) in entries {
-            if imports.contains_key(&file) {
+            if facts.contains_key(&file) {
                 continue;
             }
             if let Some(source) = self.source_for_oid(&file, oid)
                 && let Some(state) = self.parse_and_store_transient(&file, oid, source)
             {
-                imports.insert(file, state.imports);
+                facts.insert(
+                    file,
+                    ImportFileFacts {
+                        package_name: state.package_name,
+                        imports: state.imports,
+                    },
+                );
             }
         }
-        out.extend(imports);
+        out.extend(facts);
         out
     }
 

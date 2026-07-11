@@ -130,6 +130,7 @@ fn find_direct_importers_with_cancellation(
 ) -> HashSet<ProjectFile> {
     let mut files: Vec<_> = files.into_iter().collect();
     files.sort();
+    let import_infos = import_provider.import_infos_for_files(&files);
     let mut importers = HashSet::default();
     for candidate in files {
         if cancellation.is_cancelled() {
@@ -138,7 +139,11 @@ fn find_direct_importers_with_cancellation(
         if source_files.contains(&candidate) {
             continue;
         }
-        let imports = import_provider.import_info_of(&candidate);
+        let imports = import_infos
+            .as_ref()
+            .and_then(|infos| infos.get(&candidate))
+            .cloned()
+            .unwrap_or_else(|| import_provider.import_info_of(&candidate));
         let could_import_target = source_files
             .iter()
             .any(|target| import_provider.could_import_file(&candidate, &imports, target));
@@ -149,7 +154,9 @@ fn find_direct_importers_with_cancellation(
             importers.insert(candidate);
             continue;
         }
-        let imported = import_provider.imported_code_units_of(&candidate);
+        let imported = import_provider
+            .imported_code_units_from_infos(&candidate, &imports)
+            .unwrap_or_else(|| import_provider.imported_code_units_of(&candidate));
         if cancellation.is_cancelled() {
             break;
         }
@@ -428,6 +435,47 @@ mod tests {
         imported: CodeUnit,
     }
 
+    struct BatchedImportProvider {
+        calls: Arc<AtomicUsize>,
+        imported: CodeUnit,
+    }
+
+    impl ImportAnalysisProvider for BatchedImportProvider {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+            panic!("batched importer discovery must not hydrate individual import states");
+        }
+
+        fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
+            panic!("cancellable discovery must not build the global reverse index");
+        }
+
+        fn import_infos_for_files(
+            &self,
+            files: &[ProjectFile],
+        ) -> Option<crate::hash::HashMap<ProjectFile, Vec<ImportInfo>>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Some(
+                files
+                    .iter()
+                    .cloned()
+                    .map(|file| (file, Vec::new()))
+                    .collect(),
+            )
+        }
+
+        fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
+            panic!("batched import facts must be used when available");
+        }
+
+        fn imported_code_units_from_infos(
+            &self,
+            _file: &ProjectFile,
+            _imports: &[ImportInfo],
+        ) -> Option<HashSet<CodeUnit>> {
+            Some([self.imported.clone()].into_iter().collect())
+        }
+    }
+
     impl ImportAnalysisProvider for CancellingImportProvider {
         fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -466,5 +514,27 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert!(importers.is_empty());
+    }
+
+    #[test]
+    fn cancellable_importer_scan_uses_batched_import_facts_when_available() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let importer = ProjectFile::new(root, "Importer.java");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = BatchedImportProvider {
+            calls: Arc::clone(&calls),
+            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
+        };
+
+        let importers = find_direct_importers_with_cancellation(
+            [importer.clone()],
+            &provider,
+            &[target_file].into_iter().collect(),
+            &CancellationToken::default(),
+        );
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(importers, [importer].into_iter().collect());
     }
 }

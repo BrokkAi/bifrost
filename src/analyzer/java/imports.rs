@@ -14,6 +14,20 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         self.resolve_imports(file).values().cloned().collect()
     }
 
+    fn import_infos_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        let mut imports_by_file = HashMap::default();
+        for (file, facts) in self.inner.bulk_import_facts(files.iter().cloned()) {
+            self.memo_caches
+                .package_names
+                .insert(file.clone(), Arc::from(facts.package_name));
+            imports_by_file.insert(file, facts.imports);
+        }
+        Some(imports_by_file)
+    }
+
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.memo_caches.referencing_files.get(file) {
             return (*cached).clone();
@@ -40,6 +54,14 @@ impl ImportAnalysisProvider for JavaAnalyzer {
 
     fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
+    }
+
+    fn imported_code_units_from_infos(
+        &self,
+        _file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<CodeUnit>> {
+        Some(self.resolve_import_infos(imports).into_values().collect())
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {

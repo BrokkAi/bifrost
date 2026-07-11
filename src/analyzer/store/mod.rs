@@ -120,6 +120,12 @@ pub struct AnalyzerStore {
     db_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportFacts {
+    pub(crate) package_name: String,
+    pub(crate) imports: Vec<ImportInfo>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidateFlags {
     pub is_type_alias: bool,
@@ -438,8 +444,20 @@ impl AnalyzerStore {
     pub fn hydrate_import_infos_by_key<A: LanguageAdapter>(
         &self,
         entries: &[(ProjectFile, Oid, String)],
-        _adapter: &A,
+        adapter: &A,
     ) -> Result<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        Ok(self
+            .hydrate_import_facts_by_key(entries, adapter)?
+            .into_iter()
+            .map(|(file, facts)| (file, facts.imports))
+            .collect())
+    }
+
+    pub(crate) fn hydrate_import_facts_by_key<A: LanguageAdapter>(
+        &self,
+        entries: &[(ProjectFile, Oid, String)],
+        adapter: &A,
+    ) -> Result<HashMap<ProjectFile, ImportFacts>> {
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let mut out = HashMap::default();
         let mut by_lang: HashMap<String, Vec<(ProjectFile, Oid)>> = HashMap::default();
@@ -451,11 +469,20 @@ impl AnalyzerStore {
         }
         for (lang, lang_entries) in by_lang {
             let oids = unique_oid_strings(&lang_entries);
+            let packages_by_oid = read_content_packages_bulk(&conn, &lang, &oids)?;
             let imports_by_oid = read_import_infos_bulk(&conn, &lang, &oids)?;
             for (file, oid) in lang_entries {
-                if let Some(imports) = imports_by_oid.get(&oid.to_string()) {
-                    out.insert(file, imports.clone());
-                }
+                let oid = oid.to_string();
+                let Some(package_name) = packages_by_oid.get(&oid) else {
+                    continue;
+                };
+                out.insert(
+                    file.clone(),
+                    ImportFacts {
+                        package_name: adapter.hydrate_content_qualifier(package_name, &file),
+                        imports: imports_by_oid.get(&oid).cloned().unwrap_or_default(),
+                    },
+                );
             }
         }
         Ok(out)
@@ -1955,6 +1982,37 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
     Ok(out)
 }
 
+fn read_content_packages_bulk(
+    conn: &Connection,
+    lang: &str,
+    oids: &[String],
+) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::default();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk_placeholders(chunk);
+        let sql = format!(
+            "SELECT meta.blob_oid, meta.content_package
+             FROM blob_meta AS meta
+             WHERE meta.lang = ? AND meta.blob_oid IN ({placeholders})
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY meta.blob_oid"
+        );
+        let params = chunk_params(lang, chunk);
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (oid, package_name) = row?;
+            out.insert(oid, package_name);
+        }
+    }
+    Ok(out)
+}
+
 fn read_unit_rows_bulk(
     conn: &Connection,
     lang: &str,
@@ -2977,6 +3035,32 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn bulk_import_facts_include_complete_files_without_import_details() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let file = write_file(
+            root,
+            "src/demo/NoImports.java",
+            "package demo; class NoImports {}\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let adapter = JavaAdapter;
+        let state = parse_state(&adapter, &file);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "java", &adapter, &state)
+            .unwrap();
+
+        let facts = store
+            .hydrate_import_facts_by_key(&[(file.clone(), oid, "java".to_string())], &adapter)
+            .unwrap();
+        let facts = facts.get(&file).expect("complete persisted import facts");
+        assert_eq!(facts.package_name, "demo");
+        assert!(facts.imports.is_empty());
     }
 
     #[test]

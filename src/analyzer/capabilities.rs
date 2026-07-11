@@ -21,8 +21,28 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit>;
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile>;
 
+    /// Return import facts for a group of files without requiring each caller
+    /// to hydrate a complete per-file analyzer state. `None` preserves the
+    /// existing file-at-a-time behavior for providers without a bulk read model.
+    fn import_infos_for_files(
+        &self,
+        _files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        None
+    }
+
     fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
         Vec::new()
+    }
+
+    /// Resolve imported source units from already-loaded import facts. Providers
+    /// that cannot do this cheaply return `None` and use `imported_code_units_of`.
+    fn imported_code_units_from_infos(
+        &self,
+        _file: &ProjectFile,
+        _imports: &[ImportInfo],
+    ) -> Option<HashSet<CodeUnit>> {
+        None
     }
 
     fn relevant_imports_for(&self, _code_unit: &CodeUnit) -> HashSet<String> {
