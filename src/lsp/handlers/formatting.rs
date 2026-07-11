@@ -10,13 +10,13 @@ use glob::Pattern;
 use lsp_types::{DocumentFormattingParams, TextEdit};
 use serde::Deserialize;
 
-#[cfg(windows)]
-use crate::analyzer::NormalizePath;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, Project, ProjectFile, Range as ByteRange};
 use crate::cancellation::CancellationToken;
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::read_document_for_uri;
+#[cfg(windows)]
+use crate::path_normalization::NormalizePath;
 
 const MAX_ERROR_OUTPUT_CHARS: usize = 1_000;
 const MAX_FORMATTER_STDERR_BYTES: usize = 64 * 1024;
