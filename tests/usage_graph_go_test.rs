@@ -15,7 +15,6 @@
 
 mod common;
 
-use brokk_bifrost::SearchToolsService;
 use common::InlineTestProject;
 use common::usage_graph::{has_edge, usage_graph_at};
 use serde_json::Value;
@@ -30,11 +29,7 @@ fn go_usage_graph_with(args: &str) -> Value {
         .join("tests")
         .join("fixtures")
         .join("usage-graph-go");
-    let service = SearchToolsService::new(root).expect("failed to build searchtools service");
-    let payload = service
-        .call_tool_json("usage_graph", args)
-        .expect("usage_graph call failed");
-    serde_json::from_str(&payload).expect("usage_graph returned invalid JSON")
+    usage_graph_at(root, args)
 }
 
 fn edge_sites<'a>(value: &'a Value, from: &str, to: &str) -> Option<&'a Vec<Value>> {
