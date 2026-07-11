@@ -147,7 +147,9 @@ fn persisted_build_triggers_analyzer_store_gc() {
     assert!(store.contains_blob(bogus_oid, "python").unwrap());
 
     let _guard = brokk_bifrost::analyzer::store::gc::set_min_interval_secs_for_test(0);
-    let _ = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+    // Keep the workspace alive while its best-effort GC runs. Closing a
+    // workspace now cancels and joins its GC work before returning.
+    let _workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && store.contains_blob(bogus_oid, "python").unwrap() {
