@@ -13,7 +13,7 @@ Users should be able to ask for a class by its ordinary name without being force
 - [x] (2026-07-11 12:56Z) Added behavior-focused inline-project regressions for Java type/constructor precedence, real same-name type ambiguity, C# `#ctor` overload lookup, anchored lookup, and absent implicit constructors.
 - [x] (2026-07-11 12:56Z) Implemented structured shared fuzzy precedence for Java/C#/C++ and C# terminal `.#ctor` normalization without changing constructor indexing.
 - [x] (2026-07-11 12:56Z) Ran both focused test binaries, `cargo fmt --check`, `cargo clippy-no-cuda`, `git diff --check`, and the complete default `cargo test` suite successfully.
-- [ ] Review the final diff for cross-language selector regressions, commit and push only files changed for these issues, then close GitHub issues #627 and #630.
+- [x] (2026-07-11 12:57Z) Reviewed the final diff, committed only the six planned files as `fc57223d`, pushed `master`, and closed GitHub issues #627 and #630 as completed.
 
 ## Surprises & Discoveries
 
@@ -52,7 +52,7 @@ Users should be able to ask for a class by its ordinary name without being force
 
 ## Outcomes & Retrospective
 
-The implementation now resolves bare Java type names to the type when the only competing declaration is that type's explicit constructor, while preserving the repeated-name constructor selector and ambiguity between distinct same-named types. C# terminal `.#ctor` selectors now resolve explicit constructor overloads through the existing normalized identity, including within real file anchors, and classes without explicit constructors still return not found. No declaration extraction, synthetic-constructor policy, or source-text fallback changed. All focused checks, non-CUDA clippy, and the complete default test suite pass. Publication and issue closure remain.
+The implementation now resolves bare Java type names to the type when the only competing declaration is that type's explicit constructor, while preserving the repeated-name constructor selector and ambiguity between distinct same-named types. C# terminal `.#ctor` selectors now resolve explicit constructor overloads through the existing normalized identity, including within real file anchors, and classes without explicit constructors still return not found. No declaration extraction, synthetic-constructor policy, or source-text fallback changed. All focused checks, non-CUDA clippy, and the complete default test suite pass. Commit `fc57223d` is on `origin/master`, and GitHub issues #627 and #630 are closed as completed.
 
 ## Context and Orientation
 
@@ -130,3 +130,5 @@ No external dependencies or new public API are required. Reuse `IAnalyzer::paren
 Plan revision note (2026-07-11): Created after validating both issues and reviewing the constructor source-round-trip policy. It records the shared design and the distinct fixes needed for candidate precedence and C# alias routing.
 
 Plan revision note (2026-07-11 12:56Z): Updated after implementation and full validation. It records the deliberate exclusion of Scala, the exact regression coverage, and the remaining publish-and-close work requested by the user.
+
+Plan revision note (2026-07-11 12:57Z): Finalized after pushing commit `fc57223d` to `origin/master` and closing both issues through the connected GitHub app.
