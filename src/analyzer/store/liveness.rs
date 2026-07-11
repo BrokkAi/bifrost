@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use git2::{Oid, Repository};
+use sha2::{Digest, Sha256};
 
 use crate::analyzer::ProjectFile;
 use crate::gitblob;
@@ -43,7 +44,7 @@ impl Liveness {
         gitblob::working_tree_oid_for_path(&repo, &rel_path)
     }
 
-    /// Full live view; rebuilt only when `.git/index` stat changes.
+    /// Full live view; rebuilt when the Git index bytes or overlay generation change.
     pub fn snapshot(&self) -> Result<Arc<LiveSnapshot>> {
         let repo = self.repo.lock().expect("liveness repo mutex poisoned");
         let fingerprint = current_index_fingerprint(&repo)?;
@@ -151,8 +152,7 @@ struct OverlayState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IndexFingerprint {
-    modified: Option<SystemTime>,
-    size: u64,
+    digest: [u8; 32],
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -442,11 +442,9 @@ fn current_index_fingerprint(repo: &Repository) -> Result<IndexFingerprint> {
     let path = index
         .path()
         .ok_or_else(|| "repository index has no on-disk path".to_string())?;
-    let metadata =
-        std::fs::metadata(path).map_err(|e| format!("stat index {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read index {}: {e}", path.display()))?;
     Ok(IndexFingerprint {
-        modified: metadata.modified().ok(),
-        size: metadata.len(),
+        digest: Sha256::digest(bytes).into(),
     })
 }
 
@@ -516,8 +514,6 @@ mod tests {
     use super::*;
     use crate::gitblob::tests::{commit_all, init_repo};
     use git2::{IndexAddOption, ObjectType};
-    use std::thread;
-    use std::time::Duration;
 
     fn project_file(root: &Path, rel: &str) -> ProjectFile {
         ProjectFile::new(root.canonicalize().unwrap(), PathBuf::from(rel))
@@ -617,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn index_rewrite_invalidates_memoized_snapshot() {
+    fn same_size_index_rewrite_invalidates_memoized_snapshot() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
         std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
@@ -628,7 +624,6 @@ mod tests {
         let first = liveness.snapshot().unwrap();
         let old_oid = first.oid_for_path(&file).unwrap();
 
-        thread::sleep(Duration::from_millis(25));
         std::fs::write(temp.path().join("a.rs"), "fn new() {}\n").unwrap();
         {
             let mut index = liveness.repo.lock().unwrap().index().unwrap();
@@ -660,7 +655,6 @@ mod tests {
         let snapshot = liveness.snapshot().unwrap();
         assert!(snapshot.validate([&file].into_iter()).is_empty());
 
-        thread::sleep(Duration::from_millis(25));
         std::fs::write(temp.path().join("a.rs"), "fn new_name() {}\n").unwrap();
         assert_eq!(snapshot.validate([&file].into_iter()), vec![file]);
     }

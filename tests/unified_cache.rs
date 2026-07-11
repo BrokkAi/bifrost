@@ -157,9 +157,10 @@ fn first_unified_open_deletes_legacy_cache_files() {
         cache_db::LEGACY_SEMANTIC_DB_FILE_NAME,
         cache_db::LEGACY_ANALYZER_DB_FILE_NAME,
     ] {
-        for suffix in ["", "-wal", "-shm"] {
-            std::fs::write(brokk.join(format!("{name}{suffix}")), b"legacy").unwrap();
-        }
+        let connection = rusqlite::Connection::open(brokk.join(name)).unwrap();
+        connection
+            .execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
+            .unwrap();
     }
 
     let db_path = brokk.join(cache_db::CACHE_DB_FILE_NAME);

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -11,7 +11,11 @@ pub const CACHE_DB_FILE_NAME: &str = "bifrost_cache.db";
 pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
-pub const LATEST_SCHEMA_VERSION: i64 = 6;
+// Keep this at the version understood by the pre-analyzer unified-cache release.
+// That release rejects a nonzero analyzer namespace without mutating the DB, so
+// it can safely coexist with this cache during an app downgrade.
+pub const LATEST_SCHEMA_VERSION: i64 = 1;
+const PRE_RELEASE_UNIFIED_SCHEMA_VERSION: i64 = 6;
 const LATEST_SEMANTIC_SCHEMA_VERSION: i64 = 1;
 const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 7;
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -20,7 +24,6 @@ pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     let db_path = prepare_cache_db_path(db_path)?;
     ensure_safe_cache_path(&db_path)?;
-    delete_legacy_cache_files_on_first_open(&db_path)?;
     let mut conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -28,9 +31,27 @@ pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    let initialized_before_open = unified_cache_initialized(&conn);
     configure_connection(&mut conn)?;
     migrate(&mut conn)?;
+    if !initialized_before_open {
+        delete_legacy_cache_files(&db_path);
+    }
     Ok(conn)
+}
+
+fn unified_cache_initialized(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sqlite_master
+           WHERE type = 'table' AND name = 'cache_state'
+         ) AND EXISTS(
+           SELECT 1 FROM cache_state WHERE id = 1
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
 }
 
 fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
@@ -97,26 +118,51 @@ fn reject_symlink(path: &Path, label: &str) -> Result<()> {
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     assert_sqlite_version(conn)?;
-    let current = schema_version(conn)?;
-    if current == 0 {
-        let tx = conn
-            .transaction()
-            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-        create_schema(&tx)?;
-        initialize_cache_state(&tx)?;
-        tx.commit()
-            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    if !table_exists(conn, "cache_state")? {
+        if user_table_names(conn)?.is_empty() {
+            let tx = conn
+                .transaction()
+                .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+            create_schema(&tx)?;
+            initialize_cache_state(&tx)?;
+            tx.commit()
+                .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+        } else {
+            recreate_schema(conn)?;
+        }
         return Ok(());
     }
-    if current != LATEST_SCHEMA_VERSION {
+    let current = schema_version(conn)?;
+    if current == 0 {
+        recreate_schema(conn)?;
+        return Ok(());
+    }
+    if current == PRE_RELEASE_UNIFIED_SCHEMA_VERSION {
+        conn.execute(
+            "UPDATE cache_state SET schema_version = ?1 WHERE id = 1",
+            [LATEST_SCHEMA_VERSION],
+        )
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    } else if current > LATEST_SCHEMA_VERSION {
+        return Err(format!(
+            "cache DB schema version {current} is newer than this build supports"
+        ));
+    } else if current < LATEST_SCHEMA_VERSION {
         recreate_schema(conn)?;
         return Ok(());
     }
     let (semantic_version, analyzer_version) = namespace_schema_versions(conn)?;
-    if semantic_version != LATEST_SEMANTIC_SCHEMA_VERSION {
+    if semantic_version > LATEST_SEMANTIC_SCHEMA_VERSION
+        || analyzer_version > LATEST_ANALYZER_SCHEMA_VERSION
+    {
+        return Err(format!(
+            "cache namespace schema is newer than this build supports (semantic={semantic_version}, analyzer={analyzer_version})"
+        ));
+    }
+    if semantic_version < LATEST_SEMANTIC_SCHEMA_VERSION {
         recreate_semantic_schema(conn)?;
     }
-    if analyzer_version != LATEST_ANALYZER_SCHEMA_VERSION {
+    if analyzer_version < LATEST_ANALYZER_SCHEMA_VERSION {
         recreate_analyzer_schema(conn)?;
     }
     Ok(())
@@ -129,42 +175,104 @@ pub fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-fn delete_legacy_cache_files_on_first_open(db_path: &Path) -> Result<()> {
-    if db_path.exists() {
-        return Ok(());
+fn delete_legacy_cache_files(db_path: &Path) {
+    if db_path.file_name() != Some(std::ffi::OsStr::new(CACHE_DB_FILE_NAME)) {
+        return;
     }
     let Some(parent) = db_path.parent() else {
-        return Ok(());
+        return;
     };
     for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
-        for suffix in ["", "-wal", "-shm"] {
-            let path = parent.join(format!("{name}{suffix}"));
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(format!("removing legacy cache {}: {err}", path.display())),
-            }
-        }
+        delete_legacy_cache_if_idle(&parent.join(name));
     }
-    Ok(())
+}
+
+fn delete_legacy_cache_if_idle(legacy_path: &Path) {
+    if !legacy_path.exists() {
+        return;
+    }
+    let Ok(mut legacy) = Connection::open_with_flags(
+        legacy_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    ) else {
+        return;
+    };
+    if legacy.busy_timeout(Duration::ZERO).is_err()
+        || legacy
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .is_err()
+    {
+        return;
+    }
+    let checkpoint_busy = legacy
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(1);
+    if checkpoint_busy != 0 {
+        return;
+    }
+    let Ok(exclusive) = legacy.transaction_with_behavior(TransactionBehavior::Exclusive) else {
+        return;
+    };
+    // Close first: Windows cannot unlink a database while the claiming handle is open.
+    drop(exclusive);
+    drop(legacy);
+    let Some(file_name) = legacy_path.file_name() else {
+        return;
+    };
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = file_name.to_os_string();
+        name.push(suffix);
+        let _ = std::fs::remove_file(legacy_path.with_file_name(name));
+    }
 }
 
 fn recreate_schema(conn: &mut Connection) -> Result<()> {
-    let tx = conn
-        .transaction()
+    conn.pragma_update(None, "foreign_keys", "OFF")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    drop_semantic_schema(&tx)?;
-    drop_analyzer_schema(&tx)?;
-    tx.execute_batch(
-        "DROP TABLE IF EXISTS cache_state;
-         DROP TABLE IF EXISTS meta;",
+    let result = (|| {
+        let table_names = user_table_names(conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+        for table_name in table_names {
+            let quoted = format!("\"{}\"", table_name.replace('"', "\"\""));
+            tx.execute_batch(&format!("DROP TABLE {quoted};"))
+                .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+        }
+        create_schema(&tx)?;
+        initialize_cache_state(&tx)?;
+        tx.commit()
+            .map_err(|err| format!("cache DB SQLite error: {err}"))
+    })();
+    let restore = conn
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|err| format!("cache DB SQLite error: {err}"));
+    result.and(restore)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
     )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    create_schema(&tx)?;
-    initialize_cache_state(&tx)?;
-    tx.commit()
+    .map_err(|err| format!("cache DB SQLite error: {err}"))
+}
+
+fn user_table_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    Ok(())
+    statement
+        .query_map([], |row| row.get(0))
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?
+        .collect::<std::result::Result<Vec<String>, _>>()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
 fn recreate_semantic_schema(conn: &mut Connection) -> Result<()> {
@@ -599,6 +707,68 @@ fn parse_sqlite_version(version: &str) -> Option<(u32, u32, u32)> {
 mod tests {
     use super::*;
 
+    fn create_legacy_cache(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
+            .unwrap();
+    }
+
+    #[test]
+    fn first_unified_open_removes_only_idle_legacy_caches_after_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join(".brokk");
+        std::fs::create_dir(&cache_dir).unwrap();
+        for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
+            create_legacy_cache(&cache_dir.join(name));
+        }
+
+        let unified = cache_dir.join(CACHE_DB_FILE_NAME);
+        let connection = open_unified_connection(&unified).unwrap();
+
+        assert!(unified_cache_initialized(&connection));
+        for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
+            assert!(!cache_dir.join(name).exists());
+        }
+    }
+
+    #[test]
+    fn custom_database_open_does_not_remove_legacy_caches() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join(".brokk");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
+        create_legacy_cache(&legacy);
+
+        let _custom = open_unified_connection(&cache_dir.join("custom.db")).unwrap();
+
+        assert!(legacy.exists());
+    }
+
+    #[test]
+    fn active_legacy_writer_survives_first_unified_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join(".brokk");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let legacy_path = cache_dir.join(LEGACY_ANALYZER_DB_FILE_NAME);
+        let mut legacy = Connection::open(&legacy_path).unwrap();
+        legacy.pragma_update(None, "journal_mode", "WAL").unwrap();
+        legacy
+            .execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
+            .unwrap();
+        let writer = legacy
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        writer
+            .execute("INSERT INTO legacy_cache(value) VALUES('active')", [])
+            .unwrap();
+
+        let _unified = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap();
+
+        assert!(legacy_path.exists());
+        writer.rollback().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_symlinked_cache_directory() {
@@ -668,5 +838,61 @@ mod tests {
             .unwrap();
         assert_eq!(semantic_count, 1);
         assert_eq!(analyzer_count, 0);
+    }
+
+    #[test]
+    fn newer_namespace_is_refused_without_mutating_cache() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            ["2222222222222222222222222222222222222222"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cache_state SET analyzer_schema_version = ?1 WHERE id = 1",
+            [LATEST_ANALYZER_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+
+        let err = migrate(&mut conn).unwrap_err();
+        assert!(err.contains("newer than this build supports"), "{err}");
+        let analyzer_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(analyzer_count, 1);
+    }
+
+    #[test]
+    fn pre_release_global_schema_is_adopted_without_dropping_namespaces() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            ["2222222222222222222222222222222222222222"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cache_state SET schema_version = ?1 WHERE id = 1",
+            [PRE_RELEASE_UNIFIED_SCHEMA_VERSION],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let schema_version: i64 = conn
+            .query_row(
+                "SELECT schema_version FROM cache_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let analyzer_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, LATEST_SCHEMA_VERSION);
+        assert_eq!(analyzer_count, 1);
     }
 }

@@ -34,6 +34,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -157,12 +158,36 @@ struct WorkspaceSession {
     semantic: Option<Arc<SemanticIndexer>>,
 }
 
-/// Ensures request-scoped analyzer memoization is released on success and error paths.
-struct WorkspaceQueryScope<'a>(&'a WorkspaceAnalyzer);
+/// Owns one workspace snapshot and its request-scoped analyzer memoization.
+///
+/// Returning this from `snapshot_for_query` makes the cleanup obligation part
+/// of the type, including for direct callers such as the code-query REPL.
+struct WorkspaceQueryScope {
+    snapshot: Arc<WorkspaceAnalyzer>,
+}
 
-impl Drop for WorkspaceQueryScope<'_> {
+impl WorkspaceQueryScope {
+    fn new(snapshot: Arc<WorkspaceAnalyzer>) -> Self {
+        snapshot.begin_query();
+        Self { snapshot }
+    }
+
+    fn arc(&self) -> &Arc<WorkspaceAnalyzer> {
+        &self.snapshot
+    }
+}
+
+impl Deref for WorkspaceQueryScope {
+    type Target = WorkspaceAnalyzer;
+
+    fn deref(&self) -> &Self::Target {
+        self.snapshot.as_ref()
+    }
+}
+
+impl Drop for WorkspaceQueryScope {
     fn drop(&mut self) {
-        self.0.end_query();
+        self.snapshot.end_query();
     }
 }
 
@@ -387,7 +412,6 @@ impl SearchToolsService {
                 .handle_get_symbol_sources(strip_legacy_kind_filter(arguments), render_options);
         }
         let snapshot = self.snapshot_for_query()?;
-        let _query_scope = WorkspaceQueryScope(snapshot.as_ref());
         match name {
             "search_symbols" => Self::decode_render_and_run(
                 &snapshot,
@@ -1072,15 +1096,14 @@ impl SearchToolsService {
         active_workspace_result(session.snapshot.analyzer().project().root())
     }
 
-    fn snapshot_for_query(&self) -> Result<Arc<WorkspaceAnalyzer>, SearchToolsServiceError> {
+    fn snapshot_for_query(&self) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
         match self.update_strategy {
             UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
             UpdateStrategy::Manual => {}
         }
-        session.snapshot.begin_query();
-        Ok(Arc::clone(&session.snapshot))
+        Ok(WorkspaceQueryScope::new(Arc::clone(&session.snapshot)))
     }
 
     fn handle_get_symbol_sources(
@@ -1092,7 +1115,6 @@ impl SearchToolsService {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
         let initial_snapshot = self.snapshot_for_query()?;
-        let _query_scope = WorkspaceQueryScope(initial_snapshot.as_ref());
         let mut result = get_symbol_sources(initial_snapshot.analyzer(), params.clone());
         if self.update_strategy == UpdateStrategy::WatchFiles {
             let observed_sources =
@@ -1125,7 +1147,7 @@ impl SearchToolsService {
                 Arc::clone(&session.snapshot)
             };
 
-            if !Arc::ptr_eq(&initial_snapshot, &final_snapshot) {
+            if !Arc::ptr_eq(initial_snapshot.arc(), &final_snapshot) {
                 result = get_symbol_sources(final_snapshot.analyzer(), params);
             }
         }
