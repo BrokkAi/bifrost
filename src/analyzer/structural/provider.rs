@@ -11,9 +11,7 @@ use super::extract::extract_file_facts;
 use super::facts::FileFacts;
 use super::kinds::{NormalizedKind, Role};
 use super::spec::StructuralSpec;
-use crate::analyzer::tree_sitter_analyzer::{
-    LanguageAdapter, StorageLanguageAdapter, TreeSitterAnalyzer,
-};
+use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use crate::analyzer::{Language, ProjectFile};
 use moka::sync::Cache;
 use std::hash::Hasher;
@@ -27,9 +25,9 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// order for determinism.
     fn structural_files(&self) -> Vec<ProjectFile>;
 
-    /// The retained in-memory source of an analyzed file. The planner reads
-    /// this for anchor prefiltering without forcing a parse.
-    fn structural_source(&self, file: &ProjectFile) -> Option<&str>;
+    /// Source for an analyzed file. Store-backed analyzers may hydrate this on
+    /// demand instead of retaining every file's source in aggregate state.
+    fn structural_source(&self, file: &ProjectFile) -> Option<String>;
 
     /// Normalized facts for one file, served from the facts cache and
     /// extracted from the in-memory source on miss. `None` when the file is
@@ -115,27 +113,25 @@ impl StructuralFactsCache {
     }
 }
 
-impl<A: LanguageAdapter + StorageLanguageAdapter> StructuralSearchProvider
-    for TreeSitterAnalyzer<A>
-{
+impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
     fn structural_language(&self) -> Language {
         self.adapter().language()
     }
 
     fn structural_files(&self) -> Vec<ProjectFile> {
-        self.all_files().cloned().collect()
+        self.all_files()
     }
 
-    fn structural_source(&self, file: &ProjectFile) -> Option<&str> {
+    fn structural_source(&self, file: &ProjectFile) -> Option<String> {
         self.file_source(file)
     }
 
     fn structural_facts(&self, file: &ProjectFile) -> Option<Arc<FileFacts>> {
         let spec: &'static dyn StructuralSpec = self.adapter().structural_spec()?;
         let source = self.file_source(file)?;
-        self.structural_cache().get_or_extract(file, source, || {
+        self.structural_cache().get_or_extract(file, &source, || {
             let grammar = self.adapter().parser_language_for_file(file);
-            extract_file_facts(spec, &grammar, source)
+            extract_file_facts(spec, &grammar, &source)
         })
     }
 

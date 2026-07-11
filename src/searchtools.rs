@@ -20,7 +20,7 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{
     CodeUnit, CodeUnitType, GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language,
-    ProjectFile, Range, go_module_roots,
+    ProjectFile, Range, SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::lsp::conversion::percent_decode;
@@ -297,6 +297,7 @@ struct RankedSearchCandidate {
     code_unit: CodeUnit,
     score: SymbolCandidateScore,
     line: usize,
+    primary_range: Range,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -977,28 +978,46 @@ pub fn search_symbols(
         .filter(|pattern| !pattern.trim().is_empty())
         .collect();
 
-    let definitions = patterns
-        .par_iter()
-        .map(|pattern| analyzer.search_definitions(pattern, false))
-        .reduce(BTreeSet::new, |mut acc, definitions| {
-            acc.extend(definitions);
-            acc
-        });
+    let definitions = {
+        let _scope = profiling::scope("searchtools::search_symbols.resolve");
+        patterns
+            .par_iter()
+            .map(|pattern| analyzer.search_symbol_candidates(pattern, false))
+            .reduce(Vec::new, |mut acc, definitions| {
+                acc.extend(definitions);
+                acc
+            })
+    };
 
-    let filtered: Vec<_> = definitions
-        .into_par_iter()
-        .filter(|code_unit| {
-            // A search result is an implicit selector offer for source/location tools. Internal
-            // graph identities without a unique range (for example replicated Go inline-struct
-            // members) must not be advertised even when they intentionally remain resolvable.
-            !analyzer.ranges(code_unit).is_empty()
-                && (params.include_tests || !is_test_candidate(analyzer, code_unit.source()))
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect();
+    let filtered: Vec<_> = {
+        let _scope = profiling::scope("searchtools::search_symbols.filter_ranged");
+        let mut seen = HashSet::default();
+        definitions
+            .into_iter()
+            .filter_map(|candidate| {
+                // A search result is an implicit selector offer for source/location tools. Internal
+                // graph identities without a unique range (for example replicated Go inline-struct
+                // members) must not be advertised even when they intentionally remain resolvable.
+                if !seen.insert(candidate.code_unit.clone()) {
+                    return None;
+                }
+                let range = candidate
+                    .primary_range
+                    .or_else(|| primary_range(analyzer, &candidate.code_unit))?;
+                let is_test = candidate.contains_tests
+                    || test_paths::is_test_like_path(
+                        &rel_path_string(candidate.code_unit.source()),
+                        language_for_file(candidate.code_unit.source()),
+                    );
+                (params.include_tests || !is_test).then_some((candidate.code_unit, range, is_test))
+            })
+            .collect()
+    };
 
-    let ranked = rank_search_symbol_candidates(analyzer, &patterns, filtered);
+    let ranked = {
+        let _scope = profiling::scope("searchtools::search_symbols.rank");
+        rank_search_symbol_candidates(analyzer, &patterns, filtered)
+    };
 
     let mut grouped: HashMap<ProjectFile, Vec<RankedSearchCandidate>> = HashMap::default();
     for candidate in ranked {
@@ -1032,44 +1051,47 @@ pub fn search_symbols(
     );
     file_entries.truncate(effective_limit);
 
-    let files: Vec<SearchSymbolsFile> = file_entries
-        .into_iter()
-        .map(|(file, code_units)| {
-            let render_context = load_declaration_name_context(analyzer, &file);
-            let render_context = render_context.as_ref();
-            SearchSymbolsFile {
-                path: rel_path_string(&file),
-                loc: render_context
-                    .map(|context| line_count(context.content()))
-                    .unwrap_or(0),
-                classes: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Class,
-                    render_context,
-                ),
-                functions: collect_callable_kind_names(analyzer, &code_units, render_context),
-                fields: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Field,
-                    render_context,
-                ),
-                modules: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Module,
-                    render_context,
-                ),
-                macros: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Macro,
-                    render_context,
-                ),
-            }
-        })
-        .collect();
+    let files: Vec<SearchSymbolsFile> = {
+        let _scope = profiling::scope("searchtools::search_symbols.render");
+        file_entries
+            .into_iter()
+            .map(|(file, code_units)| {
+                let render_context = load_declaration_name_context(analyzer, &file);
+                let render_context = render_context.as_ref();
+                SearchSymbolsFile {
+                    path: rel_path_string(&file),
+                    loc: render_context
+                        .map(|context| line_count(context.content()))
+                        .unwrap_or(0),
+                    classes: collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Class,
+                        render_context,
+                    ),
+                    functions: collect_callable_kind_names(analyzer, &code_units, render_context),
+                    fields: collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Field,
+                        render_context,
+                    ),
+                    modules: collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Module,
+                        render_context,
+                    ),
+                    macros: collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Macro,
+                        render_context,
+                    ),
+                }
+            })
+            .collect()
+    };
     let note = search_symbols_note(truncated, files.len(), total_files);
 
     SearchSymbolsResult {
@@ -2186,6 +2208,8 @@ enum SourceLookupOutcome {
 }
 
 fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> SummaryTargets {
+    let _scope = profiling::scope("searchtools::route_summary_targets");
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut file_targets = BTreeSet::new();
     let mut directory_targets = BTreeSet::new();
     let mut directory_target_inputs = Vec::new();
@@ -2204,6 +2228,18 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
         ) {
             symbol_targets.push(target.to_string());
             continue;
+        }
+
+        match resolver.resolve_literal(target) {
+            ResolvedFileInput::File(file) => {
+                file_targets.insert(file);
+                continue;
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                ambiguous_paths.push(item);
+                continue;
+            }
+            ResolvedFileInput::NotFound(_) => {}
         }
 
         let directory_matches = resolve_directory_target(analyzer, target);
@@ -2592,6 +2628,7 @@ pub fn get_symbol_sources(
 }
 
 pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
+    let _scope = profiling::scope("searchtools::get_summaries");
     let (mut summaries, _directory_symbols, directory_target_inputs) =
         summarize_targets_with_directory_inventory(analyzer, &params.targets);
     summaries.not_found.extend(
@@ -2643,15 +2680,22 @@ fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Option<String
 }
 
 pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
+    let _scope = profiling::scope("searchtools::summarize_files");
     let mut summaries: Vec<_> = files
         .into_par_iter()
         .filter_map(|file| {
-            let mut elements = Vec::new();
-            for code_unit in analyzer.top_level_declarations(&file) {
-                elements.extend(summary_elements_for_code_unit_in_file(
-                    analyzer, &code_unit, &file,
-                ));
-            }
+            let mut elements = analyzer
+                .summary_file_projection(&file)
+                .map(|projection| summary_elements_from_file_projection(&projection, &file))
+                .unwrap_or_else(|| {
+                    let mut elements = Vec::new();
+                    for code_unit in analyzer.top_level_declarations(&file) {
+                        elements.extend(summary_elements_for_code_unit_in_file(
+                            analyzer, &code_unit, &file,
+                        ));
+                    }
+                    elements
+                });
 
             // A module-level declaration can appear both as its own entry in
             // top_level_declarations and as a child of the synthetic module unit
@@ -5762,17 +5806,18 @@ fn is_full_confidence(confidence: &f64) -> bool {
 fn rank_search_symbol_candidates(
     analyzer: &dyn IAnalyzer,
     patterns: &[String],
-    code_units: Vec<CodeUnit>,
+    code_units: Vec<(CodeUnit, Range, bool)>,
 ) -> Vec<RankedSearchCandidate> {
     let mut ranked: Vec<_> = code_units
         .into_iter()
-        .map(|code_unit| RankedSearchCandidate {
-            line: primary_range(analyzer, &code_unit)
-                .map(|range| range.start_line)
-                .unwrap_or(0),
-            score: score_search_symbol_candidate(analyzer, patterns, &code_unit),
-            code_unit,
-        })
+        .map(
+            |(code_unit, primary_range, is_test)| RankedSearchCandidate {
+                line: primary_range.start_line,
+                score: score_search_symbol_candidate(analyzer, patterns, &code_unit, is_test),
+                code_unit,
+                primary_range,
+            },
+        )
         .collect();
     ranked.sort_by(compare_ranked_search_candidates);
     ranked
@@ -5782,6 +5827,7 @@ fn score_search_symbol_candidate(
     analyzer: &dyn IAnalyzer,
     patterns: &[String],
     code_unit: &CodeUnit,
+    is_test: bool,
 ) -> SymbolCandidateScore {
     let mut best_match = SymbolMatchScore {
         tier: 0,
@@ -5798,7 +5844,7 @@ fn score_search_symbol_candidate(
         match_score: best_match,
         path_tier: search_symbol_path_tier(patterns, code_unit.source()),
         implementation_tier: search_symbol_implementation_tier(analyzer, code_unit),
-        source_quality_tier: search_symbol_source_quality_tier(analyzer, code_unit.source()),
+        source_quality_tier: search_symbol_source_quality_tier(code_unit.source(), is_test),
         synthetic_tier: u8::from(!code_unit.is_synthetic()),
     }
 }
@@ -5958,11 +6004,11 @@ fn split_camel_case_component(component: &str) -> Vec<String> {
     parts
 }
 
-fn search_symbol_source_quality_tier(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> u8 {
+fn search_symbol_source_quality_tier(file: &ProjectFile, is_test: bool) -> u8 {
     if is_generated_like_path(file) {
         return 0;
     }
-    if is_test_candidate(analyzer, file) {
+    if is_test {
         return 1;
     }
     2
@@ -6068,11 +6114,6 @@ fn classify_resolved_test_file(
         kind,
         contains_test_code,
     }
-}
-
-fn is_test_candidate(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> bool {
-    analyzer.contains_tests(file)
-        || test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
 }
 
 fn is_generated_like_path(file: &ProjectFile) -> bool {
@@ -6272,13 +6313,8 @@ fn collect_ranked_names_by(
                 .map(move |signature| SearchSymbolHit {
                     symbol: display_symbol_for_target(&candidate.code_unit),
                     signature,
-                    line: search_symbol_display_range(
-                        analyzer,
-                        &candidate.code_unit,
-                        render_context,
-                    )
-                    .map(|range| range.start_line)
-                    .unwrap_or(candidate.line),
+                    line: search_symbol_display_range(analyzer, candidate, render_context)
+                        .start_line,
                 })
         })
         .collect();
@@ -6304,11 +6340,17 @@ fn load_declaration_name_context(
 
 fn search_symbol_display_range(
     analyzer: &dyn IAnalyzer,
-    code_unit: &CodeUnit,
+    candidate: &RankedSearchCandidate,
     render_context: Option<&DeclarationNameRangeContext>,
-) -> Option<Range> {
-    let name_range = render_context.and_then(|context| context.name_range(analyzer, code_unit));
-    display_range_with_declaration_name(analyzer, code_unit, name_range)
+) -> Range {
+    let name_range =
+        render_context.and_then(|context| context.name_range(analyzer, &candidate.code_unit));
+    if let Some(mut name_range) = name_range {
+        name_range.start_line += 1;
+        name_range.end_line += 1;
+        return name_range;
+    }
+    candidate.primary_range
 }
 
 fn display_range_with_declaration_name(
@@ -6382,6 +6424,55 @@ fn summary_elements_for_code_unit_in_file(
     elements
 }
 
+fn summary_elements_from_file_projection(
+    projection: &SummaryFileProjection,
+    file: &ProjectFile,
+) -> Vec<SummaryElement> {
+    let _scope = profiling::scope("searchtools::summary_elements_from_file_projection");
+    let mut elements = Vec::new();
+    let mut stack: Vec<_> = projection
+        .top_level_declarations
+        .iter()
+        .rev()
+        .cloned()
+        .collect();
+    let mut visited = HashSet::default();
+
+    while let Some(code_unit) = stack.pop() {
+        if !visited.insert(code_unit.clone()) {
+            continue;
+        }
+        let signatures = projection
+            .signatures
+            .get(&code_unit)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let ranges = projection
+            .ranges
+            .get(&code_unit)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        elements.extend(summary_elements_from_signature_data(
+            &code_unit, signatures, ranges,
+        ));
+
+        if !code_unit.is_class() && !code_unit.is_module() {
+            continue;
+        }
+        if let Some(children) = projection.children.get(&code_unit) {
+            stack.extend(
+                children
+                    .iter()
+                    .rev()
+                    .filter(|child| !child.is_anonymous() && child.source() == file)
+                    .cloned(),
+            );
+        }
+    }
+
+    elements
+}
+
 fn display_signatures(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<String> {
     let signatures: Vec<_> = analyzer
         .signatures(code_unit)
@@ -6433,11 +6524,20 @@ fn normalize_display_signature(signature: &str) -> String {
 
 fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<SummaryElement> {
     let signatures = analyzer.signatures(code_unit);
+    let ranges = analyzer.ranges(code_unit);
+    summary_elements_from_signature_data(code_unit, &signatures, &ranges)
+}
+
+fn summary_elements_from_signature_data(
+    code_unit: &CodeUnit,
+    signatures: &[String],
+    ranges: &[Range],
+) -> Vec<SummaryElement> {
     if signatures.is_empty() {
         return Vec::new();
     }
 
-    let mut ranges = analyzer.ranges(code_unit).to_vec();
+    let mut ranges = ranges.to_vec();
     ranges.sort_by_key(|range| (range.start_line, range.start_byte));
     let path = rel_path_string(code_unit.source());
     let fallback_start = ranges.first().map(|range| range.start_line).unwrap_or(1);
@@ -6563,7 +6663,7 @@ fn source_blocks_for_code_unit(
         .into_iter()
         .filter_map(|range| {
             let start_byte = if include_comments {
-                expanded_comment_start(language, content, range.start_byte)
+                expanded_comment_start(language, &content, range.start_byte)
             } else {
                 range.start_byte
             };
@@ -6576,7 +6676,7 @@ fn source_blocks_for_code_unit(
                 text,
                 range.start_byte.saturating_sub(start_byte),
             );
-            let start_line = line_number_at_offset(content, start_byte);
+            let start_line = line_number_at_offset(&content, start_byte);
             Some(SourceBlock {
                 label: display_symbol_for_target(code_unit),
                 path: rel_path_string(code_unit.source()),
@@ -7427,7 +7527,7 @@ mod tests {
         SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
         classify_scan_usages_entry, list_symbols, resolve_file_patterns, trim_summary_signature,
     };
-    use super::{function_like_macro_query, usage_failure_hint};
+    use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
     use crate::analyzer::{
         CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
     };
@@ -7494,7 +7594,7 @@ mod tests {
     }
 
     impl IAnalyzer for CountingAnalyzer {
-        fn indexed_source<'a>(&'a self, _file: &ProjectFile) -> Option<&'a str> {
+        fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
             None
         }
 
@@ -7707,6 +7807,18 @@ def gamma():
 
         assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
         assert!(files.ambiguous_paths.is_empty());
+        assert_eq!(0, analyzer.analyzed_files_calls());
+    }
+
+    #[test]
+    fn summary_literal_file_target_avoids_directory_scan() {
+        let root = std::env::current_dir().unwrap();
+        let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
+
+        let targets = route_summary_targets(&analyzer, &["nested/B.java".to_string()]);
+
+        assert_eq!(vec!["nested/B.java"], rel_paths(&targets.file_targets));
+        assert!(targets.directory_targets.is_empty());
         assert_eq!(0, analyzer.analyzed_files_calls());
     }
 

@@ -156,13 +156,13 @@ fn resolve_indexed_receiver_type(
 
 fn module_fqn_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<String> {
     analyzer
-        .get_declarations(file)
+        .declarations(file)
         .into_iter()
         .find(|code_unit| code_unit.is_module())
         .map(|code_unit| code_unit.fq_name())
         .or_else(|| {
             analyzer
-                .get_declarations(file)
+                .declarations(file)
                 .into_iter()
                 .find(|code_unit| !code_unit.package_name().is_empty())
                 .map(|code_unit| code_unit.package_name().to_string())

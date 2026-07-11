@@ -1,3 +1,4 @@
+use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile, SignatureMetadata};
 use tree_sitter::{Language as TsLanguage, Tree};
 
@@ -7,8 +8,6 @@ use super::{csharp_normalize_full_name, csharp_signature_arity, csharp_signature
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct CSharpAdapter;
-
-impl crate::analyzer::StorageLanguageAdapter for CSharpAdapter {}
 
 impl LanguageAdapter for CSharpAdapter {
     fn language(&self) -> Language {
@@ -33,6 +32,17 @@ impl LanguageAdapter for CSharpAdapter {
 
     fn normalize_full_name(&self, fq_name: &str) -> String {
         csharp_normalize_full_name(fq_name)
+    }
+
+    fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
+        let mut candidates = lookup_suffix_candidates(normalized_fq_name, &[".", "::"]);
+        let base_candidates = candidates.clone();
+        for candidate in base_candidates {
+            candidates.extend(csharp_nested_owner_short_name_candidates(&candidate));
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
     }
 
     fn callable_arity(
@@ -86,4 +96,39 @@ impl LanguageAdapter for CSharpAdapter {
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_csharp_file(file, source, tree)
     }
+}
+
+fn csharp_nested_owner_short_name_candidates(normalized: &str) -> Vec<String> {
+    let parts: Vec<_> = normalized
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return Vec::new();
+    }
+
+    let separator_count = parts.len() - 1;
+    if separator_count > 8 {
+        let mut encoded = parts[..separator_count].join("$");
+        encoded.push('.');
+        encoded.push_str(parts[separator_count]);
+        return vec![encoded];
+    }
+
+    let mut out = Vec::new();
+    for mask in 1..(1_usize << separator_count) {
+        let mut encoded = String::new();
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                encoded.push(if (mask & (1 << (index - 1))) != 0 {
+                    '$'
+                } else {
+                    '.'
+                });
+            }
+            encoded.push_str(part);
+        }
+        out.push(encoded);
+    }
+    out
 }

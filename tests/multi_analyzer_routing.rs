@@ -48,7 +48,7 @@ fn multi_analyzer_routes_java_queries_and_capabilities() {
         .next()
         .unwrap();
 
-    let top_level = multi.get_top_level_declarations(&file);
+    let top_level = multi.top_level_declarations(&file);
     assert!(top_level.contains(&class_unit));
     assert!(
         multi
@@ -91,7 +91,7 @@ end
     );
 
     let ruby_file = project.file("app/service.rb");
-    let ruby_declarations = analyzer.get_top_level_declarations(&ruby_file);
+    let ruby_declarations = analyzer.top_level_declarations(&ruby_file);
     assert!(
         ruby_declarations
             .iter()
@@ -100,7 +100,7 @@ end
     );
     assert!(!analyzer.contains_tests(&project.file("pkg/tool.py")));
     let python_file = project.file("pkg/tool.py");
-    let python_declarations = analyzer.get_top_level_declarations(&python_file);
+    let python_declarations = analyzer.top_level_declarations(&python_file);
     assert!(
         python_declarations
             .iter()
@@ -115,8 +115,8 @@ fn multi_analyzer_handles_unknown_extensions_conservatively() {
     let multi = MultiAnalyzer::with_java(JavaAnalyzer::from_project(project));
     let unknown_file = ProjectFile::new(multi.project().root().to_path_buf(), "script.unknown");
 
-    assert!(multi.get_top_level_declarations(&unknown_file).is_empty());
-    assert!(multi.import_statements_of(&unknown_file).is_empty());
+    assert!(multi.top_level_declarations(&unknown_file).is_empty());
+    assert!(multi.import_statements(&unknown_file).is_empty());
     assert!(!multi.contains_tests(&unknown_file));
     assert!(multi.is_access_expression(&unknown_file, 0, 0));
 }

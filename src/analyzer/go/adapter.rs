@@ -1,4 +1,4 @@
-use crate::analyzer::{Language, LanguageAdapter, ProjectFile, StorageLanguageAdapter};
+use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use tree_sitter::{Language as TsLanguage, Parser, Tree};
 
 use super::declarations::{determine_go_package_name, parse_go_file};
@@ -8,9 +8,29 @@ use super::tests::go_contains_tests;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GoAdapter;
 
-impl StorageLanguageAdapter for GoAdapter {
+impl LanguageAdapter for GoAdapter {
+    fn language(&self) -> Language {
+        Language::Go
+    }
+
+    fn query_directory(&self) -> &'static str {
+        "resources/treesitter/go"
+    }
+
+    fn parser_language(&self) -> TsLanguage {
+        tree_sitter_go::LANGUAGE.into()
+    }
+
+    fn file_extension(&self) -> &'static str {
+        "go"
+    }
+
     fn storage_content_qualifier(&self, _code_unit: &crate::analyzer::CodeUnit) -> String {
         String::new()
+    }
+
+    fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
+        false
     }
 
     fn storage_file_content_qualifier(&self, _package_name: &str) -> String {
@@ -30,24 +50,6 @@ impl StorageLanguageAdapter for GoAdapter {
         };
         let declared = determine_go_package_name(tree.root_node(), &source);
         canonical_go_package_name(file, &declared)
-    }
-}
-
-impl LanguageAdapter for GoAdapter {
-    fn language(&self) -> Language {
-        Language::Go
-    }
-
-    fn query_directory(&self) -> &'static str {
-        "resources/treesitter/go"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_go::LANGUAGE.into()
-    }
-
-    fn file_extension(&self) -> &'static str {
-        "go"
     }
 
     fn contains_tests(

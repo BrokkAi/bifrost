@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::hash::HashMap;
 use crate::path_normalization::NormalizePath;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -660,6 +661,27 @@ pub struct Range {
     pub end_byte: usize,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+/// The persisted facts required to render one file's declaration summary.
+///
+/// This deliberately differs from `FileState`: it is a read model for summary
+/// rendering and omits unrelated imports, types, graph edges, and diagnostics.
+#[derive(Debug, Clone, Default)]
+pub struct SummaryFileProjection {
+    pub top_level_declarations: Vec<CodeUnit>,
+    pub signatures: HashMap<CodeUnit, Vec<String>>,
+    pub ranges: HashMap<CodeUnit, Vec<Range>>,
+    pub children: HashMap<CodeUnit, Vec<CodeUnit>>,
+}
+
+/// Persisted facts needed to rank and render one symbol-search result without
+/// hydrating the complete source file state.
+#[derive(Debug, Clone)]
+pub struct SearchSymbolCandidate {
+    pub code_unit: CodeUnit,
+    pub primary_range: Option<Range>,
+    pub contains_tests: bool,
 }
 
 /// A tree-sitter parse-error span captured during analysis so the LSP

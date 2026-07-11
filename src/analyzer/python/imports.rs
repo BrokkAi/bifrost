@@ -7,7 +7,7 @@ impl PythonAnalyzer {
     pub(super) fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
         let mut bindings = HashMap::default();
         for import in self.inner.import_info_of(file) {
-            for (binding, code_unit) in self.resolve_import(file, import) {
+            for (binding, code_unit) in self.resolve_import(file, &import) {
                 bindings.insert(binding, code_unit);
             }
         }
@@ -214,7 +214,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         referencing
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 
@@ -290,10 +290,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
 
         matched.extend(used_wildcards);
 
-        let remaining: HashSet<_> = unresolved
-            .difference(&resolved_via_wildcard)
-            .cloned()
-            .collect();
+        let remaining: HashSet<_> = unresolved.difference(&resolved_via_wildcard).collect();
         if !remaining.is_empty() {
             matched.extend(wildcard_imports.into_iter().map(|info| info.raw_snippet));
         }

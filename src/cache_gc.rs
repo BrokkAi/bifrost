@@ -1,30 +1,35 @@
-//! Shared semantic-cache GC for the unified Bifrost cache database.
-//!
-//! Claim/throttle and Git liveness are shared plumbing. Issue #584 does not
-//! create or sweep analyzer rows.
+//! Shared opportunistic GC driver for the unified bifrost cache DB.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use git2::Repository;
 use growable_bloom_filter::GrowableBloom;
 use rusqlite::{Connection, TransactionBehavior};
 
-use crate::nlp::store::SemanticStore;
+use crate::analyzer::store::AnalyzerStore;
 use crate::{cache_db, gitblob};
 
-pub(crate) const GC_AUTO_BLOB_THRESHOLD: i64 = 5000;
-pub(crate) const GC_MIN_INTERVAL_SECS: i64 = 6 * 3600;
+#[cfg(feature = "nlp")]
+use crate::nlp::store::SemanticStore;
+
+/// git-gc.auto-style blob growth threshold.
+pub const GC_AUTO_BLOB_THRESHOLD: i64 = 5000;
+/// Time-based fallback sweep interval, used only when the registry has grown.
+pub const GC_MIN_INTERVAL_SECS: i64 = 6 * 3600;
+
 const GC_CLAIM_TTL_SECS: i64 = 3600;
 
 static AUTO_BLOB_THRESHOLD: AtomicI64 = AtomicI64::new(GC_AUTO_BLOB_THRESHOLD);
 static MIN_INTERVAL_SECS: AtomicI64 = AtomicI64::new(GC_MIN_INTERVAL_SECS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GcOutcome {
-    pub(crate) ran: bool,
-    pub(crate) semantic_dropped: usize,
-    pub(crate) total_blobs_after: i64,
+pub struct GcOutcome {
+    pub ran: bool,
+    pub semantic_dropped: usize,
+    pub analyzer_dropped: usize,
+    pub total_blobs_after: i64,
 }
 
 impl GcOutcome {
@@ -32,34 +37,69 @@ impl GcOutcome {
         Self {
             ran: false,
             semantic_dropped: 0,
+            analyzer_dropped: 0,
             total_blobs_after,
         }
     }
 }
 
+#[derive(Debug)]
 struct GcClaim {
     db_path: std::path::PathBuf,
 }
 
-pub(crate) fn maybe_gc_for_semantic(
+#[cfg(feature = "nlp")]
+pub fn maybe_gc_for_semantic(
     store: &SemanticStore,
     repo: &Repository,
 ) -> Result<GcOutcome, String> {
-    run_gc(store.db_path(), repo, false)
+    run_gc(store.db_path(), repo, Some(store), None, false)
 }
 
-pub(crate) fn force_gc_for_semantic(
+#[cfg(feature = "nlp")]
+pub fn force_gc_for_semantic(
     store: &SemanticStore,
     repo: &Repository,
 ) -> Result<GcOutcome, String> {
-    run_gc(store.db_path(), repo, true)
+    run_gc(store.db_path(), repo, Some(store), None, true)
 }
 
-fn run_gc(db_path: &Path, repo: &Repository, force: bool) -> Result<GcOutcome, String> {
+pub fn maybe_gc_for_analyzer(
+    store: &AnalyzerStore,
+    repo: &Repository,
+) -> Result<GcOutcome, String> {
+    let Some(db_path) = store.db_path() else {
+        return Ok(GcOutcome::skipped(0));
+    };
+    run_gc(db_path, repo, None, Some(store), false)
+}
+
+pub fn force_gc_for_analyzer(
+    store: &AnalyzerStore,
+    repo: &Repository,
+) -> Result<GcOutcome, String> {
+    let Some(db_path) = store.db_path() else {
+        return Ok(GcOutcome::skipped(0));
+    };
+    run_gc(db_path, repo, None, Some(store), true)
+}
+
+fn run_gc(
+    db_path: &Path,
+    repo: &Repository,
+    #[cfg(feature = "nlp")] semantic_store: Option<&SemanticStore>,
+    #[cfg(not(feature = "nlp"))] _semantic_store: Option<&()>,
+    analyzer_store: Option<&AnalyzerStore>,
+    force: bool,
+) -> Result<GcOutcome, String> {
     let Some(claim) = try_claim_gc(db_path, force)? else {
         return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
     };
-    match sweep_with_claim(&claim, repo) {
+    #[cfg(feature = "nlp")]
+    let sweep = sweep_with_claim(&claim, repo, semantic_store, analyzer_store);
+    #[cfg(not(feature = "nlp"))]
+    let sweep = sweep_with_claim(&claim, repo, None, analyzer_store);
+    match sweep {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
             clear_gc_claim(db_path)?;
@@ -68,25 +108,60 @@ fn run_gc(db_path: &Path, repo: &Repository, force: bool) -> Result<GcOutcome, S
     }
 }
 
-fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, String> {
+fn sweep_with_claim(
+    claim: &GcClaim,
+    repo: &Repository,
+    #[cfg(feature = "nlp")] semantic_store: Option<&SemanticStore>,
+    #[cfg(not(feature = "nlp"))] _semantic_store: Option<&()>,
+    analyzer_store: Option<&AnalyzerStore>,
+) -> Result<GcOutcome, String> {
     let live = live_bloom(repo)?;
-    // A dedicated connection keeps background GC off the foreground store mutex.
-    let semantic = SemanticStore::open(&claim.db_path).map_err(|err| err.to_string())?;
-    let semantic_dropped = semantic
-        .gc_with(|oid| live.contains(oid))
-        .map_err(|err| err.to_string())?;
+
+    #[cfg(feature = "nlp")]
+    let semantic_dropped = match semantic_store {
+        Some(store) => store
+            .gc_with(|oid| live.contains(oid))
+            .map_err(|err| err.to_string())?,
+        None => {
+            let store = SemanticStore::open(&claim.db_path).map_err(|err| err.to_string())?;
+            store
+                .gc_with(|oid| live.contains(oid))
+                .map_err(|err| err.to_string())?
+        }
+    };
+    #[cfg(not(feature = "nlp"))]
+    let semantic_dropped = 0;
+
+    let analyzer_dropped = match analyzer_store {
+        Some(store) => store
+            .gc_with(|oid| live.contains(oid))
+            .map_err(|err| err.to_string())?,
+        None => {
+            let store =
+                AnalyzerStore::open_persistent(&claim.db_path).map_err(|err| err.to_string())?;
+            store
+                .gc_with(|oid| live.contains(oid))
+                .map_err(|err| err.to_string())?
+        }
+    };
+
     let total_blobs_after = finish_gc(&claim.db_path)?;
     Ok(GcOutcome {
         ran: true,
         semantic_dropped,
+        analyzer_dropped,
         total_blobs_after,
     })
 }
 
 fn live_bloom(repo: &Repository) -> Result<GrowableBloom, String> {
     let mut live = gitblob::reachable_bloom(repo)?;
-    for oid in gitblob::worktree_live_oids(repo)? {
-        live.insert(oid);
+    for root in gitblob::worktree_roots(repo)? {
+        if let Ok(dirty) = gitblob::uncommitted_oids(&root) {
+            for oid in dirty {
+                live.insert(oid);
+            }
+        }
     }
     Ok(live)
 }
@@ -96,7 +171,7 @@ fn try_claim_gc(db_path: &Path, force: bool) -> Result<Option<GcClaim>, String> 
     let now = cache_db::now_unix_seconds();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(gc_sqlite_error)?;
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     let current_total = total_blob_count_conn(&tx)?;
     let claim_until: i64 = tx
         .query_row(
@@ -104,21 +179,24 @@ fn try_claim_gc(db_path: &Path, force: bool) -> Result<Option<GcClaim>, String> 
             [],
             |row| row.get(0),
         )
-        .map_err(gc_sqlite_error)?;
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     if claim_until > now {
-        tx.commit().map_err(gc_sqlite_error)?;
+        tx.commit()
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
         return Ok(None);
     }
     if !force && !gc_due_tx(&tx, current_total, now)? {
-        tx.commit().map_err(gc_sqlite_error)?;
+        tx.commit()
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
         return Ok(None);
     }
     tx.execute(
         "UPDATE cache_state SET gc_claim_until = ?1 WHERE id = 1",
         [now + GC_CLAIM_TTL_SECS],
     )
-    .map_err(gc_sqlite_error)?;
-    tx.commit().map_err(gc_sqlite_error)?;
+    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    tx.commit()
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     Ok(Some(GcClaim {
         db_path: db_path.to_path_buf(),
     }))
@@ -131,20 +209,22 @@ fn gc_due_tx(tx: &rusqlite::Transaction<'_>, current_total: i64, now: i64) -> Re
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(gc_sqlite_error)?;
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     let growth = current_total - blobs_at_last_gc;
+    if growth <= 0 {
+        return Ok(false);
+    }
     if growth > AUTO_BLOB_THRESHOLD.load(Ordering::Relaxed) {
         return Ok(true);
     }
-    Ok(current_total > 0
-        && now.saturating_sub(last_gc_at) >= MIN_INTERVAL_SECS.load(Ordering::Relaxed))
+    Ok(now.saturating_sub(last_gc_at) >= MIN_INTERVAL_SECS.load(Ordering::Relaxed))
 }
 
 fn finish_gc(db_path: &Path) -> Result<i64, String> {
     let mut conn = cache_db::open_unified_connection(db_path)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(gc_sqlite_error)?;
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     let total = total_blob_count_conn(&tx)?;
     let now = cache_db::now_unix_seconds();
     tx.execute(
@@ -153,10 +233,11 @@ fn finish_gc(db_path: &Path) -> Result<i64, String> {
          WHERE id = 1",
         (now, total),
     )
-    .map_err(gc_sqlite_error)?;
-    tx.commit().map_err(gc_sqlite_error)?;
+    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    tx.commit()
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     conn.pragma_update(None, "incremental_vacuum", 0)
-        .map_err(gc_sqlite_error)?;
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     Ok(total)
 }
 
@@ -164,10 +245,11 @@ fn clear_gc_claim(db_path: &Path) -> Result<(), String> {
     let mut conn = cache_db::open_unified_connection(db_path)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(gc_sqlite_error)?;
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     tx.execute("UPDATE cache_state SET gc_claim_until = 0 WHERE id = 1", [])
-        .map_err(gc_sqlite_error)?;
-    tx.commit().map_err(gc_sqlite_error)?;
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    tx.commit()
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     Ok(())
 }
 
@@ -177,219 +259,72 @@ fn total_blob_count(db_path: &Path) -> Result<i64, String> {
 }
 
 fn total_blob_count_conn(conn: &Connection) -> Result<i64, String> {
-    conn.query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| row.get(0))
-        .map_err(gc_sqlite_error)
+    conn.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM semantic_blobs) +
+           (SELECT COUNT(*) FROM blobs)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("cache GC SQLite error: {err}"))
 }
 
-fn gc_sqlite_error(err: rusqlite::Error) -> String {
-    format!("cache GC SQLite error: {err}")
+#[doc(hidden)]
+pub struct GcTuningGuard {
+    previous_threshold: i64,
+    previous_interval: i64,
+    _lock: MutexGuard<'static, ()>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::gitblob::tests::{commit_all, init_repo};
-    use git2::{ObjectType, Oid};
-    use std::sync::{Mutex, OnceLock};
-
-    struct TuningGuard {
-        previous_threshold: i64,
-        previous_interval: i64,
-        _lock: std::sync::MutexGuard<'static, ()>,
+impl Drop for GcTuningGuard {
+    fn drop(&mut self) {
+        AUTO_BLOB_THRESHOLD.store(self.previous_threshold, Ordering::Relaxed);
+        MIN_INTERVAL_SECS.store(self.previous_interval, Ordering::Relaxed);
     }
+}
 
-    impl Drop for TuningGuard {
-        fn drop(&mut self) {
-            AUTO_BLOB_THRESHOLD.store(self.previous_threshold, Ordering::Relaxed);
-            MIN_INTERVAL_SECS.store(self.previous_interval, Ordering::Relaxed);
-        }
+#[doc(hidden)]
+pub fn set_tuning_for_test(auto_threshold: i64, min_interval_secs: i64) -> GcTuningGuard {
+    let lock = gc_tuning_lock()
+        .lock()
+        .expect("GC tuning test mutex poisoned");
+    let previous_threshold = AUTO_BLOB_THRESHOLD.swap(auto_threshold, Ordering::Relaxed);
+    let previous_interval = MIN_INTERVAL_SECS.swap(min_interval_secs, Ordering::Relaxed);
+    GcTuningGuard {
+        previous_threshold,
+        previous_interval,
+        _lock: lock,
     }
+}
 
-    fn set_tuning(auto_threshold: i64, min_interval_secs: i64) -> TuningGuard {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let lock = LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("GC tuning test mutex poisoned");
-        TuningGuard {
-            previous_threshold: AUTO_BLOB_THRESHOLD.swap(auto_threshold, Ordering::Relaxed),
-            previous_interval: MIN_INTERVAL_SECS.swap(min_interval_secs, Ordering::Relaxed),
-            _lock: lock,
-        }
-    }
+fn gc_tuning_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
-    fn put_oid(store: &SemanticStore, oid: Oid) {
-        store.put_blob(&oid.to_string(), None, &[]).unwrap();
-    }
+#[doc(hidden)]
+pub fn set_accounting_for_test(
+    db_path: &Path,
+    last_gc_at: i64,
+    blobs_at_last_gc: i64,
+) -> Result<(), String> {
+    let mut conn = cache_db::open_unified_connection(db_path)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    tx.execute(
+        "UPDATE cache_state
+         SET last_gc_at = ?1, blobs_at_last_gc = ?2, gc_claim_until = 0
+         WHERE id = 1",
+        (last_gc_at, blobs_at_last_gc),
+    )
+    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    tx.commit()
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    Ok(())
+}
 
-    fn is_present(store: &SemanticStore, oid: Oid) -> bool {
-        store.missing_blobs(&[oid.to_string()]).unwrap().is_empty()
-    }
-
-    fn run_git(root: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(root)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    fn forced_gc_preserves_clean_crlf_working_tree_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("repo");
-        std::fs::create_dir(&root).unwrap();
-        let repo = init_repo(&root);
-        repo.config()
-            .unwrap()
-            .set_str("core.autocrlf", "true")
-            .unwrap();
-        std::fs::write(root.join("clean.txt"), b"clean\r\n").unwrap();
-        run_git(&root, &["add", "clean.txt"]);
-        run_git(&root, &["commit", "-m", "base"]);
-
-        let working_oid = Oid::hash_object(ObjectType::Blob, b"clean\r\n").unwrap();
-        let index_oid = repo
-            .index()
-            .unwrap()
-            .get_path(Path::new("clean.txt"), 0)
-            .unwrap()
-            .id;
-        assert_ne!(working_oid, index_oid);
-        assert!(repo.status_file(Path::new("clean.txt")).unwrap().is_empty());
-
-        let db_path = gitblob::cache_db_path(&root);
-        let store = SemanticStore::open(&db_path).unwrap();
-        put_oid(&store, working_oid);
-
-        let outcome = force_gc_for_semantic(&store, &repo).unwrap();
-        assert!(outcome.ran);
-        assert_eq!(outcome.semantic_dropped, 0);
-        assert!(is_present(&store, working_oid));
-    }
-
-    #[test]
-    fn forced_gc_preserves_detached_worktree_head_and_dirty_bytes() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("repo");
-        std::fs::create_dir(&root).unwrap();
-        let repo = init_repo(&root);
-        std::fs::write(root.join("tracked.txt"), b"base\n").unwrap();
-        commit_all(&repo, "base");
-
-        let linked = temp.path().join("linked");
-        let output = std::process::Command::new("git")
-            .current_dir(&root)
-            .args([
-                "worktree",
-                "add",
-                "--detach",
-                linked.to_str().unwrap(),
-                "HEAD",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let linked_repo = Repository::open(&linked).unwrap();
-        std::fs::write(linked.join("tracked.txt"), b"detached\n").unwrap();
-        commit_all(&linked_repo, "detached");
-        let detached_oid = Oid::hash_object(ObjectType::Blob, b"detached\n").unwrap();
-        std::fs::write(linked.join("tracked.txt"), b"dirty\n").unwrap();
-        std::fs::write(linked.join("linked-new.txt"), b"linked untracked\n").unwrap();
-        let linked_dirty_oid = Oid::hash_object(ObjectType::Blob, b"dirty\n").unwrap();
-        let linked_untracked_oid =
-            Oid::hash_object(ObjectType::Blob, b"linked untracked\n").unwrap();
-        std::fs::write(root.join("tracked.txt"), b"primary dirty\n").unwrap();
-        std::fs::write(root.join("primary-new.txt"), b"primary untracked\n").unwrap();
-        let primary_dirty_oid = Oid::hash_object(ObjectType::Blob, b"primary dirty\n").unwrap();
-        let primary_untracked_oid =
-            Oid::hash_object(ObjectType::Blob, b"primary untracked\n").unwrap();
-        let unreachable_oid = Oid::hash_object(ObjectType::Blob, b"unreachable\n").unwrap();
-
-        let db_path = gitblob::cache_db_path(&root);
-        let store = SemanticStore::open(&db_path).unwrap();
-        put_oid(&store, detached_oid);
-        put_oid(&store, linked_dirty_oid);
-        put_oid(&store, linked_untracked_oid);
-        put_oid(&store, primary_dirty_oid);
-        put_oid(&store, primary_untracked_oid);
-        put_oid(&store, unreachable_oid);
-
-        let outcome = force_gc_for_semantic(&store, &repo).unwrap();
-        assert!(outcome.ran);
-        assert_eq!(outcome.semantic_dropped, 1);
-        assert_eq!(outcome.total_blobs_after, 5);
-        assert!(is_present(&store, detached_oid));
-        assert!(is_present(&store, linked_dirty_oid));
-        assert!(is_present(&store, linked_untracked_oid));
-        assert!(is_present(&store, primary_dirty_oid));
-        assert!(is_present(&store, primary_untracked_oid));
-        assert!(!is_present(&store, unreachable_oid));
-    }
-
-    #[test]
-    fn opportunistic_gc_uses_growth_threshold_and_interval() {
-        let _tuning = set_tuning(1, 24 * 3600);
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("repo");
-        std::fs::create_dir(&root).unwrap();
-        let repo = init_repo(&root);
-        let db_path = gitblob::cache_db_path(&root);
-        let store = SemanticStore::open(&db_path).unwrap();
-        let conn = cache_db::open_unified_connection(&db_path).unwrap();
-        conn.execute(
-            "UPDATE cache_state
-             SET last_gc_at = ?1, blobs_at_last_gc = 0, gc_claim_until = 0
-             WHERE id = 1",
-            [cache_db::now_unix_seconds()],
-        )
-        .unwrap();
-
-        put_oid(&store, Oid::hash_object(ObjectType::Blob, b"one").unwrap());
-        let skipped = maybe_gc_for_semantic(&store, &repo).unwrap();
-        assert!(!skipped.ran);
-        put_oid(&store, Oid::hash_object(ObjectType::Blob, b"two").unwrap());
-        let swept = maybe_gc_for_semantic(&store, &repo).unwrap();
-        assert!(swept.ran);
-        assert_eq!(swept.semantic_dropped, 2);
-        assert_eq!(swept.total_blobs_after, 0);
-    }
-
-    #[test]
-    fn elapsed_interval_sweeps_without_registry_growth() {
-        let _tuning = set_tuning(i64::MAX, 0);
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("repo");
-        std::fs::create_dir(&root).unwrap();
-        let repo = init_repo(&root);
-        let db_path = gitblob::cache_db_path(&root);
-        let store = SemanticStore::open(&db_path).unwrap();
-        let unreachable = Oid::hash_object(ObjectType::Blob, b"unreachable").unwrap();
-        put_oid(&store, unreachable);
-
-        let conn = cache_db::open_unified_connection(&db_path).unwrap();
-        conn.execute(
-            "UPDATE cache_state
-             SET last_gc_at = ?1, blobs_at_last_gc = 1, gc_claim_until = 0
-             WHERE id = 1",
-            [cache_db::now_unix_seconds()],
-        )
-        .unwrap();
-
-        let swept = maybe_gc_for_semantic(&store, &repo).unwrap();
-        assert!(swept.ran);
-        assert_eq!(swept.semantic_dropped, 1);
-        assert_eq!(swept.total_blobs_after, 0);
-        assert!(!is_present(&store, unreachable));
-    }
+#[doc(hidden)]
+pub fn total_blob_count_for_test(db_path: &Path) -> Result<i64, String> {
+    total_blob_count(db_path)
 }

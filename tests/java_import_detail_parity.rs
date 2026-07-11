@@ -187,7 +187,7 @@ fn relevant_imports_ignore_fully_qualified_types() {
         .next()
         .unwrap();
     let method = analyzer
-        .get_direct_children(&consumer)
+        .direct_children(&consumer)
         .into_iter()
         .find(|code_unit| code_unit.identifier() == "method")
         .unwrap();

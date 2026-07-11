@@ -3,7 +3,7 @@
 //! The epoch is a stable fingerprint of every input that, if changed, would
 //! invalidate previously-persisted analyzer payloads. It folds in:
 //!
-//! - the analyzer payload wire-format version (see `payload::PAYLOAD_VERSION`)
+//! - the analyzer store epoch salt
 //! - the analyzer crate version (`CARGO_PKG_VERSION`)
 //! - the language adapter's actual `tree_sitter::Language` fingerprint
 //!   (ABI version + every node kind name + every field name)
@@ -19,12 +19,12 @@
 //! Hashing the live `Language` makes the epoch follow the parser instead.
 
 use crate::analyzer::Language;
-use crate::analyzer::persistence::payload::PAYLOAD_VERSION;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v1";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
@@ -65,7 +65,7 @@ fn epoch_cell<L: LanguageEpoch>(ts_language: &TsLanguage) -> &'static str {
         hasher.update(b"bifrost-analyzer-epoch-v2\n");
         hasher.update(ANALYZER_VERSION.as_bytes());
         hasher.update(b"\n");
-        hasher.update(PAYLOAD_VERSION.to_le_bytes());
+        hasher.update(STORE_EPOCH_SALT.as_bytes());
         hasher.update(b"\n");
         hasher.update(L::NAME.as_bytes());
         hasher.update(b"\n");

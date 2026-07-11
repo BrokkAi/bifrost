@@ -21,7 +21,7 @@ fn discovers_fixture_lambdas_and_extracts_their_sources() {
 
     let interface_file = file_by_name(&analyzer, "Interface.java");
     let interface_lambda = analyzer
-        .get_declarations(&interface_file)
+        .declarations(&interface_file)
         .into_iter()
         .find(|code_unit| code_unit.fq_name() == "Interface.Interface$anon$5:24")
         .unwrap();
@@ -32,7 +32,7 @@ fn discovers_fixture_lambdas_and_extracts_their_sources() {
 
     let anon_file = file_by_name(&analyzer, "AnonymousUsage.java");
     let nested_lambda = analyzer
-        .get_declarations(&anon_file)
+        .declarations(&anon_file)
         .into_iter()
         .find(|code_unit| {
             code_unit.fq_name() == "AnonymousUsage.NestedClass.getSomething$anon$15:37"
@@ -54,7 +54,7 @@ fn lambda_is_child_of_enclosing_method_and_counts_as_anonymous() {
         .next()
         .unwrap();
     let child_names: BTreeSet<_> = analyzer
-        .get_direct_children(&method)
+        .direct_children(&method)
         .into_iter()
         .filter(|code_unit| code_unit.is_function())
         .map(|code_unit| code_unit.fq_name())
@@ -71,7 +71,7 @@ fn lambda_names_are_discoverable_but_filtered_from_search_results() {
 
     let interface_file = file_by_name(&analyzer, "Interface.java");
     let function_names: BTreeSet<_> = analyzer
-        .get_declarations(&interface_file)
+        .declarations(&interface_file)
         .into_iter()
         .filter(|code_unit| code_unit.is_function())
         .map(|code_unit| code_unit.fq_name())

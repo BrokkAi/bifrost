@@ -7,8 +7,6 @@ use tree_sitter::{Language as TsLanguage, Tree};
 #[derive(Debug, Clone, Default)]
 pub struct CppAdapter;
 
-impl crate::analyzer::StorageLanguageAdapter for CppAdapter {}
-
 impl LanguageAdapter for CppAdapter {
     fn language(&self) -> Language {
         Language::Cpp

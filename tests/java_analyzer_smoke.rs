@@ -15,7 +15,7 @@ fn parses_fixture_declarations() {
     assert!(!analyzer.get_definitions("A.method1").is_empty());
     assert!(
         !analyzer
-            .get_top_level_declarations(&ProjectFile::new(
+            .top_level_declarations(&ProjectFile::new(
                 analyzer.project().root().to_path_buf(),
                 "A.java"
             ))

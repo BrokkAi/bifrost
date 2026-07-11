@@ -55,7 +55,7 @@ fn test_get_top_level_declarations_java_file() {
     )]);
     let multi = java_multi(&project);
     let java_file = ProjectFile::new(multi.project().root().to_path_buf(), "TestClass.java");
-    let top_level = multi.get_top_level_declarations(&java_file);
+    let top_level = multi.top_level_declarations(&java_file);
 
     assert_eq!(1, top_level.len());
     assert_eq!("TestClass", top_level[0].fq_name());
@@ -67,7 +67,7 @@ fn test_get_top_level_declarations_unsupported_language_returns_empty() {
     let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
     let multi = java_multi(&project);
     let python_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.py");
-    assert!(multi.get_top_level_declarations(&python_file).is_empty());
+    assert!(multi.top_level_declarations(&python_file).is_empty());
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn test_get_top_level_declarations_non_existent_file() {
     let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
     let multi = java_multi(&project);
     let missing = ProjectFile::new(multi.project().root().to_path_buf(), "NonExistent.java");
-    assert!(multi.get_top_level_declarations(&missing).is_empty());
+    assert!(multi.top_level_declarations(&missing).is_empty());
 }
 
 #[test]
@@ -199,8 +199,8 @@ fn test_unknown_extension_no_exception() {
     let _ = multi.get_skeleton_header(&unknown_class);
     let _ = multi.get_sources(&unknown_method, false);
     let _ = multi.get_source(&unknown_class, false);
-    let _ = multi.get_direct_children(&unknown_class);
-    let _ = multi.get_declarations(&unknown_file);
+    let _ = multi.direct_children(&unknown_class);
+    let _ = multi.declarations(&unknown_file);
     let _ = multi.get_skeletons(&unknown_file);
 }
 

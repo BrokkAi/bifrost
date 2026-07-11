@@ -1,8 +1,7 @@
-use crate::analyzer::persistence::AnalyzerStorage;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
     IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, Project,
-    ProjectFile, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,10 +19,6 @@ impl EmptyAnalyzer {
 }
 
 impl IAnalyzer for EmptyAnalyzer {
-    fn indexed_source<'a>(&'a self, _file: &ProjectFile) -> Option<&'a str> {
-        None
-    }
-
     fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::analyzer::CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }
@@ -53,11 +48,19 @@ impl IAnalyzer for EmptyAnalyzer {
         self.project.as_ref()
     }
 
+    fn get_all_declarations(&self) -> Vec<crate::analyzer::CodeUnit> {
+        Vec::new()
+    }
+
     fn declarations(
         &self,
         _file: &crate::analyzer::ProjectFile,
     ) -> std::collections::BTreeSet<crate::analyzer::CodeUnit> {
         std::collections::BTreeSet::new()
+    }
+
+    fn get_definitions(&self, _fq_name: &str) -> Vec<crate::analyzer::CodeUnit> {
+        Vec::new()
     }
 
     fn direct_children(
@@ -156,8 +159,16 @@ pub enum WorkspaceAnalyzer {
 }
 
 impl WorkspaceAnalyzer {
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        match self {
+            Self::Empty(_) => Self::Empty(EmptyAnalyzer::new(project)),
+            Self::Single(delegate) => Self::Single(Box::new(delegate.clone_with_project(project))),
+            Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_with_project(project))),
+        }
+    }
+
     pub fn build(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        Self::build_filtered(project, config, None, None, None)
+        Self::build_filtered(project, config, None, false, None)
     }
 
     pub fn build_for_languages(
@@ -165,63 +176,11 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
     ) -> Self {
-        Self::build_filtered(project, config, Some(languages), None, None)
+        Self::build_filtered(project, config, Some(languages), false, None)
     }
 
-    /// Build the workspace analyzer with persistence enabled. Each
-    /// language analyzer reads/writes its baseline through `storage` —
-    /// see `crate::analyzer::persistence` for the schema + reconcile
-    /// algorithm.
-    pub fn build_with_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<AnalyzerStorage>,
-    ) -> Self {
-        Self::build_filtered(project, config, None, Some(storage), None)
-    }
-
-    pub fn build_with_storage_and_progress<F>(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<AnalyzerStorage>,
-        progress: F,
-    ) -> Self
-    where
-        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
-    {
-        Self::build_filtered(
-            project,
-            config,
-            None,
-            Some(storage),
-            Some(Arc::new(progress)),
-        )
-    }
-
-    /// Storage-aware variant of `build_for_languages`.
-    pub fn build_for_languages_with_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        languages: &BTreeSet<Language>,
-        storage: Arc<AnalyzerStorage>,
-    ) -> Self {
-        Self::build_filtered(project, config, Some(languages), Some(storage), None)
-    }
-
-    /// Build with on-disk persistence at the project's default cache location
-    /// (`<persistence_root>/.bifrost/analyzer.db`) when one is available,
-    /// reusing the persisted baseline so only changed files are re-analyzed.
-    ///
-    /// Persistence is best-effort: when the project has no persistence root,
-    /// the cache path is unsafe (symlinked), or the DB cannot be opened, this
-    /// transparently falls back to a full in-memory `build`. The returned
-    /// analyzer retains the storage handle, so later incremental `update`s
-    /// write their changes back.
     pub fn build_persisted(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        match Self::open_default_storage(project.as_ref()) {
-            Some(storage) => Self::build_with_storage(project, config, storage),
-            None => Self::build(project, config),
-        }
+        Self::build_filtered(project, config, None, true, None)
     }
 
     /// Progress-reporting variant of `build_persisted`.
@@ -233,34 +192,23 @@ impl WorkspaceAnalyzer {
     where
         F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
     {
-        match Self::open_default_storage(project.as_ref()) {
-            Some(storage) => {
-                Self::build_with_storage_and_progress(project, config, storage, progress)
-            }
-            None => Self::build(project, config),
-        }
-    }
-
-    /// Open the analyzer DB at the project's default, symlink-safe cache path.
-    /// Returns `None` (disabling persistence) when there is no persistence
-    /// root, the path is unsafe, or the DB cannot be opened/migrated.
-    fn open_default_storage(project: &dyn Project) -> Option<Arc<AnalyzerStorage>> {
-        project
-            .persistence_root()
-            .and_then(crate::analyzer::persistence::safe_default_db_path)
-            .and_then(|path| AnalyzerStorage::open(path).ok())
-            .map(Arc::new)
+        Self::build_filtered(project, config, None, true, Some(Arc::new(progress)))
     }
 
     fn build_filtered(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         requested_languages: Option<&BTreeSet<Language>>,
-        storage: Option<Arc<AnalyzerStorage>>,
+        persisted: bool,
         progress: Option<BuildProgress>,
     ) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
         let mut delegates = BTreeMap::new();
+        let store_context = if persisted {
+            crate::analyzer::persistent_store_context(project.as_ref())
+        } else {
+            crate::analyzer::default_store_context(project.as_ref())
+        };
         let project_languages = project.analyzer_languages();
         let selected_languages: Vec<_> = match requested_languages {
             Some(requested) if !requested.is_empty() => project_languages
@@ -274,28 +222,17 @@ impl WorkspaceAnalyzer {
                 let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
                 let project = Arc::clone(&project);
                 let cfg = config.clone();
+                let mut store_context = store_context.clone();
+                store_context.live_paths =
+                    Arc::new(crate::analyzer::store::liveness::LivePathMap::default());
                 macro_rules! build_delegate {
                     ($variant:ident, $analyzer:ty) => {
-                        match (storage.as_ref(), progress.as_ref()) {
-                            (Some(storage), Some(progress)) => AnalyzerDelegate::$variant(
-                                <$analyzer>::new_with_config_storage_and_progress(
-                                    project,
-                                    cfg,
-                                    Arc::clone(storage),
-                                    Arc::clone(progress),
-                                ),
-                            ),
-                            (Some(storage), None) => AnalyzerDelegate::$variant(
-                                <$analyzer>::new_with_config_and_storage(
-                                    project,
-                                    cfg,
-                                    Arc::clone(storage),
-                                ),
-                            ),
-                            (None, _) => AnalyzerDelegate::$variant(<$analyzer>::new_with_config(
-                                project, cfg,
-                            )),
-                        }
+                        AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
+                            project,
+                            cfg,
+                            store_context,
+                            progress.as_ref().map(Arc::clone),
+                        ))
                     };
                 }
                 match language {
@@ -345,12 +282,13 @@ impl WorkspaceAnalyzer {
         }
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        match self {
-            Self::Empty(_) => Self::Empty(EmptyAnalyzer::new(project)),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.clone_with_project(project))),
-            Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_with_project(project))),
-        }
+    /// Starts a request-scoped query cache across the active language analyzers.
+    pub(crate) fn begin_query(&self) {
+        self.analyzer().begin_query();
+    }
+
+    pub(crate) fn end_query(&self) {
+        self.analyzer().end_query();
     }
 
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
@@ -367,37 +305,5 @@ impl WorkspaceAnalyzer {
             Self::Single(delegate) => Self::Single(Box::new(delegate.update_all())),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update_all())),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::{FilesystemProject, OverlayProject};
-
-    #[test]
-    fn clone_with_project_rebinds_analyzer_reads_to_overlay_snapshot() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let path = root.join("Main.java");
-        std::fs::write(&path, "class Main {}\n").unwrap();
-        let file = ProjectFile::new(root.clone(), "Main.java");
-        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let overlay = Arc::new(OverlayProject::new(delegate));
-        assert!(overlay.set(path.clone(), "class First {}\n".to_string()));
-        let workspace = WorkspaceAnalyzer::build(overlay.clone(), AnalyzerConfig::default());
-
-        let snapshot = Arc::new(overlay.snapshot());
-        let request_workspace = workspace.clone_with_project(snapshot.clone() as Arc<dyn Project>);
-        assert!(overlay.set(path, "class Second {}\n".to_string()));
-
-        assert_eq!(
-            request_workspace
-                .analyzer()
-                .project()
-                .read_source(&file)
-                .unwrap(),
-            "class First {}\n"
-        );
     }
 }

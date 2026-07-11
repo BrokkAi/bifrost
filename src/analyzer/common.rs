@@ -1,4 +1,5 @@
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use std::path::Path;
 use tree_sitter::Language as TsLanguage;
 
 /// Default longest single line a source file may contain before tree-sitter parsing is
@@ -48,6 +49,24 @@ pub(crate) fn language_for_file(file: &ProjectFile) -> Language {
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
         .unwrap_or(Language::None)
+}
+
+pub(crate) fn rebase_project_file_to_root(file: &ProjectFile, root: &Path) -> Option<ProjectFile> {
+    if file.root() == root {
+        return Some(file.clone());
+    }
+    let abs_path = file.abs_path();
+    let rel = if let Ok(rel) = abs_path.strip_prefix(root) {
+        rel.to_path_buf()
+    } else {
+        let canonical_abs = abs_path.canonicalize().ok()?;
+        let canonical_root = root.canonicalize().ok()?;
+        canonical_abs
+            .strip_prefix(canonical_root)
+            .ok()?
+            .to_path_buf()
+    };
+    Some(ProjectFile::new(root.to_path_buf(), rel))
 }
 
 pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {

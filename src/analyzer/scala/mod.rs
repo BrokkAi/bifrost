@@ -13,12 +13,13 @@ use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_set_by_unit,
     weight_code_unit_vec_by_unit, weight_project_file_set,
 };
+use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language,
-    PoolSafeMemo, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    UsageFactsIndex, build_direct_descendant_index,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -26,7 +27,7 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-use adapter::ScalaAdapter;
+pub(crate) use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
 use tests::detect_scala_test_assertion_smells;
 
@@ -132,14 +133,14 @@ pub struct ScalaAnalyzer {
 }
 
 impl ScalaAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.inner = self.inner.clone_with_project(project);
-        snapshot
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -165,14 +166,6 @@ impl ScalaAnalyzer {
         }
     }
 
-    pub fn new_with_config_and_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
-    }
-
     /// Owned handles to the workspace indexes (refcount bumps, not map
     /// clones), for per-query views held behind `Arc` caches.
     pub(crate) fn definition_lookup_index_shared(
@@ -195,37 +188,20 @@ impl ScalaAnalyzer {
             .clone()
     }
 
-    pub(crate) fn new_with_config_storage_and_progress(
+    pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                ScalaAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                ScalaAdapter,
-                config,
-                storage,
-            ),
-        };
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            ScalaAdapter,
+            config,
+            store_context,
+            progress,
+        );
         Self::from_inner(inner, memo_budget)
     }
 
@@ -236,6 +212,36 @@ impl ScalaAnalyzer {
         Self::new(Arc::new(project))
     }
 
+    pub(crate) fn bulk_file_states(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+        source_mode: BulkFileStateSource,
+    ) -> HashMap<ProjectFile, FileState> {
+        self.inner.bulk_file_states(files, source_mode)
+    }
+
+    pub(crate) fn bulk_import_infos(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+    ) -> HashMap<ProjectFile, Vec<crate::analyzer::ImportInfo>> {
+        self.inner.bulk_import_infos(files)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn bulk_hydration_count_for_test(&self) -> usize {
+        self.inner.bulk_hydration_count_for_test()
+    }
+
     fn render_skeleton_recursive(
         &self,
         code_unit: &CodeUnit,
@@ -243,7 +249,7 @@ impl ScalaAnalyzer {
         header_only: bool,
         out: &mut String,
     ) {
-        for signature in self.signatures_of(code_unit) {
+        for signature in self.signatures(code_unit) {
             if signature.is_empty() {
                 continue;
             }
@@ -286,20 +292,39 @@ impl ScalaAnalyzer {
 impl TestDetectionProvider for ScalaAnalyzer {}
 
 impl IAnalyzer for ScalaAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -356,6 +381,10 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
+    }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
@@ -378,6 +407,14 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.inner.get_all_declarations()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.inner.get_definitions(fq_name)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -445,8 +482,12 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions_persisted(pattern)
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

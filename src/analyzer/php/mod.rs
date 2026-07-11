@@ -13,10 +13,10 @@ use crate::analyzer::js_ts::{
     build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
 };
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
-    build_direct_descendant_index,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer, Language, Project,
+    ProjectFile, Range, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    UsageFactsIndex, build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -49,14 +49,14 @@ pub struct PhpAnalyzer {
 }
 
 impl PhpAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.inner = self.inner.clone_with_project(project);
-        snapshot
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -65,42 +65,20 @@ impl PhpAnalyzer {
         Self::from_inner(inner, memo_budget)
     }
 
-    pub fn new_with_config_and_storage(
+    pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
-    }
-
-    pub(crate) fn new_with_config_storage_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                PhpAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => TreeSitterAnalyzer::new_with_config_and_storage(
-                project, PhpAdapter, config, storage,
-            ),
-        };
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            PhpAdapter,
+            config,
+            store_context,
+            progress,
+        );
         Self::from_inner(inner, memo_budget)
     }
 
@@ -329,20 +307,39 @@ impl TypeHierarchyProvider for PhpAnalyzer {
 }
 
 impl IAnalyzer for PhpAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -395,6 +392,10 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
+    }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
@@ -418,6 +419,14 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn project(&self) -> &dyn Project {
         self.inner.project()
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.inner.get_all_declarations()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.inner.get_definitions(fq_name)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -466,14 +475,7 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         let skeleton = self.inner.get_skeleton(code_unit)?;
-        if code_unit.is_class()
-            && self
-                .inner
-                .direct_children(code_unit)
-                .into_iter()
-                .next()
-                .is_none()
-        {
+        if code_unit.is_class() && self.inner.direct_children(code_unit).is_empty() {
             let trimmed = skeleton.trim();
             if trimmed.ends_with("{\n}") || trimmed.ends_with("{\r\n}") {
                 let compact = trimmed.trim_end_matches('}').trim_end().to_string();
@@ -499,8 +501,12 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions_persisted(pattern)
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
     }
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {

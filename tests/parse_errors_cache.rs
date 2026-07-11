@@ -1,10 +1,11 @@
 //! Regression tests for the analyzer-side parse-error cache that backs the
 //! LSP diagnostic handler. See issue #102 + PR #101 review.
 
-use brokk_bifrost::analyzer::persistence::AnalyzerStorage;
 use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, Language, ParseErrorKind, ProjectFile, PythonAnalyzer, TestProject,
+    WorkspaceAnalyzer,
 };
+use git2::Repository;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -141,23 +142,21 @@ fn hydrated_baseline_returns_none_so_diagnostic_falls_back() {
     // hydrated files would mis-report cleanly. This test pins the contract.
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
+    Repository::init(&root).unwrap();
     write_file(&root, "broken.py", "def x():\n    return 1)\n");
-    let db_dir = tempfile::tempdir().unwrap();
-    let db_path = db_dir.path().join("analyzer.db");
 
-    // Cold start: writes a baseline row that captures everything except
+    // Cold start: writes blob-store rows that capture everything except
     // parse_errors.
     {
-        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
         let project = Arc::new(TestProject::new(root.clone(), Language::Python));
-        let analyzer = PythonAnalyzer::new_with_config_and_storage(
+        let analyzer = WorkspaceAnalyzer::build_persisted(
             project as Arc<dyn brokk_bifrost::Project>,
             AnalyzerConfig::default(),
-            storage,
         );
         let file = project_file(&root, "broken.py");
         // Sanity: the cold-start analyzer DID populate parse_errors.
         let errors = analyzer
+            .analyzer()
             .parse_errors(&file)
             .expect("cold-start analyzer should hold parse_errors");
         assert!(
@@ -166,19 +165,17 @@ fn hydrated_baseline_returns_none_so_diagnostic_falls_back() {
         );
     }
 
-    // Warm start: a fresh analyzer reusing the same DB hydrates from the
-    // baseline without re-parsing. `parse_errors` must return None so the
+    // Warm start: a fresh analyzer reusing the same git workspace hydrates
+    // from the persistent blob store without re-parsing. `parse_errors` must return None so the
     // diagnostic handler knows to fall back to a fresh parse.
-    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
     let project = Arc::new(TestProject::new(root.clone(), Language::Python));
-    let analyzer = PythonAnalyzer::new_with_config_and_storage(
+    let analyzer = WorkspaceAnalyzer::build_persisted(
         project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
-        storage,
     );
     let file = project_file(&root, "broken.py");
     assert!(
-        analyzer.parse_errors(&file).is_none(),
+        analyzer.analyzer().parse_errors(&file).is_none(),
         "hydrated baseline must return None so diagnostic falls back to fresh parse"
     );
 }

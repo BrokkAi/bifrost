@@ -1,25 +1,84 @@
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::persistence::{self, AnalyzerStorage};
+use crate::analyzer::store::AnalyzerStore;
+use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
+use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::{
-    AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, DefinitionLookupIndex, ImportInfo,
-    Language, Project, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
+    AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo,
+    DefinitionLookupIndex, IAnalyzer, ImportInfo, Language, Project, ProjectFile, Range,
+    RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, SummaryFileProjection,
     UsageFactsIndex,
 };
+use crate::gitblob;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+
+const TRANSIENT_FILE_STATE_CACHE_CAPACITY: usize = 128;
+// A broad usage traversal may visit more files than the small cross-request
+// cache holds. Retain hydrated states for one request, then release them.
+const QUERY_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
+const SUMMARY_FILE_PROJECTION_CACHE_CAPACITY: usize = 32;
+const STORE_WRITE_IMMEDIATE_RETRIES: usize = 2;
+const STORE_WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const STORE_WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BulkFileStateSource {
+    Include,
+    Omit,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalkControl {
     Continue,
     SkipChildren,
+}
+
+#[derive(Clone)]
+pub(crate) struct AnalyzerStoreContext {
+    pub(crate) store: Arc<AnalyzerStore>,
+    pub(crate) liveness: Option<Arc<Liveness>>,
+    pub(crate) live_paths: Arc<LivePathMap>,
+}
+
+pub(crate) fn default_store_context(project: &dyn Project) -> AnalyzerStoreContext {
+    store_context(project, false)
+}
+
+pub(crate) fn persistent_store_context(project: &dyn Project) -> AnalyzerStoreContext {
+    store_context(project, true)
+}
+
+fn store_context(project: &dyn Project, persisted: bool) -> AnalyzerStoreContext {
+    let store = if persisted {
+        match project.persistence_root() {
+            Some(root) => AnalyzerStore::open_for_workspace(root)
+                .or_else(|_| AnalyzerStore::open_in_memory())
+                .expect("failed to open analyzer store"),
+            None => {
+                AnalyzerStore::open_in_memory().expect("failed to open in-memory analyzer store")
+            }
+        }
+    } else {
+        AnalyzerStore::open_in_memory().expect("failed to open in-memory analyzer store")
+    };
+    let liveness = gitblob::discover(project.root())
+        .and_then(|repo| Liveness::new(repo).ok())
+        .map(Arc::new);
+    AnalyzerStoreContext {
+        store: Arc::new(store),
+        liveness,
+        live_paths: Arc::new(LivePathMap::default()),
+    }
 }
 
 pub(crate) fn walk_tree_preorder<'tree>(
@@ -82,6 +141,15 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn parser_language_for_file(&self, _file: &ProjectFile) -> TsLanguage {
         self.parser_language()
     }
+    fn storage_language_key_for_file(&self, _file: &ProjectFile) -> String {
+        self.language().config_label().to_string()
+    }
+    fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
+        vec![(
+            self.language().config_label().to_string(),
+            self.parser_language(),
+        )]
+    }
     fn file_extension(&self) -> &'static str;
     fn normalize_full_name(&self, fq_name: &str) -> String {
         fq_name.to_string()
@@ -102,8 +170,50 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn preferred_type_candidate<'a>(&self, candidates: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
         candidates.first()
     }
+    fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
+        lookup_suffix_candidates(normalized_fq_name, &[".", "::"])
+    }
     fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
         false
+    }
+    fn storage_content_qualifier(&self, code_unit: &CodeUnit) -> String {
+        code_unit.package_name().to_string()
+    }
+    /// Whether an ASCII substring match over the persisted content qualifier
+    /// is a sound candidate filter for this adapter's normalized FQNs.
+    fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
+        true
+    }
+    fn storage_file_content_qualifier(&self, package_name: &str) -> String {
+        package_name.to_string()
+    }
+    fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
+        content_qualifier.to_string()
+    }
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        !code_unit.is_file_scope()
+    }
+    fn storage_contains_tests(&self, state: &FileState) -> bool {
+        state.contains_tests
+    }
+    fn hydrate_contains_tests(&self, stored: bool, _file: &ProjectFile, _source: &str) -> bool {
+        stored
+    }
+    fn synthesize_hydrated_units(
+        &self,
+        _file: &ProjectFile,
+        _source: &str,
+        _state: &mut FileState,
+    ) {
+    }
+    fn path_synthetic_module_unit(&self, _file: &ProjectFile) -> Option<CodeUnit> {
+        None
+    }
+    fn path_synthetic_module_requires_imports(&self) -> bool {
+        false
+    }
+    fn include_path_synthetic_module(&self, _has_structured_imports: bool) -> bool {
+        true
     }
     fn contains_tests(
         &self,
@@ -134,54 +244,28 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
 }
 
-/// Language-specific transformations required to store analyzer facts without
-/// baking a live workspace path into content-addressed data. The current
-/// analyzer does not activate a storage backend through this trait; it defines
-/// the contract that a later backend can consume while `FileState` remains the
-/// authoritative runtime representation.
-pub trait StorageLanguageAdapter: LanguageAdapter {
-    fn storage_language_key_for_file(&self, _file: &ProjectFile) -> String {
-        self.language().config_label().to_string()
+pub(crate) fn lookup_suffix_candidates(
+    normalized_fq_name: &str,
+    separators: &[&str],
+) -> Vec<String> {
+    let mut candidates = vec![normalized_fq_name.to_string()];
+    let mut frontier = vec![normalized_fq_name.to_string()];
+    while let Some(current) = frontier.pop() {
+        for separator in separators {
+            if let Some((_, suffix)) = current.split_once(separator)
+                && !suffix.is_empty()
+            {
+                let suffix = suffix.to_string();
+                if !candidates.contains(&suffix) {
+                    frontier.push(suffix.clone());
+                    candidates.push(suffix);
+                }
+            }
+        }
     }
-
-    fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
-        vec![(
-            self.language().config_label().to_string(),
-            self.parser_language(),
-        )]
-    }
-
-    fn storage_content_qualifier(&self, code_unit: &CodeUnit) -> String {
-        code_unit.package_name().to_string()
-    }
-
-    fn storage_file_content_qualifier(&self, package_name: &str) -> String {
-        package_name.to_string()
-    }
-
-    fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
-        content_qualifier.to_string()
-    }
-
-    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        !code_unit.is_file_scope()
-    }
-
-    fn storage_contains_tests(&self, state: &FileState) -> bool {
-        state.contains_tests
-    }
-
-    fn hydrate_contains_tests(&self, stored: bool, _file: &ProjectFile, _source: &str) -> bool {
-        stored
-    }
-
-    fn synthesize_hydrated_units(
-        &self,
-        _file: &ProjectFile,
-        _source: &str,
-        _state: &mut FileState,
-    ) {
-    }
+    candidates.sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
+    candidates.dedup();
+    candidates
 }
 
 pub type BuildProgress = Arc<dyn Fn(BuildProgressEvent) + Send + Sync>;
@@ -244,50 +328,156 @@ pub struct FileState {
     /// Tree-sitter parse errors captured during `analyze_file`. The LSP
     /// diagnostic handler reads this instead of re-parsing on every keystroke
     /// — see issue #102. `None` when the `FileState` was hydrated from the
-    /// persisted baseline (which does not carry parse_errors); the diagnostic
-    /// handler falls back to a fresh parse in that case until the next
-    /// `update` re-populates the field.
+    /// blob store (which does not carry parse_errors); the diagnostic handler
+    /// falls back to a fresh parse in that case until the next `update`
+    /// re-populates the field.
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct AnalyzerState {
-    files: HashMap<ProjectFile, FileState>,
-    definitions: HashMap<String, Vec<CodeUnit>>,
-    // Arc so per-query views (e.g. Scala's ProjectTypes) can hold an owned
-    // handle without cloning the workspace-sized maps.
-    definition_lookup_index: Arc<DefinitionLookupIndex>,
-    usage_facts_index: Arc<UsageFactsIndex>,
-    // Child lists are canonicalized once while building immutable analyzer
-    // state. `direct_children` intentionally exposes this deduped, source-
-    // ordered contract; callers only reorder when they need a presentation-
-    // specific view such as fields-first skeleton rendering.
-    children: HashMap<CodeUnit, Vec<CodeUnit>>,
-    module_children: HashMap<String, Vec<CodeUnit>>,
-    ranges: HashMap<CodeUnit, Vec<Range>>,
-    raw_supertypes: HashMap<CodeUnit, Vec<String>>,
-    signatures: HashMap<CodeUnit, Vec<String>>,
-    signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
-    ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
-    scala_traits: HashSet<CodeUnit>,
-    classes_by_package: HashMap<String, Vec<CodeUnit>>,
-    #[allow(dead_code)]
-    type_aliases: HashSet<CodeUnit>,
+#[derive(Debug, Clone)]
+struct DirtyFileState {
+    state: FileState,
+    attempts: usize,
+    next_retry_at: Instant,
+    _last_error: String,
 }
 
 #[derive(Debug, Default)]
-struct IndexCapacities {
-    definitions: usize,
-    children: usize,
-    module_children: usize,
-    ranges: usize,
-    raw_supertypes: usize,
-    signatures: usize,
-    signature_metadata: usize,
-    ruby_method_dispatch_modes: usize,
-    scala_traits: usize,
-    classes_by_package: usize,
-    type_aliases: usize,
+struct AnalyzerRuntimeState {
+    fresh_parse_errors: HashMap<ProjectFile, Vec<crate::analyzer::ParseError>>,
+    dirty_file_states: Mutex<HashMap<FileStateCacheKey, DirtyFileState>>,
+    seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
+}
+
+impl AnalyzerRuntimeState {
+    fn new(
+        fresh_parse_errors: HashMap<ProjectFile, Vec<crate::analyzer::ParseError>>,
+        dirty_file_states: HashMap<FileStateCacheKey, DirtyFileState>,
+        seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
+    ) -> Self {
+        Self {
+            fresh_parse_errors,
+            dirty_file_states: Mutex::new(dirty_file_states),
+            seeded_file_states,
+        }
+    }
+
+    fn seed_snapshot_file_states(&self, cache: &mut FileStateCache) {
+        for (key, state) in &self.seeded_file_states {
+            cache.insert(key.clone(), Arc::clone(state));
+        }
+    }
+
+    fn dirty_snapshot(&self) -> HashMap<FileStateCacheKey, DirtyFileState> {
+        self.dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned")
+            .clone()
+    }
+}
+
+struct ReconcileFileStates {
+    files: Vec<ProjectFile>,
+    replace_live_paths: bool,
+    progress: Option<BuildProgress>,
+    dirty_file_states: HashMap<FileStateCacheKey, DirtyFileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileStateCacheKey {
+    oid: Oid,
+    rel_path: std::path::PathBuf,
+}
+
+#[derive(Debug)]
+struct BoundedFileCache<T> {
+    capacity: usize,
+    entries: HashMap<FileStateCacheKey, Arc<T>>,
+    order: VecDeque<FileStateCacheKey>,
+}
+
+type FileStateCache = BoundedFileCache<FileState>;
+type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
+
+#[derive(Debug, Default)]
+struct QueryReadCache {
+    depth: usize,
+    live_oids: HashMap<ProjectFile, Option<Oid>>,
+    file_states: HashMap<FileStateCacheKey, Arc<FileState>>,
+}
+
+impl QueryReadCache {
+    fn begin(&mut self) {
+        if self.depth == 0 {
+            self.live_oids.clear();
+            self.file_states.clear();
+        }
+        self.depth += 1;
+    }
+
+    fn end(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+        if self.depth == 0 {
+            self.live_oids.clear();
+            self.file_states.clear();
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.depth > 0
+    }
+
+    fn file_state(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        self.file_states.get(key).cloned()
+    }
+
+    fn retain_file_state(&mut self, key: FileStateCacheKey, state: Arc<FileState>) {
+        if self.file_states.contains_key(&key)
+            || self.file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
+        {
+            self.file_states.insert(key, state);
+        }
+    }
+}
+
+impl<T> BoundedFileCache<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::default(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &FileStateCacheKey) -> Option<Arc<T>> {
+        let state = Arc::clone(self.entries.get(key)?);
+        self.touch(key);
+        Some(state)
+    }
+
+    fn insert(&mut self, key: FileStateCacheKey, value: Arc<T>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.insert(key.clone(), value).is_some() {
+            self.touch(&key);
+            return;
+        }
+        self.order.push_back(key.clone());
+        while self.entries.len() > self.capacity {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&evicted).is_some() {
+                break;
+            }
+        }
+    }
+
+    fn touch(&mut self, key: &FileStateCacheKey) {
+        self.order.retain(|existing| existing != key);
+        self.order.push_back(key.clone());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -305,8 +495,8 @@ pub struct ParsedFile {
     pub ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
     pub scala_traits: HashSet<CodeUnit>,
     pub type_aliases: HashSet<CodeUnit>,
-    ranges: HashMap<CodeUnit, Vec<Range>>,
-    children: HashMap<CodeUnit, Vec<CodeUnit>>,
+    pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
+    pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
 }
 
 impl ParsedFile {
@@ -526,13 +716,23 @@ pub struct TreeSitterAnalyzer<A> {
     project: Arc<dyn Project>,
     adapter: Arc<A>,
     config: AnalyzerConfig,
-    state: Arc<AnalyzerState>,
-    storage: Option<Arc<AnalyzerStorage>>,
+    state: Arc<AnalyzerRuntimeState>,
     /// Structural-search facts cache (issue #328). Shared across clones and
     /// incremental `update()` generations — entries are validated against a
     /// hash of the current in-memory source, so surviving stale entries are
     /// self-healing rather than wrong.
     structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
+    store_context: AnalyzerStoreContext,
+    /// Per-request persisted read model. Live OIDs are validated once and
+    /// hydrated states remain available for the graph traversal.
+    query_read_cache: Arc<Mutex<QueryReadCache>>,
+    transient_file_states: Arc<Mutex<FileStateCache>>,
+    source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
+    summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
+    definition_lookup_index: Arc<OnceLock<DefinitionLookupIndex>>,
+    usage_facts_index: Arc<OnceLock<UsageFactsIndex>>,
+    full_hydration_count: Arc<AtomicUsize>,
+    bulk_hydration_count: Arc<AtomicUsize>,
     _state: PhantomData<A>,
 }
 
@@ -543,8 +743,16 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             adapter: Arc::clone(&self.adapter),
             config: self.config.clone(),
             state: Arc::clone(&self.state),
-            storage: self.storage.as_ref().map(Arc::clone),
             structural_cache: Arc::clone(&self.structural_cache),
+            store_context: self.store_context.clone(),
+            query_read_cache: Arc::clone(&self.query_read_cache),
+            transient_file_states: Arc::clone(&self.transient_file_states),
+            source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
+            summary_file_projections: Arc::clone(&self.summary_file_projections),
+            definition_lookup_index: Arc::clone(&self.definition_lookup_index),
+            usage_facts_index: Arc::clone(&self.usage_facts_index),
+            full_hydration_count: Arc::clone(&self.full_hydration_count),
+            bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
             _state: PhantomData,
         }
     }
@@ -560,7 +768,7 @@ impl<A> TreeSitterAnalyzer<A> {
 
 impl<A> TreeSitterAnalyzer<A>
 where
-    A: LanguageAdapter + StorageLanguageAdapter,
+    A: LanguageAdapter,
 {
     fn child_order_key(ranges: &HashMap<CodeUnit, Vec<Range>>, code_unit: &CodeUnit) -> usize {
         ranges
@@ -594,25 +802,6 @@ where
         descendants.extend(keyed.into_iter().map(|(_, child)| child));
     }
 
-    fn definition_sort_key(
-        adapter: &A,
-        ranges: &HashMap<CodeUnit, Vec<Range>>,
-        code_unit: &CodeUnit,
-    ) -> (i32, usize, String, String, String, String) {
-        let first_start_byte = ranges
-            .get(code_unit)
-            .and_then(|entries| entries.iter().map(|range| range.start_byte).min())
-            .unwrap_or(usize::MAX);
-        (
-            adapter.definition_priority(code_unit),
-            first_start_byte,
-            code_unit.source().to_string().to_ascii_lowercase(),
-            code_unit.fq_name().to_ascii_lowercase(),
-            code_unit.signature().unwrap_or("").to_ascii_lowercase(),
-            format!("{:?}", code_unit.kind()),
-        )
-    }
-
     pub fn new(project: Arc<dyn Project>, adapter: A) -> Self {
         Self::new_with_config(project, adapter, AnalyzerConfig::default())
     }
@@ -621,17 +810,14 @@ where
         Self::new_internal(project, adapter, config, None, None)
     }
 
-    /// Same as `new_with_config` but persists analyzer state to and from
-    /// `storage`. On startup the analyzer reads the persisted baseline,
-    /// reanalyzes only files whose `(mtime_ns, size)` or epoch differ, and
-    /// writes the merged result back in a single transaction.
-    pub fn new_with_config_and_storage(
+    pub(crate) fn new_with_config_storage_context_and_progress(
         project: Arc<dyn Project>,
         adapter: A,
         config: AnalyzerConfig,
-        storage: Arc<AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
+        progress: Option<BuildProgress>,
     ) -> Self {
-        Self::new_internal(project, adapter, config, None, Some(storage))
+        Self::new_internal(project, adapter, config, progress, Some(store_context))
     }
 
     pub fn new_with_progress<F>(project: Arc<dyn Project>, adapter: A, progress: F) -> Self
@@ -653,33 +839,22 @@ where
         Self::new_internal(project, adapter, config, Some(Arc::new(progress)), None)
     }
 
-    pub fn new_with_config_storage_and_progress<F>(
-        project: Arc<dyn Project>,
-        adapter: A,
-        config: AnalyzerConfig,
-        storage: Arc<AnalyzerStorage>,
-        progress: F,
-    ) -> Self
-    where
-        F: Fn(BuildProgressEvent) + Send + Sync + 'static,
-    {
-        Self::new_internal(
-            project,
-            adapter,
-            config,
-            Some(Arc::new(progress)),
-            Some(storage),
-        )
-    }
-
     fn new_internal(
         project: Arc<dyn Project>,
         adapter: A,
         config: AnalyzerConfig,
         progress: Option<BuildProgress>,
-        storage: Option<Arc<AnalyzerStorage>>,
+        store_context: Option<AnalyzerStoreContext>,
     ) -> Self {
         let adapter = Arc::new(adapter);
+        let store_context =
+            store_context.unwrap_or_else(|| default_store_context(project.as_ref()));
+        for (storage_key, parser_language) in adapter.storage_language_keys() {
+            let _ = store_context.store.ensure_language_epoch_value(
+                &storage_key,
+                crate::analyzer::store::epoch::epoch_for(adapter.language(), &parser_language),
+            );
+        }
         let state = {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::new_with_config",
@@ -689,11 +864,13 @@ where
                 project.as_ref(),
                 adapter.as_ref(),
                 &config,
-                None,
                 progress,
-                storage.as_deref(),
+                &store_context,
             ))
         };
+        let mut source_snapshot_file_states =
+            FileStateCache::new(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
+        state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config));
         Self {
@@ -701,8 +878,20 @@ where
             adapter,
             config,
             state,
-            storage,
             structural_cache,
+            store_context,
+            query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
+                TRANSIENT_FILE_STATE_CACHE_CAPACITY,
+            ))),
+            source_snapshot_file_states: Arc::new(Mutex::new(source_snapshot_file_states)),
+            summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
+                SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
+            ))),
+            definition_lookup_index: Arc::new(OnceLock::new()),
+            usage_facts_index: Arc::new(OnceLock::new()),
+            full_hydration_count: Arc::new(AtomicUsize::new(0)),
+            bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
     }
@@ -735,17 +924,32 @@ where
         project: Arc<dyn Project>,
         adapter: Arc<A>,
         config: AnalyzerConfig,
-        state: AnalyzerState,
-        storage: Option<Arc<AnalyzerStorage>>,
+        state: AnalyzerRuntimeState,
         structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
+        store_context: AnalyzerStoreContext,
     ) -> Self {
+        let mut source_snapshot_file_states =
+            FileStateCache::new(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
+        state.seed_snapshot_file_states(&mut source_snapshot_file_states);
         Self {
             project,
             adapter,
             config,
             state: Arc::new(state),
-            storage,
             structural_cache,
+            store_context,
+            query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
+                TRANSIENT_FILE_STATE_CACHE_CAPACITY,
+            ))),
+            source_snapshot_file_states: Arc::new(Mutex::new(source_snapshot_file_states)),
+            summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
+                SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
+            ))),
+            definition_lookup_index: Arc::new(OnceLock::new()),
+            usage_facts_index: Arc::new(OnceLock::new()),
+            full_hydration_count: Arc::new(AtomicUsize::new(0)),
+            bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
     }
@@ -765,6 +969,15 @@ where
         file: &ProjectFile,
     ) -> Option<FileState> {
         let source = project.read_source(file).ok()?;
+        Self::analyze_source(parser, adapter, file, source)
+    }
+
+    fn analyze_source(
+        parser: &mut Parser,
+        adapter: &A,
+        file: &ProjectFile,
+        source: String,
+    ) -> Option<FileState> {
         if crate::analyzer::common::is_unparseable_source(source.as_str()) {
             return None;
         }
@@ -805,35 +1018,14 @@ where
             return None;
         }
 
-        if let Some(parent) = self.state.children.iter().find_map(|(parent, children)| {
-            if children.iter().any(|child| child == code_unit) {
-                Some(parent.clone())
-            } else {
-                None
-            }
-        }) {
-            return Some(parent);
-        }
-
-        for (module_name, children) in &self.state.module_children {
-            if !children.iter().any(|child| child == code_unit) {
-                continue;
-            }
-            if let Some(parent) = self
-                .state
-                .files
-                .values()
-                .flat_map(|state| state.declarations.iter())
-                .find(|unit| {
-                    unit.is_module()
-                        && self.adapter.normalize_full_name(&unit.fq_name()) == *module_name
-                })
-            {
-                return Some(parent.clone());
-            }
-        }
-
-        None
+        self.fetch_file_state(code_unit.source()).and_then(|state| {
+            state.children.iter().find_map(|(parent, children)| {
+                children
+                    .iter()
+                    .any(|child| child == code_unit)
+                    .then(|| parent.clone())
+            })
+        })
     }
 
     pub fn top_level_file_scope_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -841,7 +1033,7 @@ where
             return None;
         }
 
-        let state = self.state.files.get(code_unit.source())?;
+        let state = self.fetch_file_state(code_unit.source())?;
         if !state
             .top_level_declarations
             .iter()
@@ -905,14 +1097,55 @@ where
         })
     }
 
+    fn resolve_live_oids(
+        project: &dyn Project,
+        files: &[ProjectFile],
+        store_context: &AnalyzerStoreContext,
+        replace_live_paths: bool,
+    ) -> Result<HashMap<ProjectFile, Oid>, String> {
+        let mut out = map_with_capacity(files.len());
+        let mut live_entries = Vec::new();
+        for file in files {
+            if !file.exists() && !project.has_overlay(file) {
+                continue;
+            }
+            let (oid, entry) = if project.has_overlay(file) {
+                let source = project.read_source(file).map_err(|err| err.to_string())?;
+                let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                    .map_err(|err| err.to_string())?;
+                (oid, LivePathEntry::overlay(file.clone(), oid))
+            } else if let Some(liveness) = store_context.liveness.as_ref() {
+                let Some(oid) = liveness.oid_for_path(file)? else {
+                    continue;
+                };
+                (oid, LivePathEntry::filesystem(file.clone(), oid))
+            } else {
+                let bytes = std::fs::read(file.abs_path()).map_err(|err| err.to_string())?;
+                let oid =
+                    Oid::hash_object(ObjectType::Blob, &bytes).map_err(|err| err.to_string())?;
+                (oid, LivePathEntry::overlay(file.clone(), oid))
+            };
+            live_entries.push(entry);
+            out.insert(file.clone(), oid);
+        }
+        if let Some(liveness) = store_context.liveness.as_ref() {
+            let _ = liveness.refresh_overlay(live_entries.iter().cloned());
+        }
+        if replace_live_paths {
+            store_context.live_paths.replace_all(live_entries);
+        } else {
+            store_context.live_paths.refresh(live_entries);
+        }
+        Ok(out)
+    }
+
     fn build_state(
         project: &dyn Project,
         adapter: &A,
         config: &AnalyzerConfig,
-        existing: Option<&AnalyzerState>,
         progress: Option<BuildProgress>,
-        storage: Option<&AnalyzerStorage>,
-    ) -> AnalyzerState {
+        store_context: &AnalyzerStoreContext,
+    ) -> AnalyzerRuntimeState {
         let _scope = profiling::scope(format!(
             "TreeSitterAnalyzer::{:?}::build_state",
             adapter.language()
@@ -938,427 +1171,1318 @@ where
                 None,
             ));
         }
-        let analyzable_set: HashSet<_> = analyzable_files.iter().cloned().collect();
-
-        // Decide reconcile partition.
-        let storage_epoch: Option<&'static str> = storage.map(|_| {
-            let ts_lang = adapter.parser_language();
-            persistence::epoch_for(adapter.language(), &ts_lang)
-        });
-
-        let (mut files, dirty_files, mut deletes, epoch_for_commit) = match (storage, storage_epoch)
-        {
-            (Some(storage), Some(epoch_now)) => match persistence::reconcile::plan(
-                storage,
-                adapter.language(),
-                epoch_now,
-                &analyzable_files,
-            ) {
-                Ok(plan) => {
-                    if let Some(progress) = progress.as_ref() {
-                        progress(BuildProgressEvent::new(
-                            adapter.language(),
-                            BuildProgressPhase::Reconcile,
-                            plan.clean_hydrated.len(),
-                            analyzable_files.len(),
-                            None,
-                        ));
-                    }
-                    (
-                        plan.clean_hydrated,
-                        plan.dirty_to_analyze,
-                        plan.deletes,
-                        Some(epoch_now),
-                    )
-                }
-                Err(_) => {
-                    // Storage failed (corrupt, locked, etc.). Fall back to a
-                    // full in-memory rebuild so the analyzer still produces
-                    // results; persistence is best-effort.
-                    (
-                        HashMap::default(),
-                        analyzable_files.clone(),
-                        Vec::new(),
-                        None,
-                    )
-                }
+        let state = Self::reconcile_file_states(
+            project,
+            adapter,
+            config,
+            store_context,
+            ReconcileFileStates {
+                files: analyzable_files.clone(),
+                replace_live_paths: true,
+                progress: progress.clone(),
+                dirty_file_states: HashMap::default(),
             },
-            _ => {
-                let mut files = existing
-                    .map(|state| state.files.clone())
-                    .unwrap_or_default();
-                files.retain(|file, _| analyzable_set.contains(file));
-                let dirty: Vec<_> = analyzable_files.clone();
-                (files, dirty, Vec::new(), None)
-            }
-        };
+        );
 
-        let dirty_keys: HashSet<ProjectFile> = dirty_files.iter().cloned().collect();
-        let storage_active = epoch_for_commit.is_some();
-
-        for (file, state) in
-            Self::analyze_files(adapter, project, config, dirty_files, progress.clone())
-        {
-            if let Some(state) = state {
-                files.insert(file, state);
-            } else {
-                // Parse failure for a workspace file: drop any in-memory
-                // entry AND tell the storage commit to delete the matching
-                // baseline row, so a stale payload from a previous epoch
-                // can't be hydrated next startup.
-                if storage_active {
-                    deletes.push(persistence::reconcile::rel_key(&file));
-                }
-                files.remove(&file);
-            }
-        }
-
-        if let (Some(storage), Some(epoch)) = (storage, epoch_for_commit) {
-            // Skip baseline writes for files whose parsed state was computed
-            // against an in-memory overlay — the on-disk mtime did not change,
-            // so a baseline row would mis-hydrate the next session.
-            let writes = persistence::reconcile::encode_writes(
-                files
-                    .iter()
-                    .filter(|(file, _)| dirty_keys.contains(file))
-                    .filter(|(file, _)| !project.has_overlay(file)),
-                |fq_name| adapter.normalize_full_name(fq_name),
-            );
-            // Persistence is best-effort; a write failure should not poison
-            // the in-memory analyzer.
-            let _ = persistence::reconcile::commit(
-                storage,
+        if let Some(progress) = progress.as_ref() {
+            let total = analyzable_files.len();
+            progress(BuildProgressEvent::new(
                 adapter.language(),
-                epoch,
-                &writes,
-                &deletes,
-            );
-            if let Some(progress) = progress.as_ref() {
-                let total = writes.len() + deletes.len();
-                progress(BuildProgressEvent::new(
-                    adapter.language(),
-                    BuildProgressPhase::Persist,
-                    total,
-                    total,
-                    None,
-                ));
-            }
-        }
-
-        {
-            let _scope = profiling::scope(format!(
-                "TreeSitterAnalyzer::{:?}::index_state",
-                adapter.language()
+                BuildProgressPhase::Index,
+                total,
+                total,
+                None,
             ));
-            if let Some(progress) = progress.as_ref() {
-                progress(BuildProgressEvent::new(
-                    adapter.language(),
-                    BuildProgressPhase::Index,
-                    files.len(),
-                    files.len(),
-                    None,
-                ));
-            }
-            Self::index_state(files, project, adapter)
         }
+        crate::analyzer::store::gc::maybe_gc_in_background(
+            project.root(),
+            Arc::clone(&store_context.store),
+        );
+        state
     }
 
-    fn index_state(
-        files: HashMap<ProjectFile, FileState>,
+    fn reconcile_file_states(
         project: &dyn Project,
         adapter: &A,
-    ) -> AnalyzerState {
-        // The immutable index merges every per-file declaration table once; pre-sizing
-        // these maps avoids repeated growth while building large workspaces.
-        let capacities = Self::index_capacities(&files);
-        let mut definitions = map_with_capacity::<String, Vec<CodeUnit>>(capacities.definitions);
-        let mut definition_lookup_index = DefinitionLookupIndex::default();
-        let mut children = map_with_capacity::<CodeUnit, Vec<CodeUnit>>(capacities.children);
-        let mut module_children =
-            map_with_capacity::<String, Vec<CodeUnit>>(capacities.module_children);
-        let mut ranges = map_with_capacity::<CodeUnit, Vec<Range>>(capacities.ranges);
-        let mut raw_supertypes =
-            map_with_capacity::<CodeUnit, Vec<String>>(capacities.raw_supertypes);
-        let mut signatures = map_with_capacity::<CodeUnit, Vec<String>>(capacities.signatures);
-        let mut signature_metadata =
-            map_with_capacity::<CodeUnit, Vec<SignatureMetadata>>(capacities.signature_metadata);
-        let mut ruby_method_dispatch_modes = map_with_capacity::<CodeUnit, RubyMethodDispatchMode>(
-            capacities.ruby_method_dispatch_modes,
-        );
-        let mut scala_traits = set_with_capacity::<CodeUnit>(capacities.scala_traits);
-        let mut classes_by_package =
-            map_with_capacity::<String, Vec<CodeUnit>>(capacities.classes_by_package);
-        let mut type_aliases = set_with_capacity::<CodeUnit>(capacities.type_aliases);
-
-        for state in files.values() {
-            for declaration in &state.declarations {
-                if !declaration.is_file_scope() {
-                    definition_lookup_index.insert(
-                        declaration,
-                        &|fq_name| adapter.normalize_full_name(fq_name),
-                        &|unit| adapter.simple_type_name(unit),
-                    );
-                    definitions
-                        .entry(adapter.normalize_full_name(&declaration.fq_name()))
-                        .or_default()
-                        .push(declaration.clone());
-                }
-                if declaration.is_class() {
-                    classes_by_package
-                        .entry(declaration.package_name().to_string())
-                        .or_default()
-                        .push(declaration.clone());
-                }
-            }
-            for lookup_unit in &state.definition_lookup_units {
-                definition_lookup_index.insert(
-                    lookup_unit,
-                    &|fq_name| adapter.normalize_full_name(fq_name),
-                    &|unit| adapter.simple_type_name(unit),
-                );
-            }
-
-            for (parent, descendants) in &state.children {
-                children
-                    .entry(parent.clone())
-                    .or_default()
-                    .extend(descendants.iter().cloned());
-            }
-
-            for (code_unit, code_unit_ranges) in &state.ranges {
-                ranges
-                    .entry(code_unit.clone())
-                    .or_default()
-                    .extend(code_unit_ranges.iter().copied());
-            }
-
-            for (code_unit, raw) in &state.raw_supertypes {
-                raw_supertypes.insert(code_unit.clone(), raw.clone());
-            }
-
-            for (code_unit, sigs) in &state.signatures {
-                signatures
-                    .entry(code_unit.clone())
-                    .or_default()
-                    .extend(sigs.iter().cloned());
-            }
-
-            for (code_unit, metadata) in &state.signature_metadata {
-                signature_metadata
-                    .entry(code_unit.clone())
-                    .or_default()
-                    .extend(metadata.iter().cloned());
-            }
-
-            ruby_method_dispatch_modes.extend(
-                state
-                    .ruby_method_dispatch_modes
-                    .iter()
-                    .map(|(unit, mode)| (unit.clone(), *mode)),
-            );
-
-            scala_traits.extend(state.scala_traits.iter().cloned());
-            type_aliases.extend(state.type_aliases.iter().cloned());
-        }
-
-        for (parent, descendants) in children.iter_mut() {
-            Self::canonicalize_children(descendants, &ranges);
-            if parent.is_module() {
-                module_children
-                    .entry(adapter.normalize_full_name(&parent.fq_name()))
-                    .or_default()
-                    .extend(descendants.iter().cloned());
-            }
-        }
-
-        for descendants in module_children.values_mut() {
-            Self::canonicalize_children(descendants, &ranges);
-        }
-
-        for matches in definitions.values_mut() {
-            matches.sort_by_cached_key(|code_unit| {
-                Self::definition_sort_key(adapter, &ranges, code_unit)
-            });
-            matches.dedup();
-        }
-        definition_lookup_index.sort_entries();
-
-        for matches in classes_by_package.values_mut() {
-            matches.sort_by_cached_key(|code_unit| {
-                Self::definition_sort_key(adapter, &ranges, code_unit)
-            });
-            matches.dedup();
-        }
-
-        let _ = project;
-        let usage_facts_index = UsageFactsIndex::build_from_declarations(
-            &definition_lookup_index,
-            files.values().flat_map(|state| state.declarations.iter()),
-            |unit| {
-                signatures
-                    .get(unit)
-                    .and_then(|entries| entries.first().cloned())
-                    .or_else(|| unit.signature().map(str::to_string))
-            },
-            |unit| {
-                signature_metadata
-                    .get(unit)
-                    .and_then(|entries| entries.first().cloned())
-            },
-            adapter,
-        );
-
-        AnalyzerState {
+        config: &AnalyzerConfig,
+        store_context: &AnalyzerStoreContext,
+        input: ReconcileFileStates,
+    ) -> AnalyzerRuntimeState {
+        let ReconcileFileStates {
             files,
-            definitions,
-            definition_lookup_index: Arc::new(definition_lookup_index),
-            usage_facts_index: Arc::new(usage_facts_index),
-            children,
-            module_children,
-            ranges,
-            raw_supertypes,
-            signatures,
-            signature_metadata,
-            ruby_method_dispatch_modes,
-            scala_traits,
-            classes_by_package,
-            type_aliases,
+            replace_live_paths,
+            progress,
+            mut dirty_file_states,
+        } = input;
+        let mut fresh_parse_errors = HashMap::default();
+        let mut seeded_file_states = Vec::new();
+        let oid_plan = Self::resolve_live_oids(project, &files, store_context, replace_live_paths);
+        match oid_plan {
+            Ok(file_oids) => {
+                let all_blob_keys: Vec<_> = file_oids
+                    .iter()
+                    .map(|(file, oid)| (*oid, adapter.storage_language_key_for_file(file)))
+                    .collect();
+                let missing = store_context
+                    .store
+                    .missing_parsed_blob_keys(&all_blob_keys)
+                    .unwrap_or(all_blob_keys);
+                let missing_blob_keys: HashSet<(Oid, String)> = missing.iter().cloned().collect();
+
+                if let Some(progress) = progress.as_ref() {
+                    progress(BuildProgressEvent::new(
+                        adapter.language(),
+                        BuildProgressPhase::Reconcile,
+                        files.len().saturating_sub(missing_blob_keys.len()),
+                        files.len(),
+                        None,
+                    ));
+                }
+
+                let mut representative_by_blob_key = HashMap::default();
+                for (file, oid) in &file_oids {
+                    let storage_key = adapter.storage_language_key_for_file(file);
+                    if missing_blob_keys.contains(&(*oid, storage_key.clone())) {
+                        representative_by_blob_key
+                            .entry((*oid, storage_key))
+                            .or_insert_with(|| file.clone());
+                    }
+                }
+                let parse_targets: Vec<_> = missing
+                    .iter()
+                    .filter_map(|blob_key| representative_by_blob_key.get(blob_key).cloned())
+                    .collect();
+                let mut failed_blob_keys = HashSet::default();
+                let mut parsed_files = HashSet::default();
+                for (file, state) in
+                    Self::analyze_files(adapter, project, config, parse_targets, progress.clone())
+                {
+                    let Some(oid) = file_oids.get(&file).copied() else {
+                        continue;
+                    };
+                    let storage_key = adapter.storage_language_key_for_file(&file);
+                    match state {
+                        Some(state) => {
+                            let key = Self::transient_cache_key(oid, &file);
+                            Self::persist_or_mark_dirty(
+                                &mut dirty_file_states,
+                                store_context,
+                                adapter,
+                                &file,
+                                oid,
+                                &storage_key,
+                                &state,
+                            );
+                            if let Some(errors) = state.parse_errors.clone() {
+                                fresh_parse_errors.insert(file.clone(), errors);
+                            }
+                            if seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY {
+                                seeded_file_states.push((key, Arc::new(state)));
+                            }
+                            parsed_files.insert(file);
+                        }
+                        None => {
+                            failed_blob_keys.insert((oid, storage_key));
+                        }
+                    }
+                }
+
+                let mut hydrate_misses = Vec::new();
+                for file in &files {
+                    if parsed_files.contains(file) {
+                        continue;
+                    }
+                    let Some(oid) = file_oids.get(file).copied() else {
+                        continue;
+                    };
+                    let storage_key = adapter.storage_language_key_for_file(file);
+                    if failed_blob_keys.contains(&(oid, storage_key.clone())) {
+                        continue;
+                    }
+                    if !store_context
+                        .store
+                        .contains_parsed_blob(oid, &storage_key)
+                        .unwrap_or(false)
+                    {
+                        hydrate_misses.push(file.clone());
+                    }
+                }
+
+                for (file, state) in
+                    Self::analyze_files(adapter, project, config, hydrate_misses, progress)
+                {
+                    let Some(state) = state else {
+                        continue;
+                    };
+                    let mut seed_key = None;
+                    if let Some(oid) = file_oids.get(&file).copied() {
+                        let storage_key = adapter.storage_language_key_for_file(&file);
+                        Self::persist_or_mark_dirty(
+                            &mut dirty_file_states,
+                            store_context,
+                            adapter,
+                            &file,
+                            oid,
+                            &storage_key,
+                            &state,
+                        );
+                        seed_key = Some(Self::transient_cache_key(oid, &file));
+                    }
+                    if let Some(errors) = state.parse_errors.clone() {
+                        fresh_parse_errors.insert(file.clone(), errors);
+                    }
+                    if let Some(key) = seed_key
+                        && seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY
+                    {
+                        seeded_file_states.push((key, Arc::new(state)));
+                    }
+                }
+            }
+            Err(_) => {
+                for (file, state) in Self::analyze_files(adapter, project, config, files, progress)
+                {
+                    let Some(state) = state else {
+                        continue;
+                    };
+                    let seed_key = if let Ok(source) = project.read_source(&file)
+                        && let Ok(oid) = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                    {
+                        let storage_key = adapter.storage_language_key_for_file(&file);
+                        Self::persist_or_mark_dirty(
+                            &mut dirty_file_states,
+                            store_context,
+                            adapter,
+                            &file,
+                            oid,
+                            &storage_key,
+                            &state,
+                        );
+                        Some(Self::transient_cache_key(oid, &file))
+                    } else {
+                        None
+                    };
+                    if let Some(errors) = state.parse_errors.clone() {
+                        fresh_parse_errors.insert(file.clone(), errors);
+                    }
+                    if let Some(key) = seed_key
+                        && seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY
+                    {
+                        seeded_file_states.push((key, Arc::new(state)));
+                    }
+                }
+            }
         }
+
+        AnalyzerRuntimeState::new(fresh_parse_errors, dirty_file_states, seeded_file_states)
     }
 
-    fn index_capacities(files: &HashMap<ProjectFile, FileState>) -> IndexCapacities {
-        let mut capacities = IndexCapacities::default();
-        let mut class_declarations = 0usize;
-
-        for state in files.values() {
-            capacities.definitions += state.declarations.len();
-            capacities.children += state.children.len();
-            capacities.module_children += state
-                .children
-                .keys()
-                .filter(|parent| parent.is_module())
-                .count();
-            capacities.ranges += state.ranges.len();
-            capacities.raw_supertypes += state.raw_supertypes.len();
-            capacities.signatures += state.signatures.len();
-            capacities.signature_metadata += state.signature_metadata.len();
-            capacities.ruby_method_dispatch_modes += state.ruby_method_dispatch_modes.len();
-            capacities.scala_traits += state.scala_traits.len();
-            capacities.type_aliases += state.type_aliases.len();
-            class_declarations += state
-                .declarations
-                .iter()
-                .filter(|declaration| declaration.is_class())
-                .count();
-        }
-
-        capacities.classes_by_package = class_declarations.min(files.len());
-        capacities
-    }
-
-    fn file_state(&self, file: &ProjectFile) -> Option<&FileState> {
-        self.state.files.get(file)
+    fn source_snapshot_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let key = Self::transient_cache_key(oid, file);
+        self.source_snapshot_file_states
+            .lock()
+            .expect("source snapshot file-state cache mutex poisoned")
+            .get(&key)
     }
 
     /// The retained source text of an analyzed file. Structural search
     /// re-parses from this instead of touching disk.
-    pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<&str> {
-        self.file_state(file).map(|state| state.source.as_str())
+    pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<String> {
+        self.source_snapshot_file_state(file)
+            .or_else(|| self.fetch_file_state(file))
+            .map(|state| state.source.clone())
+            .or_else(|| self.project.read_source(file).ok())
     }
 
-    pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {
-        self.file_state(file)
-            .map(|state| state.package_name.as_str())
+    fn transient_cache_key(oid: Oid, file: &ProjectFile) -> FileStateCacheKey {
+        FileStateCacheKey {
+            oid,
+            rel_path: file.rel_path().to_path_buf(),
+        }
+    }
+
+    fn dirty_retry_delay(attempts: usize) -> Duration {
+        let exponent = attempts.saturating_sub(1).min(7) as u32;
+        let factor = 1u32 << exponent;
+        STORE_WRITE_RETRY_BASE_DELAY
+            .saturating_mul(factor)
+            .min(STORE_WRITE_RETRY_MAX_DELAY)
+    }
+
+    fn dirty_file_state(state: FileState, attempts: usize, last_error: String) -> DirtyFileState {
+        DirtyFileState {
+            state,
+            attempts,
+            next_retry_at: Instant::now() + Self::dirty_retry_delay(attempts),
+            _last_error: last_error,
+        }
+    }
+
+    fn write_parsed_blob_with_retries(
+        store_context: &AnalyzerStoreContext,
+        adapter: &A,
+        oid: Oid,
+        storage_key: &str,
+        state: &FileState,
+    ) -> std::result::Result<usize, String> {
+        let mut last_error = String::new();
+        for attempt in 1..=STORE_WRITE_IMMEDIATE_RETRIES + 1 {
+            match store_context
+                .store
+                .write_parsed_blob(oid, storage_key, adapter, state)
+            {
+                Ok(()) => return Ok(attempt),
+                Err(err) => {
+                    last_error = err.to_string();
+                    if attempt <= STORE_WRITE_IMMEDIATE_RETRIES {
+                        std::thread::sleep(Duration::from_millis(10 * attempt as u64));
+                    }
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    fn persist_or_mark_dirty(
+        dirty_file_states: &mut HashMap<FileStateCacheKey, DirtyFileState>,
+        store_context: &AnalyzerStoreContext,
+        adapter: &A,
+        file: &ProjectFile,
+        oid: Oid,
+        storage_key: &str,
+        state: &FileState,
+    ) {
+        let key = Self::transient_cache_key(oid, file);
+        match Self::write_parsed_blob_with_retries(store_context, adapter, oid, storage_key, state)
+        {
+            Ok(_) => {
+                dirty_file_states.remove(&key);
+            }
+            Err(err) => {
+                dirty_file_states.insert(
+                    key,
+                    Self::dirty_file_state(state.clone(), STORE_WRITE_IMMEDIATE_RETRIES + 1, err),
+                );
+            }
+        }
+    }
+
+    fn remove_dirty_for_file(
+        dirty_file_states: &mut HashMap<FileStateCacheKey, DirtyFileState>,
+        file: &ProjectFile,
+    ) {
+        let rel_path = file.rel_path();
+        dirty_file_states.retain(|key, _| key.rel_path != rel_path);
+    }
+
+    fn retry_dirty_file_state(
+        &self,
+        key: &FileStateCacheKey,
+        storage_key: &str,
+    ) -> Option<FileState> {
+        let state = {
+            let dirty_file_states = self
+                .state
+                .dirty_file_states
+                .lock()
+                .expect("dirty file-state mutex poisoned");
+            let dirty = dirty_file_states.get(key)?;
+            if Instant::now() < dirty.next_retry_at {
+                return Some(dirty.state.clone());
+            }
+            dirty.state.clone()
+        };
+
+        match self.store_context.store.write_parsed_blob(
+            key.oid,
+            storage_key,
+            self.adapter.as_ref(),
+            &state,
+        ) {
+            Ok(()) => {
+                self.state
+                    .dirty_file_states
+                    .lock()
+                    .expect("dirty file-state mutex poisoned")
+                    .remove(key);
+                self.transient_file_states
+                    .lock()
+                    .expect("transient file-state cache mutex poisoned")
+                    .insert(key.clone(), Arc::new(state.clone()));
+                Some(state)
+            }
+            Err(err) => {
+                let mut dirty_file_states = self
+                    .state
+                    .dirty_file_states
+                    .lock()
+                    .expect("dirty file-state mutex poisoned");
+                if let Some(dirty) = dirty_file_states.get_mut(key) {
+                    dirty.attempts = dirty.attempts.saturating_add(1);
+                    dirty.next_retry_at = Instant::now() + Self::dirty_retry_delay(dirty.attempts);
+                    dirty._last_error = err.to_string();
+                    return Some(dirty.state.clone());
+                }
+                Some(state)
+            }
+        }
+    }
+
+    fn storage_language_keys_for_queries(&self) -> Vec<String> {
+        self.adapter
+            .storage_language_keys()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    pub(crate) fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let key = Self::transient_cache_key(oid, file);
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
+            return Some(Arc::new(state));
+        }
+        if let Some(state) = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned")
+            .file_state(&key)
+        {
+            return Some(state);
+        }
+        if let Some(state) = self
+            .transient_file_states
+            .lock()
+            .expect("transient file-state cache mutex poisoned")
+            .get(&key)
+        {
+            let mut query_cache = self
+                .query_read_cache
+                .lock()
+                .expect("query read cache mutex poisoned");
+            if query_cache.is_active() {
+                query_cache.retain_file_state(key, Arc::clone(&state));
+            }
+            return Some(state);
+        }
+
+        self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
+        let source = self.source_for_oid(file, oid)?;
+        let mut state = match self
+            .store_context
+            .store
+            .hydrate_file_state_with_source(oid, &storage_key, self.adapter.as_ref(), file, &source)
+            .ok()
+            .flatten()
+        {
+            Some(state) => state,
+            None => self.parse_and_store_transient(file, oid, source.clone())?,
+        };
+        state.source = source;
+        let state = Arc::new(state);
+        self.transient_file_states
+            .lock()
+            .expect("transient file-state cache mutex poisoned")
+            .insert(key.clone(), Arc::clone(&state));
+        let mut query_cache = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned");
+        if query_cache.is_active() {
+            query_cache.retain_file_state(key, Arc::clone(&state));
+        }
+        Some(state)
+    }
+
+    pub(crate) fn bulk_file_states(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+        source_mode: BulkFileStateSource,
+    ) -> HashMap<ProjectFile, FileState> {
+        let mut entries = Vec::new();
+        let mut seen = HashSet::default();
+        for file in files {
+            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+                continue;
+            }
+            if !seen.insert(file.clone()) {
+                continue;
+            }
+            let Some(oid) = self.resolve_live_oid_for_file(&file) else {
+                continue;
+            };
+            let storage_key = self.adapter.storage_language_key_for_file(&file);
+            entries.push((file, oid, storage_key));
+        }
+        if entries.is_empty() {
+            return HashMap::default();
+        }
+
+        let mut out = HashMap::default();
+        let mut clean_entries = Vec::new();
+        for (file, oid, storage_key) in entries {
+            let key = Self::transient_cache_key(oid, &file);
+            if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
+                out.insert(file, state);
+            } else {
+                clean_entries.push((file, oid, storage_key));
+            }
+        }
+        let entries = clean_entries;
+        if entries.is_empty() {
+            return out;
+        }
+
+        let mut source_by_file = HashMap::default();
+        if source_mode == BulkFileStateSource::Include {
+            for (file, oid, _) in &entries {
+                if let Some(source) = self.source_for_oid(file, *oid) {
+                    source_by_file.insert(file.clone(), source);
+                }
+            }
+        }
+
+        let mut states = self
+            .store_context
+            .store
+            .hydrate_file_states_by_key(&entries, self.adapter.as_ref(), &source_by_file)
+            .unwrap_or_default();
+        self.bulk_hydration_count
+            .fetch_add(states.len(), Ordering::Relaxed);
+        for (file, oid, _) in entries {
+            if states.contains_key(&file) {
+                continue;
+            }
+            if let Some(source) = self.source_for_oid(&file, oid)
+                && let Some(state) = self.parse_and_store_transient(&file, oid, source)
+            {
+                states.insert(file, state);
+            }
+        }
+        out.extend(states);
+        out
+    }
+
+    pub(crate) fn bulk_import_infos(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+    ) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+        let mut entries = Vec::new();
+        let mut seen = HashSet::default();
+        for file in files {
+            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+                continue;
+            }
+            if !seen.insert(file.clone()) {
+                continue;
+            }
+            let Some(oid) = self.resolve_live_oid_for_file(&file) else {
+                continue;
+            };
+            let storage_key = self.adapter.storage_language_key_for_file(&file);
+            entries.push((file, oid, storage_key));
+        }
+        if entries.is_empty() {
+            return HashMap::default();
+        }
+        let mut out = HashMap::default();
+        let mut clean_entries = Vec::new();
+        for (file, oid, storage_key) in entries {
+            let key = Self::transient_cache_key(oid, &file);
+            if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
+                out.insert(file, state.imports);
+            } else {
+                clean_entries.push((file, oid, storage_key));
+            }
+        }
+        let entries = clean_entries;
+        if entries.is_empty() {
+            return out;
+        }
+        let mut imports = self
+            .store_context
+            .store
+            .hydrate_import_infos_by_key(&entries, self.adapter.as_ref())
+            .unwrap_or_default();
+        self.bulk_hydration_count
+            .fetch_add(imports.len(), Ordering::Relaxed);
+        for (file, oid, _) in entries {
+            if imports.contains_key(&file) {
+                continue;
+            }
+            if let Some(source) = self.source_for_oid(&file, oid)
+                && let Some(state) = self.parse_and_store_transient(&file, oid, source)
+            {
+                imports.insert(file, state.imports);
+            }
+        }
+        out.extend(imports);
+        out
+    }
+
+    fn resolve_live_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {
+        if self.project.has_overlay(file) {
+            let source = self.project.read_source(file).ok()?;
+            return Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok();
+        }
+        {
+            let cache = self
+                .query_read_cache
+                .lock()
+                .expect("query read cache mutex poisoned");
+            if cache.is_active()
+                && let Some(oid) = cache.live_oids.get(file).copied()
+            {
+                return oid;
+            }
+        }
+        let oid = if let Some(oid) = self
+            .store_context
+            .live_paths
+            .snapshot()
+            .validated_oid_for_path(file)
+        {
+            Some(oid)
+        } else if let Some(liveness) = self.store_context.liveness.as_ref()
+            && let Ok(Some(oid)) = liveness.oid_for_path(file)
+        {
+            Some(oid)
+        } else if file.exists()
+            && let Ok(bytes) = std::fs::read(file.abs_path())
+            && let Ok(oid) = Oid::hash_object(ObjectType::Blob, &bytes)
+        {
+            Some(oid)
+        } else {
+            self.git_index_oid_for_file(file)
+        };
+        let mut cache = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned");
+        if cache.is_active() {
+            cache.live_oids.insert(file.clone(), oid);
+        }
+        oid
+    }
+
+    fn git_index_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {
+        let repo = gitblob::discover(self.project.root())?;
+        let index = repo.index().ok()?;
+        index.get_path(file.rel_path(), 0).map(|entry| entry.id)
+    }
+
+    fn source_for_oid(&self, file: &ProjectFile, oid: Oid) -> Option<String> {
+        if let Ok(source) = self.project.read_source(file)
+            && Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok() == Some(oid)
+        {
+            return Some(source);
+        }
+        if let Some(source) = self.source_from_git_blob(oid) {
+            return Some(source);
+        }
+        None
+    }
+
+    fn source_from_git_blob(&self, oid: Oid) -> Option<String> {
+        let repo = gitblob::discover(self.project.root())?;
+        let bytes = gitblob::read_blob(&repo, &oid.to_string()).ok()?;
+        String::from_utf8(bytes).ok()
+    }
+
+    fn parse_and_store_transient(
+        &self,
+        file: &ProjectFile,
+        oid: Oid,
+        source: String,
+    ) -> Option<FileState> {
+        let mut parser = Self::build_parser(self.adapter.parser_language());
+        let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let key = Self::transient_cache_key(oid, file);
+        match Self::write_parsed_blob_with_retries(
+            &self.store_context,
+            self.adapter.as_ref(),
+            oid,
+            &storage_key,
+            &state,
+        ) {
+            Ok(_) => {
+                self.state
+                    .dirty_file_states
+                    .lock()
+                    .expect("dirty file-state mutex poisoned")
+                    .remove(&key);
+            }
+            Err(err) => {
+                self.state
+                    .dirty_file_states
+                    .lock()
+                    .expect("dirty file-state mutex poisoned")
+                    .insert(
+                        key,
+                        Self::dirty_file_state(
+                            state.clone(),
+                            STORE_WRITE_IMMEDIATE_RETRIES + 1,
+                            err,
+                        ),
+                    );
+            }
+        }
+        let live_entry = if self.project.has_overlay(file) || self.store_context.liveness.is_none()
+        {
+            LivePathEntry::overlay(file.clone(), oid)
+        } else {
+            LivePathEntry::filesystem(file.clone(), oid)
+        };
+        self.store_context.live_paths.refresh([live_entry]);
+        Some(state)
+    }
+
+    fn live_snapshot(&self) -> Arc<LiveSnapshot> {
+        self.store_context.live_paths.snapshot()
+    }
+
+    fn analyzed_live_files(&self) -> Vec<ProjectFile> {
+        let snapshot = self.live_snapshot();
+        let mut files = Vec::new();
+        for file in snapshot.all_paths() {
+            let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
+                continue;
+            };
+            if crate::analyzer::common::language_for_file(&project_file) != self.adapter.language()
+            {
+                continue;
+            }
+            let Some(oid) = snapshot.validated_oid_for_path(file) else {
+                continue;
+            };
+            let storage_key = self.adapter.storage_language_key_for_file(&project_file);
+            let key = Self::transient_cache_key(oid, &project_file);
+            if self.retry_dirty_file_state(&key, &storage_key).is_some() {
+                files.push(project_file);
+                continue;
+            }
+            if self
+                .store_context
+                .store
+                .contains_parsed_blob(oid, &storage_key)
+                .unwrap_or(false)
+            {
+                files.push(project_file);
+            }
+        }
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    fn resolve_candidate_rows(
+        &self,
+        rows: Vec<crate::analyzer::store::CandidateRow>,
+    ) -> Vec<CodeUnit> {
+        QueryResolver::from_snapshot(
+            self.adapter.as_ref(),
+            self.project.root(),
+            self.live_snapshot(),
+        )
+        .resolve_rows(rows)
+    }
+
+    fn rebase_live_file_to_project_root(&self, file: &ProjectFile) -> Option<ProjectFile> {
+        crate::analyzer::common::rebase_project_file_to_root(file, self.project.root())
+    }
+
+    fn sql_nonpersisted_workspace_declarations_vec_matching(
+        &self,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
+    ) -> Option<Vec<CodeUnit>> {
+        let snapshot = self.live_snapshot();
+        let mut candidates = Vec::new();
+        let mut candidate_files = Vec::new();
+        for file in snapshot.all_paths() {
+            let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
+                continue;
+            };
+            if crate::analyzer::common::language_for_file(&project_file) != self.adapter.language()
+            {
+                continue;
+            }
+            let Some(module) = self.adapter.path_synthetic_module_unit(&project_file) else {
+                continue;
+            };
+            if !keep(&module) {
+                continue;
+            }
+            let Some(oid) = snapshot.oid_for_path(file) else {
+                continue;
+            };
+            candidate_files.push(file.clone());
+            candidates.push((file.clone(), oid, module));
+        }
+
+        let stale: HashSet<_> = snapshot
+            .validate(candidate_files.iter())
+            .into_iter()
+            .collect();
+        candidates.retain(|(file, _, _)| !stale.contains(file));
+
+        if self.adapter.path_synthetic_module_requires_imports() {
+            let mut blob_keys: Vec<_> = candidates
+                .iter()
+                .map(|(file, oid, _)| {
+                    let project_file = self
+                        .rebase_live_file_to_project_root(file)
+                        .unwrap_or_else(|| file.clone());
+                    (
+                        *oid,
+                        self.adapter.storage_language_key_for_file(&project_file),
+                    )
+                })
+                .collect();
+            blob_keys.sort();
+            blob_keys.dedup();
+            let import_oids = self
+                .store_context
+                .store
+                .blobs_with_structured_imports_by_keys(&blob_keys)
+                .ok()?;
+            candidates.retain(|(file, oid, _)| {
+                let project_file = self
+                    .rebase_live_file_to_project_root(file)
+                    .unwrap_or_else(|| file.clone());
+                self.adapter
+                    .include_path_synthetic_module(import_oids.contains(&(
+                        *oid,
+                        self.adapter.storage_language_key_for_file(&project_file),
+                    )))
+            });
+        }
+
+        let mut declarations: Vec<_> = candidates
+            .into_iter()
+            .map(|(_, _, module)| module)
+            .filter(|unit| !unit.is_file_scope())
+            .collect();
+        declarations.sort();
+        declarations.dedup();
+        Some(declarations)
+    }
+
+    fn dirty_file_states_for_queries(&self) -> Vec<FileState> {
+        let snapshot = self.live_snapshot();
+        let dirty = self.state.dirty_snapshot();
+        let mut states = Vec::new();
+        for (key, _) in dirty {
+            let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path.clone());
+            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+                continue;
+            }
+            if snapshot.validated_oid_for_path(&file) != Some(key.oid) {
+                continue;
+            }
+            let storage_key = self.adapter.storage_language_key_for_file(&file);
+            if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
+                states.push(state);
+            }
+        }
+        states
+    }
+
+    fn dirty_units_matching(
+        &self,
+        include_definition_lookup_units: bool,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
+    ) -> Vec<CodeUnit> {
+        let mut out = Vec::new();
+        for state in self.dirty_file_states_for_queries() {
+            out.extend(
+                state
+                    .declarations
+                    .into_iter()
+                    .filter(|unit| !unit.is_file_scope() && keep(unit)),
+            );
+            if include_definition_lookup_units {
+                out.extend(
+                    state
+                        .definition_lookup_units
+                        .into_iter()
+                        .filter(|unit| !unit.is_file_scope() && keep(unit)),
+                );
+            }
+        }
+        out
+    }
+
+    fn sql_definition_lookup_index(&self) -> Option<DefinitionLookupIndex> {
+        let snapshot = self.live_snapshot();
+        let mut blob_keys = Vec::new();
+        for file in snapshot.all_paths() {
+            let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
+                continue;
+            };
+            if crate::analyzer::common::language_for_file(&project_file) != self.adapter.language()
+            {
+                continue;
+            }
+            let Some(oid) = snapshot.oid_for_path(file) else {
+                continue;
+            };
+            blob_keys.push((
+                oid,
+                self.adapter.storage_language_key_for_file(&project_file),
+            ));
+        }
+        blob_keys.sort();
+        blob_keys.dedup();
+
+        let rows = self
+            .store_context
+            .store
+            .definition_lookup_candidate_rows_by_keys(&blob_keys)
+            .ok()?;
+        let mut units = self.resolve_candidate_rows(rows);
+        units.retain(|unit| !unit.is_file_scope());
+        units.extend(self.dirty_units_matching(true, |_| true));
+        units.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                !unit.is_file_scope()
+            })?,
+        );
+        Some(DefinitionLookupIndex::from_declarations(
+            units.iter(),
+            |fqn| self.adapter.normalize_full_name(fqn),
+            |unit| self.adapter.simple_type_name(unit),
+        ))
+    }
+
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.full_hydration_count.store(0, Ordering::Relaxed);
+        self.bulk_hydration_count.store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.full_hydration_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn bulk_hydration_count_for_test(&self) -> usize {
+        self.bulk_hydration_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn write_live_file_to_store_for_test(&self, file: &ProjectFile) -> Option<()> {
+        if !file.exists() && !self.project.has_overlay(file) {
+            return None;
+        }
+        let source = self.project.read_source(file).ok()?;
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
+        let live_entry = if self.project.has_overlay(file) || self.store_context.liveness.is_none()
+        {
+            LivePathEntry::overlay(file.clone(), oid)
+        } else {
+            LivePathEntry::filesystem(file.clone(), oid)
+        };
+        let mut parser = Self::build_parser(self.adapter.parser_language());
+        let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
+        self.store_context
+            .store
+            .write_parsed_blob(
+                oid,
+                &self.adapter.storage_language_key_for_file(file),
+                self.adapter.as_ref(),
+                &state,
+            )
+            .ok()?;
+        if let Some(liveness) = self.store_context.liveness.as_ref() {
+            liveness.refresh_overlay([live_entry.clone()]).ok()?;
+        }
+        self.store_context.live_paths.refresh([live_entry]);
+        Some(())
+    }
+
+    fn sql_all_declarations_vec(&self) -> Option<Vec<CodeUnit>> {
+        let rows = self
+            .store_context
+            .store
+            .declaration_candidate_rows_for_langs(&self.storage_language_keys_for_queries())
+            .ok()?;
+        let mut units = self.resolve_candidate_rows(rows);
+        units.extend(self.dirty_units_matching(false, |_| true));
+        units.extend(self.sql_nonpersisted_workspace_declarations_vec_matching(|_| true)?);
+        units.retain(|unit| !unit.is_file_scope());
+        units.sort();
+        units.dedup();
+        Some(units)
+    }
+
+    fn sql_all_declarations_with_primary_ranges_vec(
+        &self,
+    ) -> Option<Vec<(CodeUnit, Option<Range>)>> {
+        let rows = self
+            .store_context
+            .store
+            .declaration_candidate_rows_with_primary_ranges_for_langs(
+                &self.storage_language_keys_for_queries(),
+            )
+            .ok()?;
+        let resolver = QueryResolver::from_snapshot(
+            self.adapter.as_ref(),
+            self.project.root(),
+            self.live_snapshot(),
+        );
+        let mut units = resolver.resolve_rows_with_payload(rows);
+        for state in self.dirty_file_states_for_queries() {
+            units.extend(
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope())
+                    .cloned()
+                    .map(|unit| {
+                        let range = state.ranges.get(&unit).and_then(|ranges| {
+                            ranges
+                                .iter()
+                                .copied()
+                                .min_by_key(|range| (range.start_line, range.start_byte))
+                        });
+                        (unit, range)
+                    }),
+            );
+        }
+        units.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|_| true)?
+                .into_iter()
+                .map(|unit| (unit, None)),
+        );
+        units.retain(|(unit, _)| !unit.is_file_scope());
+        units.sort_by(|(left, _), (right, _)| left.cmp(right));
+        units.dedup_by(|(left, _), (right, _)| left == right);
+        Some(units)
+    }
+
+    fn definition_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
+        let mut names = self
+            .adapter
+            .lookup_candidate_short_names(normalized_fq_name);
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn definition_sort_key_for_unit(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> (i32, usize, String, String, String, String) {
+        let first_start_byte = self
+            .ranges(code_unit)
+            .into_iter()
+            .map(|range| range.start_byte)
+            .min()
+            .unwrap_or(usize::MAX);
+        (
+            self.adapter.definition_priority(code_unit),
+            first_start_byte,
+            code_unit.source().to_string().to_ascii_lowercase(),
+            code_unit.fq_name().to_ascii_lowercase(),
+            code_unit.signature().unwrap_or("").to_ascii_lowercase(),
+            format!("{:?}", code_unit.kind()),
+        )
+    }
+
+    fn sql_definitions_vec(&self, fq_name: &str) -> Option<Vec<CodeUnit>> {
+        let normalized = self.adapter.normalize_full_name(fq_name);
+        let langs = self.storage_language_keys_for_queries();
+        let candidate_names = self.definition_candidate_short_names(&normalized);
+        let rows = if candidate_names.is_empty() {
+            self.store_context
+                .store
+                .declaration_candidate_rows_for_langs(&langs)
+                .ok()?
+        } else {
+            let mut rows = Vec::new();
+            for short_name in candidate_names {
+                rows.extend(
+                    self.store_context
+                        .store
+                        .declaration_candidate_rows_by_short_name_for_langs(&langs, &short_name)
+                        .ok()?,
+                );
+            }
+            rows
+        };
+        let mut matches: Vec<_> = self
+            .resolve_candidate_rows(rows)
+            .into_iter()
+            .filter(|unit| self.adapter.normalize_full_name(&unit.fq_name()) == normalized)
+            .collect();
+        matches.extend(self.dirty_units_matching(false, |unit| {
+            self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+        }));
+        matches.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+            })?,
+        );
+        matches.sort_by_cached_key(|code_unit| self.definition_sort_key_for_unit(code_unit));
+        matches.dedup();
+
+        let mut saw_module = false;
+        matches.retain(|code_unit| {
+            if !code_unit.is_module() {
+                return true;
+            }
+            if saw_module {
+                false
+            } else {
+                saw_module = true;
+                true
+            }
+        });
+        Some(matches)
+    }
+
+    fn sql_search_definitions(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Option<BTreeSet<CodeUnit>> {
+        if pattern.is_empty() {
+            return Some(BTreeSet::new());
+        }
+
+        let pattern = if auto_quote {
+            if pattern.contains(".*") {
+                pattern.to_string()
+            } else {
+                format!(".*?{}.*?", regex::escape(pattern))
+            }
+        } else {
+            pattern.to_string()
+        };
+        let compiled = RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+            .ok()?;
+        let storage_languages = self.storage_language_keys_for_queries();
+        let rows = if self
+            .adapter
+            .persisted_content_qualifier_supports_substring_search()
+            && literal_ascii_search_substring(&pattern).is_some()
+        {
+            self.store_context
+                .store
+                .declaration_candidate_rows_by_literal_substring_for_langs(
+                    &storage_languages,
+                    &pattern,
+                )
+                .ok()?
+        } else {
+            self.store_context
+                .store
+                .declaration_candidate_rows_by_pattern_for_langs(&storage_languages, &pattern)
+                .ok()?
+        };
+        let mut out: BTreeSet<_> = self
+            .resolve_candidate_rows(rows)
+            .into_iter()
+            .filter(|unit| {
+                let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
+                !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
+            })
+            .collect();
+        out.extend(self.dirty_units_matching(false, |unit| {
+            let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
+            !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
+        }));
+        out.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
+                !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
+            })?,
+        );
+        Some(out)
+    }
+
+    fn sql_search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Option<Vec<SearchSymbolCandidate>> {
+        if pattern.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let pattern = if auto_quote {
+            if pattern.contains(".*") {
+                pattern.to_string()
+            } else {
+                format!(".*?{}.*?", regex::escape(pattern))
+            }
+        } else {
+            pattern.to_string()
+        };
+        let compiled = RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+            .ok()?;
+        let rows = self
+            .store_context
+            .store
+            .search_candidate_rows_by_pattern_for_langs(
+                &self.storage_language_keys_for_queries(),
+                &pattern,
+            )
+            .ok()?;
+        let resolver = QueryResolver::from_snapshot(
+            self.adapter.as_ref(),
+            self.project.root(),
+            self.live_snapshot(),
+        );
+        let mut candidates = BTreeMap::new();
+        for (code_unit, (primary_range, contains_tests)) in resolver.resolve_rows_with_payload(
+            rows.into_iter()
+                .map(|row| (row.candidate, (row.primary_range, row.contains_tests))),
+        ) {
+            let fq_name = self.adapter.normalize_full_name(&code_unit.fq_name());
+            if !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name) {
+                candidates
+                    .entry(code_unit.clone())
+                    .or_insert(SearchSymbolCandidate {
+                        code_unit,
+                        primary_range,
+                        contains_tests,
+                    });
+            }
+        }
+
+        for code_unit in self.dirty_units_matching(false, |unit| {
+            let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
+            !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
+        }) {
+            candidates
+                .entry(code_unit.clone())
+                .or_insert_with(|| SearchSymbolCandidate {
+                    primary_range: self
+                        .ranges(&code_unit)
+                        .into_iter()
+                        .min_by_key(|range| (range.start_line, range.start_byte)),
+                    contains_tests: self.contains_tests(code_unit.source()),
+                    code_unit,
+                });
+        }
+        for code_unit in self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+            let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
+            !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
+        })? {
+            candidates
+                .entry(code_unit.clone())
+                .or_insert_with(|| SearchSymbolCandidate {
+                    primary_range: self
+                        .ranges(&code_unit)
+                        .into_iter()
+                        .min_by_key(|range| (range.start_line, range.start_byte)),
+                    contains_tests: self.contains_tests(code_unit.source()),
+                    code_unit,
+                });
+        }
+
+        Some(candidates.into_values().collect())
+    }
+
+    pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
+        self.fetch_file_state(file)
+            .map(|state| state.package_name.clone())
     }
 
     pub(crate) fn ruby_method_dispatch_mode(
         &self,
         code_unit: &CodeUnit,
     ) -> Option<RubyMethodDispatchMode> {
-        self.state
-            .ruby_method_dispatch_modes
-            .get(code_unit)
-            .copied()
+        self.fetch_file_state(code_unit.source())
+            .and_then(|state| state.ruby_method_dispatch_modes.get(code_unit).copied())
     }
 
-    pub(crate) fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
-        self.file_state(file)
-            .map(|state| state.imports.as_slice())
-            .unwrap_or(&[])
+    pub(crate) fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.fetch_file_state(file)
+            .map(|state| state.imports.clone())
+            .unwrap_or_default()
     }
 
-    pub(crate) fn raw_supertypes_of<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
-        self.state
-            .raw_supertypes
-            .get(code_unit)
-            .map(Vec::as_slice)
-            .or_else(|| {
-                self.file_state(code_unit.source())
-                    .and_then(|state| state.raw_supertypes.get(code_unit).map(Vec::as_slice))
-            })
-            .unwrap_or(&[])
+    pub(crate) fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.fetch_file_state(code_unit.source())
+            .and_then(|state| state.raw_supertypes.get(code_unit).cloned())
+            .unwrap_or_default()
     }
 
     pub(crate) fn is_scala_trait(&self, code_unit: &CodeUnit) -> bool {
-        self.state.scala_traits.contains(code_unit)
-            || self
-                .file_state(code_unit.source())
-                .is_some_and(|state| state.scala_traits.contains(code_unit))
+        self.fetch_file_state(code_unit.source())
+            .is_some_and(|state| state.scala_traits.contains(code_unit))
     }
 
-    pub(crate) fn scala_traits<'a>(&'a self) -> impl Iterator<Item = &'a CodeUnit> + 'a {
-        self.state.scala_traits.iter()
+    pub(crate) fn scala_traits(&self) -> Vec<CodeUnit> {
+        self.sql_all_declarations_vec()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|unit| self.is_scala_trait(unit))
+            .collect()
     }
 
-    pub(crate) fn type_identifiers_of(&self, file: &ProjectFile) -> Option<&HashSet<String>> {
-        self.file_state(file).map(|state| &state.type_identifiers)
+    pub(crate) fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
+        self.fetch_file_state(file)
+            .map(|state| state.type_identifiers.clone())
     }
 
-    pub(crate) fn all_files<'a>(&'a self) -> impl Iterator<Item = &'a ProjectFile> + 'a {
-        self.state.files.keys()
+    pub(crate) fn all_files(&self) -> Vec<ProjectFile> {
+        self.analyzed_live_files()
     }
 
-    pub(crate) fn class_declarations_in_package<'a>(
-        &'a self,
-        package_name: &str,
-    ) -> &'a [CodeUnit] {
-        self.state
-            .classes_by_package
-            .get(package_name)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    pub(crate) fn class_declarations_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+        let rows = self
+            .store_context
+            .store
+            .declaration_candidate_rows_for_langs(&self.storage_language_keys_for_queries())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.kind == CodeUnitType::Class && row.flags.is_top_level);
+        let mut matches: Vec<_> = self
+            .resolve_candidate_rows(rows.collect())
+            .into_iter()
+            .filter(|unit| unit.package_name() == package_name)
+            .collect();
+        matches.extend(self.dirty_units_matching(false, |unit| {
+            unit.is_class() && unit.package_name() == package_name
+        }));
+        matches.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                unit.is_class() && unit.package_name() == package_name
+            })
+            .unwrap_or_default(),
+        );
+
+        matches.sort_by_cached_key(|code_unit| self.definition_sort_key_for_unit(code_unit));
+        matches.dedup();
+        matches
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
-        self.state.type_aliases.contains(code_unit)
+        self.fetch_file_state(code_unit.source())
+            .map(|state| state.type_aliases.contains(code_unit))
+            .unwrap_or(false)
     }
 
-    pub(crate) fn signatures_of<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
-        self.state
-            .signatures
-            .get(code_unit)
-            .map(Vec::as_slice)
-            .or_else(|| {
-                self.file_state(code_unit.source())
-                    .and_then(|state| state.signatures.get(code_unit).map(Vec::as_slice))
-            })
-            .unwrap_or(&[])
+    pub(crate) fn signatures_vec_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.fetch_file_state(code_unit.source())
+            .and_then(|state| state.signatures.get(code_unit).cloned())
+            .unwrap_or_default()
     }
 
-    pub(crate) fn signature_metadata_of<'a>(
-        &'a self,
-        code_unit: &CodeUnit,
-    ) -> &'a [SignatureMetadata] {
-        self.state
-            .signature_metadata
-            .get(code_unit)
-            .map(Vec::as_slice)
-            .or_else(|| {
-                self.file_state(code_unit.source())
-                    .and_then(|state| state.signature_metadata.get(code_unit).map(Vec::as_slice))
-            })
-            .unwrap_or(&[])
+    pub(crate) fn signature_metadata_vec_of(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.fetch_file_state(code_unit.source())
+            .and_then(|state| state.signature_metadata.get(code_unit).cloned())
+            .unwrap_or_default()
     }
 
     fn source_slice(
@@ -1367,7 +2491,9 @@ where
         range: &Range,
         include_comments: bool,
     ) -> Option<String> {
-        let file_state = self.file_state(code_unit.source())?;
+        let file_state = self
+            .source_snapshot_file_state(code_unit.source())
+            .or_else(|| self.fetch_file_state(code_unit.source()))?;
         let start_byte = if include_comments {
             expanded_comment_start(&file_state.source, range.start_byte)
         } else {
@@ -1386,7 +2512,7 @@ where
         header_only: bool,
         out: &mut String,
     ) {
-        for signature in self.signatures_of(code_unit) {
+        for signature in self.signatures_vec_of(code_unit) {
             if signature.is_empty() {
                 continue;
             }
@@ -1397,19 +2523,21 @@ where
             }
         }
 
-        let all_children: Vec<_> = crate::analyzer::IAnalyzer::direct_children(self, code_unit)
-            .into_iter()
-            .filter(|child| {
-                !child.is_synthetic() || !crate::analyzer::IAnalyzer::ranges(self, child).is_empty()
-            })
-            .collect();
+        let all_children: Vec<_> =
+            <Self as crate::analyzer::IAnalyzer>::direct_children(self, code_unit)
+                .into_iter()
+                .filter(|child| {
+                    !child.is_synthetic()
+                        || !<Self as crate::analyzer::IAnalyzer>::ranges(self, child).is_empty()
+                })
+                .collect();
         let field_children: Vec<_> = all_children
             .iter()
             .filter(|child| child.is_field())
             .cloned()
             .collect();
-        let parent_start = crate::analyzer::IAnalyzer::ranges(self, code_unit)
-            .iter()
+        let parent_start = <Self as crate::analyzer::IAnalyzer>::ranges(self, code_unit)
+            .into_iter()
             .map(|range| range.start_byte)
             .min()
             .unwrap_or(usize::MAX);
@@ -1456,11 +2584,11 @@ where
 
 impl<A> TreeSitterAnalyzer<A>
 where
-    A: LanguageAdapter + StorageLanguageAdapter,
+    A: LanguageAdapter,
 {
     fn child_first_start(&self, child: &CodeUnit) -> usize {
-        crate::analyzer::IAnalyzer::ranges(self, child)
-            .iter()
+        <Self as crate::analyzer::IAnalyzer>::ranges(self, child)
+            .into_iter()
             .map(|range| range.start_byte)
             .min()
             .unwrap_or(usize::MAX)
@@ -1470,22 +2598,94 @@ where
     /// map clone; used by per-query views that must outlive a borrow of the
     /// analyzer (e.g. Scala's `ProjectTypes` behind `Arc` caches).
     pub(crate) fn definition_lookup_index_shared(&self) -> Arc<DefinitionLookupIndex> {
-        Arc::clone(&self.state.definition_lookup_index)
+        Arc::new(self.definition_lookup_index().clone())
     }
 
     /// Owned handle to the derived callable-facts index; see
     /// [`Self::definition_lookup_index_shared`].
     pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
-        Arc::clone(&self.state.usage_facts_index)
+        Arc::new(self.usage_facts_index().clone())
+    }
+
+    fn build_usage_facts_index(&self) -> UsageFactsIndex {
+        let declarations = self.sql_all_declarations_vec().unwrap_or_default();
+        let resolver = QueryResolver::from_snapshot(
+            self.adapter.as_ref(),
+            self.project.root(),
+            self.live_snapshot(),
+        );
+        let mut facts_by_declaration = HashMap::default();
+        let rows = self
+            .store_context
+            .store
+            .usage_fact_rows_for_langs(&self.storage_language_keys_for_queries())
+            .unwrap_or_default();
+        for (unit, row) in resolver.resolve_rows_with_payload(
+            rows.into_iter()
+                .map(|row| (row.candidate, (row.signature, row.signature_metadata))),
+        ) {
+            facts_by_declaration.insert(unit, row);
+        }
+        for state in self.dirty_file_states_for_queries() {
+            for unit in &state.declarations {
+                facts_by_declaration.insert(
+                    unit.clone(),
+                    (
+                        state
+                            .signatures
+                            .get(unit)
+                            .and_then(|signatures| signatures.first())
+                            .cloned(),
+                        state
+                            .signature_metadata
+                            .get(unit)
+                            .and_then(|metadata| metadata.first())
+                            .cloned(),
+                    ),
+                );
+            }
+        }
+        UsageFactsIndex::build_from_declarations(
+            self.definition_lookup_index(),
+            declarations.iter(),
+            |unit| {
+                facts_by_declaration
+                    .get(unit)
+                    .and_then(|(signature, _)| signature.clone())
+                    .or_else(|| unit.signature().map(str::to_string))
+            },
+            |unit| {
+                facts_by_declaration
+                    .get(unit)
+                    .and_then(|(_, metadata)| metadata.clone())
+            },
+            self.adapter.as_ref(),
+        )
     }
 }
 
 impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
-    A: LanguageAdapter + StorageLanguageAdapter,
+    A: LanguageAdapter,
 {
+    fn begin_query(&self) {
+        let mut cache = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned");
+        cache.begin();
+    }
+
+    fn end_query(&self) {
+        let mut cache = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned");
+        cache.end();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.file_state(file)
+        self.fetch_file_state(file)
             .map(|state| {
                 state
                     .top_level_declarations
@@ -1497,16 +2697,68 @@ where
             .unwrap_or_default()
     }
 
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.state.files.keys().cloned().collect()
+    fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
+        let _scope = profiling::scope(format!(
+            "TreeSitterAnalyzer::{:?}::summary_file_projection",
+            self.adapter.language()
+        ));
+        if self.project.has_overlay(file) {
+            return None;
+        }
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let cache_key = Self::transient_cache_key(oid, file);
+        if let Some(projection) = self
+            .summary_file_projections
+            .lock()
+            .expect("summary file projection cache mutex poisoned")
+            .get(&cache_key)
+        {
+            return Some(projection);
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let projection = self
+            .store_context
+            .store
+            .summary_file_projection(oid, &storage_key, self.adapter.as_ref(), file)
+            .ok()
+            .flatten()?;
+        let projection = Arc::new(projection);
+        self.summary_file_projections
+            .lock()
+            .expect("summary file projection cache mutex poisoned")
+            .insert(cache_key, Arc::clone(&projection));
+        Some(projection)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
+        self.analyzed_live_files()
+    }
+
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.file_source(file)
     }
 
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        let Some(indexed_oid) = self.live_snapshot().oid_for_path(file) else {
+            return false;
+        };
+        Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok() == Some(indexed_oid)
+    }
+
     fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.state.files.contains_key(file)
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return false;
+        };
+        crate::analyzer::common::language_for_file(file) == self.adapter.language() && {
+            let storage_key = self.adapter.storage_language_key_for_file(file);
+            let key = Self::transient_cache_key(oid, file);
+            self.retry_dirty_file_state(&key, &storage_key).is_some()
+                || self
+                    .store_context
+                    .store
+                    .contains_parsed_blob(oid, &storage_key)
+                    .unwrap_or(false)
+        }
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -1518,84 +2770,68 @@ where
             return self.clone();
         }
 
-        let mut files = self.state.files.clone();
-        let mut to_reanalyze = Vec::new();
-        let mut deletes: Vec<String> = Vec::new();
+        let mut store_context = self.store_context.clone();
+        store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
+        let mut to_update = Vec::new();
+        let mut dirty_file_states = self.state.dirty_snapshot();
 
         for file in changed_files {
-            if !file.exists() {
-                files.remove(file);
-                deletes.push(persistence::reconcile::rel_key(file));
+            Self::remove_dirty_for_file(&mut dirty_file_states, file);
+            if !file.exists() && !self.project.has_overlay(file) {
+                store_context
+                    .live_paths
+                    .remove(std::iter::once(file.clone()));
+                if let Some(liveness) = store_context.liveness.as_ref() {
+                    liveness.remove_overlay_paths(std::iter::once(file.clone()));
+                }
                 continue;
             }
-            to_reanalyze.push(file.clone());
+            to_update.push(file.clone());
         }
 
-        let dirty_keys: HashSet<ProjectFile> = to_reanalyze.iter().cloned().collect();
-
-        for (file, state) in Self::analyze_files(
-            self.adapter.as_ref(),
-            self.project.as_ref(),
-            &self.config,
-            to_reanalyze,
-            None,
-        ) {
-            if let Some(state) = state {
-                files.insert(file, state);
-            } else {
-                deletes.push(persistence::reconcile::rel_key(&file));
-                files.remove(&file);
-            }
-        }
-
-        if let Some(storage) = self.storage.as_ref() {
-            let ts_lang = self.adapter.parser_language();
-            let epoch = persistence::epoch_for(self.adapter.language(), &ts_lang);
-            let project = self.project.as_ref();
-            // Skip baseline writes for overlaid files; see build_state.
-            let writes = persistence::reconcile::encode_writes(
-                files
-                    .iter()
-                    .filter(|(file, _)| dirty_keys.contains(file))
-                    .filter(|(file, _)| !project.has_overlay(file)),
-                |fq_name| self.adapter.normalize_full_name(fq_name),
-            );
-            let _ = persistence::reconcile::commit(
-                storage.as_ref(),
-                self.adapter.language(),
-                epoch,
-                &writes,
-                &deletes,
-            );
-        }
-
-        let state = Self::index_state(files, self.project.as_ref(), self.adapter.as_ref());
-        Self::from_state(
-            Arc::clone(&self.project),
-            Arc::clone(&self.adapter),
-            self.config.clone(),
-            state,
-            self.storage.as_ref().map(Arc::clone),
-            Arc::clone(&self.structural_cache),
-        )
-    }
-
-    fn update_all(&self) -> Self {
-        let state = Self::build_state(
+        let state = Self::reconcile_file_states(
             self.project.as_ref(),
             self.adapter.as_ref(),
             &self.config,
-            None,
-            None,
-            self.storage.as_deref(),
+            &store_context,
+            ReconcileFileStates {
+                files: to_update,
+                replace_live_paths: false,
+                progress: None,
+                dirty_file_states,
+            },
+        );
+        crate::analyzer::store::gc::maybe_gc_in_background(
+            self.project.root(),
+            Arc::clone(&store_context.store),
         );
         Self::from_state(
             Arc::clone(&self.project),
             Arc::clone(&self.adapter),
             self.config.clone(),
             state,
-            self.storage.as_ref().map(Arc::clone),
             Arc::clone(&self.structural_cache),
+            store_context,
+        )
+    }
+
+    fn update_all(&self) -> Self {
+        let mut store_context = self.store_context.clone();
+        store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
+        let state = Self::build_state(
+            self.project.as_ref(),
+            self.adapter.as_ref(),
+            &self.config,
+            None,
+            &store_context,
+        );
+        Self::from_state(
+            Arc::clone(&self.project),
+            Arc::clone(&self.adapter),
+            self.config.clone(),
+            state,
+            Arc::clone(&self.structural_cache),
+            store_context,
         )
     }
 
@@ -1605,35 +2841,19 @@ where
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         Box::new(
-            self.state
-                .files
-                .values()
-                .flat_map(|state| state.declarations.iter())
-                .filter(|unit| !unit.is_file_scope())
-                .cloned(),
+            self.sql_all_declarations_vec()
+                .unwrap_or_default()
+                .into_iter(),
         )
     }
 
     fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
-        self.state
-            .files
-            .values()
-            .flat_map(|state| state.declarations.iter())
-            .filter(|unit| !unit.is_file_scope())
-            .map(|unit| {
-                let range = self.state.ranges.get(unit).and_then(|ranges| {
-                    ranges
-                        .iter()
-                        .min_by_key(|range| (range.start_line, range.start_byte))
-                        .copied()
-                });
-                (unit.clone(), range)
-            })
-            .collect()
+        self.sql_all_declarations_with_primary_ranges_vec()
+            .unwrap_or_default()
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.file_state(file)
+        self.fetch_file_state(file)
             .map(|state| {
                 state
                     .declarations
@@ -1646,57 +2866,39 @@ where
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        let normalized = self.adapter.normalize_full_name(fq_name);
-        let Some(matches) = self.state.definitions.get(&normalized) else {
-            return Box::new(std::iter::empty());
-        };
-        let mut saw_module = false;
-        let matches = matches
-            .iter()
-            .filter_map(|code_unit| {
-                if code_unit.is_module() {
-                    if saw_module {
-                        None
-                    } else {
-                        saw_module = true;
-                        Some(code_unit.clone())
-                    }
-                } else {
-                    Some(code_unit.clone())
-                }
-            })
-            .collect::<Vec<_>>();
-        Box::new(matches.into_iter())
+        Box::new(
+            self.sql_definitions_vec(fq_name)
+                .unwrap_or_default()
+                .into_iter(),
+        )
     }
 
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
-        &self.state.definition_lookup_index
+        self.definition_lookup_index
+            .get_or_init(|| self.sql_definition_lookup_index().unwrap_or_default())
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
-        &self.state.usage_facts_index
+        self.usage_facts_index
+            .get_or_init(|| self.build_usage_facts_index())
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if code_unit.is_module() {
-            let target_name = self.adapter.normalize_full_name(&code_unit.fq_name());
-            self.state
-                .module_children
-                .get(&target_name)
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            self.state
-                .children
-                .get(code_unit)
-                .cloned()
-                .unwrap_or_default()
+        if code_unit.is_module() && self.adapter.language() == Language::Java {
+            return self.class_declarations_in_package(&code_unit.fq_name());
         }
+
+        self.fetch_file_state(code_unit.source())
+            .and_then(|state| {
+                let mut children = state.children.get(code_unit).cloned()?;
+                Self::canonicalize_children(&mut children, &state.ranges);
+                Some(children)
+            })
+            .unwrap_or_default()
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.file_state(file)
-            .and_then(|state| state.parse_errors.clone())
+        self.state.fresh_parse_errors.get(file).cloned()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -1704,7 +2906,7 @@ where
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.file_state(file)
+        self.fetch_file_state(file)
             .map(|state| state.import_statements.clone())
             .unwrap_or_default()
     }
@@ -1724,18 +2926,16 @@ where
             return None;
         }
 
-        self.file_state(file)?
+        self.fetch_file_state(file)?
             .declarations
             .iter()
+            .cloned()
             .filter_map(|code_unit| {
                 let best_range = self
-                    .ranges(code_unit)
+                    .ranges(&code_unit)
                     .into_iter()
                     .find(|candidate| candidate.contains(range))?;
-                Some((
-                    best_range.end_byte - best_range.start_byte,
-                    code_unit.clone(),
-                ))
+                Some((best_range.end_byte - best_range.start_byte, code_unit))
             })
             .min_by(|(left_span, left), (right_span, right)| {
                 left_span
@@ -1769,10 +2969,7 @@ where
                     candidate.start_line <= line_range.start_line
                         && candidate.end_line >= line_range.end_line
                 })?;
-                Some((
-                    best_range.end_line - best_range.start_line,
-                    code_unit.clone(),
-                ))
+                Some((best_range.end_line - best_range.start_line, code_unit))
             })
             .min_by_key(|(span, _)| *span)
             .map(|(_, code_unit)| code_unit)
@@ -1798,10 +2995,9 @@ where
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.state
-            .ranges
-            .get(code_unit)
-            .cloned()
+        self.source_snapshot_file_state(code_unit.source())
+            .or_else(|| self.fetch_file_state(code_unit.source()))
+            .and_then(|state| state.ranges.get(code_unit).cloned())
             .unwrap_or_default()
     }
 
@@ -1809,7 +3005,7 @@ where
         let Some(config) = self.adapter.cognitive_complexity_config() else {
             return Vec::new();
         };
-        let Some(file_state) = self.file_state(file) else {
+        let Some(file_state) = self.fetch_file_state(file) else {
             return Vec::new();
         };
 
@@ -1834,12 +3030,8 @@ where
             if cu.is_function() {
                 functions.push(cu.clone());
             }
-            if let Some(children) = self.state.children.get(&cu) {
+            if let Some(children) = file_state.children.get(&cu) {
                 for child in children {
-                    work.push_back(child.clone());
-                }
-            } else if let Some(file_children) = file_state.children.get(&cu) {
-                for child in file_children {
                     work.push_back(child.clone());
                 }
             }
@@ -1847,7 +3039,7 @@ where
 
         let mut result = Vec::with_capacity(functions.len());
         for cu in functions {
-            let Some(ranges) = self.state.ranges.get(&cu) else {
+            let Some(ranges) = file_state.ranges.get(&cu) else {
                 continue;
             };
             let Some(primary) = ranges.first() else {
@@ -1910,122 +3102,50 @@ where
     }
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        if pattern.is_empty() {
-            return BTreeSet::new();
-        }
-
-        let pattern = if auto_quote {
-            if pattern.contains(".*") {
-                pattern.to_string()
-            } else {
-                format!(".*?{}.*?", regex::escape(pattern))
-            }
-        } else {
-            pattern.to_string()
-        };
-
-        let Ok(compiled) = RegexBuilder::new(&pattern).case_insensitive(true).build() else {
-            return BTreeSet::new();
-        };
-
-        self.state
-            .definitions
-            .par_iter()
-            .filter(|(fq_name, _)| {
-                !self.adapter.is_anonymous_structure(fq_name) && compiled.is_match(fq_name)
-            })
-            .flat_map(|(_, definitions)| definitions.to_vec())
-            .collect()
+        self.sql_search_definitions(pattern, auto_quote)
+            .unwrap_or_default()
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        if pattern.is_empty() {
-            return BTreeSet::new();
-        }
-        let Some(storage) = self.storage.as_ref() else {
-            return self.search_definitions(pattern, true);
-        };
-        // FTS5's trigram tokenizer produces no tokens for inputs shorter
-        // than three characters, so any 1- or 2-char query against the
-        // substring index returns zero rows regardless of what's
-        // indexed. The in-memory regex search has no such floor, so for
-        // short patterns we fall back to it to preserve substring
-        // semantics.
-        if pattern.chars().count() < 3 {
-            return self.search_definitions(pattern, true);
-        }
-        let language = self.adapter.language();
-        // The trigram index models the same substring semantics the
-        // existing in-memory `search_definitions` provides, so callers
-        // who switch to the persisted variant don't see a regression in
-        // recall. The unicode61 token index is reserved for future
-        // identifier-only / FQN-token query paths.
-        //
-        // `search_non_synthetic_symbols` pushes the synthetic filter
-        // into SQL so it runs before `LIMIT` — otherwise a top-N cap
-        // can be entirely consumed by compiler-generated rows that the
-        // post-filter below would drop anyway.
-        let hits = match storage.search_non_synthetic_symbols(
-            language,
-            pattern,
-            persistence::SymbolQueryMode::Substring,
-        ) {
-            Ok(hits) => hits,
-            Err(_) => return self.search_definitions(pattern, true),
-        };
-        let mut out = BTreeSet::new();
-        let project_root = self.project.root().to_path_buf();
-        for hit in hits {
-            if self.adapter.is_anonymous_structure(&hit.symbol.fq_name) {
-                continue;
-            }
-            let Some(kind) = persistence::parse_kind(&hit.symbol.kind) else {
-                continue;
-            };
-            let rel_path = std::path::PathBuf::from(&hit.rel_path);
-            let source = ProjectFile::new(project_root.clone(), rel_path);
-            out.insert(CodeUnit::with_signature(
-                source,
-                kind,
-                hit.symbol.package_name,
-                hit.symbol.short_name,
-                hit.symbol.signature,
-                hit.symbol.synthetic,
-            ));
-        }
-        out
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<SearchSymbolCandidate> {
+        self.sql_search_symbol_candidates(pattern, auto_quote)
+            .unwrap_or_default()
     }
 
     fn metrics(&self) -> CodeBaseMetrics {
         CodeBaseMetrics::new(
-            self.state.files.len(),
-            self.state
-                .files
-                .values()
-                .map(|state| {
-                    state
-                        .declarations
-                        .iter()
-                        .filter(|unit| !unit.is_file_scope())
-                        .count()
-                })
-                .sum(),
+            self.analyzed_live_files().len(),
+            self.all_declarations().count(),
         )
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.file_state(file)
+        self.fetch_file_state(file)
             .map(|state| state.contains_tests)
             .unwrap_or(false)
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.signatures_of(code_unit).to_vec()
+        self.signatures_vec_of(code_unit)
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.signature_metadata_of(code_unit).to_vec()
+        self.signature_metadata_vec_of(code_unit)
     }
+}
+
+/// A raw regex containing only ASCII identifier characters is exactly a
+/// case-insensitive literal substring search. It is safe to use as a storage
+/// candidate filter; all other regex forms retain the complete row set.
+fn literal_ascii_search_substring(pattern: &str) -> Option<&str> {
+    (!pattern.is_empty()
+        && pattern
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then_some(pattern)
 }
 
 fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
@@ -2139,7 +3259,10 @@ mod tests {
     use crate::analyzer::javascript::JavascriptAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::rust::RustAdapter;
+    use crate::analyzer::store::AnalyzerStore;
     use crate::analyzer::typescript::TypescriptAdapter;
+    use crate::analyzer::{AnalyzerConfig, IAnalyzer, JavaAnalyzer, Language, TestProject};
+    use git2::{ObjectType, Oid};
     use std::path::Path;
 
     fn parse_javascript(source: &str) -> Tree {
@@ -2218,6 +3341,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dirty_file_state_is_authoritative_for_symbol_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        let source = "class Dirty:\n    pass\n".to_string();
+        std::fs::write(root.join("pkg/dirty.py"), &source).unwrap();
+        let file = ProjectFile::new(root.clone(), "pkg/dirty.py");
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let adapter = Arc::new(PythonAdapter);
+        let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
+            adapter.parser_language_for_file(&file),
+        );
+        let parsed = TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
+            &mut parser,
+            &*adapter,
+            &file,
+            source,
+        )
+        .expect("python file parses");
+        let key = TreeSitterAnalyzer::<PythonAdapter>::transient_cache_key(oid, &file);
+        let mut dirty = HashMap::default();
+        dirty.insert(
+            key,
+            TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
+                parsed,
+                32,
+                "forced test persistence failure".to_string(),
+            ),
+        );
+
+        let live_paths = Arc::new(LivePathMap::default());
+        live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
+        let store = Arc::new(AnalyzerStore::open_in_memory().unwrap());
+        let store_context = AnalyzerStoreContext {
+            store: Arc::clone(&store),
+            liveness: None,
+            live_paths,
+        };
+        let config = AnalyzerConfig::default();
+        let analyzer = TreeSitterAnalyzer::from_state(
+            project,
+            adapter,
+            config.clone(),
+            AnalyzerRuntimeState::new(HashMap::default(), dirty, Vec::new()),
+            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
+                &config,
+            )),
+            store_context,
+        );
+
+        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
+        assert!(
+            analyzer
+                .declarations(&file)
+                .iter()
+                .any(|unit| unit.fq_name() == "pkg.dirty.Dirty")
+        );
+        assert_eq!(analyzer.get_definitions("pkg.dirty.Dirty").len(), 1);
+    }
+
+    #[test]
+    fn dirty_file_state_is_authoritative_for_bulk_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        let source = "import os\nclass Dirty:\n    pass\n".to_string();
+        std::fs::write(root.join("pkg/dirty.py"), &source).unwrap();
+        let file = ProjectFile::new(root.clone(), "pkg/dirty.py");
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let adapter = Arc::new(PythonAdapter);
+        let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
+            adapter.parser_language_for_file(&file),
+        );
+        let parsed = TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
+            &mut parser,
+            &*adapter,
+            &file,
+            source,
+        )
+        .expect("python file parses");
+        let key = TreeSitterAnalyzer::<PythonAdapter>::transient_cache_key(oid, &file);
+        let mut dirty = HashMap::default();
+        dirty.insert(
+            key,
+            TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
+                parsed,
+                32,
+                "forced test persistence failure".to_string(),
+            ),
+        );
+
+        let live_paths = Arc::new(LivePathMap::default());
+        live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
+        let store = Arc::new(AnalyzerStore::open_in_memory().unwrap());
+        let store_context = AnalyzerStoreContext {
+            store: Arc::clone(&store),
+            liveness: None,
+            live_paths,
+        };
+        let config = AnalyzerConfig::default();
+        let analyzer = TreeSitterAnalyzer::from_state(
+            project,
+            adapter,
+            config.clone(),
+            AnalyzerRuntimeState::new(HashMap::default(), dirty, Vec::new()),
+            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
+                &config,
+            )),
+            store_context,
+        );
+
+        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
+        let states = analyzer.bulk_file_states([file.clone()], BulkFileStateSource::Omit);
+        assert!(states.get(&file).is_some_and(|state| {
+            state
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "pkg.dirty.Dirty")
+        }));
+        let imports = analyzer.bulk_import_infos([file.clone()]);
+        assert_eq!(
+            imports
+                .get(&file)
+                .and_then(|imports| imports.first())
+                .and_then(|import| import.identifier.as_deref()),
+            Some("os")
+        );
     }
 
     #[test]
@@ -2376,5 +3633,141 @@ mod tests {
         assert!(!adapter.should_persist_code_unit(module));
         assert_eq!(state.children.get(module), Some(&vec![class]));
         assert_eq!(state.ranges.get(module).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn usage_facts_index_uses_persisted_projection_without_file_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+
+        for index in 0..=TRANSIENT_FILE_STATE_CACHE_CAPACITY {
+            std::fs::write(
+                root.join(format!("src/Type{index}.java")),
+                format!(
+                    "package demo; public class Type{index} {{ public String value{index}() {{ return \"\"; }} }}\n"
+                ),
+            )
+            .expect("java source");
+        }
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        analyzer.reset_full_hydration_count_for_test();
+
+        let facts = analyzer.usage_facts_index();
+
+        assert!(
+            !facts.facts("demo.Type0.value0").is_empty(),
+            "usage facts should include persisted Java methods"
+        );
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+        assert_eq!(analyzer.bulk_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn query_read_cache_keeps_broad_traversals_out_of_the_lru_eviction_loop() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        let files: Vec<_> = (0..=TRANSIENT_FILE_STATE_CACHE_CAPACITY)
+            .map(|index| {
+                let file = temp_file(&root, &format!("src/Type{index}.java"));
+                file.write(format!("package demo; class Type{index} {{}}\n"))
+                    .expect("java source");
+                file
+            })
+            .collect();
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        analyzer.reset_full_hydration_count_for_test();
+
+        analyzer.begin_query();
+        for file in &files {
+            assert!(analyzer.fetch_file_state(file).is_some());
+        }
+        analyzer.begin_query();
+        for file in &files {
+            assert!(analyzer.fetch_file_state(file).is_some());
+        }
+        analyzer.end_query();
+
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            TRANSIENT_FILE_STATE_CACHE_CAPACITY + 1
+        );
+
+        analyzer.end_query();
+        assert!(analyzer.fetch_file_state(&files[0]).is_some());
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            TRANSIENT_FILE_STATE_CACHE_CAPACITY + 2
+        );
+    }
+
+    #[test]
+    fn file_summary_uses_persisted_projection_without_full_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "src/demo/Example.java");
+        file.write(
+            "package demo; public class Example { public String name; public void run() {} }\n",
+        )
+        .expect("java source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = JavaAnalyzer::new(project);
+        analyzer.inner().reset_full_hydration_count_for_test();
+
+        let first_projection = analyzer
+            .summary_file_projection(&file)
+            .expect("persisted summary projection");
+        let second_projection = analyzer
+            .summary_file_projection(&file)
+            .expect("cached summary projection");
+        assert!(Arc::ptr_eq(&first_projection, &second_projection));
+
+        let result = crate::searchtools::summarize_files(&analyzer, vec![file]);
+
+        assert_eq!(result.summaries.len(), 1);
+        assert!(
+            result.summaries[0]
+                .elements
+                .iter()
+                .any(|element| element.symbol.contains("Example.run")),
+            "persisted projection should render method summaries"
+        );
+        assert_eq!(analyzer.inner().full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn literal_symbol_search_keeps_members_of_matching_java_types() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "src/demo/Gson.java");
+        file.write(
+            "package demo; public class Gson { public void fromJson() {} } class Other { void unrelated() {} }\n",
+        )
+        .expect("java source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+
+        let matches = analyzer.search_definitions("Gson", false);
+        let candidates = analyzer.search_symbol_candidates("Gson", false);
+
+        assert!(matches.iter().any(|unit| unit.fq_name() == "demo.Gson"));
+        assert!(
+            matches
+                .iter()
+                .any(|unit| unit.fq_name() == "demo.Gson.fromJson")
+        );
+        assert!(!matches.iter().any(|unit| unit.short_name() == "unrelated"));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.code_unit.fq_name() == "demo.Gson.fromJson"
+                && candidate.primary_range.is_some()
+                && !candidate.contains_tests
+        }));
     }
 }

@@ -17,17 +17,10 @@ use brokk_bifrost::{Language, SearchToolsService};
 use common::InlineTestProject;
 use common::usage_graph::{assert_every_edge_endpoint_is_a_node, find_edge};
 use serde_json::Value;
-use std::path::PathBuf;
-
-fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("usage-graph-rust")
-}
 
 fn usage_graph() -> Value {
-    let service = SearchToolsService::new(fixture_root())
+    let fixture_root = common::copy_fixture_to_temp("usage-graph-rust");
+    let service = SearchToolsService::new(fixture_root.path().to_path_buf())
         .expect("failed to build searchtools service over the fixture");
     let payload = service
         .call_tool_json("usage_graph", "{}")

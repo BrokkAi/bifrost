@@ -38,7 +38,7 @@ fn test_decorated_top_level_function_and_class() {
         "#,
     );
     let analyzer = PythonAnalyzer::from_project(project);
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations
@@ -74,7 +74,7 @@ fn property_getter_is_indexed_as_field() {
         "#,
     );
     let analyzer = PythonAnalyzer::from_project(project);
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.iter().any(|cu| {
         cu.fq_name() == "models.User.normalized_name" && cu.kind() == CodeUnitType::Field
@@ -102,7 +102,7 @@ fn test_decorated_nested_in_function_and_class() {
         "#,
     );
     let analyzer = PythonAnalyzer::from_project(project);
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations
@@ -138,7 +138,7 @@ fn test_decorated_declarations_in_top_level_conditional() {
         "#,
     );
     let analyzer = PythonAnalyzer::from_project(project);
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations

@@ -9,10 +9,41 @@ use brokk_bifrost::{
 };
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
-
 static SEARCH_TOOL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+use tempfile::TempDir;
+
+#[allow(dead_code)]
+pub fn copy_fixture_to_temp(name: &str) -> TempDir {
+    let temp = TempDir::new().unwrap();
+    copy_dir_recursively(&fixture_root(name), temp.path()).unwrap();
+    temp
+}
+
+#[allow(dead_code)]
+fn fixture_root(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
+fn copy_dir_recursively(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursively(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
 
 #[allow(unused_imports)]
 pub use inline_project::{BuiltInlineTestProject, InlineTestProject};

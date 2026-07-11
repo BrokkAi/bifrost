@@ -4,8 +4,9 @@ use crate::analyzer::{
     DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, SemanticDiagnostic, SignatureMetadata, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, TypescriptAnalyzer,
+    ScalaAnalyzer, SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata,
+    SummaryFileProjection, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    TypescriptAnalyzer,
 };
 use crate::hash::HashSet;
 use rayon::prelude::*;
@@ -258,11 +259,11 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .collect()
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .map(|provider| provider.import_info_of(file))
-            .unwrap_or(&[])
+            .unwrap_or_default()
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
@@ -319,11 +320,28 @@ impl TypeAliasProvider for MultiAnalyzer {
 impl TestDetectionProvider for MultiAnalyzer {}
 
 impl IAnalyzer for MultiAnalyzer {
+    fn begin_query(&self) {
+        self.delegates
+            .values()
+            .for_each(|delegate| delegate.analyzer().begin_query());
+    }
+
+    fn end_query(&self) {
+        self.delegates
+            .values()
+            .for_each(|delegate| delegate.analyzer().end_query());
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         match self.delegate_for_file(file) {
             Some(delegate) => delegate.analyzer().top_level_declarations(file),
             None => Vec::new(),
         }
+    }
+
+    fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().summary_file_projection(file))
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
@@ -337,9 +355,14 @@ impl IAnalyzer for MultiAnalyzer {
         files
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.delegate_for_file(file)
             .and_then(|delegate| delegate.analyzer().indexed_source(file))
+    }
+
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.delegate_for_file(file)
+            .is_some_and(|delegate| delegate.analyzer().indexed_source_matches(file, source))
     }
 
     fn render_source_fragment(
@@ -628,6 +651,26 @@ impl IAnalyzer for MultiAnalyzer {
             .map(|delegate| delegate.analyzer().search_definitions(pattern, auto_quote))
             .reduce(BTreeSet::new, |mut acc, definitions| {
                 acc.extend(definitions);
+                acc
+            })
+    }
+
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<SearchSymbolCandidate> {
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .search_symbol_candidates(pattern, auto_quote)
+            })
+            .reduce(Vec::new, |mut acc, candidates| {
+                acc.extend(candidates);
                 acc
             })
     }

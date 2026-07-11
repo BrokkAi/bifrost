@@ -29,7 +29,7 @@ fn go_fixture_declarations_match_expected_shapes() {
     let root = analyzer.project().root().to_path_buf();
     let declarations = ProjectFile::new(root, "declarations.go");
 
-    let file_declarations = analyzer.get_declarations(&declarations);
+    let file_declarations = analyzer.declarations(&declarations);
     assert!(
         file_declarations
             .iter()

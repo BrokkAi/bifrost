@@ -4,12 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use git2::{Oid, Repository};
-use sha2::{Digest, Sha256};
 
 use crate::analyzer::ProjectFile;
 use crate::gitblob;
 use crate::hash::{HashMap, map_with_capacity};
-use crate::path_normalization::NormalizePath;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -26,8 +24,7 @@ impl Liveness {
             .workdir()
             .ok_or_else(|| "repository has no working directory".to_string())?
             .canonicalize()
-            .map_err(|err| format!("canonicalizing git workdir: {err}"))?
-            .normalize();
+            .map_err(|err| format!("canonicalizing git workdir: {err}"))?;
         Ok(Self {
             repo: Mutex::new(repo),
             workdir,
@@ -46,7 +43,7 @@ impl Liveness {
         gitblob::working_tree_oid_for_path(&repo, &rel_path)
     }
 
-    /// Full live view; rebuilt when the Git index bytes or overlay generation change.
+    /// Full live view; rebuilt only when `.git/index` stat changes.
     pub fn snapshot(&self) -> Result<Arc<LiveSnapshot>> {
         let repo = self.repo.lock().expect("liveness repo mutex poisoned");
         let fingerprint = current_index_fingerprint(&repo)?;
@@ -78,6 +75,8 @@ impl Liveness {
     }
 
     pub fn refresh_overlay(&self, entries: impl IntoIterator<Item = LivePathEntry>) -> Result<()> {
+        let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+        let index = repo.index().map_err(|e| e.to_string())?;
         let mut overlay = self
             .overlay
             .lock()
@@ -86,7 +85,11 @@ impl Liveness {
 
         for entry in entries {
             let file = entry.file;
-            self.rel_path_from_workdir(&file)?;
+            let rel_path = self.rel_path_from_workdir(&file)?;
+            if index.get_path(&rel_path, 0).is_some() && entry.validation.is_filesystem() {
+                changed |= overlay.paths.remove(&file).is_some();
+                continue;
+            }
             let Some(state) = PathState::new(entry.oid, entry.validation, &file) else {
                 changed |= overlay.paths.remove(&file).is_some();
                 continue;
@@ -118,11 +121,8 @@ impl Liveness {
     }
 
     fn rel_path_from_workdir(&self, file: &ProjectFile) -> Result<PathBuf> {
-        let abs_path = file.abs_path().normalize();
-        let canonical_abs = abs_path
-            .canonicalize()
-            .map(NormalizePath::normalize)
-            .unwrap_or_else(|_| abs_path.clone());
+        let abs_path = file.abs_path();
+        let canonical_abs = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
         canonical_abs
             .strip_prefix(&self.workdir)
             .or_else(|_| abs_path.strip_prefix(&self.workdir))
@@ -151,7 +151,8 @@ struct OverlayState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IndexFingerprint {
-    digest: [u8; 32],
+    modified: Option<SystemTime>,
+    size: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -168,20 +169,18 @@ impl PathState {
         };
         Some(Self { oid, stat })
     }
-
-    fn is_valid_for(&self, file: &ProjectFile) -> bool {
-        match (&self.stat, FileStat::from_path(&file.abs_path())) {
-            (None, _) => true,
-            (Some(expected), Some(current)) => &current == expected,
-            (Some(_), None) => false,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LivePathValidation {
     Filesystem,
     Overlay,
+}
+
+impl LivePathValidation {
+    fn is_filesystem(self) -> bool {
+        matches!(self, Self::Filesystem)
+    }
 }
 
 #[derive(Clone)]
@@ -320,7 +319,11 @@ impl LiveSnapshot {
 
     pub fn validated_oid_for_path(&self, file: &ProjectFile) -> Option<Oid> {
         let state = self.path_to_state.get(file)?;
-        state.is_valid_for(file).then_some(state.oid)
+        match (&state.stat, FileStat::from_path(&file.abs_path())) {
+            (None, _) => Some(state.oid),
+            (Some(expected), Some(current)) if &current == expected => Some(state.oid),
+            _ => None,
+        }
     }
 
     pub fn contains_oid(&self, oid: Oid) -> bool {
@@ -345,8 +348,10 @@ impl LiveSnapshot {
                 stale.push(file.clone());
                 continue;
             };
-            if !state.is_valid_for(file) {
-                stale.push(file.clone());
+            match (&state.stat, FileStat::from_path(&file.abs_path())) {
+                (None, _) => {}
+                (Some(expected), Some(current)) if &current == expected => {}
+                _ => stale.push(file.clone()),
             }
         }
         stale
@@ -361,8 +366,7 @@ fn build_snapshot(
     let index = repo.index().map_err(|e| e.to_string())?;
     let root = workdir
         .canonicalize()
-        .map_err(|e| format!("canonicalizing workdir {}: {e}", workdir.display()))?
-        .normalize();
+        .map_err(|e| format!("canonicalizing workdir {}: {e}", workdir.display()))?;
     let mut oid_to_paths: HashMap<Oid, Vec<ProjectFile>> = map_with_capacity(index.len());
     let mut path_to_state = map_with_capacity(index.len());
 
@@ -385,7 +389,11 @@ fn build_snapshot(
     }
 
     for (file, state) in overlay {
-        if !state.is_valid_for(file) {
+        if state
+            .stat
+            .as_ref()
+            .is_some_and(|stat| FileStat::from_path(&file.abs_path()).as_ref() != Some(stat))
+        {
             continue;
         }
         if let Some(previous) = path_to_state.insert(file.clone(), state.clone())
@@ -410,7 +418,11 @@ fn snapshot_from_path_states(path_to_state: &HashMap<ProjectFile, PathState>) ->
     let mut oid_to_paths: HashMap<Oid, Vec<ProjectFile>> = HashMap::default();
     let mut live_states = HashMap::default();
     for (file, state) in path_to_state {
-        if !state.is_valid_for(file) {
+        if state
+            .stat
+            .as_ref()
+            .is_some_and(|stat| FileStat::from_path(&file.abs_path()).as_ref() != Some(stat))
+        {
             continue;
         }
         oid_to_paths
@@ -430,9 +442,11 @@ fn current_index_fingerprint(repo: &Repository) -> Result<IndexFingerprint> {
     let path = index
         .path()
         .ok_or_else(|| "repository index has no on-disk path".to_string())?;
-    let bytes = std::fs::read(path).map_err(|e| format!("read index {}: {e}", path.display()))?;
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("stat index {}: {e}", path.display()))?;
     Ok(IndexFingerprint {
-        digest: Sha256::digest(bytes).into(),
+        modified: metadata.modified().ok(),
+        size: metadata.len(),
     })
 }
 
@@ -497,34 +511,6 @@ impl PlatformStat {
     }
 }
 
-// Issue #584 deliberately lands this crate-internal API before the analyzer
-// store that will call it. Keep the complete contract type-checked in normal
-// builds without adding a runtime consumer or suppressing dead-code lints.
-fn compile_liveness_api_contract(repo: Repository, file: ProjectFile, oid: Oid) -> Result<()> {
-    let _ = gitblob::working_tree_oids_full(&repo)?;
-    let liveness = Liveness::new(repo)?;
-    let _ = liveness.oid_for_path(&file)?;
-    liveness.refresh_overlay([LivePathEntry::filesystem(file.clone(), oid)])?;
-    let snapshot = liveness.snapshot()?;
-    let _ = snapshot.paths_for_oid(oid);
-    let _ = snapshot.oid_for_path(&file);
-    let _ = snapshot.validated_oid_for_path(&file);
-    let _ = snapshot.contains_oid(oid);
-    let _ = snapshot.all_paths().count();
-    let _ = snapshot.validate([&file].into_iter());
-    liveness.remove_overlay_paths([file.clone()]);
-
-    let live_paths = LivePathMap::default();
-    live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
-    let fork = live_paths.fork();
-    fork.replace_all([LivePathEntry::overlay(file.clone(), oid)]);
-    let _ = fork.snapshot();
-    fork.remove([file]);
-    Ok(())
-}
-
-const _: fn(Repository, ProjectFile, Oid) -> Result<()> = compile_liveness_api_contract;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,7 +520,7 @@ mod tests {
     use std::time::Duration;
 
     fn project_file(root: &Path, rel: &str) -> ProjectFile {
-        ProjectFile::new(root.canonicalize().unwrap().normalize(), PathBuf::from(rel))
+        ProjectFile::new(root.canonicalize().unwrap(), PathBuf::from(rel))
     }
 
     #[test]
@@ -578,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn untracked_filesystem_entry_remains_consistent_after_staging() {
+    fn untracked_overlay_appears_in_snapshot_until_index_wins() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
         std::fs::write(temp.path().join("tracked.rs"), "fn tracked() {}\n").unwrap();
@@ -608,32 +594,7 @@ mod tests {
 
         let snapshot = liveness.snapshot().unwrap();
         assert_eq!(snapshot.oid_for_path(&file), Some(oid));
-        assert_eq!(snapshot.paths_for_oid(oid), std::slice::from_ref(&file));
-    }
-
-    #[test]
-    fn refreshing_tracked_filesystem_entry_replaces_memoized_identity() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
-        commit_all(&repo, "init");
-
-        let file = project_file(temp.path(), "a.rs");
-        let liveness = Liveness::new(repo).unwrap();
-        let first = liveness.snapshot().unwrap();
-        let old_oid = first.oid_for_path(&file).unwrap();
-
-        std::fs::write(temp.path().join("a.rs"), "fn refreshed_name() {}\n").unwrap();
-        let new_oid = Oid::hash_object(ObjectType::Blob, b"fn refreshed_name() {}\n").unwrap();
-        liveness
-            .refresh_overlay([LivePathEntry::filesystem(file.clone(), new_oid)])
-            .unwrap();
-
-        let second = liveness.snapshot().unwrap();
-        assert!(!Arc::ptr_eq(&first, &second));
-        assert_ne!(old_oid, new_oid);
-        assert_eq!(second.oid_for_path(&file), Some(new_oid));
-        assert_eq!(second.validated_oid_for_path(&file), Some(new_oid));
+        assert_eq!(snapshot.paths_for_oid(oid), &[file]);
     }
 
     #[test]
@@ -652,16 +613,11 @@ mod tests {
 
         let snapshot = liveness.snapshot().unwrap();
         assert_eq!(snapshot.oid_for_path(&file), Some(overlay_oid));
-        assert_eq!(
-            snapshot.paths_for_oid(overlay_oid),
-            std::slice::from_ref(&file)
-        );
-        std::fs::write(temp.path().join("tracked.rs"), "fn changed_disk() {}\n").unwrap();
-        assert_eq!(snapshot.validated_oid_for_path(&file), Some(overlay_oid));
+        assert_eq!(snapshot.paths_for_oid(overlay_oid), &[file]);
     }
 
     #[test]
-    fn same_size_index_rewrite_invalidates_memoized_snapshot() {
+    fn index_rewrite_invalidates_memoized_snapshot() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
         std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
@@ -672,6 +628,7 @@ mod tests {
         let first = liveness.snapshot().unwrap();
         let old_oid = first.oid_for_path(&file).unwrap();
 
+        thread::sleep(Duration::from_millis(25));
         std::fs::write(temp.path().join("a.rs"), "fn new() {}\n").unwrap();
         {
             let mut index = liveness.repo.lock().unwrap().index().unwrap();
@@ -722,62 +679,6 @@ mod tests {
         assert_eq!(
             snapshot.oid_for_path(&file),
             Some(Oid::hash_object(ObjectType::Blob, b"fn dirty() {}\n").unwrap())
-        );
-    }
-
-    #[test]
-    fn live_path_map_fork_replace_and_remove_are_isolated() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        let a = ProjectFile::new(root.clone(), "a.rs");
-        let b = ProjectFile::new(root, "b.rs");
-        let oid_a = Oid::hash_object(ObjectType::Blob, b"a").unwrap();
-        let oid_b = Oid::hash_object(ObjectType::Blob, b"b").unwrap();
-
-        let live = LivePathMap::default();
-        live.refresh([LivePathEntry::overlay(a.clone(), oid_a)]);
-        let fork = live.fork();
-        fork.replace_all([LivePathEntry::overlay(b.clone(), oid_b)]);
-
-        assert_eq!(live.snapshot().oid_for_path(&a), Some(oid_a));
-        assert_eq!(live.snapshot().oid_for_path(&b), None);
-        assert_eq!(fork.snapshot().oid_for_path(&a), None);
-        assert_eq!(
-            fork.snapshot().paths_for_oid(oid_b),
-            std::slice::from_ref(&b)
-        );
-        assert!(fork.snapshot().contains_oid(oid_b));
-        assert_eq!(fork.snapshot().all_paths().count(), 1);
-
-        fork.remove([b.clone()]);
-        assert_eq!(fork.snapshot().oid_for_path(&b), None);
-        live.remove([a]);
-        assert_eq!(live.snapshot().all_paths().count(), 0);
-    }
-
-    #[test]
-    fn removing_overlay_restores_index_identity() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("tracked.rs"), "fn disk() {}\n").unwrap();
-        commit_all(&repo, "init");
-
-        let file = project_file(temp.path(), "tracked.rs");
-        let overlay_oid = Oid::hash_object(ObjectType::Blob, b"fn overlay() {}\n").unwrap();
-        let disk_oid = Oid::hash_object(ObjectType::Blob, b"fn disk() {}\n").unwrap();
-        let liveness = Liveness::new(repo).unwrap();
-        liveness
-            .refresh_overlay([LivePathEntry::overlay(file.clone(), overlay_oid)])
-            .unwrap();
-        assert_eq!(
-            liveness.snapshot().unwrap().oid_for_path(&file),
-            Some(overlay_oid)
-        );
-
-        liveness.remove_overlay_paths([file.clone()]);
-        assert_eq!(
-            liveness.snapshot().unwrap().oid_for_path(&file),
-            Some(disk_oid)
         );
     }
 }

@@ -75,7 +75,7 @@ impl NoProviderAnalyzer {
 }
 
 impl IAnalyzer for NoProviderAnalyzer {
-    fn indexed_source<'a>(&'a self, _file: &ProjectFile) -> Option<&'a str> {
+    fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
         None
     }
 

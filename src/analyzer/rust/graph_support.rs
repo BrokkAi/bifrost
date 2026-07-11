@@ -207,7 +207,7 @@ impl RustAnalyzer {
         let mut binder = ImportBinder::empty();
 
         for import in self.inner.import_info_of(file) {
-            insert_rust_import_binding(&mut binder, import);
+            insert_rust_import_binding(&mut binder, &import);
         }
 
         binder

@@ -220,7 +220,7 @@ pub fn execute_with_limits(
             budget_exhausted = true;
             break;
         }
-        if !source_index.may_match(source) {
+        if !source_index.may_match(&source) {
             continue;
         }
         let Some(facts) = provider.structural_facts(&file) else {

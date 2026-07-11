@@ -50,7 +50,15 @@ successfully calling it, over tests that duplicate registry construction logic.
 
 Before pushing Rust changes, run the same core checks that CI enforces locally when practical.
 
-At minimum, run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` on CUDA-capable environments. On macOS or any machine without `nvcc`, do not use `--all-features`: it enables `nlp-gpu` and Candle's CUDA backend. Use `cargo clippy-no-cuda` instead to check all targets with the non-CUDA optional features enabled. If clippy fails, fix that locally before pushing rather than waiting for the CI matrix to report it back.
+At minimum, run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings`. There is no longer any
+compile-time GPU backend: `--all-features` just means `nlp,python` (the embedding sidecar selects CUDA/Metal at
+runtime), so this is safe on every machine. The `clippy-no-cuda` alias is a legacy equivalent of the same command;
+note it is broken inside nested worktrees (`.claude/worktrees/*`) because cargo merges the duplicate alias arrays
+from both `.cargo/config.toml` files — use the expanded command there. If clippy fails, fix that locally before
+pushing rather than waiting for the CI matrix to report it back.
+
+Full test-suite gates must pass `--features nlp,python`: `default = []`, so a featureless `cargo test` silently
+skips every `#![cfg(feature = "nlp")]` integration suite (they report `ok. 0 passed`, which looks green).
 
 We are okay with allow(clippy::too_many_arguments) rather than packing necessary parms into a struct just to
 make clippy shut up.
@@ -94,8 +102,8 @@ Backwards compatibility is not yet a concern. Clean up APIs instead when our req
 
 # Semantic search (nlp toolset)
 
-The `nlp` cargo feature (default-on) adds `semantic_search` and pulls in onnxruntime via `gte-rs`/`ort`; `ort` and
-`ort-sys` are pinned to the exact rc that `gte-rs` requires — do not bump one without the others. Tests must never
+The `nlp` cargo feature (opt-in; `default = []`) adds `semantic_search`, with voyage-4-nano embeddings served by the
+PyTorch SDPA sidecar (CUDA/Metal selected at runtime inside the sidecar — no compile-time backend features). Tests must never
 download models or spawn indexer threads: construct services with `SearchToolsService::new_without_semantic_index`,
 spawn the binary with `BIFROST_SEMANTIC_INDEX=off`, or inject `FakeEngineProvider`/`FakeHashEmbedder` from
 `nlp::engine`/`nlp::indexer`. The real-model smoke test is opt-in:

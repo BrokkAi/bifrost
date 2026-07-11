@@ -1,33 +1,26 @@
-//! Shared SQLite schema and connection setup for Bifrost's rebuildable cache.
-//!
-//! Issue #584 creates only the semantic namespace. The analyzer namespace is
-//! reserved at version zero; no analyzer tables or query backend exist here.
+//! Shared SQLite schema and connection setup for bifrost's rebuildable cache DB.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
-use crate::path_normalization::NormalizePath;
+pub type Result<T> = std::result::Result<T, String>;
 
-pub(crate) type Result<T> = std::result::Result<T, String>;
+pub const CACHE_DB_FILE_NAME: &str = "bifrost_cache.db";
+pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
+pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
-pub(crate) const CACHE_DB_FILE_NAME: &str = "bifrost_cache.db";
-pub(crate) const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 1;
-pub(crate) const LATEST_SEMANTIC_SCHEMA_VERSION: i64 = 1;
-pub(crate) const ANALYZER_SCHEMA_VERSION_NONE: i64 = 0;
-pub(crate) const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
+pub const LATEST_SCHEMA_VERSION: i64 = 6;
+const LATEST_SEMANTIC_SCHEMA_VERSION: i64 = 1;
+const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 7;
+pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 
-pub(crate) fn open_unified_connection(db_path: &Path) -> Result<Connection> {
+pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     let db_path = prepare_cache_db_path(db_path)?;
     ensure_safe_cache_path(&db_path)?;
-    let directory_guard = CacheDirectoryGuard::open(
-        db_path
-            .parent()
-            .ok_or_else(|| "cache database has no parent directory".to_string())?,
-    )?;
+    delete_legacy_cache_files_on_first_open(&db_path)?;
     let mut conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -35,161 +28,47 @@ pub(crate) fn open_unified_connection(db_path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    let initialized_before_open = unified_cache_initialized(&conn);
-    let initialized = (|| {
-        directory_guard.verify()?;
-        configure_connection(&mut conn)?;
-        migrate(&mut conn)?;
-        directory_guard.verify()
-    })();
-    if let Err(err) = initialized {
-        drop(conn);
-        return Err(err);
-    }
-    if !initialized_before_open {
-        // The legacy cache remains usable until the unified cache has opened and
-        // migrated successfully. Cleanup is best-effort because both caches are
-        // rebuildable and failure to delete an old warm cache must not fail open.
-        delete_legacy_cache_files(&db_path);
-    }
+    configure_connection(&mut conn)?;
+    migrate(&mut conn)?;
     Ok(conn)
 }
 
-fn unified_cache_initialized(conn: &Connection) -> bool {
-    conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM sqlite_master
-           WHERE type = 'table' AND name = 'cache_state'
-         ) AND EXISTS(
-           SELECT 1 FROM cache_state WHERE id = 1
-         )",
-        [],
-        |row| row.get(0),
-    )
-    .unwrap_or(false)
-}
-
 fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
-    let Some(parent) = db_path.parent() else {
-        return Ok(db_path.to_path_buf().normalize());
-    };
-    std::fs::create_dir_all(parent).map_err(|err| format!("cache DB I/O error: {err}"))?;
-    reject_symlink(parent, "cache directory")?;
-    let Some(file_name) = db_path.file_name() else {
-        return Ok(db_path.to_path_buf().normalize());
-    };
-    let canonical_parent = parent
-        .canonicalize()
-        .map_err(|err| format!("cache DB I/O error: {err}"))?
-        .normalize();
-    let expected_parent = parent
-        .parent()
-        .ok_or_else(|| "cache directory has no parent".to_string())?
-        .canonicalize()
-        .map_err(|err| format!("cache DB I/O error: {err}"))?
-        .normalize()
-        .join(
-            parent
-                .file_name()
-                .ok_or_else(|| "cache directory has no final component".to_string())?,
-        );
-    if canonical_parent != expected_parent {
-        return Err(format!(
-            "refusing cache directory that resolves outside its requested path: {}",
-            parent.display()
-        ));
-    }
-    Ok(canonical_parent.join(file_name))
-}
-
-#[cfg(unix)]
-struct CacheDirectoryGuard {
-    path: PathBuf,
-    directory: std::fs::File,
-}
-
-#[cfg(unix)]
-impl CacheDirectoryGuard {
-    fn open(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|err| format!("opening cache directory without symlink traversal: {err}"))?;
-        let guard = Self {
-            path: path.to_path_buf(),
-            directory,
-        };
-        guard.verify()?;
-        Ok(guard)
-    }
-
-    fn verify(&self) -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
-
-        reject_symlink(&self.path, "cache directory")?;
-        let held = self
-            .directory
-            .metadata()
-            .map_err(|err| format!("cache DB I/O error: {err}"))?;
-        let current =
-            std::fs::metadata(&self.path).map_err(|err| format!("cache DB I/O error: {err}"))?;
-        if held.dev() != current.dev() || held.ino() != current.ino() {
-            return Err(format!(
-                "cache directory changed while opening {}",
-                self.path.display()
-            ));
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("cache DB I/O error: {err}"))?;
+        if let Some(file_name) = db_path.file_name() {
+            let parent = parent
+                .canonicalize()
+                .map_err(|err| format!("cache DB I/O error: {err}"))?;
+            return Ok(parent.join(file_name));
         }
-        Ok(())
     }
+    Ok(db_path.to_path_buf())
 }
 
-#[cfg(not(unix))]
-struct CacheDirectoryGuard {
-    path: PathBuf,
-}
-
-#[cfg(not(unix))]
-impl CacheDirectoryGuard {
-    fn open(path: &Path) -> Result<Self> {
-        let guard = Self {
-            path: path.to_path_buf(),
-        };
-        guard.verify()?;
-        Ok(guard)
-    }
-
-    fn verify(&self) -> Result<()> {
-        reject_symlink(&self.path, "cache directory")?;
-        Ok(())
-    }
-}
-
-pub(crate) fn configure_connection(conn: &mut Connection) -> Result<()> {
+pub fn configure_connection(conn: &mut Connection) -> Result<()> {
     conn.busy_timeout(Duration::from_millis(5000))
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "foreign_keys", "ON")
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "ignore_check_constraints", "OFF")
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "recursive_triggers", "ON")
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "temp_store", "MEMORY")
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "cache_size", -65536)
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "mmap_size", 268435456i64)
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "wal_autocheckpoint", 2000)
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     Ok(())
 }
 
@@ -216,146 +95,157 @@ fn reject_symlink(path: &Path, label: &str) -> Result<()> {
     }
 }
 
-pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
+pub fn migrate(conn: &mut Connection) -> Result<()> {
     assert_sqlite_version(conn)?;
-    let state_exists = table_exists(conn, "cache_state")?;
-    if !state_exists && !table_exists(conn, "meta")? {
-        if user_table_names(conn)?.is_empty() {
-            let tx = conn.transaction().map_err(sqlite_error)?;
-            create_schema(&tx)?;
-            initialize_cache_state(&tx)?;
-            tx.commit().map_err(sqlite_error)?;
-        } else {
-            recreate_schema(conn)?;
-        }
+    let current = schema_version(conn)?;
+    if current == 0 {
+        let tx = conn
+            .transaction()
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+        create_schema(&tx)?;
+        initialize_cache_state(&tx)?;
+        tx.commit()
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
         return Ok(());
     }
-
-    if !state_exists {
+    if current != LATEST_SCHEMA_VERSION {
         recreate_schema(conn)?;
         return Ok(());
     }
-
-    let versions: Option<(i64, i64, i64)> = conn
-        .query_row(
-            "SELECT schema_version, semantic_schema_version, analyzer_schema_version
-             FROM cache_state WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    let Some((schema_version, semantic_version, analyzer_version)) = versions else {
-        return Err("cache_state is missing its required id = 1 row".to_string());
-    };
-    if analyzer_version != ANALYZER_SCHEMA_VERSION_NONE {
-        return Err(format!(
-            "cache analyzer schema version {analyzer_version} is newer than this build supports"
-        ));
+    let (semantic_version, analyzer_version) = namespace_schema_versions(conn)?;
+    if semantic_version != LATEST_SEMANTIC_SCHEMA_VERSION {
+        recreate_semantic_schema(conn)?;
     }
-    if schema_version != LATEST_SCHEMA_VERSION || semantic_version != LATEST_SEMANTIC_SCHEMA_VERSION
-    {
-        recreate_schema(conn)?;
+    if analyzer_version != LATEST_ANALYZER_SCHEMA_VERSION {
+        recreate_analyzer_schema(conn)?;
     }
     Ok(())
 }
 
-pub(crate) fn now_unix_seconds() -> i64 {
+pub fn now_unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|delta| delta.as_secs() as i64)
         .unwrap_or(0)
 }
 
-fn delete_legacy_cache_files(db_path: &Path) {
-    if db_path.file_name() != Some(std::ffi::OsStr::new(CACHE_DB_FILE_NAME)) {
-        return;
+fn delete_legacy_cache_files_on_first_open(db_path: &Path) -> Result<()> {
+    if db_path.exists() {
+        return Ok(());
     }
     let Some(parent) = db_path.parent() else {
-        return;
+        return Ok(());
     };
-    let legacy_path = parent.join(LEGACY_SEMANTIC_DB_FILE_NAME);
-    if !legacy_path.exists() {
-        return;
+    for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
+        for suffix in ["", "-wal", "-shm"] {
+            let path = parent.join(format!("{name}{suffix}"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("removing legacy cache {}: {err}", path.display())),
+            }
+        }
     }
-    let Ok(mut legacy) = Connection::open_with_flags(
-        &legacy_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    ) else {
-        return;
-    };
-    if legacy.busy_timeout(Duration::ZERO).is_err()
-        || legacy
-            .pragma_update(None, "locking_mode", "EXCLUSIVE")
-            .is_err()
-    {
-        return;
-    }
-    let checkpoint_busy = legacy
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .unwrap_or(1);
-    if checkpoint_busy != 0 {
-        return;
-    }
-    let Ok(exclusive) = legacy.transaction_with_behavior(TransactionBehavior::Exclusive) else {
-        return;
-    };
-    // Windows does not allow unlinking a SQLite database while this connection
-    // still owns file handles. The successful exclusive claim proves no live
-    // legacy writer was present; close it before best-effort cleanup.
-    drop(exclusive);
-    drop(legacy);
-    for suffix in ["", "-wal", "-shm"] {
-        let path = parent.join(format!("{LEGACY_SEMANTIC_DB_FILE_NAME}{suffix}"));
-        let _ = std::fs::remove_file(path);
-    }
+    Ok(())
 }
 
 fn recreate_schema(conn: &mut Connection) -> Result<()> {
-    conn.pragma_update(None, "foreign_keys", "OFF")
-        .map_err(sqlite_error)?;
-    let result = (|| {
-        let table_names = user_table_names(conn)?;
-        let tx = conn.transaction().map_err(sqlite_error)?;
-        for table_name in table_names {
-            let quoted = format!("\"{}\"", table_name.replace('"', "\"\""));
-            tx.execute_batch(&format!("DROP TABLE {quoted};"))
-                .map_err(sqlite_error)?;
-        }
-        create_schema(&tx)?;
-        initialize_cache_state(&tx)?;
-        tx.commit().map_err(sqlite_error)
-    })();
-    let restore = conn
-        .pragma_update(None, "foreign_keys", "ON")
-        .map_err(sqlite_error);
-    result.and(restore)
-}
-
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [table],
-        |row| row.get(0),
+    let tx = conn
+        .transaction()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    drop_semantic_schema(&tx)?;
+    drop_analyzer_schema(&tx)?;
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS cache_state;
+         DROP TABLE IF EXISTS meta;",
     )
-    .map_err(sqlite_error)
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    create_schema(&tx)?;
+    initialize_cache_state(&tx)?;
+    tx.commit()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    Ok(())
 }
 
-fn user_table_names(conn: &Connection) -> Result<Vec<String>> {
-    let mut statement = conn
-        .prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        )
-        .map_err(sqlite_error)?;
-    let names = statement
-        .query_map([], |row| row.get(0))
-        .map_err(sqlite_error)?
-        .collect::<std::result::Result<Vec<String>, _>>()
-        .map_err(sqlite_error)?;
-    Ok(names)
+fn recreate_semantic_schema(conn: &mut Connection) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    drop_semantic_schema(&tx)?;
+    create_semantic_schema(&tx)?;
+    tx.execute(
+        "UPDATE cache_state
+         SET semantic_schema_version = ?1,
+             embed_fingerprint = NULL,
+             chunker_version = NULL,
+             bm25_tokenizer_version = NULL,
+             last_gc_at = 0,
+             blobs_at_last_gc = 0
+         WHERE id = 1",
+        [LATEST_SEMANTIC_SCHEMA_VERSION],
+    )
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    tx.commit()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    Ok(())
+}
+
+fn recreate_analyzer_schema(conn: &mut Connection) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    drop_analyzer_schema(&tx)?;
+    create_analyzer_schema(&tx)?;
+    tx.execute(
+        "UPDATE cache_state
+         SET analyzer_schema_version = ?1,
+             last_gc_at = 0,
+             blobs_at_last_gc = 0
+         WHERE id = 1",
+        [LATEST_ANALYZER_SCHEMA_VERSION],
+    )
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    tx.commit()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    Ok(())
+}
+
+fn drop_semantic_schema(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS semantic_blob_chunks;
+         DROP TABLE IF EXISTS semantic_blob_summaries;
+         DROP TABLE IF EXISTS semantic_blobs;
+         DROP TABLE IF EXISTS semantic_vectors;
+         DROP TABLE IF EXISTS semantic_component_vectors;
+         DROP TABLE IF EXISTS blob_chunks;
+         DROP TABLE IF EXISTS blob_summaries;
+         DROP TABLE IF EXISTS vectors;
+         DROP TABLE IF EXISTS component_vectors;",
+    )
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    Ok(())
+}
+
+fn drop_analyzer_schema(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS import_details;
+         DROP TABLE IF EXISTS import_statements;
+         DROP TABLE IF EXISTS imports;
+         DROP TABLE IF EXISTS type_identifiers;
+         DROP TABLE IF EXISTS blob_meta;
+         DROP TABLE IF EXISTS scala_traits;
+         DROP TABLE IF EXISTS ruby_method_dispatch_modes;
+         DROP TABLE IF EXISTS unit_children;
+         DROP TABLE IF EXISTS unit_supertypes;
+         DROP TABLE IF EXISTS unit_signature_metadata;
+         DROP TABLE IF EXISTS unit_signatures;
+         DROP TABLE IF EXISTS unit_ranges;
+         DROP TABLE IF EXISTS code_units;
+         DROP TABLE IF EXISTS blobs;
+         DROP TABLE IF EXISTS analysis_epochs;",
+    )
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    Ok(())
 }
 
 fn create_schema(tx: &Transaction<'_>) -> Result<()> {
@@ -365,7 +255,7 @@ fn create_schema(tx: &Transaction<'_>) -> Result<()> {
           id                       INTEGER PRIMARY KEY CHECK(id = 1),
           schema_version           INTEGER NOT NULL,
           semantic_schema_version  INTEGER NOT NULL,
-          analyzer_schema_version  INTEGER NOT NULL CHECK(analyzer_schema_version >= 0),
+          analyzer_schema_version  INTEGER NOT NULL,
           last_gc_at               INTEGER NOT NULL DEFAULT 0,
           blobs_at_last_gc         INTEGER NOT NULL DEFAULT 0,
           gc_claim_until           INTEGER NOT NULL DEFAULT 0,
@@ -375,8 +265,10 @@ fn create_schema(tx: &Transaction<'_>) -> Result<()> {
         ) STRICT;
         "#,
     )
-    .map_err(sqlite_error)?;
-    create_semantic_schema(tx)
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    create_semantic_schema(tx)?;
+    create_analyzer_schema(tx)?;
+    Ok(())
 }
 
 fn create_semantic_schema(tx: &Transaction<'_>) -> Result<()> {
@@ -415,18 +307,195 @@ fn create_semantic_schema(tx: &Transaction<'_>) -> Result<()> {
 
         CREATE TABLE semantic_component_vectors(
           hash   BLOB PRIMARY KEY CHECK(length(hash) = 32),
-          dim    INTEGER NOT NULL CHECK(dim > 0),
+          dim    INTEGER NOT NULL,
           vector BLOB NOT NULL
         ) WITHOUT ROWID, STRICT;
 
         CREATE TABLE semantic_vectors(
           composed_hash BLOB PRIMARY KEY CHECK(length(composed_hash) = 32),
-          dim           INTEGER NOT NULL CHECK(dim > 0),
+          dim           INTEGER NOT NULL,
           vector        BLOB NOT NULL
         ) WITHOUT ROWID, STRICT;
         "#,
     )
-    .map_err(sqlite_error)?;
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    Ok(())
+}
+
+fn create_analyzer_schema(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        r#"
+        CREATE TABLE analysis_epochs(
+          lang  TEXT PRIMARY KEY,
+          epoch TEXT NOT NULL
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE blobs(
+          blob_oid TEXT NOT NULL CHECK(length(blob_oid) = 40 AND blob_oid NOT GLOB '*[^0-9a-f]*'),
+          lang     TEXT NOT NULL,
+          PRIMARY KEY(blob_oid, lang)
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE code_units(
+          blob_oid                 TEXT    NOT NULL,
+          lang                     TEXT    NOT NULL,
+          unit_key                 INTEGER NOT NULL,
+          kind                     INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 5),
+          short_name               TEXT    NOT NULL,
+          content_qualifier        TEXT    NOT NULL,
+          signature                TEXT,
+          synthetic                INTEGER NOT NULL CHECK(synthetic IN (0, 1)),
+          is_type_alias            INTEGER NOT NULL CHECK(is_type_alias IN (0, 1)),
+          top_level_ordinal        INTEGER CHECK(top_level_ordinal IS NULL OR top_level_ordinal >= 0),
+          in_declarations          INTEGER NOT NULL CHECK(in_declarations IN (0, 1)),
+          in_definition_lookup     INTEGER NOT NULL CHECK(in_definition_lookup IN (0, 1)),
+          PRIMARY KEY(blob_oid, lang, unit_key),
+          CHECK(kind <> 5),
+          CHECK(NOT (kind = 3 AND lang IN ('javascript', 'python', 'typescript'))),
+          FOREIGN KEY(blob_oid, lang)
+            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE INDEX idx_code_units_lang_short_name
+          ON code_units(lang, short_name);
+
+        CREATE TABLE unit_ranges(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          unit_key    INTEGER NOT NULL,
+          ordinal     INTEGER NOT NULL,
+          start_byte  INTEGER NOT NULL,
+          end_byte    INTEGER NOT NULL,
+          start_line  INTEGER NOT NULL,
+          end_line    INTEGER NOT NULL,
+          PRIMARY KEY(blob_oid, lang, unit_key, ordinal),
+          CHECK(start_byte >= 0 AND end_byte >= start_byte AND start_line >= 0 AND end_line >= start_line),
+          FOREIGN KEY(blob_oid, lang, unit_key)
+            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE INDEX idx_unit_ranges_lang_blob_ordinal
+          ON unit_ranges(lang, blob_oid, ordinal);
+
+        CREATE TABLE unit_signatures(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          unit_key    INTEGER NOT NULL,
+          ordinal     INTEGER NOT NULL,
+          text        TEXT    NOT NULL,
+          PRIMARY KEY(blob_oid, lang, unit_key, ordinal),
+          FOREIGN KEY(blob_oid, lang, unit_key)
+            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE unit_signature_metadata(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          unit_key    INTEGER NOT NULL,
+          ordinal     INTEGER NOT NULL,
+          metadata    BLOB    NOT NULL,
+          PRIMARY KEY(blob_oid, lang, unit_key, ordinal),
+          FOREIGN KEY(blob_oid, lang, unit_key)
+            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE unit_supertypes(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          unit_key    INTEGER NOT NULL,
+          ordinal     INTEGER NOT NULL,
+          raw         TEXT    NOT NULL,
+          PRIMARY KEY(blob_oid, lang, unit_key, ordinal),
+          FOREIGN KEY(blob_oid, lang, unit_key)
+            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE unit_children(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          parent_key  INTEGER NOT NULL,
+          child_key   INTEGER NOT NULL,
+          ordinal     INTEGER NOT NULL,
+          PRIMARY KEY(blob_oid, lang, parent_key, child_key, ordinal),
+          CHECK(parent_key <> child_key),
+          FOREIGN KEY(blob_oid, lang, parent_key)
+            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE,
+          FOREIGN KEY(blob_oid, lang, child_key)
+            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE ruby_method_dispatch_modes(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          unit_key    INTEGER NOT NULL,
+          mode        INTEGER NOT NULL CHECK(mode BETWEEN 0 AND 2),
+          PRIMARY KEY(blob_oid, lang, unit_key),
+          FOREIGN KEY(blob_oid, lang, unit_key)
+            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE scala_traits(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          unit_key    INTEGER NOT NULL,
+          PRIMARY KEY(blob_oid, lang, unit_key),
+          FOREIGN KEY(blob_oid, lang, unit_key)
+            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE import_statements(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          ordinal     INTEGER NOT NULL,
+          statement   TEXT    NOT NULL,
+          PRIMARY KEY(blob_oid, lang, ordinal),
+          FOREIGN KEY(blob_oid, lang)
+            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE import_details(
+          blob_oid    TEXT    NOT NULL,
+          lang        TEXT    NOT NULL,
+          ordinal     INTEGER NOT NULL,
+          info        BLOB    NOT NULL,
+          PRIMARY KEY(blob_oid, lang, ordinal),
+          FOREIGN KEY(blob_oid, lang)
+            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE blob_meta(
+          blob_oid           TEXT    NOT NULL,
+          lang               TEXT    NOT NULL,
+          contains_tests     INTEGER NOT NULL CHECK(contains_tests IN (0, 1)),
+          content_package    TEXT    NOT NULL,
+          stored_unit_count  INTEGER NOT NULL CHECK(stored_unit_count >= 0),
+          range_count         INTEGER NOT NULL CHECK(range_count >= 0),
+          signature_count     INTEGER NOT NULL CHECK(signature_count >= 0),
+          signature_metadata_count INTEGER NOT NULL CHECK(signature_metadata_count >= 0),
+          supertype_count     INTEGER NOT NULL CHECK(supertype_count >= 0),
+          child_count         INTEGER NOT NULL CHECK(child_count >= 0),
+          import_statement_count INTEGER NOT NULL CHECK(import_statement_count >= 0),
+          import_count        INTEGER NOT NULL CHECK(import_count >= 0),
+          type_identifier_count INTEGER NOT NULL CHECK(type_identifier_count >= 0),
+          ruby_dispatch_count INTEGER NOT NULL CHECK(ruby_dispatch_count >= 0),
+          scala_trait_count   INTEGER NOT NULL CHECK(scala_trait_count >= 0),
+          is_complete         INTEGER NOT NULL CHECK(is_complete IN (0, 1)),
+          PRIMARY KEY(blob_oid, lang),
+          FOREIGN KEY(blob_oid, lang)
+            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+
+        CREATE TABLE type_identifiers(
+          blob_oid         TEXT NOT NULL,
+          lang             TEXT NOT NULL,
+          type_identifier  TEXT NOT NULL,
+          PRIMARY KEY(blob_oid, lang, type_identifier),
+          FOREIGN KEY(blob_oid, lang)
+            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
+        ) WITHOUT ROWID, STRICT;
+        "#,
+    )
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     Ok(())
 }
 
@@ -439,22 +508,78 @@ fn initialize_cache_state(tx: &Transaction<'_>) -> Result<()> {
         [
             LATEST_SCHEMA_VERSION,
             LATEST_SEMANTIC_SCHEMA_VERSION,
-            ANALYZER_SCHEMA_VERSION_NONE,
+            LATEST_ANALYZER_SCHEMA_VERSION,
         ],
     )
-    .map_err(sqlite_error)?;
+    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     Ok(())
+}
+
+fn namespace_schema_versions(conn: &Connection) -> Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT semantic_schema_version, analyzer_schema_version
+         FROM cache_state WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|err| format!("cache DB SQLite error: {err}"))
+}
+
+fn schema_version(conn: &Connection) -> Result<i64> {
+    let state_exists: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cache_state'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    if state_exists.is_some() {
+        return conn
+            .query_row(
+                "SELECT schema_version FROM cache_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|version| version.unwrap_or(0))
+            .map_err(|err| format!("cache DB SQLite error: {err}"));
+    }
+    let meta_exists: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    if meta_exists.is_none() {
+        return Ok(0);
+    }
+    let legacy: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    legacy
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .map_err(|err| format!("invalid cache DB schema version: {err}"))
 }
 
 fn assert_sqlite_version(conn: &Connection) -> Result<()> {
     let version: String = conn
         .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-        .map_err(sqlite_error)?;
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     let parsed = parse_sqlite_version(&version)
-        .ok_or_else(|| format!("unable to parse SQLite version {version}"))?;
+        .ok_or_else(|| format!("unable to parse sqlite_version() output: {version}"))?;
     if parsed < SQLITE_MIN_VERSION {
         return Err(format!(
-            "SQLite {version} is too old; cache requires {}.{}.{} or newer",
+            "cache DB requires sqlite >= {}.{}.{} but found {version}",
             SQLITE_MIN_VERSION.0, SQLITE_MIN_VERSION.1, SQLITE_MIN_VERSION.2
         ));
     }
@@ -470,211 +595,9 @@ fn parse_sqlite_version(version: &str) -> Option<(u32, u32, u32)> {
     ))
 }
 
-fn sqlite_error(err: rusqlite::Error) -> String {
-    format!("cache DB SQLite error: {err}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn table_exists(conn: &Connection, table: &str) -> bool {
-        conn.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
-             )",
-            [table],
-            |row| row.get::<_, bool>(0),
-        )
-        .unwrap()
-    }
-
-    fn create_legacy_db(path: &Path) {
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
-            .unwrap();
-    }
-
-    #[test]
-    fn creates_only_semantic_namespace_and_reserves_analyzer_zero() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-
-        assert!(table_exists(&conn, "semantic_blobs"));
-        assert!(table_exists(&conn, "semantic_blob_chunks"));
-        assert!(!table_exists(&conn, "blobs"));
-        assert!(!table_exists(&conn, "analysis_epochs"));
-        assert!(!table_exists(&conn, "code_units"));
-        let analyzer_version: i64 = conn
-            .query_row(
-                "SELECT analyzer_schema_version FROM cache_state WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(analyzer_version, ANALYZER_SCHEMA_VERSION_NONE);
-    }
-
-    #[test]
-    fn schema_mismatch_rebuilds_semantic_namespace() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-        conn.execute(
-            "INSERT INTO semantic_blobs(blob_oid) VALUES(?1)",
-            ["1111111111111111111111111111111111111111"],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE cache_state SET schema_version = 999 WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        conn.execute_batch("CREATE TABLE analyzer_stale(id INTEGER PRIMARY KEY) STRICT;")
-            .unwrap();
-
-        migrate(&mut conn).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-        assert!(!table_exists(&conn, "analyzer_stale"));
-    }
-
-    #[test]
-    fn future_analyzer_schema_is_refused_without_mutation() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-        conn.execute_batch("CREATE TABLE analyzer_future(id INTEGER PRIMARY KEY) STRICT;")
-            .unwrap();
-        conn.execute(
-            "UPDATE cache_state SET analyzer_schema_version = 1 WHERE id = 1",
-            [],
-        )
-        .unwrap();
-
-        let err = migrate(&mut conn).unwrap_err();
-        assert!(err.contains("newer than this build supports"), "{err}");
-        assert!(table_exists(&conn, "semantic_blobs"));
-        assert!(table_exists(&conn, "analyzer_future"));
-        let version: i64 = conn
-            .query_row(
-                "SELECT analyzer_schema_version FROM cache_state WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, 1);
-    }
-
-    #[test]
-    fn missing_cache_state_row_is_reported_without_rebuild() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-        conn.execute("DELETE FROM cache_state", []).unwrap();
-
-        let err = migrate(&mut conn).unwrap_err();
-        assert!(err.contains("missing its required id = 1 row"), "{err}");
-        assert!(table_exists(&conn, "semantic_blobs"));
-    }
-
-    #[test]
-    fn first_unified_open_deletes_only_legacy_semantic_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
-        std::fs::create_dir(&cache_dir).unwrap();
-        create_legacy_db(&cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME));
-        let unrelated = cache_dir.join("analyzer_cache.db");
-        std::fs::write(&unrelated, b"unrelated").unwrap();
-
-        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
-        let _conn = open_unified_connection(&db_path).unwrap();
-        for suffix in ["", "-wal", "-shm"] {
-            assert!(
-                !cache_dir
-                    .join(format!("{LEGACY_SEMANTIC_DB_FILE_NAME}{suffix}"))
-                    .exists()
-            );
-        }
-        assert!(unrelated.exists());
-    }
-
-    #[test]
-    fn existing_unified_db_leaves_legacy_file_untouched() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
-        std::fs::create_dir(&cache_dir).unwrap();
-        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
-        let _conn = open_unified_connection(&db_path).unwrap();
-        let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
-        create_legacy_db(&legacy);
-
-        let _second = open_unified_connection(&db_path).unwrap();
-        assert!(legacy.exists());
-    }
-
-    #[test]
-    fn arbitrary_or_legacy_db_path_never_triggers_legacy_cleanup() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
-        std::fs::create_dir(&cache_dir).unwrap();
-        let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
-        create_legacy_db(&legacy);
-
-        let custom = cache_dir.join("custom.db");
-        let _custom = open_unified_connection(&custom).unwrap();
-        assert!(legacy.exists());
-
-        let _legacy = open_unified_connection(&legacy).unwrap();
-        assert!(legacy.exists());
-    }
-
-    #[test]
-    fn live_legacy_writer_prevents_first_open_cleanup() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
-        std::fs::create_dir(&cache_dir).unwrap();
-        let legacy_path = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
-        let mut legacy = Connection::open(&legacy_path).unwrap();
-        legacy.pragma_update(None, "journal_mode", "WAL").unwrap();
-        legacy
-            .execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
-            .unwrap();
-        let writer = legacy
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
-        writer
-            .execute("INSERT INTO legacy_cache(value) VALUES('active')", [])
-            .unwrap();
-
-        let unified = cache_dir.join(CACHE_DB_FILE_NAME);
-        let _conn = open_unified_connection(&unified).unwrap();
-        assert!(legacy_path.exists());
-        writer.rollback().unwrap();
-    }
-
-    #[test]
-    fn incomplete_unified_creation_cleans_legacy_after_later_success() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
-        std::fs::create_dir(&cache_dir).unwrap();
-        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
-        let partial = Connection::open(&db_path).unwrap();
-        partial
-            .execute_batch("CREATE TABLE interrupted(value TEXT) STRICT;")
-            .unwrap();
-        drop(partial);
-        let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
-        create_legacy_db(&legacy);
-
-        let conn = open_unified_connection(&db_path).unwrap();
-        assert!(table_exists(&conn, "semantic_blobs"));
-        assert!(!table_exists(&conn, "interrupted"));
-        assert!(!legacy.exists());
-    }
 
     #[cfg(unix)]
     #[test]
@@ -688,7 +611,10 @@ mod tests {
         symlink(&outside, &cache_dir).unwrap();
 
         let err = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap_err();
-        assert!(err.contains("cache directory symlink"), "unexpected: {err}");
+        assert!(
+            err.contains("cache directory symlink"),
+            "unexpected error: {err}"
+        );
         assert!(!outside.join(CACHE_DB_FILE_NAME).exists());
     }
 
@@ -704,21 +630,43 @@ mod tests {
         symlink(&outside, cache_dir.join(CACHE_DB_FILE_NAME)).unwrap();
 
         let err = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap_err();
-        assert!(err.contains("cache database symlink"), "unexpected: {err}");
+        assert!(
+            err.contains("cache database symlink"),
+            "unexpected error: {err}"
+        );
         assert!(!outside.exists());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn directory_guard_detects_cache_directory_replacement() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
-        std::fs::create_dir(&cache_dir).unwrap();
-        let guard = CacheDirectoryGuard::open(&cache_dir).unwrap();
-        std::fs::rename(&cache_dir, temp.path().join("original")).unwrap();
-        std::fs::create_dir(&cache_dir).unwrap();
+    fn analyzer_namespace_rebuild_preserves_semantic_tables() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
+            ["1111111111111111111111111111111111111111"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            ["2222222222222222222222222222222222222222"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cache_state SET analyzer_schema_version = 0 WHERE id = 1",
+            [],
+        )
+        .unwrap();
 
-        let err = guard.verify().unwrap_err();
-        assert!(err.contains("changed while opening"), "unexpected: {err}");
+        migrate(&mut conn).unwrap();
+
+        let semantic_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| row.get(0))
+            .unwrap();
+        let analyzer_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(semantic_count, 1);
+        assert_eq!(analyzer_count, 0);
     }
 }

@@ -27,6 +27,7 @@
 //! [`EdgeCollector::record`]; see the Go implementation in
 //! [`super::go_graph`] for the reference shape.
 
+use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::parsed_tree::{ParsedTreeFile, parse_tree_sitter_file};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
@@ -55,6 +56,23 @@ impl ClassRangeIndex {
                 analyzer
                     .ranges(&unit)
                     .into_iter()
+                    .map(move |range| (range.start_byte, range.end_byte, unit.fq_name()))
+            })
+            .collect();
+        Self { ranges }
+    }
+
+    pub(crate) fn build_from_state(state: &FileState) -> Self {
+        let ranges = state
+            .declarations
+            .iter()
+            .filter(|unit| unit.is_class())
+            .flat_map(|unit| {
+                state
+                    .ranges
+                    .get(unit)
+                    .into_iter()
+                    .flatten()
                     .map(move |range| (range.start_byte, range.end_byte, unit.fq_name()))
             })
             .collect();
@@ -248,6 +266,29 @@ pub(crate) fn build_file_declarations<K: NodeKey>(
     for unit in analyzer.declarations(file) {
         let key = K::from_unit(&unit);
         for unit_range in analyzer.ranges(&unit) {
+            let span = (unit_range.start_byte, unit_range.end_byte);
+            enclosers.push((span.0, span.1, key.clone()));
+            definitions.entry(key.clone()).or_default().push(span);
+        }
+    }
+    FileDeclarations {
+        enclosers,
+        definitions,
+    }
+}
+
+pub(crate) fn build_file_declarations_from_state<K: NodeKey>(
+    state: &FileState,
+) -> FileDeclarations<K> {
+    let mut enclosers = Vec::new();
+    let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
+    for unit in state
+        .declarations
+        .iter()
+        .filter(|unit| !unit.is_file_scope())
+    {
+        let key = K::from_unit(unit);
+        for unit_range in state.ranges.get(unit).into_iter().flatten() {
             let span = (unit_range.start_byte, unit_range.end_byte);
             enclosers.push((span.0, span.1, key.clone()));
             definitions.entry(key.clone()).or_default().push(span);
@@ -496,6 +537,24 @@ where
     out
 }
 
+pub(crate) fn collect_file_edges_with_declarations<K, W>(
+    file: &ProjectFile,
+    nodes: &HashSet<K>,
+    line_starts: &[usize],
+    declarations: FileDeclarations<K>,
+    walk: W,
+) -> PerFileEdges<K>
+where
+    K: NodeKey,
+    W: FnOnce(&mut EdgeCollector<K>),
+{
+    let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
+    walk(&mut collector);
+    let mut out = collector.finish();
+    out.path = crate::path_utils::rel_path_string(file);
+    out
+}
+
 /// Parse `file` on demand, build its edges via [`collect_file_edges`], and drop the
 /// tree / source / line starts when this returns — bounding live trees to ≈ the rayon
 /// worker count. Returns `None` to skip an unreadable or empty file. The `scan`
@@ -525,6 +584,26 @@ where
         file,
         nodes,
         &parsed.line_starts,
+        |collector| scan(&parsed, collector),
+    ))
+}
+
+pub(crate) fn parse_and_collect_with_declarations<S>(
+    file: &ProjectFile,
+    nodes: &HashSet<String>,
+    language: &TreeSitterLanguage,
+    declarations: FileDeclarations,
+    scan: S,
+) -> Option<PerFileEdges>
+where
+    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+{
+    let parsed = parse_tree_sitter_file(file, language)?;
+    Some(collect_file_edges_with_declarations(
+        file,
+        nodes,
+        &parsed.line_starts,
+        declarations,
         |collector| scan(&parsed, collector),
     ))
 }

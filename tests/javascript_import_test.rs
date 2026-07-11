@@ -41,7 +41,7 @@ fn test_import() {
 
     let file = project.file("foo.js");
     let analyzer = analyzer_for(project.root());
-    let imports: BTreeSet<_> = analyzer.import_statements_of(&file).into_iter().collect();
+    let imports: BTreeSet<_> = analyzer.import_statements(&file).into_iter().collect();
     let expected = BTreeSet::from([
         "import { Something, AnotherThing as AT } from './another-module';".to_string(),
         "import * as AllThings from './all-the-things';".to_string(),
@@ -318,7 +318,7 @@ fn test_require_import() {
     );
 
     let analyzer = analyzer_for(root);
-    let imports = analyzer.import_statements_of(&file);
+    let imports = analyzer.import_statements(&file);
     assert!(imports.iter().any(|line| line.contains("require('path')")));
     assert!(imports.iter().any(|line| line.contains("require('fs')")));
     assert!(

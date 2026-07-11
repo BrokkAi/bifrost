@@ -112,6 +112,11 @@ impl DefinitionLookupIndex {
         self.by_fqn.get(fqn).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    #[doc(hidden)]
+    pub fn fqn_for_test(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.fqn(fqn)
+    }
+
     pub(crate) fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
         self.direct_children_by_fqn
             .get(fqn)
@@ -124,6 +129,11 @@ impl DefinitionLookupIndex {
             .get(&(file.clone(), ident.to_string()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    #[doc(hidden)]
+    pub fn file_identifier_for_test(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        self.file_identifier(file, ident)
     }
 
     pub(crate) fn fqn_exists(&self, fqn: &str) -> bool {

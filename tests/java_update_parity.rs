@@ -151,7 +151,7 @@ fn multi_step_update_reproduction_cases_match_remaining_java_update_tests() {
         .into_iter()
         .next()
         .unwrap();
-    let children = analyzer.get_direct_children(&target_cu);
+    let children = analyzer.direct_children(&target_cu);
     assert!(
         children
             .iter()
@@ -174,7 +174,7 @@ fn multi_step_update_reproduction_cases_match_remaining_java_update_tests() {
         .into_iter()
         .next()
         .unwrap();
-    let children2 = analyzer2.get_direct_children(&target_cu2);
+    let children2 = analyzer2.direct_children(&target_cu2);
     assert!(
         children2
             .iter()

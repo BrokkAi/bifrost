@@ -481,9 +481,10 @@ pub(super) fn build_python_module_code_units(
 ) -> HashMap<String, CodeUnit> {
     inner
         .all_files()
+        .into_iter()
         .filter_map(|file| {
-            let module_fq = python_module_name(file);
-            module_code_unit(file, &module_fq).map(|code_unit| (module_fq, code_unit))
+            let module_fq = python_module_name(&file);
+            module_code_unit(&file, &module_fq).map(|code_unit| (module_fq, code_unit))
         })
         .collect()
 }

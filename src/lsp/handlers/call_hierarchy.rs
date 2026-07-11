@@ -15,7 +15,8 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range, WorkspaceAnalyzer,
+    AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range,
+    WorkspaceAnalyzer,
 };
 use crate::hash::HashMap;
 use crate::lsp::conversion::{
@@ -36,6 +37,7 @@ pub fn prepare(
     params: &CallHierarchyPrepareParams,
 ) -> Option<Vec<CallHierarchyItem>> {
     let analyzer = workspace.analyzer();
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let uri = &params.text_document_position_params.text_document.uri;
     let (file, content, line_starts) = read_document_for_uri(project, uri)?;
     let offset = position_to_byte_offset(
@@ -139,6 +141,7 @@ pub fn incoming_calls(
     params: &CallHierarchyIncomingCallsParams,
 ) -> Option<Vec<CallHierarchyIncomingCall>> {
     let analyzer = workspace.analyzer();
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let target = resolve_item_code_unit(analyzer, project, &params.item)?;
 
     let hits = UsageFinder::new()
@@ -196,6 +199,7 @@ pub fn outgoing_calls(
     params: &CallHierarchyOutgoingCallsParams,
 ) -> Option<Vec<CallHierarchyOutgoingCall>> {
     let analyzer = workspace.analyzer();
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let caller = resolve_item_code_unit(analyzer, project, &params.item)?;
     if !is_call_hierarchy_unit(&caller) {
         return Some(Vec::new());

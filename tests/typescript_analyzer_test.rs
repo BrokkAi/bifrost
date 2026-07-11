@@ -41,7 +41,7 @@ fn definition_in_file(
     fq_name: &str,
 ) -> CodeUnit {
     analyzer
-        .get_declarations(file)
+        .declarations(file)
         .into_iter()
         .find(|unit| unit.fq_name() == fq_name)
         .unwrap_or_else(|| {
@@ -67,7 +67,7 @@ fn typescript_materializes_exported_factory_object_surface() {
         "#,
     )]);
     let file = project.file("tool.ts");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
@@ -111,7 +111,7 @@ fn typescript_materializes_named_exported_returned_object_surface() {
         "#,
     )]);
     let file = project.file("factory.ts");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
@@ -151,7 +151,7 @@ fn typescript_preserves_non_surface_top_level_field_names() {
         "#,
     )]);
     let file = project.file("module.ts");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations
@@ -214,7 +214,7 @@ fn typescript_local_non_shape_preserving_define_function_blocks_surface_members(
         "#,
     )]);
     let file = project.file("tool.ts");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
@@ -418,7 +418,7 @@ fn test_hello_ts_skeletons() {
         skeletons.get(&local_details).unwrap()
     );
 
-    let declarations = analyzer.get_declarations(&hello);
+    let declarations = analyzer.declarations(&hello);
     assert!(declarations.contains(&greeter));
     assert!(
         declarations
@@ -580,7 +580,7 @@ fn typescript_anonymous_arrow_default_export_indexes_default_function() {
         "#,
     )]);
     let file = project.file("module.ts");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     let default = declarations
         .iter()
         .find(|unit| unit.short_name() == "default")
@@ -713,7 +713,7 @@ fn test_file_filtering_and_top_level_behavior() {
     let analyzer = fixture_analyzer();
     let java_file = ProjectFile::new(analyzer.project().root().to_path_buf(), "test/A.java");
     assert!(analyzer.get_skeletons(&java_file).is_empty());
-    assert!(analyzer.get_declarations(&java_file).is_empty());
+    assert!(analyzer.declarations(&java_file).is_empty());
 
     let temp = tempdir().unwrap();
     let root = temp.path();
@@ -745,8 +745,8 @@ fn test_file_filtering_and_top_level_behavior() {
         fixture_analyzer().project().root().to_path_buf(),
         "Hello.ts",
     );
-    let top_level = fixture_analyzer().get_top_level_declarations(&hello);
-    let declarations = fixture_analyzer().get_declarations(&hello);
+    let top_level = fixture_analyzer().top_level_declarations(&hello);
+    let declarations = fixture_analyzer().declarations(&hello);
     assert!(
         declarations
             .iter()
@@ -765,7 +765,7 @@ fn test_file_filtering_and_top_level_behavior() {
     );
     assert!(
         fixture_analyzer()
-            .get_top_level_declarations(&ProjectFile::new(
+            .top_level_declarations(&ProjectFile::new(
                 fixture_analyzer().project().root().to_path_buf(),
                 "NonExistent.ts",
             ))
@@ -877,7 +877,7 @@ fn test_static_instance_member_overlap() {
         analyzer.project().root().to_path_buf(),
         "StaticInstanceOverlap.ts",
     );
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     assert!(!declarations.is_empty());
 
     let color_units: Vec<_> = declarations
@@ -935,7 +935,7 @@ fn test_call_argument_object_literal_does_not_index_variable_member_definitions(
         "#,
     );
     let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations
@@ -966,7 +966,7 @@ fn test_function_overload_signatures() {
         .keys()
         .find(|code_unit| code_unit.short_name() == "add" && code_unit.is_function())
         .unwrap();
-    let add_signatures = analyzer.signatures_of(add);
+    let add_signatures = analyzer.signatures(add);
     assert_eq!(3, add_signatures.len());
     assert!(add_signatures.iter().any(|signature| {
         signature.contains("number") && signature.contains("(a: number, b: number)")
@@ -984,7 +984,7 @@ fn test_function_overload_signatures() {
         .keys()
         .find(|code_unit| code_unit.short_name() == "query" && code_unit.is_function())
         .unwrap();
-    let query_signatures = analyzer.signatures_of(query);
+    let query_signatures = analyzer.signatures(query);
     assert_eq!(3, query_signatures.len());
     assert!(
         query_signatures
@@ -996,7 +996,7 @@ fn test_function_overload_signatures() {
         .keys()
         .find(|code_unit| code_unit.short_name() == "combine" && code_unit.is_function())
         .unwrap();
-    let combine_signatures = analyzer.signatures_of(combine);
+    let combine_signatures = analyzer.signatures(combine);
     assert_eq!(3, combine_signatures.len());
     assert!(
         combine_signatures
@@ -1008,7 +1008,7 @@ fn test_function_overload_signatures() {
         .keys()
         .find(|code_unit| code_unit.short_name() == "map" && code_unit.is_function())
         .unwrap();
-    let map_signatures = analyzer.signatures_of(map);
+    let map_signatures = analyzer.signatures(map);
     assert_eq!(3, map_signatures.len());
     assert!(
         map_signatures
@@ -1017,11 +1017,11 @@ fn test_function_overload_signatures() {
     );
 
     let multiply = analyzer
-        .get_declarations(&file)
+        .declarations(&file)
         .into_iter()
         .find(|code_unit| code_unit.fq_name().contains("multiply"))
         .unwrap();
-    let multiply_signatures = analyzer.signatures_of(&multiply);
+    let multiply_signatures = analyzer.signatures(&multiply);
     assert_eq!(3, multiply_signatures.len());
     assert!(
         multiply_signatures
@@ -1052,12 +1052,12 @@ fn test_interface_overload_signatures_preserve_source_order() {
     );
     let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
     let parse = analyzer
-        .get_declarations(&file)
+        .declarations(&file)
         .into_iter()
         .find(|code_unit| code_unit.short_name() == "Parser.parse" && code_unit.is_function())
         .unwrap();
 
-    let signatures = analyzer.signatures_of(&parse);
+    let signatures = analyzer.signatures(&parse);
     assert_eq!(
         vec![
             "parse(value: string): string",
@@ -1083,14 +1083,14 @@ fn test_identical_overloads_merged_by_lookup_key() {
         "#,
     );
     let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     let log_methods: Vec<_> = declarations
         .iter()
         .filter(|code_unit| code_unit.short_name() == "Logger.log" && code_unit.is_function())
         .cloned()
         .collect();
     assert_eq!(1, log_methods.len());
-    let signatures = analyzer.signatures_of(&log_methods[0]);
+    let signatures = analyzer.signatures(&log_methods[0]);
     assert_eq!(1, signatures.len());
     assert!(signatures[0].contains("log(message: string): void"));
 }
@@ -1102,7 +1102,7 @@ fn test_alias_signature_formatting() {
     let file = write_file(root, "AliasTest.ts", "export type Foo = string | number;");
     let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
     let alias = analyzer
-        .get_declarations(&file)
+        .declarations(&file)
         .into_iter()
         .find(|code_unit| code_unit.short_name().contains("Foo"))
         .unwrap();

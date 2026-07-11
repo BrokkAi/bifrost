@@ -1,5 +1,4 @@
 use super::*;
-use crate::analyzer::build_reverse_file_index;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -41,7 +40,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
         references
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 
@@ -88,42 +87,32 @@ impl ImportAnalysisProvider for CppAnalyzer {
 impl CppAnalyzer {
     pub(crate) fn include_target_index(&self) -> &IncludeTargetIndex {
         self.include_target_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            let files = self.inner.all_files();
             IncludeTargetIndex::build(files.iter())
         })
     }
 
     fn reverse_include_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        self.reverse_include_index.get_or_build(
-            || self.compute_reverse_include_index(true),
-            || self.compute_reverse_include_index(false),
+        crate::analyzer::memoized_reverse_file_index(
+            &self.reverse_include_index,
+            || self.inner.all_files(),
+            |candidate| self.include_targets_for_file(candidate),
         )
     }
 
-    fn compute_reverse_include_index(
-        &self,
-        parallel: bool,
-    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        let files: Vec<_> = self.inner.all_files().cloned().collect();
+    fn include_targets_for_file(&self, candidate: &ProjectFile) -> Vec<ProjectFile> {
         let include_targets = self.include_target_index();
-
-        build_reverse_file_index(
-            &files,
-            |candidate| {
-                let mut matched_targets = HashSet::default();
-                let mut resolved_targets = Vec::new();
-                let imports = self.inner.import_statements(candidate);
-                for include in quoted_include_paths(&imports) {
-                    for target in include_targets.resolve_indexed(&include) {
-                        if matched_targets.insert(target.clone()) {
-                            resolved_targets.push(target);
-                        }
-                    }
+        let mut matched_targets = HashSet::default();
+        let mut resolved_targets = Vec::new();
+        let imports = self.inner.import_statements(candidate);
+        for include in quoted_include_paths(&imports) {
+            for target in include_targets.resolve_indexed(&include) {
+                if matched_targets.insert(target.clone()) {
+                    resolved_targets.push(target);
                 }
-                resolved_targets
-            },
-            parallel,
-        )
+            }
+        }
+        resolved_targets
     }
 }
 

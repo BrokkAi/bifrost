@@ -43,8 +43,6 @@ fn java_is_default_switch_label(node: Node<'_>, source: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct JavaAdapter;
 
-impl crate::analyzer::StorageLanguageAdapter for JavaAdapter {}
-
 impl LanguageAdapter for JavaAdapter {
     fn language(&self) -> Language {
         Language::Java

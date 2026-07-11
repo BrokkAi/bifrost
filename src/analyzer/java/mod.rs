@@ -12,18 +12,19 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, BuildProgressEvent, CloneSmell, CloneSmellWeights, CodeUnit,
-    CommentDensityStats, DeclarationInfo, DeclarationKind, ExceptionHandlingSmell,
-    ExceptionSmellWeights, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
+    CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo, DeclarationKind,
+    ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer, ImportAnalysisProvider, Language,
+    Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-pub(super) use adapter::JavaAdapter;
+pub(crate) use adapter::JavaAdapter;
 use cache::JavaMemoCaches;
 use clones::{build_clone_candidate_data, refine_java_clone_similarity};
 use comments::{build_java_roll_up_stats, collect_java_comment_aggregates};
@@ -45,68 +46,20 @@ pub struct JavaAnalyzer {
 }
 
 impl JavaAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.inner = self.inner.clone_with_project(project);
-        snapshot
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let external_dependencies = config.java.external_dependencies.clone();
         let inner = TreeSitterAnalyzer::new_with_config(project, JavaAdapter, config);
-        Self {
-            inner,
-            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
-            external_dependencies,
-            external_index: Arc::new(std::sync::OnceLock::new()),
-        }
-    }
-
-    pub fn new_with_config_and_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
-    }
-
-    pub(crate) fn new_with_config_storage_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: Option<BuildProgress>,
-    ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let external_dependencies = config.java.external_dependencies.clone();
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                JavaAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                JavaAdapter,
-                config,
-                storage,
-            ),
-        };
         Self {
             inner,
             memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
@@ -136,6 +89,29 @@ impl JavaAnalyzer {
             project,
             JavaAdapter,
             config,
+            progress,
+        );
+        Self {
+            inner,
+            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+            external_dependencies,
+            external_index: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    pub(crate) fn new_with_config_store_context(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        store_context: AnalyzerStoreContext,
+        progress: Option<BuildProgress>,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let external_dependencies = config.java.external_dependencies.clone();
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            JavaAdapter,
+            config,
+            store_context,
             progress,
         );
         Self {
@@ -214,8 +190,9 @@ impl JavaAnalyzer {
             .is_some()
     }
 
-    pub fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {
-        self.inner.package_name_of(file)
+    pub fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
+        self.cached_package_name(file)
+            .map(|package| package.to_string())
     }
 
     pub(crate) fn external_declaration_index(&self) -> &JavaExternalDeclarationIndex {
@@ -226,23 +203,61 @@ impl JavaAnalyzer {
             )
         })
     }
+
+    pub(crate) fn bulk_file_states(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+        source_mode: BulkFileStateSource,
+    ) -> HashMap<ProjectFile, FileState> {
+        self.inner.bulk_file_states(files, source_mode)
+    }
+
+    pub(crate) fn cached_package_name(&self, file: &ProjectFile) -> Option<Arc<str>> {
+        if let Some(package) = self.memo_caches.package_names.get(file) {
+            return Some(package);
+        }
+        let package: Arc<str> = Arc::from(self.inner.package_name_of(file)?);
+        self.memo_caches
+            .package_names
+            .insert(file.clone(), Arc::clone(&package));
+        Some(package)
+    }
 }
 
 impl IAnalyzer for JavaAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -289,6 +304,10 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
+    }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
@@ -331,6 +350,14 @@ impl IAnalyzer for JavaAnalyzer {
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
         self.inner.structural_search_providers()
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.inner.get_all_declarations()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.inner.get_definitions(fq_name)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -462,11 +489,12 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        // Forward to the inner `TreeSitterAnalyzer`; otherwise the default
-        // impl on `IAnalyzer` re-dispatches to `self.search_definitions`,
-        // skipping the FTS5 path entirely.
-        self.inner.search_definitions_persisted(pattern)
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -493,7 +521,7 @@ impl IAnalyzer for JavaAnalyzer {
         // Bifrost emits a top-level Module per Java package declaration; brokk's
         // Java analyzer does not. Skip module-kind tops so this method returns
         // the same set of stats rows as brokk-shared `JavaAnalyzer.commentDensityByTopLevel`.
-        self.get_top_level_declarations(file)
+        self.top_level_declarations(file)
             .iter()
             .filter(|cu| !cu.is_module() && !cu.is_synthetic())
             .map(|top| build_java_roll_up_stats(self, top, &aggs))

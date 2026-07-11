@@ -1,3 +1,4 @@
+use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::any::Any;
@@ -20,8 +21,8 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit>;
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile>;
 
-    fn import_info_of<'a>(&'a self, _file: &ProjectFile) -> &'a [ImportInfo] {
-        &[]
+    fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
+        Vec::new()
     }
 
     fn relevant_imports_for(&self, _code_unit: &CodeUnit) -> HashSet<String> {
@@ -55,6 +56,47 @@ where
                 .collect::<Vec<_>>()
         },
         parallel,
+    )
+}
+
+pub(crate) type ReverseFileIndex = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
+
+pub(crate) fn memoized_reverse_import_index<F, Files>(
+    memo: &PoolSafeMemo<ReverseFileIndex>,
+    files: Files,
+    resolve_imported: F,
+) -> Arc<ReverseFileIndex>
+where
+    F: Fn(&ProjectFile) -> HashSet<CodeUnit> + Sync + Copy,
+    Files: Fn() -> Vec<ProjectFile> + Copy,
+{
+    memoized_reverse_file_index(memo, files, |file| {
+        resolve_imported(file)
+            .into_iter()
+            .map(|code_unit| code_unit.source().clone())
+            .collect::<Vec<_>>()
+    })
+}
+
+pub(crate) fn memoized_reverse_file_index<F, I, Files>(
+    memo: &PoolSafeMemo<ReverseFileIndex>,
+    files: Files,
+    resolve_targets: F,
+) -> Arc<ReverseFileIndex>
+where
+    F: Fn(&ProjectFile) -> I + Sync + Copy,
+    I: IntoIterator<Item = ProjectFile>,
+    Files: Fn() -> Vec<ProjectFile> + Copy,
+{
+    memo.get_or_build(
+        || {
+            let files = files();
+            build_reverse_file_index(&files, resolve_targets, true)
+        },
+        || {
+            let files = files();
+            build_reverse_file_index(&files, resolve_targets, false)
+        },
     )
 }
 

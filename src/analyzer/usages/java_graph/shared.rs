@@ -3,13 +3,17 @@ use super::inverted;
 use super::jvm_scala::scan_scala_files_for_java_type;
 use super::resolver::TargetSpec;
 use super::return_type::{FileReturnCache, MethodReturnCache};
-use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
+use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
-use crate::hash::{HashMap, HashSet};
+use crate::analyzer::{
+    BulkFileStateSource, CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer,
+};
+use crate::hash::HashMap;
+use crate::hash::HashSet;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
@@ -51,11 +55,12 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         if scan_scope.allows(target.source()) {
             files.insert(target.source().clone());
         }
-
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut raw_match_count = 0usize;
         let mut limit_exceeded = false;
+        let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
+        let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
         let mut state = ScanState {
             max_usages,
             hits: &mut hits,
@@ -63,15 +68,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
-        // Receiver-chain return types are independent of the candidate file being
-        // scanned. Keep these caches for the whole query so repeated chains do not
-        // reparse the same declaration files once per candidate.
-        let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
-        let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
         for file in files {
-            if scan_scope.is_cancelled() {
-                break;
-            }
             scan_file(
                 self.java,
                 analyzer,
@@ -85,15 +82,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                 break;
             }
         }
-        if !scan_scope.is_cancelled() {
-            scan_scala_files_for_java_type(
-                analyzer,
-                candidate_files,
-                &spec,
-                &mut state,
-                scan_scope.cancellation(),
-            );
-        }
+        scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state, None);
 
         if limit_exceeded || hits.len() > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
@@ -115,13 +104,24 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
 pub(crate) struct JavaEdgeResolver<'a> {
     java: &'a JavaAnalyzer,
     files: Vec<ProjectFile>,
+    file_states: HashMap<ProjectFile, FileState>,
 }
 
 impl<'a> UsageEdgeResolver<'a> for JavaEdgeResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
-        let files = analyzed_files_for_language(analyzer, Language::Java);
-        Some(Self { java, files })
+        let files: Vec<ProjectFile> = analyzer
+            .project()
+            .analyzable_files(Language::Java)
+            .ok()?
+            .into_iter()
+            .collect();
+        let file_states = java.bulk_file_states(files.clone(), BulkFileStateSource::Omit);
+        Some(Self {
+            java,
+            files,
+            file_states,
+        })
     }
 
     fn build_edges<F>(
@@ -133,6 +133,13 @@ impl<'a> UsageEdgeResolver<'a> for JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_java_edges(analyzer, self.java, &self.files, nodes, keep_file)
+        inverted::build_java_edges(
+            analyzer,
+            self.java,
+            &self.files,
+            &self.file_states,
+            nodes,
+            keep_file,
+        )
     }
 }

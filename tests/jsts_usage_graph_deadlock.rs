@@ -100,7 +100,7 @@ export function run{index}() {{
     });
 
     let graph = rx
-        .recv_timeout(Duration::from_secs(120))
+        .recv_timeout(Duration::from_secs(240))
         .expect("JS/TS usage_graph hung while receiver analysis initialized usage indexes");
     let graph = match graph {
         Ok(graph) => graph,

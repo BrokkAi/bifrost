@@ -6,7 +6,7 @@ use super::syntax::PythonOverloadDecoratorBindings;
 use super::tests::python_source_contains_tests;
 use super::*;
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{LanguageAdapter, Range, StorageLanguageAdapter};
+use crate::analyzer::{LanguageAdapter, Range};
 use crate::text_utils::compute_line_starts;
 use std::sync::LazyLock;
 use tree_sitter::{Language as TsLanguage, Tree};
@@ -31,9 +31,29 @@ static PYTHON_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
 #[derive(Debug, Clone, Default)]
 pub struct PythonAdapter;
 
-impl StorageLanguageAdapter for PythonAdapter {
+impl LanguageAdapter for PythonAdapter {
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn query_directory(&self) -> &'static str {
+        "resources/treesitter/python"
+    }
+
+    fn parser_language(&self) -> TsLanguage {
+        tree_sitter_python::LANGUAGE.into()
+    }
+
+    fn file_extension(&self) -> &'static str {
+        "py"
+    }
+
     fn storage_content_qualifier(&self, _code_unit: &CodeUnit) -> String {
         String::new()
+    }
+
+    fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
+        false
     }
 
     fn storage_file_content_qualifier(&self, _package_name: &str) -> String {
@@ -77,23 +97,9 @@ impl StorageLanguageAdapter for PythonAdapter {
             state.children.insert(module, module_children);
         }
     }
-}
 
-impl LanguageAdapter for PythonAdapter {
-    fn language(&self) -> Language {
-        Language::Python
-    }
-
-    fn query_directory(&self) -> &'static str {
-        "resources/treesitter/python"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_python::LANGUAGE.into()
-    }
-
-    fn file_extension(&self) -> &'static str {
-        "py"
+    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+        module_code_unit(file, &python_module_name(file))
     }
 
     fn contains_tests(

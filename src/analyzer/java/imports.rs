@@ -1,6 +1,6 @@
 use super::external::JavaExternalType;
 use super::*;
-use crate::analyzer::{ImportInfo, build_reverse_file_index, build_reverse_import_index};
+use crate::analyzer::{ImportInfo, build_reverse_file_index};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,7 +11,7 @@ pub(crate) enum JavaTypeResolution {
 
 impl ImportAnalysisProvider for JavaAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
-        self.resolve_imports(file).into_values().collect()
+        self.resolve_imports(file).values().cloned().collect()
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -19,23 +19,10 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.memo_caches.reverse_import_index.get_or_build(
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    true,
-                )
-            },
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    false,
-                )
-            },
+        let reverse_index = crate::analyzer::memoized_reverse_import_index(
+            &self.memo_caches.reverse_import_index,
+            || self.inner.all_files(),
+            |candidate| self.imported_code_units_of(candidate),
         );
         let mut result = reverse_index
             .get(file)
@@ -51,7 +38,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         result
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 
@@ -179,8 +166,8 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return false;
         }
 
-        let source_package = self.inner.package_name_of(source_file).unwrap_or("");
-        let target_package = self.inner.package_name_of(target).unwrap_or("");
+        let source_package = self.package_name_of(source_file).unwrap_or_default();
+        let target_package = self.package_name_of(target).unwrap_or_default();
         if source_package == target_package {
             return true;
         }
@@ -206,8 +193,8 @@ impl JavaAnalyzer {
         let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
             HashMap::default();
         for file in self.inner.all_files() {
-            let package = self.inner.package_name_of(file).unwrap_or("").to_string();
-            for declaration in self.inner.top_level_declarations(file) {
+            let package = self.package_name_of(&file).unwrap_or_default();
+            for declaration in self.inner.top_level_declarations(&file) {
                 if declaration.is_class() || declaration.is_module() {
                     targets_by_package_and_name
                         .entry((package.clone(), declaration.identifier().to_string()))
@@ -217,15 +204,11 @@ impl JavaAnalyzer {
             }
         }
 
-        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        let files: Vec<_> = self.inner.all_files();
         build_reverse_file_index(
             &files,
             |candidate| {
-                let package = self
-                    .inner
-                    .package_name_of(candidate)
-                    .unwrap_or("")
-                    .to_string();
+                let package = self.package_name_of(candidate).unwrap_or_default();
                 let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
                     return Vec::new();
                 };
@@ -248,7 +231,7 @@ impl JavaAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        let target_package = self.inner.package_name_of(target).unwrap_or("");
+        let target_package = self.package_name_of(target).unwrap_or_default();
         let mut target_name = target
             .rel_path()
             .file_name()
@@ -285,40 +268,41 @@ impl JavaAnalyzer {
         false
     }
 
-    fn resolve_imports(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
+    fn resolve_imports(&self, file: &ProjectFile) -> Arc<HashMap<String, CodeUnit>> {
         if let Some(cached) = self.memo_caches.resolved_imports.get(file) {
-            return (*cached).clone();
+            return cached;
         }
 
-        let resolved = self.resolve_imports_uncached(file);
+        let resolved = Arc::new(self.resolve_imports_uncached(file));
         self.memo_caches
             .resolved_imports
-            .insert(file.clone(), Arc::new(resolved.clone()));
+            .insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
 
     fn resolve_imports_uncached(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
+        let imports = self.inner.import_info_of(file);
+        self.resolve_import_infos(&imports)
+    }
+
+    pub(crate) fn resolve_import_infos(&self, imports: &[ImportInfo]) -> HashMap<String, CodeUnit> {
         let mut resolved = HashMap::default();
         let mut wildcard_resolved = HashMap::<String, CodeUnit>::default();
 
-        for import in self.inner.import_info_of(file) {
+        for import in imports {
             let Some(import_path) = non_static_import_path(import) else {
                 continue;
             };
 
             if !import.is_wildcard {
-                if let Some(code_unit) = self
-                    .inner
-                    .definitions(import_path)
-                    .find(|code_unit| code_unit.is_class())
-                {
+                if let Some(code_unit) = self.source_type_by_fqn(import_path) {
                     resolved.insert(code_unit.identifier().to_string(), code_unit);
                 }
                 continue;
             }
 
             let package_name = import_path.trim_end_matches(".*");
-            for code_unit in self.inner.class_declarations_in_package(package_name) {
+            for code_unit in self.source_types_in_package(package_name) {
                 let identifier = code_unit.identifier().to_string();
                 if resolved.contains_key(&identifier)
                     && !wildcard_resolved.contains_key(&identifier)
@@ -343,11 +327,7 @@ impl JavaAnalyzer {
         }
 
         if normalized.contains('.') {
-            if let Some(code_unit) = self
-                .inner
-                .definitions(normalized)
-                .find(|code_unit| code_unit.is_class())
-            {
+            if let Some(code_unit) = self.source_type_by_fqn(normalized) {
                 return Some(code_unit);
             }
             if let Some(code_unit) = self.resolve_nested_type_name(file, normalized) {
@@ -361,17 +341,11 @@ impl JavaAnalyzer {
         }
 
         let same_package_fqn = self.same_package_fqn(file, normalized);
-        if let Some(code_unit) = self
-            .inner
-            .definitions(&same_package_fqn)
-            .find(|code_unit| code_unit.is_class())
-        {
+        if let Some(code_unit) = self.source_type_by_fqn(&same_package_fqn) {
             return Some(code_unit);
         }
 
-        self.inner
-            .definitions(normalized)
-            .find(|code_unit| code_unit.is_class())
+        self.source_type_by_fqn(normalized)
     }
 
     pub(crate) fn resolve_type_name_with_external(
@@ -393,38 +367,40 @@ impl JavaAnalyzer {
             return None;
         }
 
-        let access_package = self.inner.package_name_of(file).unwrap_or("");
+        let access_package = self.package_name_of(file).unwrap_or_default();
         if normalized.contains('.')
-            && let Some(external_type) = external.resolve_qualified_name(normalized, access_package)
+            && let Some(external_type) =
+                external.resolve_qualified_name(normalized, &access_package)
         {
             return Some(JavaTypeResolution::External(external_type.clone()));
         }
 
-        if let Some(external_type) = self.resolve_external_imports(file, normalized, access_package)
+        if let Some(external_type) =
+            self.resolve_external_imports(file, normalized, &access_package)
         {
             return Some(JavaTypeResolution::External(external_type));
         }
 
         if let Some((first, rest)) = normalized.split_once('.')
             && let Some(owner) =
-                self.resolve_visible_external_simple_type(file, first, access_package)
+                self.resolve_visible_external_simple_type(file, first, &access_package)
         {
             let nested_fqn = format!("{}.{}", owner.fqn(), rest);
             if let Some(external_type) =
-                external.resolve_qualified_name(&nested_fqn, access_package)
+                external.resolve_qualified_name(&nested_fqn, &access_package)
             {
                 return Some(JavaTypeResolution::External(external_type.clone()));
             }
         }
 
         let same_package = self.same_package_fqn(file, normalized);
-        if let Some(external_type) = external.resolve_same_package(access_package, normalized) {
+        if let Some(external_type) = external.resolve_same_package(&access_package, normalized) {
             return Some(JavaTypeResolution::External(external_type.clone()));
         }
 
         if same_package != normalized
             && let Some(external_type) =
-                external.resolve_qualified_name(&same_package, access_package)
+                external.resolve_qualified_name(&same_package, &access_package)
         {
             return Some(JavaTypeResolution::External(external_type.clone()));
         }
@@ -439,9 +415,7 @@ impl JavaAnalyzer {
         let (first, rest) = normalized.split_once('.')?;
         let owner = self.resolve_visible_simple_type(file, first)?;
         let nested_fqn = format!("{}.{}", owner.fq_name(), rest);
-        self.inner
-            .definitions(&nested_fqn)
-            .find(|code_unit| code_unit.is_class())
+        self.source_type_by_fqn(&nested_fqn)
     }
 
     fn resolve_visible_external_simple_type(
@@ -469,7 +443,7 @@ impl JavaAnalyzer {
     ) -> Option<JavaExternalType> {
         let external = self.external_declaration_index();
         for import in self.inner.import_info_of(file) {
-            let Some(import_path) = non_static_import_path(import) else {
+            let Some(import_path) = non_static_import_path(&import) else {
                 continue;
             };
 
@@ -486,7 +460,7 @@ impl JavaAnalyzer {
 
         let mut wildcard_match: Option<JavaExternalType> = None;
         for import in self.inner.import_info_of(file) {
-            let Some(import_path) = non_static_import_path(import) else {
+            let Some(import_path) = non_static_import_path(&import) else {
                 continue;
             };
             if !import.is_wildcard {
@@ -514,18 +488,36 @@ impl JavaAnalyzer {
             return Some(code_unit.clone());
         }
         let same_package_fqn = self.same_package_fqn(file, name);
+        self.source_type_by_fqn(&same_package_fqn)
+            .or_else(|| self.source_type_by_fqn(name))
+    }
+
+    fn source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
         self.inner
-            .definitions(&same_package_fqn)
+            .definition_lookup_index()
+            .by_fqn(fqn)
+            .iter()
             .find(|code_unit| code_unit.is_class())
-            .or_else(|| {
-                self.inner
-                    .definitions(name)
-                    .find(|code_unit| code_unit.is_class())
-            })
+            .cloned()
+    }
+
+    fn source_types_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+        let mut types: Vec<_> = self
+            .inner
+            .definition_lookup_index()
+            .package_types()
+            .filter(|((package, _), _)| package == package_name)
+            .flat_map(|(_, units)| units.iter().cloned())
+            .collect();
+        types.sort();
+        types.dedup();
+        types
     }
 
     fn same_package_fqn(&self, file: &ProjectFile, name: &str) -> String {
-        let package_name = self.inner.package_name_of(file).unwrap_or("");
+        let package_name = self
+            .cached_package_name(file)
+            .unwrap_or_else(|| Arc::from(""));
         if package_name.is_empty() {
             name.to_string()
         } else {

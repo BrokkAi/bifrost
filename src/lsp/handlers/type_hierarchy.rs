@@ -3,7 +3,7 @@ use lsp_types::{
     TypeHierarchySupertypesParams, Uri,
 };
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Project, WorkspaceAnalyzer};
+use crate::analyzer::{AnalyzerQueryScope, CodeUnit, IAnalyzer, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::path_to_uri_string;
 use crate::lsp::handlers::document_symbol::lsp_symbol_parts;
 use crate::lsp::handlers::hierarchy_support::{
@@ -18,6 +18,7 @@ pub fn prepare(
     params: &TypeHierarchyPrepareParams,
 ) -> Option<Vec<TypeHierarchyItem>> {
     let analyzer = workspace.analyzer();
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let provider = analyzer.type_hierarchy_provider()?;
     let uri = &params.text_document_position_params.text_document.uri;
     let target = resolve_type_target(
@@ -41,6 +42,7 @@ pub fn supertypes(
     params: &TypeHierarchySupertypesParams,
 ) -> Option<Vec<TypeHierarchyItem>> {
     let analyzer = workspace.analyzer();
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let provider = analyzer.type_hierarchy_provider()?;
     let code_unit = resolve_item_code_unit(analyzer, project, &params.item)?;
     if !provider.supports_type_hierarchy(&code_unit) {
@@ -59,6 +61,7 @@ pub fn subtypes(
     params: &TypeHierarchySubtypesParams,
 ) -> Option<Vec<TypeHierarchyItem>> {
     let analyzer = workspace.analyzer();
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let provider = analyzer.type_hierarchy_provider()?;
     let code_unit = resolve_item_code_unit(analyzer, project, &params.item)?;
     if !provider.supports_type_hierarchy(&code_unit) {

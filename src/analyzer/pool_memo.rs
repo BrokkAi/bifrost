@@ -29,14 +29,34 @@ impl<T> PoolSafeMemo<T> {
         build_parallel: impl FnOnce() -> T,
         build_serial: impl FnOnce() -> T,
     ) -> Arc<T> {
+        self.get_or_build_with_policy(build_parallel, build_serial, BuildPolicy::PoolSafe)
+    }
+
+    /// Build the value with the parallel builder even when called from a rayon
+    /// worker. Use only from orchestration code that prewarms a cache before
+    /// starting its own nested parallel scan.
+    pub(crate) fn get_or_build_parallel(
+        &self,
+        build_parallel: impl FnOnce() -> T,
+        build_serial: impl FnOnce() -> T,
+    ) -> Arc<T> {
+        self.get_or_build_with_policy(build_parallel, build_serial, BuildPolicy::ForceParallel)
+    }
+
+    fn get_or_build_with_policy(
+        &self,
+        build_parallel: impl FnOnce() -> T,
+        build_serial: impl FnOnce() -> T,
+        policy: BuildPolicy,
+    ) -> Arc<T> {
         if let Some(value) = self.get() {
             return value;
         }
 
-        let built = Arc::new(if rayon::current_thread_index().is_some() {
-            build_serial()
-        } else {
-            build_parallel()
+        let built = Arc::new(match policy {
+            BuildPolicy::ForceParallel => build_parallel(),
+            BuildPolicy::PoolSafe if rayon::current_thread_index().is_some() => build_serial(),
+            BuildPolicy::PoolSafe => build_parallel(),
         });
 
         let mut slot = self.slot.lock().expect("pool memo poisoned");
@@ -74,6 +94,12 @@ impl<T> PoolSafeMemo<T> {
     pub(crate) fn invalidate(&self) {
         *self.slot.lock().expect("pool memo poisoned") = None;
     }
+}
+
+#[derive(Clone, Copy)]
+enum BuildPolicy {
+    PoolSafe,
+    ForceParallel,
 }
 
 impl<T> Default for PoolSafeMemo<T> {

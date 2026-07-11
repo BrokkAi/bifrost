@@ -11,9 +11,10 @@ use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::usages::visible_names::{FileImportContext, resolve_visible_type};
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -35,14 +36,14 @@ pub struct CSharpAnalyzer {
 }
 
 impl CSharpAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.inner = self.inner.clone_with_project(project);
-        snapshot
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -53,45 +54,20 @@ impl CSharpAnalyzer {
         }
     }
 
-    pub fn new_with_config_and_storage(
+    pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
-    }
-
-    pub(crate) fn new_with_config_storage_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                CSharpAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                CSharpAdapter,
-                config,
-                storage,
-            ),
-        };
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            CSharpAdapter,
+            config,
+            store_context,
+            progress,
+        );
         Self {
             inner,
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
@@ -106,11 +82,11 @@ impl CSharpAnalyzer {
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
-        let package = self.inner.package_name_of(file).unwrap_or("");
+        let package = self.inner.package_name_of(file).unwrap_or_default();
         if !package.is_empty() {
             return package.to_string();
         }
-        self.get_declarations(file)
+        self.declarations(file)
             .into_iter()
             .map(|unit| unit.package_name().to_string())
             .find(|package| !package.is_empty())
@@ -165,7 +141,8 @@ impl CSharpAnalyzer {
         self.memo_caches.global_using_namespaces.get_or_init(|| {
             self.inner
                 .all_files()
-                .flat_map(|file| self.inner.import_info_of(file).iter())
+                .into_iter()
+                .flat_map(|file| self.inner.import_info_of(&file).into_iter())
                 .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
                 .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
                 .collect()
@@ -176,9 +153,10 @@ impl CSharpAnalyzer {
         self.memo_caches.global_using_aliases.get_or_init(|| {
             self.inner
                 .all_files()
-                .flat_map(|file| self.inner.import_info_of(file).iter())
+                .into_iter()
+                .flat_map(|file| self.inner.import_info_of(&file).into_iter())
                 .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-                .filter_map(csharp_using_alias_from_import)
+                .filter_map(|import| csharp_using_alias_from_import(&import))
                 .collect()
         })
     }
@@ -244,7 +222,7 @@ impl CSharpAnalyzer {
         (
             unit.fq_name(),
             self.inner
-                .signatures_of(unit)
+                .signatures(unit)
                 .first()
                 .map_or(0, |signature| csharp_type_parameter_count(signature)),
         )
@@ -324,7 +302,7 @@ impl CSharpAnalyzer {
 }
 
 pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
-    let normalized = fq_name.replace('$', ".");
+    let normalized = fq_name.replace(['$', '+'], ".");
     let Some(owner) = normalized.strip_suffix(".#ctor") else {
         return normalized;
     };
@@ -561,20 +539,39 @@ fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Nod
 impl TestDetectionProvider for CSharpAnalyzer {}
 
 impl IAnalyzer for CSharpAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -627,6 +624,10 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
+    }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
@@ -647,6 +648,14 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn project(&self) -> &dyn Project {
         self.inner.project()
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.inner.get_all_declarations()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.inner.get_definitions(fq_name)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -710,8 +719,12 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions_persisted(pattern)
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

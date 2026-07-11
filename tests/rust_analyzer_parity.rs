@@ -142,7 +142,7 @@ fn rust_imports_aliases_and_test_detection_match_expected_behaviors() {
     let analyzer = RustAnalyzer::from_project(project.clone());
     let main_file = ProjectFile::new(project.root().to_path_buf(), "src/main.rs");
 
-    let imports = analyzer.import_statements_of(&main_file);
+    let imports = analyzer.import_statements(&main_file);
     assert!(imports.contains(&"use crate::my_module::MyStruct;".to_string()));
     assert!(imports.contains(&"use crate::my_module::MyStruct as AliasStruct;".to_string()));
     assert!(imports.contains(&"use std::io;".to_string()));
@@ -176,7 +176,7 @@ fn rust_type_aliases_are_marked() {
     )]);
     let analyzer = RustAnalyzer::from_project(project.clone());
     let file = ProjectFile::new(project.root().to_path_buf(), "src/main.rs");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     let alias = declarations
         .iter()

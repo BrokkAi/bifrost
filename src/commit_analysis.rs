@@ -601,7 +601,10 @@ fn build_analyzer(root: &Path, files: &[PathBuf]) -> Result<WorkspaceAnalyzer, S
         root.to_path_buf(),
         files.iter().cloned(),
     ));
-    Ok(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()))
+    Ok(WorkspaceAnalyzer::build_persisted(
+        project,
+        AnalyzerConfig::default(),
+    ))
 }
 
 fn symbol_snapshot_map(

@@ -1,5 +1,4 @@
 use super::*;
-use crate::analyzer::build_reverse_file_index;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{ImportInfo, Language};
 use std::ffi::OsStr;
@@ -149,13 +148,13 @@ impl RubyAnalyzer {
         self.autoload_constant_files.get_or_init(|| {
             let mut index: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
             for file in self.inner.all_files() {
-                let Ok(source) = self.inner.project().read_source(file) else {
+                let Ok(source) = self.inner.project().read_source(&file) else {
                     continue;
                 };
                 let Some(tree) = parse_ruby_tree(&source) else {
                     continue;
                 };
-                collect_ruby_autoload_edges(file, &source, tree.root_node(), &mut index);
+                collect_ruby_autoload_edges(&file, &source, tree.root_node(), &mut index);
             }
             index
         })
@@ -286,15 +285,10 @@ impl RubyAnalyzer {
     pub(super) fn build_reverse_import_index(
         &self,
     ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        self.reverse_import_index.get_or_build(
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_file_index(&files, |file| self.required_files(file), true)
-            },
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_file_index(&files, |file| self.required_files(file), false)
-            },
+        crate::analyzer::memoized_reverse_file_index(
+            &self.reverse_import_index,
+            || self.inner.all_files(),
+            |file| self.required_files(file),
         )
     }
 
@@ -446,7 +440,7 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         referencing
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 }

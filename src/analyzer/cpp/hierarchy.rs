@@ -15,7 +15,7 @@ impl CppAnalyzer {
                 self.visible_type_units(code_unit.source(), include_targets, &mut visible_by_file);
             let mut ancestors = Vec::new();
             for raw in self.inner.raw_supertypes_of(&code_unit) {
-                if let Some(ancestor) = self.resolve_base_type(&code_unit, raw, &visible)
+                if let Some(ancestor) = self.resolve_base_type(&code_unit, &raw, &visible)
                     && !ancestors.iter().any(|existing| existing == &ancestor)
                 {
                     ancestors.push(ancestor);

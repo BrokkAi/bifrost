@@ -1,7 +1,7 @@
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
-    build_reverse_file_index, build_reverse_import_index,
+    build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -55,10 +55,10 @@ impl ScalaAnalyzer {
     ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
         let mut files_by_package: HashMap<String, Vec<ProjectFile>> = HashMap::default();
         for file in self.inner.all_files() {
-            if file_language(file) != Language::Scala {
+            if file_language(&file) != Language::Scala {
                 continue;
             }
-            if let Some(package) = self.inner.package_name_of(file) {
+            if let Some(package) = self.inner.package_name_of(&file) {
                 files_by_package
                     .entry(package.to_string())
                     .or_default()
@@ -66,7 +66,7 @@ impl ScalaAnalyzer {
             }
         }
 
-        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        let files: Vec<_> = self.inner.all_files();
         build_reverse_file_index(
             &files,
             |candidate| {
@@ -76,7 +76,7 @@ impl ScalaAnalyzer {
                 let Some(package) = self.inner.package_name_of(candidate) else {
                     return Vec::new();
                 };
-                files_by_package.get(package).cloned().unwrap_or_default()
+                files_by_package.get(&package).cloned().unwrap_or_default()
             },
             parallel,
         )
@@ -93,7 +93,7 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         }
         let mut imported = HashSet::default();
         for info in self.inner.import_info_of(file) {
-            for code_unit in self.resolve_import_info(info) {
+            for code_unit in self.resolve_import_info(&info) {
                 imported.insert(code_unit);
             }
         }
@@ -109,23 +109,10 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         if file_language(file) != Language::Scala {
             return HashSet::default();
         }
-        let reverse_index = self.reverse_import_index.get_or_build(
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    true,
-                )
-            },
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    false,
-                )
-            },
+        let reverse_index = crate::analyzer::memoized_reverse_import_index(
+            &self.reverse_import_index,
+            || self.inner.all_files(),
+            |candidate| self.imported_code_units_of(candidate),
         );
         let mut result = reverse_index
             .get(file)
@@ -140,7 +127,7 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         result
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 

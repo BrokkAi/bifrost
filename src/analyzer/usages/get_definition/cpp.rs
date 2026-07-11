@@ -2286,8 +2286,8 @@ fn cpp_choose_canonical_type(
     candidates
         .iter()
         .find(|candidate| cpp_type_has_definition_body(analyzer, candidate))
+        .or(Some(&first))
         .cloned()
-        .or(Some(first))
 }
 
 fn cpp_type_has_definition_body(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {

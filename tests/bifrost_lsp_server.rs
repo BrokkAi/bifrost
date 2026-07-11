@@ -2191,9 +2191,12 @@ fn bifrost_lsp_server_skips_startup_progress_without_client_support() {
         response["id"], 2,
         "expected documentSymbol response: {response}"
     );
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected document symbols, got {response}"));
     assert!(
-        root.join(".bifrost").exists(),
-        "server should still create the analyzer cache for clients without work-done progress (progress support is a UI capability, unrelated to persistence)"
+        symbols.iter().any(|symbol| symbol["name"] == "NoProgress"),
+        "server should still answer analyzer-backed requests for clients without work-done progress (progress support is a UI capability, unrelated to indexing): {symbols:#?}"
     );
 
     server.notify_value(json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}));
@@ -2246,9 +2249,14 @@ fn bifrost_lsp_server_disables_startup_progress_when_token_create_fails() {
         response["id"], 2,
         "expected documentSymbol response after rejected progress token: {response}"
     );
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected document symbols, got {response}"));
     assert!(
-        root.join(".bifrost").exists(),
-        "server should still create the analyzer cache after progress token creation fails (progress reporting is independent of persistence)"
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "RejectedProgress"),
+        "server should still answer analyzer-backed requests after progress token creation fails (progress reporting is independent of indexing): {symbols:#?}"
     );
 
     server.notify_value(json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}));
@@ -6686,7 +6694,10 @@ fn bifrost_lsp_server_hover_uses_python_language_tag_for_py_file() {
 
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
     let root_uri = uri_for(&canonical_root);
-    let py_uri = uri_for(&canonical_root.join("documented.py"));
+    let py_path = canonical_root.join("documented.py");
+    let py_uri = uri_for(&py_path);
+    let py_source = std::fs::read_to_string(&py_path).expect("read documented.py");
+    let (line, character) = position_after(&py_source, "class ");
 
     server.notify_value(json!({
         "jsonrpc": "2.0",
@@ -6697,16 +6708,15 @@ fn bifrost_lsp_server_hover_uses_python_language_tag_for_py_file() {
     let _ = server.read_message();
     server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
 
-    // Line 21 (0-based) is `class DocumentedClass:`. The class name starts
-    // at char 6 — guards against the language-tag table emitting "java"
-    // (or any wrong tag) for a .py file.
+    // Guards against the language-tag table emitting "java" (or any wrong tag)
+    // for a .py file.
     server.notify_value(json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "textDocument/hover",
         "params": {
             "textDocument": {"uri": py_uri},
-            "position": {"line": 21, "character": 7}
+            "position": {"line": line, "character": character}
         }
     }));
     let response = server.read_message();

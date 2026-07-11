@@ -1,22 +1,26 @@
 use super::extractor::scan_file;
 use super::inverted::{self, ProjectTypes};
 use super::resolver::TargetSpec;
-use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
+use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
+    BulkFileStateSource, CodeUnit, IAnalyzer, ImportInfo, Language, ProjectFile, ScalaAnalyzer,
+    resolve_analyzer,
 };
+use crate::hash::HashMap;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
-pub(super) struct ScalaEdgeGraph<'a> {
-    pub(super) scala: &'a ScalaAnalyzer,
+pub(super) struct ScalaEdgeGraph {
     pub(super) files: Vec<ProjectFile>,
-    pub(super) types: Arc<ProjectTypes>,
+    pub(super) types: ProjectTypes,
+    pub(super) package_by_file: HashMap<ProjectFile, String>,
+    pub(super) imports_by_file: HashMap<ProjectFile, Vec<ImportInfo>>,
+    pub(super) file_states: HashMap<ProjectFile, FileState>,
 }
 
 pub(crate) struct ScalaQueryResolver<'a> {
@@ -61,9 +65,6 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut limit_exceeded = false;
         for file in files {
-            if scan_scope.is_cancelled() {
-                break;
-            }
             scan_file(
                 self.scala,
                 analyzer,
@@ -91,20 +92,33 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
 }
 
 pub(crate) struct ScalaEdgeResolver<'a> {
-    graph: ScalaEdgeGraph<'a>,
+    scala: &'a ScalaAnalyzer,
+    graph: ScalaEdgeGraph,
 }
 
 impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
-        let files = analyzed_files_for_language(analyzer, Language::Scala);
-        let types = scala.project_types();
+        let files: Vec<ProjectFile> = analyzer
+            .project()
+            .analyzable_files(Language::Scala)
+            .ok()?
+            .into_iter()
+            .collect();
+        let file_states = scala.bulk_file_states(files.clone(), BulkFileStateSource::Omit);
+        let types = ProjectTypes::build_from_file_states(scala, &file_states);
 
         Some(Self {
+            scala,
             graph: ScalaEdgeGraph {
-                scala,
                 files,
                 types,
+                package_by_file: self::package_by_file(&file_states),
+                imports_by_file: file_states
+                    .iter()
+                    .map(|(file, state)| (file.clone(), state.imports.clone()))
+                    .collect(),
+                file_states,
             },
         })
     }
@@ -118,6 +132,13 @@ impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_scala_edges(analyzer, &self.graph, nodes, keep_file)
+        inverted::build_scala_edges(analyzer, self.scala, &self.graph, nodes, keep_file)
     }
+}
+
+fn package_by_file(states: &HashMap<ProjectFile, FileState>) -> HashMap<ProjectFile, String> {
+    states
+        .iter()
+        .map(|(file, state)| (file.clone(), state.package_name.clone()))
+        .collect()
 }

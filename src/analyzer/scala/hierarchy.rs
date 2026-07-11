@@ -68,7 +68,7 @@ impl ScalaAnalyzer {
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
         for raw in self.inner.raw_supertypes_of(code_unit) {
-            let Some(fqn) = resolver.resolve(raw) else {
+            let Some(fqn) = resolver.resolve(&raw) else {
                 continue;
             };
             if !seen.insert(fqn.clone()) {
@@ -121,6 +121,7 @@ impl ScalaAnalyzer {
     fn scala_trait_fqns(&self) -> HashSet<String> {
         self.inner
             .scala_traits()
+            .into_iter()
             .map(|unit| unit.fq_name())
             .collect()
     }

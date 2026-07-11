@@ -125,7 +125,7 @@ fn test_braced_package_bodies_preserve_top_level_source_order() {
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Packages.scala");
 
     let top_level: Vec<_> = analyzer
-        .get_top_level_declarations(&file)
+        .top_level_declarations(&file)
         .into_iter()
         .map(|unit| unit.fq_name())
         .collect();
@@ -294,7 +294,7 @@ fn test_file_summary_no_semicolons_after_imports() {
     let analyzer = ScalaAnalyzer::from_project(project.clone());
     let file = ProjectFile::new(project.root().to_path_buf(), "ai/brokk/Foo.scala");
 
-    let imports = analyzer.import_statements_of(&file);
+    let imports = analyzer.import_statements(&file);
     assert!(!imports.is_empty());
     assert!(
         imports

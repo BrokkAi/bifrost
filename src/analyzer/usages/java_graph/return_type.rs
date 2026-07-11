@@ -54,8 +54,11 @@ where
     let fqn = format!("{owner}.{name}");
     let units = ctx
         .java()
-        .definitions(&fqn)
+        .definition_lookup_index()
+        .by_fqn(&fqn)
+        .iter()
         .filter(|unit| unit.is_function() && signature_arity(unit.signature()) == arity)
+        .cloned()
         .collect::<Vec<_>>();
     if units.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;

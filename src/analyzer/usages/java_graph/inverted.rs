@@ -24,9 +24,11 @@ use super::return_type::{
     METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodReturnCache, merge_receiver_type_outcomes,
     method_return_type_for_owner_fqn,
 };
+use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, parse_and_collect,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, build_file_declarations,
+    build_file_declarations_from_state, parse_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
@@ -39,6 +41,7 @@ pub(super) fn build_java_edges<F>(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     files: &[ProjectFile],
+    file_states: &HashMap<ProjectFile, FileState>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> UsageEdges
@@ -49,20 +52,33 @@ where
     let return_type_cache: MethodReturnCache = Mutex::new(HashMap::default());
     let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
     build_edges(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
-            let mut ctx = JavaScan {
-                java,
-                file,
-                source: parsed.source.as_str(),
-                root: parsed.tree.root_node(),
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                return_type_cache: &return_type_cache,
-                file_return_cache: &file_return_cache,
-                collector,
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-        })
+        let state = file_states.get(file);
+        let declarations = state
+            .map(build_file_declarations_from_state)
+            .unwrap_or_else(|| build_file_declarations(analyzer, file));
+        let class_ranges = state
+            .map(ClassRangeIndex::build_from_state)
+            .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
+        parse_and_collect_with_declarations(
+            file,
+            nodes,
+            &language,
+            declarations,
+            |parsed, collector| {
+                let mut ctx = JavaScan {
+                    java,
+                    file,
+                    source: parsed.source.as_str(),
+                    root: parsed.tree.root_node(),
+                    class_ranges,
+                    return_type_cache: &return_type_cache,
+                    file_return_cache: &file_return_cache,
+                    collector,
+                };
+                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+            },
+        )
     })
 }
 

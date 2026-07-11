@@ -27,7 +27,7 @@ fn test_ordinary_import() {
     )]);
     let analyzer = ScalaAnalyzer::from_project(project.clone());
     let file = ProjectFile::new(project.root().to_path_buf(), "Foo.scala");
-    let imports: BTreeSet<_> = analyzer.import_statements_of(&file).into_iter().collect();
+    let imports: BTreeSet<_> = analyzer.import_statements(&file).into_iter().collect();
     assert_eq!(
         BTreeSet::from(["import foo.bar.Baz".to_string(), "import Bar".to_string()]),
         imports
@@ -46,7 +46,7 @@ fn test_static_import() {
     )]);
     let analyzer = ScalaAnalyzer::from_project(project.clone());
     let file = ProjectFile::new(project.root().to_path_buf(), "Foo.scala");
-    let imports: BTreeSet<_> = analyzer.import_statements_of(&file).into_iter().collect();
+    let imports: BTreeSet<_> = analyzer.import_statements(&file).into_iter().collect();
     assert_eq!(
         BTreeSet::from(["import foo.bar.{Baz as Bar}".to_string()]),
         imports
@@ -65,7 +65,7 @@ fn test_wildcard_import() {
     )]);
     let analyzer = ScalaAnalyzer::from_project(project.clone());
     let file = ProjectFile::new(project.root().to_path_buf(), "Foo.scala");
-    let imports: BTreeSet<_> = analyzer.import_statements_of(&file).into_iter().collect();
+    let imports: BTreeSet<_> = analyzer.import_statements(&file).into_iter().collect();
     assert_eq!(BTreeSet::from(["import foo.bar.*".to_string()]), imports);
 }
 

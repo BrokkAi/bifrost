@@ -1,6 +1,6 @@
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
-    build_reverse_file_index, build_reverse_import_index,
+    build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -52,23 +52,10 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         if target_namespaces.is_empty() {
             return HashSet::default();
         }
-        let reverse_index = self.memo_caches.reverse_import_index.get_or_build(
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    true,
-                )
-            },
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    false,
-                )
-            },
+        let reverse_index = crate::analyzer::memoized_reverse_import_index(
+            &self.memo_caches.reverse_import_index,
+            || self.inner.all_files(),
+            |candidate| self.imported_code_units_of(candidate),
         );
         let mut result = reverse_index
             .get(file)
@@ -85,7 +72,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         result
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [crate::analyzer::ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<crate::analyzer::ImportInfo> {
         self.inner.import_info_of(file)
     }
 
@@ -159,7 +146,7 @@ impl CSharpAnalyzer {
         for target in self.inner.all_files() {
             for unit in self
                 .inner
-                .top_level_declarations(target)
+                .top_level_declarations(&target)
                 .into_iter()
                 .filter(|unit| unit.kind() == CodeUnitType::Class)
             {
@@ -181,7 +168,7 @@ impl CSharpAnalyzer {
             }
         }
 
-        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        let files: Vec<_> = self.inner.all_files();
         build_reverse_file_index(
             &files,
             |candidate| {
@@ -196,7 +183,7 @@ impl CSharpAnalyzer {
                     {
                         resolved_targets.extend(namespace_targets.iter().cloned());
                     }
-                    if let Some(fq_targets) = by_fq_name.get(identifier) {
+                    if let Some(fq_targets) = by_fq_name.get(&identifier) {
                         resolved_targets.extend(fq_targets.iter().cloned());
                     }
                 }

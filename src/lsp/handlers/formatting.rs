@@ -10,6 +10,8 @@ use glob::Pattern;
 use lsp_types::{DocumentFormattingParams, TextEdit};
 use serde::Deserialize;
 
+#[cfg(windows)]
+use crate::analyzer::NormalizePath;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, Project, ProjectFile, Range as ByteRange};
 use crate::cancellation::CancellationToken;
@@ -24,10 +26,9 @@ const FORMATTER_READER_GRACE: Duration = Duration::from_secs(1);
 const FORMATTER_SPAWN_RETRIES: usize = 5;
 #[cfg(unix)]
 const FORMATTER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
-#[cfg(not(test))]
 const FORMATTER_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const FORMATTER_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(all(test, unix))]
+const TEST_HUNG_FORMATTER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -334,8 +335,14 @@ fn resolve_windows_command_outside_cwd(command: &str, cwd: &Path) -> Option<Stri
 
 #[cfg(windows)]
 fn path_is_same_or_within(path: &Path, root: &Path) -> bool {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let path = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .normalize();
+    let root = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .normalize();
     path == root || path.starts_with(root)
 }
 
@@ -359,6 +366,15 @@ fn run_formatter_command(
     command: &FormatterCommand,
     input: &str,
     cancellation: &FormatterCancellation,
+) -> Result<String, String> {
+    run_formatter_command_with_timeout(command, input, cancellation, FORMATTER_TIMEOUT)
+}
+
+fn run_formatter_command_with_timeout(
+    command: &FormatterCommand,
+    input: &str,
+    cancellation: &FormatterCancellation,
+    timeout: Duration,
 ) -> Result<String, String> {
     if cancellation.is_cancelled() {
         return Err(format!(
@@ -389,7 +405,7 @@ fn run_formatter_command(
     let stdout_reader = spawn_pipe_reader(stdout, max_stdout_bytes(input.len()));
     let stderr_reader = spawn_pipe_reader(stderr, MAX_FORMATTER_STDERR_BYTES);
     let stdin_writer = spawn_stdin_writer(stdin, input.as_bytes().to_vec());
-    let status = wait_for_formatter(&mut child, command, cancellation);
+    let status = wait_for_formatter(&mut child, command, cancellation, timeout);
     cancellation.clear_pid();
     let status = status?;
     let stdout = collect_pipe("stdout", stdout_reader, command, Some(&mut child))?;
@@ -416,6 +432,7 @@ fn wait_for_formatter(
     child: &mut std::process::Child,
     command: &FormatterCommand,
     cancellation: &FormatterCancellation,
+    timeout: Duration,
 ) -> Result<std::process::ExitStatus, String> {
     let started = Instant::now();
     loop {
@@ -429,13 +446,13 @@ fn wait_for_formatter(
         }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
-            Ok(None) if started.elapsed() >= FORMATTER_TIMEOUT => {
+            Ok(None) if started.elapsed() >= timeout => {
                 terminate_formatter(child);
                 let _ = child.wait();
                 return Err(format!(
                     "formatter `{}` timed out after {}",
                     command_line_for_message(command),
-                    format_duration(FORMATTER_TIMEOUT)
+                    format_duration(timeout)
                 ));
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
@@ -1065,6 +1082,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn run_test_formatter_with_timeout(
+        command: &FormatterCommand,
+        input: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        run_formatter_command_with_timeout(command, input, &FormatterCancellation::new(), timeout)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn formatter_executor_passes_stdin_and_returns_stdout() {
         let temp = tempfile::tempdir().unwrap();
@@ -1128,7 +1154,9 @@ mod tests {
             args: Vec::new(),
             cwd: temp.path().to_path_buf(),
         };
-        let error = run_test_formatter(&command, "hello\n").unwrap_err();
+        let error =
+            run_test_formatter_with_timeout(&command, "hello\n", TEST_HUNG_FORMATTER_TIMEOUT)
+                .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
     }
 

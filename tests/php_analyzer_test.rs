@@ -70,7 +70,7 @@ function after_classes() {}
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Ordered.php");
 
     let top_level: Vec<_> = analyzer
-        .get_top_level_declarations(&file)
+        .top_level_declarations(&file)
         .into_iter()
         .map(|unit| unit.fq_name())
         .collect();
@@ -96,7 +96,7 @@ fn test_php_determine_package_name() {
 fn test_php_get_declarations_in_file_foo() {
     let analyzer = fixture_analyzer();
     let foo_file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Foo.php");
-    let declarations = analyzer.get_declarations(&foo_file);
+    let declarations = analyzer.declarations(&foo_file);
     let fq_names: std::collections::BTreeSet<_> =
         declarations.iter().map(CodeUnit::fq_name).collect();
 
@@ -124,7 +124,7 @@ fn test_php_get_declarations_in_file_foo() {
 fn test_php_get_declarations_in_file_no_namespace() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "NoNamespace.php");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     let fq_names: std::collections::BTreeSet<_> =
         declarations.iter().map(CodeUnit::fq_name).collect();
     assert_eq!(

@@ -1,3 +1,4 @@
+use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
 use tree_sitter::{Language as TsLanguage, Tree};
 
@@ -9,9 +10,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct ScalaAdapter;
-
-impl crate::analyzer::StorageLanguageAdapter for ScalaAdapter {}
+pub(crate) struct ScalaAdapter;
 
 impl LanguageAdapter for ScalaAdapter {
     fn language(&self) -> Language {
@@ -36,6 +35,17 @@ impl LanguageAdapter for ScalaAdapter {
 
     fn normalize_full_name(&self, fq_name: &str) -> String {
         scala_normalize_full_name(fq_name)
+    }
+
+    fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
+        let mut candidates = lookup_suffix_candidates(normalized_fq_name, &["."]);
+        let base_candidates = candidates.clone();
+        for candidate in base_candidates {
+            candidates.extend(scala_object_encoded_short_name_candidates(&candidate));
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
     }
 
     fn simple_type_name(&self, unit: &CodeUnit) -> String {
@@ -90,4 +100,34 @@ impl LanguageAdapter for ScalaAdapter {
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_scala_file(file, source, tree)
     }
+}
+
+fn scala_object_encoded_short_name_candidates(normalized: &str) -> Vec<String> {
+    const MAX_OBJECT_ENCODING_SEGMENTS: usize = 8;
+
+    let parts: Vec<_> = normalized
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    if parts.len() > MAX_OBJECT_ENCODING_SEGMENTS {
+        return Vec::new();
+    }
+
+    let variant_count = 1_usize << parts.len();
+    let mut out = Vec::new();
+    for mask in 1..variant_count {
+        let mut encoded = Vec::with_capacity(parts.len());
+        for (index, part) in parts.iter().enumerate() {
+            if (mask & (1 << index)) != 0 {
+                encoded.push(format!("{part}$"));
+            } else {
+                encoded.push((*part).to_string());
+            }
+        }
+        out.push(encoded.join("."));
+    }
+    out
 }

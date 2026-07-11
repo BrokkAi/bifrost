@@ -38,7 +38,7 @@ fn definition_in_file(
     fq_name: &str,
 ) -> CodeUnit {
     analyzer
-        .get_declarations(file)
+        .declarations(file)
         .into_iter()
         .find(|unit| unit.fq_name() == fq_name)
         .unwrap_or_else(|| {
@@ -64,7 +64,7 @@ fn javascript_materializes_exported_factory_object_surface() {
         "#,
     )]);
     let file = project.file("tool.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
@@ -100,7 +100,7 @@ fn javascript_materializes_commonjs_exported_object_root() {
         "#,
     )]);
     let file = project.file("context.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
@@ -123,7 +123,7 @@ fn javascript_does_not_promote_commonjs_member_reexport_root() {
         "#,
     )]);
     let file = project.file("context.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.iter().all(|unit| {
         unit.short_name() != "internals"
@@ -152,7 +152,7 @@ fn javascript_materializes_returned_object_members_under_enclosing_factory() {
         "#,
     )]);
     let file = project.file("directive.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
@@ -190,7 +190,7 @@ fn javascript_does_not_materialize_unexported_call_or_scalar_surfaces() {
         "#,
     )]);
     let file = project.file("module.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations
@@ -228,7 +228,7 @@ fn javascript_local_non_shape_preserving_define_function_blocks_surface_members(
         "#,
     )]);
     let file = project.file("tool.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(declarations.contains(&CodeUnit::new(
         file.clone(),
@@ -426,7 +426,7 @@ fn test_javascript_jsx_skeletons() {
         skel_jsx.get(&plain_jsx).unwrap(),
     );
 
-    let declarations = analyzer.get_declarations(&hello_jsx);
+    let declarations = analyzer.declarations(&hello_jsx);
     assert!(declarations.contains(&jsx_class));
     assert!(declarations.contains(&jsx_arrow));
     assert!(declarations.contains(&local_arrow));
@@ -649,8 +649,8 @@ fn test_javascript_top_level_variables_and_usage_page_imports() {
         "let localVarJs = \"abc\"",
         skeletons.get(&local_var).unwrap().trim()
     );
-    assert!(analyzer.get_declarations(&vars_file).contains(&top_const));
-    assert!(analyzer.get_declarations(&vars_file).contains(&local_var));
+    assert!(analyzer.declarations(&vars_file).contains(&top_const));
+    assert!(analyzer.declarations(&vars_file).contains(&local_var));
 
     let usage_page = ProjectFile::new(root, "UsagePage.jsx");
     let usage_skeletons = analyzer.get_skeletons(&usage_page);
@@ -855,7 +855,7 @@ fn test_build_related_identifiers_module_cu_and_field_signatures() {
     write_file(root, "lib.js", "export const foo = 42;");
     let analyzer = JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript));
     let module = analyzer
-        .get_declarations(&main)
+        .declarations(&main)
         .into_iter()
         .find(|code_unit| code_unit.kind() == CodeUnitType::Module)
         .unwrap();
@@ -976,7 +976,7 @@ fn test_commonjs_module_exports_assignment_is_not_indexed_as_member_definition()
         "#,
     );
     let analyzer = JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript));
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations
@@ -1010,7 +1010,7 @@ obj.helper = function helper() {};
 "#,
     )]);
     let file = project.file("assignments.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     let names = fq_names(declarations.iter().cloned());
 
     assert!(

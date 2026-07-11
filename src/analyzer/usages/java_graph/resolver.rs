@@ -117,9 +117,10 @@ fn java_owner_declares_matching_method(
     target: &CodeUnit,
 ) -> bool {
     analyzer
-        .get_definitions(&format!("{}.{}", owner.fq_name(), target.identifier()))
-        .into_iter()
-        .any(|unit| unit.is_function() && java_method_signatures_match(target, &unit))
+        .definition_lookup_index()
+        .by_fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
+        .iter()
+        .any(|unit| unit.is_function() && java_method_signatures_match(target, unit))
 }
 
 pub(super) fn java_method_signatures_match(target: &CodeUnit, candidate: &CodeUnit) -> bool {
@@ -363,8 +364,11 @@ fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Op
 
     let nested = |owner: &CodeUnit| {
         ctx.analyzer
-            .definitions(&format!("{}.{}", owner.fq_name(), name))
+            .definition_lookup_index()
+            .by_fqn(&format!("{}.{}", owner.fq_name(), name))
+            .iter()
             .find(|unit| unit.is_class())
+            .cloned()
     };
     nested(&qualifier_type).or_else(|| {
         ctx.analyzer
@@ -385,10 +389,7 @@ pub(super) fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option
             let name = node_text(node, ctx.source);
             let targets = ctx.bindings.resolve_symbol(name);
             let fq_name = targets.as_precise()?.iter().next()?;
-            ctx.analyzer
-                .get_definitions(fq_name)
-                .into_iter()
-                .find(|unit| unit.is_class())
+            class_definition(ctx, fq_name)
         }
         _ => None,
     }
@@ -507,9 +508,11 @@ fn single_return_class(
 
 fn class_definition(ctx: &ScanCtx<'_>, fq_name: &str) -> Option<CodeUnit> {
     ctx.analyzer
-        .get_definitions(fq_name)
-        .into_iter()
+        .definition_lookup_index()
+        .by_fqn(fq_name)
+        .iter()
         .find(|unit| unit.is_class())
+        .cloned()
 }
 
 fn enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {

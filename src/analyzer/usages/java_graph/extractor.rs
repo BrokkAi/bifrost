@@ -81,7 +81,6 @@ pub(super) fn scan_file(
         return;
     };
     let line_starts = compute_line_starts(&source);
-
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     seed_class_binding(java, file, spec, &mut bindings);
     let mut ctx = ScanCtx {

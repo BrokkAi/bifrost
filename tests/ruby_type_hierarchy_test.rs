@@ -14,7 +14,7 @@ fn analyzer() -> RubyAnalyzer {
 }
 
 fn decls(analyzer: &RubyAnalyzer, rel: &str) -> BTreeSet<CodeUnit> {
-    analyzer.get_declarations(&ProjectFile::new(
+    analyzer.declarations(&ProjectFile::new(
         analyzer.project().root().to_path_buf(),
         rel,
     ))

@@ -23,7 +23,7 @@ fn file(analyzer: &RubyAnalyzer, rel: &str) -> ProjectFile {
 }
 
 fn declarations(analyzer: &RubyAnalyzer, rel: &str) -> BTreeSet<CodeUnit> {
-    analyzer.get_declarations(&file(analyzer, rel))
+    analyzer.declarations(&file(analyzer, rel))
 }
 
 fn find<'a>(decls: &'a BTreeSet<CodeUnit>, identifier: &str) -> &'a CodeUnit {

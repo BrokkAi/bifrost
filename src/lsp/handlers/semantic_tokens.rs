@@ -154,7 +154,7 @@ fn reference_resolution_within_budget(analyzer: &dyn IAnalyzer, language: Langua
             .analyzed_files()
             .into_iter()
             .filter(|file| language_for_file(file) == Language::Go)
-            .map(|file| analyzer.indexed_source(&file).map(str::len)),
+            .map(|file| analyzer.indexed_source(&file).map(|source| source.len())),
     )
 }
 

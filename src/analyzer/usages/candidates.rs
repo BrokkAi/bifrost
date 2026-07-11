@@ -141,7 +141,7 @@ fn find_direct_importers_with_cancellation(
         let imports = import_provider.import_info_of(&candidate);
         let could_import_target = source_files
             .iter()
-            .any(|target| import_provider.could_import_file(&candidate, imports, target));
+            .any(|target| import_provider.could_import_file(&candidate, &imports, target));
         if cancellation.is_cancelled() {
             break;
         }
@@ -439,8 +439,8 @@ mod tests {
             panic!("cancellable discovery must not build the global reverse index");
         }
 
-        fn import_info_of<'a>(&'a self, _file: &ProjectFile) -> &'a [ImportInfo] {
-            &[]
+        fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
+            Vec::new()
         }
     }
 

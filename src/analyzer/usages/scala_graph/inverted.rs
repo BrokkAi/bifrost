@@ -28,9 +28,12 @@ use super::resolver::{
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{call_arity_for_reference, node_text, parenthesized_arity, scala_import_path};
+use crate::analyzer::scala::{ScalaAdapter, scala_normalize_full_name, scala_simple_type_name};
+use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, build_file_declarations,
+    build_file_declarations_from_state, first_precise, parse_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{CodeUnit, DefinitionLookupIndex, UsageFactsIndex};
@@ -51,6 +54,8 @@ type OverrideTargetEntries = Arc<Vec<String>>;
 pub(crate) struct ProjectTypes {
     index: Arc<DefinitionLookupIndex>,
     facts: Arc<UsageFactsIndex>,
+    direct_ancestors_by_owner: Option<HashMap<String, Vec<CodeUnit>>>,
+    scala_trait_fqns: Option<HashSet<String>>,
     package_types_by_package: Mutex<HashMap<String, PackageTypeEntries>>,
     extension_methods_by_owner_member:
         Mutex<HashMap<ExtensionOwnerMemberKey, ExtensionMethodEntries>>,
@@ -63,10 +68,140 @@ impl ProjectTypes {
         Self {
             index,
             facts: scala.usage_facts_index_shared(),
+            direct_ancestors_by_owner: None,
+            scala_trait_fqns: None,
             package_types_by_package: Mutex::new(HashMap::default()),
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
             override_targets_by_method: Mutex::new(HashMap::default()),
         }
+    }
+
+    pub(crate) fn build_from_file_states(
+        scala: &ScalaAnalyzer,
+        file_states: &HashMap<ProjectFile, FileState>,
+    ) -> Self {
+        let mut declarations = Vec::new();
+        let mut seen = HashSet::default();
+        for state in file_states.values() {
+            for unit in state
+                .definition_lookup_units
+                .iter()
+                .chain(&state.declarations)
+            {
+                if !unit.is_file_scope() && seen.insert(unit.clone()) {
+                    declarations.push(unit.clone());
+                }
+            }
+        }
+        let index = Arc::new(DefinitionLookupIndex::from_declarations(
+            declarations.iter(),
+            scala_normalize_full_name,
+            scala_simple_type_name,
+        ));
+        let facts = Arc::new(UsageFactsIndex::build_from_declarations(
+            &index,
+            declarations.iter(),
+            |unit| {
+                file_states
+                    .get(unit.source())
+                    .and_then(|state| state.signatures.get(unit).and_then(|values| values.first()))
+                    .cloned()
+                    .or_else(|| unit.signature().map(str::to_string))
+            },
+            |unit| {
+                file_states
+                    .get(unit.source())
+                    .and_then(|state| {
+                        state
+                            .signature_metadata
+                            .get(unit)
+                            .and_then(|values| values.first())
+                    })
+                    .cloned()
+            },
+            &ScalaAdapter,
+        ));
+        let mut types = Self {
+            index,
+            facts,
+            direct_ancestors_by_owner: Some(HashMap::default()),
+            scala_trait_fqns: Some(
+                file_states
+                    .values()
+                    .flat_map(|state| state.scala_traits.iter().map(CodeUnit::fq_name))
+                    .collect(),
+            ),
+            package_types_by_package: Mutex::new(HashMap::default()),
+            extension_methods_by_owner_member: Mutex::new(HashMap::default()),
+            override_targets_by_method: Mutex::new(HashMap::default()),
+        };
+        types.direct_ancestors_by_owner =
+            Some(types.build_direct_ancestors_from_file_states(scala, file_states));
+        types
+    }
+
+    fn build_direct_ancestors_from_file_states(
+        &self,
+        scala: &ScalaAnalyzer,
+        file_states: &HashMap<ProjectFile, FileState>,
+    ) -> HashMap<String, Vec<CodeUnit>> {
+        let mut ancestors_by_owner = HashMap::default();
+        for state in file_states.values() {
+            if state.raw_supertypes.is_empty() {
+                continue;
+            }
+            let resolver = NameResolver::for_file_with_facts(
+                scala,
+                Some(&state.package_name),
+                &state.imports,
+                self,
+            );
+            for (owner, raw_supertypes) in &state.raw_supertypes {
+                if !owner.is_class() {
+                    continue;
+                }
+                let mut ancestors = Vec::new();
+                let mut seen = HashSet::default();
+                for raw in raw_supertypes {
+                    let Some(fqn) = resolver.resolve(raw) else {
+                        continue;
+                    };
+                    if !seen.insert(fqn.clone()) {
+                        continue;
+                    }
+                    if let Some(definition) =
+                        self.type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
+                    {
+                        ancestors.push(definition.clone());
+                    }
+                }
+                if !ancestors.is_empty() {
+                    ancestors_by_owner.insert(owner.fq_name(), ancestors);
+                }
+            }
+        }
+        ancestors_by_owner
+    }
+
+    fn direct_ancestors_for_owner(&self, scala: &ScalaAnalyzer, owner_fqn: &str) -> Vec<CodeUnit> {
+        if let Some(ancestors_by_owner) = &self.direct_ancestors_by_owner {
+            return ancestors_by_owner
+                .get(owner_fqn)
+                .cloned()
+                .unwrap_or_default();
+        }
+        scala
+            .definitions(owner_fqn)
+            .find(|unit| unit.is_class())
+            .map(|owner| scala.get_ancestors(&owner))
+            .unwrap_or_default()
+    }
+
+    fn is_scala_trait_declaration(&self, scala: &ScalaAnalyzer, code_unit: &CodeUnit) -> bool {
+        if let Some(traits) = &self.scala_trait_fqns {
+            return traits.contains(&code_unit.fq_name());
+        }
+        scala.is_scala_trait_declaration(code_unit)
     }
 
     fn method_targets_for_owner_member(
@@ -99,13 +234,11 @@ impl ProjectTypes {
         member: &str,
         call_arity: Option<usize>,
     ) -> Vec<String> {
-        if let Some(owner) = scala.definitions(owner_fqn).find(|unit| unit.is_class()) {
-            for ancestor in scala.get_ancestors(&owner) {
-                let targets =
-                    self.method_targets_for_owner_member(&ancestor.fq_name(), member, call_arity);
-                if !targets.is_empty() {
-                    return targets;
-                }
+        for ancestor in self.direct_ancestors_for_owner(scala, owner_fqn) {
+            let targets =
+                self.method_targets_for_owner_member(&ancestor.fq_name(), member, call_arity);
+            if !targets.is_empty() {
+                return targets;
             }
         }
         Vec::new()
@@ -278,39 +411,37 @@ impl ProjectTypes {
         }
 
         let mut targets = Vec::new();
-        if let Some(owner) = scala.definitions(owner_fqn).find(|unit| unit.is_class()) {
-            for ancestor in scala.get_ancestors(&owner) {
-                if !scala.is_scala_trait_declaration(&ancestor) {
-                    continue;
-                }
-                if !targets.is_empty() {
-                    break;
-                }
-                let ancestor_owner = ancestor.fq_name();
-                let normalized_ancestor_owner = scala_normalized_fq_name(&ancestor_owner);
-                targets.extend(
-                    self.index
-                        .members_for_owner_name(
-                            &ancestor_owner,
-                            &normalized_ancestor_owner,
-                            method_name,
-                        )
-                        .iter()
-                        .filter(|ancestor_method| {
-                            ancestor_method.is_function()
-                                && method_arities_compatible(
-                                    method_arity,
-                                    self.facts
-                                        .fact_for_declaration(ancestor_method)
-                                        .and_then(|facts| facts.arity),
-                                )
-                        })
-                        .map(|ancestor_method| ancestor_method.fq_name()),
-                );
+        for ancestor in self.direct_ancestors_for_owner(scala, owner_fqn) {
+            if !self.is_scala_trait_declaration(scala, &ancestor) {
+                continue;
             }
-            targets.sort();
-            targets.dedup();
+            if !targets.is_empty() {
+                break;
+            }
+            let ancestor_owner = ancestor.fq_name();
+            let normalized_ancestor_owner = scala_normalized_fq_name(&ancestor_owner);
+            targets.extend(
+                self.index
+                    .members_for_owner_name(
+                        &ancestor_owner,
+                        &normalized_ancestor_owner,
+                        method_name,
+                    )
+                    .iter()
+                    .filter(|ancestor_method| {
+                        ancestor_method.is_function()
+                            && method_arities_compatible(
+                                method_arity,
+                                self.facts
+                                    .fact_for_declaration(ancestor_method)
+                                    .and_then(|facts| facts.arity),
+                            )
+                    })
+                    .map(|ancestor_method| ancestor_method.fq_name()),
+            );
         }
+        targets.sort();
+        targets.dedup();
 
         let targets = Arc::new(targets);
         self.override_targets_by_method
@@ -342,26 +473,39 @@ impl NameResolver {
         file: &ProjectFile,
         types: &ProjectTypes,
     ) -> Self {
+        Self::for_file_with_facts(
+            scala,
+            package_name_of(scala, file).as_deref(),
+            &scala.import_info_of(file),
+            types,
+        )
+    }
+
+    pub(crate) fn for_file_with_facts(
+        scala: &ScalaAnalyzer,
+        package: Option<&str>,
+        imports: &[crate::analyzer::ImportInfo],
+        types: &ProjectTypes,
+    ) -> Self {
         let mut names = HashMap::default();
         let mut member_names = HashMap::default();
         let mut direct_extension_methods: HashMap<String, Vec<ExtensionMethod>> =
             HashMap::default();
         let mut wildcard_extension_owners = Vec::new();
 
-        // Types in the file's own package are reachable by simple name.
-        if let Some(package) = package_name_of(scala, file) {
-            for (simple, decl) in types.package_types_in(&package).iter() {
-                names.insert(simple.clone(), decl.fq_name());
-            }
+        let file_package = package.unwrap_or_default();
+        // Types in the file's own package are reachable by simple name. The
+        // default package is a real Scala scope, so it must be seeded too.
+        for (simple, decl) in types.package_types_in(file_package).iter() {
+            names.insert(simple.clone(), decl.fq_name());
         }
-        let file_package = package_name_of(scala, file).unwrap_or_default();
 
-        for import in scala.import_info_of(file) {
+        for import in imports {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
             if import.is_wildcard {
-                let package_candidates = import_candidate_paths(&path, &file_package);
+                let package_candidates = import_candidate_paths(&path, file_package);
                 // `import pkg._` exposes every type in `pkg` by simple name.
                 for decl_package in &package_candidates {
                     for (simple, decl) in types.package_types_in(decl_package).iter() {
@@ -369,11 +513,11 @@ impl NameResolver {
                     }
                 }
                 wildcard_extension_owners
-                    .extend(import_candidate_normalized_paths(&path, &file_package));
+                    .extend(import_candidate_normalized_paths(&path, file_package));
                 continue;
             }
             // `import pkg.Type [as Alias]` binds the (possibly renamed) local name.
-            let normalized_paths = import_candidate_normalized_paths(&path, &file_package);
+            let normalized_paths = import_candidate_normalized_paths(&path, file_package);
             if let Some(decl) = normalized_paths
                 .iter()
                 .find_map(|normalized| types.type_by_normalized_fqn(normalized))
@@ -526,7 +670,8 @@ fn simple_type_name(type_text: &str) -> Option<&str> {
 /// `nodes`/`keep_file` mirror the Go builder.
 pub(super) fn build_scala_edges<F>(
     analyzer: &dyn IAnalyzer,
-    graph: &ScalaEdgeGraph<'_>,
+    scala: &ScalaAnalyzer,
+    graph: &ScalaEdgeGraph,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> UsageEdges
@@ -535,25 +680,47 @@ where
 {
     let language = tree_sitter_scala::LANGUAGE.into();
     build_edges(&graph.files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
-            let resolver = NameResolver::for_file(graph.scala, file, &graph.types);
-            let factory_returns = collect_factory_return_types(
-                parsed.tree.root_node(),
-                parsed.source.as_str(),
-                &resolver,
-            );
-            let mut ctx = ScalaScan {
-                scala: graph.scala,
-                source: parsed.source.as_str(),
-                resolver: &resolver,
-                types: &graph.types,
-                factory_returns,
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                collector,
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-        })
+        let state = graph.file_states.get(file);
+        let declarations = state
+            .map(build_file_declarations_from_state)
+            .unwrap_or_else(|| build_file_declarations(analyzer, file));
+        let class_ranges = state
+            .map(ClassRangeIndex::build_from_state)
+            .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
+        parse_and_collect_with_declarations(
+            file,
+            nodes,
+            &language,
+            declarations,
+            |parsed, collector| {
+                let resolver = NameResolver::for_file_with_facts(
+                    scala,
+                    graph.package_by_file.get(file).map(String::as_str),
+                    graph
+                        .imports_by_file
+                        .get(file)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    &graph.types,
+                );
+                let factory_returns = collect_factory_return_types(
+                    parsed.tree.root_node(),
+                    parsed.source.as_str(),
+                    &resolver,
+                );
+                let mut ctx = ScalaScan {
+                    scala,
+                    source: parsed.source.as_str(),
+                    resolver: &resolver,
+                    types: &graph.types,
+                    factory_returns,
+                    class_ranges,
+                    collector,
+                };
+                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+            },
+        )
     })
 }
 

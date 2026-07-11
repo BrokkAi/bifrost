@@ -131,31 +131,12 @@ pub fn handle(
     };
 
     let analyzer = workspace.analyzer();
-    // Cold-start fallback (mirrors `workspace_symbol::handle`): when the
-    // in-memory analyzer state is empty (deferred build, rebuild in flight,
-    // no analyzable files yet), hit the persisted FTS5 symbol index so
-    // completion still responds sub-second on large repos.
-    // `search_definitions_persisted` itself falls back to the in-memory regex
-    // path when no storage is wired in or the trigram tokenizer can't index
-    // the prefix (< 3 chars), so editors on the legacy code path see no
-    // regression.
-    //
-    // Escape asymmetry between the branches is intentional:
-    // - Hot path (`autocomplete_definitions`) interpolates `query` into a
-    //   regex internally, so we `regex::escape` the prefix. Today this is a
-    //   no-op (`is_ident_byte` constrains the prefix to ASCII alphanumeric +
-    //   `_`, none of which are regex meta), but it's defence-in-depth against
-    //   future widening (e.g. Unicode XID support).
-    // - Cold path (`search_definitions_persisted`) treats the query as an
-    //   FTS5 trigram phrase, not a regex. Escaping there would inject
-    //   backslashes into the trigrams and break matches. The same ASCII
-    //   identifier constraint guarantees no metacharacters reach this path
-    //   either.
+    // Escape before interpolating into the autocomplete regex. Today this is
+    // a no-op (`is_ident_byte` constrains the prefix to ASCII alphanumeric +
+    // `_`), but it is defence-in-depth against future widening.
     let raw_matches: Vec<CodeUnit> = if analyzer.is_empty() {
-        // The cold-start path doesn't filter synthetic units; we rely on the
-        // post-search filter below to match the hot-path contract.
         analyzer
-            .search_definitions_persisted(prefix)
+            .search_definitions(prefix, true)
             .into_iter()
             .collect()
     } else {

@@ -68,8 +68,8 @@ impl TargetSpec {
         let arity = target.signature().and_then(signature_arity).or_else(|| {
             scala
                 .signatures(target)
-                .first()
-                .and_then(|sig| signature_arity(sig))
+                .into_iter()
+                .find_map(|sig| signature_arity(&sig))
         });
         let signature = target
             .signature()
@@ -432,7 +432,7 @@ pub(in crate::analyzer::usages) fn scala_resolve_declared_type(
     let simple = scala_simple_type_name(base)?;
 
     for import in scala.import_info_of(file) {
-        let Some(path) = scala_import_path(import) else {
+        let Some(path) = scala_import_path(&import) else {
             continue;
         };
         if import.is_wildcard {
@@ -548,8 +548,8 @@ pub(in crate::analyzer::usages) fn method_signature_arity(
     unit.signature().and_then(signature_arity).or_else(|| {
         scala
             .signatures(unit)
-            .first()
-            .and_then(|signature| signature_arity(signature))
+            .into_iter()
+            .find_map(|signature| signature_arity(&signature))
     })
 }
 
@@ -643,7 +643,7 @@ impl Visibility {
 
         let file_package = file_package.unwrap_or_default();
         for import in scala.import_info_of(file) {
-            visibility.apply_import(scala, import, spec, &file_package);
+            visibility.apply_import(scala, &import, spec, &file_package);
         }
 
         visibility
@@ -920,7 +920,7 @@ pub(in crate::analyzer::usages) fn scala_visible_type_fqn_from_index(
     let mut visible = scala_type_in_index_package(index, &file_package, name);
 
     for import in scala.import_info_of(file) {
-        let Some(path) = scala_import_path(import) else {
+        let Some(path) = scala_import_path(&import) else {
             continue;
         };
         if import.is_wildcard {
@@ -1032,7 +1032,7 @@ fn ambiguous_wildcard_members(
         if !import.is_wildcard {
             continue;
         }
-        let Some(path) = scala_import_path(import) else {
+        let Some(path) = scala_import_path(&import) else {
             continue;
         };
         if wildcard_path_could_expose(scala, &path, &file_package, spec) {
@@ -1062,13 +1062,11 @@ fn wildcard_path_could_expose(
         return scala.all_declarations().any(|unit| {
             unit.is_function()
                 && unit.identifier() == spec.member_name
-                && (unit
+                && unit
                     .signature()
+                    .map(str::to_string)
+                    .or_else(|| scala.signatures(&unit).into_iter().next())
                     .is_some_and(|signature| signature.starts_with("extension "))
-                    || scala
-                        .signatures(&unit)
-                        .first()
-                        .is_some_and(|signature| signature.starts_with("extension ")))
                 && owner_of(scala, &unit).is_some_and(|owner| {
                     normalized_candidates.contains(&scala_normalized_fq_name(&owner.fq_name()))
                 })

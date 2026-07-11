@@ -13,10 +13,10 @@ use crate::analyzer::js_ts::{
     build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
 };
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType,
-    IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project, ProjectFile,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
+    CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project,
+    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -48,12 +48,12 @@ pub struct CppAnalyzer {
 }
 
 impl CppAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
-    }
-
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
+    }
+
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -62,42 +62,20 @@ impl CppAnalyzer {
         Self::from_inner(inner, memo_budget)
     }
 
-    pub fn new_with_config_and_storage(
+    pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
-    }
-
-    pub(crate) fn new_with_config_storage_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                CppAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => TreeSitterAnalyzer::new_with_config_and_storage(
-                project, CppAdapter, config, storage,
-            ),
-        };
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            CppAdapter,
+            config,
+            store_context,
+            progress,
+        );
         Self::from_inner(inner, memo_budget)
     }
 
@@ -177,20 +155,39 @@ impl CppAnalyzer {
 }
 
 impl IAnalyzer for CppAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -233,6 +230,10 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
+    }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
@@ -247,6 +248,14 @@ impl IAnalyzer for CppAnalyzer {
 
     fn project(&self) -> &dyn Project {
         self.inner.project()
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.inner.get_all_declarations()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.inner.get_definitions(fq_name)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -310,8 +319,12 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions_persisted(pattern)
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

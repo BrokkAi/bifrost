@@ -22,7 +22,7 @@ fn test_is_type_alias() {
         "#,
     )]));
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     let alias = declarations
         .iter()

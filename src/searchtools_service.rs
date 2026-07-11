@@ -157,6 +157,15 @@ struct WorkspaceSession {
     semantic: Option<Arc<SemanticIndexer>>,
 }
 
+/// Ensures request-scoped analyzer memoization is released on success and error paths.
+struct WorkspaceQueryScope<'a>(&'a WorkspaceAnalyzer);
+
+impl Drop for WorkspaceQueryScope<'_> {
+    fn drop(&mut self) {
+        self.0.end_query();
+    }
+}
+
 enum ObservedSource {
     Present(String),
     Missing,
@@ -271,12 +280,13 @@ impl SearchToolsService {
         Self::new_transient_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
-    /// Construct a manual, non-persistent, non-semantic service over an
-    /// already-selected project. One-shot CLI subset workspaces use this to
-    /// avoid whole-root watchers and analyzer DB reconciliation.
+    /// Construct a manual, non-semantic service over an already-selected
+    /// project. One-shot CLI subset workspaces use this to avoid whole-root
+    /// watchers while still sharing the analyzer blob cache for git roots.
     pub fn new_manual_for_project(project: Arc<dyn Project>) -> Result<Self, String> {
         let root = project.root().to_path_buf();
-        let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
         let session = assemble_session(project, workspace, UpdateStrategy::Manual, false);
         Ok(Self {
             root: RwLock::new(root),
@@ -377,6 +387,7 @@ impl SearchToolsService {
                 .handle_get_symbol_sources(strip_legacy_kind_filter(arguments), render_options);
         }
         let snapshot = self.snapshot_for_query()?;
+        let _query_scope = WorkspaceQueryScope(snapshot.as_ref());
         match name {
             "search_symbols" => Self::decode_render_and_run(
                 &snapshot,
@@ -1068,6 +1079,7 @@ impl SearchToolsService {
             UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
             UpdateStrategy::Manual => {}
         }
+        session.snapshot.begin_query();
         Ok(Arc::clone(&session.snapshot))
     }
 
@@ -1080,6 +1092,7 @@ impl SearchToolsService {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
         let initial_snapshot = self.snapshot_for_query()?;
+        let _query_scope = WorkspaceQueryScope(initial_snapshot.as_ref());
         let mut result = get_symbol_sources(initial_snapshot.analyzer(), params.clone());
         if self.update_strategy == UpdateStrategy::WatchFiles {
             let observed_sources =
@@ -1098,17 +1111,14 @@ impl SearchToolsService {
                 let analyzer = session.snapshot.analyzer();
                 let stale_files = observed_sources
                     .iter()
-                    .filter_map(|(file, observed)| {
-                        let indexed = analyzer.indexed_source(file);
-                        match (indexed, observed) {
-                            (Some(indexed), ObservedSource::Present(current))
-                                if indexed == current =>
-                            {
-                                None
-                            }
-                            (None, ObservedSource::Missing) => None,
-                            _ => Some(file.clone()),
+                    .filter_map(|(file, observed)| match observed {
+                        ObservedSource::Present(current)
+                            if analyzer.indexed_source_matches(file, current) =>
+                        {
+                            None
                         }
+                        ObservedSource::Missing => Some(file.clone()),
+                        _ => Some(file.clone()),
                     })
                     .collect();
                 Self::apply_changed_files(session, stale_files);

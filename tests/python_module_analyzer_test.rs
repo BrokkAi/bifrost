@@ -36,7 +36,7 @@ fn module_code_unit_created_with_top_level_children_only() {
         .find(|code_unit| code_unit.is_module())
         .unwrap();
     let child_fqns: Vec<_> = analyzer
-        .get_direct_children(&module)
+        .direct_children(&module)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
@@ -63,7 +63,7 @@ fn module_code_unit_created_for_init_py_package_name() {
         .find(|code_unit| code_unit.is_module())
         .unwrap();
     let child_fqns: Vec<_> = analyzer
-        .get_direct_children(&module)
+        .direct_children(&module)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
@@ -103,12 +103,12 @@ fn module_code_units_are_per_file_in_packaged_directory() {
         .unwrap();
 
     let children_a: Vec<_> = analyzer
-        .get_direct_children(&mod_a)
+        .direct_children(&mod_a)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
     let children_b: Vec<_> = analyzer
-        .get_direct_children(&mod_b)
+        .direct_children(&mod_b)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
@@ -137,7 +137,7 @@ fn module_code_units_use_python_src_layout_import_root() {
         .find(|code_unit| code_unit.is_module())
         .unwrap();
     let children: Vec<_> = analyzer
-        .get_direct_children(&module)
+        .direct_children(&module)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();

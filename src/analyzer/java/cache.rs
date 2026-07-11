@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 pub(super) struct JavaMemoCaches {
     budget_bytes: u64,
     pub(super) resolved_imports: Cache<ProjectFile, Arc<HashMap<String, CodeUnit>>>,
+    pub(super) package_names: Cache<ProjectFile, Arc<str>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
@@ -22,6 +23,7 @@ impl JavaMemoCaches {
         Self {
             budget_bytes,
             resolved_imports: Self::build_cache(budget_bytes / 4, weight_import_map),
+            package_names: Self::build_cache(budget_bytes / 16, weight_package_name),
             referencing_files: Self::build_cache(budget_bytes / 8, weight_project_file_set),
             relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),
             direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
@@ -54,6 +56,10 @@ impl JavaMemoCaches {
 
 fn weight_import_map(key: &ProjectFile, value: &Arc<HashMap<String, CodeUnit>>) -> u32 {
     weight_bytes(estimate_project_file(key) + estimate_import_map(value.as_ref()))
+}
+
+fn weight_package_name(key: &ProjectFile, value: &Arc<str>) -> u32 {
+    weight_bytes(estimate_project_file(key) + value.len() as u64)
 }
 
 fn weight_project_file_set(key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {

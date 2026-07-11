@@ -19,9 +19,9 @@ const DIAGNOSTIC_SOURCE: &str = "bifrost-tree-sitter";
 /// Pull-model diagnostic provider. Surfaces tree-sitter `ERROR` / `MISSING`
 /// nodes as LSP Diagnostics. Tries the analyzer's cached parse-error list
 /// first (populated during `analyze_file`); falls back to a fresh parse only
-/// when the analyzer has no state for the file — e.g. when `FileState` was
-/// hydrated from the persisted baseline this session and not yet re-parsed,
-/// or when the file's language isn't loaded into the workspace.
+/// when the analyzer has no fresh parse-error state for the file — e.g. when
+/// the file was hydrated from the blob store this session and not yet
+/// re-parsed, or when the file's language isn't loaded into the workspace.
 pub fn handle(
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,

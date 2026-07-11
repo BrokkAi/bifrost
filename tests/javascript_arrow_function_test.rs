@@ -28,7 +28,7 @@ fn test_top_level_arrow_functions() {
     );
 
     let analyzer = JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript));
-    let declarations = analyzer.get_declarations(&test_file);
+    let declarations = analyzer.declarations(&test_file);
     let functions: Vec<_> = declarations
         .into_iter()
         .filter(|code_unit| code_unit.is_function())
@@ -63,7 +63,7 @@ fn anonymous_arrow_default_export_indexes_default_function_with_full_range() {
         "#,
     );
     let file = project.file("module.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     let default = declarations
         .iter()
         .find(|unit| unit.short_name() == "default")
@@ -91,7 +91,7 @@ fn anonymous_function_default_export_indexes_default_function() {
     );
     let file = project.file("module.js");
     let default = analyzer
-        .get_declarations(&file)
+        .declarations(&file)
         .into_iter()
         .find(|unit| unit.short_name() == "default")
         .expect("default export declaration");
@@ -116,7 +116,7 @@ fn anonymous_object_default_export_indexes_default_field_with_properties() {
         "#,
     );
     let file = project.file("module.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations
@@ -144,7 +144,7 @@ fn named_identifier_default_export_does_not_synthesize_default_unit() {
         "#,
     );
     let file = project.file("module.js");
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
 
     assert!(
         declarations
@@ -177,7 +177,7 @@ fn test_exported_arrow_functions() {
     );
 
     let analyzer = JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript));
-    let declarations = analyzer.get_declarations(&test_file);
+    let declarations = analyzer.declarations(&test_file);
     let functions: Vec<_> = declarations
         .into_iter()
         .filter(|code_unit| code_unit.is_function())
@@ -213,7 +213,7 @@ fn test_mixed_function_types() {
     );
 
     let analyzer = JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript));
-    let declarations = analyzer.get_declarations(&test_file);
+    let declarations = analyzer.declarations(&test_file);
     let functions: Vec<_> = declarations
         .iter()
         .filter(|code_unit| code_unit.is_function())
@@ -268,7 +268,7 @@ fn test_react_patterns() {
     );
 
     let analyzer = JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript));
-    let declarations = analyzer.get_declarations(&test_file);
+    let declarations = analyzer.declarations(&test_file);
     let functions: Vec<_> = declarations
         .into_iter()
         .filter(|code_unit| code_unit.is_function())

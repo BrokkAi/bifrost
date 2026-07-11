@@ -22,16 +22,21 @@ use crate::analyzer::js_ts::imports::{
 };
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
+use crate::analyzer::js_ts::{
+    contains_tests as js_ts_contains_tests, path_contains_tests as js_ts_path_contains_tests,
+    source_contains_tests as js_ts_source_contains_tests,
+    synthesize_hydrated_module as synthesize_js_ts_hydrated_module_unit,
+};
+use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::usages::js_ts_graph::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
 use crate::analyzer::{
-    AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, LanguageAdapter, ParameterMetadata, PoolSafeMemo, Project, ProjectFile,
-    SemanticDiagnostic, SignatureMetadata, StorageLanguageAdapter, TestAssertionSmell,
+    AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, Language, LanguageAdapter, ParameterMetadata, PoolSafeMemo,
+    Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    build_reverse_import_index,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -43,32 +48,6 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 #[derive(Debug, Clone, Default)]
 pub struct JavascriptAdapter;
-
-impl StorageLanguageAdapter for JavascriptAdapter {
-    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        crate::analyzer::js_ts::should_persist_code_unit(code_unit)
-    }
-
-    fn storage_contains_tests(
-        &self,
-        state: &crate::analyzer::tree_sitter_analyzer::FileState,
-    ) -> bool {
-        crate::analyzer::js_ts::storage_contains_tests(state)
-    }
-
-    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
-        crate::analyzer::js_ts::hydrate_contains_tests(stored, file, source)
-    }
-
-    fn synthesize_hydrated_units(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
-    ) {
-        crate::analyzer::js_ts::synthesize_hydrated_module(file, source, state);
-    }
-}
 
 impl LanguageAdapter for JavascriptAdapter {
     fn language(&self) -> Language {
@@ -85,6 +64,46 @@ impl LanguageAdapter for JavascriptAdapter {
 
     fn file_extension(&self) -> &'static str {
         "js"
+    }
+
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        !code_unit.is_file_scope() && !code_unit.is_module()
+    }
+
+    fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
+        lookup_suffix_candidates(normalized_fq_name, &["."])
+    }
+
+    fn storage_contains_tests(
+        &self,
+        state: &crate::analyzer::tree_sitter_analyzer::FileState,
+    ) -> bool {
+        js_ts_source_contains_tests(&state.source)
+    }
+
+    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
+        stored || js_ts_path_contains_tests(file) || js_ts_source_contains_tests(source)
+    }
+
+    fn synthesize_hydrated_units(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
+    ) {
+        synthesize_js_ts_hydrated_module_unit(file, source, state);
+    }
+
+    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+        Some(module_code_unit(file))
+    }
+
+    fn path_synthetic_module_requires_imports(&self) -> bool {
+        true
+    }
+
+    fn include_path_synthetic_module(&self, has_structured_imports: bool) -> bool {
+        has_structured_imports
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -222,14 +241,14 @@ impl JsMemoCaches {
 }
 
 impl JavascriptAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.inner = self.inner.clone_with_project(project);
-        snapshot
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
@@ -270,6 +289,13 @@ impl JavascriptAnalyzer {
             .ok()
     }
 
+    pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
+        self.memo_caches.jsts_usage_index.get_or_build_parallel(
+            || build_jsts_usage_index(self, Language::JavaScript, true),
+            || build_jsts_usage_index(self, Language::JavaScript, false),
+        )
+    }
+
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
@@ -281,46 +307,21 @@ impl JavascriptAnalyzer {
         }
     }
 
-    pub fn new_with_config_and_storage(
+    pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
-    }
-
-    pub(crate) fn new_with_config_storage_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                JavascriptAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                JavascriptAdapter,
-                config,
-                storage,
-            ),
-        };
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            JavascriptAdapter,
+            config,
+            store_context,
+            progress,
+        );
         Self {
             inner,
             memo_budget,
@@ -420,23 +421,10 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.memo_caches.reverse_import_index.get_or_build(
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    true,
-                )
-            },
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    false,
-                )
-            },
+        let reverse_index = crate::analyzer::memoized_reverse_import_index(
+            &self.memo_caches.reverse_import_index,
+            || self.inner.all_files(),
+            |candidate| self.imported_code_units_of(candidate),
         );
         let referencing = reverse_index
             .get(file)
@@ -449,7 +437,7 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         referencing
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 
@@ -461,7 +449,7 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         let source = self.inner.get_source(code_unit, false).unwrap_or_default();
         let mut relevant = HashSet::default();
         for import in self.inner.import_info_of(code_unit.source()) {
-            let tokens = import_info_tokens(import);
+            let tokens = import_info_tokens(&import);
             if tokens.is_empty() || tokens.iter().any(|token| source.contains(token)) {
                 relevant.insert(import.raw_snippet.clone());
             }
@@ -504,7 +492,7 @@ impl TypeHierarchyProvider for JavascriptAnalyzer {
             Language::JavaScript,
             &self.alias_resolver,
             code_unit,
-            self.inner.raw_supertypes_of(code_unit),
+            &self.inner.raw_supertypes_of(code_unit),
         );
         self.memo_caches
             .direct_ancestors
@@ -533,20 +521,39 @@ impl TypeHierarchyProvider for JavascriptAnalyzer {
 
 impl TestDetectionProvider for JavascriptAnalyzer {}
 impl IAnalyzer for JavascriptAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -587,6 +594,10 @@ impl IAnalyzer for JavascriptAnalyzer {
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
+    }
+
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -698,8 +709,12 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions_persisted(pattern)
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
@@ -2836,8 +2851,4 @@ fn is_component_like_name(name: &str) -> bool {
         .next()
         .map(|ch| ch.is_ascii_uppercase())
         .unwrap_or(false)
-}
-
-fn js_ts_contains_tests(file: &ProjectFile, source: &str) -> bool {
-    crate::analyzer::js_ts::contains_tests(file, source)
 }

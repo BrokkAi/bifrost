@@ -13,7 +13,9 @@ use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
 use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer, UsageScanScope};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
+use crate::analyzer::{
+    AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -99,6 +101,7 @@ impl UsageFinder {
         max_files: usize,
         max_usages: usize,
     ) -> QueryResult {
+        let _query_scope = AnalyzerQueryScope::new(analyzer);
         if overloads.is_empty() || self.cancellation.is_cancelled() {
             return QueryResult {
                 candidate_files: HashSet::default(),

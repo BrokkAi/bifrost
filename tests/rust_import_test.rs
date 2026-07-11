@@ -22,7 +22,7 @@ fn test_import_statement_shapes() {
     let basic_file = ProjectFile::new(basic.project().root().to_path_buf(), "src/main.rs");
     assert_eq!(
         vec!["use std::collections::HashMap;".to_string()],
-        basic.import_statements_of(&basic_file)
+        basic.import_statements(&basic_file)
     );
 
     let nested = RustAnalyzer::from_project(rust_project(&[(
@@ -30,7 +30,7 @@ fn test_import_statement_shapes() {
         "use std::collections::{HashMap, HashSet};",
     )]));
     let nested_file = ProjectFile::new(nested.project().root().to_path_buf(), "src/main.rs");
-    let imports = nested.import_statements_of(&nested_file);
+    let imports = nested.import_statements(&nested_file);
     assert!(imports.contains(&"use std::collections::HashMap;".to_string()));
     assert!(imports.contains(&"use std::collections::HashSet;".to_string()));
 
@@ -41,7 +41,7 @@ fn test_import_statement_shapes() {
     let alias_file = ProjectFile::new(alias.project().root().to_path_buf(), "src/main.rs");
     assert_eq!(
         vec!["use std::collections::HashMap as MyMap;".to_string()],
-        alias.import_statements_of(&alias_file)
+        alias.import_statements(&alias_file)
     );
 
     let wildcard =
@@ -49,7 +49,7 @@ fn test_import_statement_shapes() {
     let wildcard_file = ProjectFile::new(wildcard.project().root().to_path_buf(), "src/main.rs");
     assert_eq!(
         vec!["use std::collections::*;".to_string()],
-        wildcard.import_statements_of(&wildcard_file)
+        wildcard.import_statements(&wildcard_file)
     );
 
     let self_import = RustAnalyzer::from_project(rust_project(&[(
@@ -57,7 +57,7 @@ fn test_import_statement_shapes() {
         "use std::io::{self, Read, Write};",
     )]));
     let self_file = ProjectFile::new(self_import.project().root().to_path_buf(), "src/main.rs");
-    let imports = self_import.import_statements_of(&self_file);
+    let imports = self_import.import_statements(&self_file);
     assert!(imports.contains(&"use std::io;".to_string()));
     assert!(imports.contains(&"use std::io::Read;".to_string()));
     assert!(imports.contains(&"use std::io::Write;".to_string()));
@@ -70,7 +70,7 @@ fn test_import_statement_shapes() {
         grouped_alias_self.project().root().to_path_buf(),
         "src/main.rs",
     );
-    let imports = grouped_alias_self.import_statements_of(&grouped_file);
+    let imports = grouped_alias_self.import_statements(&grouped_file);
     assert!(imports.contains(&"use models;".to_string()));
     assert!(imports.contains(&"use models::MemoryRepository as Repo;".to_string()));
     assert!(imports.contains(&"use models::OtherRepository;".to_string()));
@@ -80,7 +80,7 @@ fn test_import_statement_shapes() {
         "use app::{env::{env_init}, service::{self, Service as S}};",
     )]));
     let nested_file = ProjectFile::new(nested_groups.project().root().to_path_buf(), "src/main.rs");
-    let imports = nested_groups.import_statements_of(&nested_file);
+    let imports = nested_groups.import_statements(&nested_file);
     assert!(imports.contains(&"use app::env::env_init;".to_string()));
     assert!(imports.contains(&"use app::service;".to_string()));
     assert!(imports.contains(&"use app::service::Service as S;".to_string()));
@@ -93,7 +93,7 @@ fn test_import_statement_shapes() {
         public_reexports.project().root().to_path_buf(),
         "src/main.rs",
     );
-    let imports = public_reexports.import_statements_of(&public_file);
+    let imports = public_reexports.import_statements(&public_file);
     assert!(imports.contains(&"pub use service::build_service;".to_string()));
     assert!(imports.contains(&"pub use service::MemoryRepository as Repo;".to_string()));
     assert!(imports.contains(&"pub use service::Service;".to_string()));
@@ -106,7 +106,7 @@ fn test_import_statement_shapes() {
         restricted_reexports.project().root().to_path_buf(),
         "src/main.rs",
     );
-    let imports = restricted_reexports.import_statements_of(&restricted_file);
+    let imports = restricted_reexports.import_statements(&restricted_file);
     assert!(imports.contains(&"pub(crate) use service::Foo as CrateFoo;".to_string()));
     assert!(imports.contains(&"pub(crate) use service::Bar;".to_string()));
     assert!(imports.contains(&"pub(self) use service::Hidden;".to_string()));
@@ -161,7 +161,7 @@ fn test_type_alias_detection_via_import_suite() {
     )]));
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs");
     let alias = analyzer
-        .get_declarations(&file)
+        .declarations(&file)
         .into_iter()
         .find(|cu| cu.identifier() == "MyResult")
         .unwrap();

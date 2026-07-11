@@ -102,7 +102,7 @@ fn packaged_file_declarations_include_module_and_members() {
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Packaged.java");
 
     let declarations: Vec<_> = analyzer
-        .get_declarations(&file)
+        .declarations(&file)
         .into_iter()
         .map(|code_unit| format!("{:?}:{}", code_unit.kind(), code_unit.fq_name()))
         .collect();
@@ -117,7 +117,7 @@ fn packaged_file_declarations_include_module_and_members() {
     );
 
     let foo = analyzer
-        .get_declarations(&file)
+        .declarations(&file)
         .into_iter()
         .find(|code_unit| code_unit.fq_name() == "io.github.jbellis.brokk.Foo")
         .unwrap();

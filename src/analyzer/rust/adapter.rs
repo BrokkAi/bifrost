@@ -1,5 +1,5 @@
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{Language, LanguageAdapter, ProjectFile, StorageLanguageAdapter};
+use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use std::sync::LazyLock;
 use tree_sitter::{Language as TsLanguage, Tree};
 
@@ -24,20 +24,6 @@ static RUST_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RustAdapter;
 
-impl StorageLanguageAdapter for RustAdapter {
-    fn storage_content_qualifier(&self, _code_unit: &crate::analyzer::CodeUnit) -> String {
-        String::new()
-    }
-
-    fn storage_file_content_qualifier(&self, _package_name: &str) -> String {
-        String::new()
-    }
-
-    fn hydrate_content_qualifier(&self, _content_qualifier: &str, file: &ProjectFile) -> String {
-        rust_package_name(file)
-    }
-}
-
 impl LanguageAdapter for RustAdapter {
     fn language(&self) -> Language {
         Language::Rust
@@ -53,6 +39,22 @@ impl LanguageAdapter for RustAdapter {
 
     fn file_extension(&self) -> &'static str {
         "rs"
+    }
+
+    fn storage_content_qualifier(&self, _code_unit: &crate::analyzer::CodeUnit) -> String {
+        String::new()
+    }
+
+    fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
+        false
+    }
+
+    fn storage_file_content_qualifier(&self, _package_name: &str) -> String {
+        String::new()
+    }
+
+    fn hydrate_content_qualifier(&self, _content_qualifier: &str, file: &ProjectFile) -> String {
+        rust_package_name(file)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

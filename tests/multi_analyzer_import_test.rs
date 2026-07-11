@@ -40,7 +40,7 @@ fn test_delegation_to_java_analyzer() {
     assert_eq!("List", java_imports[0].identifier.as_deref().unwrap());
 
     let java_unit = multi
-        .get_declarations(&java_file)
+        .declarations(&java_file)
         .into_iter()
         .find(|cu| cu.short_name() == "JavaClass")
         .unwrap();
@@ -78,7 +78,7 @@ fn test_delegation_to_python_analyzer() {
     );
 
     let python_unit = multi
-        .get_declarations(&python_file)
+        .declarations(&python_file)
         .into_iter()
         .find(|cu| cu.short_name() == "python_fn")
         .unwrap();
@@ -134,7 +134,7 @@ fn test_delegation_routes_to_correct_language() {
     );
 
     let java_unit = multi
-        .get_declarations(&java_file)
+        .declarations(&java_file)
         .into_iter()
         .find(|cu| cu.short_name() == "JavaClass")
         .unwrap();
@@ -152,7 +152,7 @@ fn test_delegation_routes_to_correct_language() {
     let updated = multi.update(&changed);
     let updated_provider = updated.import_analysis_provider().unwrap();
     let updated_python_unit = updated
-        .get_declarations(&python_file)
+        .declarations(&python_file)
         .into_iter()
         .find(|cu| cu.short_name() == "python_fn")
         .unwrap();
@@ -227,7 +227,7 @@ fn test_three_way_routing_java_python_go() {
     );
 
     let java_unit = multi
-        .get_declarations(&java_file)
+        .declarations(&java_file)
         .into_iter()
         .find(|cu| cu.short_name() == "C")
         .unwrap();

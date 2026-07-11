@@ -252,6 +252,10 @@ fn analyze_commit_from_python_service_does_not_build_root_workspace_cache() {
         !root.join(".bifrost").join("analyzer.db").exists(),
         "analyze_commit should not force the root workspace analyzer/cache"
     );
+    assert!(
+        !root.join(".brokk").join("bifrost_cache.db").exists(),
+        "analyze_commit should honor FileSetProject's persistence opt-out"
+    );
 }
 
 #[test]

@@ -1,7 +1,4 @@
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
-    build_reverse_import_index,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::HashSet;
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -35,23 +32,10 @@ impl ImportAnalysisProvider for RustAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.reverse_import_index.get_or_build(
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    true,
-                )
-            },
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    false,
-                )
-            },
+        let reverse_index = crate::analyzer::memoized_reverse_import_index(
+            &self.reverse_import_index,
+            || self.inner.all_files(),
+            |candidate| self.imported_code_units_of(candidate),
         );
         let referencing = reverse_index
             .get(file)
@@ -62,7 +46,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
         referencing
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 

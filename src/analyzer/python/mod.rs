@@ -17,9 +17,9 @@ use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType,
-    IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
+    CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project,
+    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
@@ -28,7 +28,7 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-pub(super) use adapter::PythonAdapter;
+pub(crate) use adapter::PythonAdapter;
 use cache::{
     weight_code_unit_set, weight_code_unit_set_by_unit, weight_code_unit_vec,
     weight_project_file_set,
@@ -60,14 +60,14 @@ pub struct PythonAnalyzer {
 }
 
 impl PythonAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.inner = self.inner.clone_with_project(project);
-        snapshot
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -76,45 +76,20 @@ impl PythonAnalyzer {
         Self::from_inner(inner, memo_budget)
     }
 
-    pub fn new_with_config_and_storage(
+    pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
-    }
-
-    pub(crate) fn new_with_config_storage_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                PythonAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                PythonAdapter,
-                config,
-                storage,
-            ),
-        };
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            PythonAdapter,
+            config,
+            store_context,
+            progress,
+        );
         Self::from_inner(inner, memo_budget)
     }
 
@@ -140,6 +115,11 @@ impl PythonAnalyzer {
         Self::new(Arc::new(project))
     }
 
+    #[doc(hidden)]
+    pub fn write_live_file_to_store_for_test(&self, file: &ProjectFile) -> Option<()> {
+        self.inner.write_live_file_to_store_for_test(file)
+    }
+
     fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
         let Some(tree) = parse_python_tree(source) else {
             return BTreeSet::new();
@@ -160,7 +140,7 @@ impl PythonAnalyzer {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
 
-        for code_unit in self.inner.get_top_level_declarations(file) {
+        for code_unit in self.inner.top_level_declarations(file) {
             let identifier = code_unit.identifier().trim();
             if identifier.is_empty() || identifier.starts_with('_') {
                 continue;
@@ -297,9 +277,17 @@ impl PythonAnalyzer {
     }
 
     pub fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {
+        self.import_binder_from_imports(file, &self.inner.import_info_of(file))
+    }
+
+    pub(crate) fn import_binder_from_imports(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> ImportBinder {
         let mut binder = ImportBinder::empty();
 
-        for import in self.inner.import_info_of(file) {
+        for import in imports {
             let Some(details) = parse_python_import_details(&import.raw_snippet) else {
                 continue;
             };
@@ -378,7 +366,7 @@ impl PythonAnalyzer {
         parallel: bool,
     ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
         let _scope = profiling::scope("PythonAnalyzer::build_reverse_import_index");
-        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        let files: Vec<_> = self.inner.all_files();
         let reverse =
             build_reverse_import_index(&files, |file| self.imported_code_units_of(file), parallel);
 
@@ -517,20 +505,39 @@ impl PythonAnalyzer {
 }
 
 impl IAnalyzer for PythonAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -571,6 +578,10 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
+    }
+
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -617,6 +628,14 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn project(&self) -> &dyn Project {
         self.inner.project()
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.inner.get_all_declarations()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.inner.get_definitions(fq_name)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -699,12 +718,12 @@ impl IAnalyzer for PythonAnalyzer {
             let mut grouped = Vec::new();
             for candidate in self.inner.definitions(&code_unit.fq_name()) {
                 if candidate.source() == code_unit.source() {
-                    grouped.extend(self.inner.ranges(&candidate));
+                    grouped.extend(self.inner.ranges(&candidate).iter().copied());
                 }
             }
             grouped
         } else {
-            self.inner.ranges(code_unit)
+            self.inner.ranges(code_unit).to_vec()
         };
 
         let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
@@ -725,8 +744,12 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions_persisted(pattern)
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

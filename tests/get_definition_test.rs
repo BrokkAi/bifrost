@@ -13988,6 +13988,33 @@ class Repository {
 }
 
 #[test]
+fn scala_unqualified_owner_method_call_resolves_to_definition() {
+    let source = r#"
+package example
+
+object App {
+  def target(value: Int): Int = value
+  val result = target(1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("example/App.scala", source)
+        .build();
+    let call_start = source.find("target(1)").expect("unqualified method call");
+    let value = lookup(
+        project.root(),
+        &location_reference("example/App.scala", source, call_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.App$.target",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_local_receiver_shadows_constructor_parameter_fallback() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

@@ -20,7 +20,7 @@ fn test_is_type_alias() {
     );
 
     let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     let alias = declarations
         .iter()
         .find(|code_unit| code_unit.identifier() == "MyResult")

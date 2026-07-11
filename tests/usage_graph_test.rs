@@ -18,17 +18,10 @@ use common::usage_graph::{
     assert_every_edge_endpoint_is_a_node, find_edge, has_edge, usage_graph_at,
 };
 use serde_json::Value;
-use std::path::PathBuf;
-
-fn fixture_root(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(name)
-}
 
 fn usage_graph_in(fixture: &str, arguments: &str) -> Value {
-    let service = SearchToolsService::new_for_python(fixture_root(fixture))
+    let fixture_root = common::copy_fixture_to_temp(fixture);
+    let service = SearchToolsService::new_for_python(fixture_root.path().to_path_buf())
         .expect("failed to build searchtools service over the fixture");
     let payload = service
         .call_tool_json("usage_graph", arguments)

@@ -80,6 +80,11 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = JsTsEdgeResolver::try_new(analyzer)?;
+    for language in [Language::TypeScript, Language::JavaScript] {
+        if !analyzed_files_for_language(analyzer, language).is_empty() {
+            let _ = prewarm_cached_jsts_index(analyzer, language);
+        }
+    }
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
@@ -106,6 +111,21 @@ pub(in crate::analyzer::usages) fn cached_jsts_index(
                     .jsts_usage_index_with_cancellation(token)
             },
         ),
+        _ => None,
+    }
+}
+
+pub(in crate::analyzer::usages) fn prewarm_cached_jsts_index(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> Option<Arc<JsTsUsageIndex>> {
+    match language {
+        Language::TypeScript => {
+            Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)?.prewarm_jsts_usage_index())
+        }
+        Language::JavaScript => {
+            Some(resolve_analyzer::<JavascriptAnalyzer>(analyzer)?.prewarm_jsts_usage_index())
+        }
         _ => None,
     }
 }

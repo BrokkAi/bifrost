@@ -4,11 +4,10 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, StorageLanguageAdapter, TestAssertionSmell, TestAssertionWeights,
+    AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project, ProjectFile,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -35,60 +34,20 @@ use crate::analyzer::js_ts::imports::{
 };
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::js_ts::{
+    path_contains_tests as js_ts_path_contains_tests,
+    source_contains_tests as js_ts_source_contains_tests,
+    synthesize_hydrated_module as synthesize_js_ts_hydrated_module_unit,
+};
+use crate::analyzer::tree_sitter_analyzer::{
+    WalkControl, lookup_suffix_candidates, walk_named_tree_preorder,
+};
 use crate::analyzer::usages::js_ts_graph::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
 use crate::cancellation::CancellationToken;
 #[derive(Debug, Clone, Default)]
 pub struct TypescriptAdapter;
-
-impl StorageLanguageAdapter for TypescriptAdapter {
-    fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
-        if file.rel_path().extension().is_some_and(|ext| ext == "tsx") {
-            "typescript:tsx".to_string()
-        } else {
-            "typescript:ts".to_string()
-        }
-    }
-
-    fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
-        vec![
-            (
-                "typescript:ts".to_string(),
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            ),
-            (
-                "typescript:tsx".to_string(),
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
-            ),
-        ]
-    }
-
-    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        crate::analyzer::js_ts::should_persist_code_unit(code_unit)
-    }
-
-    fn storage_contains_tests(
-        &self,
-        state: &crate::analyzer::tree_sitter_analyzer::FileState,
-    ) -> bool {
-        crate::analyzer::js_ts::storage_contains_tests(state)
-    }
-
-    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
-        crate::analyzer::js_ts::hydrate_contains_tests(stored, file, source)
-    }
-
-    fn synthesize_hydrated_units(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
-    ) {
-        crate::analyzer::js_ts::synthesize_hydrated_module(file, source, state);
-    }
-}
 
 impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
     fn language(&self) -> Language {
@@ -111,8 +70,69 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         .unwrap_or_else(|| self.parser_language())
     }
 
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
+        if file.rel_path().extension().is_some_and(|ext| ext == "tsx") {
+            "typescript:tsx".to_string()
+        } else {
+            "typescript:ts".to_string()
+        }
+    }
+
+    fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
+        vec![
+            (
+                "typescript:ts".to_string(),
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            (
+                "typescript:tsx".to_string(),
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+            ),
+        ]
+    }
+
     fn file_extension(&self) -> &'static str {
         "ts"
+    }
+
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        !code_unit.is_file_scope() && !code_unit.is_module()
+    }
+
+    fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
+        lookup_suffix_candidates(normalized_fq_name, &["."])
+    }
+
+    fn storage_contains_tests(
+        &self,
+        state: &crate::analyzer::tree_sitter_analyzer::FileState,
+    ) -> bool {
+        js_ts_source_contains_tests(&state.source)
+    }
+
+    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
+        stored || js_ts_path_contains_tests(file) || js_ts_source_contains_tests(source)
+    }
+
+    fn synthesize_hydrated_units(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
+    ) {
+        synthesize_js_ts_hydrated_module_unit(file, source, state);
+    }
+
+    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+        Some(module_code_unit(file))
+    }
+
+    fn path_synthetic_module_requires_imports(&self) -> bool {
+        true
+    }
+
+    fn include_path_synthetic_module(&self, has_structured_imports: bool) -> bool {
+        has_structured_imports
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -126,7 +146,7 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         _tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        crate::analyzer::js_ts::contains_tests(file, source)
+        js_ts_path_contains_tests(file) || js_ts_source_contains_tests(source)
     }
 
     fn parse_file(
@@ -238,14 +258,14 @@ pub struct TypescriptAnalyzer {
 }
 
 impl TypescriptAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.inner = self.inner.clone_with_project(project);
-        snapshot
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -303,46 +323,28 @@ impl TypescriptAnalyzer {
             .ok()
     }
 
-    pub fn new_with_config_and_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
+    pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
+        self.jsts_usage_index.get_or_build_parallel(
+            || build_jsts_usage_index(self, Language::TypeScript, true),
+            || build_jsts_usage_index(self, Language::TypeScript, false),
+        )
     }
 
-    pub(crate) fn new_with_config_storage_and_progress(
+    pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                TypescriptAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                TypescriptAdapter,
-                config,
-                storage,
-            ),
-        };
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            TypescriptAdapter,
+            config,
+            store_context,
+            progress,
+        );
         Self {
             inner,
             memo_budget,
@@ -363,6 +365,16 @@ impl TypescriptAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
+    }
+
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
     }
 
     pub fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
@@ -394,7 +406,7 @@ impl TypescriptAnalyzer {
     fn type_alias_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.inner
             .is_type_alias(code_unit)
-            .then(|| self.inner.signatures_of(code_unit).first().cloned())
+            .then(|| self.inner.signatures(code_unit).first().cloned())
             .flatten()
     }
 }
@@ -465,23 +477,10 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.reverse_import_index.get_or_build(
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    true,
-                )
-            },
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    false,
-                )
-            },
+        let reverse_index = crate::analyzer::memoized_reverse_import_index(
+            &self.reverse_import_index,
+            || self.inner.all_files(),
+            |candidate| self.imported_code_units_of(candidate),
         );
         let referencing = reverse_index
             .get(file)
@@ -492,7 +491,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         referencing
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 
@@ -555,7 +554,7 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
             Language::TypeScript,
             &self.alias_resolver,
             code_unit,
-            self.inner.raw_supertypes_of(code_unit),
+            &self.inner.raw_supertypes_of(code_unit),
         );
         self.direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));
@@ -580,20 +579,39 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
 }
 
 impl IAnalyzer for TypescriptAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -628,25 +646,12 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        let is_type_alias = self.inner.is_type_alias(code_unit);
-        self.inner
-            .signatures(code_unit)
-            .into_iter()
-            .map(|signature| {
-                if is_type_alias && !signature.ends_with(';') {
-                    format!("{signature};")
-                } else {
-                    signature
-                }
-            })
-            .collect()
-    }
-
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
     }
-
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
+    }
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
@@ -770,8 +775,27 @@ impl IAnalyzer for TypescriptAnalyzer {
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
     }
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions_persisted(pattern)
+
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
+    }
+
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner
+            .signatures_vec_of(code_unit)
+            .into_iter()
+            .map(|signature| {
+                if self.inner.is_type_alias(code_unit) && !signature.ends_with(';') {
+                    format!("{signature};")
+                } else {
+                    signature
+                }
+            })
+            .collect()
     }
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         Some(self)

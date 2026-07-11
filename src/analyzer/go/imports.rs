@@ -1,7 +1,4 @@
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
-    build_reverse_import_index,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -42,23 +39,10 @@ impl ImportAnalysisProvider for GoAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.memo_caches.reverse_import_index.get_or_build(
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    true,
-                )
-            },
-            || {
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_import_index(
-                    &files,
-                    |candidate| self.imported_code_units_of(candidate),
-                    false,
-                )
-            },
+        let reverse_index = crate::analyzer::memoized_reverse_import_index(
+            &self.memo_caches.reverse_import_index,
+            || self.inner.all_files(),
+            |candidate| self.imported_code_units_of(candidate),
         );
         let referencing = reverse_index
             .get(file)
@@ -70,7 +54,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
         referencing
     }
 
-    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
 
@@ -171,7 +155,7 @@ impl GoAnalyzer {
         self.memo_caches.package_files.get_or_init(|| {
             let mut files_by_package: HashMap<String, Vec<ProjectFile>> = HashMap::default();
             for file in self.inner.all_files() {
-                if let Some(package) = self.go_package_of(file) {
+                if let Some(package) = self.go_package_of(&file) {
                     files_by_package
                         .entry(package)
                         .or_default()
@@ -189,11 +173,11 @@ impl GoAnalyzer {
         self.memo_caches.dir_parent_files.get_or_init(|| {
             let mut files_by_parent: HashMap<String, Vec<ProjectFile>> = HashMap::default();
             for file in self.inner.all_files() {
-                if self.go_package_of(file).is_none() {
+                if self.go_package_of(&file).is_none() {
                     continue;
                 }
                 files_by_parent
-                    .entry(parent_path_key(file))
+                    .entry(parent_path_key(&file))
                     .or_default()
                     .push(file.clone());
             }
@@ -208,10 +192,10 @@ impl GoAnalyzer {
         self.memo_caches.dir_parent_suffix_files.get_or_init(|| {
             let mut files_by_suffix: HashMap<String, Vec<ProjectFile>> = HashMap::default();
             for file in self.inner.all_files() {
-                if self.go_package_of(file).is_none() {
+                if self.go_package_of(&file).is_none() {
                     continue;
                 }
-                for suffix in path_suffixes(&parent_path_key(file)) {
+                for suffix in path_suffixes(&parent_path_key(&file)) {
                     files_by_suffix
                         .entry(suffix.to_string())
                         .or_default()

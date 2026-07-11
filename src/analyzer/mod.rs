@@ -16,7 +16,6 @@ mod javascript;
 mod js_ts;
 mod model;
 mod multi_analyzer;
-pub mod persistence;
 mod php;
 mod pool_memo;
 mod project;
@@ -26,7 +25,7 @@ mod rust;
 mod scala;
 pub(crate) mod semantic_diagnostics;
 mod source_content;
-pub(crate) mod store;
+pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub(crate) mod test_paths;
@@ -43,6 +42,7 @@ pub use capabilities::{
 };
 pub(crate) use capabilities::{
     build_direct_descendant_index, build_reverse_file_index, build_reverse_import_index,
+    memoized_reverse_file_index, memoized_reverse_import_index,
 };
 pub use config::{
     AnalyzerConfig, JavaAnalyzerConfig, JavaExternalArtifact, JavaExternalDependencies,
@@ -63,6 +63,7 @@ pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,
     packages::{GoModuleRoot, go_module_roots},
 };
+pub(crate) use i_analyzer::AnalyzerQueryScope;
 pub use i_analyzer::IAnalyzer;
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
@@ -72,8 +73,9 @@ pub use model::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo,
     Language, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata,
-    ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
+    ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
+    SignatureMetadata, SummaryFileProjection, TestAssertionSmell, TestAssertionWeights,
+    metrics_from_declarations,
 };
 pub(crate) use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
@@ -97,7 +99,9 @@ pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
 pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
-pub(crate) use tree_sitter_analyzer::StorageLanguageAdapter;
+pub(crate) use tree_sitter_analyzer::{
+    AnalyzerStoreContext, BulkFileStateSource, default_store_context, persistent_store_context,
+};
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
 };

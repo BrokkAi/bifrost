@@ -28,7 +28,7 @@ fn test_csharp_initialization_and_skeletons() {
 
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "A.cs");
     let class_a = CodeUnit::new(file.clone(), CodeUnitType::Class, "TestNamespace", "A");
-    assert!(analyzer.get_declarations(&file).contains(&class_a));
+    assert!(analyzer.declarations(&file).contains(&class_a));
 
     let skeletons = analyzer.get_skeletons(&file);
     assert!(skeletons.contains_key(&class_a));
@@ -72,7 +72,7 @@ fn test_csharp_mixed_scopes_and_nested_namespaces() {
         CodeUnit::new(mixed.clone(), CodeUnitType::Class, "", "TopLevelStruct"),
     ] {
         assert!(mixed_skeletons.contains_key(&code_unit));
-        assert!(analyzer.get_declarations(&mixed).contains(&code_unit));
+        assert!(analyzer.declarations(&mixed).contains(&code_unit));
     }
 
     let nested = ProjectFile::new(
@@ -102,7 +102,7 @@ fn test_csharp_mixed_scopes_and_nested_namespaces() {
         ),
     ] {
         assert!(nested_skeletons.contains_key(&code_unit));
-        assert!(analyzer.get_declarations(&nested).contains(&code_unit));
+        assert!(analyzer.declarations(&nested).contains(&code_unit));
     }
 }
 
@@ -221,7 +221,7 @@ fn test_csharp_interface_skeleton_and_sources() {
         .next()
         .unwrap();
 
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     assert!(declarations.contains(&interface_cu));
     assert!(declarations.contains(&validate_cu));
     assert!(declarations.contains(&can_connect_cu));
@@ -277,7 +277,7 @@ fn test_utf8_byte_offset_handling() {
         "GetTerminationRecordByIdRequest",
     );
 
-    let declarations = analyzer.get_declarations(&file);
+    let declarations = analyzer.declarations(&file);
     assert!(declarations.contains(&handler));
     assert!(declarations.contains(&request));
 

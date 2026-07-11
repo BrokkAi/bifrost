@@ -22,17 +22,8 @@ pub fn handle(
         // shipping the whole index over the wire.
         analyzer.get_all_declarations()
     } else if analyzer.is_empty() {
-        // Cold start: in-memory `AnalyzerState` is not yet populated
-        // (e.g. analyzer build deferred, no analyzable files yet, or
-        // rebuild in flight). Hit the persisted FTS5 symbol index so
-        // workspace/symbol still responds in sub-second time on large
-        // repos. `search_definitions_persisted` falls back to the
-        // in-memory regex search internally when no storage is wired
-        // in, when the trigram tokenizer cannot index the query
-        // (`< 3` chars), or when the storage query fails — so an
-        // editor on the legacy code path sees no regression.
         analyzer
-            .search_definitions_persisted(&params.query)
+            .search_definitions(&params.query, true)
             .into_iter()
             .collect()
     } else {

@@ -38,7 +38,7 @@ fn test_go_import_resolution_variants() {
     assert!(resolved.iter().any(|cu| cu.package_name() == "os"));
     assert_eq!(
         vec!["import \"fmt\"".to_string(), "import \"os\"".to_string()],
-        analyzer.import_statements_of(&main_file)
+        analyzer.import_statements(&main_file)
     );
 }
 
@@ -122,7 +122,7 @@ fn test_go_relevant_imports_and_could_import_file() {
     let analyzer = GoAnalyzer::from_project(project.project().clone());
     let main_file = ProjectFile::new(project.root().to_path_buf(), "main.go");
     let main_fn = analyzer
-        .get_declarations(&main_file)
+        .declarations(&main_file)
         .into_iter()
         .find(|cu| cu.identifier() == "main")
         .unwrap();
@@ -133,7 +133,7 @@ fn test_go_relevant_imports_and_could_import_file() {
     let importer = ProjectFile::new(project.root().to_path_buf(), "importer.go");
     let target = ProjectFile::new(project.root().to_path_buf(), "pkg/utils/helper.go");
     let imports = analyzer.import_info_of(&importer);
-    assert!(analyzer.could_import_file(&importer, imports, &target));
+    assert!(analyzer.could_import_file(&importer, &imports, &target));
 }
 
 #[test]

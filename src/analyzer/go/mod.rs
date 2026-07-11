@@ -10,15 +10,16 @@ mod tests;
 
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-pub(super) use adapter::GoAdapter;
+pub(crate) use adapter::GoAdapter;
 use cache::GoMemoCaches;
 use declarations::determine_go_package_name;
 use tests::detect_go_test_assertion_smells;
@@ -33,14 +34,14 @@ pub struct GoAnalyzer {
 }
 
 impl GoAnalyzer {
-    pub fn new(project: Arc<dyn Project>) -> Self {
-        Self::new_with_config(project, AnalyzerConfig::default())
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
     }
 
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.inner = self.inner.clone_with_project(project);
-        snapshot
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -51,42 +52,20 @@ impl GoAnalyzer {
         }
     }
 
-    pub fn new_with_config_and_storage(
+    pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, None)
-    }
-
-    pub(crate) fn new_with_config_storage_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
-        progress: BuildProgress,
-    ) -> Self {
-        Self::new_with_config_storage(project, config, storage, Some(progress))
-    }
-
-    fn new_with_config_storage(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner = match progress {
-            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
-                project,
-                GoAdapter,
-                config,
-                storage,
-                move |event| progress(event),
-            ),
-            None => {
-                TreeSitterAnalyzer::new_with_config_and_storage(project, GoAdapter, config, storage)
-            }
-        };
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            GoAdapter,
+            config,
+            store_context,
+            progress,
+        );
         Self {
             inner,
             memo_caches: GoMemoCaches::new(memo_budget),
@@ -109,6 +88,21 @@ impl GoAnalyzer {
             return String::new();
         };
         determine_go_package_name(tree.root_node(), source)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn bulk_hydration_count_for_test(&self) -> usize {
+        self.inner.bulk_hydration_count_for_test()
     }
 
     pub(crate) fn package_clause_names(&self) -> &crate::hash::HashMap<ProjectFile, String> {
@@ -193,20 +187,39 @@ impl TypeHierarchyProvider for GoAnalyzer {
 impl TestDetectionProvider for GoAnalyzer {}
 
 impl IAnalyzer for GoAnalyzer {
+    fn begin_query(&self) {
+        self.inner.begin_query();
+    }
+
+    fn end_query(&self) {
+        self.inner.end_query();
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    fn summary_file_projection(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
+        self.inner.summary_file_projection(file)
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.inner.analyzed_files()
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.indexed_source(file)
     }
 
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str> {
-        self.inner.indexed_source(file)
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.inner.indexed_source_matches(file, source)
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -249,6 +262,10 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
+    }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
@@ -269,6 +286,14 @@ impl IAnalyzer for GoAnalyzer {
 
     fn project(&self) -> &dyn Project {
         self.inner.project()
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.inner.get_all_declarations()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.inner.get_definitions(fq_name)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -321,12 +346,20 @@ impl IAnalyzer for GoAnalyzer {
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         let skeleton = self.inner.get_skeleton(code_unit)?;
-        Some(self.render_source_fragment(code_unit, skeleton, 0))
+        if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
+            Some(format!("type {skeleton}"))
+        } else {
+            Some(skeleton)
+        }
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
         let skeleton = self.inner.get_skeleton_header(code_unit)?;
-        Some(self.render_source_fragment(code_unit, skeleton, 0))
+        if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
+            Some(format!("type {skeleton}"))
+        } else {
+            Some(skeleton)
+        }
     }
 
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
@@ -369,7 +402,7 @@ impl IAnalyzer for GoAnalyzer {
             .filter_map(|range| {
                 let start_byte = if include_comments {
                     crate::analyzer::tree_sitter_analyzer::expanded_comment_start(
-                        content,
+                        &content,
                         range.start_byte,
                     )
                 } else {
@@ -389,8 +422,12 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions_persisted(pattern)
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
+        self.inner.search_symbol_candidates(pattern, auto_quote)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

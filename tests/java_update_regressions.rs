@@ -108,7 +108,7 @@ fn duplicate_overload_preserves_distinct_signature() {
 
     let class_cu = analyzer.get_definitions("C").into_iter().next().unwrap();
     let child_sigs: BTreeSet<_> = analyzer
-        .get_direct_children(&class_cu)
+        .direct_children(&class_cu)
         .into_iter()
         .filter(|code_unit| code_unit.is_function())
         .filter_map(|code_unit| code_unit.signature().map(str::to_string))
@@ -138,7 +138,7 @@ fn incremental_class_replacement_keeps_new_children() {
         .into_iter()
         .next()
         .unwrap();
-    let children = analyzer.get_direct_children(&target_cu);
+    let children = analyzer.direct_children(&target_cu);
     assert!(
         children
             .iter()

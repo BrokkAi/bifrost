@@ -2447,11 +2447,9 @@ fn build_workspace_for_lsp(
                 progress.report_analyzer_event(event)
             })
         }
-        // Persist regardless of progress support. Work-done progress is a
-        // UI capability (can the client render a progress bar); it has no
-        // bearing on whether the analyzer cache is worth keeping. A client that
-        // cannot show progress still benefits from a warm `.bifrost` cache on
-        // restart, matching the MCP server, which always persists.
+        // Build the analyzer regardless of progress support. Work-done progress
+        // is a UI capability (can the client render a progress bar); it has no
+        // bearing on whether the analyzer store should be populated.
         None => WorkspaceAnalyzer::build_persisted(project, config),
     }
 }

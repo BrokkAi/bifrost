@@ -18,7 +18,7 @@ fn test_python_type_hierarchy() {
         analyzer.project().root().to_path_buf(),
         "inheritance/simple.py",
     );
-    let simple_decls = analyzer.get_declarations(&simple_py);
+    let simple_decls = analyzer.declarations(&simple_py);
     let dog = simple_decls
         .iter()
         .find(|cu| cu.identifier() == "Dog")
@@ -35,7 +35,7 @@ fn test_python_type_hierarchy() {
         analyzer.project().root().to_path_buf(),
         "inheritance/multilevel.py",
     );
-    let multilevel_decls = analyzer.get_declarations(&multilevel_py);
+    let multilevel_decls = analyzer.declarations(&multilevel_py);
     let child = multilevel_decls
         .iter()
         .find(|cu| cu.identifier() == "Child")
@@ -47,7 +47,7 @@ fn test_python_type_hierarchy() {
         analyzer.project().root().to_path_buf(),
         "inheritance/child.py",
     );
-    let child_file_decls = analyzer.get_declarations(&child_py);
+    let child_file_decls = analyzer.declarations(&child_py);
     let bird = child_file_decls
         .iter()
         .find(|cu| cu.identifier() == "Bird")
@@ -58,7 +58,7 @@ fn test_python_type_hierarchy() {
         analyzer.project().root().to_path_buf(),
         "inheritance/multiple.py",
     );
-    let multiple_decls = analyzer.get_declarations(&multiple_py);
+    let multiple_decls = analyzer.declarations(&multiple_py);
     let duck = multiple_decls
         .iter()
         .find(|cu| cu.identifier() == "Duck")
@@ -125,7 +125,7 @@ fn test_packaged_function_local_classes_and_top_level_names() {
         analyzer.project().root().to_path_buf(),
         "mypackage/packaged_functions.py",
     );
-    let declarations = analyzer.get_declarations(&packaged);
+    let declarations = analyzer.declarations(&packaged);
 
     let my_function = declarations
         .iter()
@@ -135,7 +135,7 @@ fn test_packaged_function_local_classes_and_top_level_names() {
         .iter()
         .find(|cu| cu.fq_name().contains("LocalClass"))
         .unwrap();
-    let function_children = analyzer.get_direct_children(my_function);
+    let function_children = analyzer.direct_children(my_function);
     assert!(
         function_children
             .iter()
@@ -147,7 +147,7 @@ fn test_packaged_function_local_classes_and_top_level_names() {
         "tests/units/utils/test_utils.py",
     );
     let top_level_classes: Vec<_> = analyzer
-        .get_declarations(&test_utils)
+        .declarations(&test_utils)
         .into_iter()
         .filter(|cu| cu.is_class())
         .filter(|cu| !cu.fq_name().contains(".test_backend_variable_cls$"))

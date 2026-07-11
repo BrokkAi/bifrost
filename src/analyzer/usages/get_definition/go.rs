@@ -248,7 +248,7 @@ fn go_external_dot_import_path(
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
 ) -> Option<String> {
-    go.import_info_of(file).iter().find_map(|import| {
+    go.import_info_of(file).into_iter().find_map(|import| {
         (import.alias.as_deref() == Some("."))
             .then(|| extract_go_import_path(&import.raw_snippet))
             .flatten()

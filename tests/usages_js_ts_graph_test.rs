@@ -8,6 +8,7 @@ use brokk_bifrost::{
     ProjectFile, TypescriptAnalyzer,
 };
 use common::{InlineTestProject, js_fixture_project, ts_fixture_project};
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn js_analyzer() -> JavascriptAnalyzer {
@@ -18,14 +19,15 @@ fn ts_analyzer() -> TypescriptAnalyzer {
     TypescriptAnalyzer::from_project(ts_fixture_project())
 }
 
-fn definition_in<'a, I>(units: I, predicate: impl Fn(&CodeUnit) -> bool) -> CodeUnit
+fn definition_in<I, T>(units: I, predicate: impl Fn(&CodeUnit) -> bool) -> CodeUnit
 where
-    I: IntoIterator<Item = &'a CodeUnit>,
+    I: IntoIterator<Item = T>,
+    T: Borrow<CodeUnit>,
 {
     units
         .into_iter()
-        .find(|cu| predicate(cu))
-        .cloned()
+        .find(|cu| predicate(cu.borrow()))
+        .map(|cu| cu.borrow().clone())
         .expect("definition not found")
 }
 

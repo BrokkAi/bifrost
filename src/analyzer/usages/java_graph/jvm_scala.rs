@@ -118,7 +118,7 @@ impl Visibility {
         }
 
         for import in scala.import_info_of(file) {
-            let Some(path) = scala_import_path(import) else {
+            let Some(path) = scala_import_path(&import) else {
                 continue;
             };
             if import.is_wildcard {

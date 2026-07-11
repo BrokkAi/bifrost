@@ -75,7 +75,7 @@ fn merges_package_modules_across_package_info_and_sources() {
     assert!(module.is_module());
 
     let children: Vec<_> = analyzer
-        .get_direct_children(module)
+        .direct_children(module)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
@@ -111,9 +111,9 @@ fn attaches_lambda_to_the_correct_java_overload() {
         .find(|code_unit| code_unit.signature() == Some("(String)"))
         .unwrap();
 
-    assert!(analyzer.get_direct_children(int_overload).is_empty());
+    assert!(analyzer.direct_children(int_overload).is_empty());
 
-    let string_children = analyzer.get_direct_children(string_overload);
+    let string_children = analyzer.direct_children(string_overload);
     assert_eq!(1, string_children.len());
     assert!(string_children[0].is_function());
     assert!(string_children[0].is_anonymous());
@@ -144,7 +144,7 @@ fn computes_relevant_imports_like_brokk_java() {
         .find(|code_unit| code_unit.is_class())
         .unwrap();
     let bar_method = analyzer
-        .get_direct_children(&consumer_class)
+        .direct_children(&consumer_class)
         .into_iter()
         .find(|code_unit| code_unit.identifier() == "bar")
         .unwrap();
@@ -182,7 +182,7 @@ fn resolves_relevant_wildcard_imports_to_known_project_types() {
         .find(|code_unit| code_unit.is_class())
         .unwrap();
     let process_method = analyzer
-        .get_direct_children(&consumer_class)
+        .direct_children(&consumer_class)
         .into_iter()
         .find(|code_unit| code_unit.identifier() == "process")
         .unwrap();

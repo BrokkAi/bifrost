@@ -64,10 +64,10 @@ fn parallel_build_matches_sequential_build_observables() {
             .next()
             .unwrap();
         assert_eq!(
-            sequential.get_direct_children(&left),
-            parallel.get_direct_children(&right)
+            sequential.direct_children(&left),
+            parallel.direct_children(&right)
         );
-        assert_eq!(sequential.ranges_of(&left), parallel.ranges_of(&right));
+        assert_eq!(sequential.ranges(&left), parallel.ranges(&right));
         assert_eq!(
             sequential.get_skeleton(&left),
             parallel.get_skeleton(&right)

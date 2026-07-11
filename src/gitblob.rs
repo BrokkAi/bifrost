@@ -1,85 +1,67 @@
-//! Shared Git blob-OID plumbing for content-addressed caches.
+//! Shared git blob-OID plumbing for content-addressed caches.
 //!
-//! Live files are hashed from the bytes visible in the working tree, using
-//! Git's blob hashing. On LF checkouts this matches the index OID for clean
-//! files; on CRLF checkouts it intentionally differs so cache identity stays
-//! aligned with the bytes consumed by analyzers and semantic indexing.
+//! Files are hashed from the bytes visible in the working tree, using Git's
+//! blob hashing, so analyzer cache keys line up with the exact byte stream used
+//! for tree-sitter ranges and LSP positions. On LF checkouts this matches the
+//! index OID for clean files; on CRLF checkouts it intentionally differs.
 
-use std::collections::HashMap;
-#[cfg(feature = "nlp")]
-use std::collections::HashSet;
-#[cfg(feature = "nlp")]
+use std::collections::{HashMap, HashSet};
+use std::fs::Metadata;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
-#[cfg(feature = "nlp")]
-use std::path::PathBuf;
-#[cfg(feature = "nlp")]
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use git2::{IndexEntry, ObjectType, Oid, Repository};
-#[cfg(feature = "nlp")]
-use git2::{Status, StatusOptions};
-#[cfg(feature = "nlp")]
+use git2::{IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions};
 use growable_bloom_filter::GrowableBloom;
 
-#[cfg(feature = "nlp")]
-use crate::path_normalization::NormalizePath;
+pub type Result<T> = std::result::Result<T, String>;
 
-pub(crate) type Result<T> = std::result::Result<T, String>;
+pub const CACHE_DIR_NAME: &str = ".brokk";
 
-#[cfg(feature = "nlp")]
-pub(crate) const CACHE_DIR_NAME: &str = ".brokk";
-
-/// Discover the non-bare repository containing `root`, if any.
-#[cfg(feature = "nlp")]
-pub(crate) fn discover(root: &Path) -> Option<Repository> {
+/// Discover the repository containing `root`, if any.
+pub fn discover(root: &Path) -> Option<Repository> {
     Repository::discover(root)
         .ok()
         .filter(|repo| !repo.is_bare())
 }
 
-/// Whether `root` is inside a non-bare Git repository.
-#[cfg(feature = "nlp")]
-pub(crate) fn is_git_repo(root: &Path) -> bool {
+/// Whether `root` is inside a non-bare git repository.
+pub fn is_git_repo(root: &Path) -> bool {
     discover(root).is_some()
 }
 
 /// Resolve the primary repository root. Linked worktrees collapse to the
 /// checkout that owns the common object database.
-#[cfg(feature = "nlp")]
-pub(crate) fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
+pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
     if repo.is_bare() {
         return None;
     }
-    let root = if repo.is_worktree() {
-        repo.commondir().parent().map(Path::to_path_buf)
-    } else {
-        repo.workdir().map(Path::to_path_buf)
-    }?;
-    Some(root.normalize())
+    if repo.is_worktree() {
+        return repo.commondir().parent().map(Path::to_path_buf);
+    }
+    repo.workdir().map(Path::to_path_buf)
 }
 
-/// Resolve the unified cache path under the primary repository's `.brokk`
-/// directory. Non-Git roots fall back to the provided workspace root.
-#[cfg(feature = "nlp")]
-pub(crate) fn cache_db_path(workspace_root: &Path) -> PathBuf {
+/// Resolve the unified cache database path under `.brokk` at the primary repo
+/// root. Non-git roots fall back to the provided workspace root.
+pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
     let primary_root = discover(workspace_root)
         .as_ref()
         .and_then(primary_repo_root)
-        .unwrap_or_else(|| workspace_root.to_path_buf().normalize());
+        .unwrap_or_else(|| workspace_root.to_path_buf());
     primary_root
         .join(CACHE_DIR_NAME)
         .join(crate::cache_db::CACHE_DB_FILE_NAME)
 }
 
-/// Working-tree blob OID (hex) for each project-relative path.
-#[cfg(feature = "nlp")]
-pub(crate) fn working_tree_oids(
+/// Working-tree blob OID (hex) for each of `rel_paths`.
+pub fn working_tree_oids(
     repo: &Repository,
     rel_paths: &[String],
 ) -> Result<HashMap<String, String>> {
     let workdir = workdir(repo)?;
-    let index = repo.index().map_err(|err| err.to_string())?;
+    let index = repo.index().map_err(|e| e.to_string())?;
+
     let mut out = HashMap::with_capacity(rel_paths.len());
     for rel in rel_paths {
         let oid = resolve_path_oid(workdir, &index, rel)?;
@@ -88,27 +70,33 @@ pub(crate) fn working_tree_oids(
     Ok(out)
 }
 
-/// Resolve every indexed path to the OID of its current working-tree bytes.
-pub(crate) fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, String>> {
+/// Like [`working_tree_oids`] but kept as the explicit incremental-update API.
+pub fn working_tree_oids_targeted(
+    repo: &Repository,
+    rel_paths: &[String],
+) -> Result<HashMap<String, String>> {
+    working_tree_oids(repo, rel_paths)
+}
+
+/// Resolve every path in the index to the blob OID for its current working-tree
+/// bytes.
+pub fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, String>> {
     let workdir = workdir(repo)?;
-    let index = repo.index().map_err(|err| err.to_string())?;
+    let index = repo.index().map_err(|e| e.to_string())?;
     let mut out = HashMap::with_capacity(index.len());
     for entry in index.iter() {
         let rel = index_path_to_string(&entry)?;
-        if !workdir.join(&rel).is_file() {
-            continue;
-        }
         let oid = resolve_index_entry_oid(workdir, &entry)?;
         out.insert(rel, oid.to_string());
     }
     Ok(out)
 }
 
-/// Resolve one path to the OID of its current working-tree bytes. Missing
-/// files return `Ok(None)`.
-pub(crate) fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> Result<Option<Oid>> {
+/// Resolve one path to the OID of its current working-tree bytes. Returns
+/// `Ok(None)` for a missing file.
+pub fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> Result<Option<Oid>> {
     let workdir = workdir(repo)?;
-    let index = repo.index().map_err(|err| err.to_string())?;
+    let index = repo.index().map_err(|e| e.to_string())?;
     let Some(rel) = rel_path.to_str() else {
         return Err(format!("non-UTF-8 git path: {}", rel_path.display()));
     };
@@ -118,23 +106,31 @@ pub(crate) fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> R
     Ok(Some(resolve_path_oid(workdir, &index, rel)?))
 }
 
-/// Read a Git blob's bytes by hexadecimal OID.
-#[cfg(feature = "nlp")]
-pub(crate) fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
-    let oid = Oid::from_str(oid_hex).map_err(|err| err.to_string())?;
-    let blob = repo.find_blob(oid).map_err(|err| err.to_string())?;
+/// Whether a path's working-tree content differs from the index entry.
+pub fn is_path_dirty(repo: &Repository, rel_path: &Path) -> Result<bool> {
+    let workdir = workdir(repo)?;
+    let index = repo.index().map_err(|e| e.to_string())?;
+    let Some(entry) = index.get_path(rel_path, 0) else {
+        return Ok(workdir.join(rel_path).is_file());
+    };
+    Ok(!entry_stat_matches(&workdir.join(rel_path), &entry))
+}
+
+/// Read a blob's bytes by OID.
+pub fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
+    let oid = Oid::from_str(oid_hex).map_err(|e| e.to_string())?;
+    let blob = repo.find_blob(oid).map_err(|e| e.to_string())?;
     Ok(blob.content().to_vec())
 }
 
-#[cfg(feature = "nlp")]
+/// Target false-positive rate for the GC reachability filter. There are no
+/// false negatives, so GC never drops a reachable blob.
 const GC_BLOOM_FP_RATE: f64 = 0.05;
-#[cfg(feature = "nlp")]
 const GC_BLOOM_EST_OIDS: usize = 1 << 19;
 
-/// Build a Bloom filter containing every object reachable from refs or a
-/// linked-worktree HEAD, including detached HEADs not named by a ref.
-#[cfg(feature = "nlp")]
-pub(crate) fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
+/// A Bloom filter of every OID reachable from any ref or linked worktree HEAD,
+/// built by streaming `git rev-list --objects --all <worktree-heads...>`.
+pub fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
     let workdir = workdir(repo)?;
     let mut args = vec![
         "rev-list".to_string(),
@@ -148,7 +144,7 @@ pub(crate) fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| format!("git rev-list failed to spawn: {err}"))?;
+        .map_err(|e| format!("git rev-list failed to spawn: {e}"))?;
     let stdout = child
         .stdout
         .take()
@@ -156,7 +152,7 @@ pub(crate) fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
 
     let mut bloom = GrowableBloom::new(GC_BLOOM_FP_RATE, GC_BLOOM_EST_OIDS);
     for line in BufReader::new(stdout).lines() {
-        let line = line.map_err(|err| format!("reading git rev-list output: {err}"))?;
+        let line = line.map_err(|e| format!("reading git rev-list output: {e}"))?;
         let oid = line.split(' ').next().unwrap_or("");
         if oid.len() >= 40 {
             bloom.insert(oid);
@@ -164,16 +160,16 @@ pub(crate) fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
     }
     let status = child
         .wait()
-        .map_err(|err| format!("git rev-list wait failed: {err}"))?;
+        .map_err(|e| format!("git rev-list wait failed: {e}"))?;
     if !status.success() {
         return Err("git rev-list --objects --all failed".to_string());
     }
     Ok(bloom)
 }
 
-/// Commit OIDs checked out by every linked worktree.
-#[cfg(feature = "nlp")]
-pub(crate) fn worktree_heads(repo: &Repository) -> Result<Vec<String>> {
+/// Commit OIDs checked out by every linked worktree, including detached HEADs
+/// that are not otherwise reachable from refs.
+pub fn worktree_heads(repo: &Repository) -> Result<Vec<String>> {
     let text = worktree_porcelain(repo)?;
     let mut heads = Vec::new();
     let mut seen = HashSet::new();
@@ -189,46 +185,25 @@ pub(crate) fn worktree_heads(repo: &Repository) -> Result<Vec<String>> {
     Ok(heads)
 }
 
-/// Roots of every linked worktree, including the primary checkout.
-#[cfg(feature = "nlp")]
-pub(crate) fn worktree_roots(repo: &Repository) -> Result<Vec<PathBuf>> {
+/// Roots of every linked worktree of this repo, including the main worktree.
+pub fn worktree_roots(repo: &Repository) -> Result<Vec<PathBuf>> {
     let text = worktree_porcelain(repo)?;
     let mut roots = Vec::new();
     for line in text.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            let path = PathBuf::from(path);
-            roots.push(
-                path.canonicalize()
-                    .map(NormalizePath::normalize)
-                    .unwrap_or_else(|_| path.normalize()),
-            );
+            roots.push(PathBuf::from(path));
         }
     }
     Ok(roots)
 }
 
-/// Exact-byte OIDs held by every worktree: all present indexed files plus
-/// untracked files. This is the shared working-tree liveness root for caches.
-#[cfg(feature = "nlp")]
-pub(crate) fn worktree_live_oids(repo: &Repository) -> Result<HashSet<String>> {
-    let mut oids = HashSet::new();
-    for root in worktree_roots(repo)? {
-        let worktree_repo = Repository::open(&root)
-            .map_err(|err| format!("opening worktree {}: {err}", root.display()))?;
-        oids.extend(working_tree_oids_full(&worktree_repo)?.into_values());
-        oids.extend(uncommitted_oids(&root)?);
-    }
-    Ok(oids)
-}
-
-#[cfg(feature = "nlp")]
 fn worktree_porcelain(repo: &Repository) -> Result<String> {
     let workdir = workdir(repo)?;
     let output = Command::new("git")
         .current_dir(workdir)
         .args(["worktree", "list", "--porcelain"])
         .output()
-        .map_err(|err| format!("git worktree list failed to spawn: {err}"))?;
+        .map_err(|e| format!("git worktree list failed to spawn: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "git worktree list failed: {}",
@@ -238,21 +213,17 @@ fn worktree_porcelain(repo: &Repository) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Blob OIDs of dirty or untracked files in one worktree.
-#[cfg(feature = "nlp")]
-pub(crate) fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
+/// Blob OIDs (hex) of dirty/untracked files in `root`'s working tree.
+pub fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
     let Some(repo) = discover(root) else {
         return Ok(HashSet::new());
     };
     let workdir = workdir(&repo)?.to_path_buf();
     let mut out = HashSet::new();
     for rel in dirty_paths(&repo)? {
-        let path = workdir.join(&rel);
-        if !path.is_file() {
-            continue;
+        if let Ok(oid) = hash_working_file(&workdir, &rel) {
+            out.insert(oid.to_string());
         }
-        let oid = hash_working_file(&workdir, &rel)?;
-        out.insert(oid.to_string());
     }
     Ok(out)
 }
@@ -263,7 +234,8 @@ fn workdir(repo: &Repository) -> Result<&Path> {
 }
 
 fn resolve_path_oid(workdir: &Path, index: &git2::Index, rel: &str) -> Result<Oid> {
-    match index.get_path(Path::new(rel), 0) {
+    let path = Path::new(rel);
+    match index.get_path(path, 0) {
         Some(entry) => resolve_index_entry_oid(workdir, &entry),
         None => hash_working_file(workdir, rel),
     }
@@ -278,16 +250,49 @@ pub(crate) fn index_path_to_string(entry: &IndexEntry) -> Result<String> {
     String::from_utf8(entry.path.clone()).map_err(|err| format!("non-UTF-8 git index path: {err}"))
 }
 
-#[cfg(feature = "nlp")]
+pub(crate) fn entry_stat_matches(path: &Path, entry: &IndexEntry) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata_matches_index(&metadata, entry)
+}
+
+#[cfg(unix)]
+fn metadata_matches_index(metadata: &Metadata, entry: &IndexEntry) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.dev() as u32 == entry.dev
+        && metadata.ino() as u32 == entry.ino
+        && metadata.mode() == entry.mode
+        && metadata.uid() == entry.uid
+        && metadata.gid() == entry.gid
+        && metadata.size() as u32 == entry.file_size
+        && metadata.mtime() as i32 == entry.mtime.seconds()
+        && metadata.mtime_nsec() as u32 == entry.mtime.nanoseconds()
+}
+
+#[cfg(not(unix))]
+fn metadata_matches_index(metadata: &Metadata, entry: &IndexEntry) -> bool {
+    use std::time::UNIX_EPOCH;
+
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    metadata.len() as u32 == entry.file_size
+        && duration.as_secs() as i32 == entry.mtime.seconds()
+        && duration.subsec_nanos() == entry.mtime.nanoseconds()
+}
+
 fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_unmodified(false)
         .exclude_submodules(true);
-    let statuses = repo
-        .statuses(Some(&mut opts))
-        .map_err(|err| err.to_string())?;
+    let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.to_string())?;
     let mut dirty = HashSet::new();
     let changed = dirty_flags();
     for entry in statuses.iter() {
@@ -300,7 +305,6 @@ fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
     Ok(dirty)
 }
 
-#[cfg(feature = "nlp")]
 fn dirty_flags() -> Status {
     Status::WT_MODIFIED
         | Status::WT_NEW
@@ -313,24 +317,21 @@ fn dirty_flags() -> Status {
 }
 
 fn hash_working_file(workdir: &Path, rel: &str) -> Result<Oid> {
-    Oid::hash_file(ObjectType::Blob, workdir.join(rel)).map_err(|err| err.to_string())
+    Oid::hash_file(ObjectType::Blob, workdir.join(rel)).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    #[cfg(feature = "nlp")]
-    use crate::path_normalization::NormalizePath;
     use git2::{IndexAddOption, Signature};
-    #[cfg(feature = "nlp")]
-    use std::process::Command;
 
     pub(crate) fn init_repo(dir: &Path) -> Repository {
         let repo = Repository::init(dir).unwrap();
-        let mut config = repo.config().unwrap();
-        config.set_str("user.email", "t@example.com").unwrap();
-        config.set_str("user.name", "T").unwrap();
-        drop(config);
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.email", "t@example.com").unwrap();
+            config.set_str("user.name", "T").unwrap();
+        }
         repo
     }
 
@@ -354,167 +355,71 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(feature = "nlp")]
-    fn run_git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[cfg(feature = "nlp")]
     #[test]
-    fn clean_file_oid_matches_working_tree_bytes() {
+    fn clean_file_oid_matches_git_hash_object() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
         std::fs::write(temp.path().join("a.txt"), "hello\n").unwrap();
         commit_all(&repo, "init");
 
-        let expected = Oid::hash_object(ObjectType::Blob, b"hello\n").unwrap();
-        let paths = vec!["a.txt".to_string()];
+        let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
         assert_eq!(
-            working_tree_oids(&repo, &paths).unwrap()["a.txt"],
-            expected.to_string()
-        );
-        assert_eq!(
-            working_tree_oids_full(&repo).unwrap()["a.txt"],
-            expected.to_string()
-        );
-        assert_eq!(
-            working_tree_oid_for_path(&repo, Path::new("a.txt")).unwrap(),
-            Some(expected)
+            oids["a.txt"],
+            Oid::hash_object(ObjectType::Blob, b"hello\n")
+                .unwrap()
+                .to_string()
         );
     }
 
-    #[cfg(feature = "nlp")]
     #[test]
-    fn clean_crlf_checkout_uses_working_tree_not_index_bytes() {
+    fn dirty_file_oid_reflects_working_tree() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
-        repo.config()
-            .unwrap()
-            .set_str("core.autocrlf", "true")
-            .unwrap();
-        std::fs::write(temp.path().join("a.txt"), b"hello\r\n").unwrap();
-        run_git(temp.path(), &["add", "a.txt"]);
-        run_git(temp.path(), &["commit", "-m", "init"]);
+        std::fs::write(temp.path().join("a.txt"), "hello\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("a.txt"), "changed\n").unwrap();
 
-        let index_oid = repo
-            .index()
-            .unwrap()
-            .get_path(Path::new("a.txt"), 0)
-            .unwrap()
-            .id;
-        let lf_oid = Oid::hash_object(ObjectType::Blob, b"hello\n").unwrap();
-        let crlf_oid = Oid::hash_object(ObjectType::Blob, b"hello\r\n").unwrap();
-        assert_eq!(index_oid, lf_oid);
-        assert_ne!(index_oid, crlf_oid);
-        let paths = vec!["a.txt".to_string()];
+        let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
         assert_eq!(
-            working_tree_oids(&repo, &paths).unwrap()["a.txt"],
-            crlf_oid.to_string()
+            oids["a.txt"],
+            Oid::hash_object(ObjectType::Blob, b"changed\n")
+                .unwrap()
+                .to_string()
         );
-        assert_eq!(
-            working_tree_oids_full(&repo).unwrap()["a.txt"],
-            crlf_oid.to_string()
-        );
-        assert_eq!(
-            working_tree_oid_for_path(&repo, Path::new("a.txt")).unwrap(),
-            Some(crlf_oid)
-        );
+
+        let uncommitted = uncommitted_oids(temp.path()).unwrap();
+        assert!(uncommitted.contains(&oids["a.txt"]));
     }
 
-    #[cfg(feature = "nlp")]
     #[test]
-    fn dirty_and_untracked_files_reflect_working_tree_bytes() {
+    fn targeted_matches_bulk_for_clean_dirty_and_untracked() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
         std::fs::write(temp.path().join("dirty.txt"), "committed\n").unwrap();
         commit_all(&repo, "init");
         std::fs::write(temp.path().join("dirty.txt"), "working\n").unwrap();
         std::fs::write(temp.path().join("new.txt"), "fresh\n").unwrap();
 
-        let paths = vec!["dirty.txt".to_string(), "new.txt".to_string()];
+        let paths = vec![
+            "clean.txt".to_string(),
+            "dirty.txt".to_string(),
+            "new.txt".to_string(),
+        ];
         let bulk = working_tree_oids(&repo, &paths).unwrap();
-        let full = working_tree_oids_full(&repo).unwrap();
-        assert_eq!(full["dirty.txt"], bulk["dirty.txt"]);
+        let targeted = working_tree_oids_targeted(&repo, &paths).unwrap();
+        assert_eq!(bulk, targeted);
         assert_eq!(
-            working_tree_oid_for_path(&repo, Path::new("dirty.txt")).unwrap(),
-            Some(Oid::from_str(&bulk["dirty.txt"]).unwrap())
+            targeted["clean.txt"],
+            Oid::hash_object(ObjectType::Blob, b"clean\n")
+                .unwrap()
+                .to_string()
         );
         assert_eq!(
-            working_tree_oid_for_path(&repo, Path::new("new.txt")).unwrap(),
-            Some(Oid::from_str(&bulk["new.txt"]).unwrap())
-        );
-        assert_eq!(
-            bulk["dirty.txt"],
+            targeted["dirty.txt"],
             Oid::hash_object(ObjectType::Blob, b"working\n")
                 .unwrap()
                 .to_string()
-        );
-        assert_eq!(
-            bulk["new.txt"],
-            Oid::hash_object(ObjectType::Blob, b"fresh\n")
-                .unwrap()
-                .to_string()
-        );
-        let uncommitted = uncommitted_oids(temp.path()).unwrap();
-        assert!(uncommitted.contains(&bulk["dirty.txt"]));
-        assert!(uncommitted.contains(&bulk["new.txt"]));
-    }
-
-    #[cfg(feature = "nlp")]
-    #[test]
-    fn linked_worktrees_share_cache_path_and_are_enumerated() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo_root = temp.path().join("repo");
-        std::fs::create_dir(&repo_root).unwrap();
-        let repo = init_repo(&repo_root);
-        std::fs::write(repo_root.join("a.txt"), "hello\n").unwrap();
-        commit_all(&repo, "init");
-
-        let linked = temp.path().join("linked");
-        run_git(
-            &repo_root,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                linked.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
-
-        assert_eq!(cache_db_path(&repo_root), cache_db_path(&linked));
-        let roots = worktree_roots(&repo).unwrap();
-        assert!(roots.contains(&repo_root.canonicalize().unwrap().normalize()));
-        assert!(roots.contains(&linked.canonicalize().unwrap().normalize()));
-        assert_eq!(worktree_heads(&repo).unwrap().len(), 1);
-        assert!(
-            worktree_live_oids(&repo).unwrap().contains(
-                &Oid::hash_object(ObjectType::Blob, b"hello\n")
-                    .unwrap()
-                    .to_string()
-            )
-        );
-    }
-
-    #[cfg(all(windows, feature = "nlp"))]
-    #[test]
-    fn cache_root_normalizes_verbatim_disk_and_unc_paths() {
-        assert_eq!(
-            cache_db_path(Path::new(r"C:\Users\runner\repo")),
-            cache_db_path(Path::new(r"\\?\C:\Users\runner\repo"))
-        );
-        assert_eq!(
-            cache_db_path(Path::new(r"\\server\share\repo")),
-            cache_db_path(Path::new(r"\\?\UNC\server\share\repo"))
         );
     }
 }

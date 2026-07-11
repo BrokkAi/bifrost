@@ -3,25 +3,50 @@ use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
-    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
+    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range,
+    SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
 };
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub trait IAnalyzer: Send + Sync + Any {
+    /// Starts a top-level query boundary. Persisted analyzers use this to
+    /// memoize filesystem liveness checks for the duration of one request.
+    fn begin_query(&self) {}
+
+    /// Ends a top-level query boundary and releases request-scoped memoized state.
+    fn end_query(&self) {}
+
     fn top_level_declarations(&self, _file: &ProjectFile) -> Vec<CodeUnit> {
         Vec::new()
+    }
+    /// A compact, self-contained view for rendering one file summary. The
+    /// default lets callers retain the existing method-by-method behavior.
+    fn summary_file_projection(&self, _file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
+        None
     }
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         Vec::new()
     }
     /// Source text retained by the analyzer generation that produced this
-    /// file's declarations and byte ranges.
-    fn indexed_source<'a>(&'a self, file: &ProjectFile) -> Option<&'a str>;
+    /// file's declarations and byte ranges. The text is owned because a
+    /// persisted analyzer may hydrate it on demand rather than retain a
+    /// workspace-sized source map.
+    fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
+        None
+    }
+
+    /// Whether the supplied on-disk source still matches this analyzer
+    /// generation. Persisted analyzers compare blob identities so freshness
+    /// checks do not need to hydrate stale source text.
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.indexed_source(file)
+            .is_some_and(|indexed| indexed == source)
+    }
     /// Applies language-specific rendering to an extracted source fragment.
     /// `declaration_start` is the byte offset of the declaration inside the
     /// fragment, after any attached comments. The default preserves the
@@ -127,6 +152,26 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
+    /// Search candidates with the metadata needed by `search_symbols`. The
+    /// default preserves existing analyzer behavior; persisted analyzers
+    /// override it with a projection that avoids full file hydration.
+    fn search_symbol_candidates(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+    ) -> Vec<SearchSymbolCandidate> {
+        self.search_definitions(pattern, auto_quote)
+            .into_iter()
+            .map(|code_unit| SearchSymbolCandidate {
+                primary_range: self
+                    .ranges(&code_unit)
+                    .into_iter()
+                    .min_by_key(|range| (range.start_line, range.start_byte)),
+                contains_tests: self.contains_tests(code_unit.source()),
+                code_unit,
+            })
+            .collect()
+    }
     /// Cold-start substring search that runs against the persisted FTS5
     /// symbol index, without requiring `AnalyzerState` to be fully built.
     /// Implementations that have no persistence layer (or whose storage
@@ -467,6 +512,24 @@ pub trait IAnalyzer: Send + Sync + Any {
 
         let parent_name = fq_name.get(..last_index?)?;
         self.definitions(parent_name).next()
+    }
+}
+
+/// Releases request-scoped analyzer memoization on every return path.
+pub(crate) struct AnalyzerQueryScope<'a> {
+    analyzer: &'a dyn IAnalyzer,
+}
+
+impl<'a> AnalyzerQueryScope<'a> {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        analyzer.begin_query();
+        Self { analyzer }
+    }
+}
+
+impl Drop for AnalyzerQueryScope<'_> {
+    fn drop(&mut self) {
+        self.analyzer.end_query();
     }
 }
 

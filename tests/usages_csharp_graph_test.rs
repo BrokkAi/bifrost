@@ -499,7 +499,7 @@ namespace App {
     )]);
 
     let file = project.file("App/Consumer.cs");
-    let statements = analyzer.import_statements_of(&file);
+    let statements = analyzer.import_statements(&file);
     assert_eq!(
         vec![
             "global using Shared;",
@@ -515,23 +515,25 @@ namespace App {
         .expect("C# import provider");
     let imports: Vec<_> = provider
         .import_info_of(&file)
-        .iter()
-        .map(|info| {
-            (
-                info.raw_snippet.as_str(),
-                info.identifier.as_deref(),
-                info.alias.as_deref(),
-            )
-        })
+        .into_iter()
+        .map(|info| (info.raw_snippet, info.identifier, info.alias))
         .collect();
     assert_eq!(
         vec![
-            ("global using Shared;", Some("Shared"), None),
-            ("using System.Collections.Generic;", Some("Generic"), None),
             (
-                "using Alias = Other.Target;",
-                Some("Other.Target"),
-                Some("Alias"),
+                "global using Shared;".to_string(),
+                Some("Shared".to_string()),
+                None
+            ),
+            (
+                "using System.Collections.Generic;".to_string(),
+                Some("Generic".to_string()),
+                None
+            ),
+            (
+                "using Alias = Other.Target;".to_string(),
+                Some("Other.Target".to_string()),
+                Some("Alias".to_string()),
             ),
         ],
         imports

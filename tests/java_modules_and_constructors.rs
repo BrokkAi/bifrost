@@ -30,7 +30,7 @@ fn creates_package_module_with_top_level_children() {
     assert_eq!(1, analyzer.ranges(&module).len());
 
     let children: Vec<_> = analyzer
-        .get_direct_children(&module)
+        .direct_children(&module)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
@@ -49,7 +49,7 @@ fn merges_package_module_children_once_in_canonical_order() {
     assert!(module.is_module());
 
     let children: Vec<_> = analyzer
-        .get_direct_children(&module)
+        .direct_children(&module)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();

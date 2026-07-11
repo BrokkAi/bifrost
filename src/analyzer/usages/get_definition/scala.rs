@@ -582,6 +582,15 @@ fn resolve_scala_call(
             if let Some(fqn) = resolver.resolve_member(name) {
                 return scala_fqn_outcome(ctx.support, &fqn, name);
             }
+            if let Some(unit) = resolve_in_enclosing_scopes(
+                ctx.analyzer,
+                ctx.file,
+                name,
+                function.start_byte(),
+                |unit| unit.is_function(),
+            ) {
+                return candidates_outcome(vec![unit]);
+            }
             if function.kind() == "identifier"
                 && let Some(owner) =
                     scala_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())
@@ -992,7 +1001,7 @@ fn scala_wildcard_imported_member_outcome(
         if !import.is_wildcard {
             continue;
         }
-        let Some(path) = scala_import_path(import) else {
+        let Some(path) = scala_import_path(&import) else {
             continue;
         };
         let mut import_candidates = Vec::new();
@@ -1649,19 +1658,22 @@ fn scala_resolve_receiver_type_annotation(
 
 fn scala_type_annotation_has_explicit_import(ctx: ScalaLookupCtx<'_>, type_text: &str) -> bool {
     let simple = scala_simple_name(type_text);
-    ctx.scala.import_info_of(ctx.file).iter().any(|import| {
-        if import.is_wildcard {
-            return false;
-        }
-        let Some(path) = scala_import_path(import) else {
-            return false;
-        };
-        let local_name = import
-            .identifier
-            .as_deref()
-            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
-        local_name == simple
-    })
+    ctx.scala
+        .import_info_of(ctx.file)
+        .into_iter()
+        .any(|import| {
+            if import.is_wildcard {
+                return false;
+            }
+            let Some(path) = scala_import_path(&import) else {
+                return false;
+            };
+            let local_name = import
+                .identifier
+                .as_deref()
+                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
+            local_name == simple
+        })
 }
 
 fn scala_type_annotation_imported(
@@ -1671,19 +1683,22 @@ fn scala_type_annotation_imported(
 ) -> bool {
     let simple = scala_simple_name(type_text);
     let resolved_package = scala_fqn_package(resolved_fqn);
-    ctx.scala.import_info_of(ctx.file).iter().any(|import| {
-        let Some(path) = scala_import_path(import) else {
-            return false;
-        };
-        if import.is_wildcard {
-            return path == resolved_package;
-        }
-        let local_name = import
-            .identifier
-            .as_deref()
-            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
-        local_name == simple
-    })
+    ctx.scala
+        .import_info_of(ctx.file)
+        .into_iter()
+        .any(|import| {
+            let Some(path) = scala_import_path(&import) else {
+                return false;
+            };
+            if import.is_wildcard {
+                return path == resolved_package;
+            }
+            let local_name = import
+                .identifier
+                .as_deref()
+                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
+            local_name == simple
+        })
 }
 
 fn scala_fqn_package(fqn: &str) -> &str {
@@ -1781,7 +1796,7 @@ fn scala_imported_member_shadows_bare_call(
 ) -> bool {
     let file_package = scala_package_name_of(scala, file).unwrap_or_default();
     for import in scala.import_info_of(file) {
-        let Some(path) = scala_import_path(import) else {
+        let Some(path) = scala_import_path(&import) else {
             continue;
         };
         if import.is_wildcard {
@@ -2027,6 +2042,15 @@ fn scala_call_result_type(
             {
                 return Some(return_type);
             }
+            if let Some(unit) = resolve_in_enclosing_scopes(
+                ctx.analyzer,
+                ctx.file,
+                name,
+                function.start_byte(),
+                |unit| unit.is_function(),
+            ) {
+                return scala_function_return_type(ctx, &unit);
+            }
             let owner = scala_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())?;
             scala_member_candidate_units(ctx, &owner.fq_name(), name, false)
                 .into_iter()
@@ -2074,11 +2098,16 @@ fn scala_constructed_type(
             .then_some(node)
         })
         .and_then(|type_node| {
-            scala_resolve_visible_type_annotation(
-                ctx,
-                resolver,
-                scala_node_text(type_node, ctx.source),
+            let type_text = scala_node_text(type_node, ctx.source);
+            resolve_in_enclosing_scopes(
+                ctx.analyzer,
+                ctx.file,
+                scala_simple_name(type_text),
+                type_node.start_byte(),
+                |unit| unit.is_class(),
             )
+            .map(|unit| unit.fq_name())
+            .or_else(|| scala_resolve_visible_type_annotation(ctx, resolver, type_text))
         })
 }
 
@@ -2173,7 +2202,7 @@ fn scala_import_boundary_for_name(
 ) -> bool {
     let simple = scala_simple_name(name);
     for import in scala.import_info_of(file) {
-        let Some(path) = scala_import_path(import) else {
+        let Some(path) = scala_import_path(&import) else {
             continue;
         };
         if import.is_wildcard {
