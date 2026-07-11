@@ -38,12 +38,28 @@ pub fn prepare_repo(
         )?;
     }
 
+    // Benchmark input must be byte-stable across hosts: the persisted analyzer
+    // deliberately keys data by working-tree bytes, including CRLF differences.
+    run_git_command(
+        Command::new("git").arg("-C").arg(&checkout_path).args([
+            "config",
+            "core.autocrlf",
+            "false",
+        ]),
+        None,
+        format!(
+            "disable line-ending conversion in `{}`",
+            checkout_path.display()
+        ),
+    )?;
+
     run_git_command(
         Command::new("git")
             .arg("-C")
             .arg(&checkout_path)
             .arg("checkout")
             .arg("--detach")
+            .arg("--force")
             .arg(&target.commit),
         None,
         format!(

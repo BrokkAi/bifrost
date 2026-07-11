@@ -21,6 +21,27 @@ fn prepare_repo_reuses_cached_commit_without_fetching_origin() {
     assert_eq!(checkout, reused);
 }
 
+#[test]
+fn prepare_repo_disables_autocrlf_for_deterministic_checkout_bytes() {
+    let temp = TempDir::new().expect("temp dir");
+    let source_root = temp.path().join("source");
+    fs::create_dir_all(&source_root).expect("source root");
+    init_git_repo(&source_root);
+
+    let cache_root = temp.path().join("cache");
+    let target = repo_target(&source_root, &head_commit(&source_root));
+    let checkout = prepare_repo(&target, &cache_root).expect("initial clone");
+    let repo = Repository::open(checkout).expect("open checkout");
+
+    assert_eq!(
+        repo.config()
+            .expect("checkout config")
+            .get_string("core.autocrlf")
+            .expect("autocrlf config"),
+        "false"
+    );
+}
+
 fn repo_target(source_root: &Path, commit: &str) -> BenchmarkRepoTarget {
     BenchmarkRepoTarget {
         name: "fixture-repo".to_string(),
