@@ -236,7 +236,24 @@ fn find_text_candidates(
         return HashSet::default();
     }
 
-    let files = analyzed_files_for_language(analyzer, language);
+    // JS and TS form one runtime module ecosystem: JavaScript tests commonly
+    // consume emitted output from TypeScript sources, and the emitted path may
+    // not exist in a source-only workspace. Candidate discovery therefore spans
+    // both languages; the graph still decides whether each AST hit is proven.
+    let files = if matches!(language, Language::JavaScript | Language::TypeScript) {
+        analyzer
+            .analyzed_files()
+            .into_iter()
+            .filter(|file| {
+                matches!(
+                    language_for_file(file),
+                    Language::JavaScript | Language::TypeScript
+                )
+            })
+            .collect()
+    } else {
+        analyzed_files_for_language(analyzer, language)
+    };
     if files.is_empty() {
         return HashSet::default();
     }
@@ -360,9 +377,15 @@ fn apply_fallback_policy(
 }
 
 fn should_union_text_candidates(target: &CodeUnit) -> bool {
-    language_for_target(target) == Language::Python
-        && (target.is_function() || target.is_field())
-        && target.short_name().contains('.')
+    let language = language_for_target(target);
+    let member = target.short_name().contains('.');
+    (language == Language::Python && (target.is_function() || target.is_field()) && member)
+        // Dynamic instance receivers can cross unresolved emitted-file import
+        // boundaries, so the import graph alone cannot prove candidate absence.
+        || (matches!(language, Language::JavaScript | Language::TypeScript)
+            && target.is_function()
+            && member
+            && !target.short_name().ends_with("$static"))
 }
 
 /// Convenience constructor for the standard [`ImportGraphCandidateProvider`] +

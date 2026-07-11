@@ -573,6 +573,52 @@ fn js_seedless_unprovable_external_member_match_is_unproven() {
 }
 
 #[test]
+fn ts_instance_method_scan_keeps_js_emitted_import_boundary_calls_unproven() {
+    let project = InlineTestProject::new()
+        .file(
+            "src/core.ts",
+            "export class ProcessPromise {\n  pipe(dest: unknown): ProcessPromise { return this; }\n}\n",
+        )
+        .file(
+            "test/core.test.js",
+            "import { ProcessPromise } from '../build/index.js';\nconst p1 = makeProcess();\nconst p2 = p1.pipe(makeProcess());\n",
+        )
+        .build();
+    let analyzer = MultiAnalyzer::new(BTreeMap::from([
+        (
+            Language::JavaScript,
+            AnalyzerDelegate::JavaScript(JavascriptAnalyzer::from_project(
+                project.project().clone(),
+            )),
+        ),
+        (
+            Language::TypeScript,
+            AnalyzerDelegate::TypeScript(TypescriptAnalyzer::from_project(
+                project.project().clone(),
+            )),
+        ),
+    ]));
+    let target = analyzer
+        .all_declarations()
+        .find(|unit| {
+            unit.source() == &project.file("src/core.ts")
+                && unit.short_name() == "ProcessPromise.pipe"
+                && unit.is_function()
+        })
+        .expect("ProcessPromise.pipe target");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+    let unproven_hits = flatten_unproven_hits(result);
+
+    assert!(
+        unproven_hits.iter().any(|hit| {
+            hit.file == project.file("test/core.test.js") && hit.snippet.contains("p1.pipe")
+        }),
+        "the unresolved emitted-file import boundary must retain the structured member call as unproven, got {unproven_hits:?}"
+    );
+}
+
+#[test]
 fn js_parent_of_module_scoped_export_const_returns_file_scope_module() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(
