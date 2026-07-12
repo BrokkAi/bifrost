@@ -478,7 +478,7 @@ fn flatten_unproven_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages:
 }
 
 #[test]
-fn js_seedless_factory_returned_unexported_class_method_scans_external_files() {
+fn js_seedless_factory_returned_unexported_class_method_is_proven() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(
             "duration.js",
@@ -495,19 +495,19 @@ fn js_seedless_factory_returned_unexported_class_method_scans_external_files() {
         cu.short_name() == "Duration.asDays" && cu.is_function()
     });
 
-    let hits = flatten_unproven_hits(
+    let hits = flatten_hits(
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
     );
 
     assert!(
         hits.iter()
             .any(|hit| hit.file == project.file("consumer.js") && hit.snippet.contains("asDays")),
-        "seedless method scan should include the external factory-return callsite, got {hits:?}"
+        "structured factory-return analysis should prove the external method call, got {hits:?}"
     );
 }
 
 #[test]
-fn js_seedless_method_with_self_call_also_scans_external_files() {
+fn js_seedless_method_with_self_call_proves_external_factory_receiver() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(
             "duration.js",
@@ -531,12 +531,12 @@ fn js_seedless_method_with_self_call_also_scans_external_files() {
         }),
         "self-call should remain editor-visible: {result:?}"
     );
-    let unproven_hits = flatten_unproven_hits(result);
+    let proven_hits = flatten_hits(result);
     assert!(
-        unproven_hits.iter().any(|hit| {
+        proven_hits.iter().any(|hit| {
             hit.file == project.file("consumer.js") && hit.snippet.contains("toISOString")
         }),
-        "seedless fallback must not stop at the declaring file when it finds a self-call, got {unproven_hits:?}"
+        "seedless scan must prove the external factory receiver even when the declaring file has a self-call, got {proven_hits:?}"
     );
 }
 

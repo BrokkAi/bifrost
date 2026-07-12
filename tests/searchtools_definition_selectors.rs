@@ -270,6 +270,22 @@ fn symbol_sources_accepts_path_colon_selector_spellings() {
                 .contains("return 'a'"),
             "{result}"
         );
+
+        let locations = call_tool(
+            &project,
+            "get_symbol_locations",
+            &serde_json::json!({ "symbols": [selector] }).to_string(),
+        );
+        assert_eq!(
+            0,
+            locations["not_found"].as_array().unwrap().len(),
+            "{locations}"
+        );
+        assert_eq!(
+            1,
+            locations["locations"].as_array().unwrap().len(),
+            "{locations}"
+        );
     }
 }
 
@@ -339,6 +355,69 @@ class Widget {
             .any(|source| source["text"].as_str().unwrap().contains("String run")),
         "{result}"
     );
+}
+
+#[test]
+fn symbol_sources_resolves_lombok_generated_accessors_to_backing_fields() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/example/Statement.java",
+            r#"package example;
+import lombok.Data;
+import lombok.Getter;
+
+@Data
+class Statement {
+    private final String sqlStatementContext;
+
+    @Getter
+    private boolean ready;
+}
+"#,
+        )
+        .build();
+
+    for (selector, field) in [
+        (
+            "example.Statement.getSqlStatementContext",
+            "private final String sqlStatementContext;",
+        ),
+        ("example.Statement.isReady", "private boolean ready;"),
+        (
+            "src/main/java/example/Statement.java#example.Statement.getSqlStatementContext",
+            "private final String sqlStatementContext;",
+        ),
+    ] {
+        let args = serde_json::json!({ "symbols": [selector] }).to_string();
+        let result = call_tool(&project, "get_symbol_sources", &args);
+        assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+        assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+        assert!(
+            result["sources"][0]["text"]
+                .as_str()
+                .is_some_and(|source| source.contains(field)),
+            "{selector}: {result}"
+        );
+    }
+}
+
+#[test]
+fn symbol_sources_does_not_invent_unannotated_java_accessors() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/example/Statement.java",
+            "package example; class Statement { private String sql; }\n",
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["example.Statement.getSql"]}"#,
+    );
+
+    assert_eq!(0, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["not_found"].as_array().unwrap().len(), "{result}");
 }
 
 #[test]
@@ -856,7 +935,7 @@ fn dotted_js_filename_selectors_resolve_fields_and_functions_consistently() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
             "packages/converters/src/utils/bruno-to-postman-translator.js",
-            "export const simpleTranslations = {};\nexport const complexTransformations = {};\nexport function processAllTransformations() { return simpleTranslations; }\n",
+            "export const simpleTranslations = {};\nexport const complexTransformations = {};\nexport function processAllTransformations() { return simpleTranslations; }\nexport class Translator { process() { return simpleTranslations; } }\n",
         )
         .build();
 
@@ -873,9 +952,54 @@ fn dotted_js_filename_selectors_resolve_fields_and_functions_consistently() {
             "bruno-to-postman-translator.js.processAllTransformations",
             "function processAllTransformations()",
         ),
+        (
+            "packages/converters/src/utils/bruno-to-postman-translator.js.Translator.process",
+            "process() { return simpleTranslations; }",
+        ),
     ] {
         let args = serde_json::json!({ "symbols": [selector] }).to_string();
         let result = call_tool(&project, "get_symbol_sources", &args);
+        assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+        assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+        assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+        assert!(
+            result["sources"][0]["text"]
+                .as_str()
+                .expect("source text")
+                .contains(expected),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn csharp_generic_arity_selectors_resolve_indexed_source_names() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "DownloadClientFixtureBase.cs",
+            "namespace NzbDrone.Core.Test.Download;\nclass DownloadClientFixtureBase<T> { public void Verify(T value) {} public U Convert<U>(T value) { return default(U); } }\n",
+        )
+        .build();
+
+    for (selector, expected) in [
+        (
+            "NzbDrone.Core.Test.Download.DownloadClientFixtureBase`1",
+            "class DownloadClientFixtureBase<T>",
+        ),
+        (
+            "NzbDrone.Core.Test.Download.DownloadClientFixtureBase`1.Verify",
+            "void Verify(T value)",
+        ),
+        (
+            "NzbDrone.Core.Test.Download.DownloadClientFixtureBase`1.Convert``1",
+            "U Convert<U>(T value)",
+        ),
+    ] {
+        let result = call_tool(
+            &project,
+            "get_symbol_sources",
+            &serde_json::json!({ "symbols": [selector] }).to_string(),
+        );
         assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
         assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
         assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");

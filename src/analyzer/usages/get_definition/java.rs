@@ -1575,7 +1575,7 @@ struct JavaAccessorProperty {
     requires_boolean_field: bool,
 }
 
-fn java_lombok_accessor_field_candidates(
+pub(crate) fn java_lombok_accessor_field_candidates(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner: &CodeUnit,
@@ -1645,11 +1645,34 @@ fn java_field_is_boolean(analyzer: &dyn IAnalyzer, field: &CodeUnit) -> bool {
         .signature()
         .map(str::to_string)
         .or_else(|| analyzer.signatures(field).first().cloned());
-    signature
+    let type_text = java_field_type_text_from_source(analyzer, field).or_else(|| {
+        signature.as_deref().and_then(|signature| {
+            java_field_type_text_from_signature(signature, field.identifier())
+        })
+    });
+    type_text
         .as_deref()
-        .and_then(|signature| java_field_type_text_from_signature(signature, field.identifier()))
-        .and_then(|type_text| java_raw_type_name(&type_text))
+        .and_then(java_raw_type_name)
         .is_some_and(|raw| matches!(raw.as_str(), "boolean" | "Boolean"))
+}
+
+fn java_field_type_text_from_source(analyzer: &dyn IAnalyzer, field: &CodeUnit) -> Option<String> {
+    let source = analyzer.get_source(field, false)?;
+    let wrapped = format!("class __BifrostLombokField {{\n{source}\n}}");
+    let tree = parse_java_tree(&wrapped)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "field_declaration"
+            && let Some(type_node) = node.child_by_field_name("type")
+        {
+            return Some(java_node_text(type_node, &wrapped).trim().to_string());
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    None
 }
 
 fn java_bean_decapitalize(name: &str) -> String {

@@ -822,10 +822,6 @@ fn member_object_match_status(
         return ReceiverMatchStatus::Proven;
     }
 
-    if node.kind() == "call_expression" {
-        return ReceiverMatchStatus::Unproven;
-    }
-
     if let Some(binding) = simple_identifier_text(node, ctx.source).and_then(|name| {
         ctx.scope_stack
             .iter()

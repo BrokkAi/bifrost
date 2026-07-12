@@ -86,9 +86,15 @@ pub(super) fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Enclos
         end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
     };
     let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
-    let owner = enclosing
-        .as_ref()
-        .and_then(|enclosing| ctx.analyzer.parent_of(enclosing));
+    let owner = enclosing.as_ref().and_then(|enclosing| {
+        let mut current = ctx.analyzer.parent_of(enclosing);
+        while current.as_ref().is_some_and(|unit| unit.is_function()) {
+            current = current
+                .as_ref()
+                .and_then(|unit| ctx.analyzer.parent_of(unit));
+        }
+        current
+    });
     let resolved = EnclosingContext { enclosing, owner };
     ctx.enclosing_cache.insert(key, resolved.clone());
     resolved

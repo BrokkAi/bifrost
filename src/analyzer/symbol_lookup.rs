@@ -397,7 +397,43 @@ fn codeunit_lookup_aliases(code_unit: &CodeUnit) -> BTreeSet<Vec<String>> {
 fn query_symbol_interpretations(language: Language, input: &str) -> BTreeSet<Vec<String>> {
     let mut paths = BTreeSet::new();
     insert_path_variants(&mut paths, language, input);
+    if language == Language::CSharp {
+        let normalized: Vec<_> = parse_symbol_path(language, input)
+            .into_iter()
+            .map(|segment| strip_csharp_generic_arity(&segment).to_string())
+            .collect();
+        if !normalized.is_empty() && normalized.iter().all(|segment| !segment.is_empty()) {
+            paths.insert(normalized);
+        }
+    }
     paths
+}
+
+pub(crate) fn symbol_selector_leaf(language: Language, input: &str) -> Option<String> {
+    let leaves: BTreeSet<_> = query_symbol_interpretations(language, input)
+        .into_iter()
+        .filter_map(|path| path.into_iter().next_back())
+        .collect();
+    (leaves.len() == 1)
+        .then(|| leaves.into_iter().next())
+        .flatten()
+}
+
+fn strip_csharp_generic_arity(segment: &str) -> &str {
+    let Some((name, arity)) = segment.rsplit_once('`') else {
+        return segment;
+    };
+    let backticks = 1 + name.bytes().rev().take_while(|byte| *byte == b'`').count();
+    let name = name.trim_end_matches('`');
+    if !name.is_empty()
+        && (1..=2).contains(&backticks)
+        && !arity.is_empty()
+        && arity.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        name
+    } else {
+        segment
+    }
 }
 
 fn insert_path_variants(paths: &mut BTreeSet<Vec<String>>, language: Language, value: &str) {

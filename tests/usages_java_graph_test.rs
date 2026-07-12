@@ -1189,6 +1189,91 @@ public class Consumer {
 }
 
 #[test]
+fn scan_usages_proves_unqualified_private_method_calls_inside_lambdas() {
+    let (project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/ClusterProcessPersistService.java",
+        r#"
+package com.example;
+
+import java.util.Collection;
+
+public class ClusterProcessPersistService {
+    void getProcessList(String taskId, Collection<String> triggerPaths) {
+        waitUntilReleaseReady(taskId, () -> isReady(triggerPaths));
+    }
+
+    void killProcess(String processId, Collection<String> triggerPaths) {
+        waitUntilReleaseReady(processId, () -> isReady(triggerPaths));
+    }
+
+    private boolean isReady(Collection<String> paths) {
+        return paths.isEmpty();
+    }
+
+    private void waitUntilReleaseReady(String id, ReadyCheck check) {}
+
+    interface ReadyCheck {
+        boolean isReady();
+    }
+}
+"#,
+    )]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let target = definition(
+        &analyzer,
+        "com.example.ClusterProcessPersistService.isReady",
+    );
+    let anonymous = analyzer
+        .all_declarations()
+        .find(|unit| unit.is_anonymous() && unit.short_name().contains("getProcessList"))
+        .expect("missing lambda declaration");
+    let anonymous_parent = analyzer
+        .parent_of(&anonymous)
+        .expect("missing lambda parent");
+    let anonymous_owner = analyzer
+        .parent_of(&anonymous_parent)
+        .expect("missing lambda owner");
+    assert_eq!(
+        "com.example.ClusterProcessPersistService",
+        anonymous_owner.fq_name(),
+        "lambda ancestry: {anonymous:?} -> {anonymous_parent:?} -> {anonymous_owner:?}"
+    );
+    assert_eq!(
+        "com.example.ClusterProcessPersistService",
+        analyzer.parent_of(&target).expect("target owner").fq_name(),
+        "target: {target:?}"
+    );
+    let direct_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(2, direct_hits.len(), "{direct_hits:#?}");
+    assert!(
+        direct_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("() -> isReady(triggerPaths)")),
+        "{direct_hits:#?}"
+    );
+
+    let scan = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["com.example.ClusterProcessPersistService.isReady"],
+            "include_tests": true
+        })
+        .to_string(),
+    );
+    let entry = &scan["results"][0];
+    assert_eq!("found", entry["status"], "{scan}");
+    assert_eq!(2, entry["total_hits"], "{scan}");
+    assert_eq!(0, entry["unproven_hits"], "{scan}");
+}
+
+#[test]
 fn java_graph_strategy_counts_anonymous_class_and_super_method_usages() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

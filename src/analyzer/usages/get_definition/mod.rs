@@ -95,7 +95,9 @@ pub(crate) use call_sites::{
 };
 pub(crate) use csharp::{CSharpTypeLookupResolution, csharp_type_lookup_resolution};
 pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
-pub(crate) use java::{JavaTypeLookupResolution, java_type_lookup_resolution};
+pub(crate) use java::{
+    JavaTypeLookupResolution, java_lombok_accessor_field_candidates, java_type_lookup_resolution,
+};
 pub(crate) use scala::{ScalaTypeLookupResolution, scala_type_lookup_resolution};
 
 /// Resolve a bare `name` against the lexically enclosing scope chain, innermost

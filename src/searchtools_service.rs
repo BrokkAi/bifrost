@@ -176,6 +176,28 @@ fn classify_source_read(
     }
 }
 
+fn stale_symbol_source_files(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    candidate_files: BTreeSet<ProjectFile>,
+) -> Result<BTreeSet<ProjectFile>, SearchToolsServiceError> {
+    candidate_files
+        .into_iter()
+        .filter_map(|file| {
+            let current = analyzer.project().read_source(&file);
+            match classify_source_read(&file, current) {
+                Ok(ObservedSource::Present(current))
+                    if analyzer.indexed_source(&file) == Some(current.as_str()) =>
+                {
+                    None
+                }
+                Ok(ObservedSource::Missing) if analyzer.indexed_source(&file).is_none() => None,
+                Ok(_) => Some(Ok(file)),
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .collect()
+}
+
 impl WorkspaceSession {
     fn close_semantic(&self) {
         #[cfg(feature = "nlp")]
@@ -1082,35 +1104,15 @@ impl SearchToolsService {
         let initial_snapshot = self.snapshot_for_query()?;
         let mut result = get_symbol_sources(initial_snapshot.analyzer(), params.clone());
         if self.update_strategy == UpdateStrategy::WatchFiles {
-            let observed_sources =
-                symbol_source_candidate_files(initial_snapshot.analyzer(), &result)
-                    .into_iter()
-                    .map(|file| {
-                        let current = initial_snapshot.analyzer().project().read_source(&file);
-                        classify_source_read(&file, current).map(|source| (file, source))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+            let candidate_files =
+                symbol_source_candidate_files(initial_snapshot.analyzer(), &result);
 
             let final_snapshot = {
                 let mut guard = self.write_session()?;
                 let session = guard.as_mut().ok_or_else(Self::closed_error)?;
                 Self::apply_watcher_delta(session);
                 let analyzer = session.snapshot.analyzer();
-                let stale_files = observed_sources
-                    .iter()
-                    .filter_map(|(file, observed)| {
-                        let indexed = analyzer.indexed_source(file);
-                        match (indexed, observed) {
-                            (Some(indexed), ObservedSource::Present(current))
-                                if indexed == current =>
-                            {
-                                None
-                            }
-                            (None, ObservedSource::Missing) => None,
-                            _ => Some(file.clone()),
-                        }
-                    })
-                    .collect();
+                let stale_files = stale_symbol_source_files(analyzer, candidate_files)?;
                 Self::apply_changed_files(session, stale_files);
                 Arc::clone(&session.snapshot)
             };
@@ -1691,6 +1693,30 @@ public partial class MudDialogContainer
                 .iter()
                 .any(|text| text.contains("private string GetBackgroundClass()")),
             "{value}"
+        );
+    }
+
+    #[test]
+    fn candidate_files_are_rechecked_after_the_source_changes() {
+        let (_temp, root) = write_project();
+        let (_project, workspace) = build_transient_workspace(root.clone()).unwrap();
+        let result = get_symbol_sources(
+            workspace.analyzer(),
+            SymbolLookupParams {
+                symbols: vec!["MudBlazor.MudDialogContainer.BackgroundClassname".to_string()],
+            },
+        );
+        let candidates = symbol_source_candidate_files(workspace.analyzer(), &result);
+
+        fs::write(root.join("MudDialogContainer.cs"), SHIFTED_SOURCE).unwrap();
+
+        let stale = stale_symbol_source_files(workspace.analyzer(), candidates).unwrap();
+        assert_eq!(
+            BTreeSet::from([ProjectFile::new(
+                root,
+                PathBuf::from("MudDialogContainer.cs")
+            )]),
+            stale
         );
     }
 

@@ -7,11 +7,12 @@ use crate::analyzer::declaration_range::{
 };
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
-    resolve_enclosing_codeunits, strip_trailing_call_suffix,
+    resolve_enclosing_codeunits, strip_trailing_call_suffix, symbol_selector_leaf,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::get_definition::{
     SCALA_UNSUPPORTED_CALL_TARGET_SHAPE, SCALA_UNSUPPORTED_RECEIVER,
+    java_lombok_accessor_field_candidates,
 };
 use crate::analyzer::usages::reference_site::reference_target_match_offsets;
 use crate::analyzer::usages::{
@@ -1109,10 +1110,12 @@ pub fn get_symbol_locations(
                 return None;
             }
 
-            let code_units = match resolve_codeunit_fuzzy(analyzer, &symbol) {
-                CodeUnitResolution::Resolved(code_units) => Some(code_units),
-                CodeUnitResolution::Ambiguous(_) | CodeUnitResolution::NotFound => None,
-            };
+            let code_units =
+                match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
+                    SelectableDefinitionResolution::Resolved(code_units) => Some(code_units),
+                    SelectableDefinitionResolution::Ambiguous(_)
+                    | SelectableDefinitionResolution::NotFound(_) => None,
+                };
             let Some(code_units) = code_units else {
                 return Some((
                     index,
@@ -1595,6 +1598,55 @@ fn resolve_definition_context_symbol(
     let exact = resolve_codeunit_exact(analyzer, symbol);
     if !exact.is_empty() {
         return Ok(exact);
+    }
+
+    let anchored = match split_definition_selector(symbol) {
+        DefinitionSelector::FileAnchored { anchor, lookup } => Some((anchor, lookup)),
+        DefinitionSelector::Name(_) => {
+            match split_path_qualified_definition_selector(analyzer, symbol) {
+                Some(PathQualifiedSelector::Resolved { anchor, lookup }) => Some((anchor, lookup)),
+                Some(PathQualifiedSelector::AmbiguousPath(item)) => {
+                    return Err(vec![DefinitionDiagnostic {
+                        kind: "ambiguous_path".to_string(),
+                        message: format!(
+                            "`{}` is ambiguous; matches: {}",
+                            item.input,
+                            item.matches.join(", ")
+                        ),
+                    }]);
+                }
+                None => None,
+            }
+        }
+    };
+    if let Some((anchor, lookup)) = anchored {
+        let candidates = match exact_then_fuzzy_codeunit_resolution(analyzer, lookup) {
+            CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => units,
+            CodeUnitResolution::NotFound => Vec::new(),
+        };
+        let narrowed: Vec<_> = candidates
+            .into_iter()
+            .filter(|unit| rel_path_string(unit.source()) == anchor)
+            .collect();
+        let groups = distinct_definitions(narrowed);
+        return match groups.as_slice() {
+            [(_, _)] => Ok(groups.into_iter().flat_map(|(_, units)| units).collect()),
+            [] => Err(vec![DefinitionDiagnostic {
+                kind: "symbol_not_found".to_string(),
+                message: format!("`{symbol}` does not resolve to a workspace symbol"),
+            }]),
+            _ => Err(vec![DefinitionDiagnostic {
+                kind: "ambiguous_symbol".to_string(),
+                message: format!(
+                    "`{symbol}` is ambiguous; matches: {}",
+                    groups
+                        .into_iter()
+                        .map(|(selector, _)| selector)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }]),
+        };
     }
 
     match resolve_codeunit_fuzzy(analyzer, symbol) {
@@ -2107,11 +2159,36 @@ fn resolve_selectable_definitions(
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
     let selector = split_definition_selector(input);
-    let (anchor, lookup) = match selector {
+    let (mut anchor, mut lookup) = match selector {
         DefinitionSelector::Name(name) => (None, name),
         DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
     };
-    let code_units = match resolve(analyzer, lookup) {
+    let mut resolution = resolve(analyzer, lookup);
+    if matches!(resolution, CodeUnitResolution::NotFound)
+        && anchor.is_none()
+        && let Some(path_selector) = split_path_qualified_definition_selector(analyzer, input)
+    {
+        match path_selector {
+            PathQualifiedSelector::Resolved {
+                anchor: path_anchor,
+                lookup: path_lookup,
+            } => {
+                anchor = Some(path_anchor);
+                lookup = path_lookup;
+                resolution = resolve(analyzer, lookup);
+            }
+            PathQualifiedSelector::AmbiguousPath(item) => {
+                return SelectableDefinitionResolution::NotFound(not_found_input(
+                    input,
+                    Some(format!(
+                        "path is ambiguous; retry with one of: {}",
+                        item.matches.join(", ")
+                    )),
+                ));
+            }
+        }
+    }
+    let code_units = match resolution {
         CodeUnitResolution::Resolved(code_units) => code_units,
         CodeUnitResolution::Ambiguous(matches) => matches,
         CodeUnitResolution::NotFound => {
@@ -2312,6 +2389,42 @@ fn source_blocks_for_resolved_units(
     blocks
 }
 
+fn java_generated_accessor_source_blocks(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    anchor: Option<&str>,
+) -> Vec<SourceBlock> {
+    let lookup = strip_trailing_call_suffix(input.trim());
+    let Some(member) = symbol_selector_leaf(Language::Java, &lookup) else {
+        return Vec::new();
+    };
+
+    let owners: Vec<_> = resolve_enclosing_codeunits(analyzer, &lookup)
+        .into_iter()
+        .filter(|owner| language_for_target(owner) == Language::Java && owner.is_class())
+        .collect();
+    let owner_names: BTreeSet<_> = owners.iter().map(CodeUnit::fq_name).collect();
+    if owner_names.len() != 1 {
+        return Vec::new();
+    }
+
+    let mut fields: Vec<_> = owners
+        .iter()
+        .flat_map(|owner| {
+            java_lombok_accessor_field_candidates(
+                analyzer,
+                analyzer.definition_lookup_index(),
+                owner,
+                &member,
+            )
+        })
+        .filter(|field| anchor.is_none_or(|anchor| rel_path_string(field.source()) == anchor))
+        .collect();
+    fields.sort();
+    fields.dedup();
+    source_blocks_for_resolved_units(analyzer, &fields)
+}
+
 pub(crate) fn symbol_source_candidate_files(
     analyzer: &dyn IAnalyzer,
     result: &SymbolSourcesResult,
@@ -2395,6 +2508,10 @@ fn resolve_file_anchored_symbol_sources(
             code_units
         }
         CodeUnitResolution::NotFound => {
+            let generated = java_generated_accessor_source_blocks(analyzer, lookup, Some(&anchor));
+            if !generated.is_empty() {
+                return SourceLookupOutcome::Found(generated);
+            }
             if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, input) {
                 return SourceLookupOutcome::NotFound(item);
             }
@@ -2465,7 +2582,17 @@ pub fn get_symbol_sources(
                 SelectableDefinitionResolution::Ambiguous(item) => {
                     return (index, SourceLookupOutcome::Ambiguous(item));
                 }
-                SelectableDefinitionResolution::NotFound(_) => {}
+                SelectableDefinitionResolution::NotFound(_) => {
+                    if let DefinitionSelector::FileAnchored { anchor, lookup } =
+                        split_definition_selector(&symbol)
+                    {
+                        let generated =
+                            java_generated_accessor_source_blocks(analyzer, lookup, Some(&anchor));
+                        if !generated.is_empty() {
+                            return (index, SourceLookupOutcome::Found(generated));
+                        }
+                    }
+                }
             }
 
             match split_path_qualified_definition_selector(analyzer, &symbol) {
@@ -2561,6 +2688,10 @@ pub fn get_symbol_sources(
                     (index, SourceLookupOutcome::Ambiguous(item))
                 }
                 SelectableDefinitionResolution::NotFound(target) => {
+                    let generated = java_generated_accessor_source_blocks(analyzer, &symbol, None);
+                    if !generated.is_empty() {
+                        return (index, SourceLookupOutcome::Found(generated));
+                    }
                     let target = unsupported_selector_shape_not_found_input(analyzer, &symbol)
                         .unwrap_or(target);
                     (index, SourceLookupOutcome::NotFound(target))
@@ -7166,18 +7297,27 @@ fn dotted_file_symbol_selector<'a>(
     analyzer: &dyn IAnalyzer,
     input: &'a str,
 ) -> Option<PathQualifiedSelector<'a>> {
-    let (path_candidate, symbol) = input.rsplit_once('.')?;
-    if path_candidate.is_empty() || symbol.is_empty() || likely_file_target_extension(symbol) {
-        return None;
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    for (separator, _) in input.rmatch_indices('.') {
+        let path_candidate = &input[..separator];
+        let symbol = &input[separator + 1..];
+        if path_candidate.is_empty() || symbol.is_empty() || likely_file_target_extension(symbol) {
+            continue;
+        }
+        match resolver.resolve_literal(path_candidate) {
+            ResolvedFileInput::File(file) => {
+                return Some(PathQualifiedSelector::Resolved {
+                    anchor: rel_path_string(&file),
+                    lookup: symbol,
+                });
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                return Some(PathQualifiedSelector::AmbiguousPath(item));
+            }
+            ResolvedFileInput::NotFound(_) => {}
+        }
     }
-    match WorkspaceFileResolver::new(analyzer.project()).resolve_literal(path_candidate) {
-        ResolvedFileInput::File(file) => Some(PathQualifiedSelector::Resolved {
-            anchor: rel_path_string(&file),
-            lookup: symbol,
-        }),
-        ResolvedFileInput::Ambiguous(item) => Some(PathQualifiedSelector::AmbiguousPath(item)),
-        ResolvedFileInput::NotFound(_) => None,
-    }
+    None
 }
 
 fn looks_like_absolute_path(input: &str) -> bool {

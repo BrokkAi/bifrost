@@ -1206,6 +1206,41 @@ pub fn caller() {
 }
 
 #[test]
+fn get_definitions_by_reference_accepts_js_file_anchored_symbols() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/core.ts",
+            "function helper() { return 1; }\nexport class ProcessPromise { pipe() { return helper(); } }\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for symbol in [
+        "src/core.ts#ProcessPromise.pipe",
+        "src/core.ts.ProcessPromise.pipe",
+    ] {
+        let payload = service
+            .call_tool_json(
+                "get_definitions_by_reference",
+                &serde_json::json!({
+                    "references": [{
+                        "symbol": symbol,
+                        "context": "pipe() { return helper(); }",
+                        "target": "helper"
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = &value["results"][0];
+        assert_eq!("resolved", result["status"], "{value}");
+        assert_eq!("helper", result["definitions"][0]["fqn"], "{value}");
+    }
+}
+
+#[test]
 fn get_definitions_guidance_matches_call_surface_for_qualified_targets() {
     let temp = TempDir::new().unwrap();
     let src = temp.path().join("src");
