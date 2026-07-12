@@ -37,7 +37,9 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     let path_text = node_text(path, ctx.source);
-    if !ctx.namespace_names.contains(path_text) || ctx.shadowed_names.contains(path_text) {
+    if !ctx.namespace_names.contains(path_text)
+        || ctx.name_shadowed_at(path_text, path.start_byte())
+    {
         return;
     }
 

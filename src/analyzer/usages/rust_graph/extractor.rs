@@ -1,3 +1,4 @@
+use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
 use crate::analyzer::usages::get_definition::rust_resolve_type_node_fqn;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -169,6 +170,7 @@ pub(super) fn scan_files_for_target(
         }
 
         let line_starts = compute_line_starts(source);
+        let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
         let refs = rust.reference_context_of(file);
         let (mut direct_names, namespace_names) = match seeds {
             Some(seeds) => rust.usage_binding_names(file, seeds),
@@ -204,14 +206,7 @@ pub(super) fn scan_files_for_target(
             target_short: &target_short,
             direct_names: &direct_names,
             namespace_names: &namespace_names,
-            shadowed_names: detect_shadowed_names(
-                tree.root_node(),
-                source,
-                &direct_names,
-                &namespace_names,
-                &target_short,
-                target_self_file,
-            ),
+            lexical_scope: &lexical_scope,
             target_self_file,
             hits: &mut local_hits,
         };
@@ -242,51 +237,58 @@ pub(super) struct ScanCtx<'a> {
     pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
     pub(super) namespace_names: &'a HashSet<String>,
-    pub(super) shadowed_names: HashSet<String>,
+    lexical_scope: &'a RustLexicalScopeIndex,
     target_self_file: bool,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
     fn matches_identifier(&self, text: &str) -> bool {
-        (self.direct_names.contains(text) && !self.shadowed_names.contains(text))
-            || (self.target_self_file
-                && text == self.target_short
-                && !self.shadowed_names.contains(text))
+        self.direct_names.contains(text) || (self.target_self_file && text == self.target_short)
+    }
+
+    pub(super) fn name_shadowed_at(&self, name: &str, byte: usize) -> bool {
+        self.lexical_scope.name_bound_at(name, byte)
+            || (!self.target_self_file && self.lexical_scope.item_bound_at(name, byte))
     }
 }
 
-fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    match node.kind() {
-        "use_declaration" => {
-            record_use_import_hits(node, ctx);
-            return;
-        }
-        "identifier" | "type_identifier" if !ctx.target_is_module => {
-            let text = node
-                .utf8_text(ctx.source.as_bytes())
-                .ok()
-                .map(str::trim)
-                .unwrap_or_default();
-            if text == "Self" && self_reference_matches_target(node, ctx) {
-                record_self_reference_hit(node, ctx);
-            } else if (!ctx.target_is_class || !identifier_is_scoped_path_part(node))
-                && ctx.matches_identifier(text)
-                && !is_shadowed_identifier(text, node, ctx)
-            {
-                record_hit(node, ctx);
+fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    walk_tree_iterative(
+        root,
+        ctx,
+        |node, ctx| {
+            match node.kind() {
+                "use_declaration" => {
+                    record_use_import_hits(node, ctx);
+                    return TreeWalkAction::Skip;
+                }
+                "identifier" | "type_identifier" if !ctx.target_is_module => {
+                    let text = node
+                        .utf8_text(ctx.source.as_bytes())
+                        .ok()
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if text == "Self" && self_reference_matches_target(node, ctx) {
+                        record_self_reference_hit(node, ctx);
+                    } else if (!ctx.target_is_class || !identifier_is_scoped_path_part(node))
+                        && ctx.matches_identifier(text)
+                        && !is_shadowed_identifier(text, node, ctx)
+                    {
+                        record_hit(node, ctx);
+                    }
+                }
+                "self"
+                    if self_member_receiver(node) && self_reference_matches_target(node, ctx) =>
+                {
+                    record_self_reference_hit(node, ctx);
+                }
+                _ => {}
             }
-        }
-        "self" if self_member_receiver(node) && self_reference_matches_target(node, ctx) => {
-            record_self_reference_hit(node, ctx);
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_node(child, ctx);
-    }
+            TreeWalkAction::Descend
+        },
+        |_| {},
+    );
 }
 
 fn identifier_is_scoped_path_part(node: Node<'_>) -> bool {
@@ -387,7 +389,9 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
 }
 
 fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if ctx.shadowed_names.contains(text) {
+    if lexical_scope::is_pattern_binding_identifier(node)
+        || ctx.name_shadowed_at(text, node.start_byte())
+    {
         return true;
     }
     let start = node.start_byte();
@@ -398,76 +402,6 @@ fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool
             decl.identifier == text
                 && (decl.range.start_byte != start || decl.range.end_byte != end)
         })
-}
-
-fn detect_shadowed_names(
-    root: Node<'_>,
-    source: &str,
-    direct_names: &HashSet<String>,
-    namespace_names: &HashSet<String>,
-    target_short: &str,
-    target_self_file: bool,
-) -> HashSet<String> {
-    let mut names = direct_names.clone();
-    names.extend(namespace_names.iter().cloned());
-    if target_self_file {
-        names.insert(target_short.to_string());
-    }
-
-    let mut shadowed = HashSet::default();
-    collect_shadowed_names(
-        root,
-        source,
-        &names,
-        target_short,
-        target_self_file,
-        &mut shadowed,
-    );
-    shadowed
-}
-
-fn collect_shadowed_names(
-    node: Node<'_>,
-    source: &str,
-    names: &HashSet<String>,
-    target_short: &str,
-    target_self_file: bool,
-    shadowed: &mut HashSet<String>,
-) {
-    match node.kind() {
-        "let_declaration" => {
-            if let Some(name) = node
-                .child_by_field_name("pattern")
-                .and_then(|pattern| simple_pattern_name(pattern, source))
-                && names.contains(&name)
-            {
-                shadowed.insert(name);
-            }
-        }
-        "struct_item" | "enum_item" | "type_item" | "function_item" => {
-            if let Some(name) = node
-                .child_by_field_name("name")
-                .and_then(|name| simple_node_text(name, source))
-                && names.contains(&name)
-                && !(target_self_file && name == target_short)
-            {
-                shadowed.insert(name);
-            }
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_shadowed_names(
-            child,
-            source,
-            names,
-            target_short,
-            target_self_file,
-            shadowed,
-        );
-    }
 }
 
 pub(super) fn scan_files_for_member_target(

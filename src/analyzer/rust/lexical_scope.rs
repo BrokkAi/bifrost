@@ -1,6 +1,6 @@
 use crate::analyzer::ImportInfo;
 use crate::analyzer::usages::{ImportBinder, ImportBinding, ImportKind};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
 
 use super::imports::{
@@ -206,18 +206,226 @@ pub(crate) fn name_shadowed_in_tree(
     name: &str,
     reference_byte: usize,
 ) -> bool {
-    let Some(scope) = enclosing_function_or_closure(root, reference_byte) else {
-        return false;
-    };
-    let mut bindings = HashSet::default();
-    if let Some(params) = scope.child_by_field_name("parameters") {
-        collect_parameter_bindings(params, source, &mut bindings);
+    RustLexicalScopeIndex::new(root, source).name_bound_at(name, reference_byte)
+}
+
+#[derive(Clone, Copy)]
+struct BindingVisibility {
+    start: usize,
+    end: usize,
+    function: Option<(usize, usize)>,
+}
+
+/// Position-aware Rust binding visibility for one parsed file.
+pub(crate) struct RustLexicalScopeIndex {
+    bindings: HashMap<String, Vec<BindingVisibility>>,
+    items: HashMap<String, Vec<(usize, usize)>>,
+    functions: Vec<(usize, usize)>,
+}
+
+impl RustLexicalScopeIndex {
+    pub(crate) fn new(root: Node<'_>, source: &str) -> Self {
+        let mut index = Self {
+            bindings: HashMap::default(),
+            items: HashMap::default(),
+            functions: Vec::new(),
+        };
+        let mut stack = vec![(root, None, root.start_byte(), root.end_byte())];
+        while let Some((node, function, scope_start, scope_end)) = stack.pop() {
+            let mut child_function = function;
+            let mut child_scope_start = scope_start;
+            let mut child_scope_end = scope_end;
+            match node.kind() {
+                "function_item" => {
+                    index.add_item_binding(node, scope_start, scope_end, source);
+                    let function_range = (node.start_byte(), node.end_byte());
+                    index.functions.push(function_range);
+                    child_function = Some(function_range);
+                    if let Some(body) = node.child_by_field_name("body") {
+                        child_scope_end = body.end_byte();
+                        index.add_parameter_bindings(node, body, source, child_function);
+                    }
+                }
+                "closure_expression" => {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        index.add_parameter_bindings(node, body, source, function);
+                    }
+                }
+                "block" | "declaration_list" => {
+                    child_scope_start = node.start_byte();
+                    child_scope_end = node.end_byte();
+                }
+                "let_declaration" => {
+                    if let Some(pattern) = node.child_by_field_name("pattern") {
+                        index.add_pattern_bindings(
+                            pattern,
+                            node.end_byte(),
+                            scope_end,
+                            source,
+                            function,
+                        );
+                    }
+                }
+                "let_condition" => {
+                    if let Some(pattern) = node.child_by_field_name("pattern")
+                        && let Some(end) = let_condition_visibility_end(node)
+                    {
+                        index.add_pattern_bindings(pattern, node.end_byte(), end, source, function);
+                    }
+                }
+                "match_arm" => {
+                    if let Some(pattern) = node.child_by_field_name("pattern") {
+                        index.add_pattern_bindings(
+                            pattern,
+                            pattern.end_byte(),
+                            node.end_byte(),
+                            source,
+                            function,
+                        );
+                    }
+                }
+                "for_expression" => {
+                    if let (Some(pattern), Some(body)) = (
+                        node.child_by_field_name("pattern"),
+                        node.child_by_field_name("body"),
+                    ) {
+                        index.add_pattern_bindings(
+                            pattern,
+                            body.start_byte(),
+                            body.end_byte(),
+                            source,
+                            function,
+                        );
+                    }
+                }
+                "struct_item" | "enum_item" | "trait_item" | "type_item" | "mod_item" => {
+                    index.add_item_binding(node, scope_start, scope_end, source);
+                }
+                _ => {}
+            }
+
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            stack.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child, child_function, child_scope_start, child_scope_end)),
+            );
+        }
+        index
     }
-    if let Some(body) = scope.child_by_field_name("body") {
-        collect_visible_local_bindings(body, source, reference_byte, &mut bindings);
+
+    pub(crate) fn name_bound_at(&self, name: &str, byte: usize) -> bool {
+        self.visibility_contains(&self.bindings, name, byte)
     }
-    collect_visible_let_condition_bindings(scope, source, reference_byte, &mut bindings);
-    bindings.contains(name)
+
+    pub(crate) fn item_bound_at(&self, name: &str, byte: usize) -> bool {
+        self.items.get(name).is_some_and(|items| {
+            items
+                .iter()
+                .any(|(start, end)| *start <= byte && byte < *end)
+        })
+    }
+
+    fn visibility_contains(
+        &self,
+        entries: &HashMap<String, Vec<BindingVisibility>>,
+        name: &str,
+        byte: usize,
+    ) -> bool {
+        let function = self
+            .functions
+            .iter()
+            .copied()
+            .filter(|(start, end)| *start <= byte && byte < *end)
+            .min_by_key(|(start, end)| end - start);
+        entries.get(name).is_some_and(|bindings| {
+            bindings.iter().any(|binding| {
+                binding.function == function && binding.start <= byte && byte < binding.end
+            })
+        })
+    }
+
+    fn add_parameter_bindings(
+        &mut self,
+        node: Node<'_>,
+        body: Node<'_>,
+        source: &str,
+        function: Option<(usize, usize)>,
+    ) {
+        let Some(parameters) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let pattern = parameter
+                .child_by_field_name("pattern")
+                .unwrap_or(parameter);
+            self.add_pattern_bindings(
+                pattern,
+                body.start_byte(),
+                body.end_byte(),
+                source,
+                function,
+            );
+        }
+    }
+
+    fn add_pattern_bindings(
+        &mut self,
+        pattern: Node<'_>,
+        start: usize,
+        end: usize,
+        source: &str,
+        function: Option<(usize, usize)>,
+    ) {
+        if start >= end {
+            return;
+        }
+        let mut names = HashSet::default();
+        collect_pattern_bindings(pattern, source, &mut names);
+        for name in names {
+            self.bindings
+                .entry(name)
+                .or_default()
+                .push(BindingVisibility {
+                    start,
+                    end,
+                    function,
+                });
+        }
+    }
+
+    fn add_item_binding(&mut self, item: Node<'_>, start: usize, end: usize, source: &str) {
+        let Some(name) = item.child_by_field_name("name") else {
+            return;
+        };
+        let name = node_text(name, source).trim();
+        if name.is_empty() {
+            return;
+        }
+        self.items
+            .entry(name.to_string())
+            .or_default()
+            .push((start, end));
+    }
+}
+
+fn let_condition_visibility_end(mut node: Node<'_>) -> Option<usize> {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "if_expression" | "while_expression") {
+            return parent
+                .child_by_field_name("consequence")
+                .or_else(|| parent.child_by_field_name("body"))
+                .map(|body| body.end_byte());
+        }
+        if !matches!(parent.kind(), "let_chain" | "parenthesized_expression") {
+            return None;
+        }
+        node = parent;
+    }
+    None
 }
 
 pub(crate) fn local_item_name_shadowed_in_tree(
@@ -365,130 +573,8 @@ fn enclosing_function_or_closure(root: Node<'_>, reference_byte: usize) -> Optio
     best
 }
 
-fn collect_parameter_bindings(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "self_parameter" => {}
-            "parameter" => {
-                if let Some(pattern) = child.child_by_field_name("pattern") {
-                    collect_pattern_bindings(pattern, source, out);
-                }
-            }
-            _ => collect_pattern_bindings(child, source, out),
-        }
-    }
-}
-
-fn collect_visible_local_bindings(
-    mut scope: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-    out: &mut HashSet<String>,
-) {
-    loop {
-        collect_direct_bindings_in_scope(scope, source, reference_byte, out);
-        let Some(child_scope) = child_lexical_scope_containing_reference(scope, reference_byte)
-        else {
-            return;
-        };
-        scope = child_scope;
-    }
-}
-
-fn collect_visible_let_condition_bindings(
-    root: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-    out: &mut HashSet<String>,
-) {
-    let mut current = root;
-    loop {
-        if matches!(current.kind(), "if_expression" | "while_expression")
-            && let Some(condition) = current.child_by_field_name("condition")
-        {
-            let body = current
-                .child_by_field_name("consequence")
-                .or_else(|| current.child_by_field_name("body"));
-            if contains_byte(condition, reference_byte)
-                || body.is_some_and(|body| contains_byte(body, reference_byte))
-            {
-                collect_let_condition_bindings_before(condition, source, reference_byte, out);
-            }
-        }
-
-        let mut cursor = current.walk();
-        let mut next = None;
-        for child in current.named_children(&mut cursor) {
-            if contains_byte(child, reference_byte) {
-                next = Some(child);
-                break;
-            }
-        }
-        let Some(child) = next else {
-            return;
-        };
-        current = child;
-    }
-}
-
-fn collect_let_condition_bindings_before(
-    condition: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-    out: &mut HashSet<String>,
-) {
-    let mut stack = vec![condition];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "let_condition" => {
-                if node.end_byte() <= reference_byte
-                    && let Some(pattern) = node.child_by_field_name("pattern")
-                {
-                    collect_pattern_bindings(pattern, source, out);
-                }
-            }
-            "let_chain" => {
-                let mut cursor = node.walk();
-                let children: Vec<_> = node.named_children(&mut cursor).collect();
-                stack.extend(
-                    children
-                        .into_iter()
-                        .rev()
-                        .filter(|child| matches!(child.kind(), "let_condition" | "let_chain")),
-                );
-            }
-            _ => {}
-        }
-    }
-}
-
 fn contains_byte(node: Node<'_>, byte: usize) -> bool {
     node.start_byte() <= byte && byte < node.end_byte()
-}
-
-fn collect_direct_bindings_in_scope(
-    scope: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-    out: &mut HashSet<String>,
-) {
-    let mut cursor = scope.walk();
-    for node in scope.named_children(&mut cursor) {
-        match node.kind() {
-            "let_declaration" => {
-                if node.end_byte() <= reference_byte
-                    && let Some(pattern) = node.child_by_field_name("pattern")
-                {
-                    collect_pattern_bindings(pattern, source, out);
-                }
-            }
-            "struct_item" | "enum_item" | "trait_item" | "type_item" | "function_item" => {
-                collect_local_item_name(node, source, out)
-            }
-            _ => {}
-        }
-    }
 }
 
 fn child_lexical_scope_containing_reference(

@@ -4450,6 +4450,83 @@ pub mod flags { pub struct OutputFormat; }
 }
 
 #[test]
+fn scan_usages_by_reference_uses_position_aware_rust_binding_scopes() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+fn language() {}
+
+fn unshadowed_callback() {
+    takes_fn(language);
+}
+
+fn local_shadow() {
+    let language = 1;
+    takes_value(language);
+}
+
+fn captured_shadow() {
+    let language = 1;
+    let callback = || takes_value(language);
+    callback();
+}
+
+fn pattern_shadow(value: Option<i32>) {
+    match value {
+        Some(language) => takes_value(language),
+        None => {}
+    }
+}
+
+fn nested_function_is_isolated() {
+    let language = 1;
+    fn callback() {
+        takes_fn(language);
+    }
+    callback();
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["language"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(1, resolved_scan_count(&value), "payload: {value}");
+    let usage = only_result(&value);
+    assert_eq!(2, usage["total_hits"].as_u64().unwrap(), "payload: {value}");
+    let hits = usage["files"][0]["hits"].as_array().unwrap();
+    let lines: Vec<_> = hits
+        .iter()
+        .map(|hit| hit["line"].as_u64().unwrap())
+        .collect();
+    assert_eq!(vec![5, 29], lines, "payload: {value}");
+
+    let definitions = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            r#"{"references":[{"symbol":"captured_shadow","context":"let callback = || takes_value(language);","target":"language"},{"symbol":"pattern_shadow","context":"takes_value(language),","target":"language"}]}"#,
+        )
+        .unwrap();
+    let definitions: Value = serde_json::from_str(&definitions).unwrap();
+    for result in definitions["results"].as_array().unwrap() {
+        assert_eq!("no_definition", result["status"], "payload: {definitions}");
+        assert_eq!(
+            "local_binding", result["diagnostics"][0]["kind"],
+            "payload: {definitions}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_paths_scope_does_not_truncate_broad_glob_candidates_before_scanning() {
     let mut project = InlineTestProject::with_language(Language::Java).file(
         "Greeter.java",
