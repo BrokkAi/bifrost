@@ -10,14 +10,42 @@ use brokk_bifrost::{Language, SearchToolsService};
 use common::InlineTestProject;
 use common::usage_graph::{has_edge, usage_graph_at};
 use serde_json::Value;
-use std::path::PathBuf;
 
 fn ts_usage_graph() -> Value {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("usage-graph-ts");
-    let service = SearchToolsService::new(root).expect("failed to build searchtools service");
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "consumer.ts",
+            r#"import { format, parse } from "./util";
+
+export function run(input: string): string {
+  const value = parse(input);
+  return format(value);
+}
+"#,
+        )
+        .file(
+            "nsconsumer.ts",
+            r#"import * as util from "./util";
+
+export function go(input: string): string {
+  return util.format(util.parse(input));
+}
+"#,
+        )
+        .file(
+            "util.ts",
+            r#"export function format(x: number): string {
+  return String(x);
+}
+
+export function parse(s: string): number {
+  return Number(s);
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new(project.root().to_path_buf())
+        .expect("failed to build searchtools service");
     let payload = service
         .call_tool_json("usage_graph", "{}")
         .expect("usage_graph call failed");
