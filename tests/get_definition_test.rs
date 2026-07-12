@@ -5562,6 +5562,83 @@ fn rust_nonterminal_scoped_focus_does_not_retry_terminal_or_flat_names() {
 }
 
 #[test]
+fn rust_scoped_path_focus_preserves_owner_and_terminal_roles() {
+    let source = r#"
+mod primary;
+mod unrelated;
+use crate::{primary::{AnalysisLog}};
+enum MatchResult { AnalysisLog(AnalysisLog) }
+
+fn consume() {
+    let _ = vec![MatchResult::AnalysisLog(AnalysisLog::floating_error())];
+    let _ = vec![unrelated::AnalysisLog::floating_error()];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .file(
+            "src/primary.rs",
+            "pub struct AnalysisLog;\nimpl AnalysisLog { pub fn floating_error() {} }\n",
+        )
+        .file(
+            "src/unrelated.rs",
+            "pub struct AnalysisLog;\nimpl AnalysisLog { pub fn floating_error() {} }\n",
+        )
+        .build();
+    let primary = "(AnalysisLog::floating_error())]";
+    let owner_start = source.find("AnalysisLog::floating_error").unwrap();
+    let terminal_start = owner_start + "AnalysisLog::".len();
+
+    for (start, expected) in [
+        (owner_start, "primary.AnalysisLog"),
+        (terminal_start, "primary.AnalysisLog.floating_error"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+
+    let unrelated_owner = source
+        .find("unrelated::AnalysisLog::floating_error")
+        .unwrap()
+        + "unrelated::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, unrelated_owner),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "unrelated.AnalysisLog",
+        "{value}"
+    );
+
+    for (target, expected) in [
+        ("AnalysisLog", "primary.AnalysisLog"),
+        ("floating_error", "primary.AnalysisLog.floating_error"),
+    ] {
+        let value = lookup_reference(
+            project.root(),
+            &json!({
+                "references": [{
+                    "symbol": "consume",
+                    "context": primary,
+                    "target": target
+                }]
+            })
+            .to_string(),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
 fn rust_focused_prefix_candidates_stay_within_rust() {
     let rust_source = r#"struct IndexedOwner;
 impl IndexedOwner {

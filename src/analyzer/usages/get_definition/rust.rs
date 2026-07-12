@@ -135,6 +135,12 @@ pub(super) fn resolve_rust(
         return outcome;
     }
     if let Some(tree) = tree
+        && let Some(outcome) =
+            rust_focused_token_tree_prefix_outcome(rust, support, file, source, tree, site, &refs)
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
         && let Some(candidates) =
             rust_use_path_module_candidates(rust, support, file, source, tree, site, &refs)
         && !candidates.is_empty()
@@ -613,33 +619,120 @@ fn rust_focused_scoped_prefix_outcome(
     }
 
     let resolved_fqn = rust_scoped_prefix_fqn(rust, file, refs, prefix, source);
-    if let Some(fqn) = resolved_fqn.as_deref() {
+    let root = rust_scoped_path_root(prefix);
+    Some(rust_focused_prefix_resolution_outcome(
+        rust,
+        support,
+        file,
+        source,
+        site,
+        refs,
+        root,
+        focused_text,
+        resolved_fqn.as_deref(),
+    ))
+}
+
+fn rust_focused_token_tree_prefix_outcome(
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    refs: &RustReferenceContext,
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    if !rust_path_segment_node(focused) || focused.parent()?.kind() != "token_tree" {
+        return None;
+    }
+    let separator = focused.next_sibling()?;
+    if separator.kind() != "::" || !separator.next_sibling().is_some_and(rust_path_segment_node) {
+        return None;
+    }
+
+    let mut root = focused;
+    while let Some(previous_separator) = root.prev_sibling() {
+        if previous_separator.kind() != "::" {
+            break;
+        }
+        let Some(previous_segment) = previous_separator.prev_sibling() else {
+            break;
+        };
+        if !rust_path_segment_node(previous_segment) {
+            break;
+        }
+        root = previous_segment;
+    }
+
+    let prefix = source.get(root.start_byte()..focused.end_byte())?.trim();
+    let focused_text = rust_node_text(focused, source).trim();
+    if prefix.is_empty() || focused_text.is_empty() {
+        return Some(no_definition(
+            "invalid_scoped_segment",
+            "the focused Rust path segment is empty",
+        ));
+    }
+    let resolved_fqn = rust_module_path_fqn(rust, file, refs, prefix);
+    Some(rust_focused_prefix_resolution_outcome(
+        rust,
+        support,
+        file,
+        source,
+        site,
+        refs,
+        root,
+        focused_text,
+        resolved_fqn.as_deref(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_focused_prefix_resolution_outcome(
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    site: &ResolvedReferenceSite,
+    refs: &RustReferenceContext,
+    root: Node<'_>,
+    focused_text: &str,
+    resolved_fqn: Option<&str>,
+) -> DefinitionLookupOutcome {
+    if let Some(fqn) = resolved_fqn {
         let candidates: Vec<_> = support
             .fqn(fqn)
             .into_iter()
             .filter(|candidate| language_for_file(candidate.source()) == Language::Rust)
             .collect();
         if !candidates.is_empty() {
-            return Some(candidates_outcome(candidates));
+            return candidates_outcome(candidates);
         }
     }
 
-    let root = rust_scoped_path_root(prefix);
     let root_name = rust_node_text(root, source).trim();
     let binder = lexical_scope::visible_import_binder_at(source, site.focus_start_byte);
     if rust_binder_has_external_binding(&binder, root_name)
         || rust_extern_prelude_root(rust, file, refs, root, root_name)
     {
-        return Some(boundary(format!(
+        return boundary(format!(
             "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
-        )));
+        ));
     }
-    Some(no_definition(
+    no_definition(
         "no_indexed_definition",
         format!(
             "focused Rust path segment `{focused_text}` did not resolve to an indexed definition"
         ),
-    ))
+    )
+}
+
+fn rust_path_segment_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "crate" | "self" | "super"
+    )
 }
 
 fn rust_extern_prelude_root(
