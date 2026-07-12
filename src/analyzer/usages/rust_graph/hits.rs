@@ -22,6 +22,11 @@ fn record_module_qualified_hits_in(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_is_module {
+        record_scoped_module_segment_hit(node, ctx);
+        return;
+    }
+
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
@@ -51,6 +56,67 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.hits,
         );
     }
+}
+
+fn record_scoped_module_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if has_ancestor_kind(node, "use_declaration") {
+        return;
+    }
+    let Some(path) = node.child_by_field_name("path") else {
+        return;
+    };
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let path_text = node_text(path, ctx.source);
+    let name_text = node_text(name, ctx.source);
+    if matches!(path.kind(), "identifier" | "type_identifier") {
+        let resolved_root = ctx
+            .refs
+            .resolve_bare(path_text)
+            .map(str::to_string)
+            .or_else(|| ctx.rust.resolve_module_package(ctx.file, path_text));
+        if resolved_root.as_deref() == Some(ctx.target_fqn) {
+            record_module_segment(path, ctx);
+        }
+    }
+    let resolved = ctx.refs.resolve_scoped(path_text, name_text).or_else(|| {
+        ctx.rust
+            .resolve_module_package(ctx.file, node_text(node, ctx.source))
+    });
+    if resolved.as_deref() != Some(ctx.target_fqn) {
+        return;
+    }
+
+    record_module_segment(name, ctx);
+}
+
+fn record_module_segment(segment: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let start = segment.start_byte();
+    let end = segment.end_byte();
+    if let Some(enclosing) =
+        member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+    {
+        push_member_hit(
+            ctx.file,
+            ctx.source,
+            ctx.line_starts,
+            start,
+            end,
+            enclosing,
+            ctx.hits,
+        );
+    }
+}
+
+fn has_ancestor_kind(mut node: Node<'_>, kind: &str) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == kind {
+            return true;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

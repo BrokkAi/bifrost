@@ -169,6 +169,7 @@ pub(super) fn scan_files_for_target(
         }
 
         let line_starts = compute_line_starts(source);
+        let refs = rust.reference_context_of(file);
         let (mut direct_names, namespace_names) = match seeds {
             Some(seeds) => rust.usage_binding_names(file, seeds),
             None => (HashSet::default(), HashSet::default()),
@@ -183,10 +184,7 @@ pub(super) fn scan_files_for_target(
                     direct_names.insert(seed_name.clone());
                 }
             }
-            direct_names.extend(
-                rust.reference_context_of(file)
-                    .bare_names_resolving_to(&target_fqn),
-            );
+            direct_names.extend(refs.bare_names_resolving_to(&target_fqn));
         }
         let target_self_file = file == target.source();
 
@@ -197,8 +195,11 @@ pub(super) fn scan_files_for_target(
             line_starts: &line_starts,
             analyzer,
             rust,
+            refs: &refs,
             support,
             target,
+            target_fqn: &target_fqn,
+            target_is_module: target.is_module(),
             target_short: &target_short,
             direct_names: &direct_names,
             namespace_names: &namespace_names,
@@ -230,9 +231,12 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
-    rust: &'a RustAnalyzer,
+    pub(super) rust: &'a RustAnalyzer,
+    pub(super) refs: &'a RustReferenceContext,
     support: &'a DefinitionLookupIndex,
     target: &'a CodeUnit,
+    pub(super) target_fqn: &'a str,
+    pub(super) target_is_module: bool,
     pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
     pub(super) namespace_names: &'a HashSet<String>,
@@ -256,7 +260,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             record_use_import_hits(node, ctx);
             return;
         }
-        "identifier" | "type_identifier" => {
+        "identifier" | "type_identifier" if !ctx.target_is_module => {
             let text = node
                 .utf8_text(ctx.source.as_bytes())
                 .ok()

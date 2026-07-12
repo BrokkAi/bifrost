@@ -4333,6 +4333,50 @@ fn scan_usages_paths_scope_blocks_rust_empty_scope_fallback() {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_exact_rust_module_path_segment() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub mod desired;
+
+pub mod unrelated {
+    pub mod desired {
+        pub struct Decoy;
+    }
+}
+
+pub fn consume() {
+    let _: crate::desired::Thing;
+    let _: crate::unrelated::desired::Decoy;
+}
+"#,
+        )
+        .file("desired.rs", "pub struct Thing;\n")
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["desired"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(1, resolved_scan_count(&value), "payload: {value}");
+    let usage = only_result(&value);
+    assert_eq!(1, usage["total_hits"].as_u64().unwrap(), "payload: {value}");
+    let files = usage["files"].as_array().unwrap();
+    assert_eq!(1, files.len(), "payload: {value}");
+    assert_eq!("lib.rs", files[0]["path"], "payload: {value}");
+    let hits = files[0]["hits"].as_array().unwrap();
+    assert_eq!(1, hits.len(), "payload: {value}");
+    assert_eq!(11, hits[0]["line"], "payload: {value}");
+}
+
+#[test]
 fn scan_usages_paths_scope_does_not_truncate_broad_glob_candidates_before_scanning() {
     let mut project = InlineTestProject::with_language(Language::Java).file(
         "Greeter.java",
