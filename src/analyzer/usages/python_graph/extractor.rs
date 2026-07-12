@@ -2,7 +2,7 @@ use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
-use crate::analyzer::usages::model::{ExportIndex, ImportBinder, UsageHit};
+use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::python_graph::hits::{
     record_hit, record_import_hit, record_unproven_hit,
 };
@@ -15,7 +15,7 @@ use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -26,7 +26,6 @@ pub(super) struct ParsedFile {
 
 pub(crate) struct PythonProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
-    scoped_files: HashSet<ProjectFile>,
 }
 
 impl PythonProjectGraph {
@@ -37,141 +36,58 @@ impl PythonProjectGraph {
     ) -> HashSet<ProjectFile> {
         candidate_files
             .iter()
-            .filter(|file| self.scoped_files.contains(*file))
             .cloned()
             .chain(std::iter::once(target_file.clone()))
             .collect()
     }
 }
 
-struct PythonGraphAdapter<'a> {
-    analyzer: &'a PythonAnalyzer,
-}
-
-impl<'a> PythonGraphAdapter<'a> {
-    fn new(analyzer: &'a PythonAnalyzer) -> Self {
-        Self { analyzer }
-    }
-
-    /// Parse the scoped import closure once for tree reuse during the forward
-    /// scan. Re-export / importer resolution now lives on the analyzer
-    /// (`PythonAnalyzer::usage_*`), so this no longer builds a cross-file graph.
-    fn build_graph(
-        &self,
-        candidate_files: &HashSet<ProjectFile>,
-        target_file: &ProjectFile,
-        cancellation: Option<&CancellationToken>,
-    ) -> PythonProjectGraph {
-        let parser_language = tree_sitter_python::LANGUAGE.into();
-        let mut scoped_files: HashSet<ProjectFile> = candidate_files.iter().cloned().collect();
-        scoped_files.insert(target_file.clone());
-
-        let mut frontier: VecDeque<ProjectFile> = scoped_files.iter().cloned().collect();
-        let mut parsed: HashMap<ProjectFile, ParsedFile> = HashMap::default();
-
-        while let Some(file) = frontier.pop_front() {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                break;
-            }
-            if parsed.contains_key(&file) {
-                continue;
-            }
-
-            let Ok(source) = file.read_to_string() else {
-                continue;
-            };
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                break;
-            }
-            if source.is_empty() {
-                continue;
-            }
-
-            let mut parser = Parser::new();
-            if parser.set_language(&parser_language).is_err() {
-                continue;
-            }
-            let Some(tree) = parser.parse(source.as_str(), None) else {
-                continue;
-            };
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                break;
-            }
-
-            let exports = self.analyzer.export_index_of(&file);
-            let binder = self.analyzer.import_binder_of(&file);
-            self.enqueue_frontier_files(&file, &exports, &binder, &mut scoped_files, &mut frontier);
-
-            parsed.insert(
-                file.clone(),
-                ParsedFile {
-                    source: Arc::new(source),
-                    tree,
-                },
-            );
-        }
-
-        PythonProjectGraph {
-            parsed,
-            scoped_files,
-        }
-    }
-
-    fn enqueue_frontier_files(
-        &self,
-        file: &ProjectFile,
-        exports: &ExportIndex,
-        binder: &ImportBinder,
-        scoped_files: &mut HashSet<ProjectFile>,
-        frontier: &mut VecDeque<ProjectFile>,
-    ) {
-        for entry in exports.exports_by_name.values() {
-            if let crate::analyzer::usages::ExportEntry::ReexportedNamed {
-                module_specifier, ..
-            } = entry
-            {
-                self.extend_scope(file, module_specifier, scoped_files, frontier);
-            }
-        }
-        for star in &exports.reexport_stars {
-            self.extend_scope(file, &star.module_specifier, scoped_files, frontier);
-        }
-        for binding in binder.bindings.values() {
-            self.extend_scope(file, &binding.module_specifier, scoped_files, frontier);
-        }
-    }
-
-    fn extend_scope(
-        &self,
-        importing_file: &ProjectFile,
-        module_specifier: &str,
-        scoped_files: &mut HashSet<ProjectFile>,
-        frontier: &mut VecDeque<ProjectFile>,
-    ) {
-        for resolved in self.resolve_module(importing_file, module_specifier) {
-            if scoped_files.insert(resolved.clone()) {
-                frontier.push_back(resolved);
-            }
-        }
-    }
-
-    fn resolve_module(
-        &self,
-        importing_file: &ProjectFile,
-        module_specifier: &str,
-    ) -> Vec<ProjectFile> {
-        self.analyzer
-            .resolve_module_files(importing_file, module_specifier)
-    }
-}
-
 pub(super) fn build_python_graph(
-    analyzer: &PythonAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     target_file: &ProjectFile,
     cancellation: Option<&CancellationToken>,
 ) -> PythonProjectGraph {
-    PythonGraphAdapter::new(analyzer).build_graph(candidate_files, target_file, cancellation)
+    let parser_language = tree_sitter_python::LANGUAGE.into();
+    let files: HashSet<ProjectFile> = candidate_files
+        .iter()
+        .cloned()
+        .chain(std::iter::once(target_file.clone()))
+        .collect();
+    let mut parsed = HashMap::default();
+
+    for file in files {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        let Ok(source) = file.read_to_string() else {
+            continue;
+        };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        if source.is_empty() {
+            continue;
+        }
+        let mut parser = Parser::new();
+        if parser.set_language(&parser_language).is_err() {
+            continue;
+        }
+        let Some(tree) = parser.parse(source.as_str(), None) else {
+            continue;
+        };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        parsed.insert(
+            file,
+            ParsedFile {
+                source: Arc::new(source),
+                tree,
+            },
+        );
+    }
+
+    PythonProjectGraph { parsed }
 }
 
 pub(super) fn scan_files_for_seeds(
@@ -1342,7 +1258,6 @@ fn returned_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{FileSetProject, Project};
     use std::path::PathBuf;
 
     #[test]
@@ -1351,15 +1266,39 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("target.py"), "def target():\n    pass\n").unwrap();
         let file = ProjectFile::new(root.clone(), PathBuf::from("target.py"));
-        let project: Arc<dyn Project> =
-            Arc::new(FileSetProject::new(root, [PathBuf::from("target.py")]));
-        let analyzer = PythonAnalyzer::new(project);
         let files = [file.clone()].into_iter().collect();
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
-        let graph = build_python_graph(&analyzer, &files, &file, Some(&cancellation));
+        let graph = build_python_graph(&files, &file, Some(&cancellation));
 
         assert!(graph.parsed.is_empty());
+    }
+
+    #[test]
+    fn graph_build_parses_only_candidates_and_target_not_transitive_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("target.py"), "from dependency import value\n").unwrap();
+        std::fs::write(
+            root.join("candidate.py"),
+            "from transitively_imported import value\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("dependency.py"), "value = 1\n").unwrap();
+        std::fs::write(root.join("transitively_imported.py"), "value = 2\n").unwrap();
+        let target = ProjectFile::new(root.clone(), PathBuf::from("target.py"));
+        let candidate = ProjectFile::new(root.clone(), PathBuf::from("candidate.py"));
+        let dependency = ProjectFile::new(root.clone(), PathBuf::from("dependency.py"));
+        let transitive = ProjectFile::new(root.clone(), PathBuf::from("transitively_imported.py"));
+        let candidates = [candidate.clone()].into_iter().collect();
+
+        let graph = build_python_graph(&candidates, &target, None);
+
+        assert_eq!(graph.parsed.len(), 2);
+        assert!(graph.parsed.contains_key(&target));
+        assert!(graph.parsed.contains_key(&candidate));
+        assert!(!graph.parsed.contains_key(&dependency));
+        assert!(!graph.parsed.contains_key(&transitive));
     }
 }

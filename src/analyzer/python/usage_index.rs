@@ -25,8 +25,6 @@ use super::imports::resolve_python_relative_module;
 /// Re-export and reverse-import indices over the Python workspace.
 #[derive(Debug, Default)]
 pub(crate) struct PythonUsageIndex {
-    /// module fqn (`pkg.util`) -> the files defining it.
-    module_index: HashMap<String, Vec<ProjectFile>>,
     exports_by_file: HashMap<ProjectFile, ExportIndex>,
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
@@ -138,20 +136,11 @@ impl PythonUsageIndex {
             build_importer_reverse(&module_index, &files, &binders_by_file, &exports_by_file);
 
         Self {
-            module_index,
             exports_by_file,
             reexport_edges,
             star_reexports,
             importer_reverse,
         }
-    }
-
-    fn resolve_module(
-        &self,
-        importing_file: &ProjectFile,
-        module_specifier: &str,
-    ) -> Vec<ProjectFile> {
-        resolve_module(&self.module_index, importing_file, module_specifier)
     }
 
     fn seeds_for_target(
@@ -292,17 +281,6 @@ impl PythonAnalyzer {
     fn usage_index(&self) -> &PythonUsageIndex {
         self.usage_index
             .get_or_init(|| PythonUsageIndex::build(self))
-    }
-
-    /// Resolve a module specifier to the files defining it (relative imports made
-    /// absolute against the importing file's package).
-    pub(crate) fn resolve_module_files(
-        &self,
-        importing_file: &ProjectFile,
-        module_specifier: &str,
-    ) -> Vec<ProjectFile> {
-        self.usage_index()
-            .resolve_module(importing_file, module_specifier)
     }
 
     /// Export seeds for the target, following re-export chains.

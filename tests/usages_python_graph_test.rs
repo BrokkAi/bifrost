@@ -506,6 +506,59 @@ def run():
 }
 
 #[test]
+fn public_scoped_barrel_usage_does_not_parse_or_leak_transitive_files() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            "class Foo:\n    def bar(self):\n        pass\n",
+        )
+        .file("pkg/__init__.py", "from .service import Foo\n")
+        .file(
+            "in_scope.py",
+            "from pkg import Foo\n\ndef run():\n    Foo().bar()\n",
+        )
+        .file(
+            "out_of_scope.py",
+            "from pkg import Foo\n\ndef run():\n    Foo().bar()\n",
+        )
+        .file("unknown.py", "def run(value):\n    value.bar()\n")
+        .build();
+
+    let proven = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["pkg.service.Foo"],
+            "include_tests": true,
+            "paths": ["in_scope.py"]
+        })
+        .to_string(),
+    );
+    let proven_result = &proven["results"][0];
+    assert_eq!(1, proven_result["total_hits"], "{proven}");
+    assert_eq!(0, proven_result["unproven_hits"], "{proven}");
+    assert_eq!("in_scope.py", proven_result["files"][0]["path"], "{proven}");
+
+    let unproven = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["pkg.service.Foo.bar"],
+            "include_tests": true,
+            "paths": ["unknown.py"]
+        })
+        .to_string(),
+    );
+    let unproven_result = &unproven["results"][0];
+    assert_eq!(0, unproven_result["total_hits"], "{unproven}");
+    assert_eq!(1, unproven_result["unproven_hits"], "{unproven}");
+    assert_eq!(
+        "unknown.py", unproven_result["unproven_files"][0]["path"],
+        "{unproven}"
+    );
+}
+
+#[test]
 fn nested_package_barrel_resolves_through_init_chain() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

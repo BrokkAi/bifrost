@@ -63,12 +63,7 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
         let py = self.py;
         let candidate_files = scan_scope.candidate_files();
 
-        let graph = build_python_graph(
-            py,
-            candidate_files,
-            target.source(),
-            scan_scope.cancellation(),
-        );
+        let graph = build_python_graph(candidate_files, target.source(), scan_scope.cancellation());
         if scan_scope.is_cancelled() {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         }
