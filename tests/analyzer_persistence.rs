@@ -203,6 +203,7 @@ fn warm_multilanguage_rust_definition_query_does_not_build_full_definition_index
 fn csharp_package_existence_ignores_stale_complete_blobs() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
+    write_file(root, ".gitignore", ".brokk/\n");
     write_file(
         root,
         "Types.cs",
