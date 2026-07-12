@@ -1614,7 +1614,7 @@ function run(): void {
                 "static class member resolves to static declaration",
                 "create_static_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["create_static_range"]),
+                ClickExpectation::Locations(&["create_static_decl"]),
             ),
             ClickCase::new(
                 "unrelated same-name method resolves to unrelated declaration",

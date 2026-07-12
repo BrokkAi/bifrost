@@ -4638,6 +4638,70 @@ object Factory {
 }
 
 #[test]
+fn scan_usages_location_target_selects_typescript_static_method() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/api.ts",
+            r#"export class ApiClient {
+  static create(baseUrl: string): ApiClient {
+    return new ApiClient(baseUrl);
+  }
+
+  create(): void {}
+
+  constructor(private readonly baseUrl: string) {}
+}
+
+export default function createClient(): ApiClient {
+  return ApiClient.create("/api");
+}
+"#,
+        )
+        .file(
+            "src/app.ts",
+            r#"import { ApiClient } from "./api";
+
+const direct = ApiClient.create("/direct");
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"src/api.ts","line":2,"column":10,"symbol":"ApiClient.create"}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!(
+        "src/api.ts#ApiClient.create$static", result["symbol"],
+        "payload: {value}"
+    );
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(2, result["total_hits"], "payload: {value}");
+    assert!(
+        result["files"].as_array().is_some_and(|files| {
+            files.iter().any(|file| {
+                file["path"] == "src/api.ts"
+                    && file["hits"]
+                        .as_array()
+                        .is_some_and(|hits| hits.iter().any(|hit| hit["line"] == 12))
+            }) && files.iter().any(|file| {
+                file["path"] == "src/app.ts"
+                    && file["hits"]
+                        .as_array()
+                        .is_some_and(|hits| hits.iter().any(|hit| hit["line"] == 3))
+            })
+        }),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_location_target_does_not_select_nested_same_line_member() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

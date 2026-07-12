@@ -3878,7 +3878,10 @@ fn resolve_scan_usages_target(
         .into_iter()
         .filter_map(|unit| {
             let selector_matches = selector.is_some_and(|symbol| {
-                unit.fq_name() == symbol || definition_selector(&unit) == symbol
+                unit.fq_name() == symbol
+                    || definition_selector(&unit) == symbol
+                    || (language_for_target(&unit) == Language::TypeScript
+                        && display_symbol_for_target(&unit) == symbol)
             });
             let ranges = if selector_matches && unit.is_module() {
                 analyzer.ranges_of(&unit)
