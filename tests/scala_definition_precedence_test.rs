@@ -43,7 +43,7 @@ fn location(source: &str, needle: &str) -> Value {
 }
 
 #[test]
-fn scala_location_definition_prefers_lexical_and_builtin_namespaces() {
+fn scala_location_definition_returns_parameters_without_guessing_other_namespaces() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file("app/App.scala", APP_SOURCE)
         .build();
@@ -66,14 +66,20 @@ fn scala_location_definition_prefers_lexical_and_builtin_namespaces() {
         Some(6),
         "{value}"
     );
-    for result in value["results"].as_array().expect("definition results") {
-        assert_eq!(result["status"], "no_definition", "{value}");
+    let results = value["results"].as_array().expect("definition results");
+    for (result, name) in [(&results[0], "expr"), (&results[1], "kind")] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["name"], name, "{value}");
+        assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
+        assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
     }
-    for result in &value["results"].as_array().expect("definition results")[..3] {
-        assert_eq!(
-            result["diagnostics"][0]["kind"], "local_variable_reference",
-            "{value}"
-        );
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[2]["diagnostics"][0]["kind"], "local_binding",
+        "{value}"
+    );
+    for result in &results[3..] {
+        assert_eq!(result["status"], "no_definition", "{value}");
     }
 }
 
@@ -97,7 +103,7 @@ fn scala_reference_definition_keeps_parameter_a_local_identity() {
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
     assert_eq!(
-        value["results"][0]["diagnostics"][0]["kind"], "local_variable_reference",
+        value["results"][0]["diagnostics"][0]["kind"], "local_binding_requires_location",
         "{value}"
     );
 }

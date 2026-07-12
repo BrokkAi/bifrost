@@ -1013,6 +1013,7 @@ pub struct SemanticDiagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeclarationKind {
     Parameter,
+    ReceiverParameter,
     LocalVariable,
     CatchParameter,
     EnhancedForVariable,
