@@ -66,6 +66,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 22:38Z) Pushed `85aa48cd` and closed #703 with stable-scope production evidence.
 - [x] (2026-07-12 23:17Z) Delegated and independently reviewed the next 39-site C# cluster, filed #704, treated generic argument lists as their own structured type boundary, passed focused/negative coverage, and changed the exact BillingBenefits site from missing to consistent.
 - [x] (2026-07-12 23:24Z) Passed the complete `cargo test --features nlp,python` validation gate for #704; affected all-feature library and C# test clippy targets also pass.
+- [x] (2026-07-12 23:27Z) Pushed `cf2743de` and closed #704.
+- [x] (2026-07-12 23:49Z) Completed a valid post-#704 full C# rerun: all 1,000 target groups queried with zero candidate-scope-loss notes, and missing sites fell from 144 to 103.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -132,6 +134,12 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: Exact-site mode unnecessarily inventories every analyzed file before selecting its requested path.
   Evidence: The post-#704 exact C# probe audited one file and one site but enumerated 126,829 eligible files and took 1,134.4 seconds. Avoiding this inventory is a campaign-engine performance task separate from analyzer correctness.
+
+- Observation: The full post-#704 record removed the complete generic-argument residual and exposed `using static` as the next C# boundary.
+  Evidence: `/tmp/csharp-n1-704-fixed.jsonl` is pinned to pushed `cf2743de`, shares the same repository head, run fingerprint, audited/sample counts, and zero candidate-loss notes with the valid pre-fix record, and reports 1,834 consistent, 40 unproven, 103 missing, and 8,023 inconclusive sites. The missing set is 34 `using static` classes, 34 other class roles, 33 functions, and two fields.
+
+- Observation: The exact-site inventory cost has a direct engine seam independent of analyzer construction.
+  Evidence: `run_reference_differential` calls `analyzer.analyzed_files()` before `select_audited_files` applies the exact-path filter. A safe fast path can validate the requested relative `ProjectFile`, apply the same language/test eligibility rules, point-check `is_analyzed`, and then reuse the unchanged semantic pipeline against the full persisted analyzer.
 
 ## Decision Log
 
@@ -293,3 +301,5 @@ Revision note (2026-07-12): Recorded #703 after rejecting the invalid post-#701 
 Revision note (2026-07-12): Recorded the valid post-#701/#703 full C# rerun and the next 39-site generic-argument boundary.
 
 Revision note (2026-07-12): Recorded delegated #704 investigation, exact production proof, and exact-mode full-inventory cost for the next engine optimization.
+
+Revision note (2026-07-12): Recorded pushed/closed #704, the valid post-fix full C# record, its 103-site residual partition, and the reviewed exact-mode fast-path boundary.

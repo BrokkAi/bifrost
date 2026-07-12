@@ -29,7 +29,9 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 22:58Z) Delegated and independently reproduced the 39-site generic `PropertyT<T>` boundary, filed #704, made `type_argument_list` an intrinsic structured type role, and passed a two-partial-target authoritative regression with repeated positives and unrelated-type, generic-method-name, and type-parameter negatives.
 - [x] (2026-07-12 23:17Z) Changed exact BillingBenefits bytes `4325..4335` from missing to consistent with a covering `4309..4383` inverse hit across both partial `JsonString` targets.
 - [x] (2026-07-12 23:24Z) Passed the complete `cargo test --features nlp,python` gate for #704; affected all-feature library and C# test clippy targets also pass.
-- [ ] Push and close #704, then rerun the full C# N=1 corpus and repartition residual sites.
+- [x] (2026-07-12 23:27Z) Pushed `cf2743de` and closed #704 with focused, exact-production, and complete-suite evidence.
+- [x] (2026-07-12 23:49Z) Completed the valid post-#704 C# N=1 rerun: all 1,000 target groups queried, zero candidate-scope-loss notes, 1,834 consistent, 40 unproven, 103 missing, and 8,023 inconclusive sites in 1,132.3 seconds.
+- [ ] Reduce the dominant residual, 34 fully qualified C# `using static` class references, while separately removing exact mode's redundant full analyzed-file inventory.
 
 ## Surprises & Discoveries
 
@@ -55,6 +57,10 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: Primary and delegated fixtures both returned no hits for `PropertyT<Demo.Json.JsonString>()` before #704. The AST is `qualified_name -> type_argument_list -> generic_name -> member_binding_expression`; continuing into the callable generic name eventually returned false. Returning true at `type_argument_list` recovered repeated positive calls while exact FQ identity rejected unrelated same-terminal types, and generic method names plus type parameters remained outside the role.
 - Observation: Exact mode still performs a full analyzed-file inventory before retaining its one requested path.
   Evidence: `/tmp/csharp-exact-generic-type-704-fixed.jsonl` audited one 7,633-byte file and one site but reported 126,829 eligible files and took 1,134.4 seconds. This is separate from #704 correctness and should be fixed in the differential runner before many more exact C# probes.
+- Observation: #704 removed the complete generic-argument cluster from the trustworthy corpus residual.
+  Evidence: `/tmp/csharp-n1-704-fixed.jsonl` has the same repository head, run fingerprint, 1,000 audited files, 10,000 sampled sites, and zero candidate-loss notes as the valid pre-fix record. Missing sites fell from 144 to 103 while consistent sites rose by 41. The residual partitions into 34 `using static` classes, 34 other class roles, 33 functions, and two fields.
+- Observation: Exact filtering currently occurs only after the expensive analyzer inventory.
+  Evidence: `run_reference_differential` calls `analyzer.analyzed_files()`, filters and sorts the complete live snapshot, and only then lets `select_audited_files` retain the requested path. The exact path can instead be validated and point-checked with `Project::file_by_rel_path` plus `IAnalyzer::is_analyzed`, while retaining the full persisted analyzer for external target resolution.
 
 ## Decision Log
 
@@ -79,7 +85,7 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 
 ## Outcomes & Retrospective
 
-The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. #698 reduced that set to 220 by aligning method-return roles and qualified ranges. #701 is pushed and closed for the explicit-interface owner role and reduced the trustworthy set to 144. #703 repaired the campaign engine's audited-scope drift. The next 39-site generic-argument cluster is fixed and exact-validated as #704; full validation, landing, and a trustworthy rerun remain.
+The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. #698 reduced that set to 220 by aligning method-return roles and qualified ranges. #701 reduced the trustworthy set to 144 by recognizing explicit-interface owners, and #703 repaired the campaign engine's audited-scope drift. #704 is pushed and closed; its full rerun removed the generic-argument cluster and left 103 trustworthy sites led by 34 fully qualified `using static` references.
 
 ## Context and Orientation
 
@@ -121,6 +127,8 @@ The canonical post-#701/#703 result is `/tmp/csharp-n1-703-fixed.jsonl`, pinned 
 
 The fixed #704 exact result is `/tmp/csharp-exact-generic-type-704-fixed.jsonl`. It completed in 1,134.4 seconds with one consistent site and an inverse hit covering bytes `4309..4383` around requested `4325..4335`; both partial `JsonString` declarations remained in the target group.
 
+The canonical post-#704 result is `/tmp/csharp-n1-704-fixed.jsonl`, pinned to pushed HEAD `cf2743dec7cdce53b4437f799412cabf3d43689a`. It completed in 1,132.3 seconds with all 1,000 configured target groups queried, zero candidate-scope-loss notes, 1,834 consistent, 40 unproven, 103 missing, and 8,023 inconclusive sites.
+
 `cargo clippy --all-targets --all-features -- -D warnings` reached an unrelated uncommitted `tests/rust_analyzer_goto_definition.rs` edit and failed on its line 65 `needless_borrow`. That file was left untouched. `cargo clippy --lib --all-features -- -D warnings` and `cargo clippy --test get_definition_test --all-features -- -D warnings` both pass for this change.
 
 ## Interfaces and Dependencies
@@ -140,3 +148,5 @@ Revision note (2026-07-12): Recorded pushed/closed #701 and rejected its invalid
 Revision note (2026-07-12): Recorded the valid post-#701/#703 1,000-target rerun, its 144-site residual, and `PropertyT<T>` generic arguments as the next C# boundary.
 
 Revision note (2026-07-12): Recorded delegated #704 reduction, negative coverage, exact production proof, and the newly measured exact-mode inventory cost.
+
+Revision note (2026-07-12): Recorded pushed/closed #704, its complete 1,000-target rerun, the 103-site residual partition, and the independently reviewed exact-mode inventory seam.
