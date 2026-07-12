@@ -3831,17 +3831,60 @@ fn resolve_scan_usages_target(
         ScanUsagesLocationSelection::Line(line)
     };
 
+    let selector = match target.symbol.as_deref() {
+        None => None,
+        Some(symbol) => match split_definition_selector(symbol) {
+            DefinitionSelector::Name(name) => Some(name),
+            DefinitionSelector::FileAnchored { anchor, lookup } => {
+                let anchor_file = match resolver.resolve_literal(&anchor) {
+                    ResolvedFileInput::File(file) => file,
+                    ResolvedFileInput::Ambiguous(item) => {
+                        return location_selector_failure(
+                            &target,
+                            "ambiguous_path",
+                            format!(
+                                "selector anchor `{}` is ambiguous; matches: {}",
+                                item.input,
+                                item.matches.join(", ")
+                            ),
+                        );
+                    }
+                    ResolvedFileInput::NotFound(path) => {
+                        return ScanUsageTargetResolution::NotFound(not_found_input(
+                            scan_usages_target_label(&target),
+                            Some(format!(
+                                "selector anchor `{path}` does not resolve to a workspace file"
+                            )),
+                        ));
+                    }
+                };
+                if anchor_file != file {
+                    return ScanUsageTargetResolution::NotFound(not_found_input(
+                        scan_usages_target_label(&target),
+                        Some(format!(
+                            "selector anchor `{anchor}` does not match target path `{}`",
+                            rel_path_string(&file)
+                        )),
+                    ));
+                }
+                Some(lookup)
+            }
+        },
+    };
+
     let range_context = DeclarationNameRangeContext::new(&file, source);
 
     let matching_units: Vec<(CodeUnit, usize)> = declarations_in_file(analyzer, &file)
         .into_iter()
         .filter_map(|unit| {
-            let selector_matches = target.symbol.as_deref().is_some_and(|symbol| {
-                unit.fq_name() == symbol || definition_selector(&unit) == symbol
+            let selector_matches = selector.is_some_and(|symbol| {
+                unit.fq_name() == symbol
+                    || definition_selector(&unit) == symbol
+                    || display_symbol_for_target(&unit) == symbol
             });
             let ranges = if selector_matches && unit.is_module() {
                 analyzer.ranges_of(&unit)
-            } else if selector_matches || target.symbol.is_none() {
+            } else if selector_matches || selector.is_none() {
                 range_context.name_ranges(analyzer, &unit)
             } else {
                 return None;
@@ -3855,7 +3898,7 @@ fn resolve_scan_usages_target(
         })
         .collect();
 
-    if matching_units.is_empty() && target.symbol.is_none() {
+    if matching_units.is_empty() && selector.is_none() {
         return ScanUsageTargetResolution::NotFound(not_found_input(
             scan_usages_target_label(&target),
             Some(scan_usages_location_diagnostic(
@@ -3888,6 +3931,17 @@ fn resolve_scan_usages_target(
         .into_iter()
         .filter_map(|(unit, span)| (span == narrowest_span).then_some(unit))
         .collect();
+
+    // A source-backed synthetic identity may intentionally share its declaration
+    // name range with the source declaration that owns it. Scala primary
+    // constructors are the current example: `class Service(value: String)`
+    // defines both the `Service` type and a synthetic `Service.Service`
+    // constructor at the `Service` token. A plain location target selects the
+    // source declaration, while an explicit `symbol` selector can still request
+    // the synthetic identity.
+    if selector.is_none() && matches.iter().any(|unit| !unit.is_synthetic()) {
+        matches.retain(|unit| !unit.is_synthetic());
+    }
 
     matches.sort_by(|left, right| {
         primary_range(analyzer, left)

@@ -4,7 +4,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 
 pub(crate) struct DeclarationNameRangeContext {
     content: Arc<String>,
@@ -95,8 +95,24 @@ fn code_unit_declaration_name_range_for_range(
 ) -> Option<Range> {
     let declaration_node = node_for_exact_range(root, &declaration_range)
         .or_else(|| node_for_smallest_containing_range(root, &declaration_range))?;
-    let name_node = declaration_name_node(declaration_node, code_unit.identifier(), content)?;
+    let name_node = declaration_name_node(
+        declaration_node,
+        declaration_source_identifier(code_unit),
+        content,
+    )?;
     Some(node_byte_range(name_node))
+}
+
+/// TypeScript uses a `$static` suffix in its internal member names to keep
+/// static and instance members distinct. That suffix is not part of the
+/// declaration token in source, which is what this module selects.
+fn declaration_source_identifier(code_unit: &CodeUnit) -> &str {
+    let identifier = code_unit.identifier();
+    if language_for_file(code_unit.source()) == Language::TypeScript {
+        identifier.strip_suffix("$static").unwrap_or(identifier)
+    } else {
+        identifier
+    }
 }
 
 /// Find the node whose byte span exactly equals `range`. When several nested
@@ -190,6 +206,9 @@ fn matching_identifier_node<'tree>(
 ) -> Option<Node<'tree>> {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if crate::analyzer::ruby::ruby_symbol_name(node, content).as_deref() == Some(identifier) {
+            return Some(node);
+        }
         if node.utf8_text(content.as_bytes()).ok()? == identifier {
             return Some(node);
         }

@@ -4,7 +4,7 @@ use brokk_bifrost::{
     searchtools::SCAN_USAGES_RESPONSE_BUDGET_BYTES, searchtools_render::RenderOptions,
 };
 mod common;
-use common::InlineTestProject;
+use common::{InlineTestProject, line_of};
 use git2::{Repository, Signature};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -3466,6 +3466,97 @@ fn scan_usages_mcp_call_resolves_ruby_public_send_symbol_dispatch() {
 }
 
 #[test]
+fn scan_usages_location_selects_ruby_macro_generated_methods() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/product.rb",
+            r#"class Product
+  attr_reader :name
+  alias_method :label, :name
+
+  def self.featured
+    new("featured")
+  end
+
+  def summary
+    label
+  end
+end
+"#,
+        )
+        .file(
+            "app/catalog.rb",
+            r#"require "lib/product"
+
+product = Product.featured
+product.name
+product.label
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for (line, column, symbol, expected_snippets) in [
+        (
+            2,
+            16,
+            "Product.name",
+            ["alias_method :label, :name", "product.name"].as_slice(),
+        ),
+        (
+            3,
+            17,
+            "Product.label",
+            ["label", "product.label"].as_slice(),
+        ),
+    ] {
+        let args = serde_json::json!({
+            "targets": [{
+                "path": "lib/product.rb",
+                "line": line,
+                "column": column,
+            }],
+            "include_tests": true,
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_location", &args.to_string())
+            .expect("scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let result = only_result(&value);
+
+        assert_eq!("found", result["status"], "payload: {value}");
+        assert_eq!(symbol, result["symbol"], "payload: {value}");
+        let snippets: Vec<_> = result["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .collect();
+        for expected in expected_snippets {
+            assert!(
+                snippets.iter().any(|snippet| snippet.contains(expected)),
+                "expected {expected} usage: {value}"
+            );
+        }
+    }
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/product.rb","line":3,"column":25}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    assert_eq!(
+        "not_found",
+        only_result(&value)["status"],
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_mcp_call_surfaces_ruby_unproven_sites() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(
@@ -3729,6 +3820,217 @@ fn scan_usages_accepts_location_target_without_symbols() {
     assert_eq!(1, results(&value).len(), "payload: {value}");
     assert_eq!(0, status_count(&value, "not_found"));
     assert_eq!(0, status_count(&value, "failure"));
+}
+
+#[test]
+fn scan_usages_by_location_matches_ruby_mixin_benchmark_cases() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/billing/auditable.rb",
+            r#"module Billing
+  module Auditable
+    def audit
+      "audit"
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/formatting.rb",
+            r#"module Billing
+  module Formatting
+    def total_label
+      "from-prepended-formatting"
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/findable.rb",
+            r#"module Billing
+  module Findable
+    def find(id)
+      "found-#{id}"
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/invoice.rb",
+            r#"require_relative "auditable"
+require_relative "formatting"
+
+module Billing
+  class Invoice
+    include Auditable
+    prepend Formatting
+
+    def total_label
+      "from-invoice"
+    end
+
+    def self.build
+      Invoice.new
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/user.rb",
+            r#"require_relative "findable"
+
+module Billing
+  class User
+    extend Findable
+  end
+
+  class LegacyUser
+    include Findable
+  end
+end
+"#,
+        )
+        .file(
+            "app/report.rb",
+            r#"require_relative "../lib/billing/invoice"
+require_relative "../lib/billing/user"
+
+class InvoiceReport
+  def render
+    invoice = Billing::Invoice.build
+    invoice.audit
+    invoice.total_label
+    Billing::User.find(42)
+    Billing::LegacyUser.new.find(7)
+    invoice.public_send(:audit)
+  end
+end
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/billing/auditable.rb","line":3,"column":9},{"path":"lib/billing/formatting.rb","line":3,"column":9},{"path":"lib/billing/findable.rb","line":3,"column":9}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let results = results(&value);
+
+    assert_eq!(3, results.len(), "payload: {value}");
+    for (symbol, expected_hits) in [
+        ("Billing$Auditable.audit", 2),
+        ("Billing$Formatting.total_label", 1),
+        ("Billing$Findable.find", 2),
+    ] {
+        assert!(
+            results.iter().any(|result| {
+                result["symbol"] == symbol
+                    && result["status"] == "found"
+                    && result["total_hits"] == expected_hits
+            }),
+            "missing {symbol}: {value}"
+        );
+    }
+}
+
+#[test]
+fn scan_usages_by_location_traverses_declarationless_ruby_loaders() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/greeter.rb",
+            r#"class Greeter
+  def hello
+    "hello"
+  end
+end
+"#,
+        )
+        .file(
+            "lib/loader.rb",
+            r#"require_relative "greeter"
+"#,
+        )
+        .file(
+            "app/main.rb",
+            r#"require_relative "../lib/loader"
+
+Greeter.new.hello
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/greeter.rb","line":2,"column":7}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("Greeter.hello", result["symbol"], "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(1, result["total_hits"], "payload: {value}");
+}
+
+#[test]
+fn scan_usages_by_location_matches_ruby_autoload_benchmark_case() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/shop/discount.rb",
+            r#"module Shop
+  class Discount
+    def self.default
+      new
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/shop/product.rb",
+            r#"module Shop
+  class Product
+  end
+
+  autoload :Discount, "shop/discount"
+end
+"#,
+        )
+        .file(
+            "app/catalog.rb",
+            r#"require_relative "../lib/shop/product"
+
+product = Shop::Product.new
+Shop::Discount.default
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/shop/discount.rb","line":2,"column":9}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("Shop$Discount", result["symbol"], "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(2, result["total_hits"], "payload: {value}");
 }
 
 #[test]
@@ -4254,6 +4556,219 @@ fn scan_usages_location_target_selects_js_object_literal_method() {
         }),
         "payload: {value}"
     );
+}
+
+#[test]
+fn scan_usages_location_prefers_scala_class_over_shared_primary_constructor_range() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Service.scala",
+            r#"package app
+
+class Service(value: String)
+
+object Factory {
+  val first = new Service("first")
+  val second = new Service("second")
+  val third = new Service("third")
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app/Service.scala","line":3,"column":7}],"include_tests":true}"#,
+        )
+        .expect("class location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let class = only_result(&value);
+    assert_eq!("found", class["status"], "payload: {value}");
+    assert_eq!("app.Service", class["symbol"], "payload: {value}");
+    assert_eq!(Some(3), class["total_hits"].as_u64(), "payload: {value}");
+
+    let anchored_class_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app/Service.scala","line":3,"column":7,"symbol":"app/Service.scala#app.Service"}],"include_tests":true}"#,
+        )
+        .expect("file-anchored class location scan succeeds");
+    let anchored_class_value: Value =
+        serde_json::from_str(&anchored_class_payload).expect("valid response");
+    let anchored_class = only_result(&anchored_class_value);
+    assert_eq!(
+        "found", anchored_class["status"],
+        "payload: {anchored_class_value}"
+    );
+    assert_eq!(
+        "app.Service", anchored_class["symbol"],
+        "payload: {anchored_class_value}"
+    );
+    assert_eq!(
+        Some(3),
+        anchored_class["total_hits"].as_u64(),
+        "payload: {anchored_class_value}"
+    );
+
+    let constructor_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app/Service.scala","line":3,"column":7,"symbol":"app.Service.Service"}],"include_tests":true}"#,
+        )
+        .expect("constructor location scan succeeds");
+    let constructor_value: Value =
+        serde_json::from_str(&constructor_payload).expect("valid response");
+    let constructor = only_result(&constructor_value);
+    assert_eq!(
+        "found", constructor["status"],
+        "payload: {constructor_value}"
+    );
+    assert_eq!(
+        "app.Service.Service", constructor["symbol"],
+        "payload: {constructor_value}"
+    );
+    assert_eq!(
+        Some(3),
+        constructor["total_hits"].as_u64(),
+        "payload: {constructor_value}"
+    );
+}
+
+#[test]
+fn scan_usages_location_target_selects_typescript_static_method() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/api.ts",
+            r#"export class ApiClient {
+  static create(baseUrl: string): ApiClient {
+    return new ApiClient(baseUrl);
+  }
+
+  create(): void {}
+
+  constructor(private readonly baseUrl: string) {}
+}
+
+export default function createClient(): ApiClient {
+  return ApiClient.create("/api");
+}
+"#,
+        )
+        .file(
+            "src/app.ts",
+            r#"import { ApiClient } from "./api";
+
+const direct = ApiClient.create("/direct");
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"src/api.ts","line":2,"column":10,"symbol":"ApiClient.create"}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!(
+        "src/api.ts#ApiClient.create$static", result["symbol"],
+        "payload: {value}"
+    );
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(2, result["total_hits"], "payload: {value}");
+    assert!(
+        result["files"].as_array().is_some_and(|files| {
+            files.iter().any(|file| {
+                file["path"] == "src/api.ts"
+                    && file["hits"]
+                        .as_array()
+                        .is_some_and(|hits| hits.iter().any(|hit| hit["line"] == 12))
+            }) && files.iter().any(|file| {
+                file["path"] == "src/app.ts"
+                    && file["hits"]
+                        .as_array()
+                        .is_some_and(|hits| hits.iter().any(|hit| hit["line"] == 3))
+            })
+        }),
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn scan_usages_location_accepts_scala_display_selectors_for_object_members() {
+    let source = r#"package example
+
+object Defaults {
+  val Prefix = "job"
+}
+
+object Service {
+  def build: String = Defaults.Prefix
+}
+
+class ConsoleRenderer
+object ConsoleRenderer {
+  def default: ConsoleRenderer = new ConsoleRenderer
+}
+
+object Syntax {
+  extension (value: String)
+    def slug: String = value.toLowerCase
+}
+
+object App {
+  import ConsoleRenderer.{default => renderer}
+  import Syntax.*
+  val service = Service.build
+  val prefix = Defaults.Prefix
+  val console = renderer
+  val second = renderer
+  val slugged = "Hello World".slug
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("example/Workflow.scala", source)
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for (selector, declaration_line, expected_hits) in [
+        ("example.Service.build", line_of(source, "def build"), 1),
+        ("example.Defaults.Prefix", line_of(source, "val Prefix"), 2),
+        (
+            "example.ConsoleRenderer.default",
+            line_of(source, "def default"),
+            2,
+        ),
+        ("example.Syntax.slug", line_of(source, "def slug"), 1),
+    ] {
+        let args = serde_json::json!({
+            "targets": [{
+                "path": "example/Workflow.scala",
+                "line": declaration_line,
+                "symbol": selector,
+            }],
+            "include_tests": true,
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_location", &args.to_string())
+            .expect("Scala location scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let result = only_result(&value);
+
+        assert_eq!("found", result["status"], "selector {selector}: {value}");
+        assert_eq!(
+            expected_hits, result["total_hits"],
+            "selector {selector}: {value}"
+        );
+    }
 }
 
 #[test]

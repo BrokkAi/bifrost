@@ -49,6 +49,15 @@ fn copy_dir_recursively(source: &Path, destination: &Path) -> std::io::Result<()
 pub use inline_project::{BuiltInlineTestProject, InlineTestProject};
 
 #[allow(dead_code)]
+pub fn line_of(source: &str, needle: &str) -> usize {
+    source
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|line| line + 1)
+        .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
+}
+
+#[allow(dead_code)]
 pub const RUST_ASSOCIATED_PATH_MAIN: &str = r#"
 pub mod state;
 

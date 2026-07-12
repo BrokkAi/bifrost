@@ -45,6 +45,17 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
         None
     }
 
+    /// Resolve directly imported project files from already-loaded import facts.
+    /// Providers that do not expose file-level edges return `None` and callers
+    /// can derive a conservative approximation from imported declarations.
+    fn imported_files_from_infos(
+        &self,
+        _file: &ProjectFile,
+        _imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        None
+    }
+
     fn relevant_imports_for(&self, _code_unit: &CodeUnit) -> HashSet<String> {
         HashSet::default()
     }

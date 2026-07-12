@@ -4,9 +4,9 @@ use crate::analyzer::usages::common::{
 use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
-use crate::hash::{HashSet, set_with_capacity};
+use crate::hash::{HashMap, HashSet, set_with_capacity};
 use rayon::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -96,15 +96,27 @@ fn find_import_graph_candidates(
         }
     }
 
-    // (3) Direct importers — only if the analyzer exposes import analysis.
+    // (3) Importers — only if the analyzer exposes import analysis. Ruby
+    // `require` chains make a transitive walk necessary: a call site can live
+    // in a file that requires an intermediary, rather than the declaration
+    // file itself. Other languages retain the cheaper direct-importer scan.
     if let Some(import_provider) = analyzer.import_analysis_provider() {
         if let Some(cancellation) = cancellation {
-            let importers = find_direct_importers_with_cancellation(
-                analyzer.analyzed_files(),
-                import_provider,
-                &source_files,
-                cancellation,
-            );
+            let importers = if language_for_target(target) == Language::Ruby {
+                find_transitive_importers_with_cancellation(
+                    analyzer.analyzed_files(),
+                    import_provider,
+                    &candidates,
+                    cancellation,
+                )
+            } else {
+                find_direct_importers_with_cancellation(
+                    analyzer.analyzed_files(),
+                    import_provider,
+                    &source_files,
+                    cancellation,
+                )
+            };
             candidates.extend(importers);
         } else {
             let snapshot: Vec<ProjectFile> = candidates.iter().cloned().collect();
@@ -167,6 +179,62 @@ fn find_direct_importers_with_cancellation(
             importers.insert(candidate);
         }
     }
+    importers
+}
+
+fn find_transitive_importers_with_cancellation(
+    files: impl IntoIterator<Item = ProjectFile>,
+    import_provider: &dyn ImportAnalysisProvider,
+    seed_files: &HashSet<ProjectFile>,
+    cancellation: &CancellationToken,
+) -> HashSet<ProjectFile> {
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort();
+    let import_infos = import_provider.import_infos_for_files(&files);
+    let mut reverse_edges: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
+
+    for candidate in files {
+        if cancellation.is_cancelled() {
+            return HashSet::default();
+        }
+        let imports = import_infos
+            .as_ref()
+            .and_then(|infos| infos.get(&candidate))
+            .cloned()
+            .unwrap_or_else(|| import_provider.import_info_of(&candidate));
+        let imported_files = import_provider
+            .imported_files_from_infos(&candidate, &imports)
+            .unwrap_or_else(|| {
+                import_provider
+                    .imported_code_units_from_infos(&candidate, &imports)
+                    .unwrap_or_else(|| import_provider.imported_code_units_of(&candidate))
+                    .into_iter()
+                    .map(|unit| unit.source().clone())
+                    .collect()
+            });
+        for imported_file in imported_files {
+            reverse_edges
+                .entry(imported_file)
+                .or_default()
+                .push(candidate.clone());
+        }
+    }
+
+    let mut importers = HashSet::default();
+    let mut visited = seed_files.clone();
+    let mut queue: VecDeque<ProjectFile> = seed_files.iter().cloned().collect();
+    while let Some(imported_file) = queue.pop_front() {
+        if cancellation.is_cancelled() {
+            return HashSet::default();
+        }
+        for importer in reverse_edges.get(&imported_file).into_iter().flatten() {
+            if visited.insert(importer.clone()) {
+                importers.insert(importer.clone());
+                queue.push_back(importer.clone());
+            }
+        }
+    }
+
     importers
 }
 
@@ -476,6 +544,30 @@ mod tests {
         imported: CodeUnit,
     }
 
+    struct FileEdgeProvider {
+        edges: HashMap<ProjectFile, HashSet<ProjectFile>>,
+        edge_lookups: Arc<AtomicUsize>,
+    }
+
+    impl ImportAnalysisProvider for FileEdgeProvider {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+            HashSet::default()
+        }
+
+        fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
+            HashSet::default()
+        }
+
+        fn imported_files_from_infos(
+            &self,
+            file: &ProjectFile,
+            _imports: &[ImportInfo],
+        ) -> Option<HashSet<ProjectFile>> {
+            self.edge_lookups.fetch_add(1, Ordering::AcqRel);
+            Some(self.edges.get(file).cloned().unwrap_or_default())
+        }
+    }
+
     impl ImportAnalysisProvider for BatchedImportProvider {
         fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
             panic!("batched importer discovery must not hydrate individual import states");
@@ -596,5 +688,36 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(importers, [importer].into_iter().collect());
+    }
+
+    #[test]
+    fn transitive_importer_scan_follows_file_edges_once() {
+        let root = std::env::temp_dir();
+        let target = ProjectFile::new(root.clone(), "target.rb");
+        let loader = ProjectFile::new(root.clone(), "loader.rb");
+        let entrypoint = ProjectFile::new(root, "main.rb");
+        let edge_lookups = Arc::new(AtomicUsize::new(0));
+        let provider = FileEdgeProvider {
+            edges: [
+                (loader.clone(), [target.clone()].into_iter().collect()),
+                (entrypoint.clone(), [loader.clone()].into_iter().collect()),
+            ]
+            .into_iter()
+            .collect(),
+            edge_lookups: Arc::clone(&edge_lookups),
+        };
+
+        let importers = find_transitive_importers_with_cancellation(
+            [target.clone(), loader.clone(), entrypoint.clone()],
+            &provider,
+            &[target].into_iter().collect(),
+            &CancellationToken::default(),
+        );
+
+        assert_eq!(
+            [loader, entrypoint].into_iter().collect::<HashSet<_>>(),
+            importers
+        );
+        assert_eq!(3, edge_lookups.load(Ordering::Acquire));
     }
 }
