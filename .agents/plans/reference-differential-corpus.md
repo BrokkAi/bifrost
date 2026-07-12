@@ -19,7 +19,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 11:35Z) Pushed `4b3f6065`, corrected #643 with the definitive debugger diagnosis and measured validation, and closed it.
 - [x] (2026-07-12 12:15Z) Completed the committed-HEAD Rust baseline and triaged all 961 disagreements into forward-focus/scope, inverse-member, and follow-on import/type clusters; filed #644 and #645.
 - [x] (2026-07-12 13:05Z) Fixed and corpus-validated #644 and #645; targeted definition/usage suites and all-feature clippy pass.
-- [ ] Push and close #644/#645, then rerun the complete Rust N=1 repository from the clean fixing HEAD.
+- [x] (2026-07-12 15:10Z) Pushed `03646ad1`, closed #644/#645, and reran the complete Rust N=1 repository from the fixing HEAD. Missing sites fell from 961 to 628; the record is commit-pinned but reports dirty because unrelated untracked agent/cache artifacts exist in both worktrees.
+- [x] (2026-07-12 16:05Z) Triaged all 628 post-fix Rust disagreements. Filed #646/#647 for the dominant cross-file type and `self`/`Self` inverse gaps, and #648/#649/#650 for independently reproduced forward scoped-focus, namespace/prelude, and let-condition defects.
+- [x] (2026-07-12 16:30Z) Implemented and behavior-tested #646/#647: nested workspace file modules now retain structured module identity, and Rust class usage emits exact editor-only owner-alias hits with CodeUnit identity checks.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -56,6 +58,12 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: Macro token trees are a distinct structured Rust usage surface, not source-text noise.
   Evidence: The real `json!(..., "path": self.file)` site remained missing after private-member visibility and receiver fixes because `record_token_tree_instance_member_hits` explicitly returned for field targets. Extending its token-node walk to distinguish field access from method calls made the exact corpus site consistent without text search.
+
+- Observation: Correcting receiver focus substantially reduced false inverse misses but exposed the owner-type surface explicitly.
+  Evidence: On `03646ad1`, the complete 10,000-site gritql rerun changed forward resolution from 1,549 to 1,348 sites and reduced missing classifications from 961 to 628. All 250 same-file class misses were focused `Self`, `Self::item`, or `self.member` owner tokens; 251 more were cross-file class references. Exact reruns and independent reviews separated these from noisy residual field/function/module collisions.
+
+- Observation: Rust workspace file modules had contradictory declaration and import identities below nested crate `src` roots.
+  Evidence: `crates/cli/src/ux.rs` declared `CheckResult` under flattened package `crates.cli.src`, while `use crate::ux::CheckResult` structurally resolved the module as `crates.cli.src.ux`. A multi-file authoritative regression recovered zero of two type annotations before #646. Applying the existing file-module stem rule to nested workspace crates aligns both sides and keeps `lib.rs` at the crate root.
 
 - Observation: Package version alone is insufficient resume identity during a fix campaign.
   Evidence: Analyzer fixes can land without changing `CARGO_PKG_VERSION`; a report produced before the fix would otherwise suppress the required rerun. Repository records and completion keys therefore include the Bifrost source HEAD as well as the target repository HEAD and configuration fingerprint.

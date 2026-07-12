@@ -405,7 +405,7 @@ pub(super) fn rust_crate_root_package(file: &ProjectFile) -> String {
         .components()
         .map(|component| component.as_os_str().to_string_lossy().to_string())
         .collect();
-    let Some(src_index) = components.iter().position(|component| component == "src") else {
+    let Some(src_index) = components.iter().rposition(|component| component == "src") else {
         return rust_package_name(file);
     };
     if src_index == 0 {

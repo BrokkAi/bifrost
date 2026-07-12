@@ -927,6 +927,184 @@ fn authoritative_hits(
 }
 
 #[test]
+fn authoritative_rust_usage_finds_bare_types_imported_from_private_file_module() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("crates/cli/src/lib.rs", "mod ux;\nmod analyze;\n"),
+        ("crates/cli/src/ux.rs", "pub struct CheckResult;\n"),
+        (
+            "crates/cli/src/analyze.rs",
+            r#"
+use crate::ux::CheckResult;
+
+fn group_checks(first: &CheckResult, rest: Vec<CheckResult>) {}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "crates.cli.src.ux.CheckResult");
+    let analyze = project.file("crates/cli/src/analyze.rs");
+
+    let hits = authoritative_hits(&analyzer, &target, [analyze.clone()].into_iter().collect());
+    let references: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .collect();
+
+    assert_eq!(
+        2,
+        references.len(),
+        "expected both imported bare type annotations: {hits:#?}"
+    );
+    assert!(references.iter().all(|hit| hit.file == analyze));
+}
+
+fn assert_editor_self_hits(
+    result: &FuzzyResult,
+    file: &ProjectFile,
+    token: &str,
+    expected_token_hits: usize,
+) {
+    let external_hits = result.all_hits();
+    let editor_hits = result.all_hits_including_imports();
+    assert!(!editor_hits.is_empty(), "expected editor self hits");
+    let source = file.read_to_string().expect("read self-reference fixture");
+    assert!(
+        external_hits
+            .iter()
+            .all(|hit| token != &source[hit.start_offset..hit.end_offset]),
+        "focused self tokens must stay off the external usage surface: {external_hits:#?}"
+    );
+    assert_eq!(
+        expected_token_hits,
+        editor_hits
+            .iter()
+            .filter(|hit| {
+                hit.kind == UsageHitKind::SelfReceiver
+                    && &hit.file == file
+                    && token == &source[hit.start_offset..hit.end_offset]
+            })
+            .count(),
+        "focused self token hits: {editor_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_class_usage_records_bare_self_as_editor_only() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Service {}
+
+impl Service {
+    fn same_type() -> Self {
+        Self {}
+    }
+}
+"#,
+    )]);
+    let file = project.file("src/service.rs");
+    let target = definition(&analyzer, "service.Service");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+
+    assert_editor_self_hits(&result, &file, "Self", 2);
+}
+
+#[test]
+fn rust_class_usage_records_self_path_focus_as_editor_only() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Service;
+
+impl Service {
+    fn make() {}
+
+    fn caller() {
+        Self::make();
+    }
+}
+"#,
+    )]);
+    let file = project.file("src/service.rs");
+    let target = definition(&analyzer, "service.Service");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+
+    assert_editor_self_hits(&result, &file, "Self", 1);
+}
+
+#[test]
+fn rust_class_usage_records_self_member_receiver_as_editor_only() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Service {
+    value: usize,
+}
+
+impl Service {
+    fn read(&self) -> usize {
+        self.value
+    }
+}
+"#,
+    )]);
+    let file = project.file("src/service.rs");
+    let target = definition(&analyzer, "service.Service");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+
+    assert_editor_self_hits(&result, &file, "self", 1);
+}
+
+#[test]
+fn rust_class_self_hits_require_the_matching_impl_owner() {
+    let source = r#"
+pub struct Service {
+    value: usize,
+}
+
+pub struct Other {
+    value: usize,
+}
+
+impl Service {
+    fn copy(&self) -> Self {
+        let _ = self.value;
+        Self { value: 0 }
+    }
+}
+
+impl Other {
+    fn copy(&self) -> Self {
+        let _ = self.value;
+        Self { value: 0 }
+    }
+}
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[("src/service.rs", source)]);
+    let target = definition(&analyzer, "service.Service");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+
+    let editor_hits = result.all_hits_including_imports();
+    let self_hits: Vec<_> = editor_hits
+        .iter()
+        .filter(|hit| hit.kind == UsageHitKind::SelfReceiver)
+        .collect();
+    assert_eq!(
+        3,
+        self_hits.len(),
+        "Service lexical self hits: {editor_hits:#?}"
+    );
+    let other_impl = source.find("impl Other").expect("Other impl");
+    assert!(
+        self_hits.iter().all(|hit| hit.start_offset < other_impl),
+        "unrelated Other impl must not contribute self hits: {editor_hits:#?}"
+    );
+}
+
+#[test]
 fn authoritative_rust_usage_finds_enum_variant_through_self() {
     let (project, analyzer) = rust_analyzer_with_files(&[(
         "src/status.rs",

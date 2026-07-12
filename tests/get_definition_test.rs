@@ -4901,7 +4901,7 @@ pub fn test_crate_macros() {
         project.root(),
         &json!({
             "references": [{
-                "symbol": "printf.src.test_crate_macros",
+                "symbol": "printf.src.tests.test_crate_macros",
                 "context": "let target = crate::sprintf!(\"noargs1\");",
                 "target": "sprintf"
             }]

@@ -123,7 +123,8 @@ pub(super) fn rust_package_name(file: &ProjectFile) -> String {
         .map(|component| component.as_os_str().to_string_lossy().to_string())
         .collect();
 
-    if components.first().map(|component| component.as_str()) == Some("src") {
+    let source_root = components.iter().rposition(|component| component == "src");
+    if source_root == Some(0) {
         components.remove(0);
     }
     if components.is_empty() {
@@ -138,7 +139,7 @@ pub(super) fn rust_package_name(file: &ProjectFile) -> String {
 
     if stem == "lib" || stem == "main" || stem == "mod" {
         components.join(".")
-    } else if rel.starts_with("src") {
+    } else if source_root.is_some() {
         components
             .into_iter()
             .chain(std::iter::once(stem.to_string()))

@@ -133,6 +133,7 @@ pub(super) fn scan_files_for_target(
 ) -> BTreeSet<UsageHit> {
     let target_short = target.identifier().to_string();
     let target_fqn = target.fq_name();
+    let support = analyzer.definition_lookup_index();
     let parser_language = tree_sitter_rust::LANGUAGE.into();
     let hits = Mutex::new(BTreeSet::new());
     let files_vec: Vec<_> = files.into_iter().collect();
@@ -195,6 +196,9 @@ pub(super) fn scan_files_for_target(
             source,
             line_starts: &line_starts,
             analyzer,
+            rust,
+            support,
+            target,
             target_short: &target_short,
             direct_names: &direct_names,
             namespace_names: &namespace_names,
@@ -226,6 +230,9 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
+    rust: &'a RustAnalyzer,
+    support: &'a DefinitionLookupIndex,
+    target: &'a CodeUnit,
     pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
     pub(super) namespace_names: &'a HashSet<String>,
@@ -255,9 +262,14 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .ok()
                 .map(str::trim)
                 .unwrap_or_default();
-            if ctx.matches_identifier(text) && !is_shadowed_identifier(text, node, ctx) {
+            if text == "Self" && self_reference_matches_target(node, ctx) {
+                record_self_reference_hit(node, ctx);
+            } else if ctx.matches_identifier(text) && !is_shadowed_identifier(text, node, ctx) {
                 record_hit(node, ctx);
             }
+        }
+        "self" if self_member_receiver(node) && self_reference_matches_target(node, ctx) => {
+            record_self_reference_hit(node, ctx);
         }
         _ => {}
     }
@@ -266,6 +278,53 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     for child in node.named_children(&mut cursor) {
         scan_node(child, ctx);
     }
+}
+
+fn self_member_receiver(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression"
+            && parent
+                .child_by_field_name("value")
+                .is_some_and(|value| same_node(value, node))
+    })
+}
+
+fn self_reference_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if !ctx.target.is_class() {
+        return false;
+    }
+    let Some(type_node) =
+        enclosing_impl_item(node).and_then(|impl_item| impl_item.child_by_field_name("type"))
+    else {
+        return false;
+    };
+    rust_resolve_type_node_fqn(
+        ctx.analyzer,
+        ctx.support,
+        ctx.file,
+        ctx.source,
+        type_node,
+        Some(type_node.start_byte()),
+    )
+    .is_some_and(|fqn| fqn_matches_owner(ctx.rust, &fqn, ctx.target))
+}
+
+fn record_self_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+    else {
+        return;
+    };
+    push_self_receiver_member_hit(
+        ctx.file,
+        ctx.source,
+        ctx.line_starts,
+        start,
+        end,
+        enclosing,
+        ctx.hits,
+    );
 }
 
 fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
