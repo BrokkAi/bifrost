@@ -10,9 +10,10 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - [x] (2026-07-12 03:00Z) Inspected repository instructions, current analyzer architecture, benchmark conventions, corpus metadata, clone availability, and the canonical target language registry.
 - [x] (2026-07-12 03:00Z) Selected the deterministic N=1 repository for each of the eleven target corpus languages by recorded `code_loc`, restricted to available valid clones.
-- [ ] Implement shared structured reference-candidate enumeration and the library-owned differential runner.
-- [ ] Implement the dedicated corpus CLI with deterministic selection, resumable JSONL reports, exact-site reruns, and bounded sampling.
-- [ ] Validate the engine on small repositories and commit the engine checkpoint.
+- [x] (2026-07-12 04:10Z) Implemented shared structured reference-candidate enumeration and the library-owned differential runner.
+- [x] (2026-07-12 04:10Z) Implemented the dedicated corpus CLI with deterministic selection, commit-aware resumable JSONL reports, exact-site reruns, and bounded sampling.
+- [x] (2026-07-12 04:50Z) Addressed review findings and validated the engine with all-language fixtures plus bounded real-repository preflights.
+- [ ] Commit and push the engine checkpoint.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -32,6 +33,18 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - Observation: Existing semantic-token code already performs the correct structured first half of the audit: iteratively enumerate grammar identifier leaves, subtract structured declaration-name ranges, and batch definition lookup per file.
   Evidence: `src/lsp/handlers/semantic_tokens.rs::reference_candidate_ranges` and `DeclarationNameRangeContext` provide this behavior; the candidate collector should move to an analyzer-owned shared module rather than be duplicated.
 
+- Observation: None of the eleven N=1 clones has an existing Bifrost database, and the clone volume has about 219 GiB free at 94% utilization.
+  Evidence: The selected checkouts occupy about 33 GB logically before analyzer caches. Run smaller analyzers first, inspect database/WAL growth and free space after each repository, and stop before free space falls below 100 GiB.
+
+- Observation: A bounded real-repository preflight completed across every analyzer and immediately exercised genuine forward/inverse disagreements without requiring a production trajectory.
+  Evidence: With at most 100 sites and 50 target groups per repository, the reviewed pass reported missing sites in C (2), C++ (4), C# (3), Go (4), JavaScript (4), Rust (12), and Scala (1), and none in Java, PHP, Python, or TypeScript. These are validation leads, not tickets, until exact-site reruns confirm them.
+
+- Observation: The semantic-token identifier frontier was structured but narrower than the resolver's accepted syntax.
+  Evidence: Existing forward resolvers handle C++ operator/destructor nodes, Rust `self`/`super`/`crate`, and receiver keywords in several languages. The differential now scans a strict superset of the old identifier frontier, while a separate shared helper preserves the LSP's prior token ranges exactly.
+
+- Observation: Package version alone is insufficient resume identity during a fix campaign.
+  Evidence: Analyzer fixes can land without changing `CARGO_PKG_VERSION`; a report produced before the fix would otherwise suppress the required rerun. Repository records and completion keys therefore include the Bifrost source HEAD as well as the target repository HEAD and configuration fingerprint.
+
 ## Decision Log
 
 - Decision: Implement a library-owned engine plus a dedicated Rust binary, not a unit test or brokkbench production trajectory.
@@ -42,16 +55,24 @@ Bifrost currently learns about false-negative reference resolution after agents 
   Rationale: This uses the user's real-world corpus and respects the repository rule against string-scanning substitutes for analyzer structure.
   Date/Author: 2026-07-12 / Codex
 
-- Decision: Deterministically sample reference sites by a stable hash of repository-relative path and byte range, then group resolved sites by exact declaration set and run the inverse resolver once per group.
-  Rationale: Path-order truncation would bias large repositories toward a few directories. Grouping preserves broad real-world coverage while bounding repeated inverse work.
+- Decision: Deterministically hash-sample eligible file paths before parsing, then hash-sample reference sites by repository-relative path and byte range, group resolved sites by exact declaration set, and run the inverse resolver once per group.
+  Rationale: Path-order truncation would bias large repositories toward a few directories, while parsing all 170,000 matching files in the largest C checkout merely to select 10,000 sites would make sampling the bottleneck. Two-stage stable sampling bounds parsing while preserving repository-wide path coverage; reports retain total eligible files and audited files so coverage is explicit.
   Date/Author: 2026-07-12 / Codex
 
 - Decision: Restrict each inverse query to the files containing sampled forward references for that declaration and mark the scope authoritative.
   Rationale: The differential asks whether inverse resolution can recover already-known sites, not whether candidate discovery can rediscover the whole workspace. This isolates semantic disagreement and prevents whole-repository candidate enumeration per target.
   Date/Author: 2026-07-12 / Codex
 
+- Decision: Apply a second deterministic cap of 1,000 unique target groups after forward resolution.
+  Rationale: Ten thousand sampled sites can approach ten thousand unique inverse queries. A target-group cap retains wider forward coverage and makes omitted sites explicitly inconclusive without allowing the inverse phase to dominate the campaign.
+  Date/Author: 2026-07-12 / Codex
+
 - Decision: Treat ambiguous forward results, inverse failures, call-site caps, and truncated unproven samples as inconclusive rather than defects.
   Rationale: Only a unique forward declaration coupled with a complete inverse answer can prove a contradiction. The report must separate unsupported or bounded work from actionable missing references.
+  Date/Author: 2026-07-12 / Codex
+
+- Decision: Key resumable records by Bifrost source HEAD in addition to target HEAD and run configuration.
+  Rationale: Every landed analyzer fix must invalidate earlier evidence automatically even when the package version and corpus checkout are unchanged.
   Date/Author: 2026-07-12 / Codex
 
 ## Outcomes & Retrospective
@@ -70,7 +91,7 @@ The corpus lives at `/home/jonathan/Projects/brokkbench/clones`, a symlink to `/
 
 ## Plan of Work
 
-First extract the structured reference-candidate traversal from semantic tokens without changing LSP behavior. Build the engine around one persisted `WorkspaceAnalyzer` per repository. Filter audited files by requested corpus language; C uses C-family `.c` seeds and C++ uses the remaining C++ family, while both resolve through `Language::Cpp`. For each eligible file, read the analyzer-generation source, parse it once through `DeclarationNameRangeContext`, subtract declaration-name ranges, and feed a stable hash-priority sampler. The sampler must scan the full eligible file inventory so `--max-sites` is unbiased by lexical path order.
+First extract the structured reference-candidate traversal from semantic tokens without changing LSP behavior. Build the engine around one persisted `WorkspaceAnalyzer` per repository. Filter audited files by requested corpus language; C uses C-family `.c` seeds and C++ uses the remaining C++ family, while both resolve through `Language::Cpp`. Enumerate the full eligible path inventory, retain the `--max-files` lowest stable path hashes, then for each retained file read the analyzer-generation source, parse it once through `DeclarationNameRangeContext`, subtract declaration-name ranges, and feed a stable site hash-priority sampler. This makes both file and site selection independent of lexical traversal order without reparsing the entire largest checkout.
 
 Batch sampled forward lookups per file with `resolve_definition_batch_with_source`. Preserve every status count, but assert only resolved sites whose declaration identities form one semantic target group. Exclude a recursive definition-contained site only when `analyzer.enclosing_code_unit` equals one of its forward targets, matching existing usage-hit behavior.
 
@@ -98,7 +119,7 @@ Run the corpus campaign with N=1 and resumable output:
     cargo run --release --bin bifrost_reference_differential -- run-corpus \
       --clones-root /home/jonathan/Projects/brokkbench/clones \
       --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
-      --repos-per-language 1 --max-sites 10000 \
+      --repos-per-language 1 --max-files 1000 --max-sites 10000 --max-targets 1000 \
       --output .agents/docs/reference-differential/n1.jsonl
 
 The deterministic N=1 selection is:
@@ -150,3 +171,9 @@ In `src/reference_differential/mod.rs`, expose serializable report types and a r
 In `src/bin/bifrost_reference_differential.rs`, provide `run-repo` and `run-corpus` subcommands, `--help`, JSONL output, stderr progress, and `--strict`. Add the `csv` crate only if structured CSV parsing cannot reuse an existing dependency; do not parse `repos.csv` with string splitting.
 
 Revision note (2026-07-12): Created the initial self-contained plan after architecture and corpus inventory. It records the full N=1 campaign, not merely engine construction, because completion requires triage and fixes across every target language.
+
+Revision note (2026-07-12): Changed sampling to a deterministic two-stage file/site design after confirming that the largest selected repositories contain more than 100,000 matching source files. This preserves broad path coverage without parsing every file solely for sample selection.
+
+Revision note (2026-07-12): Added a deterministic target-group cap and disk-safety checks after inventory showed that all large-repository analyzer databases must be built cold and that sampled sites may otherwise produce thousands of separate inverse queries.
+
+Revision note (2026-07-12): Recorded the all-language preflight and made resume identity commit-aware after review showed that package-version-only records could survive analyzer fixes incorrectly.

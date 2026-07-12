@@ -29,6 +29,7 @@ pub mod profiling;
 mod project_watcher;
 #[cfg(feature = "python")]
 mod python_module;
+pub mod reference_differential;
 mod relevance;
 pub mod scoped_project;
 pub mod searchtools;

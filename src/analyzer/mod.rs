@@ -20,6 +20,7 @@ mod php;
 mod pool_memo;
 mod project;
 mod python;
+pub(crate) mod reference_candidates;
 mod ruby;
 mod rust;
 mod scala;

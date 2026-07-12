@@ -1,11 +1,8 @@
-use lsp_types::{
-    SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensLegend,
-    SemanticTokensParams, SemanticTokensResult,
-};
-use tree_sitter::Node;
-
 use crate::analyzer::common::{is_unparseable_source, language_for_file};
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
+use crate::analyzer::reference_candidates::{
+    ReferenceCandidateRanges, semantic_token_candidate_ranges,
+};
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, resolve_definition_batch_with_source,
 };
@@ -15,6 +12,10 @@ use crate::analyzer::{
 use crate::hash::HashSet;
 use crate::lsp::conversion::byte_offset_to_position;
 use crate::lsp::handlers::util::read_document_for_uri;
+use lsp_types::{
+    SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensLegend,
+    SemanticTokensParams, SemanticTokensResult,
+};
 
 const NAMESPACE_TOKEN: u32 = 0;
 const TYPE_TOKEN: u32 = 1;
@@ -86,9 +87,11 @@ fn build_tokens(
     declarations.sort_unstable();
     declarations.dedup();
 
-    let Some(candidate_ranges) = reference_candidate_ranges(root, language) else {
-        return empty_tokens();
-    };
+    let candidate_ranges =
+        match semantic_token_candidate_ranges(root, language, MAX_SEMANTIC_TOKEN_CANDIDATES) {
+            ReferenceCandidateRanges::Complete(ranges) => ranges,
+            ReferenceCandidateRanges::LimitExceeded { .. } => return empty_tokens(),
+        };
     let declaration_ranges: HashSet<_> = declarations.iter().map(AbsoluteToken::key).collect();
     let unresolved_ranges: Vec<_> = if reference_resolution_within_budget(analyzer, language) {
         candidate_ranges
@@ -202,52 +205,6 @@ fn common_definition_token_type(definitions: &[crate::analyzer::CodeUnit]) -> Op
         }
     }
     common
-}
-
-fn reference_candidate_ranges(root: Node<'_>, language: Language) -> Option<Vec<ByteRange>> {
-    let mut ranges = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.named_child_count() == 0
-            && is_reference_identifier_node(language, node.kind())
-            && node.start_byte() < node.end_byte()
-        {
-            ranges.push(ByteRange {
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                start_line: node.start_position().row,
-                end_line: node.end_position().row,
-            });
-            if ranges.len() > MAX_SEMANTIC_TOKEN_CANDIDATES {
-                return None;
-            }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-    ranges.sort_unstable();
-    ranges.dedup();
-    Some(ranges)
-}
-
-fn is_reference_identifier_node(language: Language, kind: &str) -> bool {
-    if language == Language::None {
-        return false;
-    }
-    if kind == "identifier" || kind.ends_with("_identifier") {
-        return true;
-    }
-    match language {
-        Language::Php => kind == "name",
-        Language::Ruby => matches!(
-            kind,
-            "constant" | "instance_variable" | "class_variable" | "global_variable"
-        ),
-        _ => false,
-    }
 }
 
 fn discard_overlaps(tokens: Vec<AbsoluteToken>) -> Vec<AbsoluteToken> {
@@ -433,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_ranges_come_from_structured_nodes_in_each_language() {
+    fn semantic_token_candidates_come_from_structured_nodes_in_each_language() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
         let fixtures = [
@@ -482,20 +439,115 @@ mod tests {
             let file = crate::analyzer::ProjectFile::new(&root, PathBuf::from(path));
             let tree = parse_tree_for_language(&file, language, source)
                 .unwrap_or_else(|| panic!("failed to parse {language:?}"));
-            let ranges = reference_candidate_ranges(tree.root_node(), language)
-                .unwrap_or_else(|| panic!("candidate budget exceeded for {language:?}"));
+            let ReferenceCandidateRanges::Complete(ranges) = semantic_token_candidate_ranges(
+                tree.root_node(),
+                language,
+                MAX_SEMANTIC_TOKEN_CANDIDATES,
+            ) else {
+                panic!("candidate budget exceeded for {language:?}");
+            };
             assert!(
                 !ranges.is_empty(),
                 "expected structured identifier candidates for {language:?}"
             );
         }
-        assert!(is_reference_identifier_node(Language::Php, "name"));
-        assert!(is_reference_identifier_node(Language::Ruby, "constant"));
-        assert!(!is_reference_identifier_node(Language::None, "identifier"));
-        assert!(!is_reference_identifier_node(
-            Language::Java,
-            "string_literal"
-        ));
+        assert!(
+            crate::analyzer::reference_candidates::is_reference_candidate_node(
+                Language::Php,
+                "name"
+            )
+        );
+        assert!(
+            crate::analyzer::reference_candidates::is_reference_candidate_node(
+                Language::Ruby,
+                "constant"
+            )
+        );
+        assert!(
+            !crate::analyzer::reference_candidates::is_reference_candidate_node(
+                Language::None,
+                "identifier"
+            )
+        );
+        assert!(
+            !crate::analyzer::reference_candidates::is_reference_candidate_node(
+                Language::Java,
+                "string_literal"
+            )
+        );
+    }
+
+    #[test]
+    fn candidate_ranges_include_structured_non_identifier_references() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let fixtures = [
+            (
+                Language::Cpp,
+                "a.cpp",
+                "struct Value { Value operator+(Value); ~Value(); }; void f(Value value) { value.operator+(value); value.~Value(); }",
+                &["operator+", "~Value"][..],
+            ),
+            (
+                Language::Rust,
+                "a.rs",
+                "mod parent { pub fn f() {} mod child { fn g() { self::g(); super::f(); crate::parent::f(); } } }",
+                &["self", "super", "crate"][..],
+            ),
+            (
+                Language::JavaScript,
+                "a.js",
+                "class A { f() { this.f(); } }",
+                &["this"][..],
+            ),
+            (
+                Language::TypeScript,
+                "a.ts",
+                "class A { f(): void { this.f(); } }",
+                &["this"][..],
+            ),
+        ];
+
+        for (language, path, source, expected) in fixtures {
+            let file = crate::analyzer::ProjectFile::new(&root, PathBuf::from(path));
+            let tree = parse_tree_for_language(&file, language, source)
+                .unwrap_or_else(|| panic!("failed to parse {language:?}"));
+            let ReferenceCandidateRanges::Complete(ranges) =
+                crate::analyzer::reference_candidates::reference_candidate_ranges(
+                    tree.root_node(),
+                    language,
+                    1_000,
+                )
+            else {
+                panic!("candidate budget exceeded for {language:?}");
+            };
+            let candidate_texts = ranges
+                .iter()
+                .map(|range| &source[range.start_byte..range.end_byte])
+                .collect::<Vec<_>>();
+            for expected in expected {
+                assert!(
+                    candidate_texts.contains(expected),
+                    "expected `{expected}` among {language:?} candidates: {candidate_texts:?}"
+                );
+            }
+
+            let ReferenceCandidateRanges::Complete(semantic_ranges) =
+                semantic_token_candidate_ranges(tree.root_node(), language, 1_000)
+            else {
+                panic!("semantic token budget exceeded for {language:?}");
+            };
+            let semantic_texts = semantic_ranges
+                .iter()
+                .map(|range| &source[range.start_byte..range.end_byte])
+                .collect::<Vec<_>>();
+            for expected in expected {
+                assert!(
+                    !semantic_texts.contains(expected),
+                    "semantic-token frontier unexpectedly included `{expected}` for {language:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -510,7 +562,16 @@ mod tests {
         source.push_str("} }\n");
         let tree = parse_tree_for_language(&file, Language::Java, &source).expect("parse Java");
 
-        assert!(reference_candidate_ranges(tree.root_node(), Language::Java).is_none());
+        assert_eq!(
+            semantic_token_candidate_ranges(
+                tree.root_node(),
+                Language::Java,
+                MAX_SEMANTIC_TOKEN_CANDIDATES
+            ),
+            ReferenceCandidateRanges::LimitExceeded {
+                limit: MAX_SEMANTIC_TOKEN_CANDIDATES
+            }
+        );
     }
 
     #[test]
