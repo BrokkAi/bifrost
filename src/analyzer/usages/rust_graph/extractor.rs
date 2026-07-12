@@ -172,7 +172,7 @@ pub(super) fn scan_files_for_target(
         let line_starts = compute_line_starts(source);
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
         let refs = rust.reference_context_of(file);
-        let (mut direct_names, namespace_names) = match seeds {
+        let (mut direct_names, _namespace_names) = match seeds {
             Some(seeds) => rust.usage_binding_names(file, seeds),
             None => (HashSet::default(), HashSet::default()),
         };
@@ -205,7 +205,6 @@ pub(super) fn scan_files_for_target(
             target_is_module: target.is_module(),
             target_short: &target_short,
             direct_names: &direct_names,
-            namespace_names: &namespace_names,
             lexical_scope: &lexical_scope,
             target_self_file,
             hits: &mut local_hits,
@@ -236,7 +235,6 @@ pub(super) struct ScanCtx<'a> {
     pub(super) target_is_module: bool,
     pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
-    pub(super) namespace_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
     target_self_file: bool,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -271,7 +269,7 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         .unwrap_or_default();
                     if text == "Self" && self_reference_matches_target(node, ctx) {
                         record_self_reference_hit(node, ctx);
-                    } else if (!ctx.target_is_class || !identifier_is_scoped_path_part(node))
+                    } else if !identifier_is_scoped_path_part(node)
                         && ctx.matches_identifier(text)
                         && !is_shadowed_identifier(text, node, ctx)
                     {

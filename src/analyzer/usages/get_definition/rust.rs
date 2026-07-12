@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::RustReferenceContext;
 use crate::analyzer::rust::lexical_scope;
+use crate::analyzer::rust::rust_focused_use_path;
 use crate::hash::{HashMap, HashSet};
 
 pub(super) fn resolve_rust(
@@ -130,6 +131,12 @@ pub(super) fn resolve_rust(
     let refs = rust.reference_context_of(file);
     if let Some(tree) = tree
         && let Some(outcome) =
+            rust_focused_use_path_outcome(rust, support, file, source, tree, site, &refs)
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
+        && let Some(outcome) =
             rust_focused_scoped_prefix_outcome(rust, support, file, source, tree, site, &refs)
     {
         return outcome;
@@ -139,13 +146,6 @@ pub(super) fn resolve_rust(
             rust_focused_token_tree_prefix_outcome(rust, support, file, source, tree, site, &refs)
     {
         return outcome;
-    }
-    if let Some(tree) = tree
-        && let Some(candidates) =
-            rust_use_path_module_candidates(rust, support, file, source, tree, site, &refs)
-        && !candidates.is_empty()
-    {
-        return candidates_outcome(candidates);
     }
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
@@ -532,7 +532,7 @@ fn rust_enclosing_ancestor<'tree>(mut node: Node<'tree>, kind: &str) -> Option<N
     None
 }
 
-fn rust_use_path_module_candidates(
+fn rust_focused_use_path_outcome(
     rust: &RustAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
@@ -540,61 +540,32 @@ fn rust_use_path_module_candidates(
     tree: &Tree,
     site: &ResolvedReferenceSite,
     refs: &RustReferenceContext,
-) -> Option<Vec<CodeUnit>> {
-    let node =
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
-    if !matches!(node.kind(), "identifier" | "self" | "super" | "crate") {
-        return None;
-    }
-    let path = rust_enclosing_scoped_use_path(node)?;
-    if !(path.start_byte() <= site.focus_start_byte && site.focus_start_byte < path.end_byte()) {
-        return None;
-    }
-    let path_text = rust_node_text(path, source).trim();
-    if path_text.is_empty() {
-        return None;
-    }
-    let fqn = rust_module_path_fqn(rust, file, refs, path_text)?;
-    let candidates: Vec<_> = support
-        .fqn(&fqn)
-        .into_iter()
-        .filter(CodeUnit::is_module)
-        .collect();
-    (!candidates.is_empty()).then_some(candidates)
-}
-
-fn rust_enclosing_scoped_use_path(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        let parent = node.parent()?;
-        match parent.kind() {
-            "use_declaration" | "use_list" => return None,
-            "scoped_use_list" => {
-                let path = parent.child_by_field_name("path")?;
-                return node_within(path, node).then_some(path);
-            }
-            _ => node = parent,
-        }
-    }
+    let focused_path = rust_focused_use_path(focused, source)?;
+    let focused_text = rust_node_text(focused, source).trim();
+    let resolved_fqn = crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(
+        rust,
+        refs,
+        file,
+        &focused_path.full_path,
+    );
+    Some(rust_focused_prefix_resolution_outcome(
+        rust,
+        support,
+        file,
+        source,
+        site,
+        refs,
+        focused_path.root,
+        focused_text,
+        resolved_fqn.as_deref(),
+    ))
 }
 
 fn node_within(container: Node<'_>, node: Node<'_>) -> bool {
     container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
-}
-
-fn rust_module_path_fqn(
-    rust: &RustAnalyzer,
-    file: &ProjectFile,
-    refs: &RustReferenceContext,
-    path: &str,
-) -> Option<String> {
-    if let Some((module_path, name)) = path.rsplit_once("::")
-        && let Some(fqn) = refs.resolve_scoped(module_path, name)
-    {
-        return Some(fqn);
-    }
-    refs.resolve_bare(path)
-        .map(str::to_string)
-        .or_else(|| rust.resolve_module_package(file, path))
 }
 
 fn rust_focused_scoped_prefix_outcome(
@@ -674,7 +645,8 @@ fn rust_focused_token_tree_prefix_outcome(
             "the focused Rust path segment is empty",
         ));
     }
-    let resolved_fqn = rust_module_path_fqn(rust, file, refs, prefix);
+    let resolved_fqn =
+        crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(rust, refs, file, prefix);
     Some(rust_focused_prefix_resolution_outcome(
         rust,
         support,

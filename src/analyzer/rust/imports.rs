@@ -6,6 +6,91 @@ use tree_sitter::Node;
 use super::RustAnalyzer;
 use super::declarations::{rust_node_text, rust_package_name};
 
+pub(crate) struct RustFocusedUsePath<'tree> {
+    pub(crate) full_path: String,
+    pub(crate) root: Node<'tree>,
+}
+
+pub(crate) fn rust_focused_use_path<'tree>(
+    focused: Node<'tree>,
+    source: &str,
+) -> Option<RustFocusedUsePath<'tree>> {
+    let mut prefix = focused;
+    while let Some(parent) = prefix.parent() {
+        if parent.kind() != "scoped_identifier" {
+            break;
+        }
+        if parent
+            .child_by_field_name("name")
+            .is_some_and(|name| node_contains(name, focused))
+        {
+            if focused.kind() == "self" {
+                prefix = parent.child_by_field_name("path")?;
+                break;
+            }
+            prefix = parent;
+            continue;
+        }
+        break;
+    }
+
+    let mut path_nodes = vec![prefix];
+    let mut current = prefix;
+    let mut found_use = false;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "scoped_use_list" => {
+                if parent
+                    .child_by_field_name("list")
+                    .is_some_and(|list| node_contains(list, current))
+                    && let Some(path) = parent.child_by_field_name("path")
+                {
+                    path_nodes.push(path);
+                }
+            }
+            "use_declaration" => {
+                found_use = true;
+                break;
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    if !found_use {
+        return None;
+    }
+
+    path_nodes.reverse();
+    let root = rust_use_path_root(*path_nodes.first()?);
+    let mut full_path = String::new();
+    let path_node_count = path_nodes.len();
+    for node in path_nodes {
+        if node.kind() == "self" && path_node_count > 1 {
+            continue;
+        }
+        let part = rust_use_path_text(node, source)?;
+        if !full_path.is_empty() {
+            full_path.push_str("::");
+        }
+        full_path.push_str(&part);
+    }
+    (!full_path.is_empty()).then_some(RustFocusedUsePath { full_path, root })
+}
+
+fn node_contains(container: Node<'_>, node: Node<'_>) -> bool {
+    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
+}
+
+fn rust_use_path_root(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "scoped_identifier" {
+        let Some(path) = node.child_by_field_name("path") else {
+            break;
+        };
+        node = path;
+    }
+    node
+}
+
 impl ImportAnalysisProvider for RustAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         if let Some(cached) = self.imported_code_units.get(file) {

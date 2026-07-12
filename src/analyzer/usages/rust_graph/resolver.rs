@@ -18,6 +18,18 @@ pub(super) struct RustGraphSeeds {
     pub(super) kind: RustGraphSeedKind,
 }
 
+pub(crate) fn resolve_rust_path_fqn(
+    rust: &RustAnalyzer,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    full_path: &str,
+) -> Option<String> {
+    refs.resolve_bare(full_path)
+        .map(str::to_string)
+        .or_else(|| refs.resolve_scoped_owner(full_path))
+        .or_else(|| rust.resolve_module_package(file, full_path))
+}
+
 pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     target.is_function()
         && analyzer

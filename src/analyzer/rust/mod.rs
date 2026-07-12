@@ -30,6 +30,7 @@ pub(crate) use adapter::RustAdapter;
 use cache::{weight_code_unit_set, weight_project_file_set, weight_reference_context};
 use cargo_routes::RustCargoRouteIndex;
 use declarations::collect_rust_type_identifiers;
+pub(crate) use imports::rust_focused_use_path;
 use tests::detect_rust_test_assertion_smells;
 
 pub use graph_support::RustReferenceContext;

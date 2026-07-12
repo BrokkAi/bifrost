@@ -4509,6 +4509,71 @@ pub mod flags { pub struct OutputFormat; }
 }
 
 #[test]
+fn scan_usages_by_reference_proves_exact_rust_qualified_free_functions() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod consumer;
+pub mod decoy;
+pub mod list_index;
+pub mod messenger_variant;
+pub mod url;
+"#,
+        )
+        .file(
+            "src/consumer.rs",
+            r#"
+use crate::{decoy, list_index, url};
+use crate::list_index::to_unsigned as imported_to_unsigned;
+use crate::messenger_variant::create_emitter as imported_create_emitter;
+use crate::url::encode as imported_encode;
+
+pub fn consume() {
+    url::encode();
+    crate::messenger_variant::create_emitter();
+    list_index::to_unsigned();
+
+    decoy::encode();
+    decoy::create_emitter();
+    decoy::to_unsigned();
+}
+"#,
+        )
+        .file("src/url.rs", "pub fn encode() {}\n")
+        .file("src/messenger_variant.rs", "pub fn create_emitter() {}\n")
+        .file("src/list_index.rs", "pub fn to_unsigned() {}\n")
+        .file(
+            "src/decoy.rs",
+            "pub fn encode() {}\npub fn create_emitter() {}\npub fn to_unsigned() {}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["url.encode","messenger_variant.create_emitter","list_index.to_unsigned"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(3, resolved_scan_count(&value), "payload: {value}");
+    for usage in results(&value) {
+        assert_eq!(1, usage["total_hits"].as_u64().unwrap(), "payload: {value}");
+        let files = usage["files"].as_array().unwrap();
+        assert_eq!(1, files.len(), "payload: {value}");
+        assert_eq!("src/consumer.rs", files[0]["path"], "payload: {value}");
+        assert_eq!(
+            1,
+            files[0]["hits"].as_array().unwrap().len(),
+            "payload: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_by_reference_uses_position_aware_rust_binding_scopes() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

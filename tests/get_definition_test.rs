@@ -4002,6 +4002,106 @@ fn demo(_: Pattern) {}
 }
 
 #[test]
+fn rust_focused_use_paths_resolve_exact_cargo_targets_without_flat_collisions() {
+    let app_source = r#"
+struct Commands {
+    Auth: usize,
+    path: usize,
+}
+
+fn imports() {
+    use grit_util::{error::GritResult, auth::{Auth, Other}};
+    use std::{path::PathBuf};
+}
+"#;
+    let project = InlineTestProject::new()
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"app\", \"grit-util\"]\nresolver = \"2\"\n",
+        )
+        .file(
+            "grit-util/Cargo.toml",
+            "[package]\nname = \"grit-util\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "grit-util/src/lib.rs",
+            "pub mod auth;\npub mod error;\n",
+        )
+        .file(
+            "grit-util/src/auth.rs",
+            "pub struct Auth;\npub struct Other;\n",
+        )
+        .file("grit-util/src/error.rs", "pub struct GritResult;\n")
+        .file(
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ngrit-util = { path = \"../grit-util\" }\n",
+        )
+        .file("app/src/lib.rs", app_source)
+        .file("foreign.cpp", "struct error {};\n")
+        .build();
+
+    for (needle, expected_fqn, expected_path) in [
+        (
+            "error::GritResult",
+            "grit-util.src.error",
+            "grit-util/src/lib.rs",
+        ),
+        (
+            "Auth, Other",
+            "grit-util.src.auth.Auth",
+            "grit-util/src/auth.rs",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference(
+                "app/src/lib.rs",
+                app_source,
+                app_source.find(needle).unwrap(),
+            ),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected_fqn, "{value}");
+        assert_eq!(result["definitions"][0]["path"], expected_path, "{value}");
+    }
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/src/lib.rs",
+            app_source,
+            app_source.find("path::PathBuf").unwrap(),
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "imports",
+                "context": "    use grit_util::{error::GritResult, auth::{Auth, Other}};",
+                "target": "error"
+            }]
+        })
+        .to_string(),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "grit-util.src.error",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "grit-util/src/lib.rs",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_struct_field_access_resolves_from_parameters_and_result_locals() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

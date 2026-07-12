@@ -24,7 +24,7 @@ use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
 pub(crate) use resolver::{
-    resolve_scoped_associated_item, resolve_trait_associated_item,
+    resolve_rust_path_fqn, resolve_scoped_associated_item, resolve_trait_associated_item,
     resolve_trait_associated_item_matching,
 };
 

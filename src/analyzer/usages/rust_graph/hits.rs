@@ -1,6 +1,7 @@
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::extractor::ScanCtx;
+use crate::analyzer::usages::rust_graph::resolve_rust_path_fqn;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_range};
 use std::collections::BTreeSet;
@@ -22,6 +23,9 @@ fn record_module_qualified_hits_in(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if has_ancestor_kind(node, "use_declaration") {
+        return;
+    }
     if ctx.target_is_module || ctx.target_is_class {
         record_scoped_target_segment_hit(node, ctx);
         return;
@@ -30,15 +34,8 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
-    if node_text(name, ctx.source) != ctx.target_short {
-        return;
-    }
-    let Some(path) = node.child_by_field_name("path") else {
-        return;
-    };
-    let path_text = node_text(path, ctx.source);
-    if !ctx.namespace_names.contains(path_text)
-        || ctx.name_shadowed_at(path_text, path.start_byte())
+    if resolve_rust_path_fqn(ctx.rust, ctx.refs, ctx.file, node_text(node, ctx.source)).as_deref()
+        != Some(ctx.target_fqn)
     {
         return;
     }
@@ -61,9 +58,6 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn record_scoped_target_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if has_ancestor_kind(node, "use_declaration") {
-        return;
-    }
     let Some(path) = node.child_by_field_name("path") else {
         return;
     };
@@ -71,37 +65,21 @@ fn record_scoped_target_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     let path_text = node_text(path, ctx.source);
-    let name_text = node_text(name, ctx.source);
     if matches!(path.kind(), "identifier" | "type_identifier") {
-        let resolved_root = ctx
-            .refs
-            .resolve_bare(path_text)
-            .map(str::to_string)
-            .or_else(|| ctx.rust.resolve_module_package(ctx.file, path_text));
+        let resolved_root = resolve_rust_path_fqn(ctx.rust, ctx.refs, ctx.file, path_text);
         if resolved_root.as_deref() == Some(ctx.target_fqn) {
             record_target_segment(path, ctx);
         }
     }
-    if !scoped_node_resolves_to_target(node, path_text, name_text, ctx) {
+    if !scoped_node_resolves_to_target(node, ctx) {
         return;
     }
 
     record_target_segment(name, ctx);
 }
 
-fn scoped_node_resolves_to_target(
-    node: Node<'_>,
-    path_text: &str,
-    name_text: &str,
-    ctx: &ScanCtx<'_>,
-) -> bool {
-    ctx.refs
-        .resolve_scoped(path_text, name_text)
-        .or_else(|| {
-            ctx.rust
-                .resolve_module_package(ctx.file, node_text(node, ctx.source))
-        })
-        .as_deref()
+fn scoped_node_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    resolve_rust_path_fqn(ctx.rust, ctx.refs, ctx.file, node_text(node, ctx.source)).as_deref()
         == Some(ctx.target_fqn)
 }
 
