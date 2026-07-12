@@ -3889,6 +3889,17 @@ fn resolve_scan_usages_target(
         .filter_map(|(unit, span)| (span == narrowest_span).then_some(unit))
         .collect();
 
+    // A source-backed synthetic identity may intentionally share its declaration
+    // name range with the source declaration that owns it. Scala primary
+    // constructors are the current example: `class Service(value: String)`
+    // defines both the `Service` type and a synthetic `Service.Service`
+    // constructor at the `Service` token. A plain location target selects the
+    // source declaration, while an explicit `symbol` selector can still request
+    // the synthetic identity.
+    if target.symbol.is_none() && matches.iter().any(|unit| !unit.is_synthetic()) {
+        matches.retain(|unit| !unit.is_synthetic());
+    }
+
     matches.sort_by(|left, right| {
         primary_range(analyzer, left)
             .map(|range| (range.start_line, range.start_byte))
