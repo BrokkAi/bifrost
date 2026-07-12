@@ -34,6 +34,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 02:20Z) Completed Scala N=1 on `JetBrains__intellij-scala` at `dd63058d`: 1,000/18,936 eligible files, 10,000 sites, 1,000 queried target groups, and 473 missing classifications in 1,761.8 seconds; production-symbol triage is in progress.
 - [x] (2026-07-13 02:35Z) Implemented and symbols-tested #656 with a shared position-aware Rust lexical-scope index; inverse scanning no longer suppresses names file-wide and the touched AST walk is iterative.
 - [x] (2026-07-13 02:45Z) Implemented and symbols-tested #657: focused nonterminal Rust path segments inside macro token trees now retain owner identity instead of falling through to the terminal associated item.
+- [x] (2026-07-13 03:05Z) Triaged all 473 Scala missing classifications into 25 wrong forward identities, 219 genuine inverse omissions, and 229 non-defects/artifacts; exact current-code probes confirmed four production boundaries and #661-#664 were filed.
+- [x] (2026-07-13 03:35Z) Implemented and symbols-tested #663 by extending the existing Scala hierarchy-family usage proof from traits to class methods while preserving overload buckets, conflicts, caps, and exact unrelated-base negatives.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.

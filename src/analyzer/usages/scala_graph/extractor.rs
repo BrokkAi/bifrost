@@ -892,7 +892,7 @@ fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     };
     match call_arity_for_reference(node) {
         Some(call_arity) => call_arity == target_arity,
-        None => target_arity == 0,
+        None => target_arity == 0 || ctx.spec.unapplied_reference_is_unambiguous,
     }
 }
 

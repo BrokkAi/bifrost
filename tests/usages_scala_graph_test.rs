@@ -118,6 +118,65 @@ def compute(value: String): String = value
 }
 
 #[test]
+fn scala_inherited_class_method_usages_preserve_target_buckets_and_cap() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Services.scala",
+        r#"
+package app
+
+class UnaryBase {
+  def execute(value: Int): Int = value
+}
+
+class BinaryBase {
+  def execute(left: Int, right: Int): Int = left + right
+}
+
+class UnaryChild extends UnaryBase {
+  val unary = execute(1)
+}
+
+class BinaryChild extends BinaryBase {
+  val binary = execute(1, 2)
+}
+"#,
+    )]);
+    let targets = [
+        definition(&analyzer, "app.UnaryBase.execute"),
+        definition(&analyzer, "app.BinaryBase.execute"),
+    ];
+
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = UsageFinder::new().find_usages_default(&analyzer, &targets)
+    else {
+        panic!("expected inherited usage success");
+    };
+    for target in &targets {
+        let signature = analyzer.signatures(target).join("\n");
+        let bucket = hits_by_overload
+            .get(target)
+            .unwrap_or_else(|| panic!("missing bucket for {signature}"));
+        assert_eq!(bucket.len(), 1, "same-name base leaked into {signature}");
+        let expected = if signature.contains("left: Int, right: Int") {
+            "execute(1, 2)"
+        } else {
+            "execute(1)"
+        };
+        assert_hit_contains(&bucket.iter().cloned().collect::<Vec<_>>(), expected);
+    }
+
+    let limited = UsageFinder::new().query(&analyzer, &targets, 100, 1);
+    assert!(
+        matches!(
+            limited.result,
+            FuzzyResult::TooManyCallsites { limit: 1, .. }
+        ),
+        "inherited multi-target query must preserve the query-wide usage cap"
+    );
+}
+
+#[test]
 fn scala_import_hits_ignore_unrelated_aliased_import_path() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         ("Target.scala", "package app\n\nclass Target\n"),
@@ -1834,7 +1893,7 @@ class Workflow {
 }
 
 #[test]
-fn scala_graph_keeps_class_methods_exact_owner() {
+fn scala_graph_connects_class_methods_to_overrides_and_child_receivers() {
     let source = r#"
 package exact
 
@@ -1862,8 +1921,8 @@ class Workflow(base: Base, child: Child) {
     ));
 
     assert_hit_line(&hits, line_of(source, "base.run(value)"));
-    assert_no_hit_contains(&hits, "override def run");
-    assert_no_hit_in_enclosing(&hits, "exact.Workflow.viaChild");
+    assert_hit_line(&hits, line_of(source, "override def run"));
+    assert_hit_line(&hits, line_of(source, "child.run(value)"));
 }
 
 #[test]

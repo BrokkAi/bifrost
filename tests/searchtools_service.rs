@@ -2628,6 +2628,65 @@ def compute(value: String): String = value
 }
 
 #[test]
+fn scan_usages_by_reference_finds_inherited_scala_class_callables() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Services.scala",
+            r#"
+package app
+
+class Base {
+  def inherited(value: Int): Int = value
+  def current: Int = 1
+  def transform(value: Int): Int = value
+}
+
+class Child extends Base {
+  val call = inherited(1)
+  val property = current
+  val eta: Int => Int = transform
+}
+
+class UnrelatedBase {
+  def inherited(value: Int): Int = value
+  def current: Int = 2
+  def transform(value: Int): Int = value + 1
+}
+
+class UnrelatedChild extends UnrelatedBase {
+  val unrelatedCall = inherited(2)
+  val unrelatedProperty = current
+  val unrelatedEta: Int => Int = transform
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected) in [
+        ("app.Base.inherited", "val call = inherited(1)"),
+        ("app.Base.current", "val property = current"),
+        ("app.Base.transform", "val eta: Int => Int = transform"),
+    ] {
+        let args = serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string();
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args)
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let usage = only_result(&value);
+        assert_eq!(usage["status"], "found", "{value}");
+        assert_eq!(usage["total_hits"], 1, "{value}");
+        assert!(
+            usage["files"][0]["hits"][0]["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains(expected)),
+            "expected {expected:?}: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_labels_override_declarations_and_reports_resolved_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

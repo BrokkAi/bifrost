@@ -28,6 +28,7 @@ pub(super) struct TargetSpec {
     receiver_owner_fq_names: HashSet<String>,
     pub(super) arity: Option<usize>,
     pub(super) is_extension_method: bool,
+    pub(super) unapplied_reference_is_unambiguous: bool,
 }
 
 impl TargetSpec {
@@ -53,6 +54,7 @@ impl TargetSpec {
                 owner_name: Some(owner_name),
                 arity: None,
                 is_extension_method: false,
+                unapplied_reference_is_unambiguous: false,
             });
         }
 
@@ -86,7 +88,15 @@ impl TargetSpec {
         } else {
             target.identifier().to_string()
         };
-        let member_owners = trait_member_owners(scala, &owner, kind, &member_name, arity);
+        let unapplied_reference_is_unambiguous = kind == TargetKind::Method
+            && scala.signatures(target).len() <= 1
+            && scala
+                .definitions(&target.fq_name())
+                .filter(CodeUnit::is_function)
+                .take(2)
+                .count()
+                == 1;
+        let member_owners = inherited_member_owners(scala, &owner, kind, &member_name, arity);
         let family_owner_fq_names = member_owners
             .family_owners
             .iter()
@@ -114,6 +124,7 @@ impl TargetSpec {
             receiver_owner_fq_names,
             arity,
             is_extension_method,
+            unapplied_reference_is_unambiguous,
         })
     }
 
@@ -152,7 +163,7 @@ enum DirectMemberState {
     None,
 }
 
-fn trait_member_owners(
+fn inherited_member_owners(
     scala: &ScalaAnalyzer,
     owner: &Option<CodeUnit>,
     kind: TargetKind,
@@ -167,9 +178,9 @@ fn trait_member_owners(
     };
     let mut family_owners = vec![owner.clone()];
     let mut receiver_owners = vec![owner.clone()];
-    if !matches!(kind, TargetKind::Method | TargetKind::Field)
-        || !scala.is_scala_trait_declaration(owner)
-    {
+    let supports_inherited_owner = kind == TargetKind::Method
+        || (kind == TargetKind::Field && scala.is_scala_trait_declaration(owner));
+    if !supports_inherited_owner {
         return TraitMemberOwners {
             family_owners,
             receiver_owners,
