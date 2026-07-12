@@ -19,7 +19,8 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 20:50Z) Committed and pushed parent-lookup fix `b842208a`, then completed the full 10,000-site/1,000-target C# run in 425.0 seconds (7:07 wall) at 6,969,144 KiB peak RSS; the canonical record contains 598 consistent, 40 unproven, 1,339 missing, and 8,023 inconclusive sites.
 - [x] (2026-07-12 21:11Z) Reduced the first correctness boundary under an authoritative one-file scope, filed #698, fixed C# method-return recognition and qualified-type usage ranges, passed 59 focused tests, affected all-feature clippy, and the complete `nlp,python` test gate, then changed the exact Azure site from missing to consistent in 146.7 seconds.
 - [x] (2026-07-12 21:18Z) Pushed fixing commit `7ccce3dd` to `master` and closed #698 with the reduced regression and exact Azure evidence.
-- [ ] Triage the remaining C# missing sites from exact production reruns after the #698 checkpoint lands.
+- [x] (2026-07-12 21:31Z) Completed the fixing-HEAD full C# N=1 rerun in 486.4 seconds: consistent sites rose from 598 to 1,717 and missing sites fell from 1,339 to 220, an 83.6% reduction.
+- [ ] Reduce the dominant residual explicit-interface declaration boundary, represented by 73 sites whose forward focus resolves the interface owner in declarations such as `IEventListener.Token` and `IResourceInternal.Name`.
 
 ## Surprises & Discoveries
 
@@ -33,6 +34,8 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: The writable 1,000-site/100-target run was stopped after 17m44s at 10,112,644 KiB peak RSS. GDB captured `csharp_extension_method_candidates -> parent_of -> definitions -> declaration_candidate_rows_by_short_name -> SQLite`. Each member already carries its declaring namespace in `CodeUnit::package_name`, and the parsed per-file `children` map carries its exact structural owner.
 - Observation: The dominant partial-interface report was not caused by partial target grouping or authoritative candidate handling.
   Evidence: The reduced three-file query reached the consumer and produced a terminal `IReplicaSet` hit, but the production focus was the nonterminal `ADDomainServices` segment in a method return type. Tree-sitter C# calls that field `returns`, while `is_type_reference_node` recognized only `type` and `return_type`; after recognizing `returns`, the inverse hit still needed the containing `qualified_name` range to cover the forward-focused segment.
+- Observation: #698 removed the dominant qualified-type cluster but left a smaller set of distinct structured roles.
+  Evidence: `/tmp/csharp-n1-698-fixed.jsonl` completed from `3b2e2665` with 1,717 consistent and 220 missing sites, versus 598 consistent and 1,339 missing before the fix. Residual source-shape partitioning found 73 qualified interface owners in explicit member declarations, 39 generic `PropertyT<T>` type sites, 34 `using static` imports, 33 function targets, two field targets, and 39 other class sites.
 
 ## Decision Log
 
@@ -48,7 +51,7 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 
 ## Outcomes & Retrospective
 
-The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes in 425.0 seconds instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. The first dominant correctness boundary was fixed, pushed, and closed as #698 by `7ccce3dd`: C# method returns use the grammar field `returns`, and proven qualified-type references must emit the containing type range rather than only the terminal identifier. The reduced authoritative-scope regression passes, and exact bytes `5677..5693` now classify consistent.
+The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. The first dominant correctness boundary was fixed, pushed, and closed as #698 by `7ccce3dd`: C# method returns use the grammar field `returns`, and proven qualified-type references must emit the containing type range rather than only the terminal identifier. The exact site now classifies consistent, and the fixing-HEAD full rerun reduced missing sites to 220. The next dominant cluster is the interface-owner reference embedded in explicit interface member declarations.
 
 ## Context and Orientation
 
@@ -80,6 +83,8 @@ The full committed-HEAD result is the final line of `.agents/docs/reference-diff
 
 The fixed #698 exact result is `/tmp/csharp-exact-type-replica-698-fixed.jsonl`. It completed in 146.7 seconds with one forward-resolved site, one consistent classification, zero missing classifications, and an inverse hit covering bytes `5642..5712` around the requested `5677..5693` focus.
 
+The full fixing-HEAD result is `/tmp/csharp-n1-698-fixed.jsonl`, pinned to plan-only HEAD `3b2e26657c430eced2e074ca825359ca59ff5e61` whose analyzer code is `7ccce3dd`. It completed in 486.4 seconds with the same 3,269 forward-resolved sites, 1,717 consistent, 40 unproven, 220 missing, and 8,023 inconclusive.
+
 `cargo clippy --all-targets --all-features -- -D warnings` reached an unrelated uncommitted `tests/rust_analyzer_goto_definition.rs` edit and failed on its line 65 `needless_borrow`. That file was left untouched. `cargo clippy --lib --all-features -- -D warnings` and `cargo clippy --test get_definition_test --all-features -- -D warnings` both pass for this change.
 
 ## Interfaces and Dependencies
@@ -89,3 +94,5 @@ The analyzer cache schema stores `CodeUnit::identifier()` in `code_units.identif
 Revision note (2026-07-12): Created from the Azure PowerShell production profile before implementation.
 
 Revision note (2026-07-12): Recorded the reduced, pushed, and closed #698 correctness boundary plus exact production validation so continued C# triage starts from proven current behavior rather than the pre-fix missing report.
+
+Revision note (2026-07-12): Recorded the full post-#698 C# rerun and partitioned its 220 residual sites, making explicit-interface owner declarations the next reduced-test boundary.

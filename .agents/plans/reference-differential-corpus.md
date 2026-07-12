@@ -58,6 +58,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 20:50Z) Pushed C# parent lookup fix `b842208a` and completed the full Azure PowerShell N=1 record in 425.0 seconds: 3,269 forward-resolved sites, 598 consistent, 40 unproven, 1,339 missing, and 8,023 inconclusive. Initial triage shows 1,304 class/type targets; exact production rerun confirms the dominant fully qualified partial/interface type boundary, but no correctness issue is filed until a reduced authoritative-scope regression pins the resolver gap.
 - [x] (2026-07-12 21:11Z) Pinned the first C# correctness boundary with a three-file authoritative-scope regression, filed #698, recognized tree-sitter C#'s `returns` field, and emitted qualified-type hits on their containing AST node. The exact Azure bytes `5677..5693` changed from missing to consistent in 146.7 seconds; focused tests, affected all-feature clippy, and the complete `nlp,python` test gate pass.
 - [x] (2026-07-12 21:18Z) Pushed `7ccce3dd` to `master` and closed #698 with the exact Azure evidence; the next C# step is a complete fixing-HEAD rerun before triaging residual sites.
+- [x] (2026-07-12 21:31Z) Completed the post-#698 full C# rerun at `3b2e2665` in 486.4 seconds. Consistent sites increased from 598 to 1,717 and missing sites fell from 1,339 to 220; 73 residuals form the next explicit-interface owner declaration boundary.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -106,6 +107,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: C# fully qualified method-return sites exposed a focus-range asymmetry rather than a partial-declaration or authoritative-scope failure.
   Evidence: The reduced #698 query received both partial interface declarations and only the consumer candidate, yet initially emitted only the terminal parameter-type identifier. The grammar names method return types `returns`, and the differential had focused `ADDomainServices` inside the qualified return. Recognizing that field and emitting the containing qualified type produced a covering `5642..5712` hit for exact site `5677..5693`.
+
+- Observation: The #698 range/return-role fix removed 83.6% of the C# actionable set and exposed several smaller structured roles.
+  Evidence: `/tmp/csharp-n1-698-fixed.jsonl` retained the same 3,269 forward-resolved sites but changed consistent/missing from 598/1,339 to 1,717/220. The largest residual is 73 interface-owner focuses inside explicit interface property and method declarations; other buckets include generic `PropertyT<T>` arguments, `using static` imports, functions, and miscellaneous class roles.
 
 ## Decision Log
 
@@ -253,3 +257,5 @@ Revision note (2026-07-12): Corrected the #643 diagnosis after debugger capture 
 Revision note (2026-07-12): Recorded the first complete Rust differential triage and the #644/#645 root fixes, including the macro-token field gap found by exact-site validation.
 
 Revision note (2026-07-12): Recorded pushed and closed #698 and its exact Azure production proof, separating C# qualified-type focus/range semantics from partial target grouping and authoritative candidate routing.
+
+Revision note (2026-07-12): Recorded the full post-#698 C# rerun, its 83.6% missing-site reduction, and the next explicit-interface declaration triage boundary.
