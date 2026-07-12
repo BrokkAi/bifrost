@@ -3732,6 +3732,217 @@ fn scan_usages_accepts_location_target_without_symbols() {
 }
 
 #[test]
+fn scan_usages_by_location_matches_ruby_mixin_benchmark_cases() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/billing/auditable.rb",
+            r#"module Billing
+  module Auditable
+    def audit
+      "audit"
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/formatting.rb",
+            r#"module Billing
+  module Formatting
+    def total_label
+      "from-prepended-formatting"
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/findable.rb",
+            r#"module Billing
+  module Findable
+    def find(id)
+      "found-#{id}"
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/invoice.rb",
+            r#"require_relative "auditable"
+require_relative "formatting"
+
+module Billing
+  class Invoice
+    include Auditable
+    prepend Formatting
+
+    def total_label
+      "from-invoice"
+    end
+
+    def self.build
+      Invoice.new
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/user.rb",
+            r#"require_relative "findable"
+
+module Billing
+  class User
+    extend Findable
+  end
+
+  class LegacyUser
+    include Findable
+  end
+end
+"#,
+        )
+        .file(
+            "app/report.rb",
+            r#"require_relative "../lib/billing/invoice"
+require_relative "../lib/billing/user"
+
+class InvoiceReport
+  def render
+    invoice = Billing::Invoice.build
+    invoice.audit
+    invoice.total_label
+    Billing::User.find(42)
+    Billing::LegacyUser.new.find(7)
+    invoice.public_send(:audit)
+  end
+end
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/billing/auditable.rb","line":3,"column":9},{"path":"lib/billing/formatting.rb","line":3,"column":9},{"path":"lib/billing/findable.rb","line":3,"column":9}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let results = results(&value);
+
+    assert_eq!(3, results.len(), "payload: {value}");
+    for (symbol, expected_hits) in [
+        ("Billing$Auditable.audit", 2),
+        ("Billing$Formatting.total_label", 1),
+        ("Billing$Findable.find", 2),
+    ] {
+        assert!(
+            results.iter().any(|result| {
+                result["symbol"] == symbol
+                    && result["status"] == "found"
+                    && result["total_hits"] == expected_hits
+            }),
+            "missing {symbol}: {value}"
+        );
+    }
+}
+
+#[test]
+fn scan_usages_by_location_traverses_declarationless_ruby_loaders() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/greeter.rb",
+            r#"class Greeter
+  def hello
+    "hello"
+  end
+end
+"#,
+        )
+        .file(
+            "lib/loader.rb",
+            r#"require_relative "greeter"
+"#,
+        )
+        .file(
+            "app/main.rb",
+            r#"require_relative "../lib/loader"
+
+Greeter.new.hello
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/greeter.rb","line":2,"column":7}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("Greeter.hello", result["symbol"], "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(1, result["total_hits"], "payload: {value}");
+}
+
+#[test]
+fn scan_usages_by_location_matches_ruby_autoload_benchmark_case() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/shop/discount.rb",
+            r#"module Shop
+  class Discount
+    def self.default
+      new
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/shop/product.rb",
+            r#"module Shop
+  class Product
+  end
+
+  autoload :Discount, "shop/discount"
+end
+"#,
+        )
+        .file(
+            "app/catalog.rb",
+            r#"require_relative "../lib/shop/product"
+
+product = Shop::Product.new
+Shop::Discount.default
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/shop/discount.rb","line":2,"column":9}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("Shop$Discount", result["symbol"], "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(2, result["total_hits"], "payload: {value}");
+}
+
+#[test]
 fn scan_usages_by_location_selector_preserves_python_module_target() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
