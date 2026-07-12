@@ -16,7 +16,8 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 20:30Z) Rebuilt release `0.7.6`, separated sandbox cache-write failure from analyzer cost, completed the schema-v10 cache population far enough to enter the differential, and captured the surviving per-candidate parent-definition query.
 - [x] (2026-07-12 20:38Z) Routed C# parent lookup through the per-file structural child map and used the member's persisted namespace directly for extension visibility; all 35 focused definition tests and affected all-feature clippy targets pass.
 - [x] (2026-07-12 20:38Z) Completed the warm 1,000-site/100-target Azure PowerShell smoke in 232.1 seconds: 336 resolved sites, 41 consistent, 3 unproven, 82 missing, and 874 inconclusive; peak RSS was 6,972,940 KiB.
-- [ ] Commit and push the parent-lookup fix, rerun the full C# corpus command from committed HEAD, and exact-rerun public missing boundaries.
+- [x] (2026-07-12 20:50Z) Committed and pushed parent-lookup fix `b842208a`, then completed the full 10,000-site/1,000-target C# run in 425.0 seconds (7:07 wall) at 6,969,144 KiB peak RSS; the canonical record contains 598 consistent, 40 unproven, 1,339 missing, and 8,023 inconclusive sites.
+- [ ] Triage the 1,339 missing sites from exact production reruns; the first confirmed boundary is fully qualified partial/interface type references under authoritative one-file scope.
 
 ## Surprises & Discoveries
 
@@ -40,7 +41,7 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 
 ## Outcomes & Retrospective
 
-The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented. A warm production smoke now completes instead of remaining indefinitely in forward resolution. The 100-target smoke completed in 232.1 seconds with 6,972,940 KiB peak RSS and wrote a valid record; the full 1,000-target committed-HEAD corpus run and correctness triage remain pending.
+The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes in 425.0 seconds instead of remaining indefinitely in forward resolution. Its 1,339 actionable sites are a correctness-triage backlog: 1,304 target classes/types, 33 functions, and two fields. An exact rerun of `ReplicaSet.TypeConverter.cs` bytes `5677..5693` reproduced the dominant fully qualified partial-interface type miss in 155.9 seconds. No correctness issue has been filed yet because the reduced authoritative-scope regression and root resolver boundary still need to be pinned.
 
 ## Context and Orientation
 
@@ -67,6 +68,8 @@ All tests and corpus commands are repeatable. The interrupted pre-fix run wrote 
 The pre-fix process was stopped with exit 130 after issue #686 was filed. Its 1.1 GB persisted cache is intentionally retained for the post-fix comparison.
 
 The schema-v10 migration and query measurements must run outside the Codex filesystem sandbox because the corpus clone cache lives under `/mnt/T9/repo-clones`. Sandboxed migration attempts fail blob writes and retain dirty parsed states, so their RSS is not valid product evidence. The writable cold 1,000-site/100-target run was stopped after 17m44s at 10,112,644 KiB peak RSS after GDB proved it had entered the surviving parent-definition query. The fixed warm smoke record is `/tmp/bifrost-csharp-structural-parent-warm.jsonl`.
+
+The full committed-HEAD result is the final line of `.agents/docs/reference-differential/n1.jsonl`, pinned to `b842208a23fa7b620848c96da0db05d617bb848d`. The representative exact type result is `/tmp/csharp-exact-type-replica.jsonl`. The record is marked `bifrost_dirty=true` solely because the shared worktree retains unrelated user/untracked artifacts; the release binary and reported HEAD are pinned to the pushed commit.
 
 `cargo clippy --all-targets --all-features -- -D warnings` reached an unrelated uncommitted `tests/rust_analyzer_goto_definition.rs` edit and failed on its line 65 `needless_borrow`. That file was left untouched. `cargo clippy --lib --all-features -- -D warnings` and `cargo clippy --test get_definition_test --all-features -- -D warnings` both pass for this change.
 
