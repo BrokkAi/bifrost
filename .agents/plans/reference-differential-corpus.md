@@ -37,6 +37,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 03:05Z) Triaged all 473 Scala missing classifications into 25 wrong forward identities, 219 genuine inverse omissions, and 229 non-defects/artifacts; exact current-code probes confirmed four production boundaries and #661-#664 were filed.
 - [x] (2026-07-13 03:35Z) Implemented and symbols-tested #663 by extending the existing Scala hierarchy-family usage proof from traits to class methods while preserving overload buckets, conflicts, caps, and exact unrelated-base negatives.
 - [x] (2026-07-13 03:45Z) Implemented and symbols-tested #655 with AST-derived full focused `use` paths and one exact Rust path-to-FQN resolver shared by forward definition lookup and inverse runtime call proof; import-only sites remain excluded.
+- [x] (2026-07-13 03:55Z) Implemented and symbols-tested #664: Scala forward lookup now gives lexical bindings precedence and validates term/type namespace visibility before accepting indexed identities.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.

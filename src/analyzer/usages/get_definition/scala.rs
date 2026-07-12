@@ -113,8 +113,12 @@ pub(super) fn resolve_scala(
             if text.is_empty() {
                 return no_definition("no_reference_text", "Scala identifier is blank");
             }
-            let bindings = scala_bindings_before(ctx, &resolver, root, identifier.start_byte());
-            if scala_is_locally_shadowed(&bindings, text) {
+            if scala_lexical_binding_declares_name_before(
+                root,
+                source,
+                text,
+                identifier.start_byte(),
+            ) {
                 return no_definition(
                     "local_variable_reference",
                     format!("`{text}` is a local Scala value"),
@@ -123,7 +127,7 @@ pub(super) fn resolve_scala(
             if let Some(fqn) = resolver.resolve_member(text) {
                 return scala_fqn_outcome(support, &fqn, text);
             }
-            if let Some(fqn) = resolver.resolve(text) {
+            if let Some(fqn) = scala_resolve_visible_term(ctx, &resolver, identifier, text) {
                 return scala_fqn_outcome(support, &fqn, text);
             }
             if let Some(owner) =
@@ -227,6 +231,7 @@ fn scala_type_lookup_node_fqn(
             ctx,
             resolver,
             scala_node_text(node, ctx.source),
+            node.start_byte(),
         )
         .map(|fqn| ScalaTypeLookupResolution::Type {
             fqn,
@@ -293,6 +298,7 @@ fn scala_declaration_name_type_fqn(
                     ctx,
                     resolver,
                     scala_node_text(type_node, ctx.source),
+                    type_node.start_byte(),
                 )
             })
         }
@@ -309,6 +315,7 @@ fn scala_declaration_name_type_fqn(
                     ctx,
                     resolver,
                     scala_node_text(type_node, ctx.source),
+                    type_node.start_byte(),
                 )
             })
         }
@@ -319,6 +326,7 @@ fn scala_declaration_name_type_fqn(
                     ctx,
                     resolver,
                     scala_node_text(type_node, ctx.source),
+                    type_node.start_byte(),
                 )
             }),
         _ => {
@@ -498,16 +506,16 @@ fn resolve_scala_type(
     if text.is_empty() {
         return no_definition("no_reference_text", "Scala type reference is blank");
     }
-    if !scala_is_type_position(node) {
-        let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
-        if scala_is_locally_shadowed(&bindings, text) {
-            return no_definition(
-                "local_variable_reference",
-                format!("`{text}` is a local Scala value"),
-            );
-        }
+    if !scala_is_type_position(node)
+        && scala_lexical_binding_declares_name_before(root, ctx.source, text, node.start_byte())
+    {
+        return no_definition(
+            "local_variable_reference",
+            format!("`{text}` is a local Scala value"),
+        );
     }
-    if let Some(fqn) = resolver.resolve(text) {
+    if let Some(fqn) = scala_resolve_visible_type_annotation(ctx, resolver, text, node.start_byte())
+    {
         return scala_fqn_outcome(ctx.support, &fqn, text);
     }
     if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, scala_simple_name(text)) {
@@ -572,8 +580,12 @@ fn resolve_scala_call(
             if name.is_empty() {
                 return no_definition("no_function_name", "Scala call name is blank");
             }
-            let bindings = scala_bindings_before(ctx, resolver, root, function.start_byte());
-            if scala_is_locally_shadowed(&bindings, name) {
+            if scala_lexical_binding_declares_name_before(
+                root,
+                ctx.source,
+                name,
+                function.start_byte(),
+            ) {
                 return no_definition(
                     "local_variable_reference",
                     format!("`{name}` is a local Scala value"),
@@ -612,7 +624,9 @@ fn resolve_scala_call(
             ) {
                 return imported_member;
             }
-            if let Some(owner_fqn) = resolver.resolve(name) {
+            if let Some(owner_fqn) =
+                scala_resolve_visible_type_annotation(ctx, resolver, name, function.start_byte())
+            {
                 return scala_apply_or_type_outcome(ctx.support, &owner_fqn, name);
             }
             if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name) {
@@ -852,7 +866,7 @@ fn resolve_scala_stable_identifier(
     let bindings = scala_bindings_before(ctx, resolver, root, identifier.start_byte());
     let owner = first_precise(&bindings, owner_text).or_else(|| {
         (!bindings.is_shadowed(owner_text))
-            .then(|| resolver.resolve(owner_text))
+            .then(|| scala_resolve_visible_term_owner(ctx, resolver, root, identifier, owner_text))
             .flatten()
     });
     if let Some(owner) = owner {
@@ -1444,7 +1458,12 @@ fn scala_enclosing_class_parameter_type(
                 }
                 return parameter.child_by_field_name("type").and_then(|type_node| {
                     let type_text = scala_node_text(type_node, ctx.source);
-                    scala_resolve_receiver_type_annotation(ctx, resolver, type_text)
+                    scala_resolve_receiver_type_annotation(
+                        ctx,
+                        resolver,
+                        type_text,
+                        type_node.start_byte(),
+                    )
                 });
             }
             return None;
@@ -1460,6 +1479,25 @@ fn scala_active_path_declares_name_before(
     name: &str,
     cutoff_start: usize,
 ) -> bool {
+    scala_active_path_declares_name_before_mode(root, source, name, cutoff_start, true)
+}
+
+fn scala_lexical_binding_declares_name_before(
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+    cutoff_start: usize,
+) -> bool {
+    scala_active_path_declares_name_before_mode(root, source, name, cutoff_start, false)
+}
+
+fn scala_active_path_declares_name_before_mode(
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+    cutoff_start: usize,
+    include_callable_names: bool,
+) -> bool {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.start_byte() >= cutoff_start {
@@ -1468,7 +1506,8 @@ fn scala_active_path_declares_name_before(
         let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
         let contains_cutoff = node.start_byte() <= cutoff_start && cutoff_start < node.end_byte();
         if enters_scope && !contains_cutoff {
-            if node.kind() == "function_definition"
+            if include_callable_names
+                && node.kind() == "function_definition"
                 && scala_node_declares_name_before(node, source, name, 0, cutoff_start)
             {
                 return true;
@@ -1590,8 +1629,14 @@ fn scala_existing_package_type_fqn(
     type_text: &str,
 ) -> Option<String> {
     let fqn = scala_package_type_fqn(package, type_text)?;
-    let exists = analyzer.definitions(&fqn).any(|unit| unit.is_class());
-    exists.then_some(fqn)
+    if analyzer.definitions(&fqn).any(|unit| unit.is_class()) {
+        return Some(fqn);
+    }
+    let object_fqn = format!("{fqn}$");
+    analyzer
+        .definitions(&object_fqn)
+        .any(|unit| unit.is_class())
+        .then_some(object_fqn)
 }
 
 fn scala_package_type_fqn(package: &str, type_text: &str) -> Option<String> {
@@ -1627,9 +1672,15 @@ fn scala_resolve_visible_type_annotation(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
     type_text: &str,
+    reference_byte: usize,
 ) -> Option<String> {
-    if type_text.trim().ends_with(".type") {
-        return scala_resolve_type_annotation(resolver, type_text);
+    if let Some(base) = type_text.trim().strip_suffix(".type") {
+        let owner = scala_resolve_visible_type_annotation(ctx, resolver, base, reference_byte)?;
+        return Some(if owner.ends_with('$') {
+            owner
+        } else {
+            format!("{owner}$")
+        });
     }
     let current_package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
     let resolved = scala_resolve_type_annotation(resolver, type_text);
@@ -1644,16 +1695,62 @@ fn scala_resolve_visible_type_annotation(
     }
     scala_package_name_of(ctx.scala, ctx.file)
         .and_then(|package| scala_existing_package_type_fqn(ctx.analyzer, &package, type_text))
-        .or(resolved)
+        .or_else(|| scala_enclosing_type_fqn(ctx, type_text, reference_byte))
+        .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
 }
 
 fn scala_resolve_receiver_type_annotation(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
     type_text: &str,
+    reference_byte: usize,
 ) -> Option<String> {
-    scala_resolve_visible_type_annotation(ctx, resolver, type_text)
-        .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+    scala_resolve_visible_type_annotation(ctx, resolver, type_text, reference_byte)
+}
+
+fn scala_enclosing_type_fqn(
+    ctx: ScalaLookupCtx<'_>,
+    type_text: &str,
+    reference_byte: usize,
+) -> Option<String> {
+    let simple = scala_simple_name(type_text);
+    if simple.is_empty() || simple.contains('.') {
+        return None;
+    }
+    let owner = scala_enclosing_class(ctx.analyzer, ctx.file, reference_byte)?;
+    let candidate = format!("{}.{simple}", owner.fq_name());
+    ctx.analyzer
+        .definitions(&candidate)
+        .any(|unit| unit.is_class())
+        .then_some(candidate)
+}
+
+fn scala_resolve_visible_term(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    node: Node<'_>,
+    name: &str,
+) -> Option<String> {
+    let owner = scala_resolve_visible_type_annotation(ctx, resolver, name, node.start_byte())?;
+    if owner.ends_with('$') {
+        return Some(owner);
+    }
+    let companion = format!("{owner}$");
+    (!ctx.support.fqn(&companion).is_empty()).then_some(companion)
+}
+
+fn scala_resolve_visible_term_owner(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    node: Node<'_>,
+    name: &str,
+) -> Option<String> {
+    let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
+    if bindings.is_shadowed(name) {
+        return first_precise(&bindings, name);
+    }
+    scala_resolve_visible_type_annotation(ctx, resolver, name, node.start_byte())
 }
 
 fn scala_type_annotation_has_explicit_import(ctx: ScalaLookupCtx<'_>, type_text: &str) -> bool {
@@ -1946,7 +2043,7 @@ fn scala_seed_parameter(
         .filter(|type_node| type_node.end_byte() <= cutoff_start)
         .and_then(|type_node| {
             let type_text = scala_node_text(type_node, ctx.source);
-            scala_resolve_receiver_type_annotation(ctx, resolver, type_text)
+            scala_resolve_receiver_type_annotation(ctx, resolver, type_text, type_node.start_byte())
         });
     scala_seed_typed(binding_name, resolved, false, bindings);
 }
@@ -1967,6 +2064,7 @@ fn scala_seed_value_definition(
                 ctx,
                 resolver,
                 scala_node_text(type_node, ctx.source),
+                type_node.start_byte(),
             )
         })
         .or_else(|| {
@@ -1982,7 +2080,14 @@ fn scala_seed_value_definition(
                 })
                 .or_else(|| {
                     scala_constructor_type_text(scala_node_text(node, ctx.source)).and_then(
-                        |type_text| scala_resolve_visible_type_annotation(ctx, resolver, type_text),
+                        |type_text| {
+                            scala_resolve_visible_type_annotation(
+                                ctx,
+                                resolver,
+                                type_text,
+                                node.start_byte(),
+                            )
+                        },
                     )
                 })
         });
@@ -2107,7 +2212,14 @@ fn scala_constructed_type(
                 |unit| unit.is_class(),
             )
             .map(|unit| unit.fq_name())
-            .or_else(|| scala_resolve_visible_type_annotation(ctx, resolver, type_text))
+            .or_else(|| {
+                scala_resolve_visible_type_annotation(
+                    ctx,
+                    resolver,
+                    type_text,
+                    type_node.start_byte(),
+                )
+            })
         })
 }
 
@@ -2169,10 +2281,6 @@ fn scala_seed_typed(
         None if !is_direct_member => bindings.declare_shadow(name.to_string()),
         None => {}
     }
-}
-
-fn scala_is_locally_shadowed(bindings: &LocalInferenceEngine<String>, name: &str) -> bool {
-    bindings.is_shadowed(name) && bindings.resolve_symbol(name).is_unknown()
 }
 
 fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
