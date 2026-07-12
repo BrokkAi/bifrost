@@ -980,7 +980,7 @@ fn csharp_extension_method_candidates(
         .declaration_candidates_by_identifier(member)
         .into_iter()
         .filter(|unit| unit.is_function() && unit.identifier() == member)
-        .filter(|unit| csharp_extension_declaring_type_is_visible(csharp, &namespaces, unit))
+        .filter(|unit| csharp_extension_declaring_type_is_visible(&namespaces, unit))
         .filter(|unit| csharp_is_extension_method(analyzer, unit))
         .collect();
     sort_units(&mut candidates);
@@ -1001,16 +1001,10 @@ fn csharp_extension_method_candidates(
     candidates
 }
 
-fn csharp_extension_declaring_type_is_visible(
-    analyzer: &dyn IAnalyzer,
-    namespaces: &[String],
-    unit: &CodeUnit,
-) -> bool {
-    analyzer.parent_of(unit).is_some_and(|owner| {
-        namespaces
-            .iter()
-            .any(|namespace| owner.package_name() == namespace)
-    })
+fn csharp_extension_declaring_type_is_visible(namespaces: &[String], unit: &CodeUnit) -> bool {
+    namespaces
+        .iter()
+        .any(|namespace| unit.package_name() == namespace)
 }
 
 fn csharp_receiver_type_units(

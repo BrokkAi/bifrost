@@ -11635,6 +11635,14 @@ fn csharp_extension_lookup_uses_identifier_index_and_preserves_proof_filters() {
         .build();
     let analyzer = brokk_bifrost::CSharpAnalyzer::new(project.project_dyn());
     analyzer.reset_full_declaration_scan_count_for_test();
+    let extension_file = project.file("Visible/Extensions.cs");
+    let extension = brokk_bifrost::IAnalyzer::declarations(&analyzer, &extension_file)
+        .into_iter()
+        .find(|unit| unit.fq_name() == "Visible.Extensions.Convert")
+        .expect("visible extension declaration");
+    let owner = brokk_bifrost::IAnalyzer::parent_of(&analyzer, &extension)
+        .expect("extension method structural owner");
+    assert_eq!(owner.fq_name(), "Visible.Extensions");
     let line = "namespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }";
 
     let value = brokk_bifrost::searchtools::get_definitions_by_location(

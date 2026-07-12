@@ -13,7 +13,10 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 23:15Z) Added a public regression covering visible and hidden namespaces, extension and ordinary methods, overload arity, and zero full scans.
 - [x] (2026-07-12 23:20Z) Ran all 34 C# definition tests and the cache schema tests successfully.
 - [x] (2026-07-13) Passed formatting, all-target/all-feature clippy, the 710-test `nlp,python` library suite, and focused C# extension tests.
-- [ ] Rebuild release, rerun the full C# corpus command, and exact-rerun public missing boundaries.
+- [x] (2026-07-12 20:30Z) Rebuilt release `0.7.6`, separated sandbox cache-write failure from analyzer cost, completed the schema-v10 cache population far enough to enter the differential, and captured the surviving per-candidate parent-definition query.
+- [x] (2026-07-12 20:38Z) Routed C# parent lookup through the per-file structural child map and used the member's persisted namespace directly for extension visibility; all 35 focused definition tests and affected all-feature clippy targets pass.
+- [x] (2026-07-12 20:38Z) Completed the warm 1,000-site/100-target Azure PowerShell smoke in 232.1 seconds: 336 resolved sites, 41 consistent, 3 unproven, 82 missing, and 874 inconclusive; peak RSS was 6,972,940 KiB.
+- [ ] Commit and push the parent-lookup fix, rerun the full C# corpus command from committed HEAD, and exact-rerun public missing boundaries.
 
 ## Surprises & Discoveries
 
@@ -21,6 +24,10 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: GDB showed `resolve_definition_batch_with_source -> resolve_csharp -> csharp_extension_method_candidates -> parent_of -> definitions -> rebase_project_file_to_root`; RSS was stable near 8.8 GB.
 - Observation: Persisted C# member short names include their owner, such as `Extensions.Convert`, so exact short-name lookup for `Convert` cannot return extension candidates.
   Evidence: `csharp/declarations.rs` constructs method short names from `parent.short_name()` and the method identifier; the focused public regression failed with no candidate under the initial approach.
+- Observation: Sandboxed corpus runs cannot perform analyzer schema migration because the clone cache is outside the writable workspace; failed blob writes retain dirty file states and invalidate RSS conclusions.
+  Evidence: The sandboxed smoke reached about 8.1 GiB RSS, but GDB showed `build_persisted -> reconcile_file_states -> write_parsed_blob`. The explicitly unsandboxed run committed schema-v10 rows and later entered `run_reference_differential`.
+- Observation: After writable cache population reached the forward batch, extension visibility still queried generic FQN-derived parents once per exact identifier candidate.
+  Evidence: The writable 1,000-site/100-target run was stopped after 17m44s at 10,112,644 KiB peak RSS. GDB captured `csharp_extension_method_candidates -> parent_of -> definitions -> declaration_candidate_rows_by_short_name -> SQLite`. Each member already carries its declaring namespace in `CodeUnit::package_name`, and the parsed per-file `children` map carries its exact structural owner.
 
 ## Decision Log
 
@@ -33,7 +40,7 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 
 ## Outcomes & Retrospective
 
-The exact identifier index and public behavior regression are implemented and pass the local CI-equivalent gates. Full-corpus timing remains pending until the release binary is rebuilt; schema version 9 intentionally requires a one-time analyzer-cache rebuild so the identifier lookup is genuinely indexed.
+The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented. A warm production smoke now completes instead of remaining indefinitely in forward resolution. The 100-target smoke completed in 232.1 seconds with 6,972,940 KiB peak RSS and wrote a valid record; the full 1,000-target committed-HEAD corpus run and correctness triage remain pending.
 
 ## Context and Orientation
 
@@ -58,6 +65,10 @@ All tests and corpus commands are repeatable. The interrupted pre-fix run wrote 
 ## Artifacts and Notes
 
 The pre-fix process was stopped with exit 130 after issue #686 was filed. Its 1.1 GB persisted cache is intentionally retained for the post-fix comparison.
+
+The schema-v10 migration and query measurements must run outside the Codex filesystem sandbox because the corpus clone cache lives under `/mnt/T9/repo-clones`. Sandboxed migration attempts fail blob writes and retain dirty parsed states, so their RSS is not valid product evidence. The writable cold 1,000-site/100-target run was stopped after 17m44s at 10,112,644 KiB peak RSS after GDB proved it had entered the surviving parent-definition query. The fixed warm smoke record is `/tmp/bifrost-csharp-structural-parent-warm.jsonl`.
+
+`cargo clippy --all-targets --all-features -- -D warnings` reached an unrelated uncommitted `tests/rust_analyzer_goto_definition.rs` edit and failed on its line 65 `needless_borrow`. That file was left untouched. `cargo clippy --lib --all-features -- -D warnings` and `cargo clippy --test get_definition_test --all-features -- -D warnings` both pass for this change.
 
 ## Interfaces and Dependencies
 
