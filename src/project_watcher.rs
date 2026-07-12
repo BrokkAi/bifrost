@@ -101,17 +101,23 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
     }
 
     let mut saw_relevant_path = false;
+    let mut saw_refresh_fallback_path = false;
     for path in &event.paths {
-        if let Some(project_file) = normalize_project_file(project.as_ref(), path) {
-            let mut state = pending
-                .lock()
-                .expect("project watcher pending state poisoned");
-            state.files.insert(project_file);
-            saw_relevant_path = true;
+        match classify_project_path(project.as_ref(), path) {
+            PathDisposition::ProjectFile(project_file) => {
+                let mut state = pending
+                    .lock()
+                    .expect("project watcher pending state poisoned");
+                state.files.insert(project_file);
+                saw_relevant_path = true;
+            }
+            PathDisposition::IgnoredInternal => {}
+            PathDisposition::RefreshFallback => saw_refresh_fallback_path = true,
         }
     }
 
     if !saw_relevant_path
+        && saw_refresh_fallback_path
         && matches!(
             event.kind,
             EventKind::Any | EventKind::Other | EventKind::Modify(_) | EventKind::Remove(_)
@@ -121,11 +127,19 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
     }
 }
 
-fn normalize_project_file(project: &dyn Project, path: &Path) -> Option<ProjectFile> {
+enum PathDisposition {
+    ProjectFile(ProjectFile),
+    IgnoredInternal,
+    RefreshFallback,
+}
+
+fn classify_project_path(project: &dyn Project, path: &Path) -> PathDisposition {
     let path = path.to_path_buf().normalize();
-    let rel_path = path.strip_prefix(project.root()).ok()?;
+    let Ok(rel_path) = path.strip_prefix(project.root()) else {
+        return PathDisposition::RefreshFallback;
+    };
     if rel_path.as_os_str().is_empty() {
-        return None;
+        return PathDisposition::RefreshFallback;
     }
     // The unified SQLite cache writes inside the watched workspace. Treating
     // those writes as source changes repeatedly invalidates analyzer snapshots.
@@ -134,15 +148,15 @@ fn normalize_project_file(project: &dyn Project, path: &Path) -> Option<ProjectF
         .next()
         .is_some_and(|component| component.as_os_str() == crate::gitblob::CACHE_DIR_NAME)
     {
-        return None;
+        return PathDisposition::IgnoredInternal;
     }
 
     let file = ProjectFile::new(project.root().to_path_buf(), rel_path.to_path_buf());
     if file.exists() && project.is_gitignored(rel_path) {
-        return None;
+        return PathDisposition::RefreshFallback;
     }
 
-    Some(file)
+    PathDisposition::ProjectFile(file)
 }
 
 fn mark_full_refresh(pending: &Arc<Mutex<PendingChanges>>) {
@@ -199,11 +213,14 @@ fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_project_file, watch_roots};
+    use super::{PendingChanges, handle_event, watch_roots};
+    use crate::ProjectFile;
     use crate::path_normalization::NormalizePath;
     use crate::{FilesystemProject, Project};
+    use notify::event::{ModifyKind, RemoveKind};
+    use notify::{Event, EventKind};
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn project_with_files(paths: &[&str]) -> (TempDir, Arc<dyn Project>) {
@@ -249,16 +266,57 @@ mod tests {
     }
 
     #[test]
-    fn internal_cache_changes_are_not_project_changes() {
+    fn internal_cache_events_do_not_trigger_project_updates() {
         let (_temp, project) = project_with_files(&["src/main.rs"]);
         let cache_dir = project.root().join(crate::gitblob::CACHE_DIR_NAME);
         fs::create_dir_all(&cache_dir).unwrap();
         let cache_db = cache_dir.join(crate::cache_db::CACHE_DB_FILE_NAME);
         fs::write(&cache_db, "cache state").unwrap();
 
-        assert_eq!(normalize_project_file(project.as_ref(), &cache_db), None);
-        assert!(
-            normalize_project_file(project.as_ref(), &project.root().join("src/main.rs")).is_some()
+        for kind in [
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::Any),
+        ] {
+            let pending = Arc::new(Mutex::new(PendingChanges::default()));
+            handle_event(
+                &project,
+                &pending,
+                Event::new(kind).add_path(cache_db.clone()),
+            );
+
+            let state = pending.lock().unwrap();
+            assert!(state.files.is_empty());
+            assert!(!state.requires_full_refresh);
+        }
+    }
+
+    #[test]
+    fn source_events_are_incremental_but_git_events_trigger_full_refresh() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        let source = ProjectFile::new(project.root().to_path_buf(), "src/main.rs");
+        let source_pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &source_pending,
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(source.abs_path()),
         );
+        let source_state = source_pending.lock().unwrap();
+        assert_eq!(source_state.files.len(), 1);
+        assert!(source_state.files.contains(&source));
+        assert!(!source_state.requires_full_refresh);
+        drop(source_state);
+
+        let git_head = project.root().join(".git/HEAD");
+        fs::create_dir_all(git_head.parent().unwrap()).unwrap();
+        fs::write(&git_head, "ref: refs/heads/main\n").unwrap();
+        let git_pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &git_pending,
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(git_head),
+        );
+        let git_state = git_pending.lock().unwrap();
+        assert!(git_state.files.is_empty());
+        assert!(git_state.requires_full_refresh);
     }
 }
