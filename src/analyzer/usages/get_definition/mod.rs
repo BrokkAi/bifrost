@@ -221,7 +221,7 @@ pub(crate) fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
 ) -> Vec<DefinitionLookupOutcome> {
-    let mut context = DefinitionBatchContext::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     requests
         .into_iter()
         .map(|request| resolve_one(analyzer, &mut context, request))
@@ -234,7 +234,7 @@ pub(crate) fn resolve_definition_batch_with_source(
     file: ProjectFile,
     source: Arc<String>,
 ) -> Vec<DefinitionLookupOutcome> {
-    let mut context = DefinitionBatchContext::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
     requests
         .into_iter()
@@ -258,7 +258,7 @@ pub(crate) fn resolve_call_reference_definition_with_source(
         return None;
     }
 
-    let mut context = DefinitionBatchContext::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, false);
     context.sources.insert(file, Ok(source));
     let source = context.source(&request.file).ok()?;
     let tree = context.tree(&request.file, language, &source)?;
@@ -272,6 +272,7 @@ pub(crate) fn resolve_call_reference_definition_with_source(
 struct DefinitionBatchContext<'a> {
     analyzer: &'a dyn IAnalyzer,
     support: OnceLock<&'a DefinitionLookupIndex>,
+    rust_support: Option<rust::AnalyzerRustDefinitionProvider<'a>>,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
@@ -280,10 +281,12 @@ struct DefinitionBatchContext<'a> {
 }
 
 impl<'a> DefinitionBatchContext<'a> {
-    fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+    fn new(analyzer: &'a dyn IAnalyzer, cache_rust_lookups: bool) -> Self {
         Self {
             analyzer,
             support: OnceLock::new(),
+            rust_support: resolve_analyzer::<RustAnalyzer>(analyzer)
+                .map(|rust| rust::AnalyzerRustDefinitionProvider::new(rust, cache_rust_lookups)),
             sources: HashMap::default(),
             trees: HashMap::default(),
             line_starts: HashMap::default(),
@@ -419,13 +422,18 @@ fn resolve_one(
         }
     }
     let resolved = match language {
-        Language::Rust => rust::resolve_rust(
-            analyzer,
-            &rust::AnalyzerRustDefinitionProvider::new(analyzer),
-            &request.file,
-            &source,
-            tree.as_ref(),
-            &site,
+        Language::Rust => context.rust_support.as_ref().map_or_else(
+            || no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable"),
+            |support| {
+                rust::resolve_rust(
+                    analyzer,
+                    support,
+                    &request.file,
+                    &source,
+                    tree.as_ref(),
+                    &site,
+                )
+            },
         ),
         Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts(
             analyzer,

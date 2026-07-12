@@ -61,6 +61,7 @@ const SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT: usize = 5;
 const SCAN_USAGES_SCOPE_PATH_LIMIT: usize = 5;
 const SCAN_USAGES_SCOPE_PATH_MAX_BYTES: usize = 256;
 pub const TYPE_LOOKUP_MAX_REFERENCES: usize = 100;
+pub const DEFINITION_LOOKUP_MAX_REFERENCES: usize = 100;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
 
@@ -1211,6 +1212,27 @@ pub fn get_definitions_by_location(
     params: GetDefinitionParams,
 ) -> GetDefinitionResult {
     let _scope = profiling::scope("searchtools::get_definitions_by_location");
+
+    if params.references.len() > DEFINITION_LOOKUP_MAX_REFERENCES {
+        return GetDefinitionResult {
+            results: vec![DefinitionLookupResult {
+                query: DefinitionReferenceQuery {
+                    path: String::new(),
+                    line: None,
+                    column: None,
+                },
+                status: "invalid_location".to_string(),
+                reference: None,
+                definitions: Vec::new(),
+                diagnostics: vec![DefinitionDiagnostic {
+                    kind: "too_many_references".to_string(),
+                    message: format!(
+                        "get_definitions_by_location accepts at most {DEFINITION_LOOKUP_MAX_REFERENCES} references per call"
+                    ),
+                }],
+            }],
+        };
+    }
 
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut pending = Vec::new();

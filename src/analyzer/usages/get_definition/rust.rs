@@ -7,34 +7,64 @@ use crate::analyzer::rust::lexical_scope;
 use crate::analyzer::rust::rust_focused_use_path;
 use crate::analyzer::usages::rust_graph::RustDefinitionProvider;
 use crate::hash::{HashMap, HashSet};
+use std::cell::RefCell;
 
 pub(super) struct AnalyzerRustDefinitionProvider<'a> {
-    analyzer: &'a dyn IAnalyzer,
+    rust: &'a RustAnalyzer,
+    cache_lookups: bool,
+    fqns: RefCell<HashMap<String, Vec<CodeUnit>>>,
+    file_identifiers: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
 }
 
 impl<'a> AnalyzerRustDefinitionProvider<'a> {
-    pub(super) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
-        Self { analyzer }
+    pub(super) fn new(rust: &'a RustAnalyzer, cache_lookups: bool) -> Self {
+        Self {
+            rust,
+            cache_lookups,
+            fqns: RefCell::new(HashMap::default()),
+            file_identifiers: RefCell::new(HashMap::default()),
+        }
     }
 }
 
 impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut units: Vec<_> = self.analyzer.definitions(fqn).collect();
+        if self.cache_lookups
+            && let Some(units) = self.fqns.borrow().get(fqn)
+        {
+            return units.clone();
+        }
+        let mut units: Vec<_> = self.rust.definitions(fqn).collect();
         sort_units(&mut units);
         units.dedup();
+        if self.cache_lookups {
+            self.fqns
+                .borrow_mut()
+                .insert(fqn.to_string(), units.clone());
+        }
         units
     }
 
     fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        if self.cache_lookups {
+            let key = (file.clone(), identifier.to_string());
+            if let Some(units) = self.file_identifiers.borrow().get(&key) {
+                return units.clone();
+            }
+        }
         let mut units: Vec<_> = self
-            .analyzer
+            .rust
             .declarations(file)
             .into_iter()
             .filter(|unit| unit.identifier() == identifier)
             .collect();
         sort_units(&mut units);
         units.dedup();
+        if self.cache_lookups {
+            self.file_identifiers
+                .borrow_mut()
+                .insert((file.clone(), identifier.to_string()), units.clone());
+        }
         units
     }
 }
