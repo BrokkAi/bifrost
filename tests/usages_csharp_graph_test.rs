@@ -611,6 +611,104 @@ namespace Demo.Models {
 }
 
 #[test]
+fn usage_finder_csharp_finds_generic_method_type_arguments_in_authoritative_file_scope() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Json/JsonString.First.cs",
+            "namespace Demo.Json { public sealed partial class JsonString { } }\n",
+        ),
+        (
+            "Json/JsonString.Second.cs",
+            "namespace Demo.Json { public sealed partial class JsonString { } }\n",
+        ),
+        (
+            "Runtime/Consumer.cs",
+            r#"
+namespace Demo.Other {
+    public sealed class JsonString { }
+}
+
+namespace Demo.Runtime {
+    public static class Helpers {
+        public static T PropertyT<T>() => default(T);
+        public static T JsonString<T>() => default(T);
+    }
+
+    public sealed class Generic<JsonString> { }
+
+    public sealed class Consumer {
+        public object Read() {
+            var first = Helpers.PropertyT<Demo.Json.JsonString>();
+            var second = Helpers.PropertyT<Demo.Json.JsonString>();
+            var unrelated = Helpers.PropertyT<Demo.Other.JsonString>();
+            var method = Helpers.JsonString<int>();
+            return second;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let targets: Vec<_> = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == "Demo.Json.JsonString"
+        })
+        .cloned()
+        .collect();
+    assert_eq!(targets.len(), 2, "expected both partial type declarations");
+    let consumer = project.file("Runtime/Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "the explicit authoritative scope should contain only the consumer"
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("generic method type argument usage query should resolve");
+
+    let source = consumer.read_to_string().expect("consumer source");
+    let positive_arguments: Vec<_> = source.match_indices("Demo.Json.JsonString").collect();
+    assert_eq!(positive_arguments.len(), 2, "expected two positive calls");
+    for (type_argument, _) in positive_arguments {
+        let segment_start = type_argument + "Demo.".len();
+        let segment_end = segment_start + "Json".len();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.start_offset <= segment_start && segment_end <= hit.end_offset),
+            "generic method type argument should cover its nonterminal segment {segment_start}..{segment_end}: {hits:#?}"
+        );
+    }
+
+    for unrelated in [
+        source
+            .find("Demo.Other.JsonString")
+            .expect("unrelated qualified type"),
+        source
+            .find("JsonString<int>")
+            .expect("same-named generic method"),
+        source
+            .find("JsonString> { }")
+            .expect("same-named type parameter"),
+    ] {
+        let unrelated_end = unrelated + "JsonString".len();
+        assert!(
+            hits.iter()
+                .all(|hit| { !(hit.start_offset <= unrelated && unrelated_end <= hit.end_offset) }),
+            "unrelated same-named syntax must not become a target type hit: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn usage_finder_csharp_routes_global_using_references() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (

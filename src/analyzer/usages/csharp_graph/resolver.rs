@@ -995,6 +995,9 @@ pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) ->
         if parent.kind() == "type" {
             return true;
         }
+        if parent.kind() == "type_argument_list" {
+            return true;
+        }
         if parent.kind() == "explicit_interface_specifier" {
             return true;
         }
@@ -1016,12 +1019,7 @@ pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) ->
         }
         if matches!(
             parent.kind(),
-            "qualified_name"
-                | "generic_name"
-                | "nullable_type"
-                | "array_type"
-                | "type_argument_list"
-                | "base_list"
+            "qualified_name" | "generic_name" | "nullable_type" | "array_type" | "base_list"
         ) {
             node = parent;
             continue;

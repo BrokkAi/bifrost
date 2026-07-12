@@ -63,6 +63,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 21:50Z) Pushed `2b617770` and closed #701 with exact and full-suite evidence.
 - [x] (2026-07-12 22:12Z) Rejected the first full post-#701 record after it silently lost audited candidate files between forward and inverse phases; filed #703 and made the engine retain the original audited scope or fail explicitly.
 - [x] (2026-07-12 22:35Z) Validated #703 with a complete post-#701 C# rerun at `c8524f86`: all 1,000 configured groups were queried, candidate-loss notes fell to zero, and the trustworthy C# missing set fell from 220 to 144.
+- [x] (2026-07-12 22:38Z) Pushed `85aa48cd` and closed #703 with stable-scope production evidence.
+- [x] (2026-07-12 23:17Z) Delegated and independently reviewed the next 39-site C# cluster, filed #704, treated generic argument lists as their own structured type boundary, passed focused/negative coverage, and changed the exact BillingBenefits site from missing to consistent.
+- [x] (2026-07-12 23:24Z) Passed the complete `cargo test --features nlp,python` validation gate for #704; affected all-feature library and C# test clippy targets also pass.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -123,6 +126,12 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: The stable-scope rerun proved #701 removed 76 valid missing classifications and exposed 144 trustworthy residuals.
   Evidence: `/tmp/csharp-n1-703-fixed.jsonl` queried all 1,000 configured target groups with zero candidate-loss notes, producing 1,793 consistent, 40 unproven, 144 missing, and 8,023 inconclusive sites. The largest next cluster is 39 C# generic type arguments inside generated `PropertyT<T>` calls.
+
+- Observation: C# generic method type arguments need a type-role stop at `type_argument_list`, not traversal into the callable `generic_name`.
+  Evidence: The primary and delegated authoritative fixtures failed with zero hits before #704 and passed repeated exact positives plus three negative roles afterward. Exact BillingBenefits bytes `4325..4335` became consistent with a full qualified-argument hit.
+
+- Observation: Exact-site mode unnecessarily inventories every analyzed file before selecting its requested path.
+  Evidence: The post-#704 exact C# probe audited one file and one site but enumerated 126,829 eligible files and took 1,134.4 seconds. Avoiding this inventory is a campaign-engine performance task separate from analyzer correctness.
 
 ## Decision Log
 
@@ -282,3 +291,5 @@ Revision note (2026-07-12): Recorded delegated #701 investigation, complete vali
 Revision note (2026-07-12): Recorded #703 after rejecting the invalid post-#701 C# record and made stable audited scope a campaign-engine invariant.
 
 Revision note (2026-07-12): Recorded the valid post-#701/#703 full C# rerun and the next 39-site generic-argument boundary.
+
+Revision note (2026-07-12): Recorded delegated #704 investigation, exact production proof, and exact-mode full-inventory cost for the next engine optimization.
