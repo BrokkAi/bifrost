@@ -40,6 +40,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 03:55Z) Implemented and symbols-tested #664: Scala forward lookup now gives lexical bindings precedence and validates term/type namespace visibility before accepting indexed identities.
 - [x] (2026-07-13 04:15Z) Implemented and symbols-tested #660 with shared Rust struct-field AST roles, exact literal/pattern owner proof, lexical `Self`, declaration no-definition behavior, and matching differential sampler exclusion.
 - [x] (2026-07-13 04:25Z) Implemented and symbols-tested #662 with AST-level Scala companion-`apply` and infix lowering, exact receiver/owner proof, symbolic-method candidate routing, caps, and unrelated-owner negatives.
+- [x] (2026-07-13 04:40Z) Implemented and symbols-tested #659 by reusing forward Rust expression-type resolution on exact inverse receiver nodes, with tri-state owner proof across parameters, typed locals, nested fields, and returned values.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
