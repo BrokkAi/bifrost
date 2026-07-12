@@ -4702,6 +4702,80 @@ const direct = ApiClient.create("/direct");
 }
 
 #[test]
+fn scan_usages_location_accepts_scala_display_selectors_for_object_members() {
+    let source = r#"package example
+
+object Defaults {
+  val Prefix = "job"
+}
+
+object Service {
+  def build: String = Defaults.Prefix
+}
+
+class ConsoleRenderer
+object ConsoleRenderer {
+  def default: ConsoleRenderer = new ConsoleRenderer
+}
+
+object Syntax {
+  extension (value: String)
+    def slug: String = value.toLowerCase
+}
+
+object App {
+  import ConsoleRenderer.{default => renderer}
+  import Syntax.*
+  val service = Service.build
+  val prefix = Defaults.Prefix
+  val console = renderer
+  val second = renderer
+  val slugged = "Hello World".slug
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("example/Workflow.scala", source)
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let line_of = |needle: &str| {
+        source
+            .lines()
+            .position(|line| line.contains(needle))
+            .map(|line| line + 1)
+            .unwrap_or_else(|| panic!("missing source line containing `{needle}`"))
+    };
+
+    for (selector, declaration_line, expected_hits) in [
+        ("example.Service.build", line_of("def build"), 1),
+        ("example.Defaults.Prefix", line_of("val Prefix"), 2),
+        ("example.ConsoleRenderer.default", line_of("def default"), 2),
+        ("example.Syntax.slug", line_of("def slug"), 1),
+    ] {
+        let args = serde_json::json!({
+            "targets": [{
+                "path": "example/Workflow.scala",
+                "line": declaration_line,
+                "symbol": selector,
+            }],
+            "include_tests": true,
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_location", &args.to_string())
+            .expect("Scala location scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let result = only_result(&value);
+
+        assert_eq!("found", result["status"], "selector {selector}: {value}");
+        assert_eq!(
+            expected_hits, result["total_hits"],
+            "selector {selector}: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_location_target_does_not_select_nested_same_line_member() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
