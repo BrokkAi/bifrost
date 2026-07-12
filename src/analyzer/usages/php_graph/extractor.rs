@@ -56,7 +56,10 @@ pub(super) fn scan_file(
     let ctx = php.file_context_from_source(file, &source);
 
     let line_starts = compute_line_starts(&source);
-    if matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
+    if matches!(
+        spec.kind,
+        TargetKind::Constructor | TargetKind::Method | TargetKind::Field
+    ) {
         scan_member_patterns(
             php,
             tree.root_node(),
@@ -69,7 +72,8 @@ pub(super) fn scan_file(
             spec,
             hits,
         );
-    } else {
+    }
+    if !matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
         scan_node(
             tree.root_node(),
             analyzer,
@@ -317,7 +321,10 @@ fn scan_member_patterns(
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    if !matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
+    if !matches!(
+        spec.kind,
+        TargetKind::Constructor | TargetKind::Method | TargetKind::Field
+    ) {
         return;
     }
     let Some(owner) = spec.owner_fq_name.as_deref() else {
@@ -579,7 +586,7 @@ fn record_member_hit(
                 ctx,
                 engine,
             )
-            .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy))
+            .is_some_and(|fq| receiver_type_matches(php, &fq, owner, hierarchy))
             {
                 push_member_hit(member_node, analyzer, file, source, line_starts, spec, hits);
             }
@@ -596,6 +603,7 @@ fn record_member_hit(
                 return;
             }
             if !static_receiver_matches(
+                php,
                 analyzer,
                 file,
                 member_node.start_byte(),

@@ -50,9 +50,11 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
             files.insert(target.source().clone());
         }
 
-        let hierarchy = matches!(spec.kind, TargetKind::Method | TargetKind::Field).then(|| {
-            PhpHierarchyIndex::for_target_owner(self.php, &spec, &files, scan_scope.cancellation())
-        });
+        let hierarchy = matches!(
+            spec.kind,
+            TargetKind::Constructor | TargetKind::Method | TargetKind::Field
+        )
+        .then(|| PhpHierarchyIndex::for_target_owner(self.php, &spec));
         let empty_hierarchy = PhpHierarchyIndex::default();
         let hierarchy = hierarchy.as_ref().unwrap_or(&empty_hierarchy);
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();

@@ -3873,6 +3873,90 @@ function run() {
 }
 
 #[test]
+fn scan_usages_by_reference_resolves_javascript_namespace_export_aliases() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "fixtures.js",
+            "function readFixtureKey() {}\nmodule.exports = { readKey: readFixtureKey };\n",
+        )
+        .file(
+            "other.js",
+            "function readOtherKey() {}\nmodule.exports = { readKey: readOtherKey };\n",
+        )
+        .file(
+            "consumer.js",
+            r#"
+const fixtures = require("./fixtures");
+const other = require("./other");
+
+exports.run = function() {
+  fixtures.readKey();
+  other.readKey();
+};
+"#,
+        )
+        .file(
+            "esm-fixtures.js",
+            "function loadFixtureKey() {}\nexport { loadFixtureKey as loadKey };\n",
+        )
+        .file(
+            "esm-other.js",
+            "function loadOtherKey() {}\nexport { loadOtherKey as loadKey };\n",
+        )
+        .file(
+            "esm-consumer.js",
+            r#"
+import * as fixtures from "./esm-fixtures.js";
+import * as other from "./esm-other.js";
+
+export function run() {
+  fixtures.loadKey();
+  other.loadKey();
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["readFixtureKey"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+
+    assert_eq!(result["status"], "found", "payload: {value}");
+    assert_eq!(result["total_hits"], 1, "payload: {value}");
+    assert_eq!(
+        result["files"][0]["path"], "consumer.js",
+        "payload: {value}"
+    );
+    assert_eq!(result["files"][0]["hits"][0]["line"], 6, "payload: {value}");
+    assert_eq!(result["unproven_hits"], 0, "payload: {value}");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["loadFixtureKey"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+
+    assert_eq!(result["status"], "found", "payload: {value}");
+    assert_eq!(result["total_hits"], 1, "payload: {value}");
+    assert_eq!(
+        result["files"][0]["path"], "esm-consumer.js",
+        "payload: {value}"
+    );
+    assert_eq!(result["files"][0]["hits"][0]["line"], 6, "payload: {value}");
+    assert_eq!(result["unproven_hits"], 0, "payload: {value}");
+}
+
+#[test]
 fn scan_usages_location_target_uses_column_on_same_line_declarations() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -4610,6 +4694,145 @@ fn scan_usages_paths_scope_blocks_jvm_php_scala_target_source_leakage() {
         only_result(&scala_value)["total_hits"].as_u64().unwrap(),
         "payload: {scala_value}"
     );
+}
+
+#[test]
+fn scan_usages_php_scoped_paths_use_workspace_hierarchy_proof() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "Contracts.php",
+            r#"<?php
+namespace App\Contracts;
+trait JoinTrait {
+    public function add_joins(array $joins): void {}
+}
+"#,
+        )
+        .file(
+            "FormBase.php",
+            r#"<?php
+namespace App\Forms;
+class BaseForm { public function display(): void {} }
+"#,
+        )
+        .file(
+            "FactoryBase.php",
+            r#"<?php
+namespace App\Factory;
+class BaseFactory { public static function create(): void {} }
+"#,
+        )
+        .file(
+            "ServiceBases.php",
+            r#"<?php
+namespace App\Service;
+class BaseService { public function __construct() {} }
+class OtherBase { public function __construct() {} }
+"#,
+        )
+        .file(
+            "TraitRelations.php",
+            r#"<?php
+namespace App\Model;
+use App\Contracts\JoinTrait;
+class ReportColumn { use JoinTrait; }
+class OtherColumn { public function add_joins(array $joins): void {} }
+"#,
+        )
+        .file(
+            "FormRelations.php",
+            r#"<?php
+namespace App\Forms;
+class ChildForm extends BaseForm {}
+class OtherForm { public function display(): void {} }
+"#,
+        )
+        .file(
+            "FactoryRelations.php",
+            r#"<?php
+namespace App\Factory;
+class ChildFactory extends BaseFactory {}
+class OtherFactory { public static function create(): void {} }
+"#,
+        )
+        .file(
+            "Caller.php",
+            r#"<?php
+namespace App;
+use App\Model\ReportColumn;
+use App\Model\OtherColumn;
+use App\Forms\ChildForm;
+use App\Forms\OtherForm;
+use App\Factory\ChildFactory;
+use App\Factory\OtherFactory;
+
+$column = new ReportColumn();
+$column->add_joins([]);
+$otherColumn = new OtherColumn();
+$otherColumn->add_joins([]);
+
+$form = new ChildForm();
+$form->display();
+$otherForm = new OtherForm();
+$otherForm->display();
+
+ChildFactory::create();
+OtherFactory::create();
+"#,
+        )
+        .file(
+            "ParentCalls.php",
+            r#"<?php
+namespace App\Service;
+class ChildService extends BaseService {
+    public function __construct() { parent::__construct(); }
+}
+class OtherChild extends OtherBase {
+    public function __construct() { parent::__construct(); }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, path, expected) in [
+        (
+            "App.Contracts.JoinTrait.add_joins",
+            "Caller.php",
+            "$column->add_joins([])",
+        ),
+        (
+            "App.Forms.BaseForm.display",
+            "Caller.php",
+            "$form->display()",
+        ),
+        (
+            "App.Factory.BaseFactory.create",
+            "Caller.php",
+            "ChildFactory::create()",
+        ),
+        (
+            "App.Service.BaseService.__construct",
+            "ParentCalls.php",
+            "App.Service.ChildService.__construct",
+        ),
+    ] {
+        let args = serde_json::json!({
+            "symbols": [symbol],
+            "include_tests": true,
+            "paths": [path],
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args.to_string())
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = only_result(&value);
+
+        assert_eq!(result["status"], "found", "payload: {value}");
+        assert_eq!(result["total_hits"], 1, "payload: {value}");
+        assert!(payload.contains(expected), "payload: {value}");
+    }
 }
 
 #[test]

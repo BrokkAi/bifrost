@@ -74,39 +74,26 @@ impl TargetSpec {
 pub(super) struct PhpHierarchyIndex {
     owner_fq_name: Option<String>,
     owner_is_interface: bool,
-    descendant_fq_names: HashSet<String>,
 }
 
 impl PhpHierarchyIndex {
-    pub(super) fn for_target_owner(
-        php: &PhpAnalyzer,
-        spec: &TargetSpec,
-        files: &HashSet<ProjectFile>,
-        cancellation: Option<&CancellationToken>,
-    ) -> Self {
+    pub(super) fn for_target_owner(php: &PhpAnalyzer, spec: &TargetSpec) -> Self {
         let Some(owner) = spec.owner.as_ref() else {
             return Self::default();
         };
         let owner_fq_name = owner.fq_name();
-        let descendant_fq_names = files
-            .iter()
-            .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
-            .flat_map(|file| php.declarations(file))
-            .filter(|unit| unit.is_class())
-            .filter(|unit| unit.fq_name() != owner_fq_name)
-            .filter(|unit| class_is_subtype_of_owner(php, unit, &owner_fq_name))
-            .map(|unit| unit.fq_name())
-            .collect();
         Self {
             owner_fq_name: Some(owner_fq_name),
             owner_is_interface: php.is_interface(owner),
-            descendant_fq_names,
         }
     }
 
-    fn is_subtype(&self, receiver_fq_name: &str, owner: &str) -> bool {
+    fn is_subtype(&self, php: &PhpAnalyzer, receiver_fq_name: &str, owner: &str) -> bool {
         self.owner_fq_name.as_deref() == Some(owner)
-            && self.descendant_fq_names.contains(receiver_fq_name)
+            && php
+                .definitions(receiver_fq_name)
+                .filter(CodeUnit::is_class)
+                .any(|unit| class_is_subtype_of_owner(php, &unit, owner))
     }
 
     pub(super) fn overriding_methods(
@@ -119,13 +106,16 @@ impl PhpHierarchyIndex {
         if !self.owner_is_interface || !matches!(spec.kind, TargetKind::Method) {
             return Vec::new();
         }
+        let Some(owner_fq_name) = spec.owner_fq_name.as_deref() else {
+            return Vec::new();
+        };
 
         files
             .iter()
             .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
             .flat_map(|file| php.declarations(file))
             .filter(|unit| unit.is_class())
-            .filter(|unit| self.descendant_fq_names.contains(&unit.fq_name()))
+            .filter(|unit| self.is_subtype(php, &unit.fq_name(), owner_fq_name))
             .flat_map(|owner| php.direct_children(&owner))
             .filter(|child| child.is_function() && child.identifier() == spec.member_name)
             .collect()
@@ -152,6 +142,7 @@ fn class_is_subtype_of_owner(
 }
 
 pub(super) fn receiver_type_matches(
+    php: &PhpAnalyzer,
     receiver_fq_name: &str,
     owner: &str,
     hierarchy: &PhpHierarchyIndex,
@@ -159,11 +150,12 @@ pub(super) fn receiver_type_matches(
     if receiver_fq_name == owner {
         return true;
     }
-    hierarchy.is_subtype(receiver_fq_name, owner)
+    hierarchy.is_subtype(php, receiver_fq_name, owner)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn static_receiver_matches(
+    php: &PhpAnalyzer,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     start: usize,
@@ -175,17 +167,26 @@ pub(super) fn static_receiver_matches(
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
     match receiver {
-        "self" | "static" => {
-            receiver_is_enclosing_subtype(analyzer, file, start, end, line_starts, owner, hierarchy)
-        }
+        "self" | "static" => receiver_is_enclosing_subtype(
+            php,
+            analyzer,
+            file,
+            start,
+            end,
+            line_starts,
+            owner,
+            hierarchy,
+        ),
         "parent" => enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
-            .is_some_and(|enclosing_owner| hierarchy.is_subtype(&enclosing_owner, owner)),
+            .is_some_and(|enclosing_owner| hierarchy.is_subtype(php, &enclosing_owner, owner)),
         _ => resolve_php_type(receiver, ctx)
-            .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy)),
+            .is_some_and(|fq| receiver_type_matches(php, &fq, owner, hierarchy)),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn receiver_is_enclosing_subtype(
+    php: &PhpAnalyzer,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     start: usize,
@@ -195,7 +196,7 @@ pub(super) fn receiver_is_enclosing_subtype(
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
     enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
-        .is_some_and(|receiver| receiver_type_matches(&receiver, owner, hierarchy))
+        .is_some_and(|receiver| receiver_type_matches(php, &receiver, owner, hierarchy))
 }
 
 pub(super) fn enclosing_owner_fq_name_at(

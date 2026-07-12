@@ -68,10 +68,11 @@ pub(super) fn scan_files_for_seeds(
         if source.is_empty() {
             return;
         }
-        // Any structured reference we can resolve must still spell the target
-        // identifier/member in source; skip parsing importer files that cannot
-        // contain a match.
-        if !source.contains(reference_needle) {
+        let edges = index.matching_edges_for_importer(file, seeds);
+        // A same-file reference must spell the declaration name. Importers may
+        // instead spell an exported alias, whose identity is carried by `edges`
+        // and `seeds` and is resolved structurally below.
+        if edges.is_empty() && !source.contains(reference_needle) {
             return;
         }
         let mut parser = Parser::new();
@@ -90,7 +91,6 @@ pub(super) fn scan_files_for_seeds(
         let source_str = source.as_str();
         let tree_ref = &tree;
 
-        let edges = index.matching_edges_for_importer(file, seeds);
         let imports = index.binders_by_file.get(file).cloned().unwrap_or_default();
         let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
@@ -118,6 +118,7 @@ pub(super) fn scan_files_for_seeds(
             target_short: &target_short,
             target_member: target_member.as_deref(),
             edges: &edges,
+            seeds,
             target_self_file,
             target_is_static_member: is_static_member(target),
             target_owner: target_owner.as_ref(),
@@ -169,6 +170,8 @@ pub(super) struct ScanCtx<'a> {
     target_member: Option<&'a str>,
     /// Import edges from this file that resolve to the target's seed set.
     edges: &'a [ImportEdge],
+    /// Exported names that resolve to the target, including local and re-export aliases.
+    seeds: &'a BTreeSet<(ProjectFile, String)>,
     /// True when this scan is over the target's own defining file (used to also catch
     /// in-file references that don't go through an import binding).
     target_self_file: bool,
@@ -252,14 +255,22 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "namespace_import"
             | "export_clause"
             | "export_specifier"
-    ) || (kind == "expression_statement" && is_commonjs_export_statement(node, ctx.source))
-    {
+    ) {
         if kind == "import_statement" {
             handle_import_statement(node, ctx);
         }
         if introduces_scope {
             ctx.scope_stack.pop();
             ctx.binding_engine.exit_scope();
+        }
+        return;
+    }
+    if kind == "expression_statement" && is_commonjs_export_statement(node, ctx.source) {
+        if let Some(value) = node
+            .named_child(0)
+            .and_then(|assignment| assignment.child_by_field_name("right"))
+        {
+            scan_commonjs_export_bodies(value, ctx);
         }
         return;
     }
@@ -287,6 +298,21 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if introduces_scope {
         ctx.scope_stack.pop();
         ctx.binding_engine.exit_scope();
+    }
+}
+
+fn scan_commonjs_export_bodies(value: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "arrow_function" | "function_expression" | "generator_function" | "method_definition"
+        ) {
+            scan_node(node, ctx);
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
     }
 }
 
@@ -574,7 +600,9 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let namespace_match = ctx.edges.iter().any(|edge| {
         edge.local_name == object_text
             && match &edge.kind {
-                ImportEdgeKind::Namespace => property_text == ctx.target_short,
+                ImportEdgeKind::Namespace => ctx
+                    .seeds
+                    .contains(&(edge.target_file.clone(), property_text.to_string())),
                 ImportEdgeKind::CommonJsRequire(export_name) => property_text == export_name,
                 ImportEdgeKind::Named(_) | ImportEdgeKind::Default => false,
             }
