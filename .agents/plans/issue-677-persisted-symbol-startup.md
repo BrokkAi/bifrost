@@ -16,7 +16,7 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [ ] Migrate remaining symbols resolvers from `DefinitionLookupIndex` to owned, query-shaped analyzer operations backed by indexed SQL candidate reads.
 - [x] (2026-07-13) Add index-build/full-scan counters plus warm multi-language, blob-reuse, sibling-module, and bounded-hydration regressions for the Go vertical slice.
 - [x] (2026-07-13) Pass formatting, all-target/all-feature clippy, focused Go/persistence tests, and the complete `nlp,python` suite.
-- [ ] Measure cold build, warm open, peak RSS, and targeted query latency on `aws__aws-sdk-go-v2` and record the evidence.
+- [x] (2026-07-13) Measure schema-v9 cold population and warm exact forward/inverse resolution on `aws__aws-sdk-go-v2`.
 
 ## Surprises & Discoveries
 
@@ -78,7 +78,7 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 
 ## Outcomes & Retrospective
 
-The first Go forward-definition vertical slice is implemented. A warm persisted multi-language public `get_definitions_by_location` regression resolves an imported package member whose import-path tail differs from its declared package name, with zero warm-build parse events, zero delegate/composite definition-index builds, and zero full declaration scans. A sibling-module regression proves the workspace path index is built once and package-clause metadata is read without full file-state hydration. Remaining language migrations and real-corpus measurements are pending.
+The first Go forward-definition vertical slice is implemented. A warm persisted multi-language public `get_definitions_by_location` regression resolves an imported package member whose import-path tail differs from its declared package name, with zero warm-build parse events, zero delegate/composite definition-index builds, and zero full declaration scans. A sibling-module regression proves the workspace path index is built once and package-clause metadata is read without full file-state hydration. On the 25,617-file AWS SDK Go checkout, the one-time schema-v9 population completed in 132.05 seconds at 3,839,280 KiB peak RSS; the identical warm one-site run completed in 10.41 seconds at 401,928 KiB. An exact internal `types.S3Location` forward-plus-inverse probe completed in 10.51 seconds at 402,828 KiB and returned an exact consistent hit. Remaining language migrations are pending.
 
 ## Context and Orientation
 
@@ -127,7 +127,9 @@ All tests and benchmark commands are repeatable. The Go epoch bump invalidates o
 
 ## Artifacts and Notes
 
-The integrated Go query-provider checkpoint passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, the complete `cargo test --features nlp,python` suite, all 35 focused Go definition tests, all 16 canonical-FQN tests, all six persistence tests, and the identical-blob/two-live-path store regression. Benchmark transcripts remain pending.
+The integrated Go query-provider checkpoint passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, the complete `cargo test --features nlp,python` suite, all 35 focused Go definition tests, all 16 canonical-FQN tests, all six persistence tests, and the identical-blob/two-live-path store regression.
+
+Real-corpus commands used the release `bifrost_reference_differential` binary against `/mnt/T9/repo-clones/aws__aws-sdk-go-v2` at repository head `91eca463daf932474778dc4a984c41ecfcd9dc3c`. The cold and warm sampled records are `/tmp/bifrost-go-677-smoke.jsonl` and `/tmp/bifrost-go-677-warm.jsonl`; the resolved exact record is `/tmp/bifrost-go-677-warm-internal2.jsonl` for `service/gamelift/api_op_UpdateScript.go` bytes `2856..2866`.
 
 ## Interfaces and Dependencies
 
