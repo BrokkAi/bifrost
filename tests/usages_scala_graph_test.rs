@@ -4,7 +4,7 @@ use brokk_bifrost::usages::{
     FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
 };
 use brokk_bifrost::{CodeUnit, CodeUnitType, IAnalyzer, Language, ScalaAnalyzer};
-use common::InlineTestProject;
+use common::{InlineTestProject, line_of};
 
 fn scala_analyzer_with_files(
     files: &[(&str, &str)],
@@ -613,14 +613,6 @@ fn assert_no_hit_contains(hits: &[UsageHit], needle: &str) {
         hits.iter().all(|hit| !hit.snippet.contains(needle)),
         "expected no hit containing {needle:?}, got {hits:#?}"
     );
-}
-
-fn line_of(source: &str, needle: &str) -> usize {
-    source
-        .lines()
-        .position(|line| line.contains(needle))
-        .map(|line| line + 1)
-        .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
 }
 
 fn rel_path_string(file: &brokk_bifrost::ProjectFile) -> String {
