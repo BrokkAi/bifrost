@@ -3466,6 +3466,97 @@ fn scan_usages_mcp_call_resolves_ruby_public_send_symbol_dispatch() {
 }
 
 #[test]
+fn scan_usages_location_selects_ruby_macro_generated_methods() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/product.rb",
+            r#"class Product
+  attr_reader :name
+  alias_method :label, :name
+
+  def self.featured
+    new("featured")
+  end
+
+  def summary
+    label
+  end
+end
+"#,
+        )
+        .file(
+            "app/catalog.rb",
+            r#"require "lib/product"
+
+product = Product.featured
+product.name
+product.label
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for (line, column, symbol, expected_snippets) in [
+        (
+            2,
+            16,
+            "Product.name",
+            ["alias_method :label, :name", "product.name"].as_slice(),
+        ),
+        (
+            3,
+            17,
+            "Product.label",
+            ["label", "product.label"].as_slice(),
+        ),
+    ] {
+        let args = serde_json::json!({
+            "targets": [{
+                "path": "lib/product.rb",
+                "line": line,
+                "column": column,
+            }],
+            "include_tests": true,
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_location", &args.to_string())
+            .expect("scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let result = only_result(&value);
+
+        assert_eq!("found", result["status"], "payload: {value}");
+        assert_eq!(symbol, result["symbol"], "payload: {value}");
+        let snippets: Vec<_> = result["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .collect();
+        for expected in expected_snippets {
+            assert!(
+                snippets.iter().any(|snippet| snippet.contains(expected)),
+                "expected {expected} usage: {value}"
+            );
+        }
+    }
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/product.rb","line":3,"column":25}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    assert_eq!(
+        "not_found",
+        only_result(&value)["status"],
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_mcp_call_surfaces_ruby_unproven_sites() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(
