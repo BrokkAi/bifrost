@@ -252,7 +252,14 @@ pub fn run_reference_differential(
         forward_resolve_sites(analyzer, sampled, config, &mut summary, &mut file_errors);
     let groups = resolved_groups(resolved);
     summary.distinct_targets = groups.len();
-    compare_inverse(analyzer, groups, config, &mut records, &mut summary);
+    compare_inverse(
+        analyzer,
+        &audited,
+        groups,
+        config,
+        &mut records,
+        &mut summary,
+    )?;
     recompute_classifications(&records, &mut summary.classifications);
 
     Ok(ReferenceDifferentialReport {
@@ -560,14 +567,15 @@ fn resolved_groups(resolved: Vec<ResolvedSite>) -> Vec<ResolvedGroup> {
 
 fn compare_inverse(
     analyzer: &dyn IAnalyzer,
+    audited_files: &[ProjectFile],
     mut groups: Vec<ResolvedGroup>,
     config: &ReferenceDifferentialConfig,
     records: &mut [ReferenceDifferentialSite],
     summary: &mut ReferenceDifferentialSummary,
-) {
-    let files_by_path: HashMap<String, ProjectFile> = analyzer
-        .analyzed_files()
-        .into_iter()
+) -> Result<(), String> {
+    let files_by_path: HashMap<String, ProjectFile> = audited_files
+        .iter()
+        .cloned()
         .map(|file| (rel_path_string(&file), file))
         .collect();
     groups.sort_by_cached_key(|group| target_group_priority(config.seed, &group.targets));
@@ -602,13 +610,14 @@ fn compare_inverse(
             .filter_map(|path| files_by_path.get(path).cloned())
             .collect();
         if candidate_files.is_empty() {
-            summary.skipped_targets += 1;
-            set_group_inconclusive(
-                records,
-                &group.site_indexes,
-                "no sampled files remained for inverse query",
-            );
-            continue;
+            let target = group
+                .targets
+                .first()
+                .map(CodeUnit::fq_name)
+                .unwrap_or_else(|| "<unknown target>".to_string());
+            return Err(format!(
+                "audited inverse scope lost every sampled file for target `{target}`"
+            ));
         }
         summary.queried_targets += 1;
         let provider = ExplicitCandidateProvider::new(Arc::new(candidate_files.clone()));
@@ -623,6 +632,7 @@ fn compare_inverse(
             );
         classify_group_result(records, &group, query.result, &candidate_files);
     }
+    Ok(())
 }
 
 fn classify_group_result(

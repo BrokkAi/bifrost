@@ -22,7 +22,10 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 21:31Z) Completed the fixing-HEAD full C# N=1 rerun in 486.4 seconds: consistent sites rose from 598 to 1,717 and missing sites fell from 1,339 to 220, an 83.6% reduction.
 - [x] (2026-07-12 21:44Z) Delegated an independent reduced review to `oldskool`, reproduced the 73-site explicit-interface owner boundary locally, filed #701, recognized tree-sitter's structured `explicit_interface_specifier` type role, and passed a two-partial-declaration authoritative regression, all 60 C# graph tests, affected all-feature clippy, and the complete `nlp,python` gate.
 - [x] (2026-07-12 21:44Z) Changed exact Azure `ApiKey.cs` bytes `2898..2913` from missing to consistent with a covering `2839..2913` inverse hit in 317.7 seconds.
-- [ ] Push and close #701, then rerun the full C# N=1 corpus and repartition the remaining sites.
+- [x] (2026-07-12 21:50Z) Pushed `2b617770` to `master` and closed #701 with full validation and exact production evidence.
+- [x] (2026-07-12 22:12Z) Rejected the first post-#701 full record as invalid after it queried only 31 of 1,000 configured target groups and marked 1,910 forward-resolved sites `no sampled files remained for inverse query`; filed #703 and changed inverse comparison to retain the original audited `ProjectFile` scope.
+- [x] (2026-07-12 22:35Z) Validated #703 with a complete 1,000-target C# rerun: zero candidate-loss notes, 1,793 consistent, 40 unproven, 144 missing, and 8,023 inconclusive sites in 1,104.1 seconds. The complete `nlp,python` gate passes.
+- [ ] Push and close #703, then reduce the dominant trustworthy residual: 39 generic type arguments inside generated `PropertyT<T>` calls.
 
 ## Surprises & Discoveries
 
@@ -40,6 +43,10 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: `/tmp/csharp-n1-698-fixed.jsonl` completed from `3b2e2665` with 1,717 consistent and 220 missing sites, versus 598 consistent and 1,339 missing before the fix. Residual source-shape partitioning found 73 qualified interface owners in explicit member declarations, 39 generic `PropertyT<T>` type sites, 34 `using static` imports, 33 function targets, two field targets, and 39 other class sites.
 - Observation: Explicit-interface misses were one omitted tree-sitter role, not an overload-grouping or authoritative-scope defect.
   Evidence: Both the primary inline regression and the delegated `oldskool` reproduction scanned only the implementer and received two partial interface CodeUnits. Pre-fix they emitted only the base-list type hit; `identifier -> qualified_name -> explicit_interface_specifier` returned false from `is_type_reference_node`. Recognizing that parent kind made both explicit property and method owners pass without changing `TargetSpec`, candidate routing, or range expansion.
+- Observation: The first full post-#701 record was not valid campaign evidence despite its `completed` status and five missing classifications.
+  Evidence: `/tmp/csharp-n1-701-fixed.jsonl` began with 126,829 eligible and 1,000 audited files, but inverse comparison rebuilt its path map from a later `analyzer.analyzed_files()` snapshot. Only 31 target groups were queried, 1,672 were skipped, and 1,910 sites became inconclusive because their sampled files disappeared. The engine already possessed the authoritative audited files and had no reason to query mutable liveness again.
+- Observation: Preserving audited scope restored a comparable post-#701 record and showed the explicit-interface fix removed 76 genuine misses.
+  Evidence: `/tmp/csharp-n1-703-fixed.jsonl` queried the configured 1,000 groups with zero candidate-loss notes. Relative to the valid post-#698 baseline, consistent sites rose from 1,717 to 1,793 and missing sites fell from 220 to 144. Runtime rose from 486.4 to 1,104.1 seconds because the newly recognized interface-owner role performs real inverse work that the invalid 31-group record had skipped.
 
 ## Decision Log
 
@@ -55,10 +62,13 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - Decision: Treat `explicit_interface_specifier` as a C# type-reference role in the shared structural predicate.
   Rationale: The grammar gives explicit implementation owners a dedicated node, and its child name is semantically the interface type. The existing qualified-name resolver already proves exact identity, so recognizing the role is sufficient and avoids declaration-text interpretation.
   Date/Author: 2026-07-12 / Codex
+- Decision: Carry the selected audited `ProjectFile` set into inverse comparison and fail the run if any retained target group loses all sampled files.
+  Rationale: Candidate scope is defined by sampled audited sites, not by a later workspace liveness snapshot. Reusing the stable identities prevents false inconclusive records, removes a redundant workspace-wide persisted integrity query, and makes impossible scope loss an engine error rather than silently completed evidence.
+  Date/Author: 2026-07-12 / Codex
 
 ## Outcomes & Retrospective
 
-The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. #698 reduced that set to 220 by aligning method-return roles and qualified ranges. The next 73-site explicit-interface owner cluster is now pinned and exact-validated as #701 through the dedicated grammar role; a full fixing-HEAD rerun remains before the next residual boundary is selected.
+The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. #698 reduced that set to 220 by aligning method-return roles and qualified ranges. #701 is pushed and closed for the explicit-interface owner role and reduced the trustworthy set to 144. #703 repaired the campaign engine's audited-scope drift and is production-validated; the next dominant residual is 39 generic type arguments in generated `PropertyT<T>` calls.
 
 ## Context and Orientation
 
@@ -94,6 +104,10 @@ The full fixing-HEAD result is `/tmp/csharp-n1-698-fixed.jsonl`, pinned to plan-
 
 The fixed #701 exact result is `/tmp/csharp-exact-explicit-interface-701-fixed.jsonl`. It completed in 317.7 seconds with one consistent site and an inverse hit covering bytes `2839..2913` around the requested `2898..2913` focus.
 
+`/tmp/csharp-n1-701-fixed.jsonl` is invalid evidence and must not be used as the post-#701 baseline. Although it reported five missing sites, it queried only 31 target groups and contains 1,910 `no sampled files remained for inverse query` classifications caused by #703.
+
+The canonical post-#701/#703 result is `/tmp/csharp-n1-703-fixed.jsonl`, pinned to `c8524f8693483bf6c6b7cf750eaafd07c82e4fb5`. It completed in 1,104.1 seconds with all 1,000 target groups queried, 1,793 consistent, 40 unproven, 144 missing, and 8,023 inconclusive sites.
+
 `cargo clippy --all-targets --all-features -- -D warnings` reached an unrelated uncommitted `tests/rust_analyzer_goto_definition.rs` edit and failed on its line 65 `needless_borrow`. That file was left untouched. `cargo clippy --lib --all-features -- -D warnings` and `cargo clippy --test get_definition_test --all-features -- -D warnings` both pass for this change.
 
 ## Interfaces and Dependencies
@@ -107,3 +121,7 @@ Revision note (2026-07-12): Recorded the reduced, pushed, and closed #698 correc
 Revision note (2026-07-12): Recorded the full post-#698 C# rerun and partitioned its 220 residual sites, making explicit-interface owner declarations the next reduced-test boundary.
 
 Revision note (2026-07-12): Recorded the delegated #701 reduction, structured fix, complete validation, and exact Azure proof so the next checkpoint can push, close, and quantify the residual corpus.
+
+Revision note (2026-07-12): Recorded pushed/closed #701 and rejected its invalid full rerun after #703 exposed mutable candidate-snapshot drift; the next run must preserve the audited scope and query the configured 1,000 target groups.
+
+Revision note (2026-07-12): Recorded the valid post-#701/#703 1,000-target rerun, its 144-site residual, and `PropertyT<T>` generic arguments as the next C# boundary.

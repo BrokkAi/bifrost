@@ -60,6 +60,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 21:18Z) Pushed `7ccce3dd` to `master` and closed #698 with the exact Azure evidence; the next C# step is a complete fixing-HEAD rerun before triaging residual sites.
 - [x] (2026-07-12 21:31Z) Completed the post-#698 full C# rerun at `3b2e2665` in 486.4 seconds. Consistent sites increased from 598 to 1,717 and missing sites fell from 1,339 to 220; 73 residuals form the next explicit-interface owner declaration boundary.
 - [x] (2026-07-12 21:44Z) Delegated and independently reviewed the dominant C# residual, filed #701, recognized `explicit_interface_specifier` as a structured type role, passed the full validation gate, and changed exact `ApiKey.cs` bytes `2898..2913` from missing to consistent.
+- [x] (2026-07-12 21:50Z) Pushed `2b617770` and closed #701 with exact and full-suite evidence.
+- [x] (2026-07-12 22:12Z) Rejected the first full post-#701 record after it silently lost audited candidate files between forward and inverse phases; filed #703 and made the engine retain the original audited scope or fail explicitly.
+- [x] (2026-07-12 22:35Z) Validated #703 with a complete post-#701 C# rerun at `c8524f86`: all 1,000 configured groups were queried, candidate-loss notes fell to zero, and the trustworthy C# missing set fell from 220 to 144.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -115,6 +118,12 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - Observation: The 73-site explicit-interface cluster is independent of partial declaration grouping and path-scoped routing.
   Evidence: Primary and delegated inline regressions both supplied two partial interface declarations to an authoritative one-file query. The only pre-fix hit was the class base-list type. Adding the dedicated tree-sitter `explicit_interface_specifier` role recovered property and method owners, and the exact Azure site became consistent with a covering AST-derived hit.
 
+- Observation: Re-reading analyzer liveness between differential phases can invalidate an otherwise deterministic corpus record.
+  Evidence: `/tmp/csharp-n1-701-fixed.jsonl` selected 1,000 audited files and forward-resolved 3,269 sites, but its later inverse path map admitted only 31 target groups. The report silently classified 1,910 sites as having no sampled file and emitted `completed`. #703 carries the authoritative audited `ProjectFile`s across phases and returns an engine error on impossible scope loss.
+
+- Observation: The stable-scope rerun proved #701 removed 76 valid missing classifications and exposed 144 trustworthy residuals.
+  Evidence: `/tmp/csharp-n1-703-fixed.jsonl` queried all 1,000 configured target groups with zero candidate-loss notes, producing 1,793 consistent, 40 unproven, 144 missing, and 8,023 inconclusive sites. The largest next cluster is 39 C# generic type arguments inside generated `PropertyT<T>` calls.
+
 ## Decision Log
 
 - Decision: Implement a library-owned engine plus a dedicated Rust binary, not a unit test or brokkbench production trajectory.
@@ -143,6 +152,10 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Decision: Key resumable records by Bifrost source HEAD in addition to target HEAD and run configuration.
   Rationale: Every landed analyzer fix must invalidate earlier evidence automatically even when the package version and corpus checkout are unchanged.
+  Date/Author: 2026-07-12 / Codex
+
+- Decision: Differential inverse scope is the stable audited file set chosen before sampling; it must not be reconstructed from a later analyzer liveness snapshot.
+  Rationale: The experiment compares forward and inverse answers over one fixed sample. Allowing candidate identity to drift mid-run creates false inconclusive results and can make an invalid partial record look complete.
   Date/Author: 2026-07-12 / Codex
 
 - Decision: Treat the symbols MCP toolset as the production acceptance surface for corpus findings; LSP coverage is incidental and must not expand campaign scope.
@@ -265,3 +278,7 @@ Revision note (2026-07-12): Recorded pushed and closed #698 and its exact Azure 
 Revision note (2026-07-12): Recorded the full post-#698 C# rerun, its 83.6% missing-site reduction, and the next explicit-interface declaration triage boundary.
 
 Revision note (2026-07-12): Recorded delegated #701 investigation, complete validation, and exact production proof for the explicit-interface owner role.
+
+Revision note (2026-07-12): Recorded #703 after rejecting the invalid post-#701 C# record and made stable audited scope a campaign-engine invariant.
+
+Revision note (2026-07-12): Recorded the valid post-#701/#703 full C# rerun and the next 39-site generic-argument boundary.
