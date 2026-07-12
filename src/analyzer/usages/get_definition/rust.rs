@@ -5,11 +5,43 @@ use crate::analyzer::rust::field_roles::{
 };
 use crate::analyzer::rust::lexical_scope;
 use crate::analyzer::rust::rust_focused_use_path;
+use crate::analyzer::usages::rust_graph::RustDefinitionProvider;
 use crate::hash::{HashMap, HashSet};
+
+pub(super) struct AnalyzerRustDefinitionProvider<'a> {
+    analyzer: &'a dyn IAnalyzer,
+}
+
+impl<'a> AnalyzerRustDefinitionProvider<'a> {
+    pub(super) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self { analyzer }
+    }
+}
+
+impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut units: Vec<_> = self.analyzer.definitions(fqn).collect();
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        let mut units: Vec<_> = self
+            .analyzer
+            .declarations(file)
+            .into_iter()
+            .filter(|unit| unit.identifier() == identifier)
+            .collect();
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+}
 
 pub(super) fn resolve_rust(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -253,7 +285,7 @@ pub(super) fn resolve_rust(
 
 fn rust_struct_field_name_outcome(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -339,7 +371,7 @@ fn rust_bare_reference_role(
 #[allow(clippy::too_many_arguments)]
 fn rust_visible_import_resolution(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     reference_byte: usize,
@@ -399,7 +431,7 @@ fn rust_visible_import_resolution(
 fn rust_current_module_candidates(
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     tree: &Tree,
     site: &ResolvedReferenceSite,
@@ -483,7 +515,7 @@ fn rust_role_accepts_current_module(
 
 fn rust_impl_associated_type_declaration_outcome(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -601,7 +633,7 @@ fn rust_enclosing_ancestor<'tree>(mut node: Node<'tree>, kind: &str) -> Option<N
 
 fn rust_focused_use_path_outcome(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -637,7 +669,7 @@ fn node_within(container: Node<'_>, node: Node<'_>) -> bool {
 
 fn rust_focused_scoped_prefix_outcome(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -673,7 +705,7 @@ fn rust_focused_scoped_prefix_outcome(
 
 fn rust_focused_token_tree_prefix_outcome(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -730,7 +762,7 @@ fn rust_focused_token_tree_prefix_outcome(
 #[allow(clippy::too_many_arguments)]
 fn rust_focused_prefix_resolution_outcome(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     site: &ResolvedReferenceSite,
@@ -859,7 +891,7 @@ fn rust_scoped_path_root(mut node: Node<'_>) -> Node<'_> {
 
 fn resolve_rust_field(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -943,7 +975,7 @@ fn resolve_rust_field(
 
 fn rust_resolve_dotted_reference_text(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -1120,7 +1152,7 @@ fn rust_member_candidates(candidates: Vec<CodeUnit>, kind: RustMemberKind) -> Ve
 #[allow(clippy::too_many_arguments)]
 fn rust_expression_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1144,7 +1176,7 @@ fn rust_expression_type_fqn(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_expression_type_definition_fqn_cached(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1167,7 +1199,7 @@ pub(crate) fn rust_expression_type_definition_fqn_cached(
 #[allow(clippy::too_many_arguments)]
 fn rust_expression_type_fqn_mode(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1260,7 +1292,7 @@ fn rust_expression_type_fqn_mode(
 #[allow(clippy::too_many_arguments)]
 fn rust_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1287,7 +1319,7 @@ fn rust_binding_type_fqn(
 
 struct RustBindingLookupCtx<'a, 'tree, 'cache> {
     analyzer: &'a dyn IAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a dyn RustDefinitionProvider,
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'tree>,
@@ -1418,7 +1450,7 @@ fn rust_typed_binding<'tree>(node: Node<'tree>, source: &str) -> Option<(String,
 #[allow(clippy::too_many_arguments)]
 fn rust_call_expression_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1478,7 +1510,7 @@ fn rust_call_expression_type_fqn(
 #[allow(clippy::too_many_arguments)]
 fn rust_field_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     _source: &str,
     owner_fqn: &str,
@@ -1495,7 +1527,7 @@ fn rust_field_type_fqn(
 
 fn rust_callable_return_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     candidates: Vec<CodeUnit>,
     mode: RustTypeMode,
@@ -1508,7 +1540,7 @@ fn rust_callable_return_type_fqn(
 
 fn rust_field_code_unit_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     field: &CodeUnit,
     mode: RustTypeMode,
@@ -1519,7 +1551,7 @@ fn rust_field_code_unit_type_fqn(
 
 fn rust_function_code_unit_return_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     function: &CodeUnit,
     mode: RustTypeMode,
@@ -1538,7 +1570,7 @@ fn rust_function_code_unit_return_type_fqn(
 
 fn rust_code_unit_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     _file: &ProjectFile,
     code_unit: &CodeUnit,
     field_name: &str,
@@ -1579,7 +1611,7 @@ fn rust_code_unit_declaration_node<'tree>(
 
 pub(crate) fn rust_resolve_type_node_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
@@ -1744,7 +1776,7 @@ fn rust_unwrap_container_type_node<'tree>(
 
 fn rust_import_type_fqn(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     name: &str,
     reference_byte: Option<usize>,
@@ -1765,7 +1797,7 @@ fn rust_type_fqn_visible_from_file(file: &ProjectFile, fqn: &str) -> bool {
 
 fn rust_local_type_fqn_visible_at(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     name: &str,
     reference_byte: usize,
@@ -1849,7 +1881,7 @@ fn rust_local_package_name(file: &ProjectFile) -> String {
 
 fn rust_enclosing_impl_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -1873,7 +1905,7 @@ fn rust_enclosing_impl_type_fqn(
 }
 
 fn rust_named_candidates(
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
@@ -1886,7 +1918,7 @@ fn rust_named_candidates(
 
 fn rust_callable_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     name: &str,
     reference_byte: usize,
@@ -1926,7 +1958,7 @@ fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 
 fn rust_imported_export_candidates(
     rust: &crate::analyzer::RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     reference: &str,
     reference_byte: Option<usize>,

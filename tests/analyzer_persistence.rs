@@ -78,6 +78,13 @@ fn csharp_python_project(root: &Path) -> Arc<dyn Project> {
     ))
 }
 
+fn rust_python_project(root: &Path) -> Arc<dyn Project> {
+    Arc::new(TestProject::with_languages(
+        root.canonicalize().unwrap(),
+        BTreeSet::from([Language::Rust, Language::Python]),
+    ))
+}
+
 fn parsed_file_count(events: &[BuildProgressEvent]) -> usize {
     events
         .iter()
@@ -190,6 +197,51 @@ fn warm_multilanguage_csharp_definition_query_does_not_build_full_definition_ind
         result.results[0].definitions[0].fqn.as_deref(),
         Some("Lib.Service.Run")
     );
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+}
+
+#[test]
+fn warm_multilanguage_rust_definition_query_does_not_build_full_definition_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let value_source = "pub struct Number;\n\npub enum Value {\n    Number(Number),\n}\n\npub fn classify(value: Value) {\n    match value {\n        Value::Number(_) => {}\n    }\n}\n";
+    write_file(root, "src/value/mod.rs", value_source);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let project = rust_python_project(root);
+
+    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let events = Arc::clone(&warm_events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    let analyzer = warm.analyzer();
+    assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+
+    let (reference_line_index, reference_line) = value_source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Value::Number"))
+        .unwrap();
+    let result = brokk_bifrost::searchtools::get_definitions_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "src/value/mod.rs".to_string(),
+                line: Some(reference_line_index + 1),
+                column: Some(reference_line.find("Number").unwrap() + 1),
+            }],
+        },
+    );
+
+    assert_eq!(result.results[0].status, "resolved");
+    assert_eq!(result.results[0].definitions[0].fqn, "value.Value.Number");
     assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
     assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
 }

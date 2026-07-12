@@ -421,7 +421,7 @@ fn resolve_one(
     let resolved = match language {
         Language::Rust => rust::resolve_rust(
             analyzer,
-            context.support(),
+            &rust::AnalyzerRustDefinitionProvider::new(analyzer),
             &request.file,
             &source,
             tree.as_ref(),
