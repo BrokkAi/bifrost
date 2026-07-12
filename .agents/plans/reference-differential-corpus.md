@@ -43,6 +43,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 04:40Z) Implemented and symbols-tested #659 by reusing forward Rust expression-type resolution on exact inverse receiver nodes, with tri-state owner proof across parameters, typed locals, nested fields, and returned values.
 - [x] (2026-07-13 04:55Z) Implemented and symbols-tested #661 by extending Scala hierarchy proof to class fields and resolving named-argument labels through their structured invocation owners; the remaining selection/stable/type roles are pinned with exact-owner regressions.
 - [x] (2026-07-13 05:05Z) Implemented and symbols-tested #658 with one exact associated-item resolver across normal and macro token-tree paths, preserving call/value roles, requested identity, import exclusion, and multi-segment owners.
+- [x] (2026-07-13 05:20Z) Reopened #659 after its exact corpus site remained missing, then added structured concrete-receiver-to-trait-impl dispatch proof while leaving generic and trait-object receivers unproven.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.

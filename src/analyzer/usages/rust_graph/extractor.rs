@@ -17,7 +17,7 @@ use crate::analyzer::usages::rust_graph::resolver::{
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
     CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer,
-    RustReferenceContext,
+    RustReferenceContext, TypeHierarchyProvider,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -513,6 +513,7 @@ pub(super) fn scan_files_for_member_target(
             line_starts: &line_starts,
             owner: &owner,
             member_name: &member_name,
+            scan_target: target,
             requested_target,
             target_is_field: requested_target.is_field(),
             target_is_enum_variant: requested_target.is_field()
@@ -566,6 +567,7 @@ struct MemberScanCtx<'a> {
     line_starts: &'a [usize],
     owner: &'a CodeUnit,
     member_name: &'a str,
+    scan_target: &'a CodeUnit,
     requested_target: &'a CodeUnit,
     target_is_field: bool,
     target_is_enum_variant: bool,
@@ -624,33 +626,35 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
         return;
     };
     let receiver_name = simple_node_text(receiver, ctx.source);
-    match receiver_owner_proof(receiver, receiver_name.as_deref(), &enclosing, ctx) {
-        ReceiverOwnerProof::Matches => {}
-        ReceiverOwnerProof::Mismatches => return,
-        ReceiverOwnerProof::Unknown => {
-            if ctx.record_unproven_receivers
-                && receiver_name.as_ref().is_some_and(|receiver_name| {
-                    !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
-                })
-            {
-                push_unproven_member_hit(
-                    ctx.file,
-                    ctx.source,
-                    ctx.line_starts,
-                    start,
-                    end,
-                    enclosing,
-                    ctx.unproven_hits,
-                );
+    let inferred_match =
+        match receiver_owner_proof(receiver, receiver_name.as_deref(), &enclosing, ctx) {
+            ReceiverOwnerProof::Structured => false,
+            ReceiverOwnerProof::Inferred => true,
+            ReceiverOwnerProof::Mismatches => return,
+            ReceiverOwnerProof::Unknown => {
+                if ctx.record_unproven_receivers
+                    && receiver_name.as_ref().is_some_and(|receiver_name| {
+                        !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
+                    })
+                {
+                    push_unproven_member_hit(
+                        ctx.file,
+                        ctx.source,
+                        ctx.line_starts,
+                        start,
+                        end,
+                        enclosing,
+                        ctx.unproven_hits,
+                    );
+                }
+                return;
             }
-            return;
-        }
-    }
+        };
 
     // The explicit-mismatch guard only applies to a simple named receiver whose type
     // could be re-annotated in the enclosing scope; a resolved `self.field` receiver
     // already proved its type structurally.
-    if let Some(receiver_name) = receiver_name.as_ref() {
+    if inferred_match && let Some(receiver_name) = receiver_name.as_ref() {
         let receiver_mismatched = ctx
             .analyzer
             .get_source(&enclosing, false)
@@ -718,29 +722,31 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
         else {
             continue;
         };
-        match receiver_owner_proof(*receiver, receiver_name.as_deref(), &enclosing, ctx) {
-            ReceiverOwnerProof::Matches => {}
-            ReceiverOwnerProof::Mismatches => continue,
-            ReceiverOwnerProof::Unknown => {
-                if ctx.record_unproven_receivers
-                    && receiver_name.as_ref().is_some_and(|receiver_name| {
-                        !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
-                    })
-                {
-                    push_unproven_member_hit(
-                        ctx.file,
-                        ctx.source,
-                        ctx.line_starts,
-                        start,
-                        end,
-                        enclosing,
-                        ctx.unproven_hits,
-                    );
+        let inferred_match =
+            match receiver_owner_proof(*receiver, receiver_name.as_deref(), &enclosing, ctx) {
+                ReceiverOwnerProof::Structured => false,
+                ReceiverOwnerProof::Inferred => true,
+                ReceiverOwnerProof::Mismatches => continue,
+                ReceiverOwnerProof::Unknown => {
+                    if ctx.record_unproven_receivers
+                        && receiver_name.as_ref().is_some_and(|receiver_name| {
+                            !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
+                        })
+                    {
+                        push_unproven_member_hit(
+                            ctx.file,
+                            ctx.source,
+                            ctx.line_starts,
+                            start,
+                            end,
+                            enclosing,
+                            ctx.unproven_hits,
+                        );
+                    }
+                    continue;
                 }
-                continue;
-            }
-        }
-        if let Some(receiver_name) = receiver_name.as_ref() {
+            };
+        if inferred_match && let Some(receiver_name) = receiver_name.as_ref() {
             let receiver_mismatched = ctx
                 .analyzer
                 .get_source(&enclosing, false)
@@ -883,7 +889,8 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
 }
 
 enum ReceiverOwnerProof {
-    Matches,
+    Structured,
+    Inferred,
     Mismatches,
     Unknown,
 }
@@ -904,8 +911,15 @@ fn receiver_owner_proof(
         receiver.start_byte(),
         ctx.type_lookup_cache,
     ) {
-        if fqn_matches_owner(ctx.rust, &fqn, ctx.owner) {
-            return ReceiverOwnerProof::Matches;
+        if !ctx.target_owner_is_trait && fqn_matches_owner(ctx.rust, &fqn, ctx.owner) {
+            return ReceiverOwnerProof::Structured;
+        }
+        if let Some(matches) = receiver_type_matches_requested_dispatch(&fqn, ctx) {
+            return if matches {
+                ReceiverOwnerProof::Structured
+            } else {
+                ReceiverOwnerProof::Mismatches
+            };
         }
         let resolved_is_alias = ctx
             .support
@@ -919,7 +933,7 @@ fn receiver_owner_proof(
 
     if receiver_name.is_some_and(|name| ctx.receiver_names.iter().any(|receiver| receiver == name))
     {
-        return ReceiverOwnerProof::Matches;
+        return ReceiverOwnerProof::Inferred;
     }
 
     let matches = match receiver.kind() {
@@ -928,10 +942,54 @@ fn receiver_owner_proof(
         _ => false,
     };
     if matches {
-        ReceiverOwnerProof::Matches
+        ReceiverOwnerProof::Inferred
     } else {
         ReceiverOwnerProof::Unknown
     }
+}
+
+fn receiver_type_matches_requested_dispatch(fqn: &str, ctx: &MemberScanCtx<'_>) -> Option<bool> {
+    let receiver_types: Vec<_> = ctx
+        .support
+        .fqn(fqn)
+        .into_iter()
+        .filter(|unit| ctx.rust.supports_type_hierarchy(unit))
+        .collect();
+    if receiver_types.is_empty()
+        || receiver_types
+            .iter()
+            .any(|unit| ctx.rust.is_type_alias(unit))
+    {
+        return None;
+    }
+
+    if ctx.requested_target != ctx.scan_target {
+        let requested_owner = ctx.rust.parent_of(ctx.requested_target)?;
+        let result = receiver_types.into_iter().any(|receiver_type| {
+            same_rust_declaration_identity(&receiver_type, &requested_owner)
+                && ctx
+                    .rust
+                    .get_ancestors(&receiver_type)
+                    .iter()
+                    .any(|ancestor| same_rust_declaration_identity(ancestor, ctx.owner))
+        });
+        return Some(result);
+    }
+
+    ctx.target_owner_is_trait.then(|| {
+        receiver_types.into_iter().any(|receiver_type| {
+            ctx.rust
+                .get_ancestors(&receiver_type)
+                .iter()
+                .any(|ancestor| same_rust_declaration_identity(ancestor, ctx.owner))
+        })
+    })
+}
+
+fn same_rust_declaration_identity(left: &CodeUnit, right: &CodeUnit) -> bool {
+    left.fq_name() == right.fq_name()
+        && left.source() == right.source()
+        && left.kind() == right.kind()
 }
 
 fn receiver_is_self_rooted(receiver: Node<'_>) -> bool {

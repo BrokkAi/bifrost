@@ -4684,6 +4684,60 @@ pub fn consume(wanted: &Wanted, decoy: &Decoy, holder: &Holder) {
 }
 
 #[test]
+fn scan_usages_by_reference_proves_requested_rust_trait_impl_receiver() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub struct MarzanoQueryContext;
+
+pub trait ExecContext<Q> {
+    fn language(&self) -> usize;
+}
+
+pub struct MarzanoContext<'a> { marker: &'a str }
+impl<'a> ExecContext<MarzanoQueryContext> for MarzanoContext<'a> {
+    fn language(&self) -> usize { self.marker.len() }
+}
+
+pub struct DecoyContext;
+impl ExecContext<MarzanoQueryContext> for DecoyContext {
+    fn language(&self) -> usize { 0 }
+}
+
+pub fn consume<'a>(context: &'a MarzanoContext<'a>, decoy: &DecoyContext) {
+    let _ = context.language();
+    let _ = decoy.language();
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected_hits) in [("MarzanoContext.language", 1), ("ExecContext.language", 2)] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_reference",
+                &format!(r#"{{"symbols":["{symbol}"],"include_tests":true}}"#),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(1, resolved_scan_count(&value), "payload: {value}");
+        assert_eq!(
+            expected_hits,
+            only_result(&value)["total_hits"].as_u64().unwrap(),
+            "payload: {value}"
+        );
+        assert_eq!(
+            0,
+            only_result(&value)["unproven_hits"].as_u64().unwrap(),
+            "payload: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_by_reference_finds_exact_rust_scoped_members_inside_macros() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
