@@ -3600,6 +3600,199 @@ fn run() {
 }
 
 #[test]
+fn rust_if_let_binding_scope_and_constructor_owner_by_location() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+struct Some(i32);
+
+fn range() {}
+fn input() -> Some { todo!() }
+
+fn demo() {
+    if let Some(range) = input() {
+        let _inside = range;
+    } else {
+        let _else = range;
+    }
+    let _after = range;
+}
+"#,
+        )
+        .build();
+
+    for (line, text, needle, expected_status) in [
+        (
+            8,
+            "    if let Some(range) = input() {",
+            "range",
+            "no_definition",
+        ),
+        (9, "        let _inside = range;", "range", "no_definition"),
+        (11, "        let _else = range;", "range", "resolved"),
+        (13, "    let _after = range;", "range", "resolved"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"lib.rs","line":{line},"column":{}}}]}}"#,
+                column_of(text, needle)
+            ),
+        );
+        assert_eq!(
+            value["results"][0]["status"], expected_status,
+            "line {line}: {value}"
+        );
+        if expected_status == "resolved" {
+            assert_eq!(value["results"][0]["definitions"][0]["fqn"], "range");
+        } else {
+            assert_eq!(
+                value["results"][0]["diagnostics"][0]["kind"], "local_binding",
+                "line {line}: {value}"
+            );
+        }
+    }
+
+    let constructor = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":8,"column":{}}}]}}"#,
+            column_of("    if let Some(range) = input() {", "Some")
+        ),
+    );
+    assert_eq!(
+        constructor["results"][0]["status"], "resolved",
+        "{constructor}"
+    );
+    assert_eq!(
+        constructor["results"][0]["definitions"][0]["fqn"], "Some",
+        "{constructor}"
+    );
+}
+
+#[test]
+fn rust_while_let_binding_scope_by_reference() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+fn item() {}
+fn next() -> Option<i32> { todo!() }
+
+fn demo() {
+    while let Some(item) = next() {
+        let _while_body = item;
+        break;
+    }
+    let _while_after = item;
+}
+"#,
+        )
+        .build();
+
+    for (context, target, expected_status) in [
+        ("while let Some(item) = next() {", "item", "no_definition"),
+        ("let _while_body = item;", "item", "no_definition"),
+        ("let _while_after = item;", "item", "resolved"),
+    ] {
+        let value = lookup_reference(
+            project.root(),
+            &json!({
+                "references": [{
+                    "symbol": "demo",
+                    "context": context,
+                    "target": target
+                }]
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            value["results"][0]["status"], expected_status,
+            "{context}: {value}"
+        );
+        if expected_status == "resolved" {
+            assert_eq!(value["results"][0]["definitions"][0]["fqn"], "item");
+        } else {
+            assert_eq!(
+                value["results"][0]["diagnostics"][0]["kind"], "local_binding",
+                "{context}: {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rust_let_chain_bindings_are_visible_in_order() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+fn first() {}
+fn second() {}
+fn input(_: fn()) -> Option<Option<i32>> { todo!() }
+
+fn demo() {
+    if let Some(first) = input(second)
+        && let Some(second) = first
+        && second > 0
+    {
+        let _chain_body = (first, second);
+    }
+    let _chain_after = (first, second);
+}
+"#,
+        )
+        .build();
+
+    for (context, target, expected_status) in [
+        ("&& let Some(second) = first", "second", "no_definition"),
+        ("&& let Some(second) = first", "first", "no_definition"),
+        ("&& second > 0", "second", "no_definition"),
+        (
+            "let _chain_body = (first, second);",
+            "first",
+            "no_definition",
+        ),
+        ("let _chain_after = (first, second);", "first", "resolved"),
+    ] {
+        let value = lookup_reference(
+            project.root(),
+            &json!({
+                "references": [{
+                    "symbol": "demo",
+                    "context": context,
+                    "target": target
+                }]
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            value["results"][0]["status"], expected_status,
+            "{context}: {value}"
+        );
+        if expected_status == "no_definition" {
+            assert_eq!(
+                value["results"][0]["diagnostics"][0]["kind"], "local_binding",
+                "{context}: {value}"
+            );
+        }
+    }
+
+    let source = project
+        .file("lib.rs")
+        .read_to_string()
+        .expect("read inline Rust source");
+    let early_second = source.find("input(second)").expect("first let value") + "input(".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", &source, early_second),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(value["results"][0]["definitions"][0]["fqn"], "second");
+}
+
+#[test]
 fn rust_reference_context_resolves_target_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

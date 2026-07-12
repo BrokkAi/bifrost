@@ -216,6 +216,7 @@ pub(crate) fn name_shadowed_in_tree(
     if let Some(body) = scope.child_by_field_name("body") {
         collect_visible_local_bindings(body, source, reference_byte, &mut bindings);
     }
+    collect_visible_let_condition_bindings(scope, source, reference_byte, &mut bindings);
     bindings.contains(name)
 }
 
@@ -270,7 +271,7 @@ pub(crate) fn is_pattern_binding_identifier(node: Node<'_>) -> bool {
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
-            "let_declaration" | "parameter" | "match_arm" | "for_expression"
+            "let_declaration" | "let_condition" | "parameter" | "match_arm" | "for_expression"
         ) && let Some(pattern) = parent.child_by_field_name("pattern")
             && pattern_contains_binding_identifier(pattern, node)
         {
@@ -380,15 +381,90 @@ fn collect_parameter_bindings(node: Node<'_>, source: &str, out: &mut HashSet<St
 }
 
 fn collect_visible_local_bindings(
-    scope: Node<'_>,
+    mut scope: Node<'_>,
     source: &str,
     reference_byte: usize,
     out: &mut HashSet<String>,
 ) {
-    collect_direct_bindings_in_scope(scope, source, reference_byte, out);
-    if let Some(child_scope) = child_lexical_scope_containing_reference(scope, reference_byte) {
-        collect_visible_local_bindings(child_scope, source, reference_byte, out);
+    loop {
+        collect_direct_bindings_in_scope(scope, source, reference_byte, out);
+        let Some(child_scope) = child_lexical_scope_containing_reference(scope, reference_byte)
+        else {
+            return;
+        };
+        scope = child_scope;
     }
+}
+
+fn collect_visible_let_condition_bindings(
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    out: &mut HashSet<String>,
+) {
+    let mut current = root;
+    loop {
+        if matches!(current.kind(), "if_expression" | "while_expression")
+            && let Some(condition) = current.child_by_field_name("condition")
+        {
+            let body = current
+                .child_by_field_name("consequence")
+                .or_else(|| current.child_by_field_name("body"));
+            if contains_byte(condition, reference_byte)
+                || body.is_some_and(|body| contains_byte(body, reference_byte))
+            {
+                collect_let_condition_bindings_before(condition, source, reference_byte, out);
+            }
+        }
+
+        let mut cursor = current.walk();
+        let mut next = None;
+        for child in current.named_children(&mut cursor) {
+            if contains_byte(child, reference_byte) {
+                next = Some(child);
+                break;
+            }
+        }
+        let Some(child) = next else {
+            return;
+        };
+        current = child;
+    }
+}
+
+fn collect_let_condition_bindings_before(
+    condition: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    out: &mut HashSet<String>,
+) {
+    let mut stack = vec![condition];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "let_condition" => {
+                if node.end_byte() <= reference_byte
+                    && let Some(pattern) = node.child_by_field_name("pattern")
+                {
+                    collect_pattern_bindings(pattern, source, out);
+                }
+            }
+            "let_chain" => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                stack.extend(
+                    children
+                        .into_iter()
+                        .rev()
+                        .filter(|child| matches!(child.kind(), "let_condition" | "let_chain")),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn contains_byte(node: Node<'_>, byte: usize) -> bool {
+    node.start_byte() <= byte && byte < node.end_byte()
 }
 
 fn collect_direct_bindings_in_scope(
@@ -416,21 +492,23 @@ fn collect_direct_bindings_in_scope(
 }
 
 fn child_lexical_scope_containing_reference(
-    node: Node<'_>,
+    mut node: Node<'_>,
     reference_byte: usize,
 ) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() <= reference_byte && reference_byte < child.end_byte() {
-            if lexical_scope_kind(child.kind()) {
-                return Some(child);
-            }
-            if let Some(scope) = child_lexical_scope_containing_reference(child, reference_byte) {
-                return Some(scope);
+    loop {
+        let mut cursor = node.walk();
+        let mut next = None;
+        for child in node.named_children(&mut cursor) {
+            if contains_byte(child, reference_byte) {
+                if lexical_scope_kind(child.kind()) {
+                    return Some(child);
+                }
+                next = Some(child);
+                break;
             }
         }
+        node = next?;
     }
-    None
 }
 
 fn collect_local_item_name(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
@@ -443,63 +521,58 @@ fn collect_local_item_name(node: Node<'_>, source: &str, out: &mut HashSet<Strin
 }
 
 fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
-    match node.kind() {
-        "identifier" => {
-            let text = node_text(node, source).trim();
-            if !text.is_empty() {
-                out.insert(text.to_string());
-            }
-        }
-        "field_pattern" => {
-            if let Some(pattern) = node.child_by_field_name("pattern") {
-                collect_pattern_bindings(pattern, source, out);
-            } else if let Some(name) = node.child_by_field_name("name") {
-                let text = node_text(name, source).trim();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" => {
+                let text = node_text(node, source).trim();
                 if !text.is_empty() {
                     out.insert(text.to_string());
                 }
             }
-        }
-        "struct_pattern" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if matches!(
-                    child.kind(),
-                    "field_pattern"
-                        | "remaining_field_pattern"
-                        | "tuple_pattern"
-                        | "struct_pattern"
-                        | "ref_pattern"
-                        | "mut_pattern"
-                ) {
-                    collect_pattern_bindings(child, source, out);
+            "field_pattern" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    stack.push(pattern);
+                } else if let Some(name) = node.child_by_field_name("name") {
+                    let text = node_text(name, source).trim();
+                    if !text.is_empty() {
+                        out.insert(text.to_string());
+                    }
                 }
             }
-        }
-        "tuple_struct_pattern" => {
-            let type_id = node.child_by_field_name("type").map(|ty| ty.id());
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if Some(child.id()) == type_id {
-                    continue;
-                }
-                if matches!(
-                    child.kind(),
-                    "identifier"
-                        | "tuple_pattern"
-                        | "tuple_struct_pattern"
-                        | "struct_pattern"
-                        | "ref_pattern"
-                        | "mut_pattern"
-                ) {
-                    collect_pattern_bindings(child, source, out);
-                }
+            "struct_pattern" => {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor).filter(|child| {
+                    matches!(
+                        child.kind(),
+                        "field_pattern"
+                            | "remaining_field_pattern"
+                            | "tuple_pattern"
+                            | "struct_pattern"
+                            | "ref_pattern"
+                            | "mut_pattern"
+                    )
+                }));
             }
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_pattern_bindings(child, source, out);
+            "tuple_struct_pattern" => {
+                let type_id = node.child_by_field_name("type").map(|ty| ty.id());
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor).filter(|child| {
+                    Some(child.id()) != type_id
+                        && matches!(
+                            child.kind(),
+                            "identifier"
+                                | "tuple_pattern"
+                                | "tuple_struct_pattern"
+                                | "struct_pattern"
+                                | "ref_pattern"
+                                | "mut_pattern"
+                        )
+                }));
+            }
+            _ => {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
             }
         }
     }

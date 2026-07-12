@@ -24,6 +24,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 16:30Z) Implemented and behavior-tested #646/#647: nested workspace file modules now retain structured module identity, and Rust class usage emits exact editor-only owner-alias hits with CodeUnit identity checks.
 - [x] (2026-07-12 17:25Z) Pushed and closed #646/#647, then fixed, pushed, and closed #648 through the `get_definitions_by_location` symbols surface; no LSP-only acceptance work was retained.
 - [x] (2026-07-12 18:20Z) Implemented and symbols-tested #649 with AST namespace roles, tri-state visible imports, exact lexical-module fallback, and a cached Cargo path-dependency route index shared by forward and inverse Rust resolution.
+- [x] (2026-07-12 19:05Z) Pushed and closed #649, then implemented and symbols-tested #650 with ordered `let_condition`/let-chain visibility and fully iterative lexical/pattern traversal.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
