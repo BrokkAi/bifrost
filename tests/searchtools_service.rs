@@ -4436,6 +4436,44 @@ pub fn consume() {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_owner_exact_rust_struct_field_labels() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub struct Wanted { pub same: usize, pub only: usize }
+pub struct Decoy { pub same: usize, pub only: usize }
+
+pub fn consume(same: usize, only: usize, wanted: Wanted, decoy: Decoy) {
+    let _ = Wanted { same: 1, only };
+    let Wanted { same: renamed, only } = wanted;
+    let _ = Decoy { same: 2, only };
+    let Decoy { same: renamed_decoy, only: only_decoy } = decoy;
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for symbol in ["Wanted.same", "Wanted.only"] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_reference",
+                &format!(r#"{{"symbols":["{symbol}"],"include_tests":true}}"#),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(1, resolved_scan_count(&value), "payload: {value}");
+        assert_eq!(
+            2,
+            only_result(&value)["total_hits"].as_u64().unwrap(),
+            "payload: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_by_reference_finds_exact_fully_qualified_rust_type_owners() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

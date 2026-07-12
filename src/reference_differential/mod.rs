@@ -7,7 +7,9 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
 };
-use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{
+    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range, rust_is_field_declaration_name,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use serde::{Deserialize, Serialize};
@@ -388,6 +390,17 @@ fn collect_sampled_sites(
         for range in ranges {
             summary.structured_candidates = summary.structured_candidates.saturating_add(1);
             if declaration_ranges.contains(&(range.start_byte, range.end_byte)) {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            if language == Language::Rust
+                && root
+                    .descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        rust_is_field_declaration_name(node, range.start_byte, range.end_byte)
+                    })
+            {
                 summary.declaration_sites_excluded =
                     summary.declaration_sites_excluded.saturating_add(1);
                 continue;
@@ -1177,5 +1190,24 @@ mod tests {
         assert!(report.sites.is_empty());
         assert_eq!(report.file_errors.len(), 1);
         assert_eq!(report.file_errors[0].kind, "candidate_limit_exceeded");
+    }
+
+    #[test]
+    fn rust_sampler_excludes_nested_enum_field_declaration_names() {
+        let fixture = RoundTripFixture {
+            corpus_language: "rust",
+            analyzer_language: Language::Rust,
+            file_name: "lib.rs",
+            source: "enum Message { Variant { payload: usize } }\n",
+            call_line: "",
+        };
+
+        let report = audit_fixture(&fixture);
+
+        assert!(
+            report.summary.declaration_sites_excluded >= 1,
+            "{report:#?}"
+        );
+        assert!(report.sites.iter().all(|site| site.text != "payload"));
     }
 }

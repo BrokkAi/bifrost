@@ -1,5 +1,8 @@
 use super::*;
 use crate::analyzer::RustReferenceContext;
+use crate::analyzer::rust::field_roles::{
+    RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
+};
 use crate::analyzer::rust::lexical_scope;
 use crate::analyzer::rust::rust_focused_use_path;
 use crate::hash::{HashMap, HashSet};
@@ -17,6 +20,12 @@ pub(super) fn resolve_rust(
     };
     let mut cache = RustTypeLookupCache::default();
     let reference = site.text.as_str();
+    if let Some(tree) = tree
+        && let Some(outcome) =
+            rust_struct_field_name_outcome(analyzer, support, file, source, tree, site)
+    {
+        return outcome;
+    }
     if let Some(tree) = tree
         && !reference.contains(['.', ':'])
         && let Some(node) = smallest_named_node_covering(
@@ -240,6 +249,64 @@ pub(super) fn resolve_rust(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Rust definition"),
     )
+}
+
+fn rust_struct_field_name_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    match classify_rust_field_name(focused) {
+        RustFieldNameRole::Declaration { name }
+            if name.start_byte() == site.focus_start_byte
+                && name.end_byte() == site.focus_end_byte =>
+        {
+            Some(no_definition(
+                "declaration_site",
+                "Rust field declaration names do not reference another definition",
+            ))
+        }
+        RustFieldNameRole::Reference {
+            owner_type,
+            name,
+            container: RustStructFieldContainer::Literal,
+        } if name.start_byte() == site.focus_start_byte
+            && name.end_byte() == site.focus_end_byte =>
+        {
+            let Some(owner) = rust_resolve_type_node_fqn(
+                analyzer,
+                support,
+                file,
+                source,
+                owner_type,
+                Some(owner_type.start_byte()),
+            ) else {
+                return Some(no_definition(
+                    "unresolved_struct_owner",
+                    "Rust struct literal owner could not be resolved",
+                ));
+            };
+            let name = &source[name.byte_range()];
+            let candidates = support
+                .fqn(&format!("{owner}.{name}"))
+                .into_iter()
+                .filter(CodeUnit::is_field)
+                .collect();
+            Some(candidates_outcome(candidates))
+        }
+        RustFieldNameRole::Reference {
+            container: RustStructFieldContainer::Pattern,
+            ..
+        }
+        | RustFieldNameRole::Other
+        | RustFieldNameRole::Declaration { .. }
+        | RustFieldNameRole::Reference { .. } => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1520,6 +1587,9 @@ pub(crate) fn rust_resolve_type_node_fqn(
 ) -> Option<String> {
     let type_ref = rust_type_ref(type_node, source)?;
     let name = type_ref.name.as_str();
+    if type_ref.path.is_none() && name == "Self" {
+        return rust_enclosing_impl_type_fqn(analyzer, support, file, source, type_node);
+    }
     if let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) {
         let refs = rust.reference_context_of(file);
         if let Some(path) = type_ref.path.as_deref()

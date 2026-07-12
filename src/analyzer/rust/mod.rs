@@ -3,6 +3,7 @@ mod cache;
 mod cargo_routes;
 mod declarations;
 mod diagnostics;
+pub(crate) mod field_roles;
 mod graph_support;
 mod hierarchy;
 mod imports;
@@ -30,6 +31,7 @@ pub(crate) use adapter::RustAdapter;
 use cache::{weight_code_unit_set, weight_project_file_set, weight_reference_context};
 use cargo_routes::RustCargoRouteIndex;
 use declarations::collect_rust_type_identifiers;
+pub(crate) use field_roles::rust_is_field_declaration_name;
 pub(crate) use imports::rust_focused_use_path;
 use tests::detect_rust_test_assertion_smells;
 

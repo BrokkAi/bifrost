@@ -4167,6 +4167,62 @@ fn run(ctx: BridgeContext) -> anyhow::Result<()> {
 }
 
 #[test]
+fn rust_struct_literal_field_labels_resolve_exact_owner_and_declarations_do_not() {
+    let source = r#"
+struct Wanted { same: usize, only: usize }
+struct Decoy { same: usize, only: usize }
+
+impl Wanted {
+    fn build(same: usize) -> Self {
+        Self { same, only: 1 }
+    }
+}
+
+fn decoy() -> Decoy { Decoy { same: 2, only: 3 } }
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+
+    for (start, expected) in [
+        (source.find("same, only: 1").unwrap(), "Wanted.same"),
+        (source.find("only: 1").unwrap(), "Wanted.only"),
+        (source.find("same: 2").unwrap(), "Decoy.same"),
+    ] {
+        let value = lookup(project.root(), &location_reference("lib.rs", source, start));
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
+
+    let declaration = source.find("same: usize").unwrap();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, declaration),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "Wanted.build",
+                "context": "        Self { same, only: 1 }",
+                "target": "same"
+            }]
+        })
+        .to_string(),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Wanted.same",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_struct_field_access_ignores_shadowing_binding_after_inner_scope() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

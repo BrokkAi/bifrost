@@ -96,6 +96,7 @@ pub use project::{
 pub use python::PythonAnalyzer;
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
+pub(crate) use rust::rust_is_field_declaration_name;
 pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
 pub(crate) use scala::scala_parenthesized_arity;

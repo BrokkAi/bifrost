@@ -1,3 +1,4 @@
+use crate::analyzer::rust::field_roles::rust_struct_field_references;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
 use crate::analyzer::usages::get_definition::rust_resolve_type_node_fqn;
@@ -567,7 +568,9 @@ fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
         "field_expression" => record_instance_member_hit(node, ctx),
         "token_tree" => record_token_tree_instance_member_hits(node, ctx),
         "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
-        "struct_expression" if ctx.target_is_field => record_struct_literal_field_hit(node, ctx),
+        "struct_expression" | "struct_pattern" if ctx.target_is_field => {
+            record_struct_field_hits(node, ctx)
+        }
         _ => {}
     }
 
@@ -766,30 +769,15 @@ fn receiver_name_explicitly_mismatched(
         .unwrap_or(false)
 }
 
-/// A struct literal `S { field: value }` (or shorthand `S { field }`) references
-/// the struct's field. Count each initializer as a field read when the literal's
-/// type resolves to the field owner. (rust-analyzer:
-/// `test_basic_highlight_field_read_write`.)
-fn record_struct_literal_field_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
-    let Some(type_node) = node.child_by_field_name("name") else {
+/// Struct literal and destructuring labels reference fields on their resolved owner.
+fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let Some((type_node, fields)) = rust_struct_field_references(node) else {
         return;
     };
     if !resolved_type_matches_owner(type_node, ctx) {
         return;
     }
-    let Some(body) = node.child_by_field_name("body") else {
-        return;
-    };
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        let field = match child.kind() {
-            "field_initializer" => child.child_by_field_name("field"),
-            "shorthand_field_initializer" => child.named_child(0),
-            _ => None,
-        };
-        let Some(field) = field else {
-            continue;
-        };
+    for field in fields {
         if simple_node_text(field, ctx.source).as_deref() != Some(ctx.member_name) {
             continue;
         }
@@ -893,44 +881,17 @@ fn enclosing_impl_item(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn resolved_type_matches_owner(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
-    let Some(fqn) = resolved_type_node_fqn(type_node, ctx) else {
+    let Some(fqn) = rust_resolve_type_node_fqn(
+        ctx.analyzer,
+        ctx.support,
+        ctx.file,
+        ctx.source,
+        type_node,
+        Some(type_node.start_byte()),
+    ) else {
         return false;
     };
     fqn_matches_owner(ctx.rust, &fqn, ctx.owner)
-}
-
-fn resolved_type_node_fqn(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> Option<String> {
-    let refs = ctx.rust.reference_context_of(ctx.file);
-
-    match type_node.kind() {
-        "type_identifier" | "identifier" => {
-            let name = simple_node_text(type_node, ctx.source)?;
-            refs.resolve_bare(&name).map(str::to_string)
-        }
-        "scoped_type_identifier" | "scoped_identifier" => {
-            let path = type_node
-                .child_by_field_name("path")
-                .and_then(|path| simple_node_text(path, ctx.source))?;
-            let name = type_node
-                .child_by_field_name("name")
-                .and_then(|name| simple_node_text(name, ctx.source))?;
-            refs.resolve_scoped(&path, &name)
-        }
-        "generic_type" => {
-            let base = type_node.child_by_field_name("type").or_else(|| {
-                let mut cursor = type_node.walk();
-                type_node.named_children(&mut cursor).next()
-            })?;
-            resolved_type_node_fqn(base, ctx)
-        }
-        "reference_type" | "pointer_type" | "array_type" | "slice_type" => {
-            let mut cursor = type_node.walk();
-            type_node
-                .named_children(&mut cursor)
-                .find_map(|child| resolved_type_node_fqn(child, ctx))
-        }
-        _ => None,
-    }
 }
 
 fn fqn_matches_owner(rust: &RustAnalyzer, fqn: &str, owner: &CodeUnit) -> bool {
