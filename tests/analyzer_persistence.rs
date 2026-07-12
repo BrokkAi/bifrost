@@ -127,8 +127,8 @@ fn warm_multilanguage_go_definition_query_does_not_build_full_definition_index()
 
     assert_eq!(result.results[0].status, "resolved");
     assert_eq!(
-        result.results[0].definitions[0].fqn,
-        "example.com/app/generated/client.Helper"
+        result.results[0].definitions[0].fqn.as_deref(),
+        Some("example.com/app/generated/client.Helper")
     );
     assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
     assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
@@ -175,7 +175,10 @@ fn warm_multilanguage_csharp_definition_query_does_not_build_full_definition_ind
     );
 
     assert_eq!(result.results[0].status, "resolved");
-    assert_eq!(result.results[0].definitions[0].fqn, "Lib.Service.Run");
+    assert_eq!(
+        result.results[0].definitions[0].fqn.as_deref(),
+        Some("Lib.Service.Run")
+    );
     assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
     assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
 }

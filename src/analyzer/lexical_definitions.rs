@@ -7,6 +7,7 @@
 
 use tree_sitter::Node;
 
+use super::rust::field_roles::{RustFieldNameRole, classify_rust_field_name};
 use super::{DeclarationKind, Language, Range};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,9 @@ pub(crate) fn resolve_lexical_binding(
     }
 
     let focus = smallest_named_node(root, focus_start, focus_end)?;
+    if !focus_can_resolve_lexical(language, focus) {
+        return None;
+    }
     let mut ancestors = Vec::new();
     let mut cursor = Some(focus);
     while let Some(node) = cursor {
@@ -96,6 +100,33 @@ fn node_range(node: Node<'_>) -> Range {
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
     }
+}
+
+fn focus_can_resolve_lexical(language: Language, focus: Node<'_>) -> bool {
+    if language == Language::Rust
+        && !matches!(classify_rust_field_name(focus), RustFieldNameRole::Other)
+    {
+        return false;
+    }
+
+    let mut current = focus;
+    while let Some(parent) = current.parent() {
+        if ["type", "return_type", "superclass", "interfaces"]
+            .into_iter()
+            .any(|field| parent.child_by_field_name(field) == Some(current))
+        {
+            return false;
+        }
+        if is_parameter_declaration(language, parent.kind()) {
+            return true;
+        }
+        if is_parameter_owner(language, parent.kind()) || is_lexical_scope(language, parent.kind())
+        {
+            break;
+        }
+        current = parent;
+    }
+    true
 }
 
 fn matching_parameter<'tree>(
@@ -259,6 +290,16 @@ fn scope_has_matching_local(
             continue;
         }
         if is_local_declaration(language, node.kind()) {
+            if language == Language::Rust && node.end_byte() > focus_start {
+                continue;
+            }
+            if language == Language::Scala
+                && matches!(node.kind(), "val_definition" | "var_definition")
+                && (!scala_has_value_definition_keyword(node)
+                    || node.child_by_field_name("pattern").is_none())
+            {
+                continue;
+            }
             if binding_name_nodes(language, node, false)
                 .into_iter()
                 .any(|name| identifier_matches(language, name, source, identifier))
@@ -270,6 +311,12 @@ fn scope_has_matching_local(
         push_named_children(node, &mut stack);
     }
     false
+}
+
+fn scala_has_value_definition_keyword(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| matches!(child.kind(), "val" | "var"))
 }
 
 fn binding_name_nodes(language: Language, declaration: Node<'_>, parameter: bool) -> Vec<Node<'_>> {
@@ -606,7 +653,7 @@ fn is_lexical_scope(language: Language, kind: &str) -> bool {
         Language::Python => matches!(kind, "block" | "module"),
         Language::Rust => kind == "block",
         Language::Php => kind == "compound_statement",
-        Language::Scala => matches!(kind, "template_body" | "block" | "indented_block"),
+        Language::Scala => matches!(kind, "block" | "indented_block"),
         Language::CSharp => matches!(kind, "block" | "switch_body"),
         Language::Ruby => matches!(kind, "body_statement" | "do_block" | "block"),
         Language::None => false,
@@ -621,7 +668,7 @@ fn is_nested_scope(language: Language, kind: &str) -> bool {
             Language::JavaScript | Language::TypeScript => matches!(kind, "class_body"),
             Language::Python => matches!(kind, "class_definition"),
             Language::Php => matches!(kind, "declaration_list"),
-            Language::Scala => matches!(kind, "case_block"),
+            Language::Scala => matches!(kind, "template_body" | "case_block"),
             Language::CSharp => matches!(kind, "declaration_list"),
             Language::Ruby => matches!(kind, "class" | "module"),
             _ => false,
@@ -651,11 +698,7 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
         Language::Rust => matches!(kind, "let_declaration" | "for_expression"),
         Language::Scala => matches!(
             kind,
-            "val_definition"
-                | "var_definition"
-                | "pattern_definition"
-                | "generator"
-                | "case_clause"
+            "val_definition" | "var_definition" | "generator" | "case_clause"
         ),
         Language::CSharp => matches!(
             kind,

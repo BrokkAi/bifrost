@@ -402,7 +402,7 @@ end
 }
 
 #[test]
-fn ruby_get_definition_keeps_top_level_method_parameter_shadowed() {
+fn ruby_get_definition_resolves_shadowing_parameter_itself() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(
             "app/report.rb",
@@ -425,7 +425,14 @@ end
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["name"], "normalize_total",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]
@@ -7272,13 +7279,23 @@ bench.start();
         source.find("deref(c)").unwrap() + "deref(".len(),
         source.find("aliases[c]").unwrap() + "aliases[".len(),
         source.find("+ c +").unwrap() + 2,
-        source.find("+ path;").unwrap() + 2,
-        source.find("  path;\n").unwrap() + 2,
         source.find("constructor(path)").unwrap() + "constructor(".len(),
         source.find("= path;").unwrap() + 2,
+        source.find("return FieldBehavior;").unwrap() + "return ".len(),
+    ] {
+        let value = lookup(project.root(), &location_reference("app.js", source, start));
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert!(
+            value["results"][0]["definitions"][0].get("fqn").is_none(),
+            "{value}"
+        );
+    }
+
+    for start in [
+        source.find("+ path;").unwrap() + 2,
+        source.find("  path;\n").unwrap() + 2,
         source.find("{ createConnection:").unwrap() + 2,
         source.find("get value()").unwrap() + "get ".len(),
-        source.find("return FieldBehavior;").unwrap() + "return ".len(),
     ] {
         let value = lookup(project.root(), &location_reference("app.js", source, start));
         assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
@@ -7311,10 +7328,24 @@ const options = { createConnection: run };
         .build();
 
     for start in [
-        source.find("Record { value").unwrap() + "Record { ".len(),
         source.find("run(value:").unwrap() + "run(".len(),
         source.find("= value;").unwrap() + 2,
         source.find("return value").unwrap() + "return ".len(),
+    ] {
+        let value = lookup(project.root(), &location_reference("app.ts", source, start));
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["name"], "value",
+            "{value}"
+        );
+        assert!(
+            value["results"][0]["definitions"][0].get("fqn").is_none(),
+            "{value}"
+        );
+    }
+
+    for start in [
+        source.find("Record { value").unwrap() + "Record { ".len(),
         source.find("+ local;").unwrap() + 2,
         source.find("{ createConnection:").unwrap() + 2,
     ] {
@@ -8439,7 +8470,7 @@ func use(v *bool) {}
 }
 
 #[test]
-fn go_receiver_struct_field_resolves_to_definition() {
+fn go_receiver_focus_resolves_to_receiver_parameter() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
             "buf.go",
@@ -8469,7 +8500,12 @@ func (br *Buf) Reset() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "app.Buf.buffer", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "br", "{value}");
+    assert_eq!(
+        result["definitions"][0]["kind"], "receiver_parameter",
+        "{value}"
+    );
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]
@@ -8648,7 +8684,7 @@ func (r *Resolver) disable() {
 }
 
 #[test]
-fn go_receiver_field_chain_resolves_deepest_workspace_field() {
+fn go_receiver_chain_focus_resolves_to_receiver_parameter() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
             "buf.go",
@@ -8679,15 +8715,19 @@ func (br *Buf) Lock() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "app.Buf.rw", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "br", "{value}");
     assert_eq!(
-        result["diagnostics"][0]["kind"], "partial_selector_chain",
+        result["definitions"][0]["kind"], "receiver_parameter",
+        "{value}"
+    );
+    assert!(
+        result["diagnostics"].as_array().unwrap().is_empty(),
         "{value}"
     );
 }
 
 #[test]
-fn go_receiver_field_chain_missing_terminal_reports_partial_field() {
+fn go_receiver_chain_with_missing_terminal_still_honors_receiver_focus() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
             "buf.go",
@@ -8718,9 +8758,13 @@ func (br *Buf) Lock() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "app.Buf.rw", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "br", "{value}");
     assert_eq!(
-        result["diagnostics"][0]["kind"], "partial_selector_chain",
+        result["definitions"][0]["kind"], "receiver_parameter",
+        "{value}"
+    );
+    assert!(
+        result["diagnostics"].as_array().unwrap().is_empty(),
         "{value}"
     );
 }
@@ -8917,7 +8961,7 @@ func use(wrapper Wrapper) {
 }
 
 #[test]
-fn go_local_binding_shadows_dot_imported_definition() {
+fn go_parameter_binding_resolves_instead_of_dot_imported_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")
         .file(
@@ -8951,8 +8995,11 @@ func Helper() {}
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-    assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "Helper", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]
@@ -9323,7 +9370,7 @@ public class UsePerson {
 }
 
 #[test]
-fn java_lambda_parameter_field_resolves_from_collection_chain() {
+fn java_lambda_receiver_focus_resolves_to_lambda_parameter() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
             "Container.java",
@@ -9373,10 +9420,12 @@ class Action {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "location", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "app.Location.signature",
+        result["definitions"][0]["kind"], "lambda_parameter",
         "{value}"
     );
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]
@@ -9413,7 +9462,7 @@ class Action {
 }
 
 #[test]
-fn java_custom_foreach_generic_does_not_infer_collection_element() {
+fn java_untyped_lambda_receiver_still_resolves_to_its_parameter() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
             "Action.java",
@@ -9448,7 +9497,14 @@ class Action {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "location", "{value}");
+    assert_eq!(
+        result["definitions"][0]["kind"], "lambda_parameter",
+        "{value}"
+    );
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]
@@ -11881,7 +11937,7 @@ fn csharp_local_value_returns_no_definition() {
 }
 
 #[test]
-fn csharp_delegate_parameter_shadow_returns_no_definition() {
+fn csharp_delegate_parameter_resolves_to_lexical_definition() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "App.cs",
@@ -11898,7 +11954,11 @@ fn csharp_delegate_parameter_shadow_returns_no_definition() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "Run", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]
@@ -11923,7 +11983,7 @@ fn csharp_local_function_shadow_returns_no_definition() {
 }
 
 #[test]
-fn csharp_parameter_declaration_name_does_not_resolve_to_member() {
+fn csharp_parameter_declaration_name_resolves_to_itself() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "App.cs",
@@ -11940,7 +12000,11 @@ fn csharp_parameter_declaration_name_does_not_resolve_to_member() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "Name", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]

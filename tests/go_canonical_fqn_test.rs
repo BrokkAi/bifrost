@@ -375,7 +375,8 @@ fn definition_lookup_resolves_sibling_module_package_clause_without_workspace_hy
         );
         assert_eq!(result.results[0].status, "resolved", "{result:#?}");
         assert_eq!(
-            result.results[0].definitions[0].fqn, "example.com/application.Draw",
+            result.results[0].definitions[0].fqn.as_deref(),
+            Some("example.com/application.Draw"),
             "{result:#?}"
         );
         assert_eq!(
