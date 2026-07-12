@@ -13,7 +13,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 04:10Z) Implemented shared structured reference-candidate enumeration and the library-owned differential runner.
 - [x] (2026-07-12 04:10Z) Implemented the dedicated corpus CLI with deterministic selection, commit-aware resumable JSONL reports, exact-site reruns, and bounded sampling.
 - [x] (2026-07-12 04:50Z) Addressed review findings and validated the engine with all-language fixtures plus bounded real-repository preflights.
-- [ ] Commit and push the engine checkpoint.
+- [x] (2026-07-12 05:05Z) Committed engine checkpoint `6c056e91`; full `cargo test --features nlp,python`, all-target/all-feature clippy, formatting, and diff checks pass.
+- [ ] Push the engine checkpoint.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
