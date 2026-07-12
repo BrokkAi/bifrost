@@ -5148,8 +5148,53 @@ pub mod inner {
     );
 
     let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_indexed_definition",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_nonterminal_scoped_focus_does_not_retry_terminal_or_flat_names() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "use std::fmt;\nuse std::path;\nstruct Commands;\nstruct PathBuf;\nimpl fmt::Display for Commands {\n    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) }\n}\nfn consume(_: path::PathBuf) {}\nmod local { pub struct Item; }\nfn indexed(_: local::Item) {}\n",
+        )
+        .build();
+
+    for (line, source_line, focus) in [
+        (5, "impl fmt::Display for Commands {", "fmt"),
+        (8, "fn consume(_: path::PathBuf) {}", "path"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"lib.rs","line":{line},"column":{}}}]}}"#,
+                column_of(source_line, focus)
+            ),
+        );
+        let result = &value["results"][0];
+        assert_eq!(
+            result["status"], "unresolvable_import_boundary",
+            "focused {focus}: {value}"
+        );
+        assert!(result["definitions"][0].is_null(), "{value}");
+    }
+
+    let terminal_line = "fn indexed(_: local::Item) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":10,"column":{}}}]}}"#,
+            column_of(terminal_line, "Item")
+        ),
+    );
+    let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "inner.helper", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "local.Item", "{value}");
 }
 
 #[test]

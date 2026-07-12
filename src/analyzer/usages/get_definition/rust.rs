@@ -129,6 +129,12 @@ pub(super) fn resolve_rust(
     }
     let refs = rust.reference_context_of(file);
     if let Some(tree) = tree
+        && let Some(outcome) =
+            rust_focused_scoped_prefix_outcome(rust, support, file, source, tree, site, &refs)
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
         && let Some(candidates) =
             rust_use_path_module_candidates(rust, support, file, source, tree, site, &refs)
         && !candidates.is_empty()
@@ -137,18 +143,15 @@ pub(super) fn resolve_rust(
     }
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
-        let resolved = rust_focused_scoped_segment_candidates(rust, support, file, site)
-            .unwrap_or_else(|| {
-                match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
-                    rust, support, &refs, file, path, name,
-                ) {
-                    ReceiverAnalysisOutcome::Precise(candidates) => candidates,
-                    ReceiverAnalysisOutcome::Ambiguous(_)
-                    | ReceiverAnalysisOutcome::Unknown
-                    | ReceiverAnalysisOutcome::Unsupported { .. }
-                    | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
-                }
-            });
+        let resolved = match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
+            rust, support, &refs, file, path, name,
+        ) {
+            ReceiverAnalysisOutcome::Precise(candidates) => candidates,
+            ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unknown
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+        };
         (resolved, true)
     } else {
         // Prefer a type declared in the lexically enclosing scope (module) over the
@@ -388,51 +391,134 @@ fn rust_module_path_fqn(
         .or_else(|| rust.resolve_module_package(file, path))
 }
 
-fn rust_focused_scoped_segment_candidates(
+fn rust_focused_scoped_prefix_outcome(
     rust: &RustAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
     site: &ResolvedReferenceSite,
-) -> Option<Vec<CodeUnit>> {
-    let segments = reference_segments(site, "::", 2)?;
-    let focus_index = focus_segment_index(site, &segments)?;
-    if focus_index + 1 == segments.len() {
+    refs: &RustReferenceContext,
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let prefix = rust_focused_nonterminal_prefix(focused)?;
+    let focused_text = rust_node_text(focused, source).trim();
+    let prefix_text = rust_node_text(prefix, source).trim();
+    if focused_text.is_empty() || prefix_text.is_empty() {
+        return Some(no_definition(
+            "invalid_scoped_segment",
+            "the focused Rust path segment is empty",
+        ));
+    }
+
+    let resolved_fqn = rust_scoped_prefix_fqn(rust, file, refs, prefix, source);
+    if let Some(fqn) = resolved_fqn.as_deref() {
+        let candidates = support.fqn(fqn);
+        if !candidates.is_empty() {
+            return Some(candidates_outcome(candidates));
+        }
+    }
+
+    let root = rust_scoped_path_root(prefix);
+    let root_name = rust_node_text(root, source).trim();
+    let binder = lexical_scope::visible_import_binder_at(source, site.focus_start_byte);
+    if rust_binder_has_external_binding(&binder, root_name)
+        || rust_extern_prelude_root(rust, file, refs, root, root_name)
+    {
+        return Some(boundary(format!(
+            "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
+        )));
+    }
+    Some(no_definition(
+        "no_indexed_definition",
+        format!(
+            "focused Rust path segment `{focused_text}` did not resolve to an indexed definition"
+        ),
+    ))
+}
+
+fn rust_extern_prelude_root(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    refs: &RustReferenceContext,
+    root: Node<'_>,
+    root_name: &str,
+) -> bool {
+    matches!(root.kind(), "identifier" | "type_identifier")
+        && refs.resolve_bare(root_name).is_none()
+        && rust.resolve_module_files(file, root_name).is_empty()
+}
+
+fn rust_focused_nonterminal_prefix<'tree>(focused: Node<'tree>) -> Option<Node<'tree>> {
+    let mut prefix = focused;
+    while let Some(parent) = prefix.parent() {
+        if !matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            break;
+        }
+        if parent
+            .child_by_field_name("name")
+            .is_some_and(|name| node_within(name, focused))
+        {
+            prefix = parent;
+            continue;
+        }
+        break;
+    }
+    let parent = prefix.parent()?;
+    if !matches!(
+        parent.kind(),
+        "scoped_identifier" | "scoped_type_identifier"
+    ) {
         return None;
     }
-    let refs = rust.reference_context_of(file);
-    let resolved = if focus_index == 0 {
-        let (reference, _, _) = &segments[0];
-        let mut resolved = refs
-            .resolve_bare(reference)
-            .map(|fqn| support.fqn(fqn))
-            .unwrap_or_default();
-        if resolved.is_empty() {
-            let imported = rust_imported_export_candidates(
-                rust,
-                support,
-                file,
-                reference,
-                Some(site.focus_start_byte),
-            );
-            resolved = if imported.is_empty() {
-                support.file_identifier(file, reference)
-            } else {
-                imported
-            };
+    parent
+        .child_by_field_name("path")
+        .filter(|path| node_within(*path, prefix))
+        .map(|_| prefix)
+}
+
+fn rust_scoped_prefix_fqn(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    refs: &RustReferenceContext,
+    prefix: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    match prefix.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => {
+            let path = prefix.child_by_field_name("path")?;
+            let name = prefix.child_by_field_name("name")?;
+            let path = rust_node_text(path, source).trim();
+            let name = rust_node_text(name, source).trim();
+            refs.resolve_scoped(path, name).or_else(|| {
+                rust.resolve_module_package(file, rust_node_text(prefix, source).trim())
+            })
         }
-        resolved
-    } else {
-        let path = segments[..focus_index]
-            .iter()
-            .map(|(segment, _, _)| segment.as_str())
-            .collect::<Vec<_>>()
-            .join("::");
-        let (name, _, _) = &segments[focus_index];
-        refs.resolve_scoped(&path, name)
-            .map(|fqn| support.fqn(&fqn))
-            .unwrap_or_default()
-    };
-    (!resolved.is_empty()).then_some(resolved)
+        "identifier" | "type_identifier" => {
+            let name = rust_node_text(prefix, source).trim();
+            refs.resolve_bare(name)
+                .map(str::to_string)
+                .or_else(|| rust.resolve_module_package(file, name))
+        }
+        "crate" | "self" | "super" => {
+            rust.resolve_module_package(file, rust_node_text(prefix, source).trim())
+        }
+        _ => None,
+    }
+}
+
+fn rust_scoped_path_root(mut node: Node<'_>) -> Node<'_> {
+    while matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
+        let Some(path) = node.child_by_field_name("path") else {
+            break;
+        };
+        node = path;
+    }
+    node
 }
 
 fn resolve_rust_field(
