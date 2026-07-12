@@ -16,7 +16,7 @@ Five benchmark reports describe cases where Bifrost either fails to resolve a sy
 - [x] (2026-07-12 02:08Z) Validated and fixed #642 across source, location, and definition-by-reference tools through shared file-selector interpretation.
 - [x] (2026-07-12 02:20Z) Reviewed and integrated delegated patches; corrected one outdated JS test that still expected a now-proven factory receiver in the unproven bucket.
 - [x] (2026-07-12 02:26Z) Passed formatting, clippy, library tests, definition tests, and all affected integration suites.
-- [ ] Commit only the implementation, tests, and this ExecPlan on the current branch with a multiline rationale.
+- [x] (2026-07-12 02:28Z) Committed implementation, tests, and this ExecPlan on `master` as `95655a5e` with a multiline rationale; unrelated untracked artifacts remain untouched.
 
 ## Surprises & Discoveries
 
@@ -147,3 +147,5 @@ Keep `resolve_codeunit_fuzzy` and its `CodeUnitResolution` result as the shared 
 Revision note (2026-07-11): Created the initial self-contained plan after reading all five reports and current resolver/service code. Validity and concrete implementation details remained intentionally open until focused reproductions finished.
 
 Revision note (2026-07-12): Recorded that all five reports are valid, the generalized implementation decisions, the #641 lifecycle qualification, and complete verification evidence after integration review.
+
+Revision note (2026-07-12): Marked the final commit milestone complete after creating implementation checkpoint `95655a5e`; no required work remains.
