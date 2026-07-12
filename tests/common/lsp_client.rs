@@ -414,6 +414,19 @@ impl LspServer {
         assert!(status.success(), "bifrost exited unsuccessfully: {status}");
     }
 
+    /// Gracefully stop the server and return everything it wrote to stderr.
+    pub fn shutdown_with_stderr(mut self) -> String {
+        let status = self.shutdown_with_id_status(999);
+        assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+        let mut output = String::new();
+        self.stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut output)
+            .expect("read stderr");
+        output
+    }
+
     /// Graceful `shutdown`/`exit` using an explicit request id.
     pub fn shutdown_with_id(mut self, id: u64) {
         let status = self.shutdown_with_id_status(id);

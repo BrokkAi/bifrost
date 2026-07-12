@@ -157,14 +157,22 @@ impl RustAnalyzer {
         file: &ProjectFile,
         declarations: &BTreeSet<CodeUnit>,
     ) -> ExportIndex {
+        let _scope = crate::profiling::scope("RustAnalyzer::export_index_of_declarations");
         let mut index = ExportIndex::empty();
+        let export_visible = self.export_visible_declarations(file, declarations);
+        let mut external_visibility = HashMap::default();
 
         for code_unit in declarations {
             let identifier = code_unit.identifier().trim();
             if identifier.is_empty() || identifier.starts_with('_') {
                 continue;
             }
-            if !self.is_module_export_candidate(code_unit) {
+            if !self.is_module_export_candidate(
+                file,
+                code_unit,
+                &export_visible,
+                &mut external_visibility,
+            ) {
                 continue;
             }
             index.exports_by_name.insert(
@@ -327,6 +335,7 @@ impl RustAnalyzer {
     }
 
     fn build_reference_context(&self, file: &ProjectFile) -> RustReferenceContext {
+        let _scope = crate::profiling::scope("RustAnalyzer::build_reference_context");
         let binder = self.import_binder_of(file);
         let mut named: HashMap<String, String> = HashMap::default();
         let mut namespace: HashMap<String, String> = HashMap::default();
@@ -633,14 +642,51 @@ impl RustAnalyzer {
         })
     }
 
-    fn is_module_export_candidate(&self, code_unit: &CodeUnit) -> bool {
-        if !self.is_export_public_declaration(code_unit) {
+    fn export_visible_declarations(
+        &self,
+        file: &ProjectFile,
+        declarations: &BTreeSet<CodeUnit>,
+    ) -> HashSet<CodeUnit> {
+        let Ok(source) = self.inner.project().read_source(file) else {
+            return HashSet::default();
+        };
+        let Some(tree) = parse_rust_tree(&source) else {
+            return HashSet::default();
+        };
+        declarations
+            .iter()
+            .filter(|code_unit| {
+                self.rust_declaration_node(code_unit, tree.root_node())
+                    .and_then(|node| rust_visibility_text(node, &source))
+                    .is_some_and(is_export_visibility)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn is_module_export_candidate(
+        &self,
+        file: &ProjectFile,
+        code_unit: &CodeUnit,
+        export_visible: &HashSet<CodeUnit>,
+        external_visibility: &mut HashMap<CodeUnit, bool>,
+    ) -> bool {
+        if !export_visible.contains(code_unit) {
             return false;
         }
 
         let mut current = code_unit.clone();
         while let Some(parent) = self.parent_of(&current) {
-            if !parent.is_module() || !self.is_export_public_declaration(&parent) {
+            let parent_is_export_visible = if parent.source() == file {
+                export_visible.contains(&parent)
+            } else if let Some(visible) = external_visibility.get(&parent) {
+                *visible
+            } else {
+                let visible = self.is_export_public_declaration(&parent);
+                external_visibility.insert(parent.clone(), visible);
+                visible
+            };
+            if !parent.is_module() || !parent_is_export_visible {
                 return false;
             }
             current = parent;
@@ -669,17 +715,22 @@ impl RustAnalyzer {
         let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
             return false;
         };
-        let ranges = self.ranges(code_unit);
-        let Some(range) = ranges.first() else {
-            return false;
-        };
         let Some(tree) = parse_rust_tree(&source) else {
             return false;
         };
-        tree.root_node()
-            .descendant_for_byte_range(range.start_byte, range.end_byte)
+        self.rust_declaration_node(code_unit, tree.root_node())
             .map(|node| predicate(node, &source))
             .unwrap_or(false)
+    }
+
+    fn rust_declaration_node<'tree>(
+        &self,
+        code_unit: &CodeUnit,
+        root: Node<'tree>,
+    ) -> Option<Node<'tree>> {
+        let ranges = self.ranges(code_unit);
+        let range = ranges.first()?;
+        root.descendant_for_byte_range(range.start_byte, range.end_byte)
     }
 
     fn rust_declaration_for_exact_node(
