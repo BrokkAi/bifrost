@@ -34,7 +34,9 @@ pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {
             | "labeled_statement"
             | "function_signature"
     ) {
-        if let Some(name_node) = parent.child_by_field_name("name")
+        if let Some(name_node) = parent
+            .child_by_field_name("name")
+            .or_else(|| parent.child_by_field_name("property"))
             && name_node.id() == node.id()
         {
             return true;
@@ -65,6 +67,16 @@ pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {
         return pattern.start_byte() <= node.start_byte() && node.end_byte() <= pattern.end_byte();
     }
     false
+}
+
+pub(crate) fn is_explicit_object_literal_key(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "pair"
+        && parent
+            .child_by_field_name("key")
+            .is_some_and(|key| key.id() == node.id())
 }
 
 pub(crate) fn is_property_key_in_member(node: Node<'_>) -> bool {

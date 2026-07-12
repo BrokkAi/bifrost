@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::js_ts::syntax::{is_declaration_identifier, is_explicit_object_literal_key};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct JsTsAliasCandidateKey {
@@ -68,6 +69,34 @@ pub(super) fn resolve_js_ts(
         if !contextual_members.is_empty() {
             return js_ts_candidates_outcome(analyzer, contextual_members);
         }
+    }
+
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
+    if focused
+        .is_some_and(|node| is_declaration_identifier(node) || is_explicit_object_literal_key(node))
+    {
+        return no_definition(
+            "declaration_site",
+            "JS/TS declaration and explicit object-key names do not reference indexed definitions",
+        );
+    }
+    if !reference.contains(['.', ':'])
+        && jsts_visible_receiver_binding_scope(
+            tree.root_node(),
+            source,
+            reference,
+            site.focus_start_byte,
+        )
+        .is_some_and(|scope| {
+            scope.start_byte != tree.root_node().start_byte()
+                || scope.end_byte != tree.root_node().end_byte()
+        })
+    {
+        return no_definition(
+            "local_binding",
+            format!("`{reference}` is a local JS/TS binding, which is not indexed"),
+        );
     }
 
     // AST path for an inline construction receiver `new Foo().member` — the

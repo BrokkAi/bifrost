@@ -7045,6 +7045,91 @@ function render() {
 }
 
 #[test]
+fn javascript_local_bindings_and_named_roles_block_indexed_fallback() {
+    let source = r#"
+const aliases = { c: 1 };
+const bench = { start() {} };
+
+function deref(c) {
+  const path = c;
+  return aliases[c] + c + path;
+}
+
+class ArboristNode {
+  path;
+  constructor(path) { this.path = path; }
+}
+
+function createConnection() {}
+const options = { createConnection: deref };
+
+class WithGetter { get value() { return 1; } }
+
+const FieldBehavior = {};
+(function(FieldBehavior) { return FieldBehavior; })(FieldBehavior);
+
+bench.start();
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    for start in [
+        source.find("deref(c)").unwrap() + "deref(".len(),
+        source.find("aliases[c]").unwrap() + "aliases[".len(),
+        source.find("+ c +").unwrap() + 2,
+        source.find("+ path;").unwrap() + 2,
+        source.find("  path;\n").unwrap() + 2,
+        source.find("constructor(path)").unwrap() + "constructor(".len(),
+        source.find("= path;").unwrap() + 2,
+        source.find("{ createConnection:").unwrap() + 2,
+        source.find("get value()").unwrap() + "get ".len(),
+        source.find("return FieldBehavior;").unwrap() + "return ".len(),
+    ] {
+        let value = lookup(project.root(), &location_reference("app.js", source, start));
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    }
+
+    let bench = lookup(
+        project.root(),
+        &location_reference("app.js", source, source.find("bench.start").unwrap()),
+    );
+    assert_eq!(bench["results"][0]["status"], "resolved", "{bench}");
+    assert_eq!(
+        bench["results"][0]["definitions"][0]["fqn"], "app.js.bench",
+        "{bench}"
+    );
+}
+
+#[test]
+fn typescript_local_bindings_and_uncontextual_object_keys_block_indexed_fallback() {
+    let source = r#"
+class Record { value = 1 }
+function createConnection() {}
+function run(value: number) {
+  const local = value;
+  return value + local;
+}
+const options = { createConnection: run };
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", source)
+        .build();
+
+    for start in [
+        source.find("Record { value").unwrap() + "Record { ".len(),
+        source.find("run(value:").unwrap() + "run(".len(),
+        source.find("= value;").unwrap() + 2,
+        source.find("return value").unwrap() + "return ".len(),
+        source.find("+ local;").unwrap() + 2,
+        source.find("{ createConnection:").unwrap() + 2,
+    ] {
+        let value = lookup(project.root(), &location_reference("app.ts", source, start));
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    }
+}
+
+#[test]
 fn javascript_member_assignment_function_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
