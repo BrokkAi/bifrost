@@ -20,6 +20,7 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 - [x] (2026-07-12 22:10Z) Ran `cargo fmt`, warning-free all-target/all-feature clippy, the complete `nlp,python` Rust suite, and 38 Python tests; all pass.
 - [x] (2026-07-12 22:20Z) Pushed the completed branch and opened pull request #702 linked to issue #699.
 - [x] (2026-07-12 23:05Z) Merged the current `master` base after Linux CI exposed a persistence-fixture race, excluded the live `.brokk` cache from fixture commits, and reran the affected, definition, parameter, formatting, and clippy gates successfully.
+- [x] (2026-07-12 23:35Z) Fixed the updated base branch's Windows-only dead-code benchmark failure by comparing selected definitions through workspace-relative `PathBuf`s instead of canonical-root-sensitive `ProjectFile` equality; the benchmark and Java, Python/JS/TS, and Rust dead-code suites pass.
 
 ## Surprises & Discoveries
 
@@ -50,6 +51,9 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 - Observation: Both Linux CI targets failed in `csharp_package_existence_ignores_stale_complete_blobs` because its second broad fixture commit could sweep the live persisted-analyzer SQLite files under `.brokk` into the Git index. macOS, Windows, and local runs happened not to hit the race.
   Evidence: both failed logs reported libgit2 `failed to read file into stream` from `commit_all`; filtering `.brokk` in that helper makes all eight persistence tests pass on the merged base while the parameter and 427-case definition suites remain green.
 
+- Observation: After the Linux fix, x86 Windows exposed a separate failure already present on the updated `master`: the benchmark could reject `A.method1` from explicitly selected `A.java` when persisted definitions and input files used different canonical spellings of the same Windows root.
+  Evidence: both `master` run 29211992693 and PR run 29212727394 failed the identical `Candidate symbols analyzed: 1` assertion; the selection filter compared whole `ProjectFile` values even though its contract is workspace-relative file membership.
+
 ## Decision Log
 
 - Decision: Resolve parameters from the current parsed source on every query instead of persisting them.
@@ -70,6 +74,10 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 
 - Decision: Exclude `.brokk` through the persistence test's Git-index callback rather than retrying CI or adding timing workarounds.
   Rationale: Analyzer cache files are not fixture source, and a live SQLite database must never be captured by the test repository's broad source commit.
+  Date/Author: 2026-07-12 / Codex
+
+- Decision: Compare dead-code selection scope by normalized relative `PathBuf`, not the full `ProjectFile` including its root.
+  Rationale: all candidates belong to the same active workspace, while Windows may spell that workspace root through either an 8.3 temp path or its canonical long path. Relative file identity is both sufficient and portable.
   Date/Author: 2026-07-12 / Codex
 
 ## Outcomes & Retrospective
@@ -137,3 +145,5 @@ Use only existing tree-sitter grammars and analyzer helpers. Do not add dependen
 Revision note (2026-07-12): Marked implementation and validation complete, recorded the precedence regressions found by the full suite and the isolated-target recovery, and replaced the provisional outcome with final evidence before delivery.
 
 Revision note (2026-07-12, CI follow-up): Recorded the Linux persistence-fixture race found after PR creation, the structured exclusion of `.brokk` from fixture commits, and successful validation on the current merged base.
+
+Revision note (2026-07-12, Windows CI follow-up): Recorded the inherited Windows benchmark failure, its canonical-root mismatch, and the workspace-relative selection fix used to unblock the full matrix.

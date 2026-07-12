@@ -20,6 +20,7 @@ use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::LazyLock;
 
 const DEFAULT_MIN_SCORE: i32 = 8;
@@ -105,14 +106,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let resolved_file_count = resolved.files.len();
     let input_files: Vec<ProjectFile> = resolved.files.into_iter().take(input_file_cap).collect();
     let mut truncated = resolved.input_truncated || resolved_file_count > input_file_cap;
-    let selected_files: BTreeSet<ProjectFile> = input_files.iter().cloned().collect();
+    let selected_file_paths: HashSet<PathBuf> = input_files
+        .iter()
+        .map(|file| file.rel_path().to_path_buf())
+        .collect();
     let mut skipped: Vec<String> = Vec::new();
 
     let candidate_selection = dead_code_candidates(
         analyzer,
         &input_files,
         &params.fq_names,
-        &selected_files,
+        &selected_file_paths,
         candidate_cap,
         &mut skipped,
     );
@@ -478,7 +482,7 @@ fn dead_code_candidates(
     analyzer: &dyn IAnalyzer,
     files: &[ProjectFile],
     fq_names: &[String],
-    selected_files: &BTreeSet<ProjectFile>,
+    selected_file_paths: &HashSet<PathBuf>,
     candidate_cap: usize,
     skipped: &mut Vec<String>,
 ) -> CandidateSelection {
@@ -500,7 +504,9 @@ fn dead_code_candidates(
             }
             let mut matched_any = false;
             for definition in definitions {
-                if !selected_files.is_empty() && !selected_files.contains(definition.source()) {
+                if !selected_file_paths.is_empty()
+                    && !selected_file_paths.contains(definition.source().rel_path())
+                {
                     continue;
                 }
                 if !is_dead_code_candidate(analyzer, &definition) {
