@@ -197,7 +197,16 @@ pub(crate) fn name_shadowed_at(source: &str, name: &str, reference_byte: usize) 
     let Some(tree) = parse_rust_tree(source) else {
         return false;
     };
-    let Some(scope) = enclosing_function_or_closure(tree.root_node(), reference_byte) else {
+    name_shadowed_in_tree(tree.root_node(), source, name, reference_byte)
+}
+
+pub(crate) fn name_shadowed_in_tree(
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+    reference_byte: usize,
+) -> bool {
+    let Some(scope) = enclosing_function_or_closure(root, reference_byte) else {
         return false;
     };
     let mut bindings = HashSet::default();
@@ -208,6 +217,93 @@ pub(crate) fn name_shadowed_at(source: &str, name: &str, reference_byte: usize) 
         collect_visible_local_bindings(body, source, reference_byte, &mut bindings);
     }
     bindings.contains(name)
+}
+
+/// Whether `node` is the identifier being introduced by a Rust binding pattern.
+/// Type/variant owners in structured patterns are deliberately excluded.
+pub(crate) fn is_pattern_binding_identifier(node: Node<'_>) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "let_declaration" | "parameter" | "match_arm" | "for_expression"
+        ) && let Some(pattern) = parent.child_by_field_name("pattern")
+            && pattern_contains_binding_identifier(pattern, node)
+        {
+            return true;
+        }
+        if parent.kind() == "closure_parameters"
+            && pattern_contains_binding_identifier(parent, node)
+        {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "block" | "function_item" | "closure_expression"
+        ) {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn pattern_contains_binding_identifier(pattern: Node<'_>, target: Node<'_>) -> bool {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" => {
+                if node.id() == target.id() {
+                    return true;
+                }
+            }
+            "field_pattern" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    stack.push(pattern);
+                } else if let Some(name) = node.child_by_field_name("name") {
+                    stack.push(name);
+                }
+            }
+            "struct_pattern" => {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor).filter(|child| {
+                    matches!(
+                        child.kind(),
+                        "field_pattern"
+                            | "remaining_field_pattern"
+                            | "tuple_pattern"
+                            | "struct_pattern"
+                            | "ref_pattern"
+                            | "mut_pattern"
+                    )
+                }));
+            }
+            "tuple_struct_pattern" => {
+                let type_id = node.child_by_field_name("type").map(|ty| ty.id());
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor).filter(|child| {
+                    Some(child.id()) != type_id
+                        && matches!(
+                            child.kind(),
+                            "identifier"
+                                | "tuple_pattern"
+                                | "tuple_struct_pattern"
+                                | "struct_pattern"
+                                | "ref_pattern"
+                                | "mut_pattern"
+                        )
+                }));
+            }
+            _ => {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+    }
+    false
 }
 
 fn enclosing_function_or_closure(root: Node<'_>, reference_byte: usize) -> Option<Node<'_>> {

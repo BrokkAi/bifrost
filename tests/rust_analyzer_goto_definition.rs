@@ -141,6 +141,28 @@ fn ra_goto_def_for_fields() {
     );
 }
 
+#[test]
+fn rust_field_access_honors_receiver_focus() {
+    assert_resolves_to_nothing(
+        "receiver.rs",
+        "struct Args {\n    dry_run: bool,\n}\nfn apply(arg: &Args) {\n    let _ = arg<caret>.dry_run;\n}\n",
+    );
+    assert_resolves_to_line(
+        "field.rs",
+        "struct Args {\n    dry_run: bool,\n}\nfn apply(arg: &Args) {\n    let _ = arg.dry_run<caret>;\n}\n",
+        1,
+    );
+}
+
+#[test]
+fn rust_self_method_receiver_resolves_to_enclosing_type() {
+    assert_resolves_to_line(
+        "self_receiver.rs",
+        "struct Problem;\nimpl Problem {\n    fn execute_shared(&self) {}\n    fn execute(&self) {\n        self<caret>.execute_shared();\n    }\n}\n",
+        0,
+    );
+}
+
 // rust-analyzer: goto_def_for_ufcs_inherent_methods — `Foo::frobnicate()`
 // associated-function call resolves to the inherent method (line 2).
 #[test]
@@ -307,6 +329,44 @@ fn ra_goto_definition_on_self() {
         "s.rs",
         "struct Foo;\nimpl Foo {\n    pub fn new() -> Self {\n        Self<caret> {}\n    }\n}\n",
         0,
+    );
+}
+
+#[test]
+fn rust_self_variant_honors_owner_focus() {
+    assert_resolves_to_line(
+        "self_owner.rs",
+        "enum Pattern {\n    Empty,\n}\nimpl Pattern {\n    fn empty() -> Self {\n        Self<caret>::Empty\n    }\n}\n",
+        0,
+    );
+    assert_resolves_to_line(
+        "self_variant.rs",
+        "enum Pattern {\n    Empty,\n}\nimpl Pattern {\n    fn empty() -> Self {\n        Self::Empty<caret>\n    }\n}\n",
+        1,
+    );
+}
+
+#[test]
+fn rust_binding_declarations_do_not_resolve_to_same_file_members() {
+    assert_resolves_to_nothing(
+        "parameter.rs",
+        "struct CallbackPattern;\nstruct BuiltIns;\nimpl BuiltIns {\n    fn call(&self) {}\n}\nfn invoke(call<caret>: &CallbackPattern) {}\n",
+    );
+    assert_resolves_to_nothing(
+        "let_binding.rs",
+        "struct WrappedResult {\n    actual_sample: usize,\n}\nfn sample() {\n    let mut actual_sample<caret> = 0;\n    actual_sample += 1;\n}\n",
+    );
+    assert_resolves_to_nothing(
+        "pattern.rs",
+        "enum Value { Item(i32) }\nstruct BuiltIns;\nimpl BuiltIns {\n    fn call(&self) {}\n}\nfn inspect(value: Value) {\n    match value {\n        Value::Item(call<caret>) => {}\n    }\n}\n",
+    );
+}
+
+#[test]
+fn rust_local_references_do_not_resolve_to_same_file_members() {
+    assert_resolves_to_nothing(
+        "local_reference.rs",
+        "struct WrappedResult {\n    actual_sample: usize,\n}\nfn sample(actual_sample: usize) {\n    let _ = actual_sample<caret>;\n}\n",
     );
 }
 

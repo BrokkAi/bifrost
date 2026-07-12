@@ -1,11 +1,15 @@
 mod common;
 
-use brokk_bifrost::usages::{FuzzyResult, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::hash::HashSet;
+use brokk_bifrost::usages::{
+    ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
+};
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, RustAnalyzer,
 };
 use common::InlineTestProject;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 fn definition(analyzer: &RustAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
@@ -893,6 +897,208 @@ fn member(
         .exact_member(file, owner_name, member_name, true)
         .or_else(|| analyzer.exact_member(file, owner_name, member_name, false))
         .unwrap_or_else(|| panic!("missing member {owner_name}.{member_name}"))
+}
+
+fn authoritative_hits(
+    analyzer: &RustAnalyzer,
+    target: &CodeUnit,
+    files: HashSet<ProjectFile>,
+) -> BTreeSet<UsageHit> {
+    let provider = ExplicitCandidateProvider::new(Arc::new(files));
+    match UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            analyzer,
+            std::slice::from_ref(target),
+            Some(&provider),
+            100,
+            100,
+        )
+        .result
+    {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
+            .into_values()
+            .flat_map(BTreeSet::into_iter)
+            .collect(),
+        other => panic!("expected authoritative Rust usage success, got {other:#?}"),
+    }
+}
+
+#[test]
+fn authoritative_rust_usage_finds_enum_variant_through_self() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/status.rs",
+        r#"
+pub enum Status {
+    Ready,
+}
+
+impl Status {
+    fn current() -> Self {
+        Self::Ready
+    }
+}
+"#,
+    )]);
+    let file = project.file("src/status.rs");
+    let target = member(&analyzer, &file, "Status", "Ready");
+
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected terminal Self::Ready hit: {hits:#?}"
+    );
+    assert!(hits.iter().all(|hit| hit.file == file));
+    assert!(hits.iter().all(|hit| hit.snippet.contains("Self::Ready")));
+}
+
+#[test]
+fn authoritative_rust_usage_finds_private_self_associated_method() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Service;
+
+impl Service {
+    fn target() {}
+
+    fn caller() {
+        Self::target();
+    }
+}
+"#,
+    )]);
+    let file = project.file("src/service.rs");
+    let target = member(&analyzer, &file, "Service", "target");
+
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected terminal Self::target hit: {hits:#?}"
+    );
+    assert!(hits.iter().all(|hit| hit.file == file));
+    assert!(hits.iter().all(|hit| hit.snippet.contains("Self::target")));
+}
+
+#[test]
+fn authoritative_rust_usage_finds_private_field_in_macro_tokens() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+macro_rules! capture {
+    ($($tokens:tt)*) => {};
+}
+
+pub struct Service {
+    secret: usize,
+}
+
+impl Service {
+    fn caller(&self) {
+        capture!(self.secret);
+    }
+}
+"#,
+    )]);
+    let file = project.file("src/service.rs");
+    let target = member(&analyzer, &file, "Service", "secret");
+
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+
+    assert_eq!(1, hits.len(), "private macro field hits: {hits:#?}");
+    assert!(hits.iter().all(|hit| hit.file == file));
+    assert!(hits.iter().all(|hit| hit.snippet.contains("self.secret")));
+}
+
+#[test]
+fn authoritative_rust_private_members_respect_candidate_scope_and_owner_identity() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+pub struct Service {
+    secret: usize,
+}
+
+pub mod child;
+mod other;
+
+impl Service {
+    fn hidden(&self) {}
+}
+"#,
+        ),
+        (
+            "src/child.rs",
+            r#"
+use crate::Service;
+
+fn caller(service: &Service) {
+    let _ = service.secret;
+    service.hidden();
+}
+"#,
+        ),
+        (
+            "src/other.rs",
+            r#"
+pub struct Service {
+    secret: usize,
+}
+
+impl Service {
+    fn hidden(&self) {
+        let _ = self.secret;
+    }
+}
+"#,
+        ),
+    ]);
+    let service = project.file("src/lib.rs");
+    let child = project.file("src/child.rs");
+    let other = project.file("src/other.rs");
+    let field = member(&analyzer, &service, "Service", "secret");
+    let method = member(&analyzer, &service, "Service", "hidden");
+
+    let field_hits = authoritative_hits(
+        &analyzer,
+        &field,
+        [child.clone(), other.clone()].into_iter().collect(),
+    );
+    assert_eq!(1, field_hits.len(), "private field hits: {field_hits:#?}");
+    assert!(field_hits.iter().all(|hit| hit.file == child));
+
+    let method_hits = authoritative_hits(
+        &analyzer,
+        &method,
+        [child.clone(), other.clone()].into_iter().collect(),
+    );
+    assert_eq!(
+        1,
+        method_hits.len(),
+        "private method hits: {method_hits:#?}"
+    );
+    assert!(method_hits.iter().all(|hit| hit.file == child));
+    assert!(
+        method_hits
+            .iter()
+            .all(|hit| hit.kind == UsageHitKind::Reference)
+    );
+
+    assert!(
+        authoritative_hits(&analyzer, &field, [other.clone()].into_iter().collect()).is_empty(),
+        "same-named unrelated owner must not match the private field"
+    );
+    assert!(
+        authoritative_hits(&analyzer, &method, [other].into_iter().collect()).is_empty(),
+        "same-named unrelated owner must not match the private method"
+    );
 }
 
 #[test]

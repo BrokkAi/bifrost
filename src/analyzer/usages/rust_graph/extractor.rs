@@ -1,4 +1,5 @@
 use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
+use crate::analyzer::usages::get_definition::rust_resolve_type_node_fqn;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
@@ -442,11 +443,13 @@ pub(super) fn scan_files_for_member_target(
             return;
         }
         let line_starts = compute_line_starts(source);
-        let owner_local_names: HashSet<String> = if file == target.source() {
+        let refs = rust.reference_context_of(file);
+        let mut owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
         } else {
             rust.usage_binding_local_names(file, seeds)
         };
+        owner_local_names.extend(refs.bare_names_resolving_to(&owner.fq_name()));
         let trait_owner = is_trait_owner(rust, &owner);
         let receiver_type_names = if trait_owner {
             rust.trait_implementer_names(&owner, file)
@@ -461,19 +464,28 @@ pub(super) fn scan_files_for_member_target(
         }
         let visible_bare_constructors =
             visible_bare_constructor_names(rust, file, &self_like_constructors);
-        let receiver_names = infer_receiver_names(
+        let mut receiver_names = infer_receiver_names(
             source,
             &receiver_type_names,
             &constructor_returns,
             &visible_bare_constructors,
         );
+        receiver_names.extend(resolved_owner_receiver_names(
+            tree.root_node(),
+            source,
+            analyzer,
+            rust,
+            support,
+            file,
+            &owner,
+        ));
+        receiver_names.sort();
+        receiver_names.dedup();
         let static_owner_names = owner_local_names;
         let has_static_trait_call = trait_owner && source.contains(&format!("::{}", member_name));
         if receiver_names.is_empty() && static_owner_names.is_empty() && !has_static_trait_call {
             return;
         }
-        let refs = rust.reference_context_of(file);
-
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
         let mut ctx = MemberScanCtx {
@@ -643,20 +655,23 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
 }
 
 fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
-    if ctx.target_is_field {
-        return;
-    }
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
-    for window in children.windows(4) {
-        let [receiver, dot, member, call_args] = window else {
+    for (index, window) in children.windows(3).enumerate() {
+        let [receiver, dot, member] = window else {
             continue;
         };
-        if receiver.kind() != "identifier" || dot.kind() != "." || call_args.kind() != "token_tree"
-        {
+        if !matches!(receiver.kind(), "identifier" | "self") || dot.kind() != "." {
             continue;
         }
         if simple_node_text(*member, ctx.source).as_deref() != Some(ctx.member_name) {
+            continue;
+        }
+        let is_call = children.get(index + 3).is_some_and(|call_args| {
+            call_args.kind() == "token_tree"
+                && call_args.child(0).is_some_and(|open| open.kind() == "(")
+        });
+        if ctx.target_is_field == is_call {
             continue;
         }
         let receiver_name = simple_node_text(*receiver, ctx.source);
@@ -700,15 +715,27 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
                 continue;
             }
         }
-        push_member_hit(
-            ctx.file,
-            ctx.source,
-            ctx.line_starts,
-            start,
-            end,
-            enclosing,
-            ctx.hits,
-        );
+        if !ctx.target_is_field && receiver_is_self_rooted(*receiver) {
+            push_self_receiver_member_hit(
+                ctx.file,
+                ctx.source,
+                ctx.line_starts,
+                start,
+                end,
+                enclosing,
+                ctx.hits,
+            );
+        } else {
+            push_member_hit(
+                ctx.file,
+                ctx.source,
+                ctx.line_starts,
+                start,
+                end,
+                enclosing,
+                ctx.hits,
+            );
+        }
     }
 }
 
@@ -966,7 +993,7 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
         return;
     };
     if !ctx.static_owner_names.contains(&owner_name)
-        && !scoped_static_member_matches_target(&owner_name, ctx)
+        && !scoped_static_member_matches_target(path, &owner_name, ctx)
     {
         return;
     }
@@ -988,7 +1015,17 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     );
 }
 
-fn scoped_static_member_matches_target(owner_name: &str, ctx: &MemberScanCtx<'_>) -> bool {
+fn scoped_static_member_matches_target(
+    owner_node: Node<'_>,
+    owner_name: &str,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
+    if owner_name == "Self" {
+        return enclosing_impl_item(owner_node)
+            .and_then(|impl_item| impl_item.child_by_field_name("type"))
+            .is_some_and(|type_node| resolved_type_matches_owner(type_node, ctx));
+    }
+
     match resolve_scoped_associated_item(
         ctx.rust,
         ctx.support,
@@ -1302,6 +1339,44 @@ fn infer_receiver_names(
     receivers
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolved_owner_receiver_names(
+    root: Node<'_>,
+    source: &str,
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+) -> Vec<String> {
+    let mut receivers = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "parameter" | "let_declaration")
+            && let Some(pattern) = node.child_by_field_name("pattern")
+            && let Some(name) = simple_pattern_name(pattern, source)
+            && let Some(type_node) = node.child_by_field_name("type")
+            && rust_resolve_type_node_fqn(
+                analyzer,
+                support,
+                file,
+                source,
+                type_node,
+                Some(type_node.start_byte()),
+            )
+            .is_some_and(|fqn| fqn_matches_owner(rust, &fqn, owner))
+        {
+            receivers.push(name);
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    receivers
+}
+
 fn collect_receiver_bindings(
     source: &str,
     owner_type_names: &HashSet<String>,
@@ -1562,7 +1637,19 @@ fn explicit_receiver_annotation(node: Node<'_>, source: &str) -> Option<(String,
     let pattern = node.child_by_field_name("pattern")?;
     let name = simple_pattern_name(pattern, source)?;
     let ty = node.child_by_field_name("type")?;
-    Some((name, simple_type_name(ty, source)))
+    Some((name, direct_receiver_type_name(ty, source)))
+}
+
+fn direct_receiver_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    if let Some(name) = simple_type_name(node, source) {
+        return Some(name);
+    }
+    if node.kind() != "reference_type" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| direct_receiver_type_name(child, source))
 }
 
 fn self_field_as_ref_let_else_binding(

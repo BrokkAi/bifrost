@@ -105,8 +105,11 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                     "RustExportUsageGraphStrategy",
                 );
             }
+            let graph_visible = is_graph_visible_member_target(rust, target);
+            let private_authoritative_scope = scan_scope.is_authoritative();
             if seed_result.kind == RustGraphSeedKind::Export
-                && !is_graph_visible_member_target(rust, target)
+                && !graph_visible
+                && !private_authoritative_scope
             {
                 return GraphUsageOutcome::Resolved(FuzzyResult::success(
                     target.clone(),

@@ -17,6 +17,27 @@ pub(super) fn resolve_rust(
     let mut cache = RustTypeLookupCache::default();
     let reference = site.text.as_str();
     if let Some(tree) = tree
+        && !reference.contains(['.', ':'])
+        && let Some(node) = smallest_named_node_covering(
+            tree.root_node(),
+            site.focus_start_byte,
+            site.focus_end_byte,
+        )
+        && node.kind() == "identifier"
+        && (lexical_scope::is_pattern_binding_identifier(node)
+            || lexical_scope::name_shadowed_in_tree(
+                tree.root_node(),
+                source,
+                reference,
+                site.focus_start_byte,
+            ))
+    {
+        return no_definition(
+            "local_binding",
+            format!("`{reference}` is a local Rust binding, which is not indexed"),
+        );
+    }
+    if let Some(tree) = tree
         && let Some(outcome) = rust_impl_associated_type_declaration_outcome(
             analyzer, support, file, source, tree, site,
         )
@@ -51,7 +72,10 @@ pub(super) fn resolve_rust(
         )
         && let Some(self_type) = rust_enclosing_impl_type_fqn(analyzer, support, file, source, node)
     {
+        let focused_segment = reference_segments(site, "::", 2)
+            .and_then(|segments| focus_segment_index(site, &segments));
         let candidates = match reference.split_once("::") {
+            Some(_) if focused_segment == Some(0) => support.fqn(&self_type),
             Some((_, name)) => {
                 let mut candidates = rust_member_candidates(
                     support.fqn(&format!("{self_type}.{name}")),
@@ -425,8 +449,29 @@ fn resolve_rust_field(
         && let Some(field_expression) = rust_enclosing_field_expression(node)
     {
         let field = field_expression.child_by_field_name("field")?;
-        let member = rust_node_text(field, source).trim();
         let receiver = field_expression.child_by_field_name("value")?;
+        if receiver.start_byte() <= site.focus_start_byte
+            && site.focus_end_byte <= receiver.end_byte()
+        {
+            if rust_node_text(receiver, source).trim() == "self"
+                && let Some(owner) =
+                    rust_enclosing_impl_type_fqn(analyzer, support, file, source, node)
+            {
+                let candidates = support.fqn(&owner);
+                if !candidates.is_empty() {
+                    return Some(candidates_outcome(candidates));
+                }
+            }
+            return Some(no_definition(
+                "local_receiver",
+                "the focused Rust receiver is a local expression, which is not indexed",
+            ));
+        }
+        if !(field.start_byte() <= site.focus_start_byte && site.focus_end_byte <= field.end_byte())
+        {
+            return None;
+        }
+        let member = rust_node_text(field, source).trim();
         let owner = rust_expression_type_fqn(
             analyzer,
             support,

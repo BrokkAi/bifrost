@@ -16,7 +16,10 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 05:05Z) Committed engine checkpoint `6c056e91`; full `cargo test --features nlp,python`, all-target/all-feature clippy, formatting, and diff checks pass.
 - [x] (2026-07-12 05:10Z) Pushed engine checkpoint and plan through `2c0ceff6` to `origin/master`.
 - [x] (2026-07-12 11:20Z) Fixed #643's repeated SQLite scans and recursive Rust binding/re-export walks; the exact 512 KiB-stack validation completed in 554.7 seconds with 101,192 KiB peak RSS.
-- [ ] Push the #643 fix, correct and close the issue, then rerun Rust from the committed Bifrost HEAD.
+- [x] (2026-07-12 11:35Z) Pushed `4b3f6065`, corrected #643 with the definitive debugger diagnosis and measured validation, and closed it.
+- [x] (2026-07-12 12:15Z) Completed the committed-HEAD Rust baseline and triaged all 961 disagreements into forward-focus/scope, inverse-member, and follow-on import/type clusters; filed #644 and #645.
+- [x] (2026-07-12 13:05Z) Fixed and corpus-validated #644 and #645; targeted definition/usage suites and all-feature clippy pass.
+- [ ] Push and close #644/#645, then rerun the complete Rust N=1 repository from the clean fixing HEAD.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -49,7 +52,10 @@ Bifrost currently learns about false-negative reference resolution after agents 
   Evidence: `biomejs__gritql` completes construction and a one-target run in about 21 seconds even with a 512 KiB main stack. At the 1,000-target campaign budget, lazy `RustUsageIndex` construction repeatedly called `resolve_module_files -> analyzed_live_files -> AnalyzerStore::contains_parsed_blob -> SQLite`, driving roughly 5 GiB RSS. A debugger then captured the actual stack failure as mutual recursion between `rust_collect_binding_type_fqn` and `rust_expression_type_fqn_mode` for a binding considered in scope inside its own initializer. The fix uses a compact 306-file routing projection, a chunked set query over requested `(blob_oid, language)` keys, and iterative binding/re-export traversals. The exact 512 KiB-stack rerun completed in 554.7 seconds with 101,192 KiB peak RSS and no swaps. Filed as #643.
 
 - Observation: The first completed high-budget Rust differential contains a large follow-on triage set, independent of #643.
-  Evidence: The dirty-worktree validation audited all 306 eligible Rust files and 10,000 sampled sites. Forward resolution uniquely resolved 1,549 sites across 784 targets; inverse comparison classified 517 consistent, 41 editor-only, 5 unproven, and 961 missing. This report is validation evidence only because its resume identity is the pre-fix Bifrost HEAD plus a dirty worktree; the canonical run follows the fix commit.
+  Evidence: Both the dirty-worktree validation and committed-HEAD baseline audited all 306 eligible Rust files and 10,000 sampled sites. Forward resolution uniquely resolved 1,549 sites across 784 targets; inverse comparison classified 517 consistent, 41 editor-only, 5 unproven, and 961 missing. Structured triage found 280 nonterminal focus errors, 93 local binding/declaration false resolutions, 73 terminal `Self::item` inverse gaps, and private inherent member gaps. Filed as #644 and #645. The baseline artifact is marked dirty because delegated fixes began while it ran, so the canonical clean record follows those commits.
+
+- Observation: Macro token trees are a distinct structured Rust usage surface, not source-text noise.
+  Evidence: The real `json!(..., "path": self.file)` site remained missing after private-member visibility and receiver fixes because `record_token_tree_instance_member_hits` explicitly returned for field targets. Extending its token-node walk to distinguish field access from method calls made the exact corpus site consistent without text search.
 
 - Observation: Package version alone is insufficient resume identity during a fix campaign.
   Evidence: Analyzer fixes can land without changing `CARGO_PKG_VERSION`; a report produced before the fix would otherwise suppress the required rerun. Repository records and completion keys therefore include the Bifrost source HEAD as well as the target repository HEAD and configuration fingerprint.
@@ -188,3 +194,5 @@ Revision note (2026-07-12): Added a deterministic target-group cap and disk-safe
 Revision note (2026-07-12): Recorded the all-language preflight and made resume identity commit-aware after review showed that package-version-only records could survive analyzer fixes incorrectly.
 
 Revision note (2026-07-12): Corrected the #643 diagnosis after debugger capture identified self-initializer binding recursion as the stack overflow, and recorded the exact low-stack/RSS validation of the SQLite and traversal fixes.
+
+Revision note (2026-07-12): Recorded the first complete Rust differential triage and the #644/#645 root fixes, including the macro-token field gap found by exact-site validation.
