@@ -4559,6 +4559,85 @@ fn scan_usages_location_target_selects_js_object_literal_method() {
 }
 
 #[test]
+fn scan_usages_location_prefers_scala_class_over_shared_primary_constructor_range() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Service.scala",
+            r#"package app
+
+class Service(value: String)
+
+object Factory {
+  val first = new Service("first")
+  val second = new Service("second")
+  val third = new Service("third")
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app/Service.scala","line":3,"column":7}],"include_tests":true}"#,
+        )
+        .expect("class location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let class = only_result(&value);
+    assert_eq!("found", class["status"], "payload: {value}");
+    assert_eq!("app.Service", class["symbol"], "payload: {value}");
+    assert_eq!(Some(3), class["total_hits"].as_u64(), "payload: {value}");
+
+    let anchored_class_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app/Service.scala","line":3,"column":7,"symbol":"app/Service.scala#app.Service"}],"include_tests":true}"#,
+        )
+        .expect("file-anchored class location scan succeeds");
+    let anchored_class_value: Value =
+        serde_json::from_str(&anchored_class_payload).expect("valid response");
+    let anchored_class = only_result(&anchored_class_value);
+    assert_eq!(
+        "found", anchored_class["status"],
+        "payload: {anchored_class_value}"
+    );
+    assert_eq!(
+        "app.Service", anchored_class["symbol"],
+        "payload: {anchored_class_value}"
+    );
+    assert_eq!(
+        Some(3),
+        anchored_class["total_hits"].as_u64(),
+        "payload: {anchored_class_value}"
+    );
+
+    let constructor_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app/Service.scala","line":3,"column":7,"symbol":"app.Service.Service"}],"include_tests":true}"#,
+        )
+        .expect("constructor location scan succeeds");
+    let constructor_value: Value =
+        serde_json::from_str(&constructor_payload).expect("valid response");
+    let constructor = only_result(&constructor_value);
+    assert_eq!(
+        "found", constructor["status"],
+        "payload: {constructor_value}"
+    );
+    assert_eq!(
+        "app.Service.Service", constructor["symbol"],
+        "payload: {constructor_value}"
+    );
+    assert_eq!(
+        Some(3),
+        constructor["total_hits"].as_u64(),
+        "payload: {constructor_value}"
+    );
+}
+
+#[test]
 fn scan_usages_location_target_does_not_select_nested_same_line_member() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
