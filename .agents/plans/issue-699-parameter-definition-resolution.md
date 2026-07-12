@@ -16,7 +16,9 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 - [x] (2026-07-12 19:10Z) Carried lexical definitions through shared lookup without treating them as indexed `CodeUnit`s.
 - [x] (2026-07-12 19:20Z) Rendered lexical definitions in LSP definition/hover and `get_definitions_by_location`.
 - [x] (2026-07-12 19:40Z) Added all-language, shadowing, callable-form, declaration-site, hover, tool-contract, and overlay regressions; the focused suites pass.
-- [ ] Run focused and full quality gates, update this plan, commit only feature-owned files, push, and open a pull request.
+- [x] (2026-07-12 21:30Z) Ran focused definition, hover, click-around, issue-reproduction, search-tool, and overlay suites; all pass.
+- [x] (2026-07-12 22:10Z) Ran `cargo fmt`, warning-free all-target/all-feature clippy, the complete `nlp,python` Rust suite, and 38 Python tests; all pass.
+- [ ] Push the completed branch and open the pull request linked to issue #699.
 
 ## Surprises & Discoveries
 
@@ -38,6 +40,12 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 - Observation: The complete callable-literal matrix passed for all eleven language grammars.
   Evidence: `cargo test --test lsp_parameter_definition` reports eight passing tests, including every ordinary parameter and every closure/lambda form.
 
+- Observation: Running the complete definition suite exposed fifteen precedence regressions that focused parameter tests could not reveal: type-position identifiers, Rust field roles, initializer visibility, and Scala template members could be mistaken for lexical references or shadows.
+  Evidence: after restricting lexical focus to value-capable roles and tightening declaration visibility/scope rules, `cargo test --test get_definition_test` reports 427 passing tests.
+
+- Observation: The worktree's default target directory exhausted `/tmp` during the full all-feature build, and sharing the original checkout's target directory reused stale test artifacts.
+  Evidence: the final gates use the isolated `CARGO_TARGET_DIR=/home/jonathan/Projects/bifrost/target/issue699`; the complete run exits successfully without touching the original dirty checkout.
+
 ## Decision Log
 
 - Decision: Resolve parameters from the current parsed source on every query instead of persisting them.
@@ -58,7 +66,9 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 
 ## Outcomes & Retrospective
 
-The core implementation and focused regressions are complete. Parameters resolve from current source without storage changes; full workspace validation and delivery remain.
+The implementation is complete and validated. Explicit parameters now resolve lexically from the current tree-sitter AST in all eleven languages without a persistence schema. Definition returns the exact binding leaf, declaration-site lookup resolves to itself, hover renders the full parameter syntax from the active overlay, and location-based search returns a truthful local candidate without a fabricated FQN. Structured local discovery prevents navigation through genuine shadows while existing indexed member/type resolution keeps precedence in non-value roles.
+
+The new behavior passed the complete 427-case definition suite, the 176-case LSP server suite, click-around and Rust issue-reproduction suites, all eight new cross-language parameter fixtures, the complete all-feature Rust test run, warning-free clippy, formatting, and 38 Python tests. The main implementation lesson was that lexical lookup must be gated by the syntactic role of the focus as well as the enclosing scope: a same-spelled identifier in a field or type role is not a reference to a parameter.
 
 ## Context and Orientation
 
@@ -115,3 +125,5 @@ Issue reproduction: Rust `fn mono_family(cfg: &config::Config)` currently return
 Define a lexical result with identifier, `DeclarationKind`, exact name `Range`, and full declaration `Range`. Add an optional lexical field to `DefinitionLookupOutcome` while retaining `Vec<CodeUnit>` for indexed consumers. Extend `DefinitionCandidate` so `name` is always serialized and `fqn` is optional; indexed candidates populate both and lexical candidates omit `fqn`.
 
 Use only existing tree-sitter grammars and analyzer helpers. Do not add dependencies, SQL tables, migrations, regex fallbacks, or hand-written source parsers.
+
+Revision note (2026-07-12): Marked implementation and validation complete, recorded the precedence regressions found by the full suite and the isolated-target recovery, and replaced the provisional outcome with final evidence before delivery.
