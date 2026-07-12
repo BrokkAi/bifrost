@@ -4288,6 +4288,29 @@ object Factory {
     assert_eq!("app.Service", class["symbol"], "payload: {value}");
     assert_eq!(Some(3), class["total_hits"].as_u64(), "payload: {value}");
 
+    let anchored_class_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"app/Service.scala","line":3,"column":7,"symbol":"app/Service.scala#app.Service"}],"include_tests":true}"#,
+        )
+        .expect("file-anchored class location scan succeeds");
+    let anchored_class_value: Value =
+        serde_json::from_str(&anchored_class_payload).expect("valid response");
+    let anchored_class = only_result(&anchored_class_value);
+    assert_eq!(
+        "found", anchored_class["status"],
+        "payload: {anchored_class_value}"
+    );
+    assert_eq!(
+        "app.Service", anchored_class["symbol"],
+        "payload: {anchored_class_value}"
+    );
+    assert_eq!(
+        Some(3),
+        anchored_class["total_hits"].as_u64(),
+        "payload: {anchored_class_value}"
+    );
+
     let constructor_payload = service
         .call_tool_json(
             "scan_usages_by_location",
