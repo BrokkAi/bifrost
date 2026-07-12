@@ -393,6 +393,42 @@ fn should_union_text_candidates(target: &CodeUnit) -> bool {
             && target.is_function()
             && member
             && !target.short_name().ends_with("$static"))
+        // Symbolic Scala methods such as `-` and `<` are commonly visible through
+        // Predef rather than a source import edge. Text candidates only select
+        // files; the Scala AST resolver still proves the exact receiver target.
+        || (language == Language::Scala
+            && target.is_function()
+            && is_scala_symbolic_method_identifier(target.identifier()))
+}
+
+fn is_scala_symbolic_method_identifier(identifier: &str) -> bool {
+    if let Some(operator) = identifier.strip_prefix("unary_") {
+        return matches!(operator, "+" | "-" | "!" | "~");
+    }
+    !identifier.is_empty() && identifier.chars().all(is_scala_ascii_operator_char)
+}
+
+fn is_scala_ascii_operator_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '!' | '#'
+            | '%'
+            | '&'
+            | '*'
+            | '+'
+            | '-'
+            | '/'
+            | ':'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '\\'
+            | '^'
+            | '|'
+            | '~'
+    )
 }
 
 /// Convenience constructor for the standard [`ImportGraphCandidateProvider`] +
@@ -489,6 +525,30 @@ mod tests {
 
         fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
             Vec::new()
+        }
+    }
+
+    #[test]
+    fn scala_symbolic_candidate_names_exclude_synthetic_dollar_identifiers() {
+        for identifier in ["-", "<", "::", "++", "unary_-", "unary_!"] {
+            assert!(
+                is_scala_symbolic_method_identifier(identifier),
+                "expected Scala operator {identifier:?}"
+            );
+        }
+        for identifier in [
+            "",
+            "apply",
+            "foo+",
+            "$anonfun",
+            "$plus",
+            "`named method`",
+            "unary_*",
+        ] {
+            assert!(
+                !is_scala_symbolic_method_identifier(identifier),
+                "unexpected Scala operator {identifier:?}"
+            );
         }
     }
 

@@ -134,8 +134,12 @@ impl TargetSpec {
     }
 
     pub(super) fn receiver_owner_fq_matches(&self, owner_fq_name: &str) -> bool {
-        self.receiver_owner_fq_names
-            .contains(&scala_normalized_fq_name(owner_fq_name))
+        let normalized = scala_normalized_fq_name(owner_fq_name);
+        self.receiver_owner_fq_names.contains(&normalized)
+            || scala_builtin_type_name(&normalized).is_some_and(|builtin| {
+                self.receiver_owner_fq_names
+                    .contains(&format!("scala.{builtin}"))
+            })
     }
 
     pub(super) fn related_override_owner_fq_matches(&self, owner_fq_name: &str) -> bool {

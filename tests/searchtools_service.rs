@@ -2687,6 +2687,84 @@ class UnrelatedChild extends UnrelatedBase {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_scala_companion_apply_and_infix_calls() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/Int.scala",
+            r#"
+package scala
+
+class Int {
+  def -(other: Int): Int = this
+  def <(other: Int): Boolean = false
+}
+"#,
+        )
+        .file(
+            "app/Factories.scala",
+            r#"
+package app
+
+case class Box private (value: Int)
+
+object Box {
+  def apply(value: Int): Box = new Box(value)
+}
+
+object Factory {
+  def apply(value: Int): Box = ???
+}
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"
+package app
+
+object Use {
+  val factory = Factory(1)
+  val box = Box(2)
+  val difference = 3 - 1
+  val comparison = 3 < 4
+}
+"#,
+        )
+        .file(
+            "other/Numbers.scala",
+            r#"
+package other
+
+class Number {
+  def -(other: Number): Number = this
+  def <(other: Number): Boolean = false
+}
+
+object NumberUse {
+  def difference(left: Number, right: Number): Number = left - right
+  def comparison(left: Number, right: Number): Boolean = left < right
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["app.Factory.apply","app.Box.apply","scala.Int.-","scala.Int.<"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(4, resolved_scan_count(&value), "payload: {value}");
+    for usage in results(&value) {
+        assert_eq!(usage["status"], "found", "payload: {value}");
+        assert_eq!(usage["total_hits"], 1, "payload: {value}");
+        assert_eq!(usage["files"][0]["path"], "app/Use.scala", "{value}");
+    }
+}
+
+#[test]
 fn scan_usages_labels_override_declarations_and_reports_resolved_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

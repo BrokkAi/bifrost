@@ -177,6 +177,122 @@ class BinaryChild extends BinaryBase {
 }
 
 #[test]
+fn scala_companion_apply_and_infix_usages_preserve_exact_targets() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "scala/Int.scala",
+            r#"
+package scala
+
+class Int {
+  def -(other: Int): Int = this
+  def <(other: Int): Boolean = false
+}
+"#,
+        ),
+        (
+            "app/Factories.scala",
+            r#"
+package app
+
+case class Box private (value: Int)
+
+object Box {
+  def apply(value: Int): Box = new Box(value)
+}
+
+object Factory {
+  def apply(value: Int): Box = ???
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"
+package app
+
+object Use {
+  val factory = Factory(1)
+  val box = Box(2)
+  val difference = 3 - 1
+  val comparison = 3 < 4
+}
+"#,
+        ),
+        (
+            "other/Factories.scala",
+            r#"
+package other
+
+case class Box private (value: Int)
+
+object Box {
+  def apply(value: Int): Box = new Box(value)
+}
+
+object Factory {
+  def apply(value: Int): Box = ???
+}
+
+object Use {
+  val factory = Factory(1)
+  val box = Box(2)
+}
+"#,
+        ),
+        (
+            "other/Numbers.scala",
+            r#"
+package other
+
+class Number {
+  def -(other: Number): Number = this
+  def <(other: Number): Boolean = false
+}
+
+object NumberUse {
+  def difference(left: Number, right: Number): Number = left - right
+  def comparison(left: Number, right: Number): Boolean = left < right
+}
+"#,
+        ),
+    ]);
+
+    for (target, expected) in [
+        ("app.Factory$.apply", "Factory(1)"),
+        ("app.Box$.apply", "Box(2)"),
+        ("scala.Int.-", "3 - 1"),
+        ("scala.Int.<", "3 < 4"),
+    ] {
+        let target = definition(&analyzer, target);
+        let hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_eq!(
+            hits.len(),
+            1,
+            "wrong same-name target leaked for {target:?}"
+        );
+        assert_hit_contains(&hits, expected);
+        assert_eq!(hits[0].file.rel_path(), "app/Use.scala");
+    }
+
+    let targets = [
+        definition(&analyzer, "app.Factory$.apply"),
+        definition(&analyzer, "app.Box$.apply"),
+        definition(&analyzer, "scala.Int.-"),
+        definition(&analyzer, "scala.Int.<"),
+    ];
+    let limited = UsageFinder::new().query(&analyzer, &targets, 100, 3);
+    assert!(
+        matches!(
+            limited.result,
+            FuzzyResult::TooManyCallsites { limit: 3, .. }
+        ),
+        "lowered Scala calls must preserve the query-wide usage cap"
+    );
+}
+
+#[test]
 fn scala_import_hits_ignore_unrelated_aliased_import_path() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         ("Target.scala", "package app\n\nclass Target\n"),

@@ -11,10 +11,10 @@ use crate::analyzer::usages::scala_graph::resolver::{
     scala_normalized_fq_name, scala_resolve_declared_type,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
-    call_arity_for_reference, has_ancestor_kind, has_member_qualifier, is_assignment_lhs,
-    is_constructor_like_reference, is_field_expression_value, is_identifier_node,
-    is_owner_qualified_this, is_type_like_reference, member_qualifier, member_qualifier_node,
-    node_text, parenthesized_arity,
+    call_arity_for_reference, has_ancestor_kind, has_member_qualifier, infix_receiver_for_operator,
+    is_assignment_lhs, is_constructor_like_reference, is_field_expression_value,
+    is_identifier_node, is_owner_qualified_this, is_type_like_reference, member_qualifier,
+    member_qualifier_node, node_text, parenthesized_arity,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer, TypeHierarchyProvider,
@@ -106,6 +106,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "call_expression" {
         scan_call_expression(node, ctx);
     }
+    if node.kind() == "infix_expression" {
+        scan_infix_expression(node, ctx);
+    }
     if matches!(node.kind(), "function_definition" | "function_declaration") {
         scan_method_declaration(node, ctx);
     }
@@ -179,6 +182,10 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     let text = node_text(function, ctx.source).trim();
+    if companion_apply_call_is_proven(function, text, ctx) {
+        add_hit(function, ctx);
+        return;
+    }
     if text != ctx.spec.member_name || has_member_qualifier(function) {
         return;
     }
@@ -187,6 +194,39 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && member_call_arity_matches(function, ctx)
     {
         add_hit(function, ctx);
+    }
+}
+
+fn companion_apply_call_is_proven(function: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    ctx.spec.member_name == "apply"
+        && !has_member_qualifier(function)
+        && !is_locally_shadowed(ctx, text)
+        && member_call_arity_matches(function, ctx)
+        && ctx
+            .visibility
+            .owner_fq_name_for(text)
+            .is_some_and(|owner| ctx.spec.owner_fq_matches(owner))
+}
+
+fn scan_infix_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.spec.kind != TargetKind::Method {
+        return;
+    }
+    let (Some(operator), Some(left)) = (
+        node.child_by_field_name("operator"),
+        node.child_by_field_name("left"),
+    ) else {
+        return;
+    };
+    let text = node_text(operator, ctx.source).trim();
+    if text != ctx.spec.member_name || infix_receiver_for_operator(operator) != Some(left) {
+        return;
+    }
+    if member_call_arity_matches(operator, ctx)
+        && extension_receiver_type(left, ctx)
+            .is_some_and(|owner| ctx.spec.receiver_owner_fq_matches(&owner))
+    {
+        add_hit(operator, ctx);
     }
 }
 

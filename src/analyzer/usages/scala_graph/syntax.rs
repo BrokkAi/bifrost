@@ -129,6 +129,9 @@ pub(crate) fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<Stri
 
 pub(crate) fn call_arity_for_reference(node: Node<'_>) -> Option<usize> {
     let parent = node.parent()?;
+    if parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node) {
+        return Some(1);
+    }
     let call = if parent.kind() == "call_expression"
         && parent.child_by_field_name("function") == Some(node)
     {
@@ -145,6 +148,13 @@ pub(crate) fn call_arity_for_reference(node: Node<'_>) -> Option<usize> {
     let arguments = call.child_by_field_name("arguments")?;
     let mut cursor = arguments.walk();
     Some(arguments.named_children(&mut cursor).count())
+}
+
+pub(crate) fn infix_receiver_for_operator(node: Node<'_>) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    (parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node))
+        .then(|| parent.child_by_field_name("left"))
+        .flatten()
 }
 
 pub(crate) fn is_assignment_lhs(node: Node<'_>) -> bool {
