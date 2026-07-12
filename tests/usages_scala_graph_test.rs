@@ -36,6 +36,88 @@ fn hit_snippets(result: FuzzyResult) -> Vec<String> {
 }
 
 #[test]
+fn scala_overload_query_preserves_exact_hit_buckets() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Unary.scala",
+            r#"
+package app
+
+def compute(value: Int): Int = value
+"#,
+        ),
+        (
+            "app/Binary.scala",
+            r#"
+package app
+
+def compute(left: Int, right: Int): Int = left + right
+"#,
+        ),
+        (
+            "app/Caller.scala",
+            r#"
+package app
+
+object Caller {
+  val unary = compute(1)
+  val binary = compute(1, 2)
+  val unrelated = other.compute("no")
+}
+"#,
+        ),
+        (
+            "other/Other.scala",
+            r#"
+package other
+
+def compute(value: String): String = value
+"#,
+        ),
+    ]);
+    let mut overloads = analyzer.get_definitions("app.compute");
+    overloads.sort_by_key(|unit| analyzer.signatures(unit).join("\n"));
+    assert_eq!(overloads.len(), 2, "expected both compute overloads");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, &overloads);
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = result
+    else {
+        panic!("expected overload usage success");
+    };
+    assert_eq!(hits_by_overload.len(), 2, "one bucket per overload");
+    for overload in &overloads {
+        let signature = analyzer.signatures(overload).join("\n");
+        let bucket = hits_by_overload
+            .get(overload)
+            .unwrap_or_else(|| panic!("missing bucket for {signature}"));
+        assert_eq!(bucket.len(), 1, "wrong arity leaked into {signature}");
+        let expected = if signature.contains("left: Int, right: Int") {
+            "compute(1, 2)"
+        } else {
+            "compute(1)"
+        };
+        assert_hit_contains(&bucket.iter().cloned().collect::<Vec<_>>(), expected);
+        assert!(
+            bucket
+                .iter()
+                .all(|hit| !hit.snippet.contains("other.compute")),
+            "unrelated same-name method leaked into {signature}: {bucket:#?}"
+        );
+    }
+
+    let limited = UsageFinder::new().query(&analyzer, &overloads, 100, 1);
+    assert!(
+        matches!(
+            limited.result,
+            FuzzyResult::TooManyCallsites { limit: 1, .. }
+        ),
+        "multi-overload query must preserve the query-wide usage cap"
+    );
+}
+
+#[test]
 fn scala_import_hits_ignore_unrelated_aliased_import_path() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         ("Target.scala", "package app\n\nclass Target\n"),

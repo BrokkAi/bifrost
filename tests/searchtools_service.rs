@@ -2549,6 +2549,85 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
 }
 
 #[test]
+fn scan_usages_by_reference_includes_all_scala_overloads() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Unary.scala",
+            r#"
+package app
+
+def compute(value: Int): Int = value
+"#,
+        )
+        .file(
+            "app/Binary.scala",
+            r#"
+package app
+
+def compute(left: Int, right: Int): Int = left + right
+"#,
+        )
+        .file(
+            "app/Caller.scala",
+            r#"
+package app
+
+object Caller {
+  val unary = compute(1)
+  val binary = compute(1, 2)
+  val unrelated = other.compute("no")
+}
+"#,
+        )
+        .file(
+            "other/Other.scala",
+            r#"
+package other
+
+def compute(value: String): String = value
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["app.compute"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    assert_eq!(usage["total_hits"], 2, "{value}");
+    let snippets: Vec<&str> = usage["files"][0]["hits"]
+        .as_array()
+        .expect("Scala usage hits")
+        .iter()
+        .filter_map(|hit| hit["snippet"].as_str())
+        .collect();
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("compute(1)")),
+        "missing unary overload call: {value}"
+    );
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("compute(1, 2)")),
+        "missing binary overload call: {value}"
+    );
+    assert!(
+        snippets
+            .iter()
+            .all(|snippet| !snippet.contains("other.compute")),
+        "unrelated same-name method leaked into results: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_labels_override_declarations_and_reports_resolved_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

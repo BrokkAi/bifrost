@@ -25,6 +25,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 17:25Z) Pushed and closed #646/#647, then fixed, pushed, and closed #648 through the `get_definitions_by_location` symbols surface; no LSP-only acceptance work was retained.
 - [x] (2026-07-12 18:20Z) Implemented and symbols-tested #649 with AST namespace roles, tri-state visible imports, exact lexical-module fallback, and a cached Cargo path-dependency route index shared by forward and inverse Rust resolution.
 - [x] (2026-07-12 19:05Z) Pushed and closed #649, then implemented and symbols-tested #650 with ordered `let_condition`/let-chain visibility and fully iterative lexical/pattern traversal.
+- [x] (2026-07-12 19:45Z) Pushed and closed #650 and completed the next Rust N=1 rerun at `edd7beaa`: missing classifications fell from 628 to 268 while consistent/editor-only coverage rose from 696 to 1,758.
+- [x] (2026-07-12 20:00Z) Found and symbols-tested Scala blocker #651 before the cold Scala corpus run: inverse usage now preserves every overload CodeUnit and enforces the usage cap across their merged hit set.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.

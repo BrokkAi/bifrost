@@ -41,53 +41,71 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let Some(target) = overloads.first() else {
+        if overloads.is_empty() {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        };
-        let Some(spec) = TargetSpec::from_target(self.scala, target) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
-                "ScalaUsageGraphStrategy",
-            );
-        };
+        }
 
         let candidate_files = scan_scope.candidate_files();
-        let mut files: HashSet<ProjectFile> = candidate_files
+        let scoped_files: HashSet<ProjectFile> = candidate_files
             .iter()
             .filter(|file| language_for_file(file) == Language::Scala)
             .cloned()
             .collect();
-        if scan_scope.allows(target.source()) {
-            files.insert(target.source().clone());
-        }
+        let mut hits_by_overload = HashMap::default();
+        let mut observed_hits = BTreeSet::new();
 
-        let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut limit_exceeded = false;
-        for file in files {
-            scan_file(
-                self.scala,
-                analyzer,
-                &file,
-                &spec,
-                &mut hits,
-                max_usages,
-                &mut limit_exceeded,
-            );
-            if hits.len() > max_usages {
-                return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                    short_name: target.short_name().to_string(),
-                    total_callsites: hits.len(),
-                    limit: max_usages,
-                    sample_hits: hits,
-                });
-            }
-            if limit_exceeded {
+        for target in overloads {
+            if scan_scope.is_cancelled() {
                 break;
             }
+            let Some(spec) = TargetSpec::from_target(self.scala, target) else {
+                return GraphUsageOutcome::fallback_safe(
+                    target.fq_name(),
+                    GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
+                    "ScalaUsageGraphStrategy",
+                );
+            };
+            let target_source = (scan_scope.allows(target.source())
+                && !scoped_files.contains(target.source()))
+            .then_some(target.source());
+
+            let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
+            let mut limit_exceeded = false;
+            for file in scoped_files.iter().chain(target_source) {
+                if scan_scope.is_cancelled() {
+                    break;
+                }
+                scan_file(
+                    self.scala,
+                    analyzer,
+                    file,
+                    &spec,
+                    &mut hits,
+                    max_usages,
+                    &mut limit_exceeded,
+                );
+                if limit_exceeded {
+                    break;
+                }
+            }
+
+            observed_hits.extend(hits.iter().cloned());
+            if limit_exceeded || observed_hits.len() > max_usages {
+                return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
+                    short_name: target.short_name().to_string(),
+                    total_callsites: observed_hits.len(),
+                    limit: max_usages,
+                    sample_hits: observed_hits,
+                });
+            }
+            hits_by_overload.insert(target.clone(), hits);
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        GraphUsageOutcome::Resolved(FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload: HashMap::default(),
+            unproven_total_by_overload: HashMap::default(),
+        })
     }
 }
 
