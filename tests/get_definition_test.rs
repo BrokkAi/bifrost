@@ -15220,6 +15220,83 @@ fn unsupported_language_returns_structured_status() {
 }
 
 #[test]
+fn php_bare_function_does_not_resolve_same_named_javascript_declaration() {
+    let project = InlineTestProject::new()
+        .file("builtin.php", "<?php\n$result = count($items);\n")
+        .file(
+            "helper.js",
+            "function count(items) { return items.length; }\n",
+        )
+        .build();
+    let line = "$result = count($items);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"builtin.php","line":2,"column":{}}}]}}"#,
+            column_of(line, "count")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn php_bare_function_prefers_same_language_declaration_over_javascript_collision() {
+    let project = InlineTestProject::new()
+        .file("api.php", "<?php\nfunction count($items) { return 1; }\n")
+        .file("use.php", "<?php\n$result = count($items);\n")
+        .file(
+            "helper.js",
+            "function count(items) { return items.length; }\n",
+        )
+        .build();
+    let line = "$result = count($items);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"use.php","line":2,"column":{}}}]}}"#,
+            column_of(line, "count")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["language"], "php", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "api.php", "{value}");
+}
+
+#[test]
+fn scala_type_reference_keeps_supported_java_definition_resolution() {
+    let project = InlineTestProject::new()
+        .file("app/Greeter.java", "package app; public class Greeter {}\n")
+        .file(
+            "app/Use.scala",
+            "package app\nobject Use { val greeter = new Greeter() }\n",
+        )
+        .build();
+    let line = "object Use { val greeter = new Greeter() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Use.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "Greeter")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["language"], "java", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Greeter", "{value}");
+}
+
+#[test]
 fn php_reference_context_resolves_static_qualifier_to_class() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

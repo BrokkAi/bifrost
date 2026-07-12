@@ -1,4 +1,5 @@
-use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::analyzer::common::language_for_file;
+use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::borrow::Borrow;
@@ -108,6 +109,16 @@ impl DefinitionLookupIndex {
         self.by_fqn.get(fqn).cloned().unwrap_or_default()
     }
 
+    pub(crate) fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        self.by_fqn
+            .get(fqn)
+            .into_iter()
+            .flat_map(|units| units.iter())
+            .filter(|unit| language_for_file(unit.source()) == language)
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn by_fqn(&self, fqn: &str) -> &[CodeUnit] {
         self.by_fqn.get(fqn).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -190,6 +201,12 @@ impl DefinitionLookupIndex {
 
     pub(crate) fn package_exists(&self, package: &str) -> bool {
         self.packages.contains(package)
+    }
+
+    pub(crate) fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        self.files_by_package
+            .get(package)
+            .is_some_and(|files| files.iter().any(|file| language_for_file(file) == language))
     }
 
     /// Files belonging to the package `prefix` exactly, or to any package nested

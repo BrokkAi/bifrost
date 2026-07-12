@@ -72,7 +72,7 @@ pub(super) fn resolve_php(
         Some(PhpReferenceNode::StaticMember { scope, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
             let owner = php_static_scope_fqn(php, support, scope, source, &ctx, &class_ranges);
-            php_member_outcome(php, analyzer, support, owner, member)
+            php_member_outcome(php, support, owner, member)
         }
         Some(PhpReferenceNode::InstanceMember { object, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
@@ -96,7 +96,7 @@ pub(super) fn resolve_php(
                 &bindings,
                 &ctx,
             );
-            php_member_outcome(php, analyzer, support, owner, member)
+            php_member_outcome(php, support, owner, member)
         }
         None => no_definition(
             "unsupported_php_reference_shape",
@@ -118,7 +118,7 @@ fn php_interface_method_declaration_outcome(
 ) -> Option<DefinitionLookupOutcome> {
     let method = php_method_declaration_name(node, source)?;
     let owner_fqn = class_ranges.enclosing(node.start_byte())?;
-    let owner = support.fqn(owner_fqn).into_iter().next()?;
+    let owner = php_fqn_candidates(support, owner_fqn).into_iter().next()?;
     let mut candidates = Vec::new();
     let mut stack = php.get_direct_ancestors(&owner);
     let mut seen = HashSet::default();
@@ -128,7 +128,10 @@ fn php_interface_method_declaration_outcome(
             continue;
         }
         if php.is_interface(&ancestor) {
-            candidates.extend(support.fqn(&format!("{ancestor_fqn}.{method}")));
+            candidates.extend(php_fqn_candidates(
+                support,
+                &format!("{ancestor_fqn}.{method}"),
+            ));
         }
         stack.extend(php.get_direct_ancestors(&ancestor));
     }
@@ -308,7 +311,7 @@ fn php_fqn_outcome(
             format!("`{raw}` did not resolve to a PHP definition name"),
         );
     };
-    let candidates = support.fqn(&fqn);
+    let candidates = php_fqn_candidates(support, &fqn);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -325,7 +328,6 @@ fn php_fqn_outcome(
 
 fn php_member_outcome(
     php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner: Option<String>,
     member: &str,
@@ -337,11 +339,11 @@ fn php_member_outcome(
         );
     };
     let fqn = format!("{owner}.{member}");
-    let candidates = support.fqn(&fqn);
+    let candidates = php_fqn_candidates(support, &fqn);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    let inherited = php_inherited_member_candidates(php, analyzer, support, &owner, member);
+    let inherited = php_inherited_member_candidates(php, support, &owner, member);
     if !inherited.is_empty() {
         return candidates_outcome(inherited);
     }
@@ -358,13 +360,12 @@ fn php_member_outcome(
 
 fn php_inherited_member_candidates(
     php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner_fqn: &str,
     member: &str,
 ) -> Vec<CodeUnit> {
     let mut seen = HashSet::default();
-    let mut level = php_direct_member_owner_fqns(php, analyzer, support, owner_fqn);
+    let mut level = php_direct_member_owner_fqns(php, support, owner_fqn);
     seen.insert(owner_fqn.to_string());
     while !level.is_empty() {
         let mut level_candidates = Vec::new();
@@ -373,10 +374,8 @@ fn php_inherited_member_candidates(
             if !seen.insert(ancestor.clone()) {
                 continue;
             }
-            level_candidates.extend(support.fqn(&format!("{ancestor}.{member}")));
-            next_level.extend(php_direct_member_owner_fqns(
-                php, analyzer, support, &ancestor,
-            ));
+            level_candidates.extend(php_fqn_candidates(support, &format!("{ancestor}.{member}")));
+            next_level.extend(php_direct_member_owner_fqns(php, support, &ancestor));
         }
         sort_units(&mut level_candidates);
         level_candidates.dedup();
@@ -390,18 +389,16 @@ fn php_inherited_member_candidates(
 
 fn php_direct_member_owner_fqns(
     php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner_fqn: &str,
 ) -> Vec<String> {
-    support
-        .fqn(owner_fqn)
+    php_fqn_candidates(support, owner_fqn)
         .into_iter()
         .next()
         .into_iter()
         .flat_map(|child| php.get_direct_ancestors(&child))
         .map(|ancestor| ancestor.fq_name())
-        .filter(|ancestor| analyzer.definitions(ancestor).next().is_some())
+        .filter(|ancestor| !php_fqn_candidates(support, ancestor).is_empty())
         .collect()
 }
 
@@ -413,7 +410,7 @@ fn php_crosses_unindexed_boundary(support: &DefinitionLookupIndex, fqn: &str) ->
 }
 
 fn php_workspace_exact_namespace_exists(support: &DefinitionLookupIndex, namespace: &str) -> bool {
-    support.package_exists(namespace)
+    support.package_exists_in_language(namespace, Language::Php)
 }
 
 fn php_static_scope_fqn(
@@ -439,9 +436,15 @@ fn php_parent_fqn(
     support: &DefinitionLookupIndex,
     enclosing_fqn: &str,
 ) -> Option<String> {
-    let child = support.fqn(enclosing_fqn).into_iter().next()?;
+    let child = php_fqn_candidates(support, enclosing_fqn)
+        .into_iter()
+        .next()?;
     php.direct_declared_class_parent(&child)
         .map(|parent| parent.fq_name())
+}
+
+fn php_fqn_candidates(support: &DefinitionLookupIndex, fqn: &str) -> Vec<CodeUnit> {
+    support.fqn_in_language(fqn, Language::Php)
 }
 
 #[allow(clippy::too_many_arguments)]
