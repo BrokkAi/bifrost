@@ -81,6 +81,23 @@ impl CSharpAnalyzer {
         Self::new(Arc::new(project))
     }
 
+    #[doc(hidden)]
+    pub fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
+    }
+
+    pub(crate) fn declaration_candidates_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_declarations_by_identifier(identifier)
+    }
+
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
         let package = self.inner.package_name_of(file).unwrap_or_default();
         if !package.is_empty() {

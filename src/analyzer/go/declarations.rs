@@ -14,6 +14,7 @@ pub(super) fn parse_go_file(
     let declared_package = determine_go_package_name(tree.root_node(), source);
     let package_name = super::packages::canonical_go_package_name(file, &declared_package);
     let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(package_name);
+    parsed.content_qualifier = declared_package;
     let root = tree.root_node();
 
     collect_go_type_identifiers(root, source, &mut parsed.type_identifiers);

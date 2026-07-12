@@ -558,6 +558,34 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    pub fn declaration_candidate_rows_by_identifier_for_langs(
+        &self,
+        langs: &[String],
+        identifier: &str,
+    ) -> Result<Vec<CandidateRow>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let sql = format!(
+            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+                    units.content_qualifier, units.signature, units.synthetic,
+                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
+                    units.in_definition_lookup
+             FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+             WHERE units.lang = ?1 AND units.identifier = ?2 AND units.in_declarations = 1
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY units.blob_oid, units.unit_key"
+        );
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        for lang in langs {
+            out.extend(collect_candidate_rows(
+                stmt.query_map(params![lang, identifier], candidate_row_from_row)?,
+            )?);
+        }
+        Ok(out)
+    }
+
     pub fn declaration_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<CandidateRow>> {
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let sql = format!(
@@ -1039,10 +1067,10 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     {
         let mut stmt = tx.prepare(
             "INSERT OR IGNORE INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, content_qualifier,
+               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                signature, synthetic, is_type_alias, top_level_ordinal,
                in_declarations, in_definition_lookup
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
         for stored in &units {
             stmt.execute(params![
@@ -1051,7 +1079,8 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
                 stored.key,
                 code_unit_kind_to_i64(stored.unit.kind()),
                 stored.unit.short_name(),
-                adapter.storage_content_qualifier(&stored.unit),
+                stored.unit.identifier(),
+                adapter.storage_content_qualifier(&stored.unit, &state.content_qualifier),
                 stored.unit.signature(),
                 bool_to_i64(stored.unit.is_synthetic()),
                 bool_to_i64(stored.is_type_alias),
@@ -1422,7 +1451,7 @@ fn insert_blob_meta<A: LanguageAdapter>(
             oid,
             lang,
             bool_to_i64(adapter.storage_contains_tests(state)),
-            adapter.storage_file_content_qualifier(&state.package_name),
+            adapter.storage_file_content_qualifier(&state.content_qualifier),
             usize_to_i64(stored_unit_count)?,
             usize_to_i64(side_counts.range_count)?,
             usize_to_i64(side_counts.signature_count)?,
@@ -1478,6 +1507,7 @@ struct RawUnitRow {
 struct BlobMetaRow {
     contains_tests: bool,
     content_package: String,
+    raw_content_package: String,
     type_identifiers: HashSet<String>,
     stored_unit_count: usize,
     side_counts: PersistedSideTableCounts,
@@ -1589,6 +1619,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
     let mut state = FileState {
         source: String::new(),
         package_name: meta.content_package,
+        content_qualifier: meta.raw_content_package,
         top_level_declarations: top_level.into_iter().map(|(_, unit)| unit).collect(),
         declarations,
         definition_lookup_units,
@@ -1782,6 +1813,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
         let mut state = FileState {
             source: source.unwrap_or("").to_string(),
             package_name: adapter.hydrate_content_qualifier(&meta.content_package, file),
+            content_qualifier: meta.content_package.clone(),
             top_level_declarations: top_level.into_iter().map(|(_, unit)| unit).collect(),
             declarations,
             definition_lookup_units,
@@ -1844,6 +1876,7 @@ fn read_blob_meta<A: LanguageAdapter>(
     Ok(Some(BlobMetaRow {
         contains_tests: adapter.hydrate_contains_tests(contains_tests != 0, file, source),
         content_package: adapter.hydrate_content_qualifier(&content_package, file),
+        raw_content_package: content_package,
         type_identifiers,
         stored_unit_count: i64_to_usize(stored_unit_count)?,
         side_counts: side_table_counts_from_raw(raw_side_counts)?,
@@ -1983,6 +2016,7 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
                 oid,
                 BlobMetaRow {
                     contains_tests: contains_tests != 0,
+                    raw_content_package: content_package.clone(),
                     content_package,
                     type_identifiers: HashSet::default(),
                     stored_unit_count: i64_to_usize(stored_unit_count)?,
@@ -2968,6 +3002,7 @@ fn ruby_dispatch_mode_from_i64(value: i64) -> Result<RubyMethodDispatchMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::ruby::RubyAdapter;
@@ -3556,6 +3591,49 @@ mod tests {
     }
 
     #[test]
+    fn identical_go_blob_hydrates_with_live_import_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let _ = write_file(root, "go.mod", "module example.com/demo\n");
+        let content = "package service\ntype Client struct{}\n";
+        let file_a = write_file(root, "alpha/client.go", content);
+        let file_b = write_file(root, "beta/client.go", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = GoAdapter;
+        let state = parse_state(&adapter, &file_a);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+
+        store
+            .write_parsed_blob(oid, "go", &adapter, &state)
+            .unwrap();
+        let hydrated_a = store
+            .hydrate_file_state(oid, "go", &adapter, &file_a)
+            .unwrap()
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "go", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(hydrated_a.content_qualifier, "service");
+        assert_eq!(hydrated_b.content_qualifier, "service");
+        assert_eq!(hydrated_a.package_name, "example.com/demo/alpha");
+        assert_eq!(hydrated_b.package_name, "example.com/demo/beta");
+        assert!(
+            hydrated_a
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "example.com/demo/alpha.Client")
+        );
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "example.com/demo/beta.Client")
+        );
+    }
+
+    #[test]
     fn writer_is_idempotent_for_same_blob() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -3653,10 +3731,10 @@ mod tests {
         let file_scope_err = conn
             .execute(
                 "INSERT INTO code_units(
-                   blob_oid, lang, unit_key, kind, short_name, content_qualifier,
+                   blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                    signature, synthetic, is_type_alias, top_level_ordinal,
                    in_declarations, in_definition_lookup
-                 ) VALUES(?1, 'rust', 1, 5, 'file', '', NULL, 0, 0, 0, 1, 0)",
+                 ) VALUES(?1, 'rust', 1, 5, 'file', 'file', '', NULL, 0, 0, 0, 1, 0)",
                 [TEST_OID],
             )
             .unwrap_err();
@@ -3670,10 +3748,10 @@ mod tests {
             .and_then(|_| {
                 conn.execute(
                     "INSERT INTO code_units(
-                       blob_oid, lang, unit_key, kind, short_name, content_qualifier,
+                       blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                        signature, synthetic, is_type_alias, top_level_ordinal,
                        in_declarations, in_definition_lookup
-                     ) VALUES(?1, 'python', 1, 3, 'mod', '', NULL, 0, 0, 0, 1, 0)",
+                     ) VALUES(?1, 'python', 1, 3, 'mod', 'mod', '', NULL, 0, 0, 0, 1, 0)",
                     [TEST_OID],
                 )
             })
@@ -3761,6 +3839,7 @@ mod tests {
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
         FileState {
             source,
+            content_qualifier: parsed.content_qualifier,
             package_name: parsed.package_name,
             top_level_declarations: parsed.top_level_declarations,
             declarations: parsed.declarations,
@@ -3845,10 +3924,10 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, content_qualifier,
+               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                signature, synthetic, is_type_alias, top_level_ordinal,
                in_declarations, in_definition_lookup
-             ) VALUES(?1, 'rust', 1, 0, 'Thing', '', NULL, 0, 0, 0, 1, 0)",
+             ) VALUES(?1, 'rust', 1, 0, 'Thing', 'Thing', '', NULL, 0, 0, 0, 1, 0)",
             [TEST_OID],
         )
         .unwrap();

@@ -11582,6 +11582,56 @@ fn csharp_extension_method_resolves_from_visible_namespace() {
 }
 
 #[test]
+fn csharp_extension_lookup_uses_identifier_index_and_preserves_proof_filters() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Visible/Extensions.cs",
+            "namespace Visible { public static class Extensions { public static int Convert(this string value) => 0; public static int Convert(this string value, int radix) => 0; public static int Convert(string value, int radix, bool ordinary) => 0; } }\n",
+        )
+        .file(
+            "Hidden/Extensions.cs",
+            "namespace Hidden { public static class Extensions { public static int Convert(this string value, int radix) => 1; } }\n",
+        )
+        .file(
+            "App/Runner.cs",
+            "using Visible;\nnamespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }\n",
+        )
+        .build();
+    let analyzer = brokk_bifrost::CSharpAnalyzer::new(project.project_dyn());
+    analyzer.reset_full_declaration_scan_count_for_test();
+    let line = "namespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }";
+
+    let value = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "App/Runner.cs".to_string(),
+                line: Some(2),
+                column: Some(column_of(line, "Convert")),
+            }],
+        },
+    );
+
+    let result = &value.results[0];
+    assert_eq!(result.status, "resolved");
+    assert_eq!(
+        result.definitions.len(),
+        1,
+        "only the visible extension overload should match"
+    );
+    assert_eq!(result.definitions[0].fqn, "Visible.Extensions.Convert");
+    assert_eq!(
+        result.definitions[0].signature.as_deref(),
+        Some("(string, int)")
+    );
+    assert_eq!(
+        analyzer.full_declaration_scan_count_for_test(),
+        0,
+        "extension lookup must use the persisted identifier index"
+    );
+}
+
+#[test]
 fn csharp_typed_receiver_method_filters_overloads_by_call_arity() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

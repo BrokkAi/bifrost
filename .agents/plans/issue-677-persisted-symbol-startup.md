@@ -1,0 +1,119 @@
+# Make persisted symbol startup lazy and content-correct
+
+This ExecPlan is a living document maintained according to `.agents/PLANS.md`. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must remain current while implementation proceeds.
+
+## Purpose / Big Picture
+
+Opening a warm persisted workspace must finish without reconstructing every declaration in memory or reparsing Go files merely to recover package identity. After this change, a second open of a large clean workspace performs no source parses, full file-state hydration, or combined definition-index construction before a targeted symbols request. Single-language and multi-language analyzers retain the same public definition and usage results, and Go blobs reused at different paths produce correct path-dependent canonical import paths from one persisted content-dependent package-clause fact.
+
+## Progress
+
+- [x] (2026-07-13) Validated issue #677 against current `master` and mapped `WorkspaceAnalyzer`, `MultiAnalyzer`, `DefinitionLookupIndex`, `TreeSitterAnalyzer`, `QueryResolver`, and Go qualifier persistence.
+- [x] (2026-07-13) Isolated the raw Go package-clause persistence fix.
+- [x] (2026-07-13) Add content-dependent parsed-state qualifier storage and remove Go source parsing from row hydration.
+- [x] (2026-07-13) Prototyped and rejected lazy Arc-backed index shards because they merely defer full SQLite materialization until a graph query.
+- [ ] Replace symbols resolver access to `DefinitionLookupIndex` with owned, query-shaped analyzer operations backed by indexed SQL candidate reads.
+- [ ] Add startup counters and warm-open, blob-reuse, single-language, and multi-language public parity regressions.
+- [ ] Run focused/full tests, formatting, and all-feature clippy.
+- [ ] Measure cold build, warm open, peak RSS, and targeted query latency on `aws__aws-sdk-go-v2` and record the evidence.
+
+## Surprises & Discoveries
+
+- Observation: Current `WorkspaceAnalyzer::build_filtered` already returns `WorkspaceAnalyzer::Single` for exactly one selected language, so the single-language production path does not pass through `MultiAnalyzer::new`.
+  Evidence: `src/analyzer/workspace.rs` matches `delegates.len()` and directly stores the sole `AnalyzerDelegate`.
+
+- Observation: Multi-language construction still calls every delegate's `all_declarations` immediately and builds a copied combined `DefinitionLookupIndex`.
+  Evidence: `src/analyzer/multi_analyzer.rs::MultiAnalyzer::new` calls `DefinitionLookupIndex::from_declarations(delegates.values().flat_map(...all_declarations()))`.
+
+- Observation: Exact definition lookup, which backs the normal `get_symbol_sources` path, is already an indexed SQL query and does not require `DefinitionLookupIndex`.
+  Evidence: `TreeSitterAnalyzer::definitions` delegates to `sql_definitions_vec`, which selects candidate rows by persisted short name before applying adapter normalization.
+
+- Observation: Graph-heavy definition and usage resolution still accepts `&DefinitionLookupIndex` broadly and therefore materializes a language's full persisted definition index when that support object is first requested.
+  Evidence: `DefinitionBatchContext::new` and the usage graph resolvers retain a `DefinitionLookupIndex`; replacing that contract with bounded store-backed lookup operations is a larger follow-up than removing eager workspace construction.
+
+- Observation: Go intentionally stores empty `code_units.content_qualifier` and `blob_meta.content_package`, then `GoAdapter::hydrate_content_qualifier` reads and parses the entire source file for every resolved candidate row.
+  Evidence: `src/analyzer/go/adapter.rs` returns `String::new()` from both storage hooks and constructs a tree-sitter parser in the hydration hook.
+
+- Observation: A canonical Go import path is not blob content. The same bytes can appear at multiple live paths and must resolve to different canonical packages, while the declared `package foo` or `package foo_test` clause is content-dependent and can safely be stored once per blob.
+  Evidence: `canonical_go_package_name` combines the declared package's external-test suffix with the nearest live `go.mod` and the file's live directory.
+
+## Decision Log
+
+- Decision: Reject immutable Arc-backed `DefinitionLookupIndex` shards.
+  Rationale: They avoid a second copied workspace map but still hydrate every persisted declaration into memory when the first graph-heavy symbols request asks for a delegate index. That is deferral, not correct use of SQLite.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Introduce an owned-result, query-shaped definition provider for symbols resolvers.
+  Rationale: Exact FQN, normalized FQN, identifier, owner/member, file/identifier, type/package, and package-prefix operations can fetch bounded candidates using the persisted short-name and identifier indexes, hydrate only live matches, and merge dirty state. Multi-language lookup can fan out those owned queries without constructing a combined workspace index.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Keep exact symbols lookup on the existing bounded `definitions` SQL path and test that it does not initialize the composite definition index.
+  Rationale: Deferring the full index is only useful if common symbols requests do not immediately force it. This establishes that boundary without claiming that graph-heavy usage analysis is store-backed yet.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Persist a generic content-dependent qualifier in `ParsedFile`/`FileState`; for Go it is the raw package-clause identifier, while other adapters keep their existing package qualifier.
+  Rationale: Storage hooks need the content-only fact at write time. Canonical Go package identity remains path-dependent and is recomposed only when a row is attached to a live path.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Bump Go's analyzer epoch salt.
+  Rationale: Existing Go rows contain empty qualifiers and cannot be migrated correctly without source syntax. Rebuilding only Go blobs is the safe migration.
+  Date/Author: 2026-07-13 / Codex
+
+## Outcomes & Retrospective
+
+Implementation and measured evidence are pending.
+
+## Context and Orientation
+
+`WorkspaceAnalyzer` in `src/analyzer/workspace.rs` builds one tree-sitter delegate per detected language. A `MultiAnalyzer` in `src/analyzer/multi_analyzer.rs` routes calls across two or more delegates. A `DefinitionLookupIndex` in `src/analyzer/definition_lookup_index.rs` is an immutable set of lookup maps used by language resolvers. Each persisted `TreeSitterAnalyzer` stores content-addressed declaration rows in SQLite and resolves them against the current live path snapshot through `src/analyzer/store/query.rs::QueryResolver`.
+
+Go declarations use canonical import paths such as `github.com/aws/aws-sdk-go-v2/service/s3`. That value depends on both source content and the file's path beneath its nearest `go.mod`. The raw package clause such as `package s3` depends only on source content. Persisting the canonical path in a blob row would be wrong when identical bytes are reused at another path; persisting the raw clause and recomputing against each live path is correct.
+
+## Plan of Work
+
+First extend parsed and hydrated file state with a content-dependent qualifier. Change the language-adapter storage hook so writing a code-unit row can use that qualifier. Set Go's qualifier from the tree-sitter `package_clause`, store it in code-unit and blob metadata rows, and make Go hydration call `canonical_go_package_name(file, raw_qualifier)` without reading source or constructing a parser. Bump only the Go epoch salt so old empty rows are discarded and rebuilt.
+
+Then add an owned-result definition-query surface to the analyzer contract. Implement persisted tree-sitter operations with indexed `code_units(lang, short_name)` and `code_units(lang, identifier)` candidate queries, live-path expansion, adapter normalization, and dirty/nonpersisted unions. Migrate `DefinitionBatchContext` and forward symbols usage resolvers away from borrowed `DefinitionLookupIndex` maps. Keep inherently whole-workspace operations such as Scala inverse/global indexing explicit and measurable rather than hiding their cost behind a lazy index. `MultiAnalyzer` will fan out bounded delegate queries and merge sorted, deduplicated results.
+
+Build a generated persisted multi-language workspace twice, assert the warm build emits zero parse events and full declaration scans, then issue exact definition and representative forward usage queries and assert the scan count remains zero. Add a same-Go-blob/two-path regression with distinct canonical packages, an external-test package regression, and public single/multi analyzer definition and usage parity. Reuse existing persistence and inline-project harnesses.
+
+Finally run the repository gates and benchmark the real warm Go corpus. The benchmark must use the release binary or a dedicated ignored measurement test, record cold build time, warm open time, targeted query time, and peak RSS, and confirm the warm open reaches the query with zero parse events. Do not add a resident map proportional to workspace declarations.
+
+## Concrete Steps
+
+Work from `/home/jonathan/Projects/bifrost`.
+
+Run focused tests while implementing:
+
+    cargo test --test analyzer_persistence
+    cargo test --test analyzer_sql_query_parity
+    cargo test --test multi_analyzer_test
+    cargo test --test analyzer_query_parity
+    cargo test --test go_analyzer_parity
+
+Run final gates:
+
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+
+Build release measurement artifacts and run the warm corpus benchmark against the existing clone at `/mnt/T9/repo-clones/aws__aws-sdk-go-v2`. Capture `/usr/bin/time -v` or the repository's measurement-test output for cold build, warm open, targeted query, and maximum resident set size.
+
+## Validation and Acceptance
+
+A generated persisted workspace must parse on the cold build and report zero parse events on the second build. Exact definition and representative forward usage queries must not enumerate or materialize all persisted declarations, and must return the same symbol identities as direct single-language analyzers. Any inherently global inverse operation must be explicit and separately bounded/measured. A source-identical Go file placed beneath two different module-relative directories must produce two correct canonical package FQNs from one content blob, without a hydration parse.
+
+The real Go corpus warm open must complete in a practical time and bounded RSS rather than saturating one core for hours at multi-gigabyte memory. Public definition and usage tests must remain green for both single- and multi-language workspaces.
+
+## Idempotence and Recovery
+
+All tests and benchmark commands are repeatable. The Go epoch bump invalidates only Go analyzer rows; rerunning a cold build repopulates them transactionally. Existing user worktree files are read-only during measurement. If a benchmark is interrupted, rerun it against the same clone; persisted rows already written remain reusable.
+
+## Artifacts and Notes
+
+The isolated Go qualifier checkpoint passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, the 710-test `cargo test --features nlp,python --lib` suite, all three `go_analyzer_parity` tests, the store side-table round trip, and the identical-blob/two-live-path regression. Benchmark transcripts and final query-provider test counts remain pending.
+
+## Interfaces and Dependencies
+
+The symbols resolver contract gains owned-result definition queries for exact/normalized names, identifiers, owner members, files, types, and packages. `TreeSitterAnalyzer` implements them using indexed store reads; `MultiAnalyzer` merges delegate results. Existing `DefinitionLookupIndex` remains available only for paths not yet migrated and is not treated as an acceptable persisted symbols backend.
+
+`ParsedFile` and `FileState` gain a content-dependent qualifier string. `LanguageAdapter::storage_content_qualifier` receives that fact when persisting units. `GoAdapter` persists the raw package clause and hydrates canonical package names solely through `canonical_go_package_name`; it must not read source or instantiate tree-sitter in hydration.

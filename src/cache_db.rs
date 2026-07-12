@@ -17,7 +17,7 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const LATEST_SCHEMA_VERSION: i64 = 1;
 const PRE_RELEASE_UNIFIED_SCHEMA_VERSION: i64 = 6;
 const LATEST_SEMANTIC_SCHEMA_VERSION: i64 = 1;
-const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 8;
+const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 9;
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
@@ -450,6 +450,7 @@ fn create_analyzer_schema(tx: &Transaction<'_>) -> Result<()> {
           unit_key                 INTEGER NOT NULL,
           kind                     INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 5),
           short_name               TEXT    NOT NULL,
+          identifier               TEXT    NOT NULL,
           content_qualifier        TEXT    NOT NULL,
           signature                TEXT,
           synthetic                INTEGER NOT NULL CHECK(synthetic IN (0, 1)),
@@ -466,6 +467,10 @@ fn create_analyzer_schema(tx: &Transaction<'_>) -> Result<()> {
 
         CREATE INDEX idx_code_units_lang_short_name
           ON code_units(lang, short_name);
+
+        CREATE INDEX idx_code_units_lang_identifier_declarations
+          ON code_units(lang, identifier)
+          WHERE in_declarations = 1;
 
         CREATE TABLE unit_ranges(
           blob_oid    TEXT    NOT NULL,

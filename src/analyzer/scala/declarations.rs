@@ -95,6 +95,7 @@ impl<'a> ScalaVisitor<'a> {
                         };
                         if self.parsed.package_name.is_empty() {
                             self.parsed.package_name = current_package.clone();
+                            self.parsed.content_qualifier = current_package.clone();
                         }
                     }
                     if let Some(body) = child.child_by_field_name("body") {

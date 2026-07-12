@@ -824,7 +824,7 @@ fn csharp_extension_method_candidates(
     namespaces.dedup();
 
     let mut candidates: Vec<_> = csharp
-        .get_all_declarations()
+        .declaration_candidates_by_identifier(member)
         .into_iter()
         .filter(|unit| unit.is_function() && unit.identifier() == member)
         .filter(|unit| csharp_extension_declaring_type_is_visible(csharp, &namespaces, unit))

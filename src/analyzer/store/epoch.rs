@@ -289,7 +289,7 @@ lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07"
 );
 lang_epoch!(
     Cpp,

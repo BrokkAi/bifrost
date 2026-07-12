@@ -41,7 +41,11 @@ impl LanguageAdapter for RustAdapter {
         "rs"
     }
 
-    fn storage_content_qualifier(&self, _code_unit: &crate::analyzer::CodeUnit) -> String {
+    fn storage_content_qualifier(
+        &self,
+        _code_unit: &crate::analyzer::CodeUnit,
+        _content_qualifier: &str,
+    ) -> String {
         String::new()
     }
 

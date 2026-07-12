@@ -178,7 +178,7 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
         false
     }
-    fn storage_content_qualifier(&self, code_unit: &CodeUnit) -> String {
+    fn storage_content_qualifier(&self, code_unit: &CodeUnit, _content_qualifier: &str) -> String {
         code_unit.package_name().to_string()
     }
     /// Whether an ASCII substring match over the persisted content qualifier
@@ -312,6 +312,9 @@ impl BuildProgressEvent {
 pub struct FileState {
     pub(crate) source: String,
     pub(crate) package_name: String,
+    /// Content-only qualifier persisted with a blob. Languages whose canonical
+    /// package identity depends on the live path recompose it during hydration.
+    pub(crate) content_qualifier: String,
     pub(crate) top_level_declarations: Vec<CodeUnit>,
     pub(crate) declarations: HashSet<CodeUnit>,
     pub(crate) definition_lookup_units: HashSet<CodeUnit>,
@@ -490,6 +493,7 @@ impl<T> BoundedFileCache<T> {
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
     pub package_name: String,
+    pub content_qualifier: String,
     pub top_level_declarations: Vec<CodeUnit>,
     pub declarations: HashSet<CodeUnit>,
     pub definition_lookup_units: HashSet<CodeUnit>,
@@ -509,6 +513,7 @@ pub struct ParsedFile {
 impl ParsedFile {
     pub fn new(package_name: String) -> Self {
         Self {
+            content_qualifier: package_name.clone(),
             package_name,
             top_level_declarations: Vec::new(),
             declarations: HashSet::default(),
@@ -740,6 +745,7 @@ pub struct TreeSitterAnalyzer<A> {
     usage_facts_index: Arc<OnceLock<UsageFactsIndex>>,
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
+    full_declaration_scan_count: Arc<AtomicUsize>,
     _state: PhantomData<A>,
 }
 
@@ -760,6 +766,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             usage_facts_index: Arc::clone(&self.usage_facts_index),
             full_hydration_count: Arc::clone(&self.full_hydration_count),
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
+            full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
             _state: PhantomData,
         }
     }
@@ -899,6 +906,7 @@ where
             usage_facts_index: Arc::new(OnceLock::new()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
+            full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
     }
@@ -957,6 +965,7 @@ where
             usage_facts_index: Arc::new(OnceLock::new()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
+            full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
     }
@@ -1000,6 +1009,7 @@ where
 
         Some(FileState {
             source,
+            content_qualifier: parsed.content_qualifier,
             package_name: parsed.package_name,
             top_level_declarations: parsed.top_level_declarations,
             declarations: parsed.declarations,
@@ -2120,6 +2130,16 @@ where
     }
 
     #[doc(hidden)]
+    pub fn reset_full_declaration_scan_count_for_test(&self) {
+        self.full_declaration_scan_count.store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.full_declaration_scan_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
     pub fn write_live_file_to_store_for_test(&self, file: &ProjectFile) -> Option<()> {
         if !file.exists() && !self.project.has_overlay(file) {
             return None;
@@ -2151,6 +2171,8 @@ where
     }
 
     fn sql_all_declarations_vec(&self) -> Option<Vec<CodeUnit>> {
+        self.full_declaration_scan_count
+            .fetch_add(1, Ordering::Relaxed);
         let rows = self
             .store_context
             .store
@@ -2324,6 +2346,28 @@ where
             })?,
         );
         Some(matches)
+    }
+
+    pub(crate) fn lookup_declarations_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        let langs = self.storage_language_keys_for_queries();
+        let rows = self
+            .store_context
+            .store
+            .declaration_candidate_rows_by_identifier_for_langs(&langs, identifier)
+            .unwrap_or_default();
+        let mut matches: BTreeSet<_> = self
+            .resolve_candidate_rows(rows)
+            .into_iter()
+            .filter(|unit| unit.identifier() == identifier)
+            .collect();
+        matches.extend(self.dirty_units_matching(false, |unit| unit.identifier() == identifier));
+        matches.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                unit.identifier() == identifier
+            })
+            .unwrap_or_default(),
+        );
+        matches
     }
 
     fn sql_search_definitions(
@@ -3363,6 +3407,7 @@ mod tests {
         FileState {
             source: source.into(),
             package_name: String::new(),
+            content_qualifier: String::new(),
             top_level_declarations: Vec::new(),
             declarations: HashSet::default(),
             definition_lookup_units: HashSet::default(),
@@ -3491,6 +3536,20 @@ mod tests {
                 .any(|unit| unit.fq_name() == "pkg.dirty.Dirty")
         );
         assert_eq!(analyzer.get_definitions("pkg.dirty.Dirty").len(), 1);
+        assert!(
+            analyzer
+                .lookup_declarations_by_identifier("Dirty")
+                .iter()
+                .any(|unit| unit.fq_name() == "pkg.dirty.Dirty"),
+            "exact identifier candidates must include dirty declarations"
+        );
+        assert!(
+            analyzer
+                .lookup_declarations_by_identifier("dirty")
+                .iter()
+                .any(|unit| unit.is_module() && unit.fq_name() == "pkg.dirty"),
+            "exact identifier candidates must retain non-persisted path modules"
+        );
     }
 
     #[test]
@@ -3578,7 +3637,10 @@ mod tests {
 
         assert_eq!(adapter.storage_language_key_for_file(&file), "java");
         assert_eq!(adapter.storage_language_keys().len(), 1);
-        assert_eq!(adapter.storage_content_qualifier(&unit), "example");
+        assert_eq!(
+            adapter.storage_content_qualifier(&unit, "example"),
+            "example"
+        );
         assert_eq!(adapter.storage_file_content_qualifier("example"), "example");
         assert_eq!(
             adapter.hydrate_content_qualifier("example", &file),
@@ -3610,7 +3672,7 @@ mod tests {
             "pkg.service",
             "Service",
         );
-        assert_eq!(python.storage_content_qualifier(&python_unit), "");
+        assert_eq!(python.storage_content_qualifier(&python_unit, ""), "");
         assert_eq!(python.storage_file_content_qualifier("pkg.service"), "");
         assert_eq!(
             python.hydrate_content_qualifier("", &python_file),
@@ -3620,7 +3682,7 @@ mod tests {
         let rust_file = temp_file(&root, "src/net/mod.rs");
         let rust = RustAdapter;
         let rust_unit = CodeUnit::new(rust_file.clone(), CodeUnitType::Class, "net", "Client");
-        assert_eq!(rust.storage_content_qualifier(&rust_unit), "");
+        assert_eq!(rust.storage_content_qualifier(&rust_unit, ""), "");
         assert_eq!(rust.hydrate_content_qualifier("", &rust_file), "net");
 
         std::fs::write(root.join("go.mod"), "module example.com/demo\n").unwrap();
@@ -3635,7 +3697,7 @@ mod tests {
             "example.com/demo/internal/service",
             "Service",
         );
-        assert_eq!(go.storage_content_qualifier(&go_unit), "");
+        assert_eq!(go.storage_content_qualifier(&go_unit, "service"), "service");
         assert_eq!(
             go.hydrate_content_qualifier("", &go_file),
             "example.com/demo/internal/service"

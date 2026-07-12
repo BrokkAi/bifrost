@@ -48,7 +48,7 @@ impl LanguageAdapter for PythonAdapter {
         "py"
     }
 
-    fn storage_content_qualifier(&self, _code_unit: &CodeUnit) -> String {
+    fn storage_content_qualifier(&self, _code_unit: &CodeUnit, _content_qualifier: &str) -> String {
         String::new()
     }
 

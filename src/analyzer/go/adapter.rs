@@ -1,7 +1,7 @@
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
-use tree_sitter::{Language as TsLanguage, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Tree};
 
-use super::declarations::{determine_go_package_name, parse_go_file};
+use super::declarations::parse_go_file;
 use super::packages::canonical_go_package_name;
 use super::tests::go_contains_tests;
 
@@ -25,31 +25,24 @@ impl LanguageAdapter for GoAdapter {
         "go"
     }
 
-    fn storage_content_qualifier(&self, _code_unit: &crate::analyzer::CodeUnit) -> String {
-        String::new()
+    fn storage_content_qualifier(
+        &self,
+        _code_unit: &crate::analyzer::CodeUnit,
+        content_qualifier: &str,
+    ) -> String {
+        content_qualifier.to_string()
     }
 
     fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
         false
     }
 
-    fn storage_file_content_qualifier(&self, _package_name: &str) -> String {
-        String::new()
+    fn storage_file_content_qualifier(&self, content_qualifier: &str) -> String {
+        content_qualifier.to_string()
     }
 
-    fn hydrate_content_qualifier(&self, _content_qualifier: &str, file: &ProjectFile) -> String {
-        let Ok(source) = file.read_to_string() else {
-            return String::new();
-        };
-        let mut parser = Parser::new();
-        if parser.set_language(&self.parser_language()).is_err() {
-            return String::new();
-        }
-        let Some(tree) = parser.parse(source.as_str(), None) else {
-            return String::new();
-        };
-        let declared = determine_go_package_name(tree.root_node(), &source);
-        canonical_go_package_name(file, &declared)
+    fn hydrate_content_qualifier(&self, content_qualifier: &str, file: &ProjectFile) -> String {
+        canonical_go_package_name(file, content_qualifier)
     }
 
     fn contains_tests(
