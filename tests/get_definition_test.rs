@@ -6616,6 +6616,129 @@ export function run() {
 }
 
 #[test]
+fn typescript_cyclic_local_receiver_inference_terminates_without_unrelated_owner() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+class Unrelated {
+  make(): Unrelated { return this }
+  run(): void {}
+}
+
+export function start() {
+  const service = service.make()
+  service.run()
+}
+"#,
+        )
+        .build();
+
+    let source = project.file("app.ts").read_to_string().expect("app source");
+    let reference_start = source.rfind("run()").expect("receiver call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.ts", &source, reference_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn typescript_contextual_callback_receiver_cycle_terminates_without_unrelated_owner() {
+    let source = r#"
+class Unrelated {
+  withChild(callback: (child: Unrelated) => void): void {}
+  run(): void {}
+}
+
+export function start() {
+  const child = child.withChild((child) => child.run())
+}
+"#;
+    let reference_start = source.rfind("run()").expect("callback receiver call");
+    let args = location_reference("app.ts", source, reference_start);
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", source)
+        .build();
+
+    let value = lookup(project.root(), &args);
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn typescript_deep_acyclic_receiver_chain_stops_at_semantic_budget() {
+    const DEPTH: usize = 4_000;
+    let mut source = String::from(
+        r#"
+class Service {
+  make(): Service { return this }
+  run(): void {}
+}
+
+export function start() {
+  const value4000 = new Service()
+"#,
+    );
+    for index in (0..DEPTH).rev() {
+        source.push_str(&format!(
+            "  const value{index} = value{}.make()\n",
+            index + 1
+        ));
+    }
+    source.push_str("  value0.run()\n}\n");
+    let reference_start = source.rfind("run()").expect("receiver call");
+    let args = location_reference("app.ts", &source, reference_start);
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", source)
+        .build();
+
+    let value = lookup(project.root(), &args);
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn typescript_deep_acyclic_receiver_lookup_is_stack_safe() {
+    const DEPTH: usize = 4_000;
+    let mut source = String::from(
+        r#"
+class Service {
+  run(): void {}
+}
+
+export function start() {
+"#,
+    );
+    for _ in 0..DEPTH {
+        source.push_str("  if (true) {\n");
+    }
+    source.push_str("  const service = new Service()\n  service.run()\n");
+    for _ in 0..DEPTH {
+        source.push_str("  }\n");
+    }
+    source.push_str("}\n");
+    let reference_start = source.rfind("run()").expect("receiver call");
+    let args = location_reference("app.ts", &source, reference_start);
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", source)
+        .build();
+
+    let value = lookup(project.root(), &args);
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Service.run", "{value}");
+}
+
+#[test]
 fn typescript_contextual_callback_parameter_members_resolve() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

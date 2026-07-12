@@ -1,5 +1,51 @@
 use super::*;
 use crate::analyzer::js_ts::syntax::{is_declaration_identifier, is_explicit_object_literal_key};
+use std::cell::{Cell, RefCell};
+
+const MAX_TS_RECEIVER_RESOLUTION_DEPTH: usize = 64;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TsReceiverResolutionKey {
+    scope_id: usize,
+    receiver: String,
+    byte: usize,
+}
+
+#[derive(Default)]
+struct TsReceiverResolution {
+    active: RefCell<HashSet<TsReceiverResolutionKey>>,
+    depth: Cell<usize>,
+}
+
+struct TsReceiverResolutionGuard<'a> {
+    resolution: &'a TsReceiverResolution,
+    key: TsReceiverResolutionKey,
+}
+
+impl TsReceiverResolution {
+    fn enter(&self, key: TsReceiverResolutionKey) -> Option<TsReceiverResolutionGuard<'_>> {
+        let depth = self.depth.get();
+        if depth >= MAX_TS_RECEIVER_RESOLUTION_DEPTH
+            || !self.active.borrow_mut().insert(key.clone())
+        {
+            return None;
+        }
+        self.depth.set(depth + 1);
+        Some(TsReceiverResolutionGuard {
+            resolution: self,
+            key,
+        })
+    }
+}
+
+impl Drop for TsReceiverResolutionGuard<'_> {
+    fn drop(&mut self) {
+        self.resolution.active.borrow_mut().remove(&self.key);
+        self.resolution
+            .depth
+            .set(self.resolution.depth.get().saturating_sub(1));
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct JsTsAliasCandidateKey {
@@ -695,89 +741,71 @@ fn jsts_scope_declares_name_before(
     name: &str,
     before_byte: usize,
 ) -> bool {
-    let mut found = false;
     let scope_range = JstsReceiverBindingScope {
         start_byte: scope.start_byte(),
         end_byte: scope.end_byte(),
     };
-    jsts_visit_scope_bindings_before(
-        scope,
-        source,
-        name,
-        before_byte,
-        true,
-        scope_range,
-        &mut found,
-    );
-    found
+    jsts_scope_contains_binding_before(scope, source, name, before_byte, scope_range)
 }
 
-fn jsts_visit_scope_bindings_before(
-    node: Node<'_>,
+fn jsts_scope_contains_binding_before(
+    scope: Node<'_>,
     source: &str,
     name: &str,
     before_byte: usize,
-    is_root: bool,
     scope_range: JstsReceiverBindingScope,
-    found: &mut bool,
-) {
-    if *found || node.start_byte() >= before_byte {
-        return;
-    }
-    if !is_root
-        && matches!(
+) -> bool {
+    let root_id = scope.id();
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+            )
+        {
+            continue;
+        }
+        if matches!(
             node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-        )
-    {
-        return;
-    }
-    if matches!(
-        node.kind(),
-        "formal_parameter" | "required_parameter" | "optional_parameter" | "variable_declarator"
-    ) && let Some(pattern) = node
-        .child_by_field_name("pattern")
-        .or_else(|| node.child_by_field_name("name"))
-        && jsts_pattern_contains_name(pattern, source, name)
-        && jsts_binding_scope_for_declaration(node, source) == Some(scope_range)
-    {
-        *found = true;
-        return;
-    }
-    if matches!(node.kind(), "identifier" | "type_identifier")
-        && node
-            .parent()
-            .is_some_and(|parent| matches!(parent.kind(), "formal_parameters" | "parameters"))
-        && source
-            .get(node.start_byte()..node.end_byte())
-            .is_some_and(|text| text.trim() == name)
-        && jsts_binding_scope_for_declaration(node, source) == Some(scope_range)
-    {
-        *found = true;
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= before_byte {
-            break;
+            "formal_parameter"
+                | "required_parameter"
+                | "optional_parameter"
+                | "variable_declarator"
+        ) && let Some(pattern) = node
+            .child_by_field_name("pattern")
+            .or_else(|| node.child_by_field_name("name"))
+            && jsts_pattern_contains_name(pattern, source, name)
+            && jsts_binding_scope_for_declaration(node, source) == Some(scope_range)
+        {
+            return true;
         }
-        jsts_visit_scope_bindings_before(
-            child,
-            source,
-            name,
-            before_byte,
-            false,
-            scope_range,
-            found,
-        );
-        if *found {
-            break;
+        if matches!(node.kind(), "identifier" | "type_identifier")
+            && node
+                .parent()
+                .is_some_and(|parent| matches!(parent.kind(), "formal_parameters" | "parameters"))
+            && source
+                .get(node.start_byte()..node.end_byte())
+                .is_some_and(|text| text.trim() == name)
+            && jsts_binding_scope_for_declaration(node, source) == Some(scope_range)
+        {
+            return true;
         }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node
+            .named_children(&mut cursor)
+            .take_while(|child| child.start_byte() < before_byte)
+            .collect();
+        stack.extend(children.into_iter().rev());
     }
+    false
 }
 
 fn jsts_binding_scope_for_declaration(
@@ -845,17 +873,21 @@ fn jsts_nearest_lexical_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope
 }
 
 fn jsts_pattern_contains_name(node: Node<'_>, source: &str, name: &str) -> bool {
-    if matches!(
-        node.kind(),
-        "identifier" | "shorthand_property_identifier_pattern"
-    ) {
-        return source
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) && source
             .get(node.start_byte()..node.end_byte())
-            .is_some_and(|text| text.trim() == name);
+            .is_some_and(|text| text.trim() == name)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| jsts_pattern_contains_name(child, source, name))
+    false
 }
 
 fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
@@ -1237,7 +1269,15 @@ fn ts_call_preserves_argument_shape(
         return false;
     };
     ts_call_expression_callees(
-        analyzer, support, file, source, imports, aliases, function, 0,
+        analyzer,
+        support,
+        file,
+        source,
+        imports,
+        aliases,
+        function,
+        0,
+        &TsReceiverResolution::default(),
     )
     .into_iter()
     .any(|callee| ts_function_preserves_parameter_shape(analyzer, &callee, argument_index))
@@ -1390,6 +1430,33 @@ pub(crate) fn ts_receiver_owner_candidates_at_byte(
     receiver: &str,
     byte: usize,
 ) -> Vec<CodeUnit> {
+    ts_receiver_owner_candidates_at_byte_with_resolution(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        imports,
+        aliases,
+        receiver,
+        byte,
+        &TsReceiverResolution::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_receiver_owner_candidates_at_byte_with_resolution(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+    byte: usize,
+    resolution: &TsReceiverResolution,
+) -> Vec<CodeUnit> {
     if receiver == "this"
         && let Some(owner) = jsts_enclosing_class(analyzer, file, byte)
     {
@@ -1398,17 +1465,25 @@ pub(crate) fn ts_receiver_owner_candidates_at_byte(
     let Some(scope) = jsts_enclosing_function_scope(root, byte) else {
         return Vec::new();
     };
+    let key = TsReceiverResolutionKey {
+        scope_id: scope.id(),
+        receiver: receiver.to_string(),
+        byte,
+    };
+    let Some(_guard) = resolution.enter(key) else {
+        return Vec::new();
+    };
 
     let mut candidates = ts_receiver_owners_from_parameters(
         analyzer, support, file, source, imports, aliases, scope, receiver,
     );
     if candidates.is_empty() {
         candidates.extend(ts_receiver_owners_from_contextual_callback(
-            analyzer, support, file, source, imports, aliases, scope, receiver,
+            analyzer, support, file, source, imports, aliases, scope, receiver, resolution,
         ));
     }
     candidates.extend(ts_receiver_owners_from_local_bindings(
-        analyzer, support, file, source, imports, aliases, scope, receiver, byte, 0,
+        analyzer, support, file, source, imports, aliases, scope, receiver, byte, 0, resolution,
     ));
     sort_units(&mut candidates);
     candidates.dedup();
@@ -1537,6 +1612,7 @@ fn ts_receiver_owners_from_contextual_callback(
     aliases: &AliasResolver,
     scope: Node<'_>,
     receiver: &str,
+    resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     let Some(callback_parameter_index) = ts_callback_parameter_index(scope, source, receiver)
     else {
@@ -1549,7 +1625,7 @@ fn ts_receiver_owners_from_contextual_callback(
         return Vec::new();
     };
     let callees = ts_call_expression_callees(
-        analyzer, support, file, source, imports, aliases, function, 0,
+        analyzer, support, file, source, imports, aliases, function, 0, resolution,
     );
 
     let mut owners = Vec::new();
@@ -1751,6 +1827,7 @@ fn ts_receiver_owners_from_local_bindings(
     receiver: &str,
     before_byte: usize,
     depth: usize,
+    resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     if depth > 8 {
         return Vec::new();
@@ -1769,6 +1846,7 @@ fn ts_receiver_owners_from_local_bindings(
         before_byte,
         depth,
         &mut owners,
+        resolution,
     );
     owners
 }
@@ -1787,67 +1865,47 @@ fn ts_collect_receiver_owners_from_bindings(
     before_byte: usize,
     depth: usize,
     out: &mut Vec<CodeUnit>,
+    resolution: &TsReceiverResolution,
 ) {
-    if node.start_byte() >= before_byte {
-        return;
-    }
-    if node.id() != root_id
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-        )
-    {
-        return;
-    }
-
-    if node.kind() == "variable_declarator"
-        && let Some(name) = node.child_by_field_name("name")
-        && node_text_matches(name, source, receiver)
-    {
-        let mut latest = Vec::new();
-        if let Some(type_node) = node.child_by_field_name("type") {
-            latest.extend(ts_resolve_type_text_to_property_owners(
-                analyzer,
-                support,
-                file,
-                source,
-                imports,
-                aliases,
-                ts_type_annotation_text(type_node, source).as_str(),
-                depth + 1,
-            ));
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte {
+            continue;
         }
-        if let Some(value) = node.child_by_field_name("value") {
-            latest.extend(ts_expression_property_owners(
-                analyzer,
-                support,
-                file,
-                source,
-                imports,
-                aliases,
-                value,
-                depth + 1,
-            ));
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "interface_declaration"
+            )
+        {
+            continue;
         }
-        out.clear();
-        out.extend(latest);
-    }
 
-    if node.kind() == "assignment_expression"
-        && let Some(left) = node.child_by_field_name("left")
-        && matches!(left.kind(), "identifier" | "type_identifier")
-        && node_text_matches(left, source, receiver)
-    {
-        let latest = node
-            .child_by_field_name("right")
-            .map(|value| {
-                ts_expression_property_owners(
+        if node.kind() == "variable_declarator"
+            && let Some(name) = node.child_by_field_name("name")
+            && node_text_matches(name, source, receiver)
+        {
+            let mut latest = Vec::new();
+            if let Some(type_node) = node.child_by_field_name("type") {
+                latest.extend(ts_resolve_type_text_to_property_owners(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    imports,
+                    aliases,
+                    ts_type_annotation_text(type_node, source).as_str(),
+                    depth + 1,
+                ));
+            }
+            if let Some(value) = node.child_by_field_name("value") {
+                latest.extend(ts_expression_property_owners(
                     analyzer,
                     support,
                     file,
@@ -1856,29 +1914,41 @@ fn ts_collect_receiver_owners_from_bindings(
                     aliases,
                     value,
                     depth + 1,
-                )
-            })
-            .unwrap_or_default();
-        out.clear();
-        out.extend(latest);
-    }
+                    resolution,
+                ));
+            }
+            out.clear();
+            out.extend(latest);
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        ts_collect_receiver_owners_from_bindings(
-            analyzer,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            child,
-            root_id,
-            receiver,
-            before_byte,
-            depth,
-            out,
-        );
+        if node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+            && matches!(left.kind(), "identifier" | "type_identifier")
+            && node_text_matches(left, source, receiver)
+        {
+            let latest = node
+                .child_by_field_name("right")
+                .map(|value| {
+                    ts_expression_property_owners(
+                        analyzer,
+                        support,
+                        file,
+                        source,
+                        imports,
+                        aliases,
+                        value,
+                        depth + 1,
+                        resolution,
+                    )
+                })
+                .unwrap_or_default();
+            out.clear();
+            out.extend(latest);
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
     }
 }
 
@@ -1892,6 +1962,7 @@ fn ts_expression_property_owners(
     aliases: &AliasResolver,
     expression: Node<'_>,
     depth: usize,
+    resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     if depth > 8 {
         return Vec::new();
@@ -1909,6 +1980,7 @@ fn ts_expression_property_owners(
                     aliases,
                     function,
                     depth + 1,
+                    resolution,
                 );
                 ts_expand_property_owners(analyzer, support, callees, depth + 1)
             })
@@ -1928,6 +2000,7 @@ fn ts_expression_property_owners(
                         aliases,
                         child,
                         depth + 1,
+                        resolution,
                     )
                 })
                 .unwrap_or_default()
@@ -1978,6 +2051,7 @@ fn ts_expression_property_owners(
                             aliases,
                             child,
                             depth + 1,
+                            resolution,
                         )
                     })
                     .unwrap_or_default()
@@ -2041,92 +2115,81 @@ fn jsts_collect_local_new_receiver_owner_candidates(
     depth: usize,
     state: &mut Option<Vec<CodeUnit>>,
 ) {
-    if node.start_byte() >= before_byte {
-        return;
-    }
-    if node.id() != root_id
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-        )
-    {
-        return;
-    }
+    let root = root_node(node);
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "interface_declaration"
+            )
+        {
+            continue;
+        }
 
-    if node.kind() == "variable_declarator"
-        && let Some(name) = node.child_by_field_name("name")
-        && node_text_matches(name, source, receiver)
-    {
-        let owners = node
-            .child_by_field_name("value")
-            .map(|value| {
-                jsts_local_receiver_value_owner_candidates(
-                    analyzer,
-                    support,
-                    file,
-                    language,
-                    source,
-                    root_node(node),
-                    imports,
-                    aliases,
-                    value,
-                    before_byte,
-                    depth + 1,
-                )
-            })
-            .unwrap_or_default();
-        *state = Some(owners);
-    }
+        if node.kind() == "variable_declarator"
+            && let Some(name) = node.child_by_field_name("name")
+            && node_text_matches(name, source, receiver)
+        {
+            let owners = node
+                .child_by_field_name("value")
+                .map(|value| {
+                    jsts_local_receiver_value_owner_candidates(
+                        analyzer,
+                        support,
+                        file,
+                        language,
+                        source,
+                        root,
+                        imports,
+                        aliases,
+                        value,
+                        before_byte,
+                        depth + 1,
+                    )
+                })
+                .unwrap_or_default();
+            *state = Some(owners);
+        }
 
-    if node.kind() == "assignment_expression"
-        && let Some(left) = node.child_by_field_name("left")
-        && matches!(left.kind(), "identifier" | "type_identifier")
-        && node_text_matches(left, source, receiver)
-    {
-        let owners = node
-            .child_by_field_name("right")
-            .map(|value| {
-                jsts_local_receiver_value_owner_candidates(
-                    analyzer,
-                    support,
-                    file,
-                    language,
-                    source,
-                    root_node(node),
-                    imports,
-                    aliases,
-                    value,
-                    before_byte,
-                    depth + 1,
-                )
-            })
-            .unwrap_or_default();
-        *state = Some(owners);
-    }
+        if node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+            && matches!(left.kind(), "identifier" | "type_identifier")
+            && node_text_matches(left, source, receiver)
+        {
+            let owners = node
+                .child_by_field_name("right")
+                .map(|value| {
+                    jsts_local_receiver_value_owner_candidates(
+                        analyzer,
+                        support,
+                        file,
+                        language,
+                        source,
+                        root,
+                        imports,
+                        aliases,
+                        value,
+                        before_byte,
+                        depth + 1,
+                    )
+                })
+                .unwrap_or_default();
+            *state = Some(owners);
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        jsts_collect_local_new_receiver_owner_candidates(
-            analyzer,
-            support,
-            file,
-            language,
-            source,
-            child,
-            root_id,
-            imports,
-            aliases,
-            receiver,
-            before_byte,
-            depth,
-            state,
-        );
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
     }
 }
 
@@ -2287,6 +2350,7 @@ fn ts_call_expression_callees(
     aliases: &AliasResolver,
     function: Node<'_>,
     depth: usize,
+    resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     if depth > 8 {
         return Vec::new();
@@ -2331,11 +2395,13 @@ fn ts_call_expression_callees(
             aliases,
             object,
             depth + 1,
+            resolution,
         );
         let callees = jsts_member_candidates(analyzer, support, receiver_owners, &property, true);
         if !callees.is_empty() {
             return callees;
         }
+        return Vec::new();
     }
 
     ts_call_reference_name(function, source)
@@ -2357,6 +2423,7 @@ fn ts_expression_receiver_owners(
     aliases: &AliasResolver,
     expression: Node<'_>,
     depth: usize,
+    resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     if depth > 8 {
         return Vec::new();
@@ -2369,7 +2436,7 @@ fn ts_expression_receiver_owners(
             else {
                 return Vec::new();
             };
-            ts_receiver_owner_candidates_at_byte(
+            ts_receiver_owner_candidates_at_byte_with_resolution(
                 analyzer,
                 support,
                 file,
@@ -2379,6 +2446,7 @@ fn ts_expression_receiver_owners(
                 aliases,
                 receiver,
                 expression.start_byte(),
+                resolution,
             )
         }
         _ => ts_expression_property_owners(
@@ -2390,6 +2458,7 @@ fn ts_expression_receiver_owners(
             aliases,
             expression,
             depth + 1,
+            resolution,
         ),
     }
 }
@@ -2711,42 +2780,44 @@ fn ts_collect_return_property_owners(
     if depth > 8 {
         return;
     }
-    if node.id() != root_id
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-        )
-    {
-        return;
-    }
-    if node.kind() == "return_statement" {
-        let mut cursor = node.walk();
-        if let Some(expression) = node.named_children(&mut cursor).next() {
-            out.extend(ts_expression_property_owners(
-                analyzer,
-                support,
-                file,
-                source,
-                imports,
-                aliases,
-                expression,
-                depth + 1,
-            ));
+    let resolution = TsReceiverResolution::default();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "interface_declaration"
+            )
+        {
+            continue;
         }
-        return;
-    }
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            if let Some(expression) = node.named_children(&mut cursor).next() {
+                out.extend(ts_expression_property_owners(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    imports,
+                    aliases,
+                    expression,
+                    depth + 1,
+                    &resolution,
+                ));
+            }
+            continue;
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        ts_collect_return_property_owners(
-            analyzer, support, file, source, imports, aliases, child, root_id, depth, out,
-        );
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
     }
 }
 
@@ -2796,15 +2867,17 @@ fn ts_object_pattern_binds(pattern: Node<'_>, source: &str, receiver: &str) -> b
 }
 
 fn ts_pattern_binds_name(pattern: Node<'_>, source: &str, receiver: &str) -> bool {
-    match pattern.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => {
-            node_text_matches(pattern, source, receiver)
+    let mut current = Some(pattern);
+    while let Some(pattern) = current {
+        match pattern.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                return node_text_matches(pattern, source, receiver);
+            }
+            "assignment_pattern" => current = pattern.child_by_field_name("left"),
+            _ => return false,
         }
-        "assignment_pattern" => pattern
-            .child_by_field_name("left")
-            .is_some_and(|left| ts_pattern_binds_name(left, source, receiver)),
-        _ => false,
     }
+    false
 }
 
 fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
