@@ -2056,7 +2056,11 @@ fn js_commonjs_side_effect_and_dynamic_require_do_not_create_graph_usages() {
         .into_either()
         .expect("commonjs graph success");
 
-    assert!(hits.is_empty());
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("consumer.js")),
+        "side-effect and dynamic require consumers must not count"
+    );
 }
 
 #[test]
@@ -2110,7 +2114,8 @@ fn js_commonjs_module_object_bare_identifier_does_not_count() {
         .expect("commonjs graph success");
 
     assert!(
-        hits.is_empty(),
+        hits.iter()
+            .all(|hit| hit.file != project.file("consumer.js")),
         "bare required module object must not count"
     );
 }
@@ -2134,10 +2139,19 @@ fn js_commonjs_module_object_uses_exported_alias_name() {
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
     );
 
-    assert_eq!(1, hits.len());
+    assert_eq!(2, hits.len());
     assert!(
-        hits.iter().all(|hit| hit.snippet.contains("lib.Bar")),
-        "only the exported property alias should count"
+        hits.iter().any(|hit| {
+            hit.file == project.file("lib.js") && hit.snippet.contains("{ Bar: Foo }")
+        }),
+        "the local value used on the export RHS should count"
+    );
+    assert!(
+        hits.iter()
+            .filter(|hit| hit.file == project.file("consumer.js"))
+            .count()
+            == 1,
+        "only the exported property alias should count in the consumer"
     );
 }
 

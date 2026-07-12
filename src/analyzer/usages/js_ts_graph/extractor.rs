@@ -270,7 +270,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .named_child(0)
             .and_then(|assignment| assignment.child_by_field_name("right"))
         {
-            scan_commonjs_export_bodies(value, ctx);
+            scan_node(value, ctx);
         }
         return;
     }
@@ -298,21 +298,6 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if introduces_scope {
         ctx.scope_stack.pop();
         ctx.binding_engine.exit_scope();
-    }
-}
-
-fn scan_commonjs_export_bodies(value: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let mut stack = vec![value];
-    while let Some(node) = stack.pop() {
-        if matches!(
-            node.kind(),
-            "arrow_function" | "function_expression" | "generator_function" | "method_definition"
-        ) {
-            scan_node(node, ctx);
-            continue;
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
     }
 }
 

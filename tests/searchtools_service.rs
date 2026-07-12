@@ -3964,7 +3964,7 @@ export function run() {
     let payload = service
         .call_tool_json(
             "scan_usages_by_reference",
-            r#"{"symbols":["readFixtureKey"],"include_tests":true}"#,
+            r#"{"symbols":["readFixtureKey"],"include_tests":true,"paths":["consumer.js"]}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
@@ -3982,7 +3982,7 @@ export function run() {
     let payload = service
         .call_tool_json(
             "scan_usages_by_reference",
-            r#"{"symbols":["loadFixtureKey"],"include_tests":true}"#,
+            r#"{"symbols":["loadFixtureKey"],"include_tests":true,"paths":["esm-consumer.js"]}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
@@ -3995,6 +3995,84 @@ export function run() {
         "payload: {value}"
     );
     assert_eq!(result["files"][0]["hits"][0]["line"], 6, "payload: {value}");
+    assert_eq!(result["unproven_hits"], 0, "payload: {value}");
+}
+
+#[test]
+fn scan_usages_by_reference_resolves_javascript_commonjs_export_value_roles() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "exports.js",
+            r#"
+function parse() {}
+class ExportedClass {}
+function exportedName() {}
+function actualValue() {}
+
+module.exports = parse;
+exports.types = { ExportedClass };
+exports.alias = { exportedName: actualValue };
+exports.run = function(parse) {
+  parse();
+};
+"#,
+        )
+        .file(
+            "qualifier.js",
+            r#"
+const bench = makeBench();
+const unrelated = makeBench();
+
+exports.run = function(bench) {
+  bench.start();
+};
+exports.measure = function() {
+  bench.start();
+  unrelated.start();
+};
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for (symbol, expected_line) in [("parse", 7), ("ExportedClass", 8), ("actualValue", 9)] {
+        let args = serde_json::json!({
+            "symbols": [symbol],
+            "include_tests": true,
+            "paths": ["exports.js"],
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args.to_string())
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = only_result(&value);
+        assert_eq!(result["total_hits"], 1, "payload: {value}");
+        assert_eq!(
+            result["files"][0]["hits"][0]["line"], expected_line,
+            "payload: {value}"
+        );
+    }
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["exportedName"],"include_tests":true,"paths":["exports.js"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(only_result(&value)["total_hits"], 0, "payload: {value}");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["bench"],"include_tests":true,"paths":["qualifier.js"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+    assert_eq!(result["total_hits"], 1, "payload: {value}");
+    assert_eq!(result["files"][0]["hits"][0]["line"], 9, "payload: {value}");
     assert_eq!(result["unproven_hits"], 0, "payload: {value}");
 }
 
