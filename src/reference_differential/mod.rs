@@ -1,6 +1,7 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{ReferenceCandidateRanges, reference_candidate_ranges};
+use crate::analyzer::test_paths;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
 };
@@ -227,7 +228,10 @@ pub fn run_reference_differential(
         .analyzed_files()
         .into_iter()
         .filter(|file| corpus_file_matches(file, &config.corpus_language, requested_language))
-        .filter(|file| config.include_tests || !analyzer.contains_tests(file))
+        .filter(|file| {
+            config.include_tests
+                || !test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
+        })
         .collect();
     eligible.sort();
     summary.eligible_files = eligible.len();
@@ -1134,6 +1138,49 @@ mod tests {
         assert_eq!(
             withheld[0].note.as_deref(),
             Some("forward-resolved site is absent from the complete inverse result")
+        );
+    }
+
+    #[test]
+    fn excluded_test_paths_are_not_sampled_or_forward_audited() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::create_dir(root.join("tests")).expect("test directory");
+        fs::write(
+            root.join("Production.php"),
+            "<?php\nfunction target(): void {}\ntarget();\n",
+        )
+        .expect("production fixture");
+        fs::write(
+            root.join("tests/Excluded.php"),
+            "<?php\nfunction excluded_target(): void {}\nexcluded_target();\n",
+        )
+        .expect("test fixture");
+        let project = Arc::new(TestProject::new(&root, Language::Php));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let config = ReferenceDifferentialConfig {
+            corpus_language: "php".to_string(),
+            max_files: 10,
+            max_sites: 100,
+            max_candidates_per_file: 100,
+            max_source_bytes: 10_000,
+            max_targets: 100,
+            max_usage_files: 10,
+            max_usages: 100,
+            include_tests: false,
+            ..ReferenceDifferentialConfig::default()
+        };
+
+        let report = run_reference_differential(workspace.analyzer(), &config).expect("run audit");
+
+        assert_eq!(report.summary.eligible_files, 1);
+        assert!(
+            report
+                .sites
+                .iter()
+                .all(|site| site.path == "Production.php"),
+            "{:#?}",
+            report.sites
         );
     }
 
