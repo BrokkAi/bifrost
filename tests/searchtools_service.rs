@@ -4,7 +4,7 @@ use brokk_bifrost::{
     searchtools::SCAN_USAGES_RESPONSE_BUDGET_BYTES, searchtools_render::RenderOptions,
 };
 mod common;
-use common::InlineTestProject;
+use common::{InlineTestProject, line_of};
 use git2::{Repository, Signature};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -4739,19 +4739,15 @@ object App {
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
 
-    let line_of = |needle: &str| {
-        source
-            .lines()
-            .position(|line| line.contains(needle))
-            .map(|line| line + 1)
-            .unwrap_or_else(|| panic!("missing source line containing `{needle}`"))
-    };
-
     for (selector, declaration_line, expected_hits) in [
-        ("example.Service.build", line_of("def build"), 1),
-        ("example.Defaults.Prefix", line_of("val Prefix"), 2),
-        ("example.ConsoleRenderer.default", line_of("def default"), 2),
-        ("example.Syntax.slug", line_of("def slug"), 1),
+        ("example.Service.build", line_of(source, "def build"), 1),
+        ("example.Defaults.Prefix", line_of(source, "val Prefix"), 2),
+        (
+            "example.ConsoleRenderer.default",
+            line_of(source, "def default"),
+            2,
+        ),
+        ("example.Syntax.slug", line_of(source, "def slug"), 1),
     ] {
         let args = serde_json::json!({
             "targets": [{

@@ -8,7 +8,7 @@ use brokk_bifrost::usages::{
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ScalaAnalyzer,
 };
-use common::{InlineTestProject, call_search_tool_json};
+use common::{InlineTestProject, call_search_tool_json, line_of};
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -128,14 +128,6 @@ fn assert_success_counts(
             .unwrap_or_default(),
         "unproven hits: {unproven_total_by_overload:#?}"
     );
-}
-
-fn line_of(source: &str, needle: &str) -> usize {
-    source
-        .lines()
-        .position(|line| line.contains(needle))
-        .map(|line| line + 1)
-        .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
 }
 
 #[test]
