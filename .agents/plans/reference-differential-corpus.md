@@ -14,7 +14,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 04:10Z) Implemented the dedicated corpus CLI with deterministic selection, commit-aware resumable JSONL reports, exact-site reruns, and bounded sampling.
 - [x] (2026-07-12 04:50Z) Addressed review findings and validated the engine with all-language fixtures plus bounded real-repository preflights.
 - [x] (2026-07-12 05:05Z) Committed engine checkpoint `6c056e91`; full `cargo test --features nlp,python`, all-target/all-feature clippy, formatting, and diff checks pass.
-- [ ] Push the engine checkpoint.
+- [x] (2026-07-12 05:10Z) Pushed engine checkpoint and plan through `2c0ceff6` to `origin/master`.
+- [x] (2026-07-12 11:20Z) Fixed #643's repeated SQLite scans and recursive Rust binding/re-export walks; the exact 512 KiB-stack validation completed in 554.7 seconds with 101,192 KiB peak RSS.
+- [ ] Push the #643 fix, correct and close the issue, then rerun Rust from the committed Bifrost HEAD.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -42,6 +44,12 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: The semantic-token identifier frontier was structured but narrower than the resolver's accepted syntax.
   Evidence: Existing forward resolvers handle C++ operator/destructor nodes, Rust `self`/`super`/`crate`, and receiver keywords in several languages. The differential now scans a strict superset of the old identifier frontier, while a separate shared helper preserves the LSP's prior token ranges exactly.
+
+- Observation: The first Rust N=1 run found two pre-differential defects, neither of which was SQLite workspace construction.
+  Evidence: `biomejs__gritql` completes construction and a one-target run in about 21 seconds even with a 512 KiB main stack. At the 1,000-target campaign budget, lazy `RustUsageIndex` construction repeatedly called `resolve_module_files -> analyzed_live_files -> AnalyzerStore::contains_parsed_blob -> SQLite`, driving roughly 5 GiB RSS. A debugger then captured the actual stack failure as mutual recursion between `rust_collect_binding_type_fqn` and `rust_expression_type_fqn_mode` for a binding considered in scope inside its own initializer. The fix uses a compact 306-file routing projection, a chunked set query over requested `(blob_oid, language)` keys, and iterative binding/re-export traversals. The exact 512 KiB-stack rerun completed in 554.7 seconds with 101,192 KiB peak RSS and no swaps. Filed as #643.
+
+- Observation: The first completed high-budget Rust differential contains a large follow-on triage set, independent of #643.
+  Evidence: The dirty-worktree validation audited all 306 eligible Rust files and 10,000 sampled sites. Forward resolution uniquely resolved 1,549 sites across 784 targets; inverse comparison classified 517 consistent, 41 editor-only, 5 unproven, and 961 missing. This report is validation evidence only because its resume identity is the pre-fix Bifrost HEAD plus a dirty worktree; the canonical run follows the fix commit.
 
 - Observation: Package version alone is insufficient resume identity during a fix campaign.
   Evidence: Analyzer fixes can land without changing `CARGO_PKG_VERSION`; a report produced before the fix would otherwise suppress the required rerun. Repository records and completion keys therefore include the Bifrost source HEAD as well as the target repository HEAD and configuration fingerprint.
@@ -178,3 +186,5 @@ Revision note (2026-07-12): Changed sampling to a deterministic two-stage file/s
 Revision note (2026-07-12): Added a deterministic target-group cap and disk-safety checks after inventory showed that all large-repository analyzer databases must be built cold and that sampled sites may otherwise produce thousands of separate inverse queries.
 
 Revision note (2026-07-12): Recorded the all-language preflight and made resume identity commit-aware after review showed that package-version-only records could survive analyzer fixes incorrectly.
+
+Revision note (2026-07-12): Corrected the #643 diagnosis after debugger capture identified self-initializer binding recursion as the stack overflow, and recorded the exact low-stack/RSS validation of the SQLite and traversal fixes.

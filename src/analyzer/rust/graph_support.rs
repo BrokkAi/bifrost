@@ -144,14 +144,23 @@ fn rust_declaration_targets_in_files(
 
 impl RustAnalyzer {
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+        let declarations = self.declarations(file);
+        self.export_index_of_declarations(file, &declarations)
+    }
+
+    pub(super) fn export_index_of_declarations(
+        &self,
+        file: &ProjectFile,
+        declarations: &BTreeSet<CodeUnit>,
+    ) -> ExportIndex {
         let mut index = ExportIndex::empty();
 
-        for code_unit in self.declarations(file) {
+        for code_unit in declarations {
             let identifier = code_unit.identifier().trim();
             if identifier.is_empty() || identifier.starts_with('_') {
                 continue;
             }
-            if !self.is_module_export_candidate(&code_unit) {
+            if !self.is_module_export_candidate(code_unit) {
                 continue;
             }
             index.exports_by_name.insert(
@@ -399,15 +408,15 @@ impl RustAnalyzer {
         visited: &mut HashSet<ProjectFile>,
         names: &mut HashSet<String>,
     ) {
-        for module_file in module_files {
+        let mut pending = module_files.to_vec();
+        while let Some(module_file) = pending.pop() {
             if !visited.insert(module_file.clone()) {
                 continue;
             }
-            let export_index = self.export_index_of(module_file);
+            let export_index = self.export_index_of(&module_file);
             names.extend(export_index.exports_by_name.keys().cloned());
             for star in export_index.reexport_stars {
-                let nested_files = self.resolve_module_files(module_file, &star.module_specifier);
-                self.collect_export_names_from_files(&nested_files, visited, names);
+                pending.extend(self.resolve_module_files(&module_file, &star.module_specifier));
             }
         }
     }
@@ -626,7 +635,7 @@ impl RustAnalyzer {
         !code_unit.is_function() || self.parent_of(code_unit).is_none()
     }
 
-    fn is_visible_module_path(&self, code_unit: &CodeUnit) -> bool {
+    pub(super) fn is_visible_module_path(&self, code_unit: &CodeUnit) -> bool {
         let mut current = code_unit.clone();
         loop {
             if !current.is_module() || !self.is_export_public_declaration(&current) {
@@ -735,7 +744,10 @@ fn rust_impl_member_node_matches(
             .is_some_and(|name| node_text(name, source) == member_name)
 }
 
-fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
+pub(super) fn rust_module_files_from_path(
+    file: &ProjectFile,
+    module_specifier: &str,
+) -> Vec<ProjectFile> {
     let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
         return Vec::new();
     };

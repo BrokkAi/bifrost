@@ -832,29 +832,18 @@ struct RustBindingLookupCtx<'a, 'tree, 'cache> {
 
 fn rust_collect_binding_type_fqn(
     ctx: &mut RustBindingLookupCtx<'_, '_, '_>,
-    node: Node<'_>,
+    root: Node<'_>,
     found: &mut Option<String>,
 ) {
-    if node.start_byte() >= ctx.before_byte {
-        return;
-    }
-    match node.kind() {
-        "parameter" => {
-            if let Some((binding, type_node)) = rust_typed_binding(node, ctx.source)
-                && binding == ctx.name
-                && let Some(fqn) =
-                    rust_resolve_type_node_fqn_mode(ctx, type_node, Some(type_node.start_byte()))
-            {
-                *found = Some(fqn);
-            }
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.start_byte() >= ctx.before_byte {
+            continue;
         }
-        "let_declaration" => {
-            if let Some(binding) = node
-                .child_by_field_name("pattern")
-                .and_then(|pattern| rust_simple_identifier_text(pattern, ctx.source))
-                && binding == ctx.name
-            {
-                if let Some(type_node) = node.child_by_field_name("type")
+        match node.kind() {
+            "parameter" => {
+                if let Some((binding, type_node)) = rust_typed_binding(node, ctx.source)
+                    && binding == ctx.name
                     && let Some(fqn) = rust_resolve_type_node_fqn_mode(
                         ctx,
                         type_node,
@@ -862,35 +851,52 @@ fn rust_collect_binding_type_fqn(
                     )
                 {
                     *found = Some(fqn);
-                } else if let Some(value) = node.child_by_field_name("value")
-                    && let Some(fqn) = rust_expression_type_fqn_mode(
-                        ctx.analyzer,
-                        ctx.support,
-                        ctx.file,
-                        ctx.source,
-                        ctx.root,
-                        value,
-                        value.start_byte(),
-                        ctx.mode,
-                        ctx.cache,
-                    )
-                {
-                    *found = Some(fqn);
                 }
             }
+            "let_declaration" if node.end_byte() <= ctx.before_byte => {
+                if let Some(binding) = node
+                    .child_by_field_name("pattern")
+                    .and_then(|pattern| rust_simple_identifier_text(pattern, ctx.source))
+                    && binding == ctx.name
+                {
+                    if let Some(type_node) = node.child_by_field_name("type")
+                        && let Some(fqn) = rust_resolve_type_node_fqn_mode(
+                            ctx,
+                            type_node,
+                            Some(type_node.start_byte()),
+                        )
+                    {
+                        *found = Some(fqn);
+                    } else if let Some(value) = node.child_by_field_name("value")
+                        && let Some(fqn) = rust_expression_type_fqn_mode(
+                            ctx.analyzer,
+                            ctx.support,
+                            ctx.file,
+                            ctx.source,
+                            ctx.root,
+                            value,
+                            value.start_byte(),
+                            ctx.mode,
+                            ctx.cache,
+                        )
+                    {
+                        *found = Some(fqn);
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
-    }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= ctx.before_byte {
-            break;
+        for index in (0..node.named_child_count()).rev() {
+            let Some(child) = node.named_child(index) else {
+                continue;
+            };
+            if child.start_byte() < ctx.before_byte
+                && !rust_scope_boundary_excludes_reference(child, ctx.before_byte)
+            {
+                pending.push(child);
+            }
         }
-        if rust_scope_boundary_excludes_reference(child, ctx.before_byte) {
-            continue;
-        }
-        rust_collect_binding_type_fqn(ctx, child, found);
     }
 }
 

@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use git2::Oid;
 use growable_bloom_filter::GrowableBloom;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use tree_sitter::Language as TsLanguage;
 
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
@@ -275,29 +275,65 @@ impl AnalyzerStore {
         &self,
         entries: &[(Oid, String)],
     ) -> Result<Vec<(Oid, String)>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let sql = format!(
-            "SELECT 1 FROM blob_meta AS meta
-             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
-               AND {PARSED_BLOB_INTEGRITY_CONDITION}
-             LIMIT 1"
-        );
-        let mut stmt = conn.prepare(&sql)?;
+        let present = self.parsed_blob_keys(entries)?;
         let mut out = Vec::new();
         let mut seen = HashSet::default();
-        for (oid, lang) in entries {
-            if !seen.insert((*oid, lang.clone())) {
-                continue;
-            }
-            let exists = stmt
-                .query_row(params![oid.to_string(), lang], |_| Ok(()))
-                .optional()?
-                .is_some();
-            if !exists {
-                out.push((*oid, lang.clone()));
+        for entry in entries {
+            if seen.insert(entry.clone()) && !present.contains(entry) {
+                out.push(entry.clone());
             }
         }
         Ok(out)
+    }
+
+    /// Return the complete parsed keys from `entries` using chunked set queries.
+    /// This reads blob metadata only; it does not hydrate file state or source.
+    pub fn parsed_blob_keys(&self, entries: &[(Oid, String)]) -> Result<HashSet<(Oid, String)>> {
+        const KEYS_PER_QUERY: usize = 400;
+
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut unique = Vec::with_capacity(entries.len());
+        let mut seen = HashSet::default();
+        for entry in entries {
+            if seen.insert(entry.clone()) {
+                unique.push(entry.clone());
+            }
+        }
+        let mut present = set_with_capacity(unique.len());
+        for chunk in unique.chunks(KEYS_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values = std::iter::repeat_n("(?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "WITH requested(blob_oid, lang) AS (VALUES {values})
+                 SELECT requested.blob_oid, requested.lang
+                 FROM requested
+                 JOIN blob_meta AS meta
+                   ON meta.blob_oid = requested.blob_oid
+                  AND meta.lang = requested.lang
+                 WHERE {PARSED_BLOB_INTEGRITY_CONDITION}"
+            );
+            let parameters = chunk
+                .iter()
+                .flat_map(|(oid, lang)| [oid.to_string(), lang.clone()])
+                .collect::<Vec<_>>();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(parameters), |row| {
+                let oid: String = row.get(0)?;
+                let lang: String = row.get(1)?;
+                Ok((oid, lang))
+            })?;
+            for row in rows {
+                let (oid, lang) = row?;
+                if let Ok(oid) = Oid::from_str(&oid) {
+                    present.insert((oid, lang));
+                }
+            }
+        }
+        Ok(present)
     }
 
     pub fn contains_blob(&self, oid: Oid, lang: &str) -> Result<bool> {
@@ -2976,6 +3012,68 @@ mod tests {
                 .missing_parsed_blob_keys(&[(oid, "python".to_string())])
                 .unwrap(),
             vec![(oid, "python".to_string())]
+        );
+    }
+
+    #[test]
+    fn parsed_blob_keys_batches_mixed_languages_and_incomplete_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let python_file = write_file(root, "pkg/model.py", "class Model:\n    pass\n");
+        let java_file = write_file(root, "src/Model.java", "class Model {}\n");
+        let python_oid = oid_for(python_file.read_to_string().unwrap().as_bytes());
+        let java_oid = oid_for(java_file.read_to_string().unwrap().as_bytes());
+        let incomplete_oid = oid_for(b"registered but not parsed");
+        let missing_oid = oid_for(b"not registered");
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(
+                python_oid,
+                "python",
+                &PythonAdapter,
+                &parse_state(&PythonAdapter, &python_file),
+            )
+            .unwrap();
+        store
+            .write_parsed_blob(
+                java_oid,
+                "java",
+                &JavaAdapter,
+                &parse_state(&JavaAdapter, &java_file),
+            )
+            .unwrap();
+        store.register_blobs(&[incomplete_oid], "rust").unwrap();
+
+        let mut entries = vec![
+            (python_oid, "python".to_string()),
+            (python_oid, "java".to_string()),
+            (java_oid, "java".to_string()),
+            (incomplete_oid, "rust".to_string()),
+            (missing_oid, "python".to_string()),
+            (python_oid, "python".to_string()),
+        ];
+        let bulk_missing = (0..405)
+            .map(|index| oid_for(format!("bulk missing {index}").as_bytes()))
+            .collect::<Vec<_>>();
+        entries.extend(bulk_missing.iter().map(|oid| (*oid, "python".to_string())));
+        assert_eq!(
+            store.parsed_blob_keys(&entries).unwrap(),
+            [
+                (python_oid, "python".to_string()),
+                (java_oid, "java".to_string()),
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>()
+        );
+        let missing = store.missing_parsed_blob_keys(&entries).unwrap();
+        assert_eq!(missing.len(), 408);
+        assert!(missing.contains(&(python_oid, "java".to_string())));
+        assert!(missing.contains(&(incomplete_oid, "rust".to_string())));
+        assert!(missing.contains(&(missing_oid, "python".to_string())));
+        assert!(
+            bulk_missing
+                .iter()
+                .all(|oid| missing.contains(&(*oid, "python".to_string())))
         );
     }
 

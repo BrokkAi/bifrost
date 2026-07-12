@@ -347,3 +347,24 @@ fn ra_goto_def_bare_type_in_enclosing_module() {
         4,
     );
 }
+
+#[test]
+fn self_referential_let_initializer_does_not_reenter_binding_inference() {
+    let (_temp, lines) = definition_lines(
+        "self_init.rs",
+        "struct Value;\nimpl Value {\n    fn run(&self) {}\n}\nfn demo() {\n    let value = value;\n    value.run<caret>();\n}\n",
+    );
+    assert!(
+        lines.is_empty(),
+        "a binding is not in scope in its own initializer: {lines:?}"
+    );
+}
+
+#[test]
+fn shadowing_initializer_can_infer_from_the_outer_binding() {
+    assert_resolves_to_line(
+        "shadow_init.rs",
+        "struct Value;\nimpl Value {\n    fn run(&self) {}\n}\nfn demo() {\n    let value = Value {};\n    {\n        let value = value;\n        value.run<caret>();\n    }\n}\n",
+        2,
+    );
+}

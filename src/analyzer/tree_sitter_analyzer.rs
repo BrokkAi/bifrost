@@ -1885,6 +1885,7 @@ where
     fn analyzed_live_files(&self) -> Vec<ProjectFile> {
         let snapshot = self.live_snapshot();
         let mut files = Vec::new();
+        let mut persisted_candidates = Vec::new();
         for file in snapshot.all_paths() {
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
@@ -1902,12 +1903,19 @@ where
                 files.push(project_file);
                 continue;
             }
-            if self
-                .store_context
-                .store
-                .contains_parsed_blob(oid, &storage_key)
-                .unwrap_or(false)
-            {
+            persisted_candidates.push((project_file, oid, storage_key));
+        }
+        let keys = persisted_candidates
+            .iter()
+            .map(|(_, oid, storage_key)| (*oid, storage_key.clone()))
+            .collect::<Vec<_>>();
+        let present = self
+            .store_context
+            .store
+            .parsed_blob_keys(&keys)
+            .unwrap_or_default();
+        for (project_file, oid, storage_key) in persisted_candidates {
+            if present.contains(&(oid, storage_key)) {
                 files.push(project_file);
             }
         }
