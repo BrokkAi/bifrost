@@ -190,6 +190,9 @@ fn matching_identifier_node<'tree>(
 ) -> Option<Node<'tree>> {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if crate::analyzer::ruby::ruby_symbol_name(node, content).as_deref() == Some(identifier) {
+            return Some(node);
+        }
         if node.utf8_text(content.as_bytes()).ok()? == identifier {
             return Some(node);
         }
