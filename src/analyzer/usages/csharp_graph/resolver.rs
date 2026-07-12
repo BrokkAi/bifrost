@@ -995,6 +995,9 @@ pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) ->
         if parent.kind() == "type" {
             return true;
         }
+        if parent.kind() == "explicit_interface_specifier" {
+            return true;
+        }
         if parent.kind() == "object_creation_expression" {
             return true;
         }

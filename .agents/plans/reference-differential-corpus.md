@@ -59,6 +59,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 21:11Z) Pinned the first C# correctness boundary with a three-file authoritative-scope regression, filed #698, recognized tree-sitter C#'s `returns` field, and emitted qualified-type hits on their containing AST node. The exact Azure bytes `5677..5693` changed from missing to consistent in 146.7 seconds; focused tests, affected all-feature clippy, and the complete `nlp,python` test gate pass.
 - [x] (2026-07-12 21:18Z) Pushed `7ccce3dd` to `master` and closed #698 with the exact Azure evidence; the next C# step is a complete fixing-HEAD rerun before triaging residual sites.
 - [x] (2026-07-12 21:31Z) Completed the post-#698 full C# rerun at `3b2e2665` in 486.4 seconds. Consistent sites increased from 598 to 1,717 and missing sites fell from 1,339 to 220; 73 residuals form the next explicit-interface owner declaration boundary.
+- [x] (2026-07-12 21:44Z) Delegated and independently reviewed the dominant C# residual, filed #701, recognized `explicit_interface_specifier` as a structured type role, passed the full validation gate, and changed exact `ApiKey.cs` bytes `2898..2913` from missing to consistent.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -110,6 +111,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: The #698 range/return-role fix removed 83.6% of the C# actionable set and exposed several smaller structured roles.
   Evidence: `/tmp/csharp-n1-698-fixed.jsonl` retained the same 3,269 forward-resolved sites but changed consistent/missing from 598/1,339 to 1,717/220. The largest residual is 73 interface-owner focuses inside explicit interface property and method declarations; other buckets include generic `PropertyT<T>` arguments, `using static` imports, functions, and miscellaneous class roles.
+
+- Observation: The 73-site explicit-interface cluster is independent of partial declaration grouping and path-scoped routing.
+  Evidence: Primary and delegated inline regressions both supplied two partial interface declarations to an authoritative one-file query. The only pre-fix hit was the class base-list type. Adding the dedicated tree-sitter `explicit_interface_specifier` role recovered property and method owners, and the exact Azure site became consistent with a covering AST-derived hit.
 
 ## Decision Log
 
@@ -259,3 +263,5 @@ Revision note (2026-07-12): Recorded the first complete Rust differential triage
 Revision note (2026-07-12): Recorded pushed and closed #698 and its exact Azure production proof, separating C# qualified-type focus/range semantics from partial target grouping and authoritative candidate routing.
 
 Revision note (2026-07-12): Recorded the full post-#698 C# rerun, its 83.6% missing-site reduction, and the next explicit-interface declaration triage boundary.
+
+Revision note (2026-07-12): Recorded delegated #701 investigation, complete validation, and exact production proof for the explicit-interface owner role.

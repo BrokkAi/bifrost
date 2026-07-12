@@ -528,6 +528,89 @@ namespace Microsoft.Azure.PowerShell.Cmdlets.ADDomainServices.Models {
 }
 
 #[test]
+fn usage_finder_csharp_finds_explicit_interface_owners_in_authoritative_file_scope() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Contracts/IHasName.First.cs",
+            r#"
+namespace Demo.Contracts {
+    public partial interface IHasName {
+        string Name { get; }
+    }
+}
+"#,
+        ),
+        (
+            "Contracts/IHasName.Second.cs",
+            r#"
+namespace Demo.Contracts {
+    public partial interface IHasName {
+        void Reset();
+    }
+}
+"#,
+        ),
+        (
+            "Models/NamedThing.cs",
+            r#"
+namespace Demo.Models {
+    public sealed class NamedThing : Demo.Contracts.IHasName {
+        string Demo.Contracts.IHasName.Name => "Ada";
+        void Demo.Contracts.IHasName.Reset() { }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let targets: Vec<_> = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == "Demo.Contracts.IHasName"
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        targets.len(),
+        2,
+        "expected both partial interface declarations"
+    );
+    let implementer = project.file("Models/NamedThing.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(implementer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(implementer.clone()).collect(),
+        "the explicit authoritative scope should contain only the implementer"
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("explicit interface owner usage query should resolve");
+
+    let source = implementer.read_to_string().expect("implementer source");
+    let property_owner = source
+        .find("Demo.Contracts.IHasName.Name")
+        .expect("explicit interface property owner");
+    let method_owner = source
+        .find("Demo.Contracts.IHasName.Reset")
+        .expect("explicit interface method owner");
+    for owner_start in [property_owner, method_owner] {
+        let segment_start = owner_start + "Demo.".len();
+        let segment_end = segment_start + "Contracts".len();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.start_offset <= segment_start && segment_end <= hit.end_offset),
+            "explicit interface owner should cover its nonterminal segment {segment_start}..{segment_end}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn usage_finder_csharp_routes_global_using_references() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (
