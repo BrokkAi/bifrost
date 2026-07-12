@@ -127,6 +127,15 @@ fn normalize_project_file(project: &dyn Project, path: &Path) -> Option<ProjectF
     if rel_path.as_os_str().is_empty() {
         return None;
     }
+    // The unified SQLite cache writes inside the watched workspace. Treating
+    // those writes as source changes repeatedly invalidates analyzer snapshots.
+    if rel_path
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == crate::gitblob::CACHE_DIR_NAME)
+    {
+        return None;
+    }
 
     let file = ProjectFile::new(project.root().to_path_buf(), rel_path.to_path_buf());
     if file.exists() && project.is_gitignored(rel_path) {
@@ -190,7 +199,7 @@ fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::watch_roots;
+    use super::{normalize_project_file, watch_roots};
     use crate::path_normalization::NormalizePath;
     use crate::{FilesystemProject, Project};
     use std::fs;
@@ -237,5 +246,19 @@ mod tests {
         let project = FilesystemProject::new(root.clone()).unwrap();
         let roots = watch_roots(&project).unwrap();
         assert_eq!(roots, vec![root.normalize()]);
+    }
+
+    #[test]
+    fn internal_cache_changes_are_not_project_changes() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        let cache_dir = project.root().join(crate::gitblob::CACHE_DIR_NAME);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_db = cache_dir.join(crate::cache_db::CACHE_DB_FILE_NAME);
+        fs::write(&cache_db, "cache state").unwrap();
+
+        assert_eq!(normalize_project_file(project.as_ref(), &cache_db), None);
+        assert!(
+            normalize_project_file(project.as_ref(), &project.root().join("src/main.rs")).is_some()
+        );
     }
 }
