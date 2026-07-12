@@ -18,12 +18,11 @@ pub(super) fn resolve_csharp_type(
     let Some(tree) = tree else {
         return no_type("csharp_parse_failed", "C# source could not be parsed");
     };
-    let support = analyzer.definition_lookup_index();
     let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
         return no_type("csharp_analyzer_unavailable", "C# analyzer is unavailable");
     };
     let Some(resolution) =
-        csharp_type_lookup_resolution(analyzer, support, file, source, tree.root_node(), site)
+        csharp_type_lookup_resolution(analyzer, file, source, tree.root_node(), site)
     else {
         return no_type(
             "no_explicit_type",

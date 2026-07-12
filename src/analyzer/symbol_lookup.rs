@@ -1,4 +1,5 @@
 use crate::analyzer::common::language_for_target as code_unit_language;
+use crate::analyzer::csharp::strip_csharp_generic_arity;
 use crate::analyzer::{CodeUnit, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -447,23 +448,6 @@ pub(crate) fn symbol_selector_leaf(language: Language, input: &str) -> Option<St
     (leaves.len() == 1)
         .then(|| leaves.into_iter().next())
         .flatten()
-}
-
-fn strip_csharp_generic_arity(segment: &str) -> &str {
-    let Some((name, arity)) = segment.rsplit_once('`') else {
-        return segment;
-    };
-    let backticks = 1 + name.bytes().rev().take_while(|byte| *byte == b'`').count();
-    let name = name.trim_end_matches('`');
-    if !name.is_empty()
-        && (1..=2).contains(&backticks)
-        && !arity.is_empty()
-        && arity.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        name
-    } else {
-        segment
-    }
 }
 
 fn insert_path_variants(paths: &mut BTreeSet<Vec<String>>, language: Language, value: &str) {

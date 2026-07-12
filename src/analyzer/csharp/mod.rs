@@ -98,6 +98,35 @@ impl CSharpAnalyzer {
         self.inner.lookup_declarations_by_identifier(identifier)
     }
 
+    pub(crate) fn declaration_candidates_by_fqn(
+        &self,
+        fqn: &str,
+        normalized: bool,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_persisted_fqn(fqn, normalized)
+    }
+
+    pub(crate) fn type_candidates_in_package(
+        &self,
+        package: &str,
+        simple: &str,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_types_by_package_simple(package, simple)
+    }
+
+    pub(crate) fn member_candidates_for_owner(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_members_for_owner_name(owner_fqn, name)
+    }
+
+    pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
+        self.inner.persisted_package_exists(namespace)
+    }
+
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
         let package = self.inner.package_name_of(file).unwrap_or_default();
         if !package.is_empty() {
@@ -319,7 +348,12 @@ impl CSharpAnalyzer {
 }
 
 pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
-    let normalized = fq_name.replace(['$', '+'], ".");
+    let normalized = fq_name
+        .replace(['$', '+'], ".")
+        .split('.')
+        .map(strip_csharp_generic_arity)
+        .collect::<Vec<_>>()
+        .join(".");
     let Some(owner) = normalized.strip_suffix(".#ctor") else {
         return normalized;
     };
@@ -335,6 +369,23 @@ pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
         normalized
     } else {
         format!("{owner}.{constructor_name}")
+    }
+}
+
+pub(crate) fn strip_csharp_generic_arity(segment: &str) -> &str {
+    let Some((name, arity)) = segment.rsplit_once('`') else {
+        return segment;
+    };
+    let backticks = 1 + name.bytes().rev().take_while(|byte| *byte == b'`').count();
+    let name = name.trim_end_matches('`');
+    if !name.is_empty()
+        && (1..=2).contains(&backticks)
+        && !arity.is_empty()
+        && arity.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        name
+    } else {
+        segment
     }
 }
 
@@ -387,7 +438,7 @@ fn member_modifier(part: &str) -> bool {
     )
 }
 
-fn normalize_csharp_type_fragment(reference: &str) -> String {
+pub(crate) fn normalize_csharp_type_fragment(reference: &str) -> String {
     let trimmed = reference.trim();
     let without_nullable = trimmed.trim_end_matches('?').trim();
     let without_arrays = without_nullable.trim_end_matches("[]").trim();

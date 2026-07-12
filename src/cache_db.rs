@@ -17,7 +17,7 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const LATEST_SCHEMA_VERSION: i64 = 1;
 const PRE_RELEASE_UNIFIED_SCHEMA_VERSION: i64 = 6;
 const LATEST_SEMANTIC_SCHEMA_VERSION: i64 = 1;
-const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 9;
+const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 10;
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
@@ -452,6 +452,9 @@ fn create_analyzer_schema(tx: &Transaction<'_>) -> Result<()> {
           short_name               TEXT    NOT NULL,
           identifier               TEXT    NOT NULL,
           content_qualifier        TEXT    NOT NULL,
+          exact_fqn                TEXT,
+          normalized_fqn           TEXT,
+          simple_type_name         TEXT,
           signature                TEXT,
           synthetic                INTEGER NOT NULL CHECK(synthetic IN (0, 1)),
           is_type_alias            INTEGER NOT NULL CHECK(is_type_alias IN (0, 1)),
@@ -470,6 +473,22 @@ fn create_analyzer_schema(tx: &Transaction<'_>) -> Result<()> {
 
         CREATE INDEX idx_code_units_lang_identifier_declarations
           ON code_units(lang, identifier)
+          WHERE in_declarations = 1;
+
+        CREATE INDEX idx_code_units_lang_exact_fqn_declarations
+          ON code_units(lang, exact_fqn)
+          WHERE in_declarations = 1;
+
+        CREATE INDEX idx_code_units_lang_normalized_fqn_declarations
+          ON code_units(lang, normalized_fqn)
+          WHERE in_declarations = 1;
+
+        CREATE INDEX idx_code_units_lang_package_simple_type_declarations
+          ON code_units(lang, content_qualifier, simple_type_name)
+          WHERE in_declarations = 1 AND kind = 0;
+
+        CREATE INDEX idx_code_units_lang_content_qualifier_declarations
+          ON code_units(lang, content_qualifier)
           WHERE in_declarations = 1;
 
         CREATE TABLE unit_ranges(

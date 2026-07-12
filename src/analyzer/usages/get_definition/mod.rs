@@ -8,8 +8,8 @@ use crate::analyzer::usages::cpp_graph::{
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,
     csharp_is_extension_method, csharp_is_type_reference_node, csharp_member_declared_type_fq_name,
-    csharp_method_return_type_fq_name, csharp_node_text, csharp_object_initializer_for_label,
-    csharp_reference_type_text, csharp_signature_arity,
+    csharp_method_return_type_fq_name, csharp_node_text, csharp_object_created_type,
+    csharp_object_initializer_for_label, csharp_reference_type_text, csharp_signature_arity,
     member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
@@ -459,13 +459,19 @@ fn resolve_one(
             tree.as_ref(),
             &site,
         ),
-        Language::CSharp => csharp::resolve_csharp(
-            analyzer,
-            context.support(),
-            &request.file,
-            &source,
-            tree.as_ref(),
-            &site,
+        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer).map_or_else(
+            || no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable"),
+            |csharp_analyzer| {
+                let definitions = csharp::CSharpDefinitionProvider::new(csharp_analyzer);
+                csharp::resolve_csharp(
+                    analyzer,
+                    &definitions,
+                    &request.file,
+                    &source,
+                    tree.as_ref(),
+                    &site,
+                )
+            },
         ),
         Language::Cpp => cpp::resolve_cpp(
             analyzer,

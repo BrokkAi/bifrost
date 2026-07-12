@@ -159,6 +159,12 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn simple_type_name(&self, unit: &CodeUnit) -> String {
         unit.identifier().to_string()
     }
+    /// Whether fully-qualified lookup keys are intrinsic to blob contents.
+    /// Path-derived adapters must leave these projections absent because one
+    /// blob may be mounted at multiple live workspace paths.
+    fn persist_content_stable_lookup_keys(&self) -> bool {
+        false
+    }
     fn callable_arity(
         &self,
         _signature: &str,
@@ -2408,6 +2414,174 @@ where
             .unwrap_or_default(),
         );
         matches
+    }
+
+    pub(crate) fn lookup_declarations_by_persisted_fqn(
+        &self,
+        fqn: &str,
+        normalized: bool,
+    ) -> BTreeSet<CodeUnit> {
+        use crate::analyzer::store::PersistedLookupKey;
+        let key = if normalized {
+            PersistedLookupKey::NormalizedFqn
+        } else {
+            PersistedLookupKey::ExactFqn
+        };
+        let lookup = if normalized {
+            self.adapter.normalize_full_name(fqn)
+        } else {
+            fqn.to_string()
+        };
+        let rows = self
+            .store_context
+            .store
+            .declaration_candidate_rows_by_lookup_key_for_langs(
+                &self.storage_language_keys_for_queries(),
+                key,
+                &lookup,
+            )
+            .unwrap_or_default();
+        let mut matches: BTreeSet<_> = self.resolve_candidate_rows(rows).into_iter().collect();
+        matches.extend(self.dirty_units_matching(false, |unit| {
+            let candidate = if normalized {
+                self.adapter.normalize_full_name(&unit.fq_name())
+            } else {
+                unit.fq_name()
+            };
+            candidate == lookup
+        }));
+        matches.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                let candidate = if normalized {
+                    self.adapter.normalize_full_name(&unit.fq_name())
+                } else {
+                    unit.fq_name()
+                };
+                candidate == lookup
+            })
+            .unwrap_or_default(),
+        );
+        matches
+    }
+
+    pub(crate) fn lookup_types_by_package_simple(
+        &self,
+        package: &str,
+        simple: &str,
+    ) -> BTreeSet<CodeUnit> {
+        let rows = self
+            .store_context
+            .store
+            .declaration_type_rows_by_package_simple_for_langs(
+                &self.storage_language_keys_for_queries(),
+                package,
+                simple,
+            )
+            .unwrap_or_default();
+        let mut matches: BTreeSet<_> = self.resolve_candidate_rows(rows).into_iter().collect();
+        matches.extend(self.dirty_units_matching(false, |unit| {
+            unit.is_class()
+                && unit.package_name() == package
+                && self.adapter.simple_type_name(unit) == simple
+        }));
+        matches.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                unit.is_class()
+                    && unit.package_name() == package
+                    && self.adapter.simple_type_name(unit) == simple
+            })
+            .unwrap_or_default(),
+        );
+        matches
+    }
+
+    pub(crate) fn lookup_members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+    ) -> BTreeSet<CodeUnit> {
+        let exact_rows = self
+            .store_context
+            .store
+            .declaration_member_rows_for_owner_for_langs(
+                &self.storage_language_keys_for_queries(),
+                owner_fqn,
+                false,
+                name,
+            )
+            .unwrap_or_default();
+        let mut matches: BTreeSet<_> = self
+            .resolve_candidate_rows(exact_rows)
+            .into_iter()
+            .collect();
+        matches.extend(self.dirty_units_matching(false, |unit| {
+            unit.identifier() == name && unit.fq_name() == format!("{owner_fqn}.{name}")
+        }));
+        matches.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                unit.identifier() == name && unit.fq_name() == format!("{owner_fqn}.{name}")
+            })
+            .unwrap_or_default(),
+        );
+        if !matches.is_empty() {
+            return matches;
+        }
+
+        let normalized_owner = self.adapter.normalize_full_name(owner_fqn);
+        let normalized_rows = self
+            .store_context
+            .store
+            .declaration_member_rows_for_owner_for_langs(
+                &self.storage_language_keys_for_queries(),
+                &normalized_owner,
+                true,
+                name,
+            )
+            .unwrap_or_default();
+        matches.extend(self.resolve_candidate_rows(normalized_rows));
+        let normalized_member = self
+            .adapter
+            .normalize_full_name(&format!("{owner_fqn}.{name}"));
+        matches.extend(self.dirty_units_matching(false, |unit| {
+            unit.identifier() == name
+                && self.adapter.normalize_full_name(&unit.fq_name()) == normalized_member
+        }));
+        matches.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                unit.identifier() == name
+                    && self.adapter.normalize_full_name(&unit.fq_name()) == normalized_member
+            })
+            .unwrap_or_default(),
+        );
+        matches
+    }
+
+    pub(crate) fn persisted_package_exists(&self, package: &str) -> bool {
+        if !self
+            .dirty_units_matching(false, |unit| unit.package_name() == package)
+            .is_empty()
+        {
+            return true;
+        }
+        if self
+            .sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                unit.package_name() == package
+            })
+            .is_some_and(|units| !units.is_empty())
+        {
+            return true;
+        }
+        let rows = self
+            .store_context
+            .store
+            .declaration_rows_by_package_for_langs(
+                &self.storage_language_keys_for_queries(),
+                package,
+            )
+            .unwrap_or_default();
+        self.resolve_candidate_rows(rows)
+            .into_iter()
+            .any(|unit| unit.package_name() == package)
     }
 
     fn sql_search_definitions(

@@ -13,6 +13,7 @@ pub(in crate::analyzer::usages) use resolver::{
     is_type_reference_node as csharp_is_type_reference_node,
     member_declared_type_fq_name as csharp_member_declared_type_fq_name,
     method_return_type_fq_name as csharp_method_return_type_fq_name, node_text as csharp_node_text,
+    object_created_type as csharp_object_created_type,
     object_initializer_for_label as csharp_object_initializer_for_label,
     reference_type_text as csharp_reference_type_text,
     seed_bindings_before as seed_csharp_bindings_before, signature_arity as csharp_signature_arity,

@@ -43,7 +43,7 @@ use tree_sitter::Language as TreeSitterLanguage;
 /// analyzer's own fqns, so nested classes resolve to whatever fqn the analyzer
 /// emits.
 pub(crate) struct ClassRangeIndex {
-    ranges: Vec<(usize, usize, String)>,
+    ranges: Vec<(usize, usize, CodeUnit, String)>,
 }
 
 impl ClassRangeIndex {
@@ -53,10 +53,14 @@ impl ClassRangeIndex {
             .into_iter()
             .filter(|unit| unit.is_class())
             .flat_map(|unit| {
-                analyzer
-                    .ranges(&unit)
-                    .into_iter()
-                    .map(move |range| (range.start_byte, range.end_byte, unit.fq_name()))
+                analyzer.ranges(&unit).into_iter().map(move |range| {
+                    (
+                        range.start_byte,
+                        range.end_byte,
+                        unit.clone(),
+                        unit.fq_name(),
+                    )
+                })
             })
             .collect();
         Self { ranges }
@@ -73,7 +77,14 @@ impl ClassRangeIndex {
                     .get(unit)
                     .into_iter()
                     .flatten()
-                    .map(move |range| (range.start_byte, range.end_byte, unit.fq_name()))
+                    .map(move |range| {
+                        (
+                            range.start_byte,
+                            range.end_byte,
+                            unit.clone(),
+                            unit.fq_name(),
+                        )
+                    })
             })
             .collect();
         Self { ranges }
@@ -83,9 +94,18 @@ impl ClassRangeIndex {
     pub(crate) fn enclosing(&self, byte: usize) -> Option<&str> {
         self.ranges
             .iter()
-            .filter(|(start, end, _)| *start <= byte && byte < *end)
-            .min_by_key(|(start, end, _)| end - start)
-            .map(|(_, _, fqn)| fqn.as_str())
+            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+            .min_by_key(|(start, end, _, _)| end - start)
+            .map(|(_, _, _, fqn)| fqn.as_str())
+    }
+
+    /// The exact declaration identity of the smallest class containing `byte`.
+    pub(crate) fn enclosing_unit(&self, byte: usize) -> Option<&CodeUnit> {
+        self.ranges
+            .iter()
+            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+            .min_by_key(|(start, end, _, _)| end - start)
+            .map(|(_, _, unit, _)| unit)
     }
 }
 

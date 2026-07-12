@@ -13,6 +13,8 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-13) Add content-dependent parsed-state qualifier storage and remove Go source parsing from row hydration.
 - [x] (2026-07-13) Prototyped and rejected lazy Arc-backed index shards because they merely defer full SQLite materialization until a graph query.
 - [x] (2026-07-13) Add a lazy batch support boundary and migrate Go forward definition resolution to an owned, query-shaped provider backed by exact SQL definitions and bounded file hydration.
+- [x] (2026-07-13) Add adapter-opt-in persisted lookup projections and migrate direct C# forward definition resolution to indexed exact/normalized/type/package/member queries without constructing the legacy definition index.
+- [ ] Migrate C# inherited-member, candidate-signature/return-type, global-using, and `get_type_by_location` paths off the remaining explicit legacy fallbacks.
 - [ ] Migrate remaining symbols resolvers from `DefinitionLookupIndex` to owned, query-shaped analyzer operations backed by indexed SQL candidate reads.
 - [x] (2026-07-13) Add index-build/full-scan counters plus warm multi-language, blob-reuse, sibling-module, and bounded-hydration regressions for the Go vertical slice.
 - [x] (2026-07-13) Pass formatting, all-target/all-feature clippy, focused Go/persistence tests, and the complete `nlp,python` suite.
@@ -50,6 +52,12 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - Observation: A canonical Go import path is not blob content. The same bytes can appear at multiple live paths and must resolve to different canonical packages, while the declared `package foo` or `package foo_test` clause is content-dependent and can safely be stored once per blob.
   Evidence: `canonical_go_package_name` combines the declared package's external-test suffix with the nearest live `go.mod` and the file's live directory.
 
+- Observation: C# fully-qualified declaration names are content-stable, but this is not a property shared by all adapters.
+  Evidence: Schema-v10 lookup projections are nullable and populated only when `LanguageAdapter::persist_content_stable_lookup_keys` opts in; C# opts in while Go and path-synthetic module languages retain no persisted FQN projection.
+
+- Observation: Normalized C# owner names are not declaration identities. A nested `N.Outer$Inner` and a top-level `N.Outer.Inner` normalize to the same selector spelling.
+  Evidence: Member queries now try the indexed exact owner first and only fall back to the normalized owner when no live exact child exists. `ClassRangeIndex` retains the exact enclosing `CodeUnit` so it does not discard this distinction before the query.
+
 ## Decision Log
 
 - Decision: Reject immutable Arc-backed `DefinitionLookupIndex` shards.
@@ -76,9 +84,17 @@ Opening a warm persisted workspace must finish without reconstructing every decl
   Rationale: Existing Go rows contain empty qualifiers and cannot be migrated correctly without source syntax. Rebuilding only Go blobs is the safe migration.
   Date/Author: 2026-07-13 / Codex
 
+- Decision: Persist exact FQN, normalized FQN, and package/simple-type lookup projections only for adapters whose names are intrinsic to blob contents.
+  Rationale: This gives C# indexed candidate reads without reintroducing path-dependent identity corruption for Go or path-synthetic module languages. Nullable projections make the capability explicit in storage instead of pretending every language has the same identity model.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Keep unresolved C# initializer/member-return and hierarchy paths as explicit legacy fallbacks until candidate-scoped signatures, supertypes, and global imports are persisted and queryable.
+  Rationale: Direct typed receivers and `var x = new Foo()` are now bounded, but removing the remaining fallback before its structured replacement exists regresses valid `var x = field` and factory-return resolution. Tests and the plan must not overstate the migration boundary.
+  Date/Author: 2026-07-13 / Codex
+
 ## Outcomes & Retrospective
 
-The first Go forward-definition vertical slice is implemented. A warm persisted multi-language public `get_definitions_by_location` regression resolves an imported package member whose import-path tail differs from its declared package name, with zero warm-build parse events, zero delegate/composite definition-index builds, and zero full declaration scans. A sibling-module regression proves the workspace path index is built once and package-clause metadata is read without full file-state hydration. On the 25,617-file AWS SDK Go checkout, the one-time schema-v9 population completed in 132.05 seconds at 3,839,280 KiB peak RSS; the identical warm one-site run completed in 10.41 seconds at 401,928 KiB. An exact internal `types.S3Location` forward-plus-inverse probe completed in 10.51 seconds at 402,828 KiB and returned an exact consistent hit. Remaining language migrations are pending.
+The first Go forward-definition vertical slice and the direct C# forward-definition slice are implemented. A warm persisted multi-language Go regression resolves an imported package member whose import-path tail differs from its declared package name, with zero warm-build parse events, zero delegate/composite definition-index builds, and zero full declaration scans. The corresponding C#+Python regression resolves `var service = new Service(); service.Run()` with the same zero-index/zero-scan guarantees. C# stale-blob package existence and nested-vs-dotted owner collisions have public regressions. A sibling-module Go regression proves the workspace path index is built once and package-clause metadata is read without full file-state hydration. On the 25,617-file AWS SDK Go checkout, the one-time schema-v9 population completed in 132.05 seconds at 3,839,280 KiB peak RSS; the identical warm one-site run completed in 10.41 seconds at 401,928 KiB. An exact internal `types.S3Location` forward-plus-inverse probe completed in 10.51 seconds at 402,828 KiB and returned an exact consistent hit. C# candidate signatures, supertypes, global usings, and `get_type_by_location`, plus remaining language migrations, are pending.
 
 ## Context and Orientation
 
@@ -128,6 +144,8 @@ All tests and benchmark commands are repeatable. The Go epoch bump invalidates o
 ## Artifacts and Notes
 
 The integrated Go query-provider checkpoint passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, the complete `cargo test --features nlp,python` suite, all 35 focused Go definition tests, all 16 canonical-FQN tests, all six persistence tests, and the identical-blob/two-live-path store regression.
+
+The direct C# query-provider checkpoint passed all 425 cross-language `get_definition_test` cases, all 43 definition-selector cases, all analyzer persistence tests, all 33 analyzer-store tests, all eight cache-schema tests, and `cargo clippy --all-targets --all-features -- -D warnings`. Its warm multi-language regression proves direct object-created receiver lookup does not build either definition index or scan all declarations; separate public regressions prove stale complete blobs are filtered by the live snapshot and exact nested owners are not merged with normalized dotted-name collisions.
 
 Real-corpus commands used the release `bifrost_reference_differential` binary against `/mnt/T9/repo-clones/aws__aws-sdk-go-v2` at repository head `91eca463daf932474778dc4a984c41ecfcd9dc3c`. The cold and warm sampled records are `/tmp/bifrost-go-677-smoke.jsonl` and `/tmp/bifrost-go-677-warm.jsonl`; the resolved exact record is `/tmp/bifrost-go-677-warm-internal2.jsonl` for `service/gamelift/api_op_UpdateScript.go` bytes `2856..2866`.
 

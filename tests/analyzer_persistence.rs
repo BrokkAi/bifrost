@@ -60,6 +60,13 @@ fn go_python_project(root: &Path) -> Arc<dyn Project> {
     ))
 }
 
+fn csharp_python_project(root: &Path) -> Arc<dyn Project> {
+    Arc::new(TestProject::with_languages(
+        root.canonicalize().unwrap(),
+        BTreeSet::from([Language::CSharp, Language::Python]),
+    ))
+}
+
 fn parsed_file_count(events: &[BuildProgressEvent]) -> usize {
     events
         .iter()
@@ -125,6 +132,98 @@ fn warm_multilanguage_go_definition_query_does_not_build_full_definition_index()
     );
     assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
     assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+}
+
+#[test]
+fn warm_multilanguage_csharp_definition_query_does_not_build_full_definition_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "Lib/Service.cs",
+        "namespace Lib { public class Service { public void Run() {} } }\n",
+    );
+    let caller = "using Lib;\nnamespace App { public class Controller { public void Handle() { var service = new Service(); service.Run(); } } }\n";
+    write_file(root, "App/Controller.cs", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let project = csharp_python_project(root);
+
+    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let events = Arc::clone(&warm_events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    let analyzer = warm.analyzer();
+    assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+
+    let call_line = caller.lines().nth(1).unwrap();
+    let result = brokk_bifrost::searchtools::get_definitions_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "App/Controller.cs".to_string(),
+                line: Some(2),
+                column: Some(call_line.find("Run").unwrap() + 1),
+            }],
+        },
+    );
+
+    assert_eq!(result.results[0].status, "resolved");
+    assert_eq!(result.results[0].definitions[0].fqn, "Lib.Service.Run");
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+}
+
+#[test]
+fn csharp_package_existence_ignores_stale_complete_blobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "Types.cs",
+        "namespace Removed { public class OldType {} }\n",
+    );
+    let caller =
+        "using Removed;\nnamespace App { public class Controller { private Missing value; } }\n";
+    write_file(root, "Controller.cs", caller);
+    let repo = init_git_repo(root);
+    commit_all(&repo, "initial namespace");
+    let project = Arc::new(TestProject::new(
+        root.canonicalize().unwrap(),
+        Language::CSharp,
+    ));
+
+    let _cold = WorkspaceAnalyzer::build_persisted(project.clone(), AnalyzerConfig::default());
+    write_file(
+        root,
+        "Types.cs",
+        "namespace Replacement { public class NewType {} }\n",
+    );
+    commit_all(&repo, "replace namespace");
+    let warm = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+
+    let type_line = caller.lines().nth(1).unwrap();
+    let result = brokk_bifrost::searchtools::get_definitions_by_location(
+        warm.analyzer(),
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "Controller.cs".to_string(),
+                line: Some(2),
+                column: Some(type_line.find("Missing").unwrap() + 1),
+            }],
+        },
+    );
+
+    assert_eq!(
+        result.results[0].status, "unresolvable_import_boundary",
+        "the stale Removed namespace blob must not count as live"
+    );
 }
 
 #[test]

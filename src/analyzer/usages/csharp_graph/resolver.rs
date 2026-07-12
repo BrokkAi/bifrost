@@ -73,17 +73,6 @@ pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> u
     csharp_signature_arity(signature)
 }
 
-pub(in crate::analyzer::usages) fn seed_bindings_before(
-    node: Node<'_>,
-    cutoff_start: usize,
-    csharp: &CSharpAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    bindings: &mut LocalInferenceEngine<String>,
-) {
-    seed_bindings_before_inner(node, cutoff_start, csharp, file, source, bindings);
-}
-
 pub(in crate::analyzer::usages) fn seed_visible_bindings_at(
     scope: Node<'_>,
     target: Node<'_>,
@@ -93,6 +82,17 @@ pub(in crate::analyzer::usages) fn seed_visible_bindings_at(
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     seed_visible_bindings_inner(scope, target, csharp, file, source, bindings);
+}
+
+pub(in crate::analyzer::usages) fn seed_bindings_before(
+    node: Node<'_>,
+    cutoff_start: usize,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    seed_bindings_before_inner(node, cutoff_start, csharp, file, source, bindings);
 }
 
 fn seed_bindings_before_inner(
@@ -580,7 +580,7 @@ fn seed_symbol_for_type(
     }
 }
 
-fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
+pub(in crate::analyzer::usages) fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() == "object_creation_expression" {
         return node
             .child_by_field_name("type")

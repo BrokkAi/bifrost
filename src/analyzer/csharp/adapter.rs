@@ -34,6 +34,10 @@ impl LanguageAdapter for CSharpAdapter {
         csharp_normalize_full_name(fq_name)
     }
 
+    fn persist_content_stable_lookup_keys(&self) -> bool {
+        true
+    }
+
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
         let mut candidates = lookup_suffix_candidates(normalized_fq_name, &[".", "::"]);
         let base_candidates = candidates.clone();

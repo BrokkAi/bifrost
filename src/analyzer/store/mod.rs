@@ -591,6 +591,140 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    pub(crate) fn declaration_candidate_rows_by_lookup_key_for_langs(
+        &self,
+        langs: &[String],
+        column: PersistedLookupKey,
+        value: &str,
+    ) -> Result<Vec<CandidateRow>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let column = match column {
+            PersistedLookupKey::ExactFqn => "exact_fqn",
+            PersistedLookupKey::NormalizedFqn => "normalized_fqn",
+        };
+        let sql = format!(
+            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+                    units.content_qualifier, units.signature, units.synthetic,
+                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
+                    units.in_definition_lookup
+             FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+             WHERE units.lang = ?1 AND units.{column} = ?2 AND units.in_declarations = 1
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY units.blob_oid, units.unit_key"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut out = Vec::new();
+        for lang in langs {
+            out.extend(collect_candidate_rows(
+                stmt.query_map(params![lang, value], candidate_row_from_row)?,
+            )?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn declaration_type_rows_by_package_simple_for_langs(
+        &self,
+        langs: &[String],
+        package: &str,
+        simple: &str,
+    ) -> Result<Vec<CandidateRow>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let sql = format!(
+            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+                    units.content_qualifier, units.signature, units.synthetic,
+                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
+                    units.in_definition_lookup
+             FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+             WHERE units.lang = ?1 AND units.content_qualifier = ?2
+               AND units.simple_type_name = ?3 AND units.kind = 0
+               AND units.in_declarations = 1 AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY units.blob_oid, units.unit_key"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut out = Vec::new();
+        for lang in langs {
+            out.extend(collect_candidate_rows(stmt.query_map(
+                params![lang, package, simple],
+                candidate_row_from_row,
+            )?)?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn declaration_member_rows_for_owner_for_langs(
+        &self,
+        langs: &[String],
+        owner: &str,
+        normalized: bool,
+        identifier: &str,
+    ) -> Result<Vec<CandidateRow>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let owner_column = if normalized {
+            "normalized_fqn"
+        } else {
+            "exact_fqn"
+        };
+        let sql = format!(
+            "SELECT child.blob_oid, child.lang, child.unit_key, child.kind, child.short_name,
+                    child.content_qualifier, child.signature, child.synthetic,
+                    child.is_type_alias, child.top_level_ordinal, child.in_declarations,
+                    child.in_definition_lookup
+             FROM code_units AS owner
+             JOIN unit_children AS edge
+               ON edge.blob_oid = owner.blob_oid AND edge.lang = owner.lang
+              AND edge.parent_key = owner.unit_key
+             JOIN code_units AS child
+               ON child.blob_oid = edge.blob_oid AND child.lang = edge.lang
+              AND child.unit_key = edge.child_key
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = child.blob_oid AND meta.lang = child.lang
+             WHERE owner.lang = ?1 AND owner.{owner_column} = ?2
+               AND owner.in_declarations = 1 AND child.identifier = ?3
+               AND child.in_declarations = 1 AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY child.blob_oid, child.unit_key"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut out = Vec::new();
+        for lang in langs {
+            out.extend(collect_candidate_rows(stmt.query_map(
+                params![lang, owner, identifier],
+                candidate_row_from_row,
+            )?)?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn declaration_rows_by_package_for_langs(
+        &self,
+        langs: &[String],
+        package: &str,
+    ) -> Result<Vec<CandidateRow>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let sql = format!(
+            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+                    units.content_qualifier, units.signature, units.synthetic,
+                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
+                    units.in_definition_lookup
+             FROM code_units AS units JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+             WHERE units.lang = ?1 AND units.content_qualifier = ?2
+               AND units.in_declarations = 1 AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY units.blob_oid, units.unit_key"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut out = Vec::new();
+        for lang in langs {
+            out.extend(collect_candidate_rows(
+                stmt.query_map(params![lang, package], candidate_row_from_row)?,
+            )?);
+        }
+        Ok(out)
+    }
+
     pub fn declaration_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<CandidateRow>> {
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let sql = format!(
@@ -1022,6 +1156,12 @@ impl AnalyzerStore {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PersistedLookupKey {
+    ExactFqn,
+    NormalizedFqn,
+}
+
 #[derive(Debug, Clone)]
 struct StoredUnit {
     key: i64,
@@ -1073,11 +1213,19 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
         let mut stmt = tx.prepare(
             "INSERT OR IGNORE INTO code_units(
                blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
+               exact_fqn, normalized_fqn, simple_type_name,
                signature, synthetic, is_type_alias, top_level_ordinal,
                in_declarations, in_definition_lookup
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )?;
         for stored in &units {
+            let persist_lookup_keys = adapter.persist_content_stable_lookup_keys();
+            let exact_fqn = persist_lookup_keys.then(|| stored.unit.fq_name());
+            let normalized_fqn = exact_fqn
+                .as_deref()
+                .map(|fqn| adapter.normalize_full_name(fqn));
+            let simple_type_name = (persist_lookup_keys && stored.unit.is_class())
+                .then(|| adapter.simple_type_name(&stored.unit));
             stmt.execute(params![
                 oid,
                 lang,
@@ -1086,6 +1234,9 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
                 stored.unit.short_name(),
                 stored.unit.identifier(),
                 adapter.storage_content_qualifier(&stored.unit, &state.content_qualifier),
+                exact_fqn,
+                normalized_fqn,
+                simple_type_name,
                 stored.unit.signature(),
                 bool_to_i64(stored.unit.is_synthetic()),
                 bool_to_i64(stored.is_type_alias),

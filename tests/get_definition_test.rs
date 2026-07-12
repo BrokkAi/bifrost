@@ -11215,6 +11215,42 @@ fn csharp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn csharp_nested_owner_member_does_not_merge_dotted_owner_collision() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Nested.cs",
+            "namespace N { public class Outer { public class Inner { public void Target() {} public void Run() { Target(); } } } }\n",
+        )
+        .file(
+            "Dotted.cs",
+            "namespace N.Outer { public class Inner { public void Target(int value) {} } }\n",
+        )
+        .build();
+
+    let line = "namespace N { public class Outer { public class Inner { public void Target() {} public void Run() { Target(); } } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"Nested.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Target();")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer$Inner.Target",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "Nested.cs", "{value}");
+}
+
+#[test]
 fn csharp_visible_enum_member_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
