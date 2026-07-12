@@ -263,7 +263,7 @@ fn scan_usages_by_reference_descriptor() -> Value {
 fn scan_usages_by_location_descriptor() -> Value {
     tool_descriptor(
         "scan_usages_by_location",
-        "Find references, call sites, callers, and related tests for declarations selected by project-relative path and 1-based line/column. The location must identify a declaration name; arbitrary lines inside a declaration body are rejected.",
+        "Find references, call sites, callers, and related tests for declarations selected by project-relative path and 1-based line/column. The location normally identifies a declaration name; an exact `symbol` selector may additionally select a module across its file range.",
         json!({
             "type": "object",
             "properties": {
@@ -287,6 +287,11 @@ fn scan_usages_by_location_descriptor() -> Value {
                                 "type": "integer",
                                 "minimum": 1,
                                 "description": "Optional 1-based character column inside the declaration name."
+                            },
+                            "symbol": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Optional exact declaration selector that disambiguates overlapping declarations at this location. Use the selector returned by search_symbols when available."
                             }
                         },
                         "required": ["path", "line"]

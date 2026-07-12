@@ -1292,10 +1292,15 @@ impl SearchToolsService {
                     && target
                         .get("column")
                         .is_none_or(|column| column.as_u64().is_some_and(|column| column > 0))
+                    && target.get("symbol").is_none_or(|symbol| {
+                        symbol
+                            .as_str()
+                            .is_some_and(|symbol| !symbol.trim().is_empty())
+                    })
             });
             if !valid {
                 return Err(SearchToolsServiceError::invalid_params(format!(
-                    "scan_usages_by_location target {} requires a non-blank `path`, a positive 1-based `line`, and an optional positive 1-based `column`",
+                    "scan_usages_by_location target {} requires a non-blank `path`, a positive 1-based `line`, an optional positive 1-based `column`, and an optional non-blank `symbol`",
                     index + 1
                 )));
             }

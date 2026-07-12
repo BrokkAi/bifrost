@@ -130,6 +130,11 @@ pub struct ScanUsagesTarget {
     pub line: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column: Option<usize>,
+    /// Optional exact declaration selector used to disambiguate overlapping
+    /// declaration ranges at this location. The selector must name a declaration
+    /// in `path` that contains the requested location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
 }
 
 /// Parameters for [`usage_graph`].
@@ -3804,8 +3809,17 @@ fn resolve_scan_usages_target(
     let matching_units: Vec<(CodeUnit, usize)> = declarations_in_file(analyzer, &file)
         .into_iter()
         .filter_map(|unit| {
-            let best_span = range_context
-                .name_ranges(analyzer, &unit)
+            let selector_matches = target.symbol.as_deref().is_some_and(|symbol| {
+                unit.fq_name() == symbol || definition_selector(&unit) == symbol
+            });
+            let ranges = if selector_matches && unit.is_module() {
+                analyzer.ranges_of(&unit)
+            } else if selector_matches || target.symbol.is_none() {
+                range_context.name_ranges(analyzer, &unit)
+            } else {
+                return None;
+            };
+            let best_span = ranges
                 .into_iter()
                 .filter(|range| scan_usages_target_matches_range(selection, *range))
                 .map(|range| range.end_byte.saturating_sub(range.start_byte))
@@ -3814,13 +3828,26 @@ fn resolve_scan_usages_target(
         })
         .collect();
 
-    if matching_units.is_empty() {
+    if matching_units.is_empty() && target.symbol.is_none() {
         return ScanUsageTargetResolution::NotFound(not_found_input(
             scan_usages_target_label(&target),
             Some(scan_usages_location_diagnostic(
                 &target,
                 range_context.content(),
                 "no declaration at location",
+            )),
+        ));
+    }
+
+    if matching_units.is_empty()
+        && let Some(symbol) = target.symbol.as_deref()
+    {
+        return ScanUsageTargetResolution::NotFound(not_found_input(
+            scan_usages_target_label(&target),
+            Some(scan_usages_location_diagnostic(
+                &target,
+                range_context.content(),
+                &format!("no declaration matching selector `{symbol}` at location"),
             )),
         ));
     }

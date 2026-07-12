@@ -3428,6 +3428,47 @@ fn scan_usages_accepts_location_target_without_symbols() {
 }
 
 #[test]
+fn scan_usages_by_location_selector_preserves_python_module_target() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "example/service.py",
+            r#"DEFAULT_PREFIX = "job"
+
+class Repository:
+    pass
+
+class Service:
+    def execute(self, name):
+        return f"{DEFAULT_PREFIX}:{name}"
+"#,
+        )
+        .file(
+            "example/__init__.py",
+            "from .service import DEFAULT_PREFIX, Repository, Service\n",
+        )
+        .file(
+            "tests/test_service.py",
+            "from example import DEFAULT_PREFIX\n\ndef test_prefix():\n    assert DEFAULT_PREFIX == \"job\"\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"example/service.py","line":1,"column":1,"symbol":"example.service"}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("example.service", result["symbol"], "payload: {value}");
+    assert_eq!("verified_absent", result["status"], "payload: {value}");
+    assert_eq!(0, result["total_hits"], "payload: {value}");
+}
+
+#[test]
 fn scan_usages_by_reference_requires_symbols() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
 
@@ -3452,6 +3493,7 @@ fn scan_usages_by_location_validation_names_its_own_arguments() {
         r#"{}"#,
         r#"{"targets":[]}"#,
         r#"{"targets":[{"path":"A.java"}]}"#,
+        r#"{"targets":[{"path":"A.java","line":1,"symbol":"   "}]}"#,
     ] {
         let error = service
             .call_tool_json("scan_usages_by_location", args)
