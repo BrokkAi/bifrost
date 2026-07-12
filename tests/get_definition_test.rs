@@ -11663,7 +11663,10 @@ fn csharp_extension_lookup_uses_identifier_index_and_preserves_proof_filters() {
         1,
         "only the visible extension overload should match"
     );
-    assert_eq!(result.definitions[0].fqn, "Visible.Extensions.Convert");
+    assert_eq!(
+        result.definitions[0].fqn.as_deref(),
+        Some("Visible.Extensions.Convert")
+    );
     assert_eq!(
         result.definitions[0].signature.as_deref(),
         Some("(string, int)")
@@ -15868,4 +15871,53 @@ fn scala_reference_context_resolves_select_qualifier_to_object() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Types$", "{value}");
+}
+
+#[test]
+fn rust_parameter_definition_by_location_has_local_candidate_contract() {
+    let source =
+        "fn mono_family(cfg: &config::Config) -> String {\n    cfg.font.mono_family.clone()\n}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", source)
+        .build();
+    let reference = source.find("cfg.font").expect("body parameter reference");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("main.rs", source, reference),
+    );
+    let result = &value["results"][0];
+    let definition = &result["definitions"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(definition["name"], "cfg", "{value}");
+    assert!(definition.get("fqn").is_none(), "{value}");
+    assert_eq!(definition["kind"], "parameter", "{value}");
+    assert_eq!(definition["signature"], "cfg: &config::Config", "{value}");
+    assert_eq!(definition["path"], "main.rs", "{value}");
+    assert_eq!(definition["start_line"], 1, "{value}");
+}
+
+#[test]
+fn javascript_destructured_parameter_definition_reports_binding_leaf() {
+    let source = "function render({ label, nested: { value } }) {\n  return value;\n}\n";
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("render.js", source)
+        .build();
+    let reference = source.rfind("value").expect("body parameter reference");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("render.js", source, reference),
+    );
+    let result = &value["results"][0];
+    let definition = &result["definitions"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(definition["name"], "value", "{value}");
+    assert!(definition.get("fqn").is_none(), "{value}");
+    assert_eq!(definition["kind"], "parameter", "{value}");
+    assert_eq!(
+        definition["signature"], "{ label, nested: { value } }",
+        "{value}"
+    );
+    assert_eq!(definition["start_line"], 1, "{value}");
 }

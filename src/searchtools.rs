@@ -5,6 +5,7 @@ use crate::analyzer::common::{
 use crate::analyzer::declaration_range::{
     DeclarationNameRangeContext, code_unit_declaration_name_range,
 };
+use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
     resolve_enclosing_codeunits, strip_trailing_call_suffix, symbol_selector_leaf,
@@ -20,8 +21,8 @@ use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language,
-    ProjectFile, Range, SummaryFileProjection, go_module_roots,
+    CodeUnit, CodeUnitType, DeclarationKind, GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer,
+    Language, ProjectFile, Range, SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::lsp::conversion::percent_decode;
@@ -410,12 +411,23 @@ pub struct DefinitionByReferenceLookupResult {
     pub diagnostics: Vec<DefinitionDiagnostic>,
 }
 
-type DefinitionCandidateKey = (String, String, usize, usize, String, Option<String>, String);
+type DefinitionCandidateKey = (
+    String,
+    Option<String>,
+    String,
+    usize,
+    usize,
+    String,
+    Option<String>,
+    String,
+);
 type DefinitionOutcomeKey = (String, Vec<DefinitionCandidateKey>);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DefinitionCandidate {
-    pub fqn: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fqn: Option<String>,
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -1745,6 +1757,18 @@ fn render_definition_reference_lookup(
     query: DefinitionContextReferenceQuery,
     outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
 ) -> DefinitionByReferenceLookupResult {
+    if outcome.lexical_definition.is_some() {
+        return DefinitionByReferenceLookupResult {
+            query,
+            status: "no_definition".to_string(),
+            definitions: Vec::new(),
+            diagnostics: vec![DefinitionDiagnostic {
+                kind: "local_binding_requires_location".to_string(),
+                message: "the target resolves to a lexical binding; use get_definitions_by_location with its source position"
+                    .to_string(),
+            }],
+        };
+    }
     let diagnostics = outcome
         .diagnostics
         .into_iter()
@@ -1817,6 +1841,7 @@ fn semantic_outcome_key(
 
 fn definition_candidate_key(candidate: &DefinitionCandidate) -> DefinitionCandidateKey {
     (
+        candidate.name.clone(),
         candidate.fqn.clone(),
         candidate.path.clone(),
         candidate.start_line,
@@ -1835,6 +1860,13 @@ fn render_definition_lookup(
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
     let status = outcome.status.as_str().to_string();
+    let mut definitions =
+        definition_candidates_with_cache(analyzer, &outcome.definitions, render_cache);
+    if let Some(definition) = outcome.lexical_definition.as_ref()
+        && let Some(candidate) = lexical_definition_candidate(analyzer, file, definition)
+    {
+        definitions.push(candidate);
+    }
     let mut diagnostics: Vec<DefinitionDiagnostic> = outcome
         .diagnostics
         .into_iter()
@@ -1865,8 +1897,43 @@ fn render_definition_lookup(
             path: site.path,
             target: site.text,
         }),
-        definitions: definition_candidates_with_cache(analyzer, &outcome.definitions, render_cache),
+        definitions,
         diagnostics,
+    }
+}
+
+fn lexical_definition_candidate(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    definition: &LexicalDefinition,
+) -> Option<DefinitionCandidate> {
+    let source = analyzer.project().read_source(file).ok()?;
+    let signature = source
+        .get(definition.declaration_range.start_byte..definition.declaration_range.end_byte)?
+        .trim()
+        .to_string();
+    Some(DefinitionCandidate {
+        name: definition.identifier.clone(),
+        fqn: None,
+        path: rel_path_string(file),
+        start_line: definition.name_range.start_line,
+        end_line: definition.name_range.end_line,
+        kind: declaration_kind_name(definition.kind).to_string(),
+        signature: (!signature.is_empty()).then_some(signature),
+        language: language_name(language_for_file(file)),
+    })
+}
+
+fn declaration_kind_name(kind: DeclarationKind) -> &'static str {
+    match kind {
+        DeclarationKind::Parameter => "parameter",
+        DeclarationKind::ReceiverParameter => "receiver_parameter",
+        DeclarationKind::LambdaParameter => "lambda_parameter",
+        DeclarationKind::LocalVariable
+        | DeclarationKind::CatchParameter
+        | DeclarationKind::EnhancedForVariable
+        | DeclarationKind::PatternVariable
+        | DeclarationKind::ResourceVariable => "local_variable",
     }
 }
 
@@ -2033,7 +2100,8 @@ fn definition_candidate_from_range(
     range: Range,
 ) -> DefinitionCandidate {
     DefinitionCandidate {
-        fqn: unit.fq_name(),
+        name: unit.identifier().to_string(),
+        fqn: Some(unit.fq_name()),
         path: rel_path_string(unit.source()),
         start_line: range.start_line,
         end_line: range.end_line,

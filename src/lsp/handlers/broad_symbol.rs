@@ -3,6 +3,7 @@ use std::sync::Arc;
 use lsp_types::{Position, Uri};
 
 use crate::analyzer::declaration_range::code_unit_declaration_name_range;
+use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
 };
@@ -19,6 +20,7 @@ pub(super) struct BroadSymbolTarget {
     pub(super) end_byte: usize,
     pub(super) declaration_site: bool,
     pub(super) candidates: Vec<CodeUnit>,
+    pub(super) lexical_definition: Option<LexicalDefinition>,
 }
 
 pub(super) fn broad_symbol_target_at_position(
@@ -39,14 +41,14 @@ pub(super) fn broad_symbol_target_at_position(
     let declaration =
         selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true);
     let declaration_site = declaration.is_some();
-    let candidates = declaration
-        .map(|declaration| vec![declaration])
+    let (candidates, lexical_definition) = declaration
+        .map(|declaration| (vec![declaration], None))
         .or_else(|| {
             let identifier = content.get(start_byte..end_byte)?;
             if is_ambiguous_imported_reference(analyzer, &file, identifier) {
                 return None;
             }
-            resolved_reference_candidates(
+            resolved_reference_target(
                 analyzer,
                 &file,
                 Arc::new(content.clone()),
@@ -63,6 +65,7 @@ pub(super) fn broad_symbol_target_at_position(
         end_byte,
         declaration_site,
         candidates,
+        lexical_definition,
     })
 }
 
@@ -114,13 +117,13 @@ pub(super) fn selected_code_unit_declaration_at_cursor(
         .map(|(_, code_unit)| code_unit)
 }
 
-fn resolved_reference_candidates(
+fn resolved_reference_target(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     content: Arc<String>,
     start_byte: usize,
     end_byte: usize,
-) -> Option<Vec<CodeUnit>> {
+) -> Option<(Vec<CodeUnit>, Option<LexicalDefinition>)> {
     let outcome = resolve_definition_batch_with_source(
         analyzer,
         vec![DefinitionLookupRequest {
@@ -135,8 +138,10 @@ fn resolved_reference_candidates(
     )
     .into_iter()
     .next()?;
-    if outcome.status != DefinitionLookupStatus::Resolved || outcome.definitions.is_empty() {
+    if outcome.status != DefinitionLookupStatus::Resolved
+        || (outcome.definitions.is_empty() && outcome.lexical_definition.is_none())
+    {
         return None;
     }
-    Some(outcome.definitions)
+    Some((outcome.definitions, outcome.lexical_definition))
 }

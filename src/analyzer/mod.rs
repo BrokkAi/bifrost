@@ -14,6 +14,7 @@ mod i_analyzer;
 mod java;
 mod javascript;
 mod js_ts;
+pub(crate) mod lexical_definitions;
 mod model;
 mod multi_analyzer;
 mod php;
