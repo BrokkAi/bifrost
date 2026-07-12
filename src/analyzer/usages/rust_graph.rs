@@ -129,6 +129,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 rust,
                 scan_files,
                 scan_target,
+                target,
                 &seeds,
                 scan_scope.cancellation(),
             );

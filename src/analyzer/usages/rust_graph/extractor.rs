@@ -405,12 +405,14 @@ fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_member_target(
     analyzer: &dyn IAnalyzer,
     graph: &RustProjectGraph,
     rust: &RustAnalyzer,
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
+    requested_target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
     cancellation: Option<&CancellationToken>,
 ) -> RustMemberScanResult {
@@ -511,12 +513,15 @@ pub(super) fn scan_files_for_member_target(
             line_starts: &line_starts,
             owner: &owner,
             member_name: &member_name,
-            target,
-            target_is_field: target.is_field(),
+            requested_target,
+            target_is_field: requested_target.is_field(),
+            target_is_enum_variant: requested_target.is_field()
+                && rust
+                    .parent_of(requested_target)
+                    .is_some_and(|owner| rust.is_rust_enum_declaration(&owner)),
             target_owner_is_trait: trait_owner,
             receiver_names: &receiver_names,
             receiver_type_names: &receiver_type_names,
-            static_owner_names: &static_owner_names,
             record_unproven_receivers,
             type_lookup_cache: &mut type_lookup_cache,
             hits: &mut local_hits,
@@ -561,12 +566,12 @@ struct MemberScanCtx<'a> {
     line_starts: &'a [usize],
     owner: &'a CodeUnit,
     member_name: &'a str,
-    target: &'a CodeUnit,
+    requested_target: &'a CodeUnit,
     target_is_field: bool,
+    target_is_enum_variant: bool,
     target_owner_is_trait: bool,
     receiver_names: &'a Vec<String>,
     receiver_type_names: &'a HashSet<String>,
-    static_owner_names: &'a HashSet<String>,
     record_unproven_receivers: bool,
     type_lookup_cache: &'a mut RustTypeLookupCache,
     hits: &'a mut BTreeSet<UsageHit>,
@@ -576,7 +581,10 @@ struct MemberScanCtx<'a> {
 fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     match node.kind() {
         "field_expression" => record_instance_member_hit(node, ctx),
-        "token_tree" => record_token_tree_instance_member_hits(node, ctx),
+        "token_tree" => {
+            record_token_tree_instance_member_hits(node, ctx);
+            record_token_tree_static_member_hits(node, ctx);
+        }
         "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
         "struct_expression" | "struct_pattern" if ctx.target_is_field => {
             record_struct_field_hits(node, ctx)
@@ -771,6 +779,58 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
             );
         }
     }
+}
+
+fn record_token_tree_static_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+    for member_index in 2..children.len() {
+        let owner_index = member_index - 2;
+        let owner = children[owner_index];
+        let separator = children[member_index - 1];
+        let member = children[member_index];
+        if !rust_token_path_segment(owner)
+            || separator.kind() != "::"
+            || simple_node_text(member, ctx.source).as_deref() != Some(ctx.member_name)
+        {
+            continue;
+        }
+        let is_call = children.get(member_index + 1).is_some_and(|arguments| {
+            arguments.kind() == "token_tree"
+                && arguments.child(0).is_some_and(|open| open.kind() == "(")
+        });
+        if !static_member_role_matches_target(is_call, ctx) {
+            continue;
+        }
+        let Some(owner_name) = rust_token_owner_path(&children, owner_index, ctx.source) else {
+            continue;
+        };
+        if !scoped_static_member_matches_target(owner, &owner_name, ctx) {
+            continue;
+        }
+        record_static_member_name_hit(member, ctx);
+    }
+}
+
+fn rust_token_owner_path(children: &[Node<'_>], mut index: usize, source: &str) -> Option<String> {
+    let mut segments = vec![simple_node_text(children[index], source)?];
+    while index >= 2 && children[index - 1].kind() == "::" {
+        let segment = children[index - 2];
+        if !rust_token_path_segment(segment) {
+            break;
+        }
+        segments.push(simple_node_text(segment, source)?);
+        index -= 2;
+    }
+    segments.reverse();
+    Some(segments.join("::"))
+}
+
+fn rust_token_path_segment(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "self" | "super" | "crate"
+    )
 }
 
 fn receiver_name_explicitly_mismatched(
@@ -1006,6 +1066,9 @@ fn field_expression_is_called(node: Node<'_>) -> bool {
 }
 
 fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    if node_in_use_declaration(node) {
+        return;
+    }
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
@@ -1015,15 +1078,20 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some(path) = node.child_by_field_name("path") else {
         return;
     };
+    if !static_member_role_matches_target(field_expression_is_called(node), ctx) {
+        return;
+    }
     let Some(owner_name) = simple_node_text(path, ctx.source) else {
         return;
     };
-    if !ctx.static_owner_names.contains(&owner_name)
-        && !scoped_static_member_matches_target(path, &owner_name, ctx)
-    {
+    if !scoped_static_member_matches_target(path, &owner_name, ctx) {
         return;
     }
 
+    record_static_member_name_hit(name, ctx);
+}
+
+fn record_static_member_name_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let start = name.start_byte();
     let end = name.end_byte();
     let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
@@ -1039,6 +1107,20 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
         enclosing,
         ctx.hits,
     );
+}
+
+fn static_member_role_matches_target(is_call: bool, ctx: &MemberScanCtx<'_>) -> bool {
+    ctx.target_is_enum_variant || ctx.target_is_field != is_call
+}
+
+fn node_in_use_declaration(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "use_declaration" {
+            return true;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn scoped_static_member_matches_target(
@@ -1061,8 +1143,9 @@ fn scoped_static_member_matches_target(
         ctx.member_name,
     ) {
         ReceiverAnalysisOutcome::Precise(candidates) => candidates.into_iter().any(|candidate| {
-            candidate == *ctx.target
-                || candidate.fq_name() == format!("{}.{}", ctx.owner.fq_name(), ctx.member_name)
+            candidate.fq_name() == ctx.requested_target.fq_name()
+                && candidate.source() == ctx.requested_target.source()
+                && candidate.kind() == ctx.requested_target.kind()
         }),
         ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unknown

@@ -4684,6 +4684,64 @@ pub fn consume(wanted: &Wanted, decoy: &Decoy, holder: &Holder) {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_exact_rust_scoped_members_inside_macros() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub enum Wanted { Ready }
+impl Wanted {
+    pub type Assoc = usize;
+    pub fn make() -> Self { Self::Ready }
+}
+
+pub enum Decoy { Ready }
+impl Decoy {
+    pub type Assoc = usize;
+    pub fn make() -> Self { Self::Ready }
+}
+
+use Wanted::Ready;
+
+pub fn consume(value: Wanted) {
+    let _: Wanted::Assoc;
+    Wanted::make();
+    let _ = Wanted::Ready;
+    let _ = matches!(value, Wanted::Ready);
+    let _ = matches!(value, crate::Wanted::Ready);
+    bail!(Wanted::make());
+    bail!(crate::Wanted::make());
+
+    let _: Decoy::Assoc;
+    Decoy::make();
+    let _ = Decoy::Ready;
+    let _ = matches!(Decoy::Ready, crate::Decoy::Ready);
+    bail!(crate::Decoy::make());
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected_hits) in [("Wanted.Assoc", 1), ("Wanted.Ready", 4), ("Wanted.make", 3)] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_reference",
+                &format!(r#"{{"symbols":["{symbol}"],"include_tests":true}}"#),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(1, resolved_scan_count(&value), "payload: {value}");
+        assert_eq!(
+            expected_hits,
+            only_result(&value)["total_hits"].as_u64().unwrap(),
+            "payload: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_by_reference_finds_exact_fully_qualified_rust_type_owners() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
