@@ -157,6 +157,55 @@ pub(crate) fn infix_receiver_for_operator(node: Node<'_>) -> Option<Node<'_>> {
         .flatten()
 }
 
+pub(crate) fn named_argument_invocation_owner(node: Node<'_>) -> Option<Node<'_>> {
+    let assignment = node.parent()?;
+    if assignment.kind() != "assignment_expression"
+        || assignment.child_by_field_name("left") != Some(node)
+    {
+        return None;
+    }
+    let arguments = assignment.parent()?;
+    if arguments.kind() != "arguments" {
+        return None;
+    }
+    let invocation = arguments.parent()?;
+    match invocation.kind() {
+        "call_expression" => invocation.child_by_field_name("function"),
+        "instance_expression" => {
+            let mut cursor = invocation.walk();
+            invocation.named_children(&mut cursor).find(|child| {
+                matches!(
+                    child.kind(),
+                    "type_identifier" | "stable_type_identifier" | "generic_type"
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier" | "type_identifier" => Some(node),
+        "generic_function" => node
+            .child_by_field_name("function")
+            .and_then(terminal_invocation_owner_name),
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(terminal_invocation_owner_name),
+        "field_expression" => node
+            .child_by_field_name("field")
+            .and_then(terminal_invocation_owner_name),
+        "stable_type_identifier" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .last()
+                .and_then(terminal_invocation_owner_name)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn is_assignment_lhs(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "assignment_expression" && parent.child_by_field_name("left") == Some(node)

@@ -149,7 +149,7 @@ impl TargetSpec {
     }
 }
 
-struct TraitMemberOwners {
+struct InheritedMemberOwners {
     family_owners: Vec<CodeUnit>,
     receiver_owners: Vec<CodeUnit>,
 }
@@ -173,19 +173,17 @@ fn inherited_member_owners(
     kind: TargetKind,
     member_name: &str,
     arity: Option<usize>,
-) -> TraitMemberOwners {
+) -> InheritedMemberOwners {
     let Some(owner) = owner else {
-        return TraitMemberOwners {
+        return InheritedMemberOwners {
             family_owners: Vec::new(),
             receiver_owners: Vec::new(),
         };
     };
     let mut family_owners = vec![owner.clone()];
     let mut receiver_owners = vec![owner.clone()];
-    let supports_inherited_owner = kind == TargetKind::Method
-        || (kind == TargetKind::Field && scala.is_scala_trait_declaration(owner));
-    if !supports_inherited_owner {
-        return TraitMemberOwners {
+    if !matches!(kind, TargetKind::Method | TargetKind::Field) {
+        return InheritedMemberOwners {
             family_owners,
             receiver_owners,
         };
@@ -228,7 +226,7 @@ fn inherited_member_owners(
             }
         }
     }
-    TraitMemberOwners {
+    InheritedMemberOwners {
         family_owners,
         receiver_owners,
     }

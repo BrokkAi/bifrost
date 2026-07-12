@@ -293,6 +293,117 @@ object NumberUse {
 }
 
 #[test]
+fn scala_selection_label_stable_and_type_usages_preserve_exact_targets() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Model.scala",
+            r#"
+package app
+
+case class Config(name: String)
+case class GenericConfig[T](name: String, value: T)
+
+object Marks {
+  val START = "<"
+}
+
+class Base {
+  val marker = "base"
+}
+
+class Child extends Base {
+  val inherited = marker
+}
+
+trait Api {
+  def value: Int
+  def run(): Int
+}
+
+class Impl extends Api {
+  override def value: Int = 1
+  override def run(): Int = 2
+}
+
+enum Mode {
+  case Active
+}
+
+object Extractor {
+  def unapply(value: String): Option[String] = Some(value)
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"
+package app
+
+object Use {
+  val config = Config(name = "main")
+  val generic = GenericConfig[Int](name = "generic", value = 1)
+  val created = new GenericConfig[Int](name = "created", value = 2)
+  val typed: Config = config
+  val marked = s"${Marks.START}value"
+  val mode = Mode.Active
+
+  def selected(api: Api): Int = api.run() + api.value
+  def extracted(value: String): String = value match {
+    case Extractor(found) => found
+    case _ => value
+  }
+}
+"#,
+        ),
+        (
+            "other/Model.scala",
+            r#"
+package other
+
+case class Config(name: String)
+case class GenericConfig[T](name: String, value: T)
+object Marks { val START = "other" }
+class Base { val marker = "other" }
+trait Api { def value: Int; def run(): Int }
+enum Mode { case Active }
+object Extractor { def unapply(value: String): Option[String] = Some(value) }
+
+object Use {
+  val config = Config(name = "other")
+  val generic = GenericConfig[Int](name = "other", value = 1)
+  val marked = s"${Marks.START}value"
+  val mode = Mode.Active
+  def selected(api: Api): Int = api.run() + api.value
+  def extracted(value: String): String = value match { case Extractor(found) => found }
+}
+"#,
+        ),
+    ]);
+
+    for (target, expected) in [
+        ("app.Config.name", "Config(name = \"main\")"),
+        ("app.GenericConfig.name", "name = \"created\""),
+        ("app.Base.marker", "val inherited = marker"),
+        ("app.Marks$.START", "Marks.START"),
+        ("app.Api.run", "api.run()"),
+        ("app.Api.value", "api.value"),
+        ("app.Config", "val typed: Config"),
+        ("app.Mode", "Mode.Active"),
+        ("app.Extractor$", "case Extractor(found)"),
+    ] {
+        let target = definition(&analyzer, target);
+        let hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&hits, expected);
+        assert!(
+            hits.iter()
+                .all(|hit| hit.file.rel_path() != "other/Model.scala"),
+            "unrelated same-name owner leaked for {target:?}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn scala_import_hits_ignore_unrelated_aliased_import_path() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         ("Target.scala", "package app\n\nclass Target\n"),

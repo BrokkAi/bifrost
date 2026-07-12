@@ -2765,6 +2765,78 @@ object NumberUse {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_scala_structured_selection_roles() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            r#"
+package app
+
+case class Config(name: String)
+case class GenericConfig[T](name: String, value: T)
+object Marks { val START = "<" }
+class Base { val marker = "base" }
+class Child extends Base { val inherited = marker }
+trait Api { def value: Int; def run(): Int }
+enum Mode { case Active }
+object Extractor { def unapply(value: String): Option[String] = Some(value) }
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"
+package app
+
+object Use {
+  val config = Config(name = "main")
+  val generic = GenericConfig[Int](name = "generic", value = 1)
+  val created = new GenericConfig[Int](name = "created", value = 2)
+  val typed: Config = config
+  val marked = s"${Marks.START}value"
+  val mode = Mode.Active
+  def selected(api: Api): Int = api.run() + api.value
+  def extracted(value: String): String = value match { case Extractor(found) => found }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected) in [
+        ("app.Config.name", "Config(name = \"main\")"),
+        ("app.GenericConfig.name", "name = \"created\""),
+        ("app.Base.marker", "val inherited = marker"),
+        ("app.Marks.START", "Marks.START"),
+        ("app.Api.run", "api.run()"),
+        ("app.Api.value", "api.value"),
+        ("app.Config", "val typed: Config"),
+        ("app.Mode", "Mode.Active"),
+        ("app.Extractor", "case Extractor(found)"),
+    ] {
+        let args = serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string();
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args)
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let usage = only_result(&value);
+        assert_eq!(usage["status"], "found", "{value}");
+        let snippets = usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str());
+        assert!(
+            snippets
+                .into_iter()
+                .any(|snippet| snippet.contains(expected)),
+            "expected {expected:?}: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_labels_override_declarations_and_reports_resolved_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

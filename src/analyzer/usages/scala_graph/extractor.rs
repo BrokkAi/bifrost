@@ -14,7 +14,8 @@ use crate::analyzer::usages::scala_graph::syntax::{
     call_arity_for_reference, has_ancestor_kind, has_member_qualifier, infix_receiver_for_operator,
     is_assignment_lhs, is_constructor_like_reference, is_field_expression_value,
     is_identifier_node, is_owner_qualified_this, is_type_like_reference, member_qualifier,
-    member_qualifier_node, node_text, parenthesized_arity,
+    member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
+    terminal_invocation_owner_name,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer, TypeHierarchyProvider,
@@ -584,7 +585,11 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.visibility.type_names.contains(text)
                 && is_constructor_like_reference(node, ctx.source)
         }
-        TargetKind::Method | TargetKind::Field => member_reference_is_proven(node, text, ctx),
+        TargetKind::Method => member_reference_is_proven(node, text, ctx),
+        TargetKind::Field => {
+            named_argument_field_is_proven(node, text, ctx)
+                || member_reference_is_proven(node, text, ctx)
+        }
     };
     if proven {
         add_hit(node, ctx);
@@ -595,6 +600,24 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         ctx.bindings.declare_shadow(text.to_string());
     }
+}
+
+fn named_argument_field_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if text != ctx.spec.member_name {
+        return false;
+    }
+    let Some(owner) =
+        named_argument_invocation_owner(node).and_then(terminal_invocation_owner_name)
+    else {
+        return false;
+    };
+    let owner_name = node_text(owner, ctx.source).trim();
+    !is_locally_shadowed(ctx, owner_name)
+        && ctx
+            .visibility
+            .owner_fq_name_for(owner_name)
+            .or_else(|| ctx.visibility.receiver_type_fq_name_for(owner_name))
+            .is_some_and(|owner| ctx.spec.receiver_owner_fq_matches(owner))
 }
 
 fn assignment_lhs_is_target_member_write(proven: bool, text: &str, ctx: &ScanCtx<'_>) -> bool {
