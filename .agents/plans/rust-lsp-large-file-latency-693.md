@@ -14,8 +14,8 @@ Rust definition and hover requests should remain interactive after Bifrost finis
 - [x] (2026-07-12 19:10Z) Reproduced the latency against the exact LGTM revision and captured indexing and request profiles.
 - [x] (2026-07-12 19:24Z) Identified repeated whole-file parsing during Rust export projection as the root cause.
 - [x] (2026-07-12 19:47Z) Implemented one-parse export visibility collection, preserved cross-file public-module ancestry, and added synthetic plus exact-reproduction LSP coverage.
-- [ ] Re-run the exact reproduction and focused tests, then run formatting, clippy, and the feature-complete test suite (completed: exact release-profile reproduction, synthetic scale test, all 108 Rust usage graph tests, targeted glob-import regression; remaining: full Rust LSP suite after the cross-file correction, clippy, full feature suite).
-- [ ] Commit only the files changed for issue #693 on the current branch.
+- [x] (2026-07-12 20:01Z) Re-ran the exact reproduction and focused tests, then passed formatting, all-target/all-feature clippy, and the feature-complete `nlp,python` test suite.
+- [x] (2026-07-12 20:02Z) Committed only the issue #693 implementation, tests, harness support, and this ExecPlan on the current `master` branch; a final follow-up commit records the clippy-only test cleanup and completed plan.
 
 ## Surprises & Discoveries
 
@@ -54,7 +54,7 @@ Rust definition and hover requests should remain interactive after Bifrost finis
 
 ## Outcomes & Retrospective
 
-The root-cause implementation and focused verification are complete. The exact LGTM field query now resolves in 128.6 ms rather than 10.6 seconds in the same release-profile environment, and subsequent definition/hover requests take 66-68 ms. Full all-feature validation and the final commit remain.
+Issue #693 is fixed and fully validated. The exact LGTM field query now resolves in 128.6 ms rather than 10.6 seconds in the same release-profile environment, and subsequent definition/hover requests take 66-68 ms. The generated real-LSP scale regression completes in 0.24 seconds in the debug test profile and verifies both the field definition and nested-field hover. Formatting, all-target/all-feature clippy, all 108 Rust usage graph tests, all 25 active Rust go-to-definition tests, and the complete `cargo test --features nlp,python` run pass. The key lesson is that an apparently request-local Rust inference stall was caused by a shared export projection repeatedly parsing the same source; phase-level profiling prevented an ineffective resolver-specific optimization.
 
 ## Context and Orientation
 
@@ -128,3 +128,5 @@ No new external dependency is used. The existing `brokk_bifrost::profiling` modu
 Revision note (2026-07-12): Created the plan after issue intake and initial request-path orientation; implementation details intentionally remained conditional on profiling evidence.
 
 Revision note (2026-07-12 19:47Z): Recorded the exact profile, the repeated-parse root cause, the cross-file module correction, the chosen one-parse design, focused test results, and before/after latency evidence.
+
+Revision note (2026-07-12 20:02Z): Marked implementation and validation complete after the all-feature clippy and full `nlp,python` suite passed, and summarized the final measured outcome.

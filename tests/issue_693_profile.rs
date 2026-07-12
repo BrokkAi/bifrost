@@ -5,7 +5,6 @@ mod common;
 use brokk_bifrost::Language;
 use common::InlineTestProject;
 use common::lsp_client::{LspServer, uri_for};
-use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -42,7 +41,7 @@ fn large_rust_file_definition_and_hover_stay_interactive() {
     assert!(
         locations.iter().any(|location| {
             location["uri"].as_str() == Some(config_uri.as_str())
-                && location["range"]["start"]["line"] == Value::from(1)
+                && location["range"]["start"]["line"].as_u64() == Some(1)
         }),
         "expected Config.font definition, got {definition}"
     );
