@@ -18,6 +18,7 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 20:38Z) Completed the warm 1,000-site/100-target Azure PowerShell smoke in 232.1 seconds: 336 resolved sites, 41 consistent, 3 unproven, 82 missing, and 874 inconclusive; peak RSS was 6,972,940 KiB.
 - [x] (2026-07-12 20:50Z) Committed and pushed parent-lookup fix `b842208a`, then completed the full 10,000-site/1,000-target C# run in 425.0 seconds (7:07 wall) at 6,969,144 KiB peak RSS; the canonical record contains 598 consistent, 40 unproven, 1,339 missing, and 8,023 inconclusive sites.
 - [x] (2026-07-12 21:11Z) Reduced the first correctness boundary under an authoritative one-file scope, filed #698, fixed C# method-return recognition and qualified-type usage ranges, passed 59 focused tests, affected all-feature clippy, and the complete `nlp,python` test gate, then changed the exact Azure site from missing to consistent in 146.7 seconds.
+- [x] (2026-07-12 21:18Z) Pushed fixing commit `7ccce3dd` to `master` and closed #698 with the reduced regression and exact Azure evidence.
 - [ ] Triage the remaining C# missing sites from exact production reruns after the #698 checkpoint lands.
 
 ## Surprises & Discoveries
@@ -47,7 +48,7 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 
 ## Outcomes & Retrospective
 
-The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes in 425.0 seconds instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. The first dominant correctness boundary is pinned by #698: C# method returns use the grammar field `returns`, and proven qualified-type references must emit the containing type range rather than only the terminal identifier. The reduced authoritative-scope regression passes, and exact bytes `5677..5693` now classify consistent.
+The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes in 425.0 seconds instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. The first dominant correctness boundary was fixed, pushed, and closed as #698 by `7ccce3dd`: C# method returns use the grammar field `returns`, and proven qualified-type references must emit the containing type range rather than only the terminal identifier. The reduced authoritative-scope regression passes, and exact bytes `5677..5693` now classify consistent.
 
 ## Context and Orientation
 
@@ -87,4 +88,4 @@ The analyzer cache schema stores `CodeUnit::identifier()` in `code_units.identif
 
 Revision note (2026-07-12): Created from the Azure PowerShell production profile before implementation.
 
-Revision note (2026-07-12): Recorded the reduced #698 correctness boundary and exact production validation so the next session can continue C# triage from proven current behavior rather than the pre-fix missing report.
+Revision note (2026-07-12): Recorded the reduced, pushed, and closed #698 correctness boundary plus exact production validation so continued C# triage starts from proven current behavior rather than the pre-fix missing report.
