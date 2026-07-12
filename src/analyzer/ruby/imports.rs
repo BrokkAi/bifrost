@@ -443,6 +443,19 @@ impl ImportAnalysisProvider for RubyAnalyzer {
     fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
     }
+
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        Some(
+            imports
+                .iter()
+                .filter_map(|import| resolve_required_file(file, import))
+                .collect(),
+        )
+    }
 }
 
 fn gemfile_declares_zeitwerk_autoloading(contents: &str) -> bool {
