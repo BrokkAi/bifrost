@@ -6320,6 +6320,18 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
+    let re_enabled_publish = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        re_enabled_publish["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["code"] == "python_unrecognized_symbol")
+            }),
+        "re-enabling the opt-in must refresh existing push diagnostics: {re_enabled_publish}"
+    );
+
     fs::write(temp_root.join("app.py"), "def run(\n    missing_value\n")
         .expect("write malformed app.py");
     server.notify_value(json!({
