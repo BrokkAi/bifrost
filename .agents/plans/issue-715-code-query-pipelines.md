@@ -1,0 +1,148 @@
+# Add typed CodeQuery pipelines and import-graph traversal
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. Maintain this document in accordance with `.agents/PLANS.md`.
+
+## Purpose / Big Picture
+
+`query_code` currently returns only syntax matches. After this work a caller can start with the same normalized syntax query and apply typed semantic steps to find the containing declaration, convert a match or declaration to its file, and walk direct project import edges in either direction. JSON and the RQL shorthand compile to the same ordered pipeline, terminal values are returned as tagged results, and every derived result carries enough provenance to explain which seed and edges produced it.
+
+The behavior is visible through the existing `query_code` MCP/CLI surface. A JSON query containing `"steps":[{"op":"file_of"},{"op":"imports_of"}]` returns directly imported workspace files, while the equivalent nested RQL expression `(imports-of (file-of ...))` returns the same ordered results. The executable documentation examples under `docs/src/content/docs/code-query-tutorials/` prove the public examples against real inline projects.
+
+## Progress
+
+- [x] (2026-07-13 10:08Z) Confirmed the clean tracked issue branch, fetched its upstream, and rebased it without changes.
+- [x] (2026-07-13 10:08Z) Inspected the existing query IR, decoder, structural executor, import-provider contracts, Python models, and documentation test harness.
+- [ ] Implement schema version 2, typed steps, canonical JSON, RQL lowering, and domain validation.
+- [ ] Implement typed row execution, exact enclosing declarations, direct import edges, deduplication, provenance, and budgets.
+- [ ] Update service schemas, CLI rendering/help, and the Python client/models.
+- [ ] Add behavior-focused integration tests and executable cookbook examples for every new step.
+- [ ] Run formatting, focused tests, Python tests, Clippy, and the full `nlp,python` feature test suite.
+- [ ] Record final evidence and complete the retrospective.
+
+## Surprises & Discoveries
+
+- Observation: The Bifrost MCP navigation tools named by the installed skills are not exposed in this Codex workspace session.
+  Evidence: the active tool catalog contains no `search_symbols`, `get_symbol_sources`, or related Bifrost tools, so code inspection uses the skill-prescribed `rg` and direct-file fallback.
+
+- Observation: `ImportAnalysisProvider::referencing_files_of` is not uniformly a direct-edge API.
+  Evidence: the Ruby provider intentionally computes transitive referencing files for usage candidate discovery. Query pipelines must instead build direct forward edges from structured import information and invert that graph for `importers-of`.
+
+## Decision Log
+
+- Decision: Name the declaration step `enclosing-decl`, not `enclosing-symbol`, `enclosing-parent`, or an AST-parent term.
+  Rationale: The public value is an indexed semantic declaration rather than an arbitrary syntax-tree ancestor.
+  Date/Author: 2026-07-13 / user and Codex
+
+- Decision: `enclosing-decl` is inclusive and returns the smallest real declaration containing the exact seed range, including the declaration itself when it is the matched node.
+  Rationale: Inclusive containment is useful for both expression and declaration seeds and avoids inventing a separate strict-parent operation.
+  Date/Author: 2026-07-13 / user and Codex
+
+- Decision: Schema version 2 keeps the top-level `match` pattern and adds an ordered `steps` array. RQL wrappers lower into that same IR.
+  Rationale: This leaves the normalized syntax language intact while making semantic traversal explicit and statically typed.
+  Date/Author: 2026-07-13 / user and Codex
+
+- Decision: Replace the result object's `matches` array with a tagged `results` array whose variants are `structural_match`, `declaration`, and `file`.
+  Rationale: A pipeline can terminate in different semantic domains, so the output must describe the actual value type rather than pretending every result is a syntax match.
+  Date/Author: 2026-07-13 / user and Codex
+
+- Decision: Include minimal seed-and-step provenance in compact and full output; full output adds richer identity and range details.
+  Rationale: Derived graph results need to remain explainable even under the default compact rendering.
+  Date/Author: 2026-07-13 / user and Codex
+
+- Decision: Import steps expose only direct, project-local file edges. Multi-hop traversal is expressed by repeating a step.
+  Rationale: Direct edges compose predictably, keep the language primitive small, and avoid Ruby's usage-specific transitive reverse semantics.
+  Date/Author: 2026-07-13 / Codex
+
+## Outcomes & Retrospective
+
+Implementation has not started. This section will be updated after each milestone with observable behavior, validation evidence, remaining gaps, and lessons learned.
+
+## Context and Orientation
+
+The query language lives in `src/analyzer/structural/query/`. `ir.rs` defines `CodeQuery` and syntax `Pattern` values, `decode.rs` validates canonical JSON, `json.rs` serializes the IR, and `sexp.rs` parses the RQL shorthand. The current schema version is 1 and a query has one root syntax pattern plus filters such as `inside`, `where`, and `languages`.
+
+`src/analyzer/structural/search.rs` executes a planned syntax query. It scans candidate files in deterministic order, produces internal pending matches, renders them into `CodeQueryMatch`, and returns `CodeQueryResult { matches, truncated, diagnostics }`. `src/analyzer/structural/planner.rs` selects source anchors and required structural capabilities. `src/searchtools_service.rs` connects decoding and execution to the public tool, and `src/mcp_extended.rs` publishes the JSON tool schema.
+
+A `CodeUnit` is Bifrost's exact indexed identity for a declaration such as a class, function, field, or module. An analyzer can find the smallest `CodeUnit` containing a byte range. It also creates synthetic file-scope units internally; those are bookkeeping containers and must not be returned by `enclosing-decl`.
+
+Language analyzers that support structured imports expose `ImportAnalysisProvider`. The provider can parse import information in bulk and resolve that information to imported files or imported `CodeUnit` values. `src/analyzer/usages/candidates.rs` demonstrates the required structured fallback sequence. Query traversal must use these structured APIs and must not scan source text or call reverse APIs whose contract is designed for transitive usage discovery.
+
+The Python package in `bifrost_searchtools/` mirrors Rust result objects. Documentation lives under `docs/src/content/docs/`; `tests/code_query_docs.rs` validates marked examples and `tests/code_query_tutorials.rs` executes tutorial cases against inline fixture projects.
+
+## Plan of Work
+
+First, extend `src/analyzer/structural/query/ir.rs` with schema version 2, `QueryStep`, and the three value domains: structural match, declaration, and file. Add `steps` to `CodeQuery`. Update `decode.rs` to require version 2, accept an optional array of at most sixteen step objects containing only `op`, and validate the domain transition at each `steps[i]`. Update `json.rs` and `sexp.rs` so snake-case JSON operations and kebab-case RQL wrappers produce identical ordered IR. The legal transitions are `enclosing_decl` from a structural match, `file_of` from a structural match or declaration, and either import operation from a file.
+
+Second, refactor `src/analyzer/structural/search.rs` around an internal typed row that owns an exact syntax seed, declaration `CodeUnit`, or `ProjectFile` plus bounded provenance traces. The syntax scan supplies seed rows. Each step consumes and produces only its declared domain, deduplicates by exact identity while preserving first-discovery order, and merges at most sixteen deterministic provenance traces. Apply the public `limit` only after the last step. Count seed rows and edge expansions against a 50,000-row pipeline budget; budget exhaustion makes the top-level result truncated and adds one diagnostic.
+
+For `enclosing-decl`, ask the analyzer for the smallest declaration containing the seed's exact byte range. Accept the result when it is non-synthetic and not `FileScope`; otherwise emit no row. For `file-of`, retain the exact `ProjectFile` from the syntax seed or declaration source. For imports, build direct forward project-file edges using bulk `ImportInfo`, `imported_files_from_infos`, and the imported-code-unit fallback already used by usage candidate selection. Sort and deduplicate each adjacency list by normalized workspace-relative path. Build reverse edges by inverting those forward edges instead of calling `referencing_files_of`. Group unsupported-provider diagnostics by language and step while continuing supported rows; unresolved external packages are normal omissions.
+
+Third, replace `CodeQueryResult.matches` with `results` and add tagged serialized variants. A structural match retains the existing fields plus `result_type: "structural_match"`. A declaration includes `result_type: "declaration"`, exact stable identity, fully qualified name, declaration kind, language, path, range, and optional signature. A file includes `result_type: "file"`, path, and language. Derived results include `provenance`, an array of traces containing a minimal seed reference and ordered `{ op, result }` step references, plus `provenance_truncated`. Compact traces contain identifying path/name/location data; full traces add stable IDs and precise ranges. Top-level `truncated` describes an incomplete terminal set, while provenance loss is reported per result.
+
+Update the public MCP schema, CLI/RQL help and rendering, `bifrost_searchtools/client.py`, `bifrost_searchtools/models.py`, package exports, and Python README. The Python client accepts `steps: list[dict] | None`, parses the three tagged result dataclasses, exposes `CodeQueryResult.results`, and renders structural matches, declarations, and files without assuming every item has source text.
+
+Finally, add inline-project integration coverage and update every schema-version marker and result example that is part of the public v1 surface. Add executable cookbook examples for `enclosing-decl`, `file-of`, `imports-of`, and `importers-of`, including repeated traversal. Keep the documentation concise but make each example assert a real result through the existing tutorial harness.
+
+## Concrete Steps
+
+Work from `/Users/dave/.codex/worktrees/b86e/bifrost` on the existing `715-add-typed-codequery-pipelines-and-import-graph-traversal` branch.
+
+Implement and validate the query IR milestone with:
+
+    cargo test analyzer::structural::query
+
+Implement the executor and run its focused unit and integration tests. Discover the exact new integration-test target after adding the file with:
+
+    cargo test --test <new-query-pipeline-test-target> --features nlp,python
+
+Validate documentation examples and Python models with:
+
+    cargo test --test code_query_docs --test code_query_tutorials --features nlp,python
+    python -m unittest discover -s bifrost_searchtools/tests
+
+Run repository gates from the same directory:
+
+    cargo fmt
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --features nlp,python
+
+Update this ExecPlan after each milestone and checkpoint the milestone by staging only the files changed for issue 715.
+
+## Validation and Acceptance
+
+A canonical version-2 JSON query without steps must still return syntax results, now tagged `structural_match`. A query matching a call and applying `enclosing_decl` must return its smallest real containing declaration, and matching that declaration directly must return the declaration itself. No result may expose a synthetic file scope.
+
+Applying `file_of` to many matches in one file must return one file result with deterministic merged provenance. Applying `imports_of` must return only directly imported workspace files. Applying `importers_of` to C in a Ruby A-to-B-to-C fixture must return B after one hop and A after a repeated second hop; it must not jump directly to A. Repeated traversal across a cycle must terminate and return stable ordering.
+
+Invalid pipelines must fail before execution with an error path naming the exact `steps[i]`. Unsupported language import providers must produce an aggregated diagnostic without suppressing results from supported languages. A terminal limit must be applied after deduplication, and exhausting the 50,000-row pipeline budget must set `truncated` with a diagnostic. More than sixteen provenance paths must preserve the first sixteen in deterministic order and set `provenance_truncated` on that result.
+
+The MCP schema, Rust JSON, RQL, Python client, rendered text, and executable documentation must agree on schema version 2 and the tagged `results` shape. The focused tests, Clippy with warnings denied, and the full feature test suite must pass.
+
+## Idempotence and Recovery
+
+All source edits and tests are safe to repeat. Import graph construction is read-only and scoped to the analyzer's indexed workspace. If a milestone fails, inspect the focused test before advancing; do not mask missing structured analysis with source-text fallbacks. Checkpoint commits contain only issue-715 files, so a failed later milestone can be diagnosed without disturbing unrelated work.
+
+## Artifacts and Notes
+
+The canonical operation names are:
+
+    JSON: enclosing_decl, file_of, imports_of, importers_of
+    RQL:  enclosing-decl, file-of, imports-of, importers-of
+
+The result domains and legal transitions are:
+
+    structural_match --enclosing_decl--> declaration
+    structural_match --file_of---------> file
+    declaration      --file_of---------> file
+    file             --imports_of------> file
+    file             --importers_of----> file
+
+Revision note (2026-07-13): Created the initial self-contained plan after confirming the issue branch and inspecting the current query, import-analysis, client, and documentation architecture.
+
+## Interfaces and Dependencies
+
+The query IR must expose a serializable `QueryStep` enum and a `Vec<QueryStep>` on `CodeQuery`. The decoder owns static domain validation; execution must therefore never receive an ill-typed chain.
+
+The executor must expose one `CodeQueryResult` containing `Vec<CodeQueryResultItem>`, where the item is a tagged enum or equivalent serialization-safe Rust representation. Internal pipeline values retain `CodeUnit` and `ProjectFile` rather than public strings. Provenance references use the same tagged domains but a bounded compact representation to avoid recursive full result objects.
+
+No new third-party dependency is required. Use existing analyzer APIs, `ImportAnalysisProvider`, normalized project paths, serde/serde_json, and the current structural fact providers. Preserve cross-platform path handling through `Path`, `PathBuf`, and `ProjectFile`; convert to stable slash-separated workspace-relative strings only at the public serialization boundary.
