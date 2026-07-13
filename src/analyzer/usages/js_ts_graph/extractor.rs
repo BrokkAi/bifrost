@@ -265,12 +265,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // Skip import statements outright — bindings declared there are not usages.
     if matches!(
         kind,
-        "import_statement"
-            | "import_clause"
-            | "import_specifier"
-            | "namespace_import"
-            | "export_clause"
-            | "export_specifier"
+        "import_statement" | "import_clause" | "import_specifier" | "namespace_import"
     ) {
         if kind == "import_statement" {
             handle_import_statement(node, ctx);
@@ -279,6 +274,13 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.scope_stack.pop();
             ctx.binding_engine.exit_scope();
         }
+        return;
+    }
+    // An export specifier's `name` is a value-side reference, whereas its optional
+    // `alias` is a newly declared export name. Handle the former directly rather
+    // than recursively visiting both identifiers.
+    if kind == "export_specifier" {
+        handle_export_specifier(node, ctx);
         return;
     }
     if kind == "expression_statement" && is_commonjs_export_statement(node, ctx.source) {
@@ -683,6 +685,21 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     record_hit(node, ctx);
+}
+
+fn handle_export_specifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let exported_name = node.child_by_field_name("alias").unwrap_or(name);
+    let exported_name = slice(exported_name, ctx.source);
+    if ctx.binds_target(slice(name, ctx.source))
+        || ctx
+            .seeds
+            .contains(&(ctx.file.clone(), exported_name.to_string()))
+    {
+        record_hit(name, ctx);
+    }
 }
 
 fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
