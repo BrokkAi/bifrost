@@ -1004,7 +1004,11 @@ fn ts_local_barrel_reexport_is_followed() {
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
     );
 
-    assert_eq!(1, hits.len());
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected the barrel and consumer references: {hits:?}"
+    );
 }
 
 #[test]
@@ -1034,7 +1038,78 @@ fn ts_chained_local_barrel_reexport_is_followed() {
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
     );
 
-    assert_eq!(1, hits.len());
+    assert_eq!(
+        3,
+        hits.len(),
+        "expected both barrel references and the consumer reference: {hits:?}"
+    );
+}
+
+#[test]
+fn ts_export_specifier_value_references_are_reported_without_aliases() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("source.ts", "export class SuccessCorpus {}\n")
+            .file(
+                "local-exports.ts",
+                r#"
+import { SuccessCorpus } from "./source";
+
+export { SuccessCorpus };
+export { type SuccessCorpus };
+export type { SuccessCorpus as TypeSuccessCorpus };
+export { SuccessCorpus as default };
+export { SuccessCorpus as RenamedSuccessCorpus };
+"#,
+            )
+            .file(
+                "cross-file-export.ts",
+                "export type { SuccessCorpus as CrossFileSuccessCorpus } from \"./source\";\n",
+            )
+            .file(
+                "unrelated.ts",
+                r#"
+class UnrelatedSuccessCorpus {}
+export { UnrelatedSuccessCorpus as SuccessCorpus };
+"#,
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("source.ts"), |cu| {
+        cu.identifier() == "SuccessCorpus" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(6, hits.len(), "expected one hit per export value: {hits:?}");
+    assert!(
+        hits.iter()
+            .filter(|hit| hit.file == project.file("local-exports.ts"))
+            .count()
+            == 5,
+        "local named, type, default, and renamed export values should resolve: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("cross-file-export.ts")),
+        "cross-file type re-export should resolve to the source declaration: {hits:?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            let source = hit.file.read_to_string().expect("read hit source");
+            source
+                .get(hit.start_offset..hit.end_offset)
+                .is_some_and(|text| text == "SuccessCorpus")
+        }),
+        "only export-specifier value names, never aliases, should be reported: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("unrelated.ts")),
+        "an unrelated export alias must not count as a SuccessCorpus reference: {hits:?}"
+    );
 }
 
 #[test]
