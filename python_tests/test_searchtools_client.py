@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bifrost_searchtools import (
+    CodeQueryFile,
+    CodeQueryMatch,
     CodeQueryResult,
     SearchToolsClient,
     SearchToolsError,
@@ -154,17 +156,18 @@ class SearchToolsClientTest(unittest.TestCase):
                 {"kind": "class", "name": "A"},
                 where=[absolute_where],
                 languages=["java"],
-                schema_version=1,
+                schema_version=2,
             )
 
         self.assertIsInstance(result, CodeQueryResult)
         self.assertEqual(result.count, 1)
-        self.assertEqual(result.matches[0].path, "A.java")
-        self.assertEqual(result.matches[0].kind, "class")
-        self.assertEqual(result.matches[0].language, "java")
-        self.assertEqual(result.matches[0].text, "public class A {…")
-        self.assertIsNone(result.matches[0].id)
-        self.assertIsNone(result.matches[0].node_range)
+        self.assertIsInstance(result.results[0], CodeQueryMatch)
+        self.assertEqual(result.results[0].path, "A.java")
+        self.assertEqual(result.results[0].kind, "class")
+        self.assertEqual(result.results[0].language, "java")
+        self.assertEqual(result.results[0].text, "public class A {…")
+        self.assertIsNone(result.results[0].id)
+        self.assertIsNone(result.results[0].node_range)
         self.assertEqual(result.diagnostics, [])
 
         with SearchToolsClient(root=self.fixture_root) as client:
@@ -175,21 +178,33 @@ class SearchToolsClientTest(unittest.TestCase):
                 result_detail="full",
             )
 
-        self.assertIsNotNone(detailed.matches[0].id)
-        self.assertIsNotNone(detailed.matches[0].node_range)
+        self.assertIsNotNone(detailed.results[0].id)
+        self.assertIsNotNone(detailed.results[0].node_range)
         self.assertGreater(
             (
-                detailed.matches[0].node_range.end_line,
-                detailed.matches[0].node_range.end_column,
+                detailed.results[0].node_range.end_line,
+                detailed.results[0].node_range.end_column,
             ),
             (
-                detailed.matches[0].node_range.start_line,
-                detailed.matches[0].node_range.start_column,
+                detailed.results[0].node_range.start_line,
+                detailed.results[0].node_range.start_column,
             ),
         )
-        self.assertEqual(detailed.matches[0].captures[0].kind, "class")
-        self.assertIsNotNone(detailed.matches[0].captures[0].range)
-        self.assertGreaterEqual(detailed.matches[0].captures[0].range.end_line, detailed.matches[0].captures[0].start_line)
+        self.assertEqual(detailed.results[0].captures[0].kind, "class")
+        self.assertIsNotNone(detailed.results[0].captures[0].range)
+        self.assertGreaterEqual(detailed.results[0].captures[0].range.end_line, detailed.results[0].captures[0].start_line)
+
+        with SearchToolsClient(root=self.fixture_root) as client:
+            files = client.query_code(
+                {"kind": "class", "name": "A"},
+                where=[absolute_where],
+                languages=["java"],
+                steps=[{"op": "file_of"}],
+            )
+
+        self.assertIsInstance(files.results[0], CodeQueryFile)
+        self.assertEqual(files.results[0].path, "A.java")
+        self.assertEqual(len(files.results[0].provenance), 1)
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

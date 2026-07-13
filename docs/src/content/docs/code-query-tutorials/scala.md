@@ -3,7 +3,7 @@ title: Scala
 description: Query Scala named and block arguments, annotations, imports, and assignments with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 Scala has several call shapes that look like assignments in source. The normalized adapter keeps named arguments in `kwargs`, while real `val`/`var` declarations remain `assignment` facts. It also exposes block arguments as structured descendants.
 
@@ -52,7 +52,7 @@ Use `kwargs` for Scala named arguments. A block argument can be queried with `ha
 <!-- code-query-case:named-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "captures": [
         {"name": "value", "start_line": 13, "text": "\"named\""}
@@ -61,6 +61,7 @@ Use `kwargs` for Scala named arguments. A block argument can be queried with `ha
       "end_line": 13,
       "kind": "call",
       "language": "scala",
+      "result_type": "structural_match",
       "path": "scala/App.scala",
       "start_line": 13,
       "text": "auditNamed(code = \"named\")"
@@ -85,12 +86,13 @@ Use `kwargs` for Scala named arguments. A block argument can be queried with `ha
 <!-- code-query-case:block-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "app.Service.run",
       "end_line": 12,
       "kind": "call",
       "language": "scala",
+      "result_type": "structural_match",
       "path": "scala/App.scala",
       "start_line": 12,
       "text": "ListBuffer(1).foreach { value => audit(value.toString) }"
@@ -119,7 +121,7 @@ The assignment query finds the real `val password` declaration. It must not mist
 <!-- code-query-case:assignment:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "captures": [
         {"name": "value", "start_line": 10, "text": "\"hunter2\""}
@@ -128,6 +130,7 @@ The assignment query finds the real `val password` declaration. It must not mist
       "end_line": 10,
       "kind": "assignment",
       "language": "scala",
+      "result_type": "structural_match",
       "path": "scala/App.scala",
       "start_line": 10,
       "text": "val password = \"hunter2\""
@@ -150,12 +153,13 @@ The assignment query finds the real `val password` declaration. It must not mist
 <!-- code-query-case:annotation:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "app.Service",
       "end_line": 17,
       "kind": "class",
       "language": "scala",
+      "result_type": "structural_match",
       "path": "scala/App.scala",
       "start_line": 6,
       "text": "@deprecated(\"use Service2\", \"1.0\")…"
@@ -182,11 +186,12 @@ Grouped imports expose their imported selector or alias through `module`; path p
 <!-- code-query-case:import:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "end_line": 4,
       "kind": "import",
       "language": "scala",
+      "result_type": "structural_match",
       "path": "scala/App.scala",
       "start_line": 4,
       "text": "import scala.collection.mutable.{ListBuffer, Map as MutableMap}"

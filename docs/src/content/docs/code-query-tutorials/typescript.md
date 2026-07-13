@@ -3,7 +3,7 @@ title: TypeScript
 description: Query TypeScript declarations, callable refinements, decorators, and TSX with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 TypeScript shares JavaScript's structural adapter and adds interface, enum, abstract-class, type-alias, type-identifier, decorator, and TSX grammar shapes.
 
@@ -64,8 +64,9 @@ A type alias is a normalized `declaration`; interfaces, enums, and abstract clas
 <!-- code-query-case:type-alias:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "typescript/service.ts",
       "language": "typescript",
       "kind": "declaration",
@@ -98,10 +99,10 @@ A type alias is a normalized `declaration`; interfaces, enums, and abstract clas
 <!-- code-query-case:class-like:expected -->
 ```json
 {
-  "matches": [
-    {"path":"typescript/service.ts","language":"typescript","kind":"class","start_line":5,"end_line":7,"text":"interface User {…","enclosing_symbol":"User"},
-    {"path":"typescript/service.ts","language":"typescript","kind":"class","start_line":9,"end_line":11,"text":"enum State {…","enclosing_symbol":"State"},
-    {"path":"typescript/service.ts","language":"typescript","kind":"class","start_line":13,"end_line":13,"text":"abstract class BaseService {}","enclosing_symbol":"BaseService"}
+  "results": [
+    {"result_type":"structural_match","path":"typescript/service.ts","language":"typescript","kind":"class","start_line":5,"end_line":7,"text":"interface User {…","enclosing_symbol":"User"},
+    {"result_type":"structural_match","path":"typescript/service.ts","language":"typescript","kind":"class","start_line":9,"end_line":11,"text":"enum State {…","enclosing_symbol":"State"},
+    {"result_type":"structural_match","path":"typescript/service.ts","language":"typescript","kind":"class","start_line":13,"end_line":13,"text":"abstract class BaseService {}","enclosing_symbol":"BaseService"}
   ],
   "truncated": false
 }
@@ -136,8 +137,9 @@ A type alias is a normalized `declaration`; interfaces, enums, and abstract clas
 <!-- code-query-case:named-save:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "typescript/service.ts",
       "language": "typescript",
       "kind": "method",
@@ -182,8 +184,9 @@ The TypeScript language filter includes `.tsx`; `where` narrows this call to the
 <!-- code-query-case:tsx-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "typescript/view.tsx",
       "language": "typescript",
       "kind": "call",
@@ -200,4 +203,4 @@ The TypeScript language filter includes `.tsx`; `where` narrows this call to the
 
 ## Precision Boundary
 
-Interfaces, enums, and abstract classes intentionally share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; version 1 has no separate public `interface` kind.
+Interfaces, enums, and abstract classes intentionally share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; version 2 has no separate public `interface` kind.

@@ -187,19 +187,19 @@ class SearchToolsClient:
         not_inside: dict[str, Any] | None = None,
         where: list[str] | None = None,
         languages: list[str] | None = None,
+        steps: list[dict[str, Any]] | None = None,
         limit: int | None = None,
         result_detail: str | None = None,
         schema_version: int | None = None,
     ) -> CodeQueryResult:
         """Query normalized code structure across supported languages.
 
-        Version 1 evaluates normalized syntactic structure. It does not yet
-        traverse call graphs, control flow, or data flow. ``pattern`` is
-        sent as the tool's ``match`` object. ``where`` accepts project-relative
-        globs or absolute in-workspace paths/globs.
-        ``result_detail="full"`` includes line/column ranges and stable match
-        ids for follow-up tooling; the default compact mode is optimized
-        for small LLM contexts.
+        Version 2 starts with normalized syntactic structure and optionally
+        applies typed semantic ``steps`` such as ``enclosing_decl``, ``file_of``,
+        ``imports_of``, and ``importers_of``. ``pattern`` is sent as the tool's
+        ``match`` object. ``where`` accepts project-relative globs or absolute
+        in-workspace paths/globs. ``result_detail="full"`` adds stable IDs and
+        precise ranges; compact mode retains minimal pipeline provenance.
         """
         arguments: dict[str, Any] = {"match": pattern}
         if inside is not None:
@@ -210,6 +210,8 @@ class SearchToolsClient:
             arguments["where"] = list(where)
         if languages is not None:
             arguments["languages"] = list(languages)
+        if steps is not None:
+            arguments["steps"] = list(steps)
         if limit is not None:
             arguments["limit"] = limit
         if result_detail is not None:

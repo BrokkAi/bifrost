@@ -14,8 +14,8 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 - [x] (2026-07-13 10:08Z) Inspected the existing query IR, decoder, structural executor, import-provider contracts, Python models, and documentation test harness.
 - [x] (2026-07-13 10:42Z) Implemented schema version 2, typed steps, canonical JSON, RQL lowering, and path-aware domain validation.
 - [x] (2026-07-13 10:42Z) Implemented typed row execution, exact enclosing declarations, direct import edges, deduplication, provenance, and budgets.
-- [ ] Update service schemas, CLI rendering/help, and the Python client/models.
-- [ ] Add behavior-focused integration tests and executable cookbook examples for every new step (completed: pipeline integration tests; remaining: executable public cookbook fixtures and examples).
+- [x] (2026-07-13 11:36Z) Updated the MCP schema, CLI rendering/help, and Python client/models for typed `results` and pipeline `steps`.
+- [x] (2026-07-13 11:36Z) Added behavior-focused integration tests and executable cookbook examples for every new step, including repeated direct import traversal.
 - [ ] Run formatting, focused tests, Python tests, Clippy, and the full `nlp,python` feature test suite.
 - [ ] Record final evidence and complete the retrospective.
 
@@ -48,6 +48,10 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
   Rationale: A pipeline can terminate in different semantic domains, so the output must describe the actual value type rather than pretending every result is a syntax match.
   Date/Author: 2026-07-13 / user and Codex
 
+- Decision: Remove the legacy Rust `matches` storage as well as its serialized form; existing Rust assertions use a typed `structural_matches()` view over `results`.
+  Rationale: Schema v2 is an intentional clean break, and maintaining two result collections would create two sources of truth.
+  Date/Author: 2026-07-13 / Codex
+
 - Decision: Include minimal seed-and-step provenance in compact and full output; full output adds richer identity and range details.
   Rationale: Derived graph results need to remain explainable even under the default compact rendering.
   Date/Author: 2026-07-13 / user and Codex
@@ -58,11 +62,11 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 ## Outcomes & Retrospective
 
-The query IR and executor milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. Existing cross-language structural search and planner tests remain green. Public schemas, clients, and documentation still need migration before the feature is complete.
+The query IR, executor, public-surface, and cookbook milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, full-detail stable identities, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. The MCP schema, CLI and saved-query mode, Python models/client, and executable tutorial examples now agree on tagged `results`. The focused Rust matrix passes 114 tests across pipeline, documentation, CLI, cross-language, Python-structural, and planner targets. Repository-wide Python, Clippy, and full-feature validation remain before completion.
 
 ## Context and Orientation
 
-The query language lives in `src/analyzer/structural/query/`. `ir.rs` defines `CodeQuery` and syntax `Pattern` values, `decode.rs` validates canonical JSON, `json.rs` serializes the IR, and `sexp.rs` parses the RQL shorthand. The current schema version is 1 and a query has one root syntax pattern plus filters such as `inside`, `where`, and `languages`.
+The query language lives in `src/analyzer/structural/query/`. `ir.rs` defines `CodeQuery` and syntax `Pattern` values, `decode.rs` validates canonical JSON, `json.rs` serializes the IR, and `sexp.rs` parses the RQL shorthand. Before this work the schema version was 1 and a query had one root syntax pattern plus filters such as `inside`, `where`, and `languages`.
 
 `src/analyzer/structural/search.rs` executes a planned syntax query. It scans candidate files in deterministic order, produces internal pending matches, renders them into `CodeQueryMatch`, and returns `CodeQueryResult { matches, truncated, diagnostics }`. `src/analyzer/structural/planner.rs` selects source anchors and required structural capabilities. `src/searchtools_service.rs` connects decoding and execution to the public tool, and `src/mcp_extended.rs` publishes the JSON tool schema.
 
@@ -143,6 +147,8 @@ The result domains and legal transitions are:
 Revision note (2026-07-13): Created the initial self-contained plan after confirming the issue branch and inspecting the current query, import-analysis, client, and documentation architecture.
 
 Revision note (2026-07-13 10:42Z): Marked the typed IR and executor milestones complete, recorded the indexed-declaration boundary discovered by testing, and captured the passing focused integration evidence.
+
+Revision note (2026-07-13 11:36Z): Marked the public API and executable cookbook milestones complete, recorded the clean removal of the legacy Rust `matches` collection, and captured the passing 114-test focused Rust matrix.
 
 ## Interfaces and Dependencies
 

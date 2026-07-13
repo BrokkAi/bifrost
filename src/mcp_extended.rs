@@ -1,7 +1,8 @@
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
     MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
-    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    SCHEMA_VERSION,
 };
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
@@ -47,7 +48,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     vec![
         tool_descriptor(
             "query_code",
-            "Query code structure across languages using normalized node kinds instead of grammar-specific node names. Version 1 is syntactic structural matching: it does not traverse call graphs, resolve types or aliases, or perform control-flow or data-flow analysis. It finds shapes like calls, assignments, decorated declarations, or imports, with named captures and enclosing symbols. Constructor calls are included where adapters support them, positional args match as an ordered subsequence, and unsupported roles/kinds are reported in diagnostics. Use the mode-appropriate scan_usages_by_reference or scan_usages_by_location tool when you already know the exact declaration. Minimal query: {\"match\":{\"kind\":\"call\",\"callee\":{\"name\":\"eval\"}}}. Guide: https://brokkai.github.io/bifrost/code-querying/",
+            "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports enclosing_decl, file_of, imports_of, and importers_of; import steps traverse direct project-local file edges and can be repeated for multiple hops. Terminal values are tagged structural_match, declaration, or file results with provenance. It does not yet traverse call graphs, resolve arbitrary types or aliases, or perform control-flow or data-flow analysis. Minimal query: {\"match\":{\"kind\":\"call\",\"callee\":{\"name\":\"eval\"}}}. Pipeline example: {\"match\":{\"kind\":\"call\"},\"steps\":[{\"op\":\"file_of\"},{\"op\":\"imports_of\"}]}. Guide: https://brokkai.github.io/bifrost/code-querying/",
             json!({
                 "type": "object",
                 "properties": {
@@ -75,12 +76,28 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Optional language filter (e.g. \"python\"). Languages without structural support are reported in diagnostics."
                     },
+                    "steps": {
+                        "type": "array",
+                        "maxItems": MAX_QUERY_STEPS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["enclosing_decl", "file_of", "imports_of", "importers_of"]
+                                }
+                            },
+                            "required": ["op"],
+                            "additionalProperties": false
+                        },
+                        "description": "Ordered typed transformations applied after structural matching. enclosing_decl consumes a structural match; file_of consumes a structural match or declaration; import steps consume files."
+                    },
                     "limit": {
                         "type": "integer",
                         "default": DEFAULT_LIMIT,
                         "minimum": 1,
                         "maximum": MAX_LIMIT,
-                        "description": "Maximum number of matches to return."
+                        "description": "Maximum number of terminal results to return after pipeline deduplication."
                     },
                     "result_detail": {
                         "type": "string",
@@ -92,7 +109,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "type": "integer",
                         "default": SCHEMA_VERSION,
                         "enum": [SCHEMA_VERSION],
-                        "description": "Optional query schema version. Omit for v1; non-v1 versions are rejected so callers do not accidentally rely on an incompatible query shape."
+                        "description": "Optional query schema version. Omit for v2; other versions are rejected so callers do not accidentally rely on an incompatible query shape."
                     },
                     "query_file": {
                         "type": "string",
@@ -113,6 +130,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                                 { "required": ["match"] },
                                 { "required": ["inside"] },
                                 { "required": ["not_inside"] },
+                                { "required": ["steps"] },
                                 { "required": ["limit"] },
                                 { "required": ["result_detail"] },
                                 { "required": ["schema_version"] }
@@ -359,4 +377,27 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             }),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_code_schema_exposes_typed_pipeline_steps() {
+        let query_code = extended_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "query_code")
+            .expect("query_code descriptor");
+        let steps = &query_code["inputSchema"]["properties"]["steps"];
+        assert_eq!(steps["maxItems"], MAX_QUERY_STEPS);
+        assert_eq!(
+            steps["items"]["properties"]["op"]["enum"],
+            json!(["enclosing_decl", "file_of", "imports_of", "importers_of"])
+        );
+        assert_eq!(
+            query_code["inputSchema"]["properties"]["schema_version"]["enum"],
+            json!([2])
+        );
+    }
 }

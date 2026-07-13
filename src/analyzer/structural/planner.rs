@@ -6,7 +6,7 @@
 //! never contribute to pruning, because "file lacks X" makes a negation
 //! *easier* to satisfy, not harder.
 //!
-//! v1 pruning is literal-anchor based: every exact `name` predicate (and
+//! Seed-query pruning is literal-anchor based: every exact `name` predicate (and
 //! every `kwargs` keyword) reachable through conjunctive positive pattern
 //! positions matches a span of the file's own source text, so a file whose
 //! source does not contain one of those strings cannot match. Anchors are
@@ -54,7 +54,7 @@ impl QueryPlan {
 
 /// Source-level candidate index for a single planned query.
 ///
-/// v1 indexes only the query's required literal anchors and checks them against
+/// The index uses only the query's required literal anchors and checks them against
 /// each file's retained source text. Keeping this behind a named index boundary
 /// lets richer candidate indexes replace the implementation without changing
 /// search execution.

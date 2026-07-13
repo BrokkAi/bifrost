@@ -3,7 +3,7 @@ title: PHP
 description: Query PHP named arguments, attributes, imports, and nullsafe calls with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 PHP exposes instance, static, nullsafe, and object-creation calls; named arguments through `kwargs`; attributes through `decorators`; and namespace imports separately from trait composition.
 
@@ -57,7 +57,7 @@ The named-argument query uses `kwargs` to distinguish `audit_named(code: $code)`
 <!-- code-query-case:named-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "captures": [
         {"name": "value", "start_line": 14, "text": "$code"}
@@ -66,6 +66,7 @@ The named-argument query uses `kwargs` to distinguish `audit_named(code: $code)`
       "end_line": 14,
       "kind": "call",
       "language": "php",
+      "result_type": "structural_match",
       "path": "php/app.php",
       "start_line": 14,
       "text": "audit_named(code: $code)"
@@ -88,12 +89,13 @@ The named-argument query uses `kwargs` to distinguish `audit_named(code: $code)`
 <!-- code-query-case:static-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "App.Service.run",
       "end_line": 15,
       "kind": "call",
       "language": "php",
+      "result_type": "structural_match",
       "path": "php/app.php",
       "start_line": 15,
       "text": "Formatter::format($code)"
@@ -120,12 +122,13 @@ PHP attributes are normalized as decorators. Namespace `use` declarations are im
 <!-- code-query-case:attribute:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "App.Service",
       "end_line": 18,
       "kind": "class",
       "language": "php",
+      "result_type": "structural_match",
       "path": "php/app.php",
       "start_line": 7,
       "text": "#[Route('/run')]…"
@@ -148,11 +151,12 @@ PHP attributes are normalized as decorators. Namespace `use` declarations are im
 <!-- code-query-case:import:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "end_line": 5,
       "kind": "import",
       "language": "php",
+      "result_type": "structural_match",
       "path": "php/app.php",
       "start_line": 5,
       "text": "use App\\Support\\{Logger, Writer as WriterAlias};"
@@ -175,7 +179,7 @@ PHP attributes are normalized as decorators. Namespace `use` declarations are im
 <!-- code-query-case:trait-not-import:expected -->
 ```json
 {
-  "matches": [],
+  "results": [],
   "truncated": false
 }
 ```

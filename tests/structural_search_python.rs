@@ -61,8 +61,12 @@ fn finds_eval_calls_with_argument_capture() {
         }
     }));
 
-    assert_eq!(output.matches.len(), 2, "expected both eval call sites");
-    let first = &output.matches[0];
+    assert_eq!(
+        output.structural_matches().len(),
+        2,
+        "expected both eval call sites"
+    );
+    let first = &output.structural_matches()[0];
     assert_eq!(first.path, "src/app.py");
     assert_eq!(first.kind, "call");
     assert_eq!(first.text, "eval(code)");
@@ -77,7 +81,7 @@ fn finds_eval_calls_with_argument_capture() {
         Some("src.app.handle_request")
     );
 
-    let second = &output.matches[1];
+    let second = &output.structural_matches()[1];
     assert_eq!(second.text, "eval(cmd)");
     assert_eq!(
         second.enclosing_symbol.as_deref(),
@@ -97,7 +101,7 @@ fn full_result_detail_includes_stable_ranges_and_capture_kind() {
         "limit": 1
     }));
 
-    let first = &output.matches[0];
+    let first = &output.structural_matches()[0];
     let id = first.id.as_deref().expect("full detail match id");
     assert!(id.contains("src/app.py:call:"), "{id}");
     let range = first.node_range.expect("full detail node range");
@@ -140,11 +144,11 @@ def run(x, y):
     .expect("query should parse");
     let output = execute(workspace.analyzer(), &query);
 
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].text, "pair(x, x)");
-    assert_eq!(output.matches[0].captures.len(), 2);
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(output.structural_matches()[0].text, "pair(x, x)");
+    assert_eq!(output.structural_matches()[0].captures.len(), 2);
     assert!(
-        output.matches[0]
+        output.structural_matches()[0]
             .captures
             .iter()
             .all(|capture| capture.name == "same" && capture.text == "x")
@@ -162,8 +166,11 @@ fn receiver_and_kwargs_narrow_call_matches() {
         }
     }));
 
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].text, "subprocess.run(cmd, shell=True)");
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(
+        output.structural_matches()[0].text,
+        "subprocess.run(cmd, shell=True)"
+    );
 
     // Same query but requiring a string-literal shell value: no match.
     let output = run_query(json!({
@@ -173,7 +180,7 @@ fn receiver_and_kwargs_narrow_call_matches() {
             "kwargs": { "shell": { "kind": "string_literal" } }
         }
     }));
-    assert!(output.matches.is_empty());
+    assert!(output.structural_matches().is_empty());
 }
 
 #[test]
@@ -182,9 +189,11 @@ fn containment_and_negation_scope_matches() {
         "match": { "kind": "call", "callee": { "name": "eval" } },
         "inside": { "kind": "class", "name": { "regex": ".*Controller$" } }
     }));
-    assert_eq!(inside_class.matches.len(), 1);
+    assert_eq!(inside_class.structural_matches().len(), 1);
     assert_eq!(
-        inside_class.matches[0].enclosing_symbol.as_deref(),
+        inside_class.structural_matches()[0]
+            .enclosing_symbol
+            .as_deref(),
         Some("src.app.Controller.execute_action")
     );
 
@@ -192,9 +201,11 @@ fn containment_and_negation_scope_matches() {
         "match": { "kind": "call", "callee": { "name": "eval" } },
         "not_inside": { "kind": "class" }
     }));
-    assert_eq!(outside_class.matches.len(), 1);
+    assert_eq!(outside_class.structural_matches().len(), 1);
     assert_eq!(
-        outside_class.matches[0].enclosing_symbol.as_deref(),
+        outside_class.structural_matches()[0]
+            .enclosing_symbol
+            .as_deref(),
         Some("src.app.handle_request")
     );
 }
@@ -208,22 +219,32 @@ fn assignment_of_string_literal_and_kind_hierarchy() {
             "right": { "kind": "string_literal", "capture": "value" }
         }
     }));
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].text, r#"password = "hunter2""#);
-    assert_eq!(output.matches[0].captures[0].text, r#""hunter2""#);
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(
+        output.structural_matches()[0].text,
+        r#"password = "hunter2""#
+    );
+    assert_eq!(
+        output.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
 
     // Subtype-aware: the broad `literal` kind matches both the string and
     // the numeric assignment right-hand sides.
     let broad = run_query(json!({
         "match": { "kind": "assignment", "right": { "kind": "literal" } }
     }));
-    assert_eq!(broad.matches.len(), 3, "hunter2, retries, and data");
+    assert_eq!(
+        broad.structural_matches().len(),
+        3,
+        "hunter2, retries, and data"
+    );
 
     // Kind unions: string OR numeric literal on the right, spelled out.
     let union = run_query(json!({
         "match": { "kind": "assignment", "right": { "kind": ["string_literal", "numeric_literal"] } }
     }));
-    assert_eq!(union.matches.len(), 3);
+    assert_eq!(union.structural_matches().len(), 3);
 
     // Exclusion narrows the broad kind: literal-but-not-string leaves only
     // the numeric assignment.
@@ -233,8 +254,8 @@ fn assignment_of_string_literal_and_kind_hierarchy() {
             "right": { "kind": "literal", "not_kind": "string_literal" }
         }
     }));
-    assert_eq!(subtractive.matches.len(), 1);
-    assert_eq!(subtractive.matches[0].text, "retries = 3");
+    assert_eq!(subtractive.structural_matches().len(), 1);
+    assert_eq!(subtractive.structural_matches()[0].text, "retries = 3");
 }
 
 #[test]
@@ -242,9 +263,11 @@ fn decorated_functions_and_method_kind_refinement() {
     let decorated = run_query(json!({
         "match": { "kind": "function", "decorators": [{ "name": "route" }] }
     }));
-    assert_eq!(decorated.matches.len(), 1);
+    assert_eq!(decorated.structural_matches().len(), 1);
     assert_eq!(
-        decorated.matches[0].enclosing_symbol.as_deref(),
+        decorated.structural_matches()[0]
+            .enclosing_symbol
+            .as_deref(),
         Some("src.app.handle_request")
     );
 
@@ -256,11 +279,15 @@ fn decorated_functions_and_method_kind_refinement() {
         "method is a Python refined kind and should not warn: {:?}",
         methods.diagnostics
     );
-    assert_eq!(methods.matches.len(), 2, "execute_action and safe");
+    assert_eq!(
+        methods.structural_matches().len(),
+        2,
+        "execute_action and safe"
+    );
 
     let callables = run_query(json!({ "match": { "kind": "callable" } }));
     assert_eq!(
-        callables.matches.len(),
+        callables.structural_matches().len(),
         5,
         "2 functions + 2 methods + 1 lambda"
     );
@@ -270,10 +297,14 @@ fn decorated_functions_and_method_kind_refinement() {
     let named = run_query(json!({
         "match": { "kind": "callable", "not_kind": ["constructor", "lambda"] }
     }));
-    assert_eq!(named.matches.len(), 4, "2 functions + 2 methods");
+    assert_eq!(
+        named.structural_matches().len(),
+        4,
+        "2 functions + 2 methods"
+    );
 
     let union = run_query(json!({ "match": { "kind": ["function", "method"] } }));
-    assert_eq!(union.matches.len(), 4);
+    assert_eq!(union.structural_matches().len(), 4);
 }
 
 #[test]
@@ -281,14 +312,17 @@ fn imports_match_by_module_name() {
     let output = run_query(json!({
         "match": { "kind": "import", "module": { "name": "pickle" } }
     }));
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].text, "import pickle");
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(output.structural_matches()[0].text, "import pickle");
 
     let from_import = run_query(json!({
         "match": { "kind": "import", "module": { "name": "os" } }
     }));
-    assert_eq!(from_import.matches.len(), 1);
-    assert_eq!(from_import.matches[0].text, "from os import path");
+    assert_eq!(from_import.structural_matches().len(), 1);
+    assert_eq!(
+        from_import.structural_matches()[0].text,
+        "from os import path"
+    );
 }
 
 #[test]
@@ -297,13 +331,13 @@ fn where_globs_and_limit_scope_the_search() {
         "where": ["lib/**/*.py"],
         "match": { "kind": "call" }
     }));
-    assert!(excluded.matches.is_empty());
+    assert!(excluded.structural_matches().is_empty());
 
     let limited = run_query(json!({
         "match": { "kind": "call", "callee": { "name": "eval" } },
         "limit": 1
     }));
-    assert_eq!(limited.matches.len(), 1);
+    assert_eq!(limited.structural_matches().len(), 1);
     assert!(limited.truncated);
 }
 
@@ -313,7 +347,7 @@ fn broad_call_query_finds_every_call() {
     // unit tests; this asserts the broad end-to-end shape.
     let output = run_query(json!({ "match": { "kind": "call" } }));
     assert_eq!(
-        output.matches.len(),
+        output.structural_matches().len(),
         4,
         "route decorator call, eval x2, subprocess.run; request.args[...] is a subscript, not a call"
     );

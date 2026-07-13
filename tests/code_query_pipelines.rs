@@ -78,6 +78,33 @@ fn enclosing_decl_is_inclusive_and_excludes_file_scope() {
 }
 
 #[test]
+fn full_results_include_stable_terminal_and_provenance_identities() {
+    let result = run(
+        &[(
+            "app.py",
+            "class Outer:\n    def inner(self):\n        audit()\n",
+        )],
+        json!({
+            "match": { "kind": "call", "callee": { "name": "audit" } },
+            "steps": [{ "op": "enclosing_decl" }],
+            "result_detail": "full"
+        }),
+    );
+    let value = serialized(&result);
+    let terminal = &value["results"][0];
+    assert_eq!(terminal["result_type"], "declaration", "{value}");
+    assert!(terminal["id"].is_string(), "{value}");
+    assert!(terminal["node_range"].is_object(), "{value}");
+
+    let trace = &terminal["provenance"][0];
+    assert_eq!(trace["seed"]["result_type"], "structural_match", "{value}");
+    assert!(trace["seed"]["id"].is_string(), "{value}");
+    assert!(trace["seed"]["node_range"].is_object(), "{value}");
+    assert_eq!(trace["steps"][0]["op"], "enclosing_decl", "{value}");
+    assert_eq!(trace["steps"][0]["result"]["id"], terminal["id"], "{value}");
+}
+
+#[test]
 fn file_of_deduplicates_and_caps_deterministic_provenance() {
     let calls = (0..17)
         .map(|_| "    audit()")

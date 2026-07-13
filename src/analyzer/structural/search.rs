@@ -32,10 +32,6 @@ const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
 #[derive(Debug, Serialize)]
 pub struct CodeQueryResult {
     pub results: Vec<CodeQueryResultItem>,
-    /// Kept only for Rust callers while the v2 migration lands. The canonical
-    /// serialized surface contains `results`, never `matches`.
-    #[serde(skip)]
-    pub matches: Vec<CodeQueryMatch>,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<CodeQueryDiagnostic>,
@@ -460,7 +456,6 @@ pub fn execute_with_limits(
             .collect();
         return CodeQueryResult {
             results,
-            matches,
             truncated,
             diagnostics,
         };
@@ -525,7 +520,6 @@ pub fn execute_with_limits(
         .collect();
     CodeQueryResult {
         results,
-        matches: Vec::new(),
         truncated,
         diagnostics,
     }
@@ -1097,6 +1091,18 @@ fn snippet(text: &str) -> String {
 }
 
 impl CodeQueryResult {
+    pub fn structural_matches(&self) -> Vec<&CodeQueryMatch> {
+        self.results
+            .iter()
+            .filter_map(|result| match &result.value {
+                CodeQueryResultValue::StructuralMatch { value } => Some(value),
+                CodeQueryResultValue::Declaration { .. } | CodeQueryResultValue::File { .. } => {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn result_count_line(&self) -> String {
         format!(
             "{} result{}{}",

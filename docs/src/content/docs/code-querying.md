@@ -3,9 +3,9 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's composable code-query engine is `query_code`. Version 1 searches normalized syntactic structure instead of exposing raw parser nodes from each language. It answers questions such as “find calls to this callee,” “find assignments of string literals,” or “find annotated methods” across supported languages.
+Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing-declaration and direct import-file steps. It answers questions such as “find calls to this callee,” “which declaration contains them,” and “which project files directly import their files” across supported languages.
 
-The broader name is intentional. Future versions may add optional predicates backed by Bifrost's existing usage and type analyses or by future control-flow and data-flow analyses. Those expensive facets can be computed lazily only after cheaper path, language, name, and structural constraints narrow the candidates. They are a direction, not part of the version-1 contract: `query_code` does not currently traverse call graphs, resolve types or aliases, or prove control/data flow.
+The broader name is intentional. Future versions may add more steps backed by Bifrost's existing usage and type analyses or by future control-flow and data-flow analyses. Version 2 does not traverse call graphs, resolve arbitrary types or aliases, or prove control/data flow.
 
 ## Choose The Right Tool
 
@@ -16,7 +16,7 @@ Use the narrowest tool that directly answers the question:
 | “Where is `Parser.parse` declared?” | `search_symbols` | Searches indexed declarations by name. |
 | “Who references this exact symbol?” | `scan_usages_by_reference` or `scan_usages_by_location` | Resolves a known declaration to reference sites from a symbol or source location. |
 | “What is the workspace caller/callee graph?” | `usage_graph` | Returns the existing whole-workspace resolved usage graph. |
-| “Which code has this language-neutral syntactic shape?” | `query_code` | Matches normalized kinds, roles, containment, and captures. |
+| “Which code has this shape, enclosing declaration, or direct import relationship?” | `query_code` | Matches normalized kinds and applies typed declaration/file steps. |
 | “Which code is conceptually about retry policy?” | `semantic_search` | Retrieves code by meaning rather than exact structure. |
 | “Where does this literal text occur?” | `search_file_contents` | Searches source text without structural interpretation. |
 
@@ -30,9 +30,9 @@ Each language adapter starts from tree-sitter parses, then maps grammar-specific
 
 The matcher only sees this normalized fact arena. Language-specific tree-sitter node names stop at the adapter boundary, so a query can ask for a `call` with a `callee` across supported languages without knowing each grammar's internal node labels.
 
-## Version 1 Structural Facet
+## Version 2 Typed Pipelines
 
-`query_code` validates a query, chooses candidate files and facts, checks normalized kinds and roles, applies containment constraints, and returns structural matches with file ranges and optional captures.
+`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations, `file_of` converts matches or declarations to files, and `imports_of` / `importers_of` traverse one direct project-local file edge per step. Derived results retain seed-and-edge provenance.
 
 The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
 
@@ -255,9 +255,9 @@ bifrost --root ./code-query-toy --tool query_code --args '{"match":{"kind":"call
 The result contains one `call` match for each current analyzable language and no diagnostics. Representative rows look like:
 
 ```json
-{"language":"python","path":"python/app.py","kind":"call","text":"audit(code)"}
-{"language":"typescript","path":"typescript/app.ts","kind":"call","text":"audit(code)"}
-{"language":"ruby","path":"ruby/app.rb","kind":"call","text":"audit(code)"}
+{"result_type":"structural_match","language":"python","path":"python/app.py","kind":"call","text":"audit(code)"}
+{"result_type":"structural_match","language":"typescript","path":"typescript/app.ts","kind":"call","text":"audit(code)"}
+{"result_type":"structural_match","language":"ruby","path":"ruby/app.rb","kind":"call","text":"audit(code)"}
 ```
 
 Find assignments to `password` whose right-hand side is a string literal, and capture the value:
@@ -269,9 +269,9 @@ bifrost --root ./code-query-toy --tool query_code --args '{"match":{"kind":"assi
 The result contains one assignment match per language. The captured `value` is `"hunter2"` in each match, even though the source syntax varies:
 
 ```json
-{"language":"java","text":"password = \"hunter2\"","captures":[{"name":"value","text":"\"hunter2\""}]}
-{"language":"php","text":"$password = \"hunter2\"","captures":[{"name":"value","text":"\"hunter2\""}]}
-{"language":"rust","text":"let password = \"hunter2\";","captures":[{"name":"value","text":"\"hunter2\""}]}
+{"result_type":"structural_match","language":"java","text":"password = \"hunter2\"","captures":[{"name":"value","text":"\"hunter2\""}]}
+{"result_type":"structural_match","language":"php","text":"$password = \"hunter2\"","captures":[{"name":"value","text":"\"hunter2\""}]}
+{"result_type":"structural_match","language":"rust","text":"let password = \"hunter2\";","captures":[{"name":"value","text":"\"hunter2\""}]}
 ```
 
 Limit a query to one adapter while debugging a mapping:
