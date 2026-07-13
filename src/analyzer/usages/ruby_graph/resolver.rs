@@ -231,7 +231,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     pub(crate) fn resolve_method_candidates(
         &self,
-        support: &crate::analyzer::DefinitionLookupIndex,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
         visible_files: &HashSet<ProjectFile>,
         receiver: &ReceiverType,
         member: &str,
@@ -313,7 +313,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     pub(crate) fn resolve_bare_method_candidates(
         &self,
-        support: &crate::analyzer::DefinitionLookupIndex,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
         visible_files: &HashSet<ProjectFile>,
         receiver: &ReceiverType,
         member: &str,
@@ -328,7 +328,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     fn resolve_top_level_method_candidates(
         &self,
-        support: &crate::analyzer::DefinitionLookupIndex,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         member: &str,
     ) -> Vec<CodeUnit> {

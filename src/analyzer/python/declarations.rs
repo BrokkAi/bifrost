@@ -476,19 +476,6 @@ pub(super) fn python_module_name(file: &ProjectFile) -> String {
     python_module_info(file).module_qualified_package()
 }
 
-pub(super) fn build_python_module_code_units(
-    inner: &TreeSitterAnalyzer<PythonAdapter>,
-) -> HashMap<String, CodeUnit> {
-    inner
-        .all_files()
-        .into_iter()
-        .filter_map(|file| {
-            let module_fq = python_module_name(&file);
-            module_code_unit(&file, &module_fq).map(|code_unit| (module_fq, code_unit))
-        })
-        .collect()
-}
-
 fn python_module_info(file: &ProjectFile) -> PythonModuleInfo {
     let raw_package = python_package_name_for_file(file);
     let module_name = file

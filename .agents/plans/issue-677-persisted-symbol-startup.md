@@ -28,8 +28,11 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-13) Add a shared bounded lookup facade, persistently query lookup-only JS/TS assignment declarations by short name, and fan out deterministic owned results through `MultiAnalyzer`.
 - [x] (2026-07-13) Move Java, PHP, Python, Ruby, JavaScript/TypeScript, and C++ forward definition dispatch onto the bounded facade; C++ include visibility now remains request-scoped instead of retaining a global definition index.
 - [x] (2026-07-13) Reproduce and review the post-migration Scala failures: 47 focused Scala cases pass and three fail on class/companion identity or explicit-import precedence; the nine existing persistence tests pass but cover only Go, C#, and Rust forward requests.
-- [ ] (2026-07-13) Replace the language-agnostic forward facade with an internal, request-scoped, language-bound query session and remove request-time path-synthetic workspace enumeration.
-- [ ] (2026-07-13) Replace Scala's string-only forward resolver with typed class/singleton resolution and candidate-scoped persisted ancestry; prove no forward path constructs `ProjectTypes`.
+- [x] (2026-07-13) Replace the language-agnostic forward facade with an internal, request-scoped, language-bound query session and remove request-time path-synthetic workspace enumeration.
+- [x] (2026-07-13) Replace Scala's string-only forward resolver with typed class/singleton resolution and candidate-scoped persisted ancestry; prove no forward path constructs `ProjectTypes`.
+- [x] (2026-07-13) Persist OID-validated path projections for JavaScript, TypeScript, and Python modules, refresh them during reconciliation, and remove Python's eager workspace module map.
+- [x] (2026-07-13) Make empty candidate-name queries return no rows, batch prefix validation, and add request counters for path scans and Scala `ProjectTypes` construction.
+- [x] (2026-07-13) Pass all 436 definition tests, all 14 analyzer-persistence tests, 50 focused Scala definition/type tests, and structured-supertype unit tests after the typed Scala milestone.
 - [ ] (2026-07-13) Complete warm persisted definition/type coverage for every migrated language, including path-derived modules, dirty overlays, stale blobs, and unrelated generated files.
 
 ## Surprises & Discoveries
@@ -90,6 +93,9 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 
 - Observation: Python constructs another workspace-sized derived index during analyzer construction.
   Evidence: `PythonAnalyzer::from_inner` eagerly calls `build_python_module_code_units`, which iterates `inner.all_files()` and retains an `Arc<HashMap<String, CodeUnit>>` before any forward request.
+
+- Observation: The installed default Cargo/Rust compiler and `clippy-driver` binaries have incompatible LLVM patch versions on this machine, so the nominal clippy command reports E0514 before checking repository code.
+  Evidence: the default compiler reports LLVM 22.1.2 while the Homebrew compiler and clippy driver report LLVM 22.1.6; running the identical all-target/all-feature clippy gate with `/opt/homebrew/bin/cargo` and `/opt/homebrew/bin/rustc` succeeds cleanly in an isolated target directory.
 
 ## Decision Log
 
@@ -157,9 +163,13 @@ Opening a warm persisted workspace must finish without reconstructing every decl
   Rationale: Forward ancestry needs the base type identity but must neither split Scala type syntax by delimiters nor reparse a clean owner source on a warm request. The declaration extractor already has the tree-sitter node and can persist both facts safely.
   Date/Author: 2026-07-13 / Codex
 
+- Decision: Validate path projections against both the current live blob OID and the adapter-derived live identity before returning them.
+  Rationale: Workspace-relative module identities are safe to index only while attached to the exact live path/blob pair that produced them. OID and identity validation makes stale rows harmless and keeps dirty files in the bounded live overlay.
+  Date/Author: 2026-07-13 / Codex
+
 ## Outcomes & Retrospective
 
-The first Go forward-definition vertical slice and the direct C# and Rust forward-definition slices are implemented. A warm persisted multi-language Go regression resolves an imported package member whose import-path tail differs from its declared package name, with zero warm-build parse events, zero delegate/composite definition-index builds, and zero full declaration scans. The corresponding C#+Python regression resolves `var service = new Service(); service.Run()` with the same zero-index/zero-scan guarantees, and the Rust+Python regression resolves a serde-shaped `value.Value.Number` enum-variant reference with those same guarantees. C# stale-blob package existence and nested-vs-dotted owner collisions have public regressions. A sibling-module Go regression proves the workspace path index is built once and package-clause metadata is read without full file-state hydration. On the 25,617-file AWS SDK Go checkout, the one-time schema-v9 population completed in 132.05 seconds at 3,839,280 KiB peak RSS; the identical warm one-site run completed in 10.41 seconds at 401,928 KiB. An exact internal `types.S3Location` forward-plus-inverse probe completed in 10.51 seconds at 402,828 KiB and returned an exact consistent hit. C# candidate signatures, supertypes, global usings, and `get_type_by_location`, plus remaining Java, JavaScript/TypeScript, PHP, Python, Ruby, and Scala definition-provider migrations, are pending.
+The request-scoped forward query layer and typed Scala forward resolver are implemented. A forward batch now carries an explicit language scope and positive/negative owned-result caches; it does not expose new public `IAnalyzer` methods or fan out to unrelated delegates. JavaScript, TypeScript, and Python synthetic module identities are stored in OID-validated workspace-path projections, so exact module queries no longer enumerate all live paths and Python no longer constructs an eager workspace module map. Scala distinguishes class and singleton owners, treats a missing explicit import as terminal, persists structured supertype lookup paths, and walks only candidate owner facts iteratively. The previously failing class/companion, missing-import, and `.type` regressions now pass, as do all 436 definition tests and all 14 persistence tests. Warm Scala inheritance/type and JavaScript/TypeScript/Python module regressions assert zero parses, declaration scans, global-index builds, Scala `ProjectTypes` builds, and request-time path scans. The remaining completion work is the full language/type persistence matrix, explicit legacy global-index naming, the feature-enabled repository gate, and refreshed corpus measurements.
 
 ## Context and Orientation
 

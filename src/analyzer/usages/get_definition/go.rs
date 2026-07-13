@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::DefinitionLookupIndex;
 use tree_sitter::Tree;
 
 pub(crate) trait GoDefinitionProvider {
@@ -30,12 +31,12 @@ impl GoDefinitionProvider for DefinitionLookupIndex {
     }
 }
 
-pub(super) struct AnalyzerGoDefinitionProvider<'a> {
+pub(crate) struct AnalyzerGoDefinitionProvider<'a> {
     analyzer: &'a GoAnalyzer,
 }
 
 impl<'a> AnalyzerGoDefinitionProvider<'a> {
-    pub(super) fn new(analyzer: &'a GoAnalyzer) -> Self {
+    pub(crate) fn new(analyzer: &'a GoAnalyzer) -> Self {
         Self { analyzer }
     }
 }

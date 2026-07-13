@@ -57,6 +57,8 @@ pub struct RubyAnalyzer {
     types_by_identifier: Arc<OnceLock<HashMap<String, Vec<CodeUnit>>>>,
 }
 
+crate::analyzer::impl_forward_query_provider!(RubyAnalyzer);
+
 impl RubyAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
@@ -226,6 +228,23 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
+    }
+
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.inner
+            .reset_definition_lookup_index_build_count_for_test();
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.inner.definition_lookup_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
     }
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::usages::php_graph::syntax::{
     assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
@@ -9,7 +10,7 @@ use crate::analyzer::usages::php_graph::syntax::{
 
 pub(super) fn resolve_php(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -111,7 +112,7 @@ pub(super) fn resolve_php(
 
 fn php_interface_method_declaration_outcome(
     php: &PhpAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     source: &str,
     node: Node<'_>,
     class_ranges: &ClassRangeIndex,
@@ -301,7 +302,7 @@ fn php_qualified_reference_node(mut node: Node<'_>) -> Node<'_> {
 }
 
 fn php_fqn_outcome(
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     fqn: Option<String>,
     raw: &str,
 ) -> DefinitionLookupOutcome {
@@ -328,7 +329,7 @@ fn php_fqn_outcome(
 
 fn php_member_outcome(
     php: &PhpAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     owner: Option<String>,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -360,7 +361,7 @@ fn php_member_outcome(
 
 fn php_inherited_member_candidates(
     php: &PhpAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     owner_fqn: &str,
     member: &str,
 ) -> Vec<CodeUnit> {
@@ -389,7 +390,7 @@ fn php_inherited_member_candidates(
 
 fn php_direct_member_owner_fqns(
     php: &PhpAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     owner_fqn: &str,
 ) -> Vec<String> {
     php_fqn_candidates(support, owner_fqn)
@@ -402,20 +403,23 @@ fn php_direct_member_owner_fqns(
         .collect()
 }
 
-fn php_crosses_unindexed_boundary(support: &DefinitionLookupIndex, fqn: &str) -> bool {
+fn php_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
     let Some((namespace, _)) = fqn.rsplit_once('.') else {
         return !php_workspace_exact_namespace_exists(support, "");
     };
     !php_workspace_exact_namespace_exists(support, namespace)
 }
 
-fn php_workspace_exact_namespace_exists(support: &DefinitionLookupIndex, namespace: &str) -> bool {
+fn php_workspace_exact_namespace_exists(
+    support: &dyn BoundedDefinitionLookup,
+    namespace: &str,
+) -> bool {
     support.package_exists_in_language(namespace, Language::Php)
 }
 
 fn php_static_scope_fqn(
     php: &PhpAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     scope: Node<'_>,
     source: &str,
     ctx: &FileContext,
@@ -433,7 +437,7 @@ fn php_static_scope_fqn(
 
 fn php_parent_fqn(
     php: &PhpAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     enclosing_fqn: &str,
 ) -> Option<String> {
     let child = php_fqn_candidates(support, enclosing_fqn)
@@ -443,7 +447,7 @@ fn php_parent_fqn(
         .map(|parent| parent.fq_name())
 }
 
-fn php_fqn_candidates(support: &DefinitionLookupIndex, fqn: &str) -> Vec<CodeUnit> {
+fn php_fqn_candidates(support: &dyn BoundedDefinitionLookup, fqn: &str) -> Vec<CodeUnit> {
     support.fqn_in_language(fqn, Language::Php)
 }
 
@@ -451,7 +455,7 @@ fn php_fqn_candidates(support: &DefinitionLookupIndex, fqn: &str) -> Vec<CodeUni
 fn php_instance_receiver_fqn(
     php: &PhpAnalyzer,
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     object: Node<'_>,
     source: &str,
     class_ranges: &ClassRangeIndex,
@@ -501,7 +505,7 @@ fn php_instance_receiver_fqn(
 fn php_member_access_receiver_fqn(
     php: &PhpAnalyzer,
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     access: Node<'_>,
     source: &str,
     class_ranges: &ClassRangeIndex,
@@ -537,7 +541,7 @@ fn php_bindings_before(
     byte: usize,
     class_ranges: &ClassRangeIndex,
     ctx: &FileContext,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
 ) -> LocalInferenceEngine<String> {
     let scope = php_enclosing_scope(root, byte).unwrap_or(root);
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -607,7 +611,7 @@ fn php_seed_assignment(
     source: &str,
     class_ranges: &ClassRangeIndex,
     ctx: &FileContext,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let Some((left, right)) = assignment_parts(node) else {
@@ -629,7 +633,7 @@ fn php_seed_assignment(
 
 fn php_assignment_receiver_fqn(
     php: &PhpAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     right: Node<'_>,
     source: &str,
     class_ranges: &ClassRangeIndex,
@@ -662,7 +666,7 @@ fn php_assignment_receiver_fqn(
 
 fn php_declared_callable_return_type_fqn(
     php: &PhpAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     callable_fqn: &str,
 ) -> Option<String> {
     if let Some(return_type) = php.usage_facts_index().callable_return_type(callable_fqn) {

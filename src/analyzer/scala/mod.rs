@@ -25,6 +25,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::ScalaAdapter;
@@ -42,6 +43,14 @@ pub(crate) fn scala_simple_type_name(unit: &CodeUnit) -> String {
         .unwrap_or(unit.short_name())
         .trim_end_matches('$')
         .to_string()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScalaForwardOwnerFacts {
+    pub(crate) raw_supertypes: Vec<String>,
+    pub(crate) supertype_lookup_paths: Vec<String>,
+    pub(crate) signatures: Vec<String>,
+    pub(crate) is_trait: bool,
 }
 
 pub(crate) fn scala_signature_return_type(signature: &str) -> Option<&str> {
@@ -128,11 +137,43 @@ pub struct ScalaAnalyzer {
     /// Analyzer-cached Scala usage/type-resolution support, built once per
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
+    project_types_build_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
 
+crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
+
 impl ScalaAnalyzer {
+    pub(crate) fn forward_owner_facts(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> Option<ScalaForwardOwnerFacts> {
+        let state = self.inner.fetch_file_state(code_unit.source())?;
+        if !state.declarations.contains(code_unit) {
+            return None;
+        }
+        let raw_supertypes = state
+            .raw_supertypes
+            .get(code_unit)
+            .cloned()
+            .unwrap_or_default();
+        let supertype_lookup_paths = state
+            .supertype_lookup_paths
+            .get(code_unit)
+            .cloned()
+            .unwrap_or_default();
+        if raw_supertypes.len() != supertype_lookup_paths.len() {
+            return None;
+        }
+        Some(ScalaForwardOwnerFacts {
+            raw_supertypes,
+            supertype_lookup_paths,
+            signatures: state.signatures.get(code_unit).cloned().unwrap_or_default(),
+            is_trait: state.scala_traits.contains(code_unit),
+        })
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
@@ -162,6 +203,7 @@ impl ScalaAnalyzer {
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
+            project_types_build_count: Arc::new(AtomicUsize::new(0)),
             type_relations: Arc::new(OnceLock::new()),
         }
     }
@@ -183,6 +225,8 @@ impl ScalaAnalyzer {
     ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes> {
         self.project_types
             .get_or_init(|| {
+                self.project_types_build_count
+                    .fetch_add(1, Ordering::Relaxed);
                 Arc::new(crate::analyzer::usages::scala_graph::ScalaProjectTypes::build(self))
             })
             .clone()
@@ -339,6 +383,39 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.definitions(fq_name)
     }
 
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.inner
+            .reset_definition_lookup_index_build_count_for_test();
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.inner.definition_lookup_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        self.inner.reset_workspace_path_scan_count_for_test();
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.inner.workspace_path_scan_count_for_test()
+    }
+
+    fn reset_scala_project_types_build_count_for_test(&self) {
+        self.project_types_build_count.store(0, Ordering::Relaxed);
+    }
+
+    fn scala_project_types_build_count_for_test(&self) -> usize {
+        self.project_types_build_count.load(Ordering::Relaxed)
+    }
+
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
         self.inner.definition_lookup_index()
     }
@@ -374,7 +451,9 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures(code_unit)
+        self.forward_owner_facts(code_unit)
+            .map(|facts| facts.signatures)
+            .unwrap_or_else(|| self.inner.signatures(code_unit))
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {

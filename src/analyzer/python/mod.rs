@@ -35,8 +35,8 @@ use cache::{
 };
 use clones::{build_clone_candidate_data, refine_python_clone_similarity};
 use declarations::{
-    build_python_module_code_units, collect_python_identifiers, parse_python_tree, py_node_text,
-    python_expanded_comment_start, python_module_name,
+    collect_python_identifiers, parse_python_tree, py_node_text, python_expanded_comment_start,
+    python_module_name,
 };
 use imports::{
     PythonImportDetails, parse_python_import_details, parse_python_import_infos,
@@ -54,10 +54,11 @@ pub struct PythonAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
-    module_code_units: Arc<HashMap<String, CodeUnit>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<PythonUsageIndex>>,
 }
+
+crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
 
 impl PythonAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
@@ -95,7 +96,6 @@ impl PythonAnalyzer {
 
     fn from_inner(inner: TreeSitterAnalyzer<PythonAdapter>, memo_budget: u64) -> Self {
         Self {
-            module_code_units: Arc::new(build_python_module_code_units(&inner)),
             inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
@@ -131,9 +131,9 @@ impl PythonAnalyzer {
 
     fn resolve_module_code_unit(&self, module_fq: &str) -> Option<CodeUnit> {
         self.inner
-            .definitions(module_fq)
+            .forward_definition_fqn(module_fq)
+            .into_iter()
             .find(|code_unit| code_unit.is_module())
-            .or_else(|| self.module_code_units.get(module_fq).cloned())
     }
 
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
@@ -552,6 +552,31 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.definitions(fq_name)
     }
 
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.inner
+            .reset_definition_lookup_index_build_count_for_test();
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.inner.definition_lookup_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        self.inner.reset_workspace_path_scan_count_for_test();
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.inner.workspace_path_scan_count_for_test()
+    }
+
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
         self.inner.definition_lookup_index()
     }
@@ -591,7 +616,6 @@ impl IAnalyzer for PythonAnalyzer {
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         let inner = self.inner.update(changed_files);
         Self {
-            module_code_units: Arc::new(build_python_module_code_units(&inner)),
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
@@ -610,7 +634,6 @@ impl IAnalyzer for PythonAnalyzer {
     fn update_all(&self) -> Self {
         let inner = self.inner.update_all();
         Self {
-            module_code_units: Arc::new(build_python_module_code_units(&inner)),
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),

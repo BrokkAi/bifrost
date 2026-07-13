@@ -67,6 +67,10 @@ pub(crate) use csharp::{
     csharp_using_directive_target,
 };
 pub use definition_lookup_index::DefinitionLookupIndex;
+pub(crate) use definition_lookup_index::{
+    AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
+    impl_forward_query_provider,
+};
 pub use go::GoAnalyzer;
 pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,

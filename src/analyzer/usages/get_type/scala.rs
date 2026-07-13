@@ -3,18 +3,21 @@ use crate::analyzer::usages::get_definition::{
     ScalaTypeLookupResolution, scala_type_lookup_resolution,
 };
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::{IAnalyzer, ProjectFile, ScalaAnalyzer, resolve_analyzer};
+use crate::analyzer::{
+    AnalyzerDefinitionLookup, BoundedDefinitionLookup, IAnalyzer, Language, ProjectFile,
+    ScalaAnalyzer, resolve_analyzer,
+};
 use tree_sitter::Tree;
 
 pub(super) fn resolve_scala_type(
     analyzer: &dyn IAnalyzer,
-    context: &mut TypeBatchContext,
+    _context: &mut TypeBatchContext,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> TypeLookupOutcome {
-    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
+    let Some(_scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
         return no_type(
             "scala_analyzer_unavailable",
             "Scala analyzer is unavailable",
@@ -23,17 +26,10 @@ pub(super) fn resolve_scala_type(
     let Some(tree) = tree else {
         return no_type("scala_parse_failed", "Scala source could not be parsed");
     };
-    let support = analyzer.definition_lookup_index();
-    let types = context.scala_project_types(scala);
-    let Some(resolution) = scala_type_lookup_resolution(
-        analyzer,
-        support,
-        types.as_ref(),
-        file,
-        source,
-        tree.root_node(),
-        site,
-    ) else {
+    let support = AnalyzerDefinitionLookup::new(analyzer, Language::Scala);
+    let Some(resolution) =
+        scala_type_lookup_resolution(analyzer, &support, file, source, tree.root_node(), site)
+    else {
         return no_type(
             "no_explicit_type",
             format!(

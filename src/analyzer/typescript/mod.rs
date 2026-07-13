@@ -261,6 +261,8 @@ pub struct TypescriptAnalyzer {
     alias_resolver: Arc<AliasResolver>,
 }
 
+crate::analyzer::impl_forward_query_provider!(TypescriptAnalyzer);
+
 impl TypescriptAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
@@ -648,6 +650,31 @@ impl IAnalyzer for TypescriptAnalyzer {
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
+    }
+
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.inner
+            .reset_definition_lookup_index_build_count_for_test();
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.inner.definition_lookup_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        self.inner.reset_workspace_path_scan_count_for_test();
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.inner.workspace_path_scan_count_for_test()
     }
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {

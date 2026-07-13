@@ -16,8 +16,13 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 const BASELINE_MIGRATION_VERSION: i64 = 1;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
-static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
-    Lazy::new(|| Migrations::new(vec![M::up(CURRENT_BASELINE_SQL)]));
+const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
+static CACHE_MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
+    Migrations::new(vec![
+        M::up(CURRENT_BASELINE_SQL),
+        M::up(PATH_SYMBOL_UNITS_SQL),
+    ])
+});
 static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open baseline schema connection");
     conn.execute_batch(CURRENT_BASELINE_SQL)

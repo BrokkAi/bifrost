@@ -516,6 +516,40 @@ impl IAnalyzer for MultiAnalyzer {
             .sum()
     }
 
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .reset_workspace_path_scan_count_for_test();
+        }
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| delegate.analyzer().workspace_path_scan_count_for_test())
+            .sum()
+    }
+
+    fn reset_scala_project_types_build_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .reset_scala_project_types_build_count_for_test();
+        }
+    }
+
+    fn scala_project_types_build_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .scala_project_types_build_count_for_test()
+            })
+            .sum()
+    }
+
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         match self.delegate_for_code_unit(code_unit) {
             Some(delegate) => delegate.analyzer().direct_children(code_unit),

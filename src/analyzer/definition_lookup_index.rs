@@ -1,8 +1,13 @@
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use crate::analyzer::{
+    CSharpAnalyzer, CodeUnit, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer,
+    Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
+    TypescriptAnalyzer, resolve_analyzer,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::borrow::Borrow;
+use std::cell::{Cell, RefCell};
 
 #[derive(Debug, Clone, Default)]
 pub struct DefinitionLookupIndex {
@@ -14,6 +19,271 @@ pub struct DefinitionLookupIndex {
     files_by_package: HashMap<String, Vec<ProjectFile>>,
     by_normalized_fqn: HashMap<String, Vec<CodeUnit>>,
     types_by_package_simple: HashMap<(String, String), Vec<CodeUnit>>,
+}
+
+/// Candidate-shaped declaration operations used by forward symbols queries.
+///
+/// Unlike [`DefinitionLookupIndex`], implementations backed by a persisted
+/// analyzer must not materialize every workspace declaration.  The legacy
+/// index implements this trait only for explicit whole-workspace graph paths;
+/// forward `get_definition` and `get_type_by_location` dispatches use the
+/// `dyn IAnalyzer` implementation, which delegates to bounded store queries.
+pub(crate) trait BoundedDefinitionLookup {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit>;
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit>;
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
+    fn fqn_exists(&self, fqn: &str) -> bool;
+    fn package_exists(&self, package: &str) -> bool;
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool;
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool;
+
+    fn fqn_candidates(&self, fqns: Vec<String>) -> Vec<CodeUnit> {
+        let mut candidates = fqns
+            .into_iter()
+            .flat_map(|fqn| self.fqn(&fqn))
+            .collect::<Vec<_>>();
+        sort_units(&mut candidates);
+        candidates.dedup();
+        candidates
+    }
+
+    fn file_identifier_in_files(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
+        let mut out = Vec::new();
+        for file in files {
+            out.extend(self.file_identifier(file, ident));
+        }
+        sort_units(&mut out);
+        out.dedup();
+        out
+    }
+}
+
+pub(crate) trait ForwardQueryProvider {
+    fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
+    fn forward_file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit>;
+    fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit>;
+    fn forward_package_exists(&self, package: &str) -> bool;
+    fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool;
+}
+
+macro_rules! impl_forward_query_provider {
+    ($analyzer:ty) => {
+        impl crate::analyzer::ForwardQueryProvider for $analyzer {
+            fn forward_definition_fqn(&self, fqn: &str) -> Vec<crate::analyzer::CodeUnit> {
+                self.inner.forward_definition_fqn(fqn)
+            }
+
+            fn forward_file_identifier(
+                &self,
+                file: &crate::analyzer::ProjectFile,
+                identifier: &str,
+            ) -> Vec<crate::analyzer::CodeUnit> {
+                self.inner.forward_file_identifier(file, identifier)
+            }
+
+            fn forward_direct_children(
+                &self,
+                owner: &crate::analyzer::CodeUnit,
+            ) -> Vec<crate::analyzer::CodeUnit> {
+                self.inner.forward_direct_children(owner)
+            }
+
+            fn forward_package_exists(&self, package: &str) -> bool {
+                self.inner.forward_package_exists(package)
+            }
+
+            fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool {
+                self.inner.forward_fqn_prefix_exists(prefix)
+            }
+        }
+    };
+}
+
+pub(crate) use impl_forward_query_provider;
+
+/// A forward-query view over an analyzer.  Keeping this separate from the
+/// legacy index makes accidental whole-workspace fallback impossible at call
+/// sites that accept only `BoundedDefinitionLookup`.
+pub(crate) struct AnalyzerDefinitionLookup<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    language: Cell<Language>,
+    fqn_cache: RefCell<HashMap<(Language, String), Vec<CodeUnit>>>,
+    file_identifier_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
+    children_cache: RefCell<HashMap<(Language, String), Vec<CodeUnit>>>,
+    package_cache: RefCell<HashMap<(Language, String), bool>>,
+    prefix_cache: RefCell<HashMap<(Language, String), bool>>,
+}
+
+impl<'a> AnalyzerDefinitionLookup<'a> {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer, language: Language) -> Self {
+        Self {
+            analyzer,
+            language: Cell::new(language),
+            fqn_cache: RefCell::new(HashMap::default()),
+            file_identifier_cache: RefCell::new(HashMap::default()),
+            children_cache: RefCell::new(HashMap::default()),
+            package_cache: RefCell::new(HashMap::default()),
+            prefix_cache: RefCell::new(HashMap::default()),
+        }
+    }
+
+    pub(crate) fn set_language(&self, language: Language) {
+        self.language.set(language);
+    }
+
+    fn language_analyzer(&self, language: Language) -> Option<&dyn ForwardQueryProvider> {
+        analyzer_for_language(self.analyzer, language)
+    }
+
+    fn fqn_for_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        let key = (language, fqn.to_string());
+        if let Some(cached) = self.fqn_cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let matches = self
+            .language_analyzer(language)
+            .map(|analyzer| analyzer.forward_definition_fqn(fqn))
+            .unwrap_or_default();
+        self.fqn_cache.borrow_mut().insert(key, matches.clone());
+        matches
+    }
+}
+
+fn analyzer_for_language(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> Option<&dyn ForwardQueryProvider> {
+    match language {
+        Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer).map(|value| value as _),
+        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer).map(|value| value as _),
+        Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer).map(|value| value as _),
+        Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer).map(|value| value as _),
+        Language::JavaScript => {
+            resolve_analyzer::<JavascriptAnalyzer>(analyzer).map(|value| value as _)
+        }
+        Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer).map(|value| value as _),
+        Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _),
+        Language::TypeScript => {
+            resolve_analyzer::<TypescriptAnalyzer>(analyzer).map(|value| value as _)
+        }
+        Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer).map(|value| value as _),
+        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|value| value as _),
+        Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer).map(|value| value as _),
+        Language::None => None,
+    }
+}
+
+impl BoundedDefinitionLookup for DefinitionLookupIndex {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        Self::fqn(self, fqn)
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        Self::fqn_in_language(self, fqn, language)
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        Self::file_identifier(self, file, ident)
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        Self::fqn_direct_children(self, fqn)
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        Self::fqn_exists(self, fqn)
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        Self::package_exists(self, package)
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        Self::package_exists_in_language(self, package, language)
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        Self::fqn_prefix_exists(self, prefix)
+    }
+}
+
+impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.fqn_for_language(fqn, self.language.get())
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        self.fqn_for_language(fqn, language)
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        let key = (file.clone(), ident.to_string());
+        if let Some(cached) = self.file_identifier_cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let matches = self
+            .language_analyzer(language_for_file(file))
+            .map(|analyzer| analyzer.forward_file_identifier(file, ident))
+            .unwrap_or_default();
+        self.file_identifier_cache
+            .borrow_mut()
+            .insert(key, matches.clone());
+        matches
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        let language = self.language.get();
+        let key = (language, fqn.to_string());
+        if let Some(cached) = self.children_cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let mut children = Vec::new();
+        if let Some(analyzer) = self.language_analyzer(language) {
+            for owner in self.fqn_for_language(fqn, language) {
+                children.extend(analyzer.forward_direct_children(&owner));
+            }
+        }
+        sort_units(&mut children);
+        children.dedup();
+        self.children_cache
+            .borrow_mut()
+            .insert(key, children.clone());
+        children
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        !self.fqn(fqn).is_empty()
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        self.package_exists_in_language(package, self.language.get())
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        let key = (language, package.to_string());
+        if let Some(cached) = self.package_cache.borrow().get(&key) {
+            return *cached;
+        }
+        let exists = self
+            .language_analyzer(language)
+            .is_some_and(|analyzer| analyzer.forward_package_exists(package));
+        self.package_cache.borrow_mut().insert(key, exists);
+        exists
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        let language = self.language.get();
+        let key = (language, prefix.to_string());
+        if let Some(cached) = self.prefix_cache.borrow().get(&key) {
+            return *cached;
+        }
+        let exists = self
+            .language_analyzer(language)
+            .is_some_and(|analyzer| analyzer.forward_fqn_prefix_exists(prefix));
+        self.prefix_cache.borrow_mut().insert(key, exists);
+        exists
+    }
 }
 
 impl DefinitionLookupIndex {
@@ -151,10 +421,6 @@ impl DefinitionLookupIndex {
         self.by_fqn.contains_key(fqn)
     }
 
-    pub(crate) fn normalized_fqn_exists(&self, fqn: &str) -> bool {
-        self.by_normalized_fqn.contains_key(fqn)
-    }
-
     pub(crate) fn by_normalized_fqn(&self, normalized: &str) -> &[CodeUnit] {
         self.by_normalized_fqn
             .get(normalized)
@@ -230,30 +496,6 @@ impl DefinitionLookupIndex {
     pub(crate) fn fqn_prefix_exists(&self, prefix: &str) -> bool {
         let prefix = format!("{prefix}.");
         self.by_fqn.keys().any(|fqn| fqn.starts_with(&prefix))
-    }
-
-    pub(crate) fn file_identifier_in_files(
-        &self,
-        files: &[ProjectFile],
-        ident: &str,
-    ) -> Vec<CodeUnit> {
-        let mut out = Vec::new();
-        for file in files {
-            out.extend(self.file_identifier(file, ident));
-        }
-        sort_units(&mut out);
-        out.dedup();
-        out
-    }
-
-    pub(crate) fn fqn_candidates(&self, fqns: impl IntoIterator<Item = String>) -> Vec<CodeUnit> {
-        let mut out = Vec::new();
-        for fqn in fqns {
-            out.extend(self.fqn(&fqn));
-        }
-        sort_units(&mut out);
-        out.dedup();
-        out
     }
 }
 
@@ -367,7 +609,6 @@ mod tests {
             index.by_normalized_fqn("example.Helpers")[0].fq_name(),
             "example.Helpers$"
         );
-        assert!(index.normalized_fqn_exists("example.Helpers"));
     }
 
     #[test]

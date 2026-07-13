@@ -47,6 +47,8 @@ pub struct CppAnalyzer {
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
 }
 
+crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
+
 impl CppAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
@@ -146,12 +148,6 @@ impl CppAnalyzer {
             .map(|token| token.trim_matches(':').to_string())
             .collect()
     }
-
-    pub(crate) fn definition_lookup_index_shared(
-        &self,
-    ) -> Arc<crate::analyzer::DefinitionLookupIndex> {
-        self.inner.definition_lookup_index_shared()
-    }
 }
 
 impl IAnalyzer for CppAnalyzer {
@@ -200,6 +196,23 @@ impl IAnalyzer for CppAnalyzer {
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
+    }
+
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.inner
+            .reset_definition_lookup_index_build_count_for_test();
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.inner.definition_lookup_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
     }
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {

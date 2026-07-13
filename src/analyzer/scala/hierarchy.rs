@@ -115,7 +115,11 @@ impl ScalaAnalyzer {
     }
 
     pub(crate) fn is_scala_trait_declaration(&self, code_unit: &CodeUnit) -> bool {
-        code_unit.is_class() && self.inner.is_scala_trait(code_unit)
+        code_unit.is_class()
+            && self
+                .forward_owner_facts(code_unit)
+                .map(|facts| facts.is_trait)
+                .unwrap_or_else(|| self.inner.is_scala_trait(code_unit))
     }
 
     fn scala_trait_fqns(&self) -> HashSet<String> {

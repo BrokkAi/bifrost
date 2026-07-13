@@ -9,7 +9,7 @@ use crate::analyzer::usages::rust_graph::RustDefinitionProvider;
 use crate::hash::{HashMap, HashSet};
 use std::cell::RefCell;
 
-pub(super) struct AnalyzerRustDefinitionProvider<'a> {
+pub(crate) struct AnalyzerRustDefinitionProvider<'a> {
     rust: &'a RustAnalyzer,
     cache_lookups: bool,
     fqns: RefCell<HashMap<String, Vec<CodeUnit>>>,
@@ -17,7 +17,7 @@ pub(super) struct AnalyzerRustDefinitionProvider<'a> {
 }
 
 impl<'a> AnalyzerRustDefinitionProvider<'a> {
-    pub(super) fn new(rust: &'a RustAnalyzer, cache_lookups: bool) -> Self {
+    pub(crate) fn new(rust: &'a RustAnalyzer, cache_lookups: bool) -> Self {
         Self {
             rust,
             cache_lookups,

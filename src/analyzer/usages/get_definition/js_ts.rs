@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::syntax::{is_declaration_identifier, is_explicit_object_literal_key};
 use crate::analyzer::typescript::ts_is_global_internal_module;
 use std::cell::{Cell, RefCell};
@@ -94,7 +95,7 @@ fn js_ts_alias_preference(unit: &CodeUnit) -> (usize, String) {
 
 pub(super) fn resolve_js_ts(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -419,7 +420,7 @@ pub(super) fn resolve_js_ts(
 #[allow(clippy::too_many_arguments)]
 fn ts_contextual_object_literal_key_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -473,7 +474,7 @@ fn ts_object_literal_property_at_key<'tree>(
 #[allow(clippy::too_many_arguments)]
 fn ts_contextual_object_literal_owners(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -546,7 +547,7 @@ fn resolve_js_ts_module_binding(
     module: &str,
     exported_name: &str,
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     aliases: Option<&AliasResolver>,
     value_position: bool,
 ) -> DefinitionLookupOutcome {
@@ -592,7 +593,7 @@ fn resolve_js_ts_module_binding(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_js_ts_module_binding_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     language: Language,
     file: &ProjectFile,
     module: &str,
@@ -642,7 +643,7 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
 /// paths, so callers that have already resolved a receiver must retain this scope.
 fn jsts_file_scoped_dotted_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     reference: &str,
     value_position: bool,
@@ -663,7 +664,7 @@ fn jsts_file_scoped_dotted_candidates(
 #[derive(Clone, Copy)]
 struct JstsScopedDottedLookup<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     root: Node<'tree>,
     source: &'a str,
@@ -702,7 +703,7 @@ fn jsts_exact_scoped_dotted_candidates(ctx: JstsScopedDottedLookup<'_, '_>) -> V
 
 fn jsts_exact_dotted_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     reference: &str,
     value_position: bool,
@@ -1020,7 +1021,7 @@ fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
 
 fn jsts_module_export_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     language: Language,
     files: &[ProjectFile],
     exported_name: &str,
@@ -1081,7 +1082,7 @@ fn jsts_reference_prefix_for_focus(site: &ResolvedReferenceSite) -> Option<Strin
 /// member-expression whose object is a `new_expression`.
 fn jsts_construction_receiver_members(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -1126,7 +1127,7 @@ fn jsts_construction_receiver_members(
 #[allow(clippy::too_many_arguments)]
 fn jsts_receiver_provider_member_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -1181,7 +1182,7 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 
 fn jsts_member_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
     value_position: bool,
@@ -1219,7 +1220,7 @@ fn jsts_file_scoped_member_candidates(
 
 fn ts_member_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
     value_position: bool,
@@ -1275,7 +1276,7 @@ fn ts_member_candidates(
 
 fn ts_synthetic_member_is_supported_by_receiver_initializer(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     receiver: &CodeUnit,
     member: &str,
 ) -> bool {
@@ -1400,7 +1401,7 @@ fn ts_object_literal_has_member(object: Node<'_>, source: &str, member: &str) ->
 #[allow(clippy::too_many_arguments)]
 fn ts_call_preserves_argument_shape(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -1539,7 +1540,7 @@ fn ts_expression_preserves_parameter_shape(
 #[allow(clippy::too_many_arguments)]
 fn ts_local_receiver_owner_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -1564,7 +1565,7 @@ fn ts_local_receiver_owner_candidates(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ts_receiver_owner_candidates_at_byte(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1590,7 +1591,7 @@ pub(crate) fn ts_receiver_owner_candidates_at_byte(
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owner_candidates_at_byte_with_resolution(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1676,7 +1677,7 @@ fn jsts_enclosing_function_or_program_scope(root: Node<'_>, byte: usize) -> Opti
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owners_from_parameters(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -1747,7 +1748,7 @@ fn ts_receiver_owners_from_parameters(
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owners_from_contextual_callback(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -1828,7 +1829,7 @@ fn ts_callback_argument_context(scope: Node<'_>) -> Option<(Node<'_>, usize)> {
 
 fn ts_callback_parameter_owners_from_callee(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     callee: &CodeUnit,
     argument_index: usize,
     callback_parameter_index: usize,
@@ -1960,7 +1961,7 @@ fn ts_split_top_level_commas(text: &str) -> Vec<&str> {
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owners_from_local_bindings(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -1996,7 +1997,7 @@ fn ts_receiver_owners_from_local_bindings(
 #[allow(clippy::too_many_arguments)]
 fn ts_collect_receiver_owners_from_bindings(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -2097,7 +2098,7 @@ fn ts_collect_receiver_owners_from_bindings(
 #[allow(clippy::too_many_arguments)]
 fn ts_expression_property_owners(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -2205,7 +2206,7 @@ fn ts_expression_property_owners(
 #[allow(clippy::too_many_arguments)]
 fn jsts_local_new_receiver_owner_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -2244,7 +2245,7 @@ fn jsts_local_new_receiver_owner_candidates(
 #[allow(clippy::too_many_arguments)]
 fn jsts_collect_local_new_receiver_owner_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -2338,7 +2339,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
 #[allow(clippy::too_many_arguments)]
 fn jsts_local_receiver_value_owner_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -2405,7 +2406,7 @@ fn jsts_local_receiver_value_owner_candidates(
 #[allow(clippy::too_many_arguments)]
 fn jsts_call_expression_callees(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -2431,7 +2432,7 @@ fn jsts_call_expression_callees(
 #[allow(clippy::too_many_arguments)]
 fn jsts_constructor_owner_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -2485,7 +2486,7 @@ fn jsts_constructor_name<'a>(constructor: Node<'_>, source: &'a str) -> Option<&
 #[allow(clippy::too_many_arguments)]
 fn ts_call_expression_callees(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -2558,7 +2559,7 @@ fn ts_call_expression_callees(
 #[allow(clippy::too_many_arguments)]
 fn ts_expression_receiver_owners(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -2615,7 +2616,7 @@ fn root_node(mut node: Node<'_>) -> Node<'_> {
 #[allow(clippy::too_many_arguments)]
 fn ts_identifier_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -2639,7 +2640,7 @@ fn ts_identifier_candidates(
 #[allow(clippy::too_many_arguments)]
 fn jsts_identifier_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     language: Language,
     file: &ProjectFile,
     _source: &str,
@@ -2682,7 +2683,7 @@ fn jsts_identifier_candidates(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ts_resolve_type_text_to_property_owners(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -2755,7 +2756,7 @@ pub(crate) fn ts_resolve_type_text_to_property_owners(
 
 fn ts_expand_property_owners(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     candidates: Vec<CodeUnit>,
     depth: usize,
 ) -> Vec<CodeUnit> {
@@ -2806,7 +2807,7 @@ fn ts_expand_property_owners(
 
 fn ts_resolve_type_from_unit_context(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     unit: &CodeUnit,
     type_text: &str,
     depth: usize,
@@ -2833,7 +2834,7 @@ fn ts_resolve_type_from_unit_context(
 
 pub(crate) fn ts_function_return_property_owners(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     function: &CodeUnit,
     depth: usize,
 ) -> Vec<CodeUnit> {
@@ -2909,7 +2910,7 @@ fn ts_nodes_for_code_unit<'tree>(
 #[allow(clippy::too_many_arguments)]
 fn ts_collect_return_property_owners(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -2966,7 +2967,7 @@ fn ts_collect_return_property_owners(
 #[allow(clippy::too_many_arguments)]
 fn ts_field_signature_type_owners(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,

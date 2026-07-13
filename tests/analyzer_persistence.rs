@@ -93,8 +93,14 @@ fn assert_warm_multilanguage_definition_query(
         });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
+    analyzer.reset_definition_lookup_index_build_count_for_test();
+    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer.reset_workspace_path_scan_count_for_test();
+    analyzer.reset_scala_project_types_build_count_for_test();
     assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
     assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
+    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
 
     let result = brokk_bifrost::searchtools::get_definitions_by_location(
         analyzer,
@@ -110,6 +116,18 @@ fn assert_warm_multilanguage_definition_query(
     );
     assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
     assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
+    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+}
+
+fn write_unrelated_generated_files(root: &Path, extension: &str, body: &str) {
+    for index in 0..32 {
+        write_file(
+            root,
+            &format!("generated/unrelated_{index}.{extension}"),
+            body,
+        );
+    }
 }
 
 fn declaration_names(analyzer: &dyn IAnalyzer) -> BTreeSet<String> {
@@ -196,6 +214,165 @@ fn warm_multilanguage_rust_definition_query_does_not_build_full_definition_index
             column: Some(reference_line.find("Number").unwrap() + 1),
         },
         "value.Value.Number",
+    );
+}
+
+#[test]
+fn warm_scala_inherited_member_query_is_candidate_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "app/Model.scala",
+        "package app\nclass Base { def value: Int = 1 }\nclass Child extends Base\nobject Child { def value: Int = 2 }\n",
+    );
+    let caller = "package app\nclass Controller { def run(child: Child): Int = child.value }\n";
+    write_file(root, "app/Controller.scala", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    write_unrelated_generated_files(
+        root,
+        "scala",
+        "package generated\nclass Unrelated { def ignored: Int = 0 }\n",
+    );
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let line = caller.lines().nth(1).unwrap();
+    assert_warm_multilanguage_definition_query(
+        language_python_project(root, Language::Scala),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "app/Controller.scala".to_string(),
+            line: Some(2),
+            column: Some(line.find("value").unwrap() + 1),
+        },
+        "app.Base.value",
+    );
+}
+
+#[test]
+fn warm_scala_class_and_singleton_type_batch_is_candidate_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "app/Settings.scala",
+        "package app\nclass Settings { def value: Int = 0 }\nobject Settings { def value: Int = 1 }\n",
+    );
+    let caller = "package app\nclass Controller { def run(plain: Settings, singleton: Settings.type): Int = plain.value + singleton.value }\n";
+    write_file(root, "app/Controller.scala", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    write_unrelated_generated_files(root, "scala", "package generated\nclass UnrelatedType\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let project = language_python_project(root, Language::Scala);
+    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let events = Arc::clone(&warm_events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    let analyzer = warm.analyzer();
+    assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
+    analyzer.reset_definition_lookup_index_build_count_for_test();
+    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer.reset_workspace_path_scan_count_for_test();
+    analyzer.reset_scala_project_types_build_count_for_test();
+
+    let line = caller.lines().nth(1).unwrap();
+    let result = brokk_bifrost::searchtools::get_type_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetTypeParams {
+            references: vec![
+                brokk_bifrost::searchtools::TypeReferenceQuery {
+                    path: "app/Controller.scala".to_string(),
+                    line: Some(2),
+                    column: Some(line.find("plain.value").unwrap() + 1),
+                },
+                brokk_bifrost::searchtools::TypeReferenceQuery {
+                    path: "app/Controller.scala".to_string(),
+                    line: Some(2),
+                    column: Some(line.find("singleton.value").unwrap() + 1),
+                },
+            ],
+        },
+    );
+
+    assert_eq!(result.results[0].status, "resolved");
+    assert_eq!(result.results[0].types[0].fqn, "app.Settings");
+    assert_eq!(result.results[1].status, "resolved");
+    assert_eq!(result.results[1].types[0].fqn, "app.Settings$");
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
+    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+}
+
+#[test]
+fn warm_typescript_path_module_query_does_not_scan_live_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(root, "util.ts", "export function helper() {}\n");
+    let caller = "import { helper } from \"./util\";\nhelper();\n";
+    write_file(root, "app.ts", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    write_unrelated_generated_files(root, "ts", "export const ignored = 1;\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    assert_warm_multilanguage_definition_query(
+        language_python_project(root, Language::TypeScript),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "app.ts".to_string(),
+            line: Some(2),
+            column: Some(1),
+        },
+        "helper",
+    );
+}
+
+#[test]
+fn warm_javascript_path_module_query_does_not_scan_live_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "components.js",
+        "export class Greeter { greet() {} }\nexport function createGreeter() { return new Greeter(); }\n",
+    );
+    let caller = "import { createGreeter } from \"./components.js\";\nconst greeter = createGreeter();\ngreeter.greet();\n";
+    write_file(root, "app.js", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    write_unrelated_generated_files(root, "js", "export const ignored = 1;\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    assert_warm_multilanguage_definition_query(
+        language_python_project(root, Language::JavaScript),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "app.js".to_string(),
+            line: Some(3),
+            column: Some("greeter.".len() + 1),
+        },
+        "Greeter.greet",
+    );
+}
+
+#[test]
+fn warm_python_path_module_query_does_not_scan_live_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(root, "pkg/util.py", "def helper():\n    pass\n");
+    let caller = "import pkg.util as util\n\ndef run():\n    util.helper()\n";
+    write_file(root, "app.py", caller);
+    write_unrelated_generated_files(root, "py", "def ignored():\n    return 1\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    assert_warm_multilanguage_definition_query(
+        python_project(root),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "app.py".to_string(),
+            line: Some(4),
+            column: Some("    util.".len() + 1),
+        },
+        "pkg.util.helper",
     );
 }
 

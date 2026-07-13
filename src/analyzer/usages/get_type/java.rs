@@ -3,11 +3,12 @@ use crate::analyzer::usages::get_definition::{
     JavaTypeLookupResolution, java_type_lookup_resolution,
 };
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile};
 use tree_sitter::Tree;
 
 pub(super) fn resolve_java_type(
     analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -29,7 +30,7 @@ pub(super) fn resolve_java_type(
     };
     match resolution {
         JavaTypeLookupResolution::Type { fqn, target_kind } => {
-            let candidates = analyzer.definition_lookup_index().fqn(&fqn);
+            let candidates = support.fqn(&fqn);
             if candidates.is_empty() {
                 return no_type(
                     "no_indexed_type_definition",

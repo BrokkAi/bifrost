@@ -190,8 +190,17 @@ impl<'a> ScalaVisitor<'a> {
             .add_signature(code_unit.clone(), scala_type_signature(node, self.source));
         let raw_supertypes = extract_scala_supertypes(node, self.source);
         if !raw_supertypes.is_empty() {
-            self.parsed
-                .set_raw_supertypes(code_unit.clone(), raw_supertypes);
+            self.parsed.set_raw_supertypes(
+                code_unit.clone(),
+                raw_supertypes.iter().map(|fact| fact.raw.clone()).collect(),
+            );
+            self.parsed.set_supertype_lookup_paths(
+                code_unit.clone(),
+                raw_supertypes
+                    .into_iter()
+                    .map(|fact| fact.lookup_path)
+                    .collect(),
+            );
         }
         if node.kind() == "trait_definition" {
             self.parsed.set_scala_trait(code_unit.clone());

@@ -18,7 +18,7 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverSummaryQuery, ReceiverValue,
 };
 use crate::analyzer::{
-    AliasResolver, CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile, Range,
+    AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, Range,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -29,7 +29,7 @@ const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
 
 pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     analyzer: &'a dyn IAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a dyn BoundedDefinitionLookup,
     language: Language,
     file: &'a ProjectFile,
     source: &'a str,
@@ -46,7 +46,7 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     pub(crate) fn new(
         analyzer: &'a dyn IAnalyzer,
-        support: &'a DefinitionLookupIndex,
+        support: &'a dyn BoundedDefinitionLookup,
         language: Language,
         file: &'a ProjectFile,
         source: &'a str,

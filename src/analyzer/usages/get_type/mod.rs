@@ -3,9 +3,8 @@ use crate::analyzer::usages::get_definition::{RustTypeLookupCache, parse_tree_fo
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
 };
-use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::sync::Arc;
@@ -76,29 +75,25 @@ pub(crate) fn resolve_type_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<TypeLookupRequest>,
 ) -> Vec<TypeLookupOutcome> {
-    let mut context = TypeBatchContext::new(analyzer);
+    let mut context = TypeBatchContext::new();
     requests
         .into_iter()
         .map(|request| resolve_one(analyzer, &mut context, request))
         .collect()
 }
 
-struct TypeBatchContext<'a> {
-    support: &'a DefinitionLookupIndex,
+struct TypeBatchContext {
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     rust_cache: RustTypeLookupCache,
-    scala_project_types: Option<Arc<ScalaProjectTypes>>,
 }
 
-impl<'a> TypeBatchContext<'a> {
-    fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+impl TypeBatchContext {
+    fn new() -> Self {
         Self {
-            support: analyzer.definition_lookup_index(),
             sources: HashMap::default(),
             trees: HashMap::default(),
             rust_cache: RustTypeLookupCache::default(),
-            scala_project_types: None,
         }
     }
 
@@ -119,20 +114,11 @@ impl<'a> TypeBatchContext<'a> {
             .or_insert_with(|| parse_tree_for_type_lookup(file, language, source))
             .clone()
     }
-
-    fn scala_project_types(
-        &mut self,
-        scala: &crate::analyzer::ScalaAnalyzer,
-    ) -> Arc<ScalaProjectTypes> {
-        self.scala_project_types
-            .get_or_insert_with(|| scala.project_types())
-            .clone()
-    }
 }
 
 fn resolve_one(
     analyzer: &dyn IAnalyzer,
-    context: &mut TypeBatchContext<'_>,
+    context: &mut TypeBatchContext,
     request: TypeLookupRequest,
 ) -> TypeLookupOutcome {
     let file = request.file.clone();
@@ -187,10 +173,17 @@ fn resolve_one(
             csharp::resolve_csharp_type(analyzer, &file, &source, tree.as_ref(), &site)
         }
         Language::Go => go::resolve_go_type(analyzer, &file, &source, tree.as_ref(), &site),
-        Language::Java => java::resolve_java_type(analyzer, &file, &source, tree.as_ref(), &site),
+        Language::Java => java::resolve_java_type(
+            analyzer,
+            &crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, language),
+            &file,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
         Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts_type(
             analyzer,
-            context.support,
+            &crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, language),
             &file,
             language,
             &source,

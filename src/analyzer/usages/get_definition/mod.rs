@@ -60,24 +60,25 @@ use crate::analyzer::usages::ruby_graph::{
     symbol_or_string_value as ruby_symbol_or_string_value,
 };
 use crate::analyzer::usages::scala_graph::{
-    ScalaNameResolver, ScalaProjectTypes, import_candidate_fq_names,
-    import_candidate_owner_fq_names, package_name_of as scala_package_name_of,
-    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_import_path,
-    scala_literal_type_name, scala_node_text, scala_normalized_fq_name,
-    scala_visible_type_fqn_from_index,
+    import_candidate_fq_names, import_candidate_owner_fq_names,
+    package_name_of as scala_package_name_of, scala_builtin_type_name,
+    scala_extension_receiver_matches_resolved, scala_import_path, scala_literal_type_name,
+    scala_node_text, scala_normalized_fq_name,
 };
 use crate::analyzer::{
-    AliasResolver, CSharpAnalyzer, CodeUnit, CppAnalyzer, DefinitionLookupIndex, GoAnalyzer,
-    IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile,
-    PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, cpp_include_paths,
-    cpp_node_text, csharp_callable_arity, resolve_analyzer, resolve_include_targets,
+    AliasResolver, AnalyzerDefinitionLookup, BoundedDefinitionLookup, CSharpAnalyzer, CodeUnit,
+    CppAnalyzer, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
+    PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
+    cpp_include_paths, cpp_node_text, csharp_callable_arity, resolve_analyzer,
+    resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 pub(crate) use rust::{
-    RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_is_type_definition,
+    AnalyzerRustDefinitionProvider, RustTypeLookupCache,
+    rust_expression_type_definition_fqn_cached, rust_is_type_definition,
     rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};
@@ -99,7 +100,10 @@ pub(crate) use call_sites::{
     call_reference_ranges, call_signature_context, is_call_reference_range_in_tree,
 };
 pub(crate) use csharp::{CSharpTypeLookupResolution, csharp_type_lookup_resolution};
-pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
+pub(crate) use go::{
+    AnalyzerGoDefinitionProvider, GoDefinitionProvider, GoTypeLookupResolutionKind,
+    go_type_lookup_resolution,
+};
 pub(crate) use java::{
     JavaTypeLookupResolution, java_lombok_accessor_field_candidates, java_type_lookup_resolution,
 };
@@ -302,14 +306,12 @@ pub(crate) fn resolve_call_reference_definition_with_source(
 }
 
 struct DefinitionBatchContext<'a> {
-    analyzer: &'a dyn IAnalyzer,
-    support: OnceLock<&'a DefinitionLookupIndex>,
+    bounded_support: AnalyzerDefinitionLookup<'a>,
     rust_support: Option<rust::AnalyzerRustDefinitionProvider<'a>>,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
-    scala_project_types: Option<Arc<ScalaProjectTypes>>,
     python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
     #[cfg(test)]
     python_build_counters: Arc<python::PythonDefinitionBuildCounters>,
@@ -318,28 +320,21 @@ struct DefinitionBatchContext<'a> {
 impl<'a> DefinitionBatchContext<'a> {
     fn new(analyzer: &'a dyn IAnalyzer, cache_rust_lookups: bool) -> Self {
         Self {
-            analyzer,
-            support: OnceLock::new(),
+            bounded_support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             rust_support: resolve_analyzer::<RustAnalyzer>(analyzer)
                 .map(|rust| rust::AnalyzerRustDefinitionProvider::new(rust, cache_rust_lookups)),
             sources: HashMap::default(),
             trees: HashMap::default(),
             line_starts: HashMap::default(),
             cpp_visibility: HashMap::default(),
-            scala_project_types: None,
             python_contexts: HashMap::default(),
             #[cfg(test)]
             python_build_counters: Arc::default(),
         }
     }
 
-    fn support(&self) -> &'a DefinitionLookupIndex {
-        let _scope = profiling::scope("get_definition::definition_lookup_index");
-        if profiling::enabled() {
-            profiling::note(format!("cached={}", self.support.get().is_some()));
-        }
-        self.support
-            .get_or_init(|| self.analyzer.definition_lookup_index())
+    fn bounded_support(&self) -> &dyn BoundedDefinitionLookup {
+        &self.bounded_support
     }
 
     fn source(&mut self, file: &ProjectFile) -> Result<Arc<String>, String> {
@@ -382,13 +377,6 @@ impl<'a> DefinitionBatchContext<'a> {
             })
             .clone()
     }
-
-    fn scala_project_types(&mut self, scala: &ScalaAnalyzer) -> Arc<ScalaProjectTypes> {
-        self.scala_project_types
-            .get_or_insert_with(|| scala.project_types())
-            .clone()
-    }
-
     fn python_context(
         &mut self,
         py: &PythonAnalyzer,
@@ -433,6 +421,7 @@ fn resolve_one(
 ) -> DefinitionLookupOutcome {
     let _scope = profiling::scope("get_definition::resolve_one");
     let language = language_for_file(&request.file);
+    context.bounded_support.set_language(language);
     if profiling::enabled() {
         profiling::note(format!("language={language:?}"));
     }
@@ -529,7 +518,7 @@ fn resolve_one(
         ),
         Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts(
             analyzer,
-            context.support(),
+            context.bounded_support(),
             &request.file,
             language,
             &source,
@@ -567,7 +556,7 @@ fn resolve_one(
         }
         Language::Java => java::resolve_java(
             analyzer,
-            context.support(),
+            context.bounded_support(),
             &request.file,
             &source,
             tree.as_ref(),
@@ -575,7 +564,7 @@ fn resolve_one(
         ),
         Language::Php => php::resolve_php(
             analyzer,
-            context.support(),
+            context.bounded_support(),
             &request.file,
             &source,
             tree.as_ref(),
@@ -621,7 +610,7 @@ fn resolve_one(
         ),
         Language::Ruby => ruby::resolve_ruby(
             analyzer,
-            context.support(),
+            context.bounded_support(),
             &request.file,
             &source,
             tree.as_ref(),

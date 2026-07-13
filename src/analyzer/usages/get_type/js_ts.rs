@@ -14,13 +14,13 @@ use crate::analyzer::usages::reference_site::{
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
-    AliasResolver, CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile,
+    AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
 };
 use tree_sitter::{Node, Tree};
 
 pub(super) fn resolve_js_ts_type(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -170,7 +170,7 @@ pub(super) fn resolve_js_ts_type(
 #[allow(clippy::too_many_arguments)]
 fn resolve_declared_type_text(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     imports: &ImportBinder,
@@ -225,7 +225,7 @@ fn resolve_declared_type_text(
 
 fn resolve_declared_type_name(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     imports: &ImportBinder,
@@ -247,7 +247,7 @@ fn resolve_declared_type_name(
 #[allow(clippy::too_many_arguments)]
 fn identifier_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
     imports: &ImportBinder,
@@ -640,7 +640,7 @@ fn leading_type_identifier(text: &str) -> Option<&str> {
 #[allow(clippy::too_many_arguments)]
 fn qualified_imported_type_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     type_node: Node<'_>,
     source: &str,

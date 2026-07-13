@@ -5,15 +5,15 @@ use crate::analyzer::usages::cpp_call_match::{
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppAnalyzer, DefinitionLookupIndex, IAnalyzer, IncludeTargetIndex,
-    ProjectFile, cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
+    CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
+    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
     resolve_include_targets_with_index,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::hash::Hash;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,7 +164,6 @@ impl CppScanBinding {
 }
 
 pub(in crate::analyzer::usages) struct VisibilityIndex {
-    definitions: Arc<DefinitionLookupIndex>,
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     alias_source_files: HashSet<ProjectFile>,
@@ -227,7 +226,6 @@ impl VisibilityIndex {
         }
         let visible_by_identifier = build_visible_identifier_index(&visible_by_file);
         Self {
-            definitions: cpp.definition_lookup_index_shared(),
             visible_by_file,
             visible_by_identifier,
             alias_source_files: files,
@@ -245,14 +243,6 @@ impl VisibilityIndex {
                 .visible_by_file
                 .get(file)
                 .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
-    }
-
-    fn is_in_visible_closure(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
-        file == target.source()
-            || self
-                .visible_by_file
-                .get(file)
-                .is_some_and(|visible| visible.contains(target))
     }
 
     pub(in crate::analyzer::usages) fn visible_units<'b>(
@@ -499,10 +489,14 @@ impl VisibilityIndex {
         owner: &CodeUnit,
         name: &str,
     ) -> Vec<&'b CodeUnit> {
-        self.definitions
-            .members_for_owner_name(&owner.fq_name(), &owner.fq_name(), name)
-            .into_iter()
-            .filter(|unit| self.is_in_visible_closure(file, unit))
+        self.visible_units(file)
+            .filter(|unit| {
+                unit.identifier() == name
+                    && unit
+                        .fq_name()
+                        .rsplit_once('.')
+                        .is_some_and(|(parent, _)| parent == owner.fq_name())
+            })
             .collect()
     }
 
@@ -540,16 +534,11 @@ impl VisibilityIndex {
         kind: TargetKind,
     ) -> Vec<&'b CodeUnit> {
         if normalized.contains("::") {
-            let mut candidates = Vec::new();
-            for fqn in cpp_reference_fqn_candidates(normalized, kind) {
-                candidates.extend(
-                    self.definitions
-                        .by_fqn(&fqn)
-                        .iter()
-                        .filter(|unit| self.is_in_visible_closure(file, unit)),
-                );
-            }
-            return candidates;
+            let fqns = cpp_reference_fqn_candidates(normalized, kind);
+            return self
+                .visible_units(file)
+                .filter(|unit| fqns.iter().any(|fqn| unit.fq_name() == *fqn))
+                .collect();
         }
         self.visible_identifier_candidates(file, normalized)
             .collect()

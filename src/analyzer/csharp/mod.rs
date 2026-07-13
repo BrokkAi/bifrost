@@ -78,6 +78,8 @@ pub struct CSharpAnalyzer {
     memo_caches: Arc<CSharpMemoCaches>,
 }
 
+crate::analyzer::impl_forward_query_provider!(CSharpAnalyzer);
+
 impl CSharpAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
@@ -415,11 +417,10 @@ impl CSharpAnalyzer {
     }
 
     fn type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.definition_lookup_index()
-            .by_fqn(fqn)
-            .iter()
+        self.inner
+            .forward_definition_fqn(fqn)
+            .into_iter()
             .filter(|unit| unit.is_class())
-            .cloned()
             .collect()
     }
 }
@@ -886,6 +887,15 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
+    }
+
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.inner
+            .reset_definition_lookup_index_build_count_for_test();
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.inner.definition_lookup_index_build_count_for_test()
     }
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {

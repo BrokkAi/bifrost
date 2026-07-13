@@ -54,6 +54,8 @@ pub struct RustAnalyzer {
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
 
+crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
+
 impl RustAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
