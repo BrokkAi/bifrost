@@ -14,7 +14,7 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 
 - [x] (2026-07-13 09:55Z) Verified issue #697, fetched current refs, and confirmed the checkout is the matching feature branch at the same commit as `origin/master`.
 - [x] (2026-07-13 09:55Z) Traced the MCP session, benchmark runner, CLI/report, workflow, watcher/snapshot, and definition-index code paths.
-- [ ] Implement a continuously running standard-error drain with a bounded sequenced tail, explicit shutdown, and focused tests that exceed normal pipe capacity.
+- [x] (2026-07-13 10:07Z) Implemented a continuously running standard-error drain with a 256 KiB production tail, sequenced request cursors, explicit child-before-reader shutdown, poison recovery, and focused tests that push over 2 MiB through a bounded socket.
 - [ ] Add opt-in CLI and runner profiling configuration, per-iteration trace artifacts, failure-tail reporting, compact optional report references, and the manual workflow input.
 - [ ] Add disabled-by-default scopes and counters around watcher delta application, snapshot updates, definition batch/language dispatch, live-key enumeration, persisted row fetch, row resolution, dirty/nonpersisted units, and definition-index construction.
 - [ ] Run formatting, focused tests, the benchmark integration suite, Clippy with all targets and features, and the full feature-enabled test suite; update this plan with evidence and outcomes.
@@ -29,6 +29,9 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 
 - Observation: The existing `BIFROST_TIMING` implementation already avoids printing when disabled, and scopes can be added without changing report schemas unless profiling itself is requested.
   Evidence: `src/profiling.rs::Scope::new` and `profiling::note` guard output with `profiling::enabled()`.
+
+- Observation: `cargo test benchmark::mcp_session` builds every integration-test target before applying the name filter, which made the first focused invocation spend several minutes linking unrelated binaries.
+  Evidence: Interrupting that invocation and running `cargo test --lib benchmark::mcp_session` reused the compiled library and completed with 3 passing tests in 0.41 seconds.
 
 ## Decision Log
 
@@ -50,7 +53,7 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. The initial investigation established the unsafe pipe lifecycle and the exact instrumentation boundaries. No production behavior has changed yet.
+The first milestone is complete. Every MCP child now has its standard error consumed from the moment it is spawned, so a full pipe cannot deadlock a request. The drain retains only a bounded newest tail, supports request cursors needed by the next artifact milestone, and shuts down after the child has been killed and waited. Profiling artifacts and hot-path scopes remain to be implemented.
 
 ## Context and Orientation
 
@@ -79,7 +82,7 @@ All commands run from `/Users/dave/.codex/worktrees/195f/bifrost`.
 Create and verify the drain milestone:
 
     cargo fmt
-    cargo test benchmark::mcp_session
+    cargo test --lib benchmark::mcp_session
 
 Expected evidence is that a test writes substantially more than 64 KiB of standard-error data, the reader reaches end-of-file without blocking, the captured byte count stays at or below its configured bound, and the final marker remains in the tail.
 
@@ -150,3 +153,5 @@ In `src/benchmark/report.rs`, add an optional profile artifact field with `#[ser
 In `src/profiling.rs`, continue to use the existing environment-gated `scope` and `note` API. Do not add a logging framework or always-on counters.
 
 Plan revision note (2026-07-13 09:55Z): Created the initial self-contained plan after live issue verification and source-path investigation. The design chooses an always-on safety drain with opt-in artifact writing so deadlock prevention is unconditional while report churn remains opt-in.
+
+Plan revision note (2026-07-13 10:07Z): Recorded completion and focused-test evidence for the safe drain milestone, plus the discovery that unit-test filters require `--lib` here to avoid linking all integration targets.
