@@ -650,7 +650,7 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
     );
     assert!(json_response["error"].is_null(), "{json_response}");
     assert_eq!(
-        json_response["result"]["matches"].as_array().unwrap().len(),
+        json_response["result"]["results"].as_array().unwrap().len(),
         2
     );
     let text = response["result"]["text"]

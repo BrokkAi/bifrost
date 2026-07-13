@@ -260,7 +260,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
     for (index, entry) in entries.iter().enumerate() {
         let entry_path = index_path(path, index);
         let object = as_object(entry, &entry_path)?;
-        check_known_fields(object, &entry_path, &["op"])?;
+        if let Some(key) = object.keys().find(|key| key.as_str() != "op") {
+            return Err(QueryError::new(
+                child_path(&entry_path, key),
+                "unknown field in query step object",
+            ));
+        }
         let op_path = child_path(&entry_path, "op");
         let label = object
             .get("op")

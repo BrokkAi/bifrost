@@ -1691,6 +1691,7 @@ mod tests {
             r#"(call :callee "run")"#,
             r#"(import :module "os")"#,
             r#"(result-detail "full" (call))"#,
+            r#"(imports-of (file-of (class)))"#,
         ] {
             CodeQuery::from_source(source)
                 .unwrap_or_else(|error| panic!("{source:?} should execute: {error}"));
@@ -1718,6 +1719,35 @@ mod tests {
             assert_eq!(&source[help.range], expected_range);
         }
         assert!(query_source_help_at(source, source.find("run").unwrap()).is_none());
+    }
+
+    #[test]
+    fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
+        let rql = "(file-of (enclosing-decl (call)))";
+        for token in ["file-of", "enclosing-decl"] {
+            let offset = rql.find(token).unwrap();
+            let help =
+                query_source_help_at(rql, offset).unwrap_or_else(|| panic!("no help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        let json = r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;
+        for token in ["steps", "op", "file_of"] {
+            let offset = json.find(token).unwrap();
+            let help =
+                query_source_help_at(json, offset).unwrap_or_else(|| panic!("no help for {token}"));
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(json).is_empty());
+
+        let invalid =
+            r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"imports_of"}]}"#;
+        let diagnostic = validate_query_source(invalid).pop().expect("diagnostic");
+        assert_eq!(diagnostic.code, "invalid-query");
+        assert_eq!(&invalid[diagnostic.range], r#"{"op":"imports_of"}"#);
+        assert!(diagnostic.message.contains("requires file"));
     }
 
     #[test]

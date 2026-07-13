@@ -73,7 +73,7 @@ test("reports request failures through the error UI", async () => {
     { languageId: RQL_LANGUAGE_ID, text: "(class" },
     runner({
       sendRequest: async () => {
-        throw new Error("Failed to parse RQL query: unexpected end of input");
+        throw new Error("Failed to parse query source: unexpected end of input");
       },
       showError: (message) => errors.push(message)
     })
@@ -81,7 +81,7 @@ test("reports request failures through the error UI", async () => {
 
   assert.equal(response, undefined);
   assert.deepEqual(errors, [
-    "Bifrost RQL query failed: Failed to parse RQL query: unexpected end of input"
+    "Bifrost RQL query failed: Failed to parse query source: unexpected end of input"
   ]);
 });
 

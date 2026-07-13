@@ -25,6 +25,9 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 - [x] (2026-07-13) Migrated the private LSP/VS Code RQL protocol to canonical tagged `results`, retained provenance, added navigable URIs, and taught the Explorer view to render structural matches, declarations, and files.
 - [x] (2026-07-13) Extended the LSP and extension tests across all three result variants; the focused LSP test and all 36 VS Code lint/build/unit checks pass, and strict all-feature Clippy passes.
 - [x] (2026-07-13) Re-ran the broader gates after the master integration: all 178 LSP tests, the full `nlp,python` Rust matrix, 38 Python tests, `nlp` doctests, query/docs/tutorial suites, formatting, strict Clippy, and all 36 VS Code checks pass.
+- [x] (2026-07-13) Rebasing again after `master` advanced with PR #730, resolved the schema-v1 live-lint conflicts semantically, and registered schema-v2 steps and pipeline wrappers in the shared decoder/help metadata.
+- [x] (2026-07-13) Added live diagnostics and hover coverage for RQL wrappers and JSON steps; all 50 query tests, the typed LSP execution test, and the expanded 45-test VS Code suite pass.
+- [x] (2026-07-13) Re-ran strict all-target/all-feature Clippy and the full `nlp,python` Rust matrix after the final `master` integration; the 759-test library suite and all 179 LSP tests pass, including an isolated retry of the timing-sensitive drop-cleanup test after one parallel-run SIGKILL.
 
 ## Surprises & Discoveries
 
@@ -57,6 +60,9 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 - Observation: A concurrent `master` change can break only the pull request's synthetic merge commit even when the feature branch and its local full suite are green.
   Evidence: PR #712 added `src/lsp/server.rs` after this branch fork and read `CodeQueryResult.matches`; all six Rust CI targets for PR #731 failed on that stale field while the branch itself contained no LSP query consumer.
+
+- Observation: `master` advanced again during CI validation with schema-driven live RQL linting and hover help.
+  Evidence: PR #730 introduced a shared `RqlForm`/`QueryField` registry and source diagnostics against schema v1, requiring the new pipeline wrappers, `steps` field, and schema version 2 to be added to that registry rather than restored as parallel hard-coded lists.
 
 ## Decision Log
 
@@ -104,11 +110,15 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
   Rationale: Reusing the canonical tagged value preserves structural, declaration, file, provenance, and future fields without another schema-v1-shaped consumer drifting from the query API.
   Date/Author: 2026-07-13 / Codex CI integration
 
+- Decision: Pipeline RQL forms and the JSON `steps` field are first-class entries in the shared query schema metadata used by parsing, REPL help, live diagnostics, and hover.
+  Rationale: Schema-driven consumers must learn the new vocabulary from one registry; retaining pipeline-only hard-coded help or decoder field lists would recreate the drift that caused CI to fail.
+  Date/Author: 2026-07-13 / Codex live-lint integration
+
 ## Outcomes & Retrospective
 
 The query IR, executor, public surface, and cookbook milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, full-detail stable identities, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. Guided-review regressions additionally prove that truncated pipelines never serialize an intermediate result domain, synthetic nearest units fall through to the smallest real declaration, reverse traversal is governed by source providers, and declaration-free JavaScript/TypeScript/Go/C++ imports still produce direct file edges. The MCP schema, CLI and saved-query mode, Python models/client, executable tutorial examples, and the concurrently added VS Code RQL runner now agree on tagged `results`.
 
-Final validation is green after the guided-review and `master` integration fixes: the focused pipeline suite passes 21 tests; the query-IR suite passes 34 tests; all 178 LSP tests pass; all 36 VS Code lint/build/unit checks pass; and the documentation/tutorial regressions pass. `scripts/test_python.sh` passes all 38 Python tests; `cargo clippy --all-targets --all-features -- -D warnings` passes; and every Rust unit and integration target passes with `--features nlp,python`. Because the local Cargo/Rustc installation lacks `rustdoc` and cannot consume the Homebrew toolchain's differently-versioned metadata, doctests were run separately with the Homebrew toolchain and the CI Rust feature set, `--doc --features nlp`; that gate also passes. No regex or text-search import fallback was introduced, all eight guided-review findings are fixed and verified, the six-platform CI compile failure is covered end to end, and no known issue-715 work remains.
+Final validation is green after the guided-review and `master` integration fixes: the focused pipeline suite passes 21 tests; the shared query/source suite passes 50 tests; all 45 VS Code lint/build/unit checks pass; and the documentation/tutorial regressions pass. `scripts/test_python.sh` passes all 38 Python tests; `cargo clippy --all-targets --all-features -- -D warnings` passes; and the 759-test Rust library plus all 179 LSP integration tests pass with `--features nlp,python`. One full-matrix attempt SIGKILLed the timing-sensitive LSP drop-cleanup test after 178 passes; the test passed both in isolation and on the immediate complete-target retry. Because the local Cargo/Rustc installation lacks `rustdoc` and cannot consume the Homebrew toolchain's differently-versioned metadata, doctests were run separately with the Homebrew toolchain and the CI Rust feature set, `--doc --features nlp`; that gate also passes. No regex or text-search import fallback was introduced, all eight guided-review findings are fixed and verified, the six-platform CI compile failure is covered end to end, and no known issue-715 work remains.
 
 ## Context and Orientation
 
@@ -205,6 +215,10 @@ Revision note (2026-07-13): Completed post-review validation and closed the retr
 Revision note (2026-07-13): Reopened the plan for PR #731's merge-build failure, rebased onto the concurrent VS Code RQL work, and recorded the typed LSP/editor integration plus focused validation.
 
 Revision note (2026-07-13): Completed post-rebase validation, including the full Rust, LSP, Python, doctest, and VS Code gates, and closed the CI integration milestone.
+
+Revision note (2026-07-13): Reopened final validation after PR #730 landed during the session, integrated schema-v2 pipeline metadata into live linting/hover, and added focused source-diagnostic coverage.
+
+Revision note (2026-07-13): Completed the final post-PR-730 validation, including strict Clippy, 50 query tests, 45 VS Code checks, the 759-test library suite, and all 179 LSP integration tests before updating PR #731.
 
 ## Interfaces and Dependencies
 
