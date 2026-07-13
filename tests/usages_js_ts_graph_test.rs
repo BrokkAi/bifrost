@@ -688,6 +688,84 @@ fn js_parent_of_module_scoped_export_const_returns_file_scope_module() {
 }
 
 #[test]
+fn ts_uninitialized_module_variable_bare_reads_preserve_exact_identity() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "target.ts",
+            r#"
+type HttpSetup = {};
+declare function send(client: HttpSetup, config: unknown): unknown;
+let httpClient: HttpSetup;
+
+export function request(config: unknown) {
+  if (!httpClient) {
+    throw new Error('missing client');
+  }
+  return send(httpClient, config);
+}
+
+export function shadowed(httpClient: HttpSetup) {
+  return send(httpClient, {});
+}
+
+export function uninitializedLocalShadow() {
+  let httpClient: HttpSetup;
+  return { client: httpClient };
+}
+"#,
+        )
+        .file(
+            "unrelated.ts",
+            r#"
+type HttpSetup = {};
+let httpClient: HttpSetup;
+
+export function request(config: unknown) {
+  if (!httpClient) {
+    throw new Error('missing client');
+  }
+  return send(httpClient, config);
+}
+"#,
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("target.ts"), |cu| {
+        cu.identifier() == "httpClient" && cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(
+        hits.len(),
+        2,
+        "only the target module variable's two unshadowed reads should match: {hits:?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.file == project.file("target.ts")),
+        "a same-name variable in another module must not match: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("if (!httpClient)")),
+        "the function-body read should be present: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("send(httpClient, config)")),
+        "the call-argument read should be present: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("client: httpClient")),
+        "an uninitialized function-local binding must shadow the module target: {hits:?}"
+    );
+}
+
+#[test]
 fn js_export_const_seed_resolves_destructured_import_usage() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

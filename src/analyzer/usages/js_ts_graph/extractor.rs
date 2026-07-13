@@ -373,7 +373,14 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
+    let lhs = slice(name_node, ctx.source);
+    if lhs.is_empty() {
+        return;
+    }
     let Some(value_node) = node.child_by_field_name("value") else {
+        if is_target_declaration_binding(name_node, lhs, ctx, false) {
+            return;
+        }
         register_pattern_bindings(name_node, ctx);
         return;
     };
@@ -386,17 +393,14 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    let lhs = slice(name_node, ctx.source);
-    if lhs.is_empty() {
-        return;
-    }
-    if is_target_declaration_binding(name_node, lhs, ctx) {
+    if is_target_declaration_binding(name_node, lhs, ctx, true) {
         if ctx.target_member.is_some_and(|member| member == lhs) {
             ctx.binding_engine
                 .seed_symbol(lhs.to_string(), TARGET_VALUE_BINDING);
         }
         return;
     }
+
     ctx.binding_engine.declare_shadow(lhs.to_string());
 
     if expression_carries_target_object(value_node, ctx) {
@@ -498,7 +502,12 @@ fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) ->
     target.identifier().trim_end_matches("$static").to_string()
 }
 
-fn is_target_declaration_binding(name_node: Node<'_>, lhs: &str, ctx: &ScanCtx<'_>) -> bool {
+fn is_target_declaration_binding(
+    name_node: Node<'_>,
+    lhs: &str,
+    ctx: &ScanCtx<'_>,
+    allow_owner_fallback: bool,
+) -> bool {
     if !ctx.target_self_file
         || (lhs != ctx.target_short && ctx.target_member.is_none_or(|member| lhs != member))
     {
@@ -517,6 +526,9 @@ fn is_target_declaration_binding(name_node: Node<'_>, lhs: &str, ctx: &ScanCtx<'
         .any(|target_range| range_within(&range, target_range))
     {
         return true;
+    }
+    if !allow_owner_fallback {
+        return false;
     }
     if let Some(owner) = ctx.target_owner
         && ctx
