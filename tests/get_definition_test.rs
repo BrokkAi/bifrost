@@ -12807,8 +12807,8 @@ namespace App {
 }
 
 #[test]
-fn csharp_extension_lookup_uses_identifier_index_and_preserves_proof_filters() {
-    let project = InlineTestProject::with_language(Language::CSharp)
+fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration() {
+    let mut project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Visible/Extensions.cs",
             "namespace Visible { public static class Extensions { public static int Convert(this string value) => 0; public static int Convert(this string value, int radix) => 0; public static int Convert(string value, int radix, bool ordinary) => 0; } }\n",
@@ -12819,11 +12819,18 @@ fn csharp_extension_lookup_uses_identifier_index_and_preserves_proof_filters() {
         )
         .file(
             "App/Runner.cs",
-            "using Visible;\nnamespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }\n",
-        )
-        .build();
+            "using static Visible.Extensions;\nnamespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }\n",
+        );
+    for index in 0..256 {
+        project = project.file(
+            format!("Noise{index}/Extensions.cs"),
+            format!(
+                "namespace Noise{index} {{ public static class Extensions {{ public static int Convert(this string value, int radix) => {index}; }} }}\n"
+            ),
+        );
+    }
+    let project = project.build();
     let analyzer = brokk_bifrost::CSharpAnalyzer::new(project.project_dyn());
-    analyzer.reset_full_declaration_scan_count_for_test();
     let extension_file = project.file("Visible/Extensions.cs");
     let extension = brokk_bifrost::IAnalyzer::declarations(&analyzer, &extension_file)
         .into_iter()
@@ -12832,6 +12839,8 @@ fn csharp_extension_lookup_uses_identifier_index_and_preserves_proof_filters() {
     let owner = brokk_bifrost::IAnalyzer::parent_of(&analyzer, &extension)
         .expect("extension method structural owner");
     assert_eq!(owner.fq_name(), "Visible.Extensions");
+    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer.reset_full_hydration_count_for_test();
     let line = "namespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }";
 
     let value = brokk_bifrost::searchtools::get_definitions_by_location(
@@ -12863,8 +12872,225 @@ fn csharp_extension_lookup_uses_identifier_index_and_preserves_proof_filters() {
     assert_eq!(
         analyzer.full_declaration_scan_count_for_test(),
         0,
-        "extension lookup must use the persisted identifier index"
+        "extension lookup must use persisted visibility indexes"
     );
+    assert!(
+        analyzer.full_hydration_count_for_test() <= 2,
+        "extension lookup may hydrate the consumer and visible declaration, but not unrelated same-name files"
+    );
+}
+
+#[test]
+fn csharp_fully_qualified_property_receiver_prefers_applicable_direct_member() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/Module.cs",
+            r#"namespace Demo {
+    public sealed class Module {
+        public static Module Instance { get; } = new Module();
+        public void Signal(int a, int b, int c, int d, int e, int f, int g, int h, int i) {}
+    }
+}
+"#,
+        )
+        .file(
+            "Demo/Extensions.cs",
+            r#"namespace Demo.Runtime {
+    public static class Extensions {
+        public static void Signal(this Demo.Module module, int value) {}
+        public static void Signal(this Demo.Module module, string value) {}
+    }
+}
+"#,
+        )
+        .file(
+            "App/Consumer.cs",
+            r#"using static Demo.Runtime.Extensions;
+namespace App {
+    public sealed class Consumer {
+        public void Run() { Demo.Module.Instance.Signal(1, 2, 3, 4, 5, 6, 7, 8, 9); }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line =
+        "        public void Run() { Demo.Module.Instance.Signal(1, 2, 3, 4, 5, 6, 7, 8, 9); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":4,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "inapplicable extensions must not replace the direct property receiver member: {value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "Demo.Module.Signal");
+    assert_eq!(
+        result["definitions"][0]["signature"],
+        "(int, int, int, int, int, int, int, int, int)"
+    );
+}
+
+#[test]
+fn csharp_dotted_value_receiver_precedes_same_spelled_type_path() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/Types.cs",
+            r#"namespace Demo {
+    public sealed class Module { public void Signal(int first, int second) {} }
+    public sealed class DirectTarget { public void Signal(string value) {} }
+    public sealed class Holder { public DirectTarget Module { get; } = new DirectTarget(); }
+}
+"#,
+        )
+        .file(
+            "App/Consumer.cs",
+            r#"namespace App {
+    public sealed class Consumer {
+        public void Run(Demo.Holder Demo) { Demo.Module.Signal("value"); }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        public void Run(Demo.Holder Demo) { Demo.Module.Signal(\"value\"); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":3,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.DirectTarget.Signal",
+        "a typed value must shadow the same-spelled namespace/type path: {value}"
+    );
+    assert_eq!(result["definitions"][0]["signature"], "(string)");
+}
+
+#[test]
+fn csharp_unresolved_dotted_value_shadow_does_not_become_type_path() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/Module.cs",
+            "namespace Demo { public sealed class Module { public static void Signal() {} } }\n",
+        )
+        .file(
+            "App/Consumer.cs",
+            r#"namespace App {
+    public sealed class Consumer {
+        public void Run(dynamic Demo) { Demo.Module.Signal(); }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        public void Run(dynamic Demo) { Demo.Module.Signal(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":3,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].as_array().is_none_or(Vec::is_empty));
+}
+
+#[test]
+fn csharp_dotted_receiver_uses_nearest_hidden_property_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/Types.cs",
+            r#"namespace Demo {
+    public sealed class BaseRoute { public void Signal(int value) {} }
+    public sealed class DerivedRoute { public void Signal(string value) {} }
+    public class Base { public Demo.BaseRoute Route { get; } }
+    public sealed class Derived : Base { public Demo.DerivedRoute Route { get; } }
+}
+"#,
+        )
+        .file(
+            "App/Consumer.cs",
+            r#"namespace App {
+    public sealed class Consumer {
+        public void Run(Demo.Derived derived) { derived.Route.Signal("value"); }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        public void Run(Demo.Derived derived) { derived.Route.Signal(\"value\"); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":3,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.DerivedRoute.Signal",
+        "a hidden property must stop lookup before the base property: {value}"
+    );
+    assert_eq!(result["definitions"][0]["signature"], "(string)");
+}
+
+#[test]
+fn csharp_unresolved_hidden_property_blocks_base_property_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/Types.cs",
+            r#"namespace Demo {
+    public sealed class BaseRoute { public void Signal(string value) {} }
+    public class Base { public Demo.BaseRoute Route { get; } }
+    public sealed class Derived : Base { public ExternalRoute Route { get; } }
+}
+"#,
+        )
+        .file(
+            "App/Consumer.cs",
+            r#"namespace App {
+    public sealed class Consumer {
+        public void Run(Demo.Derived derived) { derived.Route.Signal("value"); }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        public void Run(Demo.Derived derived) { derived.Route.Signal(\"value\"); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":3,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].as_array().is_none_or(Vec::is_empty));
 }
 
 #[test]

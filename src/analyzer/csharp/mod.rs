@@ -107,6 +107,16 @@ impl CSharpAnalyzer {
         self.inner.full_declaration_scan_count_for_test()
     }
 
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
+    }
+
     pub(crate) fn declaration_candidates_by_identifier(
         &self,
         identifier: &str,

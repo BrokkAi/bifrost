@@ -1114,20 +1114,25 @@ fn csharp_extension_method_candidates(
         .into_iter()
         .filter(|unit| unit.is_function() && unit.identifier() == member)
         .filter(|unit| {
-            csharp_extension_declaring_type_is_visible(
-                analyzer,
-                &namespaces,
-                &static_using_types,
-                unit,
-            )
-        })
-        .filter(|unit| csharp_is_extension_method(analyzer, unit))
-        .filter(|unit| {
-            csharp_extension_receiver_is_compatible(analyzer, &receiver_type_names, unit)
+            namespaces
+                .iter()
+                .any(|namespace| unit.package_name() == namespace)
         })
         .collect();
+    for owner in static_using_types {
+        candidates.extend(
+            csharp
+                .member_candidates_for_owner(&owner.fq_name(), member)
+                .into_iter()
+                .filter(|unit| unit.is_function() && unit.identifier() == member),
+        );
+    }
     sort_units(&mut candidates);
     candidates.dedup();
+    candidates.retain(|unit| csharp_is_extension_method(analyzer, unit));
+    candidates.retain(|unit| {
+        csharp_extension_receiver_is_compatible(analyzer, &receiver_type_names, unit)
+    });
 
     if let Some(call_arity) = arity {
         let expected = call_arity + 1;
@@ -1143,23 +1148,6 @@ fn csharp_extension_method_candidates(
     }
 
     candidates
-}
-
-fn csharp_extension_declaring_type_is_visible(
-    analyzer: &dyn IAnalyzer,
-    namespaces: &[String],
-    static_using_types: &[CodeUnit],
-    unit: &CodeUnit,
-) -> bool {
-    namespaces
-        .iter()
-        .any(|namespace| unit.package_name() == namespace)
-        || analyzer.parent_of(unit).is_some_and(|owner| {
-            let owner = csharp_normalize_full_name(&owner.fq_name());
-            static_using_types
-                .iter()
-                .any(|target| csharp_normalize_full_name(&target.fq_name()) == owner)
-        })
 }
 
 fn csharp_extension_receiver_is_compatible(
@@ -1263,6 +1251,15 @@ fn csharp_receiver_type_units(
             file,
             &csharp_reference_type_text(receiver, source),
         ),
+        "member_access_expression" => csharp_member_access_result_type_units(
+            analyzer,
+            csharp,
+            definitions,
+            file,
+            source,
+            root,
+            receiver,
+        ),
         // `new Foo().Member` — the receiver is typed by the class being constructed.
         "object_creation_expression" => receiver
             .child_by_field_name("type")
@@ -1288,6 +1285,135 @@ fn csharp_receiver_type_units(
         ),
         _ => Vec::new(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csharp_member_access_result_type_units(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+) -> Vec<CodeUnit> {
+    let mut layers = Vec::new();
+    let mut base = expression;
+    while base.kind() == "member_access_expression" {
+        let Some(receiver) = csharp_member_access_receiver(base) else {
+            return Vec::new();
+        };
+        let Some(name) = csharp_member_access_name(base) else {
+            return Vec::new();
+        };
+        layers.push((receiver, name));
+        base = receiver;
+    }
+
+    let base_is_shadowed = if base.kind() == "identifier" {
+        let name = csharp_node_text(base, source);
+        csharp_type_bindings_before_scoped(
+            csharp,
+            definitions,
+            file,
+            source,
+            root,
+            base.start_byte(),
+        )
+        .is_shadowed(name)
+    } else {
+        false
+    };
+    let mut owners =
+        csharp_receiver_type_units(analyzer, csharp, definitions, file, source, root, base);
+    let first_member = if owners.is_empty() {
+        if base_is_shadowed {
+            return Vec::new();
+        }
+        let expression_type = csharp_reference_type_text(expression, source);
+        let direct_types =
+            csharp_logical_visible_type_candidates(csharp, definitions, file, &expression_type);
+        if !direct_types.is_empty() {
+            return direct_types;
+        }
+
+        let mut type_prefix = None;
+        for (index, (receiver, _)) in layers.iter().enumerate() {
+            let type_name = csharp_reference_type_text(*receiver, source);
+            let candidates =
+                csharp_logical_visible_type_candidates(csharp, definitions, file, &type_name);
+            if !candidates.is_empty() {
+                type_prefix = Some((index, candidates));
+                break;
+            }
+        }
+        let Some((index, candidates)) = type_prefix else {
+            return Vec::new();
+        };
+        owners = candidates;
+        index
+    } else {
+        layers.len().saturating_sub(1)
+    };
+
+    for index in (0..=first_member).rev() {
+        let name = csharp_node_text(layers[index].1, source);
+        let member_types =
+            csharp_nearest_member_type_units(analyzer, csharp, definitions, file, owners, name);
+        if member_types.is_empty() {
+            return Vec::new();
+        }
+        owners = member_types;
+    }
+    owners
+}
+
+fn csharp_nearest_member_type_units(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    owners: Vec<CodeUnit>,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let provider = analyzer.type_hierarchy_provider();
+    let mut result = Vec::new();
+    for owner in owners {
+        let mut seen = HashSet::default();
+        let mut level = vec![owner];
+        while !level.is_empty() {
+            let mut level_types = Vec::new();
+            let mut level_declares_member = false;
+            let mut next_level = Vec::new();
+            for current in level {
+                if !seen.insert(current.clone()) {
+                    continue;
+                }
+                level_declares_member |= !definitions
+                    .members_for_owner_name(&current.fq_name(), name)
+                    .is_empty();
+                csharp_collect_member_type_units(
+                    csharp,
+                    definitions,
+                    file,
+                    &current,
+                    name,
+                    &mut level_types,
+                );
+                if let Some(provider) = provider {
+                    next_level.extend(provider.get_direct_ancestors(&current));
+                }
+            }
+            if level_declares_member {
+                result.extend(level_types);
+                break;
+            }
+            level = next_level;
+        }
+    }
+    sort_units(&mut result);
+    result.dedup();
+    result
 }
 
 /// Type an `invocation_expression` receiver by the callee's declared return
