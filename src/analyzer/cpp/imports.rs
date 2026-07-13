@@ -44,6 +44,23 @@ impl ImportAnalysisProvider for CppAnalyzer {
         self.inner.import_info_of(file)
     }
 
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        let include_targets = self.include_target_index();
+        Some(
+            imports
+                .iter()
+                .filter_map(|import| parse_quoted_include(&import.raw_snippet))
+                .flat_map(|path| {
+                    resolve_direct_include_targets_with_index(file, &path, include_targets)
+                })
+                .collect(),
+        )
+    }
+
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let source = code_unit.source();
         let identifiers = self

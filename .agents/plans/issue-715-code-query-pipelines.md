@@ -18,6 +18,9 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 - [x] (2026-07-13 11:36Z) Added behavior-focused integration tests and executable cookbook examples for every new step, including repeated direct import traversal.
 - [x] (2026-07-13) Ran formatting, the 114-test focused Rust matrix, all 38 Python tests, Clippy with every feature and target, the full `nlp,python` Rust unit/integration matrix, and the CI-equivalent `nlp` doctest gate.
 - [x] (2026-07-13) Recorded final validation evidence and completed the retrospective.
+- [x] (2026-07-13) Ran the guided review against the four issue-715 commits and fixed all eight findings: terminal-type preservation on budget exhaustion, non-synthetic enclosing ancestors, reverse-provider ownership, declaration-free imports, bounded lazy graph construction, canonical newline coordinates, programmatic step validation, and cached full provenance rendering.
+- [x] (2026-07-13) Added focused regression coverage for every guided-review finding; the 21-test pipeline suite, 34 query-IR tests, render-cache unit test, mixed-newline unit test, and 71 related import/docs/tutorial/cross-language tests pass.
+- [x] (2026-07-13) Re-ran all repository gates after the guided-review fixes: formatting and diff checks pass, Clippy passes with every target and feature, all 38 Python tests pass, the full `nlp,python` Rust unit/integration matrix passes, and the CI-equivalent `nlp` doctest gate passes.
 
 ## Surprises & Discoveries
 
@@ -35,6 +38,18 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 - Observation: The repository-wide service suite found one v1-shaped assertion that the focused query tests did not exercise.
   Evidence: `service_normalizes_query_code_absolute_where_globs` still indexed `value["matches"]`; changing that assertion to the schema-v2 `value["results"]` shape made the focused service test and the subsequent full unit/integration matrix pass.
+
+- Observation: Provider support belongs to the file whose imports are being resolved, not the terminal file reached by a reverse edge.
+  Evidence: a Ruby source can directly import a PHP target even though PHP has no import provider; `importers-of` must inspect and invert supported source edges rather than reject the target language.
+
+- Observation: Declaration-derived import resolution is incomplete for imports that intentionally bind no declarations.
+  Evidence: JavaScript/TypeScript side-effect imports, Go blank imports, and C++ includes of empty headers have valid direct file edges but no imported `CodeUnit`; the shared resolver now prefers structured file resolution and uses code units only as a structured fallback.
+
+- Observation: Building the complete import graph before executing a pipeline defeats both empty-seed short-circuiting and query budgets.
+  Evidence: forward traversal only needs the current file frontier, while reverse traversal needs a bounded workspace inversion. The executor now constructs the graph lazily, batches import parsing by language, and accounts separately for scanned files and stored edges.
+
+- Observation: Rejecting a synthetic nearest declaration is not equivalent to finding the nearest real declaration.
+  Evidence: a C++ call in a synthetic member prototype is still enclosed by its real class declaration. Candidate selection now filters synthetic and file-scope units before choosing the smallest containing range.
 
 ## Decision Log
 
@@ -66,11 +81,23 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
   Rationale: Direct edges compose predictably, keep the language primitive small, and avoid Ruby's usage-specific transitive reverse semantics.
   Date/Author: 2026-07-13 / Codex
 
+- Decision: Validate step count and domain transitions through one shared IR validator used by both decoding and execution.
+  Rationale: Public Rust callers can construct `CodeQuery` directly, so decoder-only validation left execution invariants vulnerable to panics.
+  Date/Author: 2026-07-13 / Codex guided review
+
+- Decision: Exhausting a pipeline budget before the terminal stage returns no intermediate-domain rows; exhausting it during the terminal stage may return the bounded partial terminal set.
+  Rationale: Every serialized item must still satisfy the statically declared terminal result type, even when traversal is truncated.
+  Date/Author: 2026-07-13 / Codex guided review
+
+- Decision: Use the shared canonical byte-offset converter and cache indexed source, line starts, and declaration ranges for full provenance rendering.
+  Rationale: CR, LF, and CRLF coordinates must agree everywhere, and provenance fan-out must not repeatedly clone and rescan the same source file.
+  Date/Author: 2026-07-13 / Codex guided review
+
 ## Outcomes & Retrospective
 
-The query IR, executor, public surface, and cookbook milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, full-detail stable identities, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. The MCP schema, CLI and saved-query mode, Python models/client, and executable tutorial examples now agree on tagged `results`.
+The query IR, executor, public surface, and cookbook milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, full-detail stable identities, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. Guided-review regressions additionally prove that truncated pipelines never serialize an intermediate result domain, synthetic nearest units fall through to the smallest real declaration, reverse traversal is governed by source providers, and declaration-free JavaScript/TypeScript/Go/C++ imports still produce direct file edges. The MCP schema, CLI and saved-query mode, Python models/client, and executable tutorial examples now agree on tagged `results`.
 
-Final validation is green: the focused Rust matrix passes 114 tests across pipeline, documentation, CLI, cross-language, Python-structural, and planner targets; `scripts/test_python.sh` passes all 38 Python tests; `cargo clippy --all-targets --all-features -- -D warnings` passes; and every Rust unit and integration target passes with `--features nlp,python`. Because the local Cargo/Rustc installation lacks `rustdoc` and cannot consume the Homebrew toolchain's differently-versioned metadata, doctests were run separately with the Homebrew toolchain and the CI Rust feature set, `--doc --features nlp`; that gate also passes. No regex or text-search import fallback was introduced, and no known issue-715 work remains.
+Final validation is green after the guided-review fixes: the focused pipeline suite passes 21 tests; the query-IR suite passes 34 tests; the render-cache and mixed-newline unit regressions pass; and 71 related import, documentation, tutorial, and cross-language tests pass. `scripts/test_python.sh` passes all 38 Python tests; `cargo clippy --all-targets --all-features -- -D warnings` passes; and every Rust unit and integration target passes with `--features nlp,python`. Because the local Cargo/Rustc installation lacks `rustdoc` and cannot consume the Homebrew toolchain's differently-versioned metadata, doctests were run separately with the Homebrew toolchain and the CI Rust feature set, `--doc --features nlp`; that gate also passes. No regex or text-search import fallback was introduced, all eight guided-review findings are fixed and verified, and no known issue-715 work remains.
 
 ## Context and Orientation
 
@@ -159,6 +186,10 @@ Revision note (2026-07-13 10:42Z): Marked the typed IR and executor milestones c
 Revision note (2026-07-13 11:36Z): Marked the public API and executable cookbook milestones complete, recorded the clean removal of the legacy Rust `matches` collection, and captured the passing 114-test focused Rust matrix.
 
 Revision note (2026-07-13): Completed repository-wide validation, documented the split local Rust toolchain required to run the full-feature unit/integration and doctest gates, fixed the final stale v1 service assertion, and closed the retrospective.
+
+Revision note (2026-07-13): Reopened validation after the guided review, documented all eight findings and their fixes, and expanded focused coverage for pipeline invariants, import-edge completeness, graph bounds, source-coordinate consistency, and rendering efficiency.
+
+Revision note (2026-07-13): Completed post-review validation and closed the retrospective with all eight findings applied and verified.
 
 ## Interfaces and Dependencies
 

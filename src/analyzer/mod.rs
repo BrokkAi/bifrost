@@ -44,7 +44,7 @@ pub use capabilities::{
 };
 pub(crate) use capabilities::{
     build_direct_descendant_index, build_reverse_file_index, build_reverse_import_index,
-    memoized_reverse_file_index, memoized_reverse_import_index,
+    memoized_reverse_file_index, memoized_reverse_import_index, resolve_imported_files_from_infos,
 };
 pub use config::{
     AnalyzerConfig, JavaAnalyzerConfig, JavaExternalArtifact, JavaExternalDependencies,

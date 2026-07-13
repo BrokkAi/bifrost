@@ -78,6 +78,24 @@ fn enclosing_decl_is_inclusive_and_excludes_file_scope() {
 }
 
 #[test]
+fn enclosing_decl_skips_synthetic_cpp_members_for_real_parent() {
+    let result = run(
+        &[(
+            "widget.cpp",
+            "int audit();\nclass Widget {\npublic:\n    void run(int value = audit());\n};\n",
+        )],
+        json!({
+            "match": { "kind": "call", "callee": { "name": "audit" } },
+            "steps": [{ "op": "enclosing_decl" }]
+        }),
+    );
+    let value = serialized(&result);
+    assert_eq!(value["results"][0]["result_type"], "declaration", "{value}");
+    assert_eq!(value["results"][0]["kind"], "class", "{value}");
+    assert_eq!(value["results"][0]["fq_name"], "Widget", "{value}");
+}
+
+#[test]
 fn full_results_include_stable_terminal_and_provenance_identities() {
     let result = run(
         &[(
@@ -165,6 +183,100 @@ fn ruby_importers_are_direct_and_repeat_for_multiple_hops() {
         "{repeated}"
     );
     assert_eq!(repeated["results"][0]["path"], "a.rb");
+}
+
+#[test]
+fn importers_of_does_not_require_target_language_provider() {
+    let result = run(
+        &[
+            (
+                "a.rb",
+                "require_relative 'target.php'\ndef from_ruby; end\n",
+            ),
+            ("target.php", "<?php\nfunction target() {}\n"),
+        ],
+        json!({
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "file_of" }, { "op": "importers_of" }]
+        }),
+    );
+    let value = serialized(&result);
+    assert_eq!(value["results"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["results"][0]["path"], "a.rb", "{value}");
+}
+
+#[test]
+fn side_effect_import_keeps_declaration_free_file_edge() {
+    let result = run(
+        &[
+            (
+                "entry.js",
+                "import './empty.js';\nexport function target() {}\n",
+            ),
+            ("empty.js", "// side effect only\n"),
+        ],
+        json!({
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "file_of" }, { "op": "imports_of" }]
+        }),
+    );
+    let value = serialized(&result);
+    assert_eq!(value["results"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["results"][0]["path"], "empty.js", "{value}");
+}
+
+#[test]
+fn file_level_import_resolvers_keep_declaration_free_targets() {
+    let cases = [
+        (
+            vec![
+                ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+                (
+                    "main.go",
+                    "package main\nimport _ \"example.com/app/sideeffects\"\nfunc target() {}\n",
+                ),
+                ("sideeffects/init.go", "package sideeffects\n"),
+            ],
+            "sideeffects/init.go",
+        ),
+        (
+            vec![
+                (
+                    "entry.ts",
+                    "import './empty';\nexport function target() {}\n",
+                ),
+                ("empty.ts", "// side effect only\n"),
+            ],
+            "empty.ts",
+        ),
+        (
+            vec![
+                (
+                    "main.cpp",
+                    "#include \"empty.h\"\nint target() { return 1; }\n",
+                ),
+                ("empty.h", "// intentionally empty\n"),
+            ],
+            "empty.h",
+        ),
+    ];
+
+    for (files, expected) in cases {
+        let result = run(
+            &files,
+            json!({
+                "match": { "kind": "function", "name": "target" },
+                "steps": [{ "op": "file_of" }, { "op": "imports_of" }]
+            }),
+        );
+        let value = serialized(&result);
+        assert_eq!(
+            value["results"].as_array().unwrap().len(),
+            1,
+            "expected {expected}: {value}"
+        );
+        assert_eq!(value["results"][0]["path"], expected, "{value}");
+    }
 }
 
 #[test]
@@ -259,6 +371,161 @@ fn pipeline_budget_returns_partial_results_with_diagnostic() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("pipeline budget exhausted")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn intermediate_budget_exhaustion_never_returns_wrong_terminal_type() {
+    let project = InlineTestProject::new()
+        .file("app.py", "def run():\n    audit()\n    audit()\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "audit" } },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "file_of" }]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(result.truncated);
+    assert!(
+        result.results.is_empty(),
+        "intermediate rows must not escape"
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("pipeline budget exhausted"))
+            .count(),
+        1,
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn seed_budget_emits_one_aggregated_diagnostic() {
+    let project = InlineTestProject::new()
+        .file("app.py", "audit()\naudit()\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "audit" } },
+        "steps": [{ "op": "file_of" }]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(result.truncated);
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("pipeline budget exhausted"))
+            .count(),
+        1,
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn invalid_programmatic_pipeline_is_diagnostic_not_panic() {
+    let project = InlineTestProject::new().file("app.py", "audit()\n").build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let mut query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" }
+    }))
+    .unwrap();
+    query.steps = vec![brokk_bifrost::analyzer::structural::QueryStep::ImportsOf];
+
+    let result = execute(workspace.analyzer(), &query);
+    assert!(result.results.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("invalid query at steps[0]")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn empty_seed_frontier_does_not_build_import_graph() {
+    let project = InlineTestProject::new()
+        .file("a.rb", "require_relative 'b'\ndef present; end\n")
+        .file("b.rb", "def other; end\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "where": ["a.rb"],
+        "match": { "kind": "function", "name": "absent" },
+        "steps": [{ "op": "file_of" }, { "op": "importers_of" }]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(!result.truncated, "{:?}", result.diagnostics);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("import graph budget exhausted"))
+    );
+}
+
+#[test]
+fn reverse_import_graph_work_is_bounded_and_diagnostic() {
+    let project = InlineTestProject::new()
+        .file("a.rb", "require_relative 'b'\ndef from_a; end\n")
+        .file("b.rb", "require_relative 'c'\ndef from_b; end\n")
+        .file("c.rb", "def target; end\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "where": ["c.rb"],
+        "match": { "kind": "function", "name": "target" },
+        "steps": [{ "op": "file_of" }, { "op": "importers_of" }]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(result.truncated, "{:?}", result.diagnostics);
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("import graph budget exhausted"))
+            .count(),
+        1,
         "{:?}",
         result.diagnostics
     );

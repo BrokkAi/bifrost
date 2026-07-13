@@ -2,8 +2,8 @@ use super::ir::{
     CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind,
-    SCHEMA_VERSION, StringPredicate,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, SCHEMA_VERSION,
+    StringPredicate, validate_query_steps,
 };
 use super::schema::{PatternField, QueryField, StringPredicateField};
 use crate::analyzer::Language;
@@ -257,7 +257,6 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
     }
 
     let mut steps = Vec::with_capacity(entries.len());
-    let mut value_kind = QueryValueKind::StructuralMatch;
     for (index, entry) in entries.iter().enumerate() {
         let entry_path = index_path(path, index);
         let object = as_object(entry, &entry_path)?;
@@ -276,23 +275,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 ),
             )
         })?;
-        let expected_input = match step {
-            QueryStep::EnclosingDecl => "structural_match",
-            QueryStep::FileOf => "structural_match or declaration",
-            QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
-        };
-        value_kind = step.output_kind(value_kind).ok_or_else(|| {
-            QueryError::new(
-                &entry_path,
-                format!(
-                    "step {} requires {expected_input}, but the previous stage produces {}",
-                    step.label(),
-                    value_kind.label()
-                ),
-            )
-        })?;
         steps.push(step);
     }
+    validate_query_steps(&steps)?;
     Ok(steps)
 }
 

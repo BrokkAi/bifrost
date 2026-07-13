@@ -15,8 +15,9 @@ use crate::analyzer::structural::capabilities::QueryFeature;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
+use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Longest match/capture snippet reported inline; full content is always
@@ -243,11 +244,87 @@ struct PipelineRow {
     provenance_truncated: bool,
 }
 
+struct CachedSourceCoordinates {
+    source: String,
+    line_starts: Vec<usize>,
+}
+
+#[derive(Default)]
+struct PipelineRenderCache {
+    sources: HashMap<ProjectFile, Option<CachedSourceCoordinates>>,
+    declaration_ranges: HashMap<DeclarationValue, Option<CodeQueryRange>>,
+}
+
+impl PipelineRenderCache {
+    fn coordinates_for<F>(
+        &mut self,
+        file: &ProjectFile,
+        load: F,
+    ) -> Option<&CachedSourceCoordinates>
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        self.sources
+            .entry(file.clone())
+            .or_insert_with(|| {
+                load().map(|source| CachedSourceCoordinates {
+                    line_starts: compute_line_starts(&source),
+                    source,
+                })
+            })
+            .as_ref()
+    }
+
+    fn range_for_declaration(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        declaration: &DeclarationValue,
+    ) -> Option<CodeQueryRange> {
+        if let Some(range) = self.declaration_ranges.get(declaration) {
+            return *range;
+        }
+
+        let file = declaration.unit.source();
+        let range = {
+            self.coordinates_for(file, || analyzer.indexed_source(file))
+                .map(|coordinates| {
+                    range_for_offsets(
+                        &coordinates.source,
+                        &coordinates.line_starts,
+                        declaration.range.start_byte,
+                        declaration.range.end_byte,
+                    )
+                })
+        };
+        self.declaration_ranges.insert(declaration.clone(), range);
+        range
+    }
+}
+
 #[derive(Debug, Default)]
 struct DirectImportGraph {
     forward: HashMap<ProjectFile, Vec<ProjectFile>>,
     reverse: HashMap<ProjectFile, Vec<ProjectFile>>,
     unsupported: HashSet<ProjectFile>,
+    all_files: Vec<ProjectFile>,
+    analyzed: HashSet<ProjectFile>,
+    resolved_files: usize,
+    resolved_edges: usize,
+    complete: bool,
+    truncated: bool,
+}
+
+impl DirectImportGraph {
+    fn new(analyzer: &dyn IAnalyzer) -> Self {
+        let mut all_files: Vec<_> = analyzer.analyzed_files().into_iter().collect();
+        all_files.sort_by_key(rel_path_string);
+        let analyzed = all_files.iter().cloned().collect();
+        Self {
+            all_files,
+            analyzed,
+            ..Self::default()
+        }
+    }
 }
 
 /// Run `query` across every language provider the analyzer exposes.
@@ -288,6 +365,17 @@ pub fn execute_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
+    if let Err(error) = query.validate_steps() {
+        return CodeQueryResult {
+            results: Vec::new(),
+            truncated: false,
+            diagnostics: vec![CodeQueryDiagnostic {
+                language: "workspace",
+                message: error.to_string(),
+            }],
+        };
+    }
+
     let plan = QueryPlan::for_query(query);
     let source_index = plan.build_source_index();
     let mut providers = analyzer.structural_search_providers();
@@ -380,6 +468,7 @@ pub fn execute_with_limits(
     let mut pending: Vec<PendingMatch> = Vec::new();
     let mut budget = CodeQueryExecutionBudget::default();
     let mut budget_exhausted = false;
+    let mut pipeline_budget_diagnostic_emitted = false;
     for (_path, language, provider, file) in candidates {
         let Some(source) = provider.structural_source(&file) else {
             continue;
@@ -424,6 +513,7 @@ pub fn execute_with_limits(
         pending.truncate(limits.max_pipeline_rows);
         budget.pipeline_rows = pending.len();
         push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
+        pipeline_budget_diagnostic_emitted = true;
     }
 
     if !pipeline_query {
@@ -482,12 +572,44 @@ pub fn execute_with_limits(
         .collect::<Vec<_>>();
     budget.pipeline_rows = rows.len();
 
-    let import_graph = query
-        .steps
-        .iter()
-        .any(|step| matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf))
-        .then(|| build_direct_import_graph(analyzer));
-    for &step in &query.steps {
+    let mut import_graph = None;
+    let mut import_graph_budget_diagnostic_emitted = false;
+    for (step_index, &step) in query.steps.iter().enumerate() {
+        if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
+            let graph = import_graph.get_or_insert_with(|| DirectImportGraph::new(analyzer));
+            let graph_exhausted = if step == QueryStep::ImportersOf {
+                ensure_complete_import_graph(
+                    analyzer,
+                    graph,
+                    limits.max_scanned_files,
+                    limits.max_pipeline_rows,
+                )
+            } else {
+                let mut frontier = rows
+                    .iter()
+                    .filter_map(|row| match &row.value {
+                        PipelineValue::File(file) => Some(file.clone()),
+                        PipelineValue::StructuralMatch(_) | PipelineValue::Declaration(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                frontier.sort_by_key(rel_path_string);
+                frontier.dedup();
+                ensure_forward_import_edges(
+                    analyzer,
+                    graph,
+                    &frontier,
+                    limits.max_scanned_files,
+                    limits.max_pipeline_rows,
+                )
+            };
+            if graph_exhausted {
+                budget_exhausted = true;
+                if !import_graph_budget_diagnostic_emitted {
+                    push_import_graph_budget_diagnostic(&mut diagnostics, graph);
+                    import_graph_budget_diagnostic_emitted = true;
+                }
+            }
+        }
         let (next, exhausted) = apply_pipeline_step(
             analyzer,
             step,
@@ -500,7 +622,15 @@ pub fn execute_with_limits(
         rows = next;
         if exhausted {
             budget_exhausted = true;
-            push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
+            if !pipeline_budget_diagnostic_emitted {
+                push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
+            }
+            if step_index + 1 < query.steps.len() {
+                // A partial intermediate stage does not satisfy the statically
+                // validated terminal domain. Preserve only complete terminal
+                // values when the final stage itself exhausts the budget.
+                rows.clear();
+            }
             break;
         }
     }
@@ -514,9 +644,10 @@ pub fn execute_with_limits(
     if should_report_broad_query(&plan, query, &budget, truncated) {
         push_broad_query_diagnostic(&mut diagnostics, &budget);
     }
+    let mut render_cache = PipelineRenderCache::default();
     let results = rows
         .into_iter()
-        .map(|row| render_pipeline_item(analyzer, row, query.result_detail))
+        .map(|row| render_pipeline_item(analyzer, row, query.result_detail, &mut render_cache))
         .collect();
     CodeQueryResult {
         results,
@@ -525,51 +656,109 @@ pub fn execute_with_limits(
     }
 }
 
-fn build_direct_import_graph(analyzer: &dyn IAnalyzer) -> DirectImportGraph {
-    let mut graph = DirectImportGraph::default();
-    let mut files: Vec<_> = analyzer.analyzed_files().into_iter().collect();
-    files.sort_by_key(rel_path_string);
-    let analyzed: HashSet<_> = files.iter().cloned().collect();
+fn ensure_complete_import_graph(
+    analyzer: &dyn IAnalyzer,
+    graph: &mut DirectImportGraph,
+    max_files: usize,
+    max_edges: usize,
+) -> bool {
+    if graph.complete || graph.truncated {
+        return graph.truncated;
+    }
+    let files = graph.all_files.clone();
+    let exhausted = ensure_forward_import_edges(analyzer, graph, &files, max_files, max_edges);
+    if !exhausted {
+        graph.complete = true;
+    }
+    exhausted
+}
 
-    for file in &files {
-        let Some(provider) = analyzer.import_analysis_provider_for_file(file) else {
-            graph.unsupported.insert(file.clone());
-            continue;
-        };
-        let imports = provider.import_info_of(file);
-        let imported_files = provider
-            .imported_files_from_infos(file, &imports)
-            .unwrap_or_else(|| {
-                provider
-                    .imported_code_units_from_infos(file, &imports)
-                    .unwrap_or_else(|| provider.imported_code_units_of(file))
-                    .into_iter()
-                    .map(|unit| unit.source().clone())
-                    .collect()
-            });
-        let mut targets: Vec<_> = imported_files
-            .into_iter()
-            .filter(|target| analyzed.contains(target))
-            .collect();
-        targets.sort_by_key(rel_path_string);
-        targets.dedup();
-        graph.forward.insert(file.clone(), targets);
+fn ensure_forward_import_edges(
+    analyzer: &dyn IAnalyzer,
+    graph: &mut DirectImportGraph,
+    files: &[ProjectFile],
+    max_files: usize,
+    max_edges: usize,
+) -> bool {
+    if graph.truncated {
+        return true;
     }
 
-    for (source, targets) in &graph.forward {
-        for target in targets {
-            graph
-                .reverse
-                .entry(target.clone())
+    let mut pending = files
+        .iter()
+        .filter(|file| !graph.forward.contains_key(*file) && !graph.unsupported.contains(*file))
+        .cloned()
+        .collect::<Vec<_>>();
+    pending.sort_by_key(rel_path_string);
+    pending.dedup();
+    if pending.is_empty() {
+        return false;
+    }
+
+    let available_files = max_files.saturating_sub(graph.resolved_files);
+    if pending.len() > available_files {
+        pending.truncate(available_files);
+        graph.truncated = true;
+    }
+
+    let mut groups: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+    for file in pending {
+        graph.resolved_files += 1;
+        if analyzer.import_analysis_provider_for_file(&file).is_some() {
+            groups
+                .entry(crate::analyzer::common::language_for_file(&file))
                 .or_default()
-                .push(source.clone());
+                .push(file);
+        } else {
+            graph.unsupported.insert(file);
         }
     }
+
+    for files in groups.values_mut() {
+        files.sort_by_key(rel_path_string);
+        let Some(provider) = files
+            .first()
+            .and_then(|file| analyzer.import_analysis_provider_for_file(file))
+        else {
+            continue;
+        };
+        let bulk_infos = provider.import_infos_for_files(files);
+        for file in files.iter() {
+            let imports = bulk_infos
+                .as_ref()
+                .and_then(|infos| infos.get(file))
+                .cloned()
+                .unwrap_or_else(|| provider.import_info_of(file));
+            let mut targets =
+                crate::analyzer::resolve_imported_files_from_infos(provider, file, &imports)
+                    .into_iter()
+                    .filter(|target| graph.analyzed.contains(target))
+                    .collect::<Vec<_>>();
+            targets.sort_by_key(rel_path_string);
+            targets.dedup();
+
+            let available_edges = max_edges.saturating_sub(graph.resolved_edges);
+            if targets.len() > available_edges {
+                targets.truncate(available_edges);
+                graph.truncated = true;
+            }
+            graph.resolved_edges += targets.len();
+            for target in &targets {
+                graph
+                    .reverse
+                    .entry(target.clone())
+                    .or_default()
+                    .push(file.clone());
+            }
+            graph.forward.insert(file.clone(), targets);
+        }
+    }
+
     for importers in graph.reverse.values_mut() {
         importers.sort_by_key(rel_path_string);
         importers.dedup();
     }
-    graph
+    graph.truncated
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -585,12 +774,14 @@ fn apply_pipeline_step(
     let mut output = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut unsupported_languages = BTreeSet::new();
+    let mut enclosing_declarations: HashMap<ProjectFile, Vec<DeclarationValue>> =
+        HashMap::default();
     let mut exhausted = false;
 
     'rows: for row in rows {
         let values = match (&row.value, step) {
             (PipelineValue::StructuralMatch(seed), QueryStep::EnclosingDecl) => {
-                enclosing_declaration_value(analyzer, seed)
+                enclosing_declaration_value(analyzer, seed, &mut enclosing_declarations)
                     .map(PipelineValue::Declaration)
                     .into_iter()
                     .collect()
@@ -601,18 +792,15 @@ fn apply_pipeline_step(
             (PipelineValue::Declaration(declaration), QueryStep::FileOf) => {
                 vec![PipelineValue::File(declaration.unit.source().clone())]
             }
-            (PipelineValue::File(file), QueryStep::ImportsOf | QueryStep::ImportersOf) => {
+            (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
                 if graph.unsupported.contains(file) {
                     unsupported_languages.insert(crate::analyzer::common::language_for_file(file));
                     Vec::new()
                 } else {
-                    let adjacent = if step == QueryStep::ImportsOf {
-                        graph.forward.get(file)
-                    } else {
-                        graph.reverse.get(file)
-                    };
-                    adjacent
+                    graph
+                        .forward
+                        .get(file)
                         .into_iter()
                         .flatten()
                         .cloned()
@@ -620,7 +808,16 @@ fn apply_pipeline_step(
                         .collect()
                 }
             }
-            _ => unreachable!("query step domains are validated during decoding"),
+            (PipelineValue::File(file), QueryStep::ImportersOf) => import_graph
+                .expect("import graph exists for import steps")
+                .reverse
+                .get(file)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(PipelineValue::File)
+                .collect(),
+            _ => unreachable!("query step domains are validated before execution"),
         };
 
         for value in values {
@@ -653,6 +850,17 @@ fn apply_pipeline_step(
         }
     }
 
+    if step == QueryStep::ImportersOf
+        && let Some(graph) = import_graph
+    {
+        unsupported_languages.extend(
+            graph
+                .unsupported
+                .iter()
+                .map(crate::analyzer::common::language_for_file),
+        );
+    }
+
     for language in unsupported_languages {
         diagnostics.push(CodeQueryDiagnostic {
             language: language.config_label(),
@@ -669,6 +877,7 @@ fn apply_pipeline_step(
 fn enclosing_declaration_value(
     analyzer: &dyn IAnalyzer,
     seed: &SeedMatch,
+    declarations_by_file: &mut HashMap<ProjectFile, Vec<DeclarationValue>>,
 ) -> Option<DeclarationValue> {
     let fact = seed.facts.node(seed.fact_match.node);
     let span = fact.span();
@@ -678,18 +887,41 @@ fn enclosing_declaration_value(
         start_line: fact.range.start_line,
         end_line: fact.range.end_line,
     };
-    let unit = analyzer.enclosing_code_unit(&seed.file, &seed_range)?;
-    if unit.is_synthetic() || unit.is_file_scope() {
-        return None;
-    }
-    let range = analyzer
-        .ranges_of(&unit)
-        .into_iter()
-        .filter(|range| {
-            range.start_byte <= seed_range.start_byte && range.end_byte >= seed_range.end_byte
+    let declarations = declarations_by_file
+        .entry(seed.file.clone())
+        .or_insert_with(|| {
+            let mut declarations = analyzer
+                .get_declarations(&seed.file)
+                .into_iter()
+                .filter(|unit| !unit.is_synthetic() && !unit.is_file_scope())
+                .flat_map(|unit| {
+                    analyzer
+                        .ranges_of(&unit)
+                        .into_iter()
+                        .map(move |range| DeclarationValue {
+                            unit: unit.clone(),
+                            range,
+                        })
+                })
+                .collect::<Vec<_>>();
+            declarations.sort_by(|left, right| {
+                let left_span = left.range.end_byte.saturating_sub(left.range.start_byte);
+                let right_span = right.range.end_byte.saturating_sub(right.range.start_byte);
+                left_span
+                    .cmp(&right_span)
+                    .then_with(|| left.unit.cmp(&right.unit))
+                    .then_with(|| left.range.start_byte.cmp(&right.range.start_byte))
+                    .then_with(|| left.range.end_byte.cmp(&right.range.end_byte))
+            });
+            declarations
+        });
+    declarations
+        .iter()
+        .find(|declaration| {
+            declaration.range.start_byte <= seed_range.start_byte
+                && declaration.range.end_byte >= seed_range.end_byte
         })
-        .min_by_key(|range| range.end_byte.saturating_sub(range.start_byte))?;
-    Some(DeclarationValue { unit, range })
+        .cloned()
 }
 
 fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
@@ -735,11 +967,12 @@ fn render_pipeline_item(
     analyzer: &dyn IAnalyzer,
     row: PipelineRow,
     detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultItem {
     let provenance = row
         .traces
         .iter()
-        .map(|trace| render_provenance(analyzer, trace, detail))
+        .map(|trace| render_provenance(analyzer, trace, detail, cache))
         .collect();
     let value = match row.value {
         PipelineValue::StructuralMatch(seed) => CodeQueryResultValue::StructuralMatch {
@@ -753,7 +986,7 @@ fn render_pipeline_item(
             ),
         },
         PipelineValue::Declaration(declaration) => CodeQueryResultValue::Declaration {
-            value: render_declaration(analyzer, &declaration, detail),
+            value: render_declaration(analyzer, &declaration, detail, cache),
         },
         PipelineValue::File(file) => CodeQueryResultValue::File {
             value: render_file(&file),
@@ -770,6 +1003,7 @@ fn render_provenance(
     analyzer: &dyn IAnalyzer,
     trace: &PipelineTrace,
     detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
 ) -> CodeQueryProvenance {
     CodeQueryProvenance {
         seed: render_seed_ref(&trace.seed, detail),
@@ -780,7 +1014,7 @@ fn render_provenance(
                 op: step.op.label(),
                 result: match &step.value {
                     PipelineTraceValue::Declaration(declaration) => {
-                        render_declaration_ref(analyzer, declaration, detail)
+                        render_declaration_ref(analyzer, declaration, detail, cache)
                     }
                     PipelineTraceValue::File(file) => render_file_ref(file),
                 },
@@ -807,6 +1041,7 @@ fn render_declaration_ref(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
     detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
     let path = rel_path_string(declaration.unit.source());
     let fq_name = declaration.unit.fq_name();
@@ -820,7 +1055,7 @@ fn render_declaration_ref(
         start_line: declaration.range.start_line,
         end_line: declaration.range.end_line,
         node_range: full
-            .then(|| range_for_declaration(analyzer, declaration))
+            .then(|| cache.range_for_declaration(analyzer, declaration))
             .flatten(),
     }
 }
@@ -835,6 +1070,7 @@ fn render_declaration(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
     detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
 ) -> CodeQueryDeclaration {
     let path = rel_path_string(declaration.unit.source());
     let fq_name = declaration.unit.fq_name();
@@ -856,7 +1092,7 @@ fn render_declaration(
         end_line: declaration.range.end_line,
         signature,
         node_range: full
-            .then(|| range_for_declaration(analyzer, declaration))
+            .then(|| cache.range_for_declaration(analyzer, declaration))
             .flatten(),
     }
 }
@@ -875,40 +1111,20 @@ fn declaration_id(path: &str, kind: &str, fq_name: &str, range: Range) -> String
     )
 }
 
-fn range_for_declaration(
-    analyzer: &dyn IAnalyzer,
-    declaration: &DeclarationValue,
-) -> Option<CodeQueryRange> {
-    let source = analyzer.indexed_source(declaration.unit.source())?;
-    Some(range_for_offsets(
-        &source,
-        declaration.range.start_byte,
-        declaration.range.end_byte,
-    ))
-}
-
-fn range_for_offsets(source: &str, start_byte: usize, end_byte: usize) -> CodeQueryRange {
-    let (start_line, start_column) = line_column_of_byte(source, start_byte);
-    let (end_line, end_column) = line_column_of_byte(source, end_byte);
+fn range_for_offsets(
+    source: &str,
+    line_starts: &[usize],
+    start_byte: usize,
+    end_byte: usize,
+) -> CodeQueryRange {
+    let (start_line, start_column) = line_column_for_offset(source, line_starts, start_byte);
+    let (end_line, end_column) = line_column_for_offset(source, line_starts, end_byte);
     CodeQueryRange {
         start_line,
         start_column,
         end_line,
         end_column,
     }
-}
-
-fn line_column_of_byte(source: &str, byte: usize) -> (usize, usize) {
-    let bounded = byte.min(source.len());
-    let mut boundary = bounded;
-    while boundary > 0 && !source.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    let prefix = &source[..boundary];
-    let line = prefix.bytes().filter(|&byte| byte == b'\n').count() + 1;
-    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
-    let column = source[line_start..boundary].chars().count() + 1;
-    (line, column)
 }
 
 fn provider_supports_feature(
@@ -943,6 +1159,19 @@ fn push_pipeline_budget_diagnostic(
         message: format!(
             "query_code pipeline budget exhausted after producing {} seed and edge rows; refine the match, where, or languages filters",
             budget.pipeline_rows
+        ),
+    });
+}
+
+fn push_import_graph_budget_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    graph: &DirectImportGraph,
+) {
+    diagnostics.push(CodeQueryDiagnostic {
+        language: "workspace",
+        message: format!(
+            "query_code import graph budget exhausted after resolving {} files and {} direct edges; import traversal results are partial",
+            graph.resolved_files, graph.resolved_edges
         ),
     });
 }
@@ -1208,6 +1437,7 @@ mod tests {
     use super::*;
     use crate::analyzer::structural::CodeQuery;
     use serde_json::json;
+    use std::cell::Cell;
 
     #[test]
     fn where_globs_match_slash_normalized_paths() {
@@ -1222,5 +1452,26 @@ mod tests {
         );
 
         assert!(file_matches_globs(&file, &query));
+    }
+
+    #[test]
+    fn pipeline_render_cache_loads_each_source_once() {
+        let file = ProjectFile::new(
+            std::env::temp_dir().join("bifrost-pipeline-render-cache"),
+            std::path::PathBuf::from("src/app.rs"),
+        );
+        let loads = Cell::new(0);
+        let mut cache = PipelineRenderCache::default();
+
+        for _ in 0..2 {
+            let coordinates = cache
+                .coordinates_for(&file, || {
+                    loads.set(loads.get() + 1);
+                    Some("fn demo() {}\n".to_string())
+                })
+                .expect("cached coordinates");
+            assert_eq!(coordinates.line_starts, vec![0, 13]);
+        }
+        assert_eq!(loads.get(), 1);
     }
 }

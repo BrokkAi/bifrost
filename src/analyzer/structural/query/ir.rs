@@ -80,6 +80,35 @@ impl QueryStep {
     }
 }
 
+pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind, QueryError> {
+    if steps.len() > MAX_QUERY_STEPS {
+        return Err(QueryError::new(
+            "steps",
+            format!("at most {MAX_QUERY_STEPS} query steps are allowed"),
+        ));
+    }
+
+    let mut value_kind = QueryValueKind::StructuralMatch;
+    for (index, &step) in steps.iter().enumerate() {
+        let expected_input = match step {
+            QueryStep::EnclosingDecl => "structural_match",
+            QueryStep::FileOf => "structural_match or declaration",
+            QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
+        };
+        value_kind = step.output_kind(value_kind).ok_or_else(|| {
+            QueryError::new(
+                format!("steps[{index}]"),
+                format!(
+                    "step {} requires {expected_input}, but the previous stage produces {}",
+                    step.label(),
+                    value_kind.label()
+                ),
+            )
+        })?;
+    }
+    Ok(value_kind)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeQueryResultDetail {
     Compact,
@@ -125,6 +154,15 @@ pub struct CodeQuery {
     pub steps: Vec<QueryStep>,
     pub limit: usize,
     pub result_detail: CodeQueryResultDetail,
+}
+
+impl CodeQuery {
+    /// Validate the semantic pipeline independently of its JSON/RQL origin.
+    /// Embedders may construct this public IR directly, so execution cannot
+    /// rely solely on decoder validation.
+    pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
+        validate_query_steps(&self.steps)
+    }
 }
 
 /// Predicate over a string attribute of a fact (its name or source text).

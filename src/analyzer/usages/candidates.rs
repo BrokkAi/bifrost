@@ -203,16 +203,11 @@ fn find_transitive_importers_with_cancellation(
             .and_then(|infos| infos.get(&candidate))
             .cloned()
             .unwrap_or_else(|| import_provider.import_info_of(&candidate));
-        let imported_files = import_provider
-            .imported_files_from_infos(&candidate, &imports)
-            .unwrap_or_else(|| {
-                import_provider
-                    .imported_code_units_from_infos(&candidate, &imports)
-                    .unwrap_or_else(|| import_provider.imported_code_units_of(&candidate))
-                    .into_iter()
-                    .map(|unit| unit.source().clone())
-                    .collect()
-            });
+        let imported_files = crate::analyzer::resolve_imported_files_from_infos(
+            import_provider,
+            &candidate,
+            &imports,
+        );
         for imported_file in imported_files {
             reverse_edges
                 .entry(imported_file)
