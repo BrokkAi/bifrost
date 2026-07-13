@@ -210,7 +210,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 continue;
             };
             if import.is_wildcard {
-                for owner in import_candidate_fq_names(&path, &self.package) {
+                for owner in import_candidate_owner_fq_names(&path, &self.package) {
                     units.extend(
                         self.support
                             .fqn_direct_children(&owner)
@@ -1287,16 +1287,11 @@ fn scala_wildcard_imported_member_outcome(
         let Some(path) = scala_import_path(&import) else {
             continue;
         };
-        let mut import_candidates = Vec::new();
-        for owner_fqn in import_candidate_owner_fq_names(&path, &file_package) {
-            import_candidates.extend(
-                ctx.support
-                    .fqn_direct_children(&owner_fqn)
-                    .into_iter()
-                    .filter(|unit| unit.identifier() == member)
-                    .filter(|unit| scala_member_candidate_applies(ctx, unit, call_arity)),
-            );
-        }
+        let import_candidates =
+            scala_wildcard_imported_member_units(ctx.support, &path, &file_package, member)
+                .into_iter()
+                .filter(|unit| scala_member_candidate_applies(ctx, unit, call_arity))
+                .collect::<Vec<_>>();
         if !import_candidates.is_empty() {
             contributing_imports += 1;
             candidates.extend(import_candidates);
@@ -1315,6 +1310,34 @@ fn scala_wildcard_imported_member_outcome(
     } else {
         Some(candidates_outcome(candidates))
     }
+}
+
+fn scala_wildcard_imported_member_units(
+    support: &dyn BoundedDefinitionLookup,
+    path: &str,
+    file_package: &str,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for imported_fqn in import_candidate_fq_names(path, file_package) {
+        candidates.extend(
+            support
+                .fqn(&format!("{imported_fqn}.{member}"))
+                .into_iter()
+                .filter(|unit| unit.identifier() == member),
+        );
+    }
+    for owner_fqn in import_candidate_owner_fq_names(path, file_package) {
+        candidates.extend(
+            support
+                .fqn_direct_children(&owner_fqn)
+                .into_iter()
+                .filter(|unit| unit.identifier() == member),
+        );
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 fn scala_ancestor_member_candidate_units(
@@ -2018,17 +2041,11 @@ fn scala_imported_member_shadows_bare_call(
             continue;
         };
         if import.is_wildcard {
-            for owner_fqn in import_candidate_owner_fq_names(&path, &file_package) {
-                if support
-                    .fqn_direct_children(&owner_fqn)
-                    .into_iter()
-                    .any(|unit| {
-                        unit.identifier() == name
-                            && scala_member_unit_applies(scala, &unit, call_arity)
-                    })
-                {
-                    return true;
-                }
+            if scala_wildcard_imported_member_units(support, &path, &file_package, name)
+                .into_iter()
+                .any(|unit| scala_member_unit_applies(scala, &unit, call_arity))
+            {
+                return true;
             }
             continue;
         }

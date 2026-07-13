@@ -903,6 +903,148 @@ fn warm_scala_extension_receiver_is_candidate_bounded() {
 }
 
 #[test]
+fn scala_dirty_owner_overlay_supplies_live_ancestor_facts() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "lib/Base.scala",
+        "package lib\nclass Base { def oldValue: Int = 1 }\n",
+    );
+    write_file(
+        root,
+        "app/Child.scala",
+        "package app\nimport lib.Base\nclass Child extends Base\n",
+    );
+    let caller =
+        "package app\nclass Controller { def run(child: Child): Int = child.replacement }\n";
+    write_file(root, "app/Controller.scala", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    write_unrelated_generated_files(root, "scala", "package generated\nclass Unrelated\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "initial owner");
+    let project = language_python_project(root, Language::Scala);
+    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+
+    write_file(
+        root,
+        "lib/Base.scala",
+        "package lib\nclass Base { def replacement: Int = 2 }\n",
+    );
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let events = Arc::clone(&events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    assert_eq!(parsed_file_count(&events.lock().unwrap()), 1);
+    let analyzer = warm.analyzer();
+    analyzer.reset_global_usage_definition_index_build_count_for_test();
+    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer.reset_candidate_hydration_count_for_test();
+    analyzer.reset_workspace_path_scan_count_for_test();
+    analyzer.reset_scala_project_types_build_count_for_test();
+    let line = caller.lines().nth(1).unwrap();
+    let result = brokk_bifrost::searchtools::get_definitions_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "app/Controller.scala".to_string(),
+                line: Some(2),
+                column: Some(line.find("replacement").unwrap() + 1),
+            }],
+        },
+    );
+    assert_eq!(result.results[0].status, "resolved");
+    assert_eq!(
+        result.results[0].definitions[0].fqn.as_deref(),
+        Some("lib.Base.replacement")
+    );
+    assert_eq!(
+        analyzer.global_usage_definition_index_build_count_for_test(),
+        0
+    );
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert!(analyzer.candidate_hydration_count_for_test() < 32);
+    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
+    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+}
+
+#[test]
+fn scala_stale_owner_blob_is_excluded_from_ancestor_facts() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "lib/Base.scala",
+        "package lib\nclass Base { def oldValue: Int = 1 }\n",
+    );
+    write_file(
+        root,
+        "app/Child.scala",
+        "package app\nimport lib.Base\nclass Child extends Base\n",
+    );
+    let caller = "package app\nclass Controller { def run(child: Child): Int = child.replacement + child.oldValue }\n";
+    write_file(root, "app/Controller.scala", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    write_unrelated_generated_files(root, "scala", "package generated\nclass Unrelated\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "initial owner");
+    let project = language_python_project(root, Language::Scala);
+    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+
+    write_file(
+        root,
+        "lib/Base.scala",
+        "package lib\nclass Base { def replacement: Int = 2 }\n",
+    );
+    commit_all(&repo, "replace owner blob");
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let events = Arc::clone(&events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    assert_eq!(parsed_file_count(&events.lock().unwrap()), 1);
+    let analyzer = warm.analyzer();
+    analyzer.reset_global_usage_definition_index_build_count_for_test();
+    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer.reset_workspace_path_scan_count_for_test();
+    analyzer.reset_scala_project_types_build_count_for_test();
+    let line = caller.lines().nth(1).unwrap();
+    let result = brokk_bifrost::searchtools::get_definitions_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![
+                brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "app/Controller.scala".to_string(),
+                    line: Some(2),
+                    column: Some(line.find("replacement").unwrap() + 1),
+                },
+                brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "app/Controller.scala".to_string(),
+                    line: Some(2),
+                    column: Some(line.find("oldValue").unwrap() + 1),
+                },
+            ],
+        },
+    );
+    assert_eq!(result.results[0].status, "resolved");
+    assert_eq!(
+        result.results[0].definitions[0].fqn.as_deref(),
+        Some("lib.Base.replacement")
+    );
+    assert_eq!(result.results[1].status, "no_definition");
+    assert_eq!(
+        analyzer.global_usage_definition_index_build_count_for_test(),
+        0
+    );
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
+    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+}
+
+#[test]
 fn warm_scala_class_and_singleton_type_batch_is_candidate_bounded() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

@@ -2895,7 +2895,13 @@ namespace App {
     assert!(
         generic_body_hits
             .iter()
-            .any(|hit| hit.snippet.contains("public T Read() => Body")),
+            .any(|hit| hit.line == 10 && hit.snippet.contains("initializedGeneric")),
+        "{generic_body_hits:#?}"
+    );
+    assert!(
+        generic_body_hits
+            .iter()
+            .any(|hit| hit.line == 14 && hit.snippet.contains("public T Read() => Body")),
         "the sibling partial self-read should retain the exact generic owner identity: {generic_body_hits:#?}"
     );
 }

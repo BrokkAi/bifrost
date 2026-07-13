@@ -15,16 +15,16 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-13) Add a lazy batch support boundary and migrate Go forward definition resolution to an owned, query-shaped provider backed by exact SQL definitions and bounded file hydration.
 - [x] (2026-07-13) Add adapter-opt-in persisted lookup projections and migrate direct C# forward definition resolution to indexed exact/normalized/type/package/member queries without constructing the legacy definition index.
 - [x] (2026-07-12) Migrate Rust forward definition resolution to exact FQN, same-file identifier, and exact owner/member queries without constructing the legacy definition index.
-- [ ] Migrate C# inherited-member, candidate-signature/return-type, global-using, and `get_type_by_location` paths off the remaining explicit legacy fallbacks.
-- [ ] Migrate remaining symbols resolvers from `DefinitionLookupIndex` to owned, query-shaped analyzer operations backed by indexed SQL candidate reads.
+- [x] (2026-07-13) Migrate C# inherited-member, candidate-signature/return-type, global-using, and `get_type_by_location` paths off the remaining explicit legacy fallbacks.
+- [x] (2026-07-13) Migrate all remaining forward definition/type resolvers from the legacy index to owned, query-shaped analyzer operations backed by indexed SQL candidate reads.
 - [x] (2026-07-13) Add index-build/full-scan counters plus warm multi-language, blob-reuse, sibling-module, and bounded-hydration regressions for the Go vertical slice.
 - [x] (2026-07-12) Pass the complete 427-case definition suite, both Rust usage-graph suites, all analyzer-persistence tests, and the local serde-json-rs benchmark for the Rust provider slice.
 - [x] (2026-07-12) Complete repository gates after guided-review fixes; usagebench passed 110/110 at the implementation checkpoint and all actionable review findings have been incorporated.
 - [x] (2026-07-13) Pass formatting, all-target/all-feature clippy, focused Go/persistence tests, and the complete `nlp,python` suite.
 - [x] (2026-07-13) Measure schema-v9 cold population and warm exact forward/inverse resolution on `aws__aws-sdk-go-v2`.
-- [ ] (2026-07-13) Replace the remaining forward definition and type resolver uses of `DefinitionLookupIndex` with bounded persisted candidate queries for every supported language.
-- [ ] (2026-07-13) Keep Scala `ProjectTypes`, C++ global visibility support, and other whole-workspace graph helpers out of forward definition/type dispatch; retain them only for explicit inverse usage analysis.
-- [ ] (2026-07-13) Add warm persisted definition/type regressions for every supported language, including generated unrelated files and stale/dirty/path-dependent state.
+- [x] (2026-07-13) Replace every forward definition and type resolver use of the legacy index with bounded persisted candidate queries for every supported language.
+- [x] (2026-07-13) Keep Scala `ProjectTypes`, C++ global visibility support, and other whole-workspace graph helpers out of forward definition/type dispatch; retain them only for explicit inverse usage analysis.
+- [x] (2026-07-13) Add warm persisted definition/type regressions for every supported language, including generated unrelated files and stale/dirty/path-dependent state.
 - [x] (2026-07-13) Add a shared bounded lookup facade, persistently query lookup-only JS/TS assignment declarations by short name, and fan out deterministic owned results through `MultiAnalyzer`.
 - [x] (2026-07-13) Move Java, PHP, Python, Ruby, JavaScript/TypeScript, and C++ forward definition dispatch onto the bounded facade; C++ include visibility now remains request-scoped instead of retaining a global definition index.
 - [x] (2026-07-13) Reproduce and review the post-migration Scala failures: 47 focused Scala cases pass and three fail on class/companion identity or explicit-import precedence; the nine existing persistence tests pass but cover only Go, C#, and Rust forward requests.
@@ -33,10 +33,14 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-13) Persist OID-validated path projections for JavaScript, TypeScript, and Python modules, refresh them during reconciliation, and remove Python's eager workspace module map.
 - [x] (2026-07-13) Make empty candidate-name queries return no rows, batch prefix validation, and add request counters for path scans and Scala `ProjectTypes` construction.
 - [x] (2026-07-13) Pass all 436 definition tests, all 14 analyzer-persistence tests, 50 focused Scala definition/type tests, and structured-supertype unit tests after the typed Scala milestone.
-- [ ] (2026-07-13) Complete warm persisted definition/type coverage for every migrated language, including path-derived modules, dirty overlays, stale blobs, and unrelated generated files.
+- [x] (2026-07-13) Complete warm persisted definition/type coverage for every migrated language, including path-derived modules, dirty Scala owner overlays, stale Scala owner blobs, and unrelated generated files.
 - [x] (2026-07-13) Rename the legacy index and its public trait hook to `GlobalUsageDefinitionIndex` / `global_usage_definition_index`, preserving it only for explicitly global diagnostics and inverse usage paths.
 - [x] (2026-07-13) Complete the clean warm definition matrix for C++, C#, Go, Java, JavaScript, TypeScript, PHP, Python, Ruby, Rust, and Scala, plus the supported C#/Go/Java/JS/TS/Rust/Scala type matrix, with a 32-file unrelated hydration sentinel.
 - [x] (2026-07-13) Close matrix-discovered Java import, Ruby semantic-facts, C# factory-return, and Rust import/export route leaks without weakening the zero-global-work assertions.
+- [x] (2026-07-13) Repair cache migration-v2 tests and benchmark profiling assertions so they encode the new path projection and require forward definition profiles to avoid the global usage index.
+- [x] (2026-07-13) Restore bounded Scala wildcard-import resolution for top-level package members as well as object members; the complete LSP click-around regression now passes.
+- [x] (2026-07-13) Pass 436 definition tests, 35 persistence tests, 18 cache migration tests, all-target/all-feature clippy, formatting, and the complete `nlp,python` gate under the macOS CI linker configuration.
+- [x] (2026-07-13) Make asynchronous unified-cache GC snapshot eligible rows before its Git reachability walk, preventing an in-flight cold-build GC from deleting dirty/stale blobs written by a concurrent warm build; the 35-case persistence suite passes 20 consecutive stress runs.
 
 ## Surprises & Discoveries
 
@@ -102,6 +106,18 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 
 - Observation: Generated unrelated files exposed four forward paths that the focused language suites could not reveal: Java exact imports still consulted the global import index, Ruby eagerly built all semantic facts even for a constant lookup, C# factory return inference initialized global callable facts, and Rust import resolution initialized `RustUsageIndex` and hydrated every Rust file.
   Evidence: the expanded persistence harness failed the global-index/full-scan/hydration counters for each path before the fixes and now passes all 33 clean warm regressions with every request below the 32-file hydration sentinel.
+
+- Observation: A wildcard Scala import can target either a singleton owner (`Syntax.*`) or a package containing top-level declarations (`support.*`); owner-child lookup alone cannot represent the latter because a package is not a `CodeUnit`.
+  Evidence: the full feature gate exposed `milestone_4_scala_extension_trait_click_around`; bounded exact lookup of `support.helper` plus candidate owner-child lookup restores both forms without enumerating the package.
+
+- Observation: Adding the path-projection migration advanced the unified cache to version 2 and intentionally invalidated analyzer blob rows, but the cache tests still described the version-1 baseline as the current schema.
+  Evidence: the first feature-enabled gate failed the migration suite; current-schema validation now applies both migrations, future-migration fixtures include migration 2, and all 18 cache tests pass.
+
+- Observation: Exact-first C# owner lookup resolves an additional valid reference inside a partial generic type that the prior exact-plus-normalized lookup discarded as ambiguous with the nongeneric type.
+  Evidence: `csharp_graph_distinguishes_generic_and_nongeneric_constructor_owners` now finds the generic object initializer and `RestException<T>.Read` body, while all 66 C# usage tests prove the nongeneric initializer remains excluded.
+
+- Observation: The first dirty/stale Scala regressions were intermittently erased by an older analyzer's asynchronous GC, not by Scala resolution. GC computed reachability before the warm analyzer wrote its new blob, then swept the newly inserted row because the sweep enumerated rows after the reachability walk.
+  Evidence: the 35-case persistence suite failed within three stress repetitions before the fix. GC now stores its eligible OID/language keys in disk-backed temporary tables before walking Git and sweeps only that snapshot; 20 consecutive suite repetitions pass.
 
 ## Decision Log
 
@@ -179,7 +195,9 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 
 ## Outcomes & Retrospective
 
-The request-scoped forward query layer and typed Scala forward resolver are implemented. A forward batch now carries an explicit language scope and positive/negative owned-result caches; it does not expose new public `IAnalyzer` methods or fan out to unrelated delegates. JavaScript, TypeScript, and Python synthetic module identities are stored in OID-validated workspace-path projections, so exact module queries no longer enumerate all live paths and Python no longer constructs an eager workspace module map. Scala distinguishes class and singleton owners, treats a missing explicit import as terminal, persists structured supertype lookup paths, and walks only candidate owner facts iteratively. The previously failing class/companion, missing-import, and `.type` regressions now pass, as do all 436 definition tests and all 14 persistence tests. Warm Scala inheritance/type and JavaScript/TypeScript/Python module regressions assert zero parses, declaration scans, global-index builds, Scala `ProjectTypes` builds, and request-time path scans. The remaining completion work is the full language/type persistence matrix, explicit legacy global-index naming, the feature-enabled repository gate, and refreshed corpus measurements.
+The request-scoped forward query layer and typed Scala forward resolver are complete. A forward batch carries an explicit language scope and positive/negative owned-result caches; it does not expose new public `IAnalyzer` methods or fan out to unrelated delegates. JavaScript, TypeScript, and Python synthetic module identities live in OID-validated workspace-path projections, so exact module queries no longer enumerate all live paths and Python no longer constructs an eager workspace module map. Scala distinguishes class and singleton owners, treats a missing explicit import as terminal, persists structured supertype lookup paths, walks only candidate owner facts iteratively, and resolves wildcard imports through exact package-member candidates or bounded singleton children. The legacy index is explicitly named `GlobalUsageDefinitionIndex` and remains reachable only from global diagnostics and inverse usage analysis.
+
+The final local gates pass: 436 definition tests, 35 persistence tests, 18 cache migration tests, the complete Scala LSP click-around regression, formatting, warning-as-error all-target/all-feature clippy, and the complete feature-enabled workspace suite. The persistence matrix covers every supported definition language and every type-enabled language, asserts zero warm parses, full declaration scans, global-index builds, Scala `ProjectTypes` builds, and request-time path scans, and keeps candidate hydration below a 32-file unrelated sentinel. The requested AWS rerun cannot be performed in this worktree because `/mnt/T9/repo-clones/aws__aws-sdk-go-v2` is not mounted; the prior schema-v9 artifacts remain the latest real-corpus evidence and this environmental limitation does not weaken the deterministic bounded-work regressions.
 
 ## Context and Orientation
 

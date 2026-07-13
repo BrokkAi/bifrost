@@ -226,17 +226,23 @@ definition_queries = [
         "get_definition::resolve_definition_batch",
         "language=Java",
         "get_definition::language_dispatch",
-        "global_usage_definition_index::enumerate_live_keys",
-        "AnalyzerStore::definition_lookup_rows_by_keys",
-        "global_usage_definition_index::resolve_persisted_rows",
-        "global_usage_definition_index::collect_dirty_units",
-        "global_usage_definition_index::collect_nonpersisted_units",
-        "global_usage_definition_index::build",
-        "build_count=1",
     ] {
         assert!(
             combined_traces.contains(expected),
             "profile traces missing `{expected}`:\n{combined_traces}"
+        );
+    }
+    for forbidden in [
+        "global_usage_definition_index::enumerate_live_keys",
+        "global_usage_definition_index::fetch_persisted_rows",
+        "global_usage_definition_index::resolve_persisted_rows",
+        "global_usage_definition_index::collect_dirty_units",
+        "global_usage_definition_index::collect_nonpersisted_units",
+        "global_usage_definition_index::build",
+    ] {
+        assert!(
+            !combined_traces.contains(forbidden),
+            "forward definition profile unexpectedly entered `{forbidden}`:\n{combined_traces}"
         );
     }
 }

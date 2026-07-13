@@ -115,35 +115,117 @@ fn sweep_with_claim(
     #[cfg(not(feature = "nlp"))] _semantic_store: Option<&()>,
     analyzer_store: Option<&AnalyzerStore>,
 ) -> Result<GcOutcome, String> {
+    // Snapshot the rows eligible for this collection before walking Git. A
+    // workspace build may persist another blob while the reachability walk is
+    // in flight; that new row must belong to the next collection, even when
+    // the walk started before its working-tree or ref update became visible.
+    let mut conn = cache_db::open_unified_connection(&claim.db_path)?;
+    conn.pragma_update(None, "temp_store", "FILE")
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    conn.execute_batch(
+        "CREATE TEMP TABLE gc_semantic_candidates(
+           blob_oid TEXT PRIMARY KEY
+         ) WITHOUT ROWID;
+         INSERT INTO gc_semantic_candidates(blob_oid)
+           SELECT blob_oid FROM semantic_blobs;
+         CREATE TEMP TABLE gc_analyzer_candidates(
+           blob_oid TEXT NOT NULL,
+           lang TEXT NOT NULL,
+           PRIMARY KEY(blob_oid, lang)
+         ) WITHOUT ROWID;
+         INSERT INTO gc_analyzer_candidates(blob_oid, lang)
+           SELECT blob_oid, lang FROM blobs;",
+    )
+    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+
     let live = live_bloom(repo)?;
-
+    let _ = analyzer_store;
     #[cfg(feature = "nlp")]
-    let semantic_dropped = match semantic_store {
-        Some(store) => store
-            .gc_with(|oid| live.contains(oid))
-            .map_err(|err| err.to_string())?,
-        None => {
-            let store = SemanticStore::open(&claim.db_path).map_err(|err| err.to_string())?;
-            store
-                .gc_with(|oid| live.contains(oid))
-                .map_err(|err| err.to_string())?
-        }
-    };
-    #[cfg(not(feature = "nlp"))]
-    let semantic_dropped = 0;
+    let _ = semantic_store;
 
-    let analyzer_dropped = match analyzer_store {
-        Some(store) => store
-            .gc_with(|oid| live.contains(oid))
-            .map_err(|err| err.to_string())?,
-        None => {
-            let store =
-                AnalyzerStore::open_persistent(&claim.db_path).map_err(|err| err.to_string())?;
-            store
-                .gc_with(|oid| live.contains(oid))
-                .map_err(|err| err.to_string())?
-        }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    let dead_semantic = {
+        let mut stmt = tx
+            .prepare("SELECT blob_oid FROM gc_semantic_candidates")
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?
+            .into_iter()
+            .filter(|oid| !live.contains(oid))
+            .collect::<Vec<_>>()
     };
+    {
+        let mut delete = tx
+            .prepare("DELETE FROM semantic_blobs WHERE blob_oid = ?1")
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        for oid in &dead_semantic {
+            delete
+                .execute([oid])
+                .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM semantic_vectors
+         WHERE composed_hash NOT IN (SELECT composed_hash FROM semantic_blob_chunks)",
+        [],
+    )
+    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    tx.execute(
+        "DELETE FROM semantic_blob_summaries
+         WHERE blob_summary_id NOT IN (
+           SELECT parent_summary_id FROM semantic_blob_chunks
+           WHERE parent_summary_id IS NOT NULL
+         )",
+        [],
+    )
+    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    tx.execute(
+        "DELETE FROM semantic_component_vectors
+         WHERE hash NOT IN (
+           SELECT hash FROM semantic_blob_chunks
+           UNION SELECT hash FROM semantic_blob_summaries
+         )",
+        [],
+    )
+    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+
+    let dead_analyzer = {
+        let mut stmt = tx
+            .prepare("SELECT blob_oid, lang FROM gc_analyzer_candidates")
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?
+            .into_iter()
+            .filter(|(oid, _)| !live.contains(oid))
+            .collect::<Vec<_>>()
+    };
+    {
+        let mut delete = tx
+            .prepare("DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2")
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        for (oid, lang) in &dead_analyzer {
+            delete
+                .execute((oid, lang))
+                .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        }
+    }
+    tx.commit()
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    conn.pragma_update(None, "incremental_vacuum", 0)
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+
+    let semantic_dropped = dead_semantic.len();
+    let analyzer_dropped = dead_analyzer.len();
 
     let total_blobs_after = finish_gc(&claim.db_path)?;
     Ok(GcOutcome {
