@@ -1111,16 +1111,16 @@ fn ts_member_candidates(
         let mut members = jsts_file_scoped_dotted_candidates(
             analyzer,
             support,
-            &plain_fqn,
             receiver.source(),
+            &plain_fqn,
             value_position,
         );
         if static_access {
             let static_members = jsts_file_scoped_dotted_candidates(
                 analyzer,
                 support,
-                &static_fqn,
                 receiver.source(),
+                &static_fqn,
                 value_position,
             );
             if !static_members.is_empty() {
@@ -1130,8 +1130,8 @@ fn ts_member_candidates(
             members = jsts_file_scoped_dotted_candidates(
                 analyzer,
                 support,
-                &static_fqn,
                 receiver.source(),
+                &static_fqn,
                 value_position,
             );
         }
