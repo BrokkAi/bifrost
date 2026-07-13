@@ -14,7 +14,7 @@ The implementation also removes the current maintenance trap in which the S-expr
 - [x] (2026-07-13 10:37Z) Milestone 0: created this ExecPlan with the source-schema, diagnostic, hover, LSP, and extension design.
 - [x] (2026-07-13 10:57Z) Milestone 1: centralized query vocabulary/help metadata and added byte-spanned RQL/JSON source analysis, multi-diagnostic validation, `CodeQuery::from_source`, schema-backed REPL help/completion, and focused Rust tests.
 - [x] (2026-07-13 11:01Z) Milestone 2: exposed analyzer-free validation and hover requests through LSP, switched query execution to the shared source parser, and added focused UTF-16/JSON/RQL integration tests.
-- [ ] Milestone 3: add debounced/cancellable VS Code diagnostics and hover integration with pure unit-tested lifecycle logic.
+- [x] (2026-07-13 11:05Z) Milestone 3: added `.rql`-only debounced/cancellable VS Code diagnostics and hover integration with pure unit-tested lifecycle logic.
 - [ ] Milestone 4: document the maintenance contract in `AGENTS.md`, run focused/full validation, manually inspect the Extension Development Host, and complete review fixes.
 
 ## Surprises & Discoveries
@@ -36,6 +36,9 @@ The implementation also removes the current maintenance trap in which the S-expr
 
 - Observation: The private request handlers can be ordinary pure functions even though the current request loop starts after indexing.
   Evidence: `validate_query_request` and `query_hover_request` accept only source/position params, use existing UTF-16 conversion helpers, and have no `ServerState`, project, workspace, analyzer, or execution parameter.
+
+- Observation: The extension can test every validation race without importing the `vscode` module.
+  Evidence: `RqlValidationController` depends on injected timer, cancellation, request, current-document, publish, and clear functions; 7 focused controller/contract tests cover debounce, cancellation, stale versions, clearing, lifecycle stop, hover params, and JSON-language exclusion.
 
 ## Decision Log
 
@@ -61,7 +64,7 @@ The implementation also removes the current maintenance trap in which the S-expr
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. A required-metadata macro registry now owns RQL forms/properties and JSON fields, while the kind/role registries own their help and shapes. Parser and decoder dispatch use generated enums with exhaustive matches, the REPL consumes the same descriptions, and source APIs provide byte ranges, independent diagnostics, hover tokens, and JSON-or-RQL execution. Private LSP validation and hover handlers convert those ranges to UTF-16 without receiving analyzer state, and Play execution now accepts the same JSON-or-RQL source. The 38 focused library tests, 11 focused REPL tests, and 2 focused LSP integration tests pass.
+Milestones 1 through 3 are complete. A required-metadata macro registry owns RQL forms/properties and JSON fields, while the kind/role registries own their help and shapes. Parser and decoder dispatch use generated enums with exhaustive matches, the REPL consumes the same descriptions, and source APIs provide byte ranges, independent diagnostics, hover tokens, and JSON-or-RQL execution. Private LSP validation and hover handlers convert those ranges to UTF-16 without receiving analyzer state, and Play execution accepts the same JSON-or-RQL source. VS Code now owns a dedicated RQL diagnostic collection, rejects non-`bifrost-rql` documents before scheduling work, cancels stale requests, and adapts server hover Markdown. The 38 focused library tests, 11 focused REPL tests, 2 focused LSP integration tests, and all 43 extension tests pass.
 
 ## Context and Orientation
 
@@ -156,3 +159,5 @@ Revision note, 2026-07-13: Initial ExecPlan created from issue #711, the existin
 Revision note, 2026-07-13: Milestone 1 completed with macro-generated schema metadata, exhaustive parser/decoder handling, spanned RQL and JSON source analysis, shared execution parsing, and schema-backed REPL documentation.
 
 Revision note, 2026-07-13: Milestone 2 completed with analyzer-free `bifrost/validateQuery` and `bifrost/queryHover` handlers, UTF-16 range conversion, and shared JSON-or-RQL query execution.
+
+Revision note, 2026-07-13: Milestone 3 completed with a dedicated RQL diagnostic collection, debounced/cancellable generation-and-version guarded validation, close/server cleanup, schema hover wiring, and explicit ordinary-JSON exclusion tests.

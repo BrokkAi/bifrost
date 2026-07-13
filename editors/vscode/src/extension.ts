@@ -44,11 +44,23 @@ import {
   runRqlQuery
 } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
+import {
+  RQL_QUERY_HOVER_METHOD,
+  RqlValidationController,
+  VALIDATE_RQL_QUERY_METHOD,
+  WireDiagnostic,
+  WireHover,
+  queryHoverParams,
+  validationDocument
+} from "./rql_validation";
+import { RQL_LANGUAGE_ID } from "./rql_query";
 
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
 let rqlQueryResults: RqlQueryResultsProvider | undefined;
+let rqlDiagnostics: vscode.DiagnosticCollection | undefined;
+let rqlValidation: RqlValidationController<vscode.CancellationToken> | undefined;
 let lastLaunchConfig: BifrostLaunchConfig | undefined;
 let startInFlight: Promise<void> | undefined;
 let extensionActive = false;
@@ -60,6 +72,9 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(outputChannel);
   rqlQueryResults = new RqlQueryResultsProvider();
   context.subscriptions.push(rqlQueryResults);
+  rqlDiagnostics = vscode.languages.createDiagnosticCollection("Bifrost RQL");
+  context.subscriptions.push(rqlDiagnostics);
+  rqlValidation = createRqlValidationController();
   context.subscriptions.push(
     vscode.window.createTreeView("bifrost.queryResults", {
       treeDataProvider: rqlQueryResults,
@@ -104,7 +119,40 @@ export function activate(context: vscode.ExtensionContext): void {
       ) {
         void promptRestartAfterConfigurationChange(context);
       }
-    })
+    }),
+    vscode.workspace.onDidOpenTextDocument((document) => {
+      rqlValidation?.schedule(validationDocument(document));
+    }),
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      rqlValidation?.schedule(validationDocument(event.document));
+    }),
+    vscode.workspace.onDidCloseTextDocument((document) => {
+      rqlValidation?.close(document.uri.toString());
+    }),
+    vscode.languages.registerHoverProvider(
+      { scheme: "file", language: RQL_LANGUAGE_ID },
+      {
+        provideHover: async (document, position, token) => {
+          const currentClient = client;
+          if (currentClient?.state !== State.Running) {
+            return undefined;
+          }
+          try {
+            const hover = await currentClient.sendRequest<WireHover | null>(
+              RQL_QUERY_HOVER_METHOD,
+              queryHoverParams(document.getText(), {
+                line: position.line,
+                character: position.character
+              }),
+              token
+            );
+            return hover ? vscodeHover(hover) : undefined;
+          } catch {
+            return undefined;
+          }
+        }
+      }
+    )
   );
 
   void startClient(context);
@@ -314,6 +362,9 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
     );
     setStatusCommand("bifrost.restartServer");
     log("Bifrost language client started.");
+    for (const document of vscode.workspace.textDocuments) {
+      rqlValidation?.schedule(validationDocument(document));
+    }
   } catch (error) {
     const message = formatError(error);
     setStatus("$(error) Bifrost", `${message}\n\nClick to retry.`);
@@ -350,6 +401,7 @@ function currentBifrostRuntimeSettings(
 }
 
 async function stopClient(options: { updateUi?: boolean } = {}): Promise<void> {
+  rqlValidation?.stop();
   const updateUi = options.updateUi ?? true;
   const startup = startInFlight;
   if (startup) {
@@ -392,6 +444,66 @@ async function stopClient(options: { updateUi?: boolean } = {}): Promise<void> {
       setStatusCommand("bifrost.startServer");
     }
   }
+}
+
+function createRqlValidationController(): RqlValidationController<vscode.CancellationToken> {
+  return new RqlValidationController<vscode.CancellationToken>({
+    validate: async (query, token) => {
+      const currentClient = client;
+      if (currentClient?.state !== State.Running) {
+        throw new Error("Bifrost is not running");
+      }
+      return currentClient.sendRequest<{ diagnostics: WireDiagnostic[] }>(
+        VALIDATE_RQL_QUERY_METHOD,
+        { query },
+        token
+      );
+    },
+    publish: (uri, diagnostics) => {
+      rqlDiagnostics?.set(vscode.Uri.parse(uri), diagnostics.map(vscodeDiagnostic));
+    },
+    clear: (uri) => {
+      rqlDiagnostics?.delete(vscode.Uri.parse(uri));
+    },
+    isCurrent: (expected) => {
+      const current = vscode.workspace.textDocuments.find(
+        (document) => document.uri.toString() === expected.uri
+      );
+      return current?.languageId === RQL_LANGUAGE_ID && current.version === expected.version;
+    },
+    createCancellationSource: () => new vscode.CancellationTokenSource(),
+    setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearTimer: (timer) => clearTimeout(timer as NodeJS.Timeout)
+  });
+}
+
+function vscodeDiagnostic(diagnostic: WireDiagnostic): vscode.Diagnostic {
+  const value = new vscode.Diagnostic(
+    vscodeRange(diagnostic.range),
+    diagnostic.message,
+    vscode.DiagnosticSeverity.Error
+  );
+  value.code = diagnostic.code;
+  value.source = diagnostic.source;
+  return value;
+}
+
+function vscodeHover(hover: WireHover): vscode.Hover {
+  const contents = new vscode.MarkdownString(hover.contents.value);
+  contents.isTrusted = false;
+  return new vscode.Hover(contents, hover.range ? vscodeRange(hover.range) : undefined);
+}
+
+function vscodeRange(range: {
+  start: { line: number; character: number };
+  end: { line: number; character: number };
+}): vscode.Range {
+  return new vscode.Range(
+    range.start.line,
+    range.start.character,
+    range.end.line,
+    range.end.character
+  );
 }
 
 async function restartClient(context: vscode.ExtensionContext): Promise<void> {
