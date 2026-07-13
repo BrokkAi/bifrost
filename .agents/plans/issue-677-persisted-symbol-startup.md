@@ -4,7 +4,7 @@ This ExecPlan is a living document maintained according to `.agents/PLANS.md`. T
 
 ## Purpose / Big Picture
 
-Opening a warm persisted workspace must finish without reconstructing every declaration in memory or reparsing Go files merely to recover package identity. After this change, a second open of a large clean workspace performs no source parses, full file-state hydration, or combined definition-index construction before a targeted symbols request. Single-language and multi-language analyzers retain the same public definition and usage results, and Go blobs reused at different paths produce correct path-dependent canonical import paths from one persisted content-dependent package-clause fact.
+Opening a warm persisted workspace must finish without reconstructing every declaration in memory or reparsing Go files merely to recover package identity. After this change, a second open of a large clean workspace performs no source parses, full file-state hydration, combined definition-index construction, or other workspace-sized derived-index construction before any supported `get_definition` or `get_type_by_location` request. Single-language and multi-language analyzers retain the same public definition and type results, and Go blobs reused at different paths produce correct path-dependent canonical import paths from one persisted content-dependent package-clause fact. Inverse usage scans remain explicit global operations; they must not be reached from a forward definition or type request.
 
 ## Progress
 
@@ -22,6 +22,15 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-12) Complete repository gates after guided-review fixes; usagebench passed 110/110 at the implementation checkpoint and all actionable review findings have been incorporated.
 - [x] (2026-07-13) Pass formatting, all-target/all-feature clippy, focused Go/persistence tests, and the complete `nlp,python` suite.
 - [x] (2026-07-13) Measure schema-v9 cold population and warm exact forward/inverse resolution on `aws__aws-sdk-go-v2`.
+- [ ] (2026-07-13) Replace the remaining forward definition and type resolver uses of `DefinitionLookupIndex` with bounded persisted candidate queries for every supported language.
+- [ ] (2026-07-13) Keep Scala `ProjectTypes`, C++ global visibility support, and other whole-workspace graph helpers out of forward definition/type dispatch; retain them only for explicit inverse usage analysis.
+- [ ] (2026-07-13) Add warm persisted definition/type regressions for every supported language, including generated unrelated files and stale/dirty/path-dependent state.
+- [x] (2026-07-13) Add a shared bounded lookup facade, persistently query lookup-only JS/TS assignment declarations by short name, and fan out deterministic owned results through `MultiAnalyzer`.
+- [x] (2026-07-13) Move Java, PHP, Python, Ruby, JavaScript/TypeScript, and C++ forward definition dispatch onto the bounded facade; C++ include visibility now remains request-scoped instead of retaining a global definition index.
+- [x] (2026-07-13) Reproduce and review the post-migration Scala failures: 47 focused Scala cases pass and three fail on class/companion identity or explicit-import precedence; the nine existing persistence tests pass but cover only Go, C#, and Rust forward requests.
+- [ ] (2026-07-13) Replace the language-agnostic forward facade with an internal, request-scoped, language-bound query session and remove request-time path-synthetic workspace enumeration.
+- [ ] (2026-07-13) Replace Scala's string-only forward resolver with typed class/singleton resolution and candidate-scoped persisted ancestry; prove no forward path constructs `ProjectTypes`.
+- [ ] (2026-07-13) Complete warm persisted definition/type coverage for every migrated language, including path-derived modules, dirty overlays, stale blobs, and unrelated generated files.
 
 ## Surprises & Discoveries
 
@@ -64,6 +73,24 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - Observation: Rust forward definition resolution only reads exact FQNs, same-file identifiers, and named members beneath an exact owner, and Rust currently contributes no lookup-only units outside its declaration set.
   Evidence: `src/analyzer/usages/get_definition/rust.rs` uses only `fqn` and `file_identifier`; the shared trait-associated resolver can replace direct-child enumeration with exact `{owner}.{name}` lookup, while only JavaScript currently calls `ParsedFile::add_definition_lookup_unit`.
 
+- Observation: JS/TS member assignments can be intentionally absent from the ordinary declaration surface while remaining valid forward-resolution targets.
+  Evidence: `JsAssignmentSymbolSurface::DefinitionLookupOnly` populates `ParsedFile::definition_lookup_units`; name-bounded persisted candidate reads must include that membership bit and still validate each hydrated live path.
+
+- Observation: The current Scala forward rewrite conflates a class, its `$` companion object, and a missing explicit import into one optional FQN string.
+  Evidence: `cargo test --test get_definition_test scala_ -- --nocapture` reports 47 passes and three failures: `scala_instance_member_prefers_inherited_member_over_companion_object` returns `app.Child$.value`, `scala_missing_imported_type_annotation_does_not_fall_back_to_same_package_type` returns `app.Child.local`, and `scala_singleton_typed_receiver_method_prefers_object_definition` returns `app.Settings.value`.
+
+- Observation: Scala forward lookup can still reach the global `ProjectTypes` graph even though its main resolver accepts bounded queries.
+  Evidence: `scala_enclosing_member_shadows_bare_call` calls `type_hierarchy_provider().get_direct_ancestors`; `ScalaAnalyzer` implements that operation by calling `resolve_direct_ancestors`, which initializes `project_types()`.
+
+- Observation: An absent persisted Scala supertype row currently means both "this owner has no parents" and "facts were unavailable", causing the forward resolver to parse an owner source file after a bounded lookup miss.
+  Evidence: `scala_owner_source_ancestor_member_units` falls through from `raw_supertypes_of` to `get_source`, `parse_scala_tree`, and an AST walk whenever no inherited member was found, including clean owners with no parents.
+
+- Observation: The current generic bounded FQN query still performs hidden workspace work for path-synthetic languages and can perform a full declaration scan for malformed or empty lookup keys.
+  Evidence: `sql_definition_candidates_vec` calls `declaration_candidate_rows_for_langs` when `definition_candidate_short_names` is empty and always unions `sql_nonpersisted_workspace_declarations_vec_matching`; that helper iterates `LiveSnapshot::all_paths()` for JavaScript, TypeScript, and Python.
+
+- Observation: Python constructs another workspace-sized derived index during analyzer construction.
+  Evidence: `PythonAnalyzer::from_inner` eagerly calls `build_python_module_code_units`, which iterates `inner.all_files()` and retains an `Arc<HashMap<String, CodeUnit>>` before any forward request.
+
 ## Decision Log
 
 - Decision: Reject immutable Arc-backed `DefinitionLookupIndex` shards.
@@ -102,9 +129,33 @@ Opening a warm persisted workspace must finish without reconstructing every decl
   Rationale: Rust can be migrated completely with three bounded query shapes, while JavaScript/TypeScript lookup-only units and the remaining languages' package, normalized-name, and prefix semantics need different structured operations. A broad interface now would obscure which implementations remain workspace-wide.
   Date/Author: 2026-07-12 / Codex
 
+- Decision: Treat all public forward definition and type lookup paths as the issue #677 completion boundary; retain `DefinitionLookupIndex` only for explicitly global inverse usage analysis.
+  Rationale: A lazy index is still an unbounded persisted mirror when a common symbols request initializes it. Forward resolution must instead use candidate-shaped SQL queries and request-scoped source trees, while inverse graph analysis may remain explicit about its whole-workspace cost.
+  Date/Author: 2026-07-13 / Codex
+
 - Decision: Bind forward Rust queries to the concrete `RustAnalyzer`, cache owned results for multi-reference request batches, and cap public definition batches at 100 references.
   Rationale: Delegating through `MultiAnalyzer::definitions` would apply other languages' normalization rules and could reintroduce path-wide work through non-Rust adapters. Request-scoped positive and negative caches preserve the old batch index's reuse property without retaining workspace-sized state, while single-reference requests avoid cache insertion overhead and the limit bounds unique adversarial queries consistently with `get_type_by_location`.
   Date/Author: 2026-07-12 / Codex
+
+- Decision: Keep C++ include closure construction request-scoped and use its already hydrated visible declarations for qualified/member selection.
+  Rationale: The include closure is necessary C++ visibility information for the requested file, while retaining a second global `DefinitionLookupIndex` inside it silently defeats bounded forward lookup.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Bind forward lookup sessions to an explicit language scope and keep the capability crate-internal instead of adding more methods to the public `IAnalyzer` trait.
+  Rationale: A request already knows its source language. Explicit scopes prevent unrelated delegate normalization and path work, preserve deliberate Scala/Java and JavaScript/TypeScript interoperability, and avoid public wrapper boilerplate. A request-local positive/negative cache recovers batch reuse without retaining workspace-sized state.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Store path-derived synthetic module identities in a separate workspace-path projection, never in content-addressed blob declaration rows.
+  Rationale: JavaScript, TypeScript, and Python module identities depend on the live path. An indexed path projection can be refreshed from already enumerated live paths and queried by candidate FQN without scanning every path per request or corrupting identical blobs mounted at different paths.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Model Scala forward owners as class or singleton identities and model missing explicit imports as a terminal resolution outcome.
+  Rationale: Suffix manipulation after an untyped name lookup cannot express the distinction between `Child`, the term `Child`, and `Child.type`; it also cannot preserve the rule that a matching but missing explicit import blocks same-package fallback. Typed outcomes make member precedence mechanical rather than heuristic.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Persist a structured Scala supertype lookup path alongside its raw source spelling.
+  Rationale: Forward ancestry needs the base type identity but must neither split Scala type syntax by delimiters nor reparse a clean owner source on a warm request. The declaration extractor already has the tree-sitter node and can persist both facts safely.
+  Date/Author: 2026-07-13 / Codex
 
 ## Outcomes & Retrospective
 
@@ -120,21 +171,24 @@ Go declarations use canonical import paths such as `github.com/aws/aws-sdk-go-v2
 
 First extend parsed and hydrated file state with a content-dependent qualifier. Change the language-adapter storage hook so writing a code-unit row can use that qualifier. Set Go's qualifier from the tree-sitter `package_clause`, store it in code-unit and blob metadata rows, and make Go hydration call `canonical_go_package_name(file, raw_qualifier)` without reading source or constructing a parser. Bump only the Go epoch salt so old empty rows are discarded and rebuilt.
 
-Then add an owned-result definition-query surface to the analyzer contract. Implement persisted tree-sitter operations with indexed `code_units(lang, short_name)` and `code_units(lang, identifier)` candidate queries, live-path expansion, adapter normalization, and dirty/nonpersisted unions. Migrate `DefinitionBatchContext` and forward symbols usage resolvers away from borrowed `DefinitionLookupIndex` maps. Keep inherently whole-workspace operations such as Scala inverse/global indexing explicit and measurable rather than hiding their cost behind a lazy index. `MultiAnalyzer` will fan out bounded delegate queries and merge sorted, deduplicated results.
+Then add an owned-result definition-query surface behind a crate-internal, request-scoped session bound to explicit languages. Implement persisted tree-sitter operations with indexed exact/normalized FQN, short-name, identifier, owner/member, package/type, and prefix candidates plus live-path validation and dirty unions. A separate indexed workspace-path projection supplies JavaScript, TypeScript, and Python synthetic modules without persisting path-derived identities in blob rows or iterating all live paths during a request. Remove the public `IAnalyzer::bounded_*` additions, make `MultiAnalyzer` route only the requested delegates without Rayon fan-out, and cache positive and negative owned results for each public batch.
+
+For Scala forward resolution, introduce a typed owner identity that distinguishes an instance class from its singleton companion and a name result that distinguishes a missing explicit import from an ordinary miss. Resolve names in ordered tiers: explicit import, wildcard import, current package or enclosing type, then built-ins. Normal annotations select the plain class; `.type` and AST-proven term/object receivers select the `$` object. Read each exact owner's signatures, trait marker, and structured supertype facts from its one hydrated `FileState`, then walk ancestors iteratively with a visited-FQN set. Direct instance members win, followed by the nearest inherited members, AST-gated companion dispatch, and finally applicable extensions. Every Scala forward helper, including shadow checks and type lookup, must use this provider and must not call `TypeHierarchyProvider`, `project_types`, or a descendant index.
 
 For the completed Rust slice, keep the query contract in `src/analyzer/usages/rust_graph/resolver.rs` so forward resolution and existing usage-graph callers share the same semantic operations. The analyzer-backed implementation in `src/analyzer/usages/get_definition/rust.rs` queries only the concrete Rust delegate for exact FQNs and one file's declarations, preventing other languages' normalization rules or path-synthetic work from entering a Rust lookup; the legacy `DefinitionLookupIndex` implements the same contract for graph callers. `DefinitionBatchContext` owns this provider and enables its positive/negative caches for multi-reference request batches. Single-reference requests query the concrete analyzer directly without populating request-local maps. Named trait members use exact `{owner}.{name}` queries and retain the existing parent/kind proof filters.
 
-Build a generated persisted multi-language workspace twice, assert the warm build emits zero parse events and full declaration scans, then issue exact definition and representative forward usage queries and assert the scan count remains zero. Add a same-Go-blob/two-path regression with distinct canonical packages, an external-test package regression, and public single/multi analyzer definition and usage parity. Reuse existing persistence and inline-project harnesses.
+Build generated persisted multi-language workspaces twice, assert the warm build emits zero parse events, then issue representative definition and type requests while asserting zero full declaration scans, global definition-index builds, Scala `ProjectTypes` builds, and request-time live-path scans. Record targeted full-hydration counts and prove unrelated generated files remain untouched. Cover the Scala class/companion failures, imports, inheritance, extensions, dirty overlays, stale blobs, and multi-reference parity, then complete the same warm matrix for every migrated language.
 
 Finally run the repository gates and benchmark the real warm Go corpus. The benchmark must use the release binary or a dedicated ignored measurement test, record cold build time, warm open time, targeted query time, and peak RSS, and confirm the warm open reaches the query with zero parse events. Do not add a resident map proportional to workspace declarations.
 
 ## Concrete Steps
 
-Work from `/home/jonathan/Projects/bifrost`.
+Work from `/Users/dave/.codex/worktrees/a8f0/bifrost`.
 
 Run focused tests while implementing:
 
     cargo test --test analyzer_persistence
+    cargo test --test get_definition_test scala_
     cargo test --test analyzer_sql_query_parity
     cargo test --test multi_analyzer_test
     cargo test --test analyzer_query_parity
@@ -151,7 +205,7 @@ Build release measurement artifacts and run the warm corpus benchmark against th
 
 A generated persisted workspace must parse on the cold build and report zero parse events on the second build. Exact definition and representative forward usage queries must not enumerate or materialize all persisted declarations, and must return the same symbol identities as direct single-language analyzers. Any inherently global inverse operation must be explicit and separately bounded/measured. A source-identical Go file placed beneath two different module-relative directories must produce two correct canonical package FQNs from one content blob, without a hydration parse.
 
-The real Go corpus warm open must complete in a practical time and bounded RSS rather than saturating one core for hours at multi-gigabyte memory. Public definition and usage tests must remain green for both single- and multi-language workspaces.
+The real Go corpus warm open must complete in a practical time and bounded RSS rather than saturating one core for hours at multi-gigabyte memory. Public definition and usage tests must remain green for both single- and multi-language workspaces. Scala acceptance additionally requires that an instance `Child` resolves inherited `Base` members even when `object Child` exists, `Child.type` resolves only the singleton object, a missing explicit import never falls back to a same-package type, and neither definition nor type lookup initializes `ProjectTypes`.
 
 ## Idempotence and Recovery
 
@@ -169,8 +223,10 @@ Real-corpus commands used the release `bifrost_reference_differential` binary ag
 
 ## Interfaces and Dependencies
 
-The symbols resolver contract gains owned-result definition queries for exact/normalized names, identifiers, owner members, files, types, and packages. `TreeSitterAnalyzer` implements them using indexed store reads; `MultiAnalyzer` merges delegate results. Rust's current slice uses `RustDefinitionProvider::{fqn,file_identifier,members_for_owner_name}` with an analyzer-backed implementation for forward queries and a `DefinitionLookupIndex` implementation for existing usage-graph paths. Existing `DefinitionLookupIndex` remains available only for paths not yet migrated and is not treated as an acceptable persisted symbols backend.
+The completed forward interface is crate-internal and request-scoped. It exposes explicit language scopes and owned queries for exact/normalized FQNs, file identifiers, owner members, package/simple types, packages/prefixes, and path-derived modules. `TreeSitterAnalyzer` implements these operations using indexed store reads; multi-language sessions merge only explicitly requested delegates. Rust's current slice uses `RustDefinitionProvider::{fqn,file_identifier,members_for_owner_name}` with an analyzer-backed implementation for forward queries and a global index implementation for existing usage-graph paths. The legacy workspace index is renamed to communicate that it belongs to explicit global usage analysis and is not an acceptable persisted symbols backend. Scala's forward provider exposes typed class/singleton owners plus complete owner facts; inverse Scala usage analysis retains `ProjectTypes` unchanged.
 
 `ParsedFile` and `FileState` gain a content-dependent qualifier string. `LanguageAdapter::storage_content_qualifier` receives that fact when persisting units. `GoAdapter` persists the raw package clause and hydrates canonical package names solely through `canonical_go_package_name`; it must not read source or instantiate tree-sitter in hydration.
 
 Revision note (2026-07-12): recorded the completed Rust forward-definition vertical slice, its language-specific provider decision, focused zero-index and usagebench evidence, and the guided-review hardening so the plan remains restartable from current `master`.
+
+Revision note (2026-07-13): recorded the three reproduced Scala semantic regressions and the remaining hidden workspace work, then expanded the final milestones to use typed Scala owners, structured persisted supertype facts, language-bound request sessions, and indexed path-derived module projections. This revision prevents a narrow companion fallback from being mistaken for completion of issue #677.
