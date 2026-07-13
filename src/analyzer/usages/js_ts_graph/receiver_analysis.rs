@@ -1558,7 +1558,7 @@ export function caller() {
         let tree = parse(source);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.definition_lookup_index(),
+            analyzer.global_usage_definition_index(),
             Language::TypeScript,
             &file,
             source,
@@ -1607,7 +1607,7 @@ export function second() {
         let tree = parse(source);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.definition_lookup_index(),
+            analyzer.global_usage_definition_index(),
             Language::TypeScript,
             &file,
             source,
@@ -1655,7 +1655,7 @@ export function caller(which: number) {
         let tree = parse(source);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.definition_lookup_index(),
+            analyzer.global_usage_definition_index(),
             Language::TypeScript,
             &file,
             source,

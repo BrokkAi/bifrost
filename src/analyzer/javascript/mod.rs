@@ -594,13 +594,14 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_definition_lookup_index_build_count_for_test(&self) {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
         self.inner
-            .reset_definition_lookup_index_build_count_for_test();
+            .reset_global_usage_definition_index_build_count_for_test();
     }
 
-    fn definition_lookup_index_build_count_for_test(&self) -> usize {
-        self.inner.definition_lookup_index_build_count_for_test()
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .global_usage_definition_index_build_count_for_test()
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {
@@ -611,6 +612,14 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.full_declaration_scan_count_for_test()
     }
 
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
     fn reset_workspace_path_scan_count_for_test(&self) {
         self.inner.reset_workspace_path_scan_count_for_test();
     }
@@ -619,8 +628,8 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.workspace_path_scan_count_for_test()
     }
 
-    fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
-        self.inner.definition_lookup_index()
+    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+        self.inner.global_usage_definition_index()
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {

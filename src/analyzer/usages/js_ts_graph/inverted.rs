@@ -103,7 +103,7 @@ where
                     source,
                     receiver_provider: JsTsReceiverFactProvider::new(
                         analyzer,
-                        analyzer.definition_lookup_index(),
+                        analyzer.global_usage_definition_index(),
                         language,
                         file,
                         source,
@@ -172,7 +172,7 @@ where
                     source: parsed.source.as_str(),
                     receiver_provider: JsTsReceiverFactProvider::new(
                         analyzer,
-                        analyzer.definition_lookup_index(),
+                        analyzer.global_usage_definition_index(),
                         language,
                         file,
                         parsed.source.as_str(),

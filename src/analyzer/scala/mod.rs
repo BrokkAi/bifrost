@@ -210,10 +210,10 @@ impl ScalaAnalyzer {
 
     /// Owned handles to the workspace indexes (refcount bumps, not map
     /// clones), for per-query views held behind `Arc` caches.
-    pub(crate) fn definition_lookup_index_shared(
+    pub(crate) fn global_usage_definition_index_shared(
         &self,
-    ) -> Arc<crate::analyzer::DefinitionLookupIndex> {
-        self.inner.definition_lookup_index_shared()
+    ) -> Arc<crate::analyzer::GlobalUsageDefinitionIndex> {
+        self.inner.global_usage_definition_index_shared()
     }
 
     pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
@@ -383,13 +383,14 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_definition_lookup_index_build_count_for_test(&self) {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
         self.inner
-            .reset_definition_lookup_index_build_count_for_test();
+            .reset_global_usage_definition_index_build_count_for_test();
     }
 
-    fn definition_lookup_index_build_count_for_test(&self) -> usize {
-        self.inner.definition_lookup_index_build_count_for_test()
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .global_usage_definition_index_build_count_for_test()
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {
@@ -398,6 +399,14 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn full_declaration_scan_count_for_test(&self) -> usize {
         self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
     fn reset_workspace_path_scan_count_for_test(&self) {
@@ -416,8 +425,8 @@ impl IAnalyzer for ScalaAnalyzer {
         self.project_types_build_count.load(Ordering::Relaxed)
     }
 
-    fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
-        self.inner.definition_lookup_index()
+    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+        self.inner.global_usage_definition_index()
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {

@@ -34,6 +34,9 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-13) Make empty candidate-name queries return no rows, batch prefix validation, and add request counters for path scans and Scala `ProjectTypes` construction.
 - [x] (2026-07-13) Pass all 436 definition tests, all 14 analyzer-persistence tests, 50 focused Scala definition/type tests, and structured-supertype unit tests after the typed Scala milestone.
 - [ ] (2026-07-13) Complete warm persisted definition/type coverage for every migrated language, including path-derived modules, dirty overlays, stale blobs, and unrelated generated files.
+- [x] (2026-07-13) Rename the legacy index and its public trait hook to `GlobalUsageDefinitionIndex` / `global_usage_definition_index`, preserving it only for explicitly global diagnostics and inverse usage paths.
+- [x] (2026-07-13) Complete the clean warm definition matrix for C++, C#, Go, Java, JavaScript, TypeScript, PHP, Python, Ruby, Rust, and Scala, plus the supported C#/Go/Java/JS/TS/Rust/Scala type matrix, with a 32-file unrelated hydration sentinel.
+- [x] (2026-07-13) Close matrix-discovered Java import, Ruby semantic-facts, C# factory-return, and Rust import/export route leaks without weakening the zero-global-work assertions.
 
 ## Surprises & Discoveries
 
@@ -96,6 +99,9 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 
 - Observation: The installed default Cargo/Rust compiler and `clippy-driver` binaries have incompatible LLVM patch versions on this machine, so the nominal clippy command reports E0514 before checking repository code.
   Evidence: the default compiler reports LLVM 22.1.2 while the Homebrew compiler and clippy driver report LLVM 22.1.6; running the identical all-target/all-feature clippy gate with `/opt/homebrew/bin/cargo` and `/opt/homebrew/bin/rustc` succeeds cleanly in an isolated target directory.
+
+- Observation: Generated unrelated files exposed four forward paths that the focused language suites could not reveal: Java exact imports still consulted the global import index, Ruby eagerly built all semantic facts even for a constant lookup, C# factory return inference initialized global callable facts, and Rust import resolution initialized `RustUsageIndex` and hydrated every Rust file.
+  Evidence: the expanded persistence harness failed the global-index/full-scan/hydration counters for each path before the fixes and now passes all 33 clean warm regressions with every request below the 32-file hydration sentinel.
 
 ## Decision Log
 
@@ -165,6 +171,10 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 
 - Decision: Validate path projections against both the current live blob OID and the adapter-derived live identity before returning them.
   Rationale: Workspace-relative module identities are safe to index only while attached to the exact live path/blob pair that produced them. OID and identity validation makes stale rows harmless and keeps dirty files in the bounded live overlay.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Treat callable signatures, Ruby mixin/ancestor facts, and Rust re-export routes as owner/module candidates in forward resolution rather than reusing their global inverse indexes.
+  Rationale: Each request already identifies the receiver owner or imported module. Hydrating that owner, reading its persisted signature/supertype facts, and following only its manifest/re-export edges preserves semantics while making unrelated source files unreachable from the request.
   Date/Author: 2026-07-13 / Codex
 
 ## Outcomes & Retrospective

@@ -54,7 +54,7 @@ where
     let fqn = format!("{owner}.{name}");
     let units = ctx
         .java()
-        .definition_lookup_index()
+        .global_usage_definition_index()
         .by_fqn(&fqn)
         .iter()
         .filter(|unit| unit.is_function() && signature_arity(unit.signature()) == arity)

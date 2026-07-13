@@ -499,7 +499,7 @@ fn scala_declared_type_in_package(
 ) -> Option<String> {
     preferred_scala_type(
         scala
-            .definition_lookup_index()
+            .global_usage_definition_index()
             .types_in_package(package_name, simple),
     )
     .map(|unit| unit.fq_name())
@@ -509,7 +509,7 @@ fn scala_declared_type_fqn(scala: &ScalaAnalyzer, fqn: &str) -> Option<String> {
     let normalized = scala_normalized_fq_name(fqn);
     preferred_scala_type(
         scala
-            .definition_lookup_index()
+            .global_usage_definition_index()
             .by_normalized_fqn(&normalized)
             .iter()
             .filter(|unit| unit.is_class()),

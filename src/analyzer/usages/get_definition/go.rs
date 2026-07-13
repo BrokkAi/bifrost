@@ -1,5 +1,5 @@
 use super::*;
-use crate::analyzer::DefinitionLookupIndex;
+use crate::analyzer::GlobalUsageDefinitionIndex;
 use tree_sitter::Tree;
 
 pub(crate) trait GoDefinitionProvider {
@@ -13,21 +13,21 @@ pub(crate) trait GoDefinitionProvider {
     }
 }
 
-impl GoDefinitionProvider for DefinitionLookupIndex {
+impl GoDefinitionProvider for GlobalUsageDefinitionIndex {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        DefinitionLookupIndex::fqn(self, fqn)
+        GlobalUsageDefinitionIndex::fqn(self, fqn)
     }
 
     fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
-        DefinitionLookupIndex::file_identifier(self, file, identifier)
+        GlobalUsageDefinitionIndex::file_identifier(self, file, identifier)
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        DefinitionLookupIndex::fqn_direct_children(self, fqn)
+        GlobalUsageDefinitionIndex::fqn_direct_children(self, fqn)
     }
 
     fn fqn_prefix_exists(&self, prefix: &str) -> bool {
-        DefinitionLookupIndex::fqn_prefix_exists(self, prefix)
+        GlobalUsageDefinitionIndex::fqn_prefix_exists(self, prefix)
     }
 }
 

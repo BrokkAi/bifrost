@@ -198,6 +198,79 @@ impl ImportAnalysisProvider for JavaAnalyzer {
     }
 }
 
+impl JavaAnalyzer {
+    /// Resolve a source type for a forward definition/type request without
+    /// constructing the workspace-wide usage index.
+    pub(super) fn resolve_forward_type_name(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        let normalized = raw_name.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+
+        if normalized.contains('.')
+            && let Some(unit) = self.forward_source_type_by_fqn(normalized)
+        {
+            return Some(unit);
+        }
+
+        let imports = self.inner.import_info_of(file);
+        for import in &imports {
+            let Some(import_path) = non_static_import_path(import) else {
+                continue;
+            };
+            if import.is_wildcard {
+                continue;
+            }
+            let Some(imported_name) = import.identifier.as_deref() else {
+                continue;
+            };
+            if normalized == imported_name
+                && let Some(unit) = self.forward_source_type_by_fqn(import_path)
+            {
+                return Some(unit);
+            }
+            if let Some(rest) = normalized
+                .strip_prefix(imported_name)
+                .and_then(|rest| rest.strip_prefix('.'))
+            {
+                let nested_fqn = format!("{import_path}.{rest}");
+                if let Some(unit) = self.forward_source_type_by_fqn(&nested_fqn) {
+                    return Some(unit);
+                }
+            }
+        }
+
+        for import in &imports {
+            let Some(import_path) = non_static_import_path(import) else {
+                continue;
+            };
+            if !import.is_wildcard {
+                continue;
+            }
+            let package = import_path.trim_end_matches(".*");
+            let fqn = format!("{package}.{normalized}");
+            if let Some(unit) = self.forward_source_type_by_fqn(&fqn) {
+                return Some(unit);
+            }
+        }
+
+        let same_package_fqn = self.same_package_fqn(file, normalized);
+        self.forward_source_type_by_fqn(&same_package_fqn)
+            .or_else(|| self.forward_source_type_by_fqn(normalized))
+    }
+
+    fn forward_source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
+        self.inner
+            .forward_definition_fqn(fqn)
+            .into_iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == fqn)
+    }
+}
+
 impl TestDetectionProvider for JavaAnalyzer {}
 
 impl JavaAnalyzer {
@@ -516,7 +589,7 @@ impl JavaAnalyzer {
 
     fn source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
         self.inner
-            .definition_lookup_index()
+            .global_usage_definition_index()
             .by_fqn(fqn)
             .iter()
             .find(|code_unit| code_unit.is_class())
@@ -526,7 +599,7 @@ impl JavaAnalyzer {
     fn source_types_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
         let mut types: Vec<_> = self
             .inner
-            .definition_lookup_index()
+            .global_usage_definition_index()
             .package_types()
             .filter(|((package, _), _)| package == package_name)
             .flat_map(|(_, units)| units.iter().cloned())

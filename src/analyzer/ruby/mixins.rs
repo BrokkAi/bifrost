@@ -10,6 +10,12 @@ use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
+#[derive(Clone)]
+pub(crate) struct RubyForwardMixinSpec {
+    pub(crate) kind: TypeRelationKind,
+    pub(crate) raw_target: String,
+}
+
 impl RubyAnalyzer {
     pub(crate) fn mixin_relations(&self) -> &[TypeRelation] {
         self.mixin_relations
@@ -41,6 +47,53 @@ impl RubyAnalyzer {
             }
         }
         relations
+    }
+
+    /// Extract mixin statements only from the exact requested owner. This is
+    /// the forward-query counterpart to the global relation collector used by
+    /// inverse analysis.
+    pub(crate) fn forward_mixin_specs(&self, owner: &CodeUnit) -> Vec<RubyForwardMixinSpec> {
+        let Ok(source) = self.project().read_source(owner.source()) else {
+            return Vec::new();
+        };
+        let Some(tree) = parse_ruby_tree(&source) else {
+            return Vec::new();
+        };
+
+        let mut stack = Vec::new();
+        push_children(tree.root_node(), &[], &mut stack);
+        while let Some((node, segments)) = stack.pop() {
+            match node.kind() {
+                "class" | "module" => {
+                    let Some(name_node) = node.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let name_segments = extract_name_segments(name_node, &source);
+                    if name_segments.is_empty() {
+                        continue;
+                    }
+                    let mut type_segments = segments.clone();
+                    type_segments.extend(name_segments);
+                    if type_segments.join("$") == owner.fq_name() {
+                        return raw_mixin_specs_for_type(node, &source);
+                    }
+                    if let Some(body) = node.child_by_field_name("body") {
+                        push_children(body, &type_segments, &mut stack);
+                    }
+                }
+                "singleton_class" => {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        push_children(body, &segments, &mut stack);
+                    }
+                }
+                "method" | "singleton_method" => {}
+                kind if is_descendable_container(kind) => {
+                    push_children(node, &segments, &mut stack)
+                }
+                _ => {}
+            }
+        }
+        Vec::new()
     }
 
     fn collect_mixin_relation_statement<'tree>(
@@ -172,6 +225,42 @@ impl RubyAnalyzer {
         );
         files
     }
+}
+
+fn raw_mixin_specs_for_type(node: Node<'_>, source: &str) -> Vec<RubyForwardMixinSpec> {
+    let Some(body) = node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    let mut specs = Vec::new();
+    let mut stack = vec![body];
+    while let Some(current) = stack.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            match child.kind() {
+                "call" => {
+                    let Some(kind) = mixin_call_kind(child, source) else {
+                        continue;
+                    };
+                    let Some(arguments) = child.child_by_field_name("arguments") else {
+                        continue;
+                    };
+                    let mut arg_cursor = arguments.walk();
+                    let mut call_specs = Vec::new();
+                    for argument in arguments.named_children(&mut arg_cursor) {
+                        if matches!(argument.kind(), "constant" | "scope_resolution")
+                            && let Some(raw_target) = qualified_internal_name(argument, source)
+                        {
+                            call_specs.push(RubyForwardMixinSpec { kind, raw_target });
+                        }
+                    }
+                    specs.extend(call_specs.into_iter().rev());
+                }
+                kind if is_descendable_container(kind) => stack.push(child),
+                _ => {}
+            }
+        }
+    }
+    specs
 }
 
 fn push_children<'tree>(

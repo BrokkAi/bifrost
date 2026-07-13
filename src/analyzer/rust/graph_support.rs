@@ -243,11 +243,30 @@ impl RustAnalyzer {
         self.resolve_imported_export_from_binder(file, &binder, reference)
     }
 
+    pub(crate) fn resolve_imported_export_from_binder_forward(
+        &self,
+        file: &ProjectFile,
+        binder: &ImportBinder,
+        reference: &str,
+    ) -> Vec<(ProjectFile, String)> {
+        self.resolve_imported_export_from_binder_with_mode(file, binder, reference, true)
+    }
+
     pub(crate) fn resolve_imported_export_from_binder(
         &self,
         file: &ProjectFile,
         binder: &ImportBinder,
         reference: &str,
+    ) -> Vec<(ProjectFile, String)> {
+        self.resolve_imported_export_from_binder_with_mode(file, binder, reference, false)
+    }
+
+    fn resolve_imported_export_from_binder_with_mode(
+        &self,
+        file: &ProjectFile,
+        binder: &ImportBinder,
+        reference: &str,
+        forward: bool,
     ) -> Vec<(ProjectFile, String)> {
         let mut targets = HashSet::default();
         let mut saw_explicit_binding = false;
@@ -257,7 +276,11 @@ impl RustAnalyzer {
                     saw_explicit_binding = true;
                     let imported = binding.imported_name.as_deref().unwrap_or(reference);
                     let files = self.resolve_module_files(file, &binding.module_specifier);
-                    targets.extend(self.exported_targets_from_files(&files, imported));
+                    targets.extend(if forward {
+                        self.forward_exported_targets_from_files(&files, imported)
+                    } else {
+                        self.exported_targets_from_files(&files, imported)
+                    });
                     if targets.is_empty() {
                         targets.extend(rust_declaration_targets_in_files(self, &files, imported));
                     }
@@ -270,7 +293,11 @@ impl RustAnalyzer {
                         continue;
                     };
                     let files = self.resolve_module_files(file, module_specifier);
-                    targets.extend(self.exported_targets_from_files(&files, imported));
+                    targets.extend(if forward {
+                        self.forward_exported_targets_from_files(&files, imported)
+                    } else {
+                        self.exported_targets_from_files(&files, imported)
+                    });
                     if targets.is_empty() {
                         targets.extend(rust_declaration_targets_in_files(self, &files, imported));
                     }
@@ -290,7 +317,11 @@ impl RustAnalyzer {
         for binding in binder.bindings.values() {
             if matches!(binding.kind, ImportKind::Glob) {
                 let files = self.resolve_module_files(file, &binding.module_specifier);
-                targets.extend(self.exported_targets_from_files(&files, reference));
+                targets.extend(if forward {
+                    self.forward_exported_targets_from_files(&files, reference)
+                } else {
+                    self.exported_targets_from_files(&files, reference)
+                });
             }
         }
         let mut sorted: Vec<_> = targets.into_iter().collect();
@@ -308,9 +339,8 @@ impl RustAnalyzer {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Option<String> {
-        if let Some(package) = self
-            .cargo_routes()
-            .resolve_module_package(importing_file, module_specifier)
+        if let Some(package) =
+            super::cargo_routes::resolve_module_package_for_file(importing_file, module_specifier)
         {
             return Some(package);
         }
@@ -328,13 +358,20 @@ impl RustAnalyzer {
         if let Some(cached) = self.reference_contexts.get(file) {
             return cached;
         }
-        let context = Arc::new(self.build_reference_context(file));
+        let context = Arc::new(self.build_reference_context(file, false));
         self.reference_contexts
             .insert(file.clone(), context.clone());
         context
     }
 
-    fn build_reference_context(&self, file: &ProjectFile) -> RustReferenceContext {
+    pub(crate) fn forward_reference_context_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<RustReferenceContext> {
+        Arc::new(self.build_reference_context(file, true))
+    }
+
+    fn build_reference_context(&self, file: &ProjectFile, forward: bool) -> RustReferenceContext {
         let _scope = crate::profiling::scope("RustAnalyzer::build_reference_context");
         let binder = self.import_binder_of(file);
         let mut named: HashMap<String, String> = HashMap::default();
@@ -359,7 +396,7 @@ impl RustAnalyzer {
                 ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
             }
         }
-        self.insert_reexport_reference_bindings(file, &mut named);
+        self.insert_reexport_reference_bindings(file, &mut named, forward);
         let same_file: HashMap<String, String> = self
             .declarations(file)
             .into_iter()
@@ -378,6 +415,7 @@ impl RustAnalyzer {
         &self,
         file: &ProjectFile,
         named: &mut HashMap<String, String>,
+        forward: bool,
     ) {
         let export_index = self.export_index_of(file);
         for (exported_name, entry) in export_index.exports_by_name {
@@ -387,7 +425,11 @@ impl RustAnalyzer {
             } = entry
             {
                 let module_files = self.resolve_module_files(file, &module_specifier);
-                let mut targets = self.exported_targets_from_files(&module_files, &imported_name);
+                let mut targets = if forward {
+                    self.forward_exported_targets_from_files(&module_files, &imported_name)
+                } else {
+                    self.exported_targets_from_files(&module_files, &imported_name)
+                };
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files(
                         self,
@@ -408,7 +450,11 @@ impl RustAnalyzer {
                 &mut export_names,
             );
             for export_name in export_names {
-                let mut targets = self.exported_targets_from_files(&module_files, &export_name);
+                let mut targets = if forward {
+                    self.forward_exported_targets_from_files(&module_files, &export_name)
+                } else {
+                    self.exported_targets_from_files(&module_files, &export_name)
+                };
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files(
                         self,
@@ -440,6 +486,56 @@ impl RustAnalyzer {
         }
     }
 
+    fn forward_exported_targets_from_files(
+        &self,
+        module_files: &[ProjectFile],
+        export_name: &str,
+    ) -> BTreeSet<(ProjectFile, String)> {
+        let mut targets = BTreeSet::new();
+        let mut visited = HashSet::default();
+        let mut pending: Vec<_> = module_files
+            .iter()
+            .cloned()
+            .map(|file| (file, export_name.to_string()))
+            .collect();
+        while let Some((file, name)) = pending.pop() {
+            if !visited.insert((file.clone(), name.clone())) {
+                continue;
+            }
+            let index = self.export_index_of(&file);
+            match index.exports_by_name.get(&name) {
+                Some(ExportEntry::Local { local_name }) => {
+                    targets.insert((file.clone(), local_name.clone()));
+                }
+                Some(ExportEntry::ReexportedNamed {
+                    module_specifier,
+                    imported_name,
+                }) => {
+                    pending.extend(
+                        self.resolve_module_files(&file, module_specifier)
+                            .into_iter()
+                            .map(|target_file| (target_file, imported_name.clone())),
+                    );
+                }
+                Some(ExportEntry::Default {
+                    local_name: Some(local_name),
+                }) => {
+                    targets.insert((file.clone(), local_name.clone()));
+                }
+                Some(ExportEntry::Default { local_name: None }) => {}
+                None => {}
+            }
+            for star in index.reexport_stars {
+                pending.extend(
+                    self.resolve_module_files(&file, &star.module_specifier)
+                        .into_iter()
+                        .map(|target_file| (target_file, name.clone())),
+                );
+            }
+        }
+        targets
+    }
+
     pub fn resolve_module_files(
         &self,
         importing_file: &ProjectFile,
@@ -448,7 +544,6 @@ impl RustAnalyzer {
         let package = rust_package_name(importing_file);
         let crate_package = rust_crate_root_package(importing_file);
         let Some(resolved_module) = self
-            .cargo_routes()
             .resolve_module_package(importing_file, module_specifier)
             .or_else(|| {
                 resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
@@ -462,13 +557,16 @@ impl RustAnalyzer {
             .into_iter()
             .filter(|file| rust_package_name(file) == resolved_module)
             .collect();
-        files.extend(self.get_analyzed_files().into_iter().filter(|file| {
-            self.declarations(file).into_iter().any(|code_unit| {
-                code_unit.is_module()
-                    && code_unit.short_name() == resolved_module
-                    && (*file == *importing_file || self.is_visible_module_path(&code_unit))
-            })
-        }));
+        files.extend(
+            self.inner
+                .definitions(&resolved_module)
+                .filter(|code_unit| {
+                    code_unit.is_module()
+                        && (code_unit.source() == importing_file
+                            || self.is_visible_module_path(code_unit))
+                })
+                .map(|code_unit| code_unit.source().clone()),
+        );
         files.extend(rust_module_files_from_path(
             importing_file,
             module_specifier,

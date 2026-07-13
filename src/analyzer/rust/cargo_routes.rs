@@ -5,6 +5,91 @@ use std::path::{Component, Path, PathBuf};
 use super::declarations::rust_package_name;
 use super::imports::rust_external_module_route;
 
+pub(super) fn resolve_module_package_for_file(
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+) -> Option<String> {
+    let (route_root, nested) = rust_external_module_route(module_specifier)?;
+    let manifest_directory = nearest_manifest_directory(importing_file)?;
+    let project_root = importing_file.root();
+    let manifest = read_manifest(project_root, &manifest_directory)?;
+    let current = cargo_crate(project_root, manifest_directory.clone(), manifest.clone())?;
+    let normalized_route = normalize_crate_name(route_root);
+
+    let mut resolved =
+        (current.library_name == normalized_route).then(|| current.root_package.clone());
+    if resolved.is_none() {
+        'dependencies: for dependencies in cargo_dependency_tables(&manifest) {
+            for (exposed_name, dependency) in dependencies {
+                let Some(path) = dependency
+                    .as_table()
+                    .and_then(|dependency| dependency.get("path"))
+                    .and_then(toml::Value::as_str)
+                else {
+                    continue;
+                };
+                let directory = normalize_relative_path(&manifest_directory.join(path));
+                let Some(target_manifest) = read_manifest(project_root, &directory) else {
+                    continue;
+                };
+                let Some(target) = cargo_crate(project_root, directory, target_manifest) else {
+                    continue;
+                };
+                let is_renamed = dependency
+                    .as_table()
+                    .is_some_and(|dependency| dependency.contains_key("package"));
+                let exposed_name = if is_renamed {
+                    normalize_crate_name(exposed_name)
+                } else {
+                    target.library_name.clone()
+                };
+                if exposed_name == normalized_route {
+                    resolved = Some(target.root_package);
+                    break 'dependencies;
+                }
+            }
+        }
+    }
+
+    resolved.map(|package| match nested {
+        Some(nested) => format!("{package}.{nested}"),
+        None => package,
+    })
+}
+
+fn read_manifest(root: &Path, directory: &Path) -> Option<toml::Value> {
+    std::fs::read_to_string(root.join(directory).join("Cargo.toml"))
+        .ok()
+        .and_then(|source| toml::from_str(&source).ok())
+}
+
+fn cargo_crate(root: &Path, directory: PathBuf, manifest: toml::Value) -> Option<CargoCrate> {
+    let package_name = manifest
+        .get("package")?
+        .get("name")?
+        .as_str()
+        .map(normalize_crate_name)?;
+    let library_name = manifest
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(normalize_crate_name)
+        .unwrap_or_else(|| package_name.clone());
+    let library_path = manifest
+        .get("lib")
+        .and_then(|lib| lib.get("path"))
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("src/lib.rs"));
+    let root_file = ProjectFile::new(root.to_path_buf(), directory.join(library_path));
+    Some(CargoCrate {
+        directory,
+        library_name,
+        root_package: rust_package_name(&root_file),
+        manifest,
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RustCargoRouteIndex {
     manifest_by_file: HashMap<ProjectFile, PathBuf>,

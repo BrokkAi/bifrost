@@ -117,7 +117,7 @@ fn java_owner_declares_matching_method(
     target: &CodeUnit,
 ) -> bool {
     analyzer
-        .definition_lookup_index()
+        .global_usage_definition_index()
         .by_fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
         .iter()
         .any(|unit| unit.is_function() && java_method_signatures_match(target, unit))
@@ -364,7 +364,7 @@ fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Op
 
     let nested = |owner: &CodeUnit| {
         ctx.analyzer
-            .definition_lookup_index()
+            .global_usage_definition_index()
             .by_fqn(&format!("{}.{}", owner.fq_name(), name))
             .iter()
             .find(|unit| unit.is_class())
@@ -508,7 +508,7 @@ fn single_return_class(
 
 fn class_definition(ctx: &ScanCtx<'_>, fq_name: &str) -> Option<CodeUnit> {
     ctx.analyzer
-        .definition_lookup_index()
+        .global_usage_definition_index()
         .by_fqn(fq_name)
         .iter()
         .find(|unit| unit.is_class())

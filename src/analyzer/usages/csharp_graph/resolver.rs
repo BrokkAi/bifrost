@@ -484,21 +484,17 @@ pub(super) fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Opti
 }
 
 fn type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Vec<CodeUnit> {
-    let index = csharp.definition_lookup_index();
-    let mut candidates = index
-        .by_fqn(fqn)
-        .iter()
+    let mut candidates = csharp
+        .declaration_candidates_by_fqn(fqn, false)
+        .into_iter()
         .filter(|unit| unit.is_class())
-        .cloned()
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        candidates.extend(
-            index
-                .by_normalized_fqn(&csharp_normalize_full_name(fqn))
-                .iter()
-                .filter(|unit| unit.is_class())
-                .cloned(),
-        );
+        candidates = csharp
+            .declaration_candidates_by_fqn(fqn, true)
+            .into_iter()
+            .filter(|unit| unit.is_class())
+            .collect();
     }
     csharp.sort_dedup_type_candidates(&mut candidates);
     candidates
@@ -512,25 +508,12 @@ pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
 ) -> Option<String> {
     let member_fqn = format!("{}.{}", owner.fq_name(), member_name);
     csharp
-        .definition_lookup_index()
-        .members_for_owner_name(
-            owner.fq_name().as_str(),
-            &csharp_normalize_full_name(&owner.fq_name()),
-            member_name,
-        )
+        .member_candidates_for_owner(owner.fq_name().as_str(), member_name)
         .into_iter()
         .filter(|unit| unit.is_field() && unit.fq_name() == member_fqn)
         .filter_map(|unit| {
-            let indexed = csharp
-                .usage_facts_index()
-                .fact_for_declaration(unit)
-                .and_then(|facts| facts.return_type_fqn.as_deref())
-                .map(str::to_string);
-            indexed.or_else(|| {
-                member_declared_type(csharp, unit).and_then(|type_text| {
-                    resolve_member_type_fq_name(csharp, file, owner, &type_text)
-                })
-            })
+            member_declared_type(csharp, &unit)
+                .and_then(|type_text| resolve_member_type_fq_name(csharp, file, owner, &type_text))
         })
         .next()
 }
@@ -1225,12 +1208,12 @@ fn compatible_receiver_type_names(
     for receiver_type in receiver_type_names {
         compatible.insert(csharp_normalize_full_name(receiver_type));
         let owners = csharp
-            .definition_lookup_index()
+            .global_usage_definition_index()
             .by_fqn(receiver_type)
             .iter()
             .chain(
                 csharp
-                    .definition_lookup_index()
+                    .global_usage_definition_index()
                     .by_normalized_fqn(&csharp_normalize_full_name(receiver_type))
                     .iter(),
             )

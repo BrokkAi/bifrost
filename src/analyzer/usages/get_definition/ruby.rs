@@ -239,7 +239,11 @@ fn ruby_field_outcome(
 
     let owners: Vec<String> = match scope {
         RubyFieldScope::ClassVariable => std::iter::once(owner.clone())
-            .chain(semantic.ancestor_lookup_order(&owner))
+            .chain(semantic.forward_ancestor_lookup_order(
+                support,
+                &context.visible_files.iter().cloned().collect::<Vec<_>>(),
+                &owner,
+            ))
             .collect(),
         RubyFieldScope::Instance | RubyFieldScope::SingletonClass => vec![owner],
     };

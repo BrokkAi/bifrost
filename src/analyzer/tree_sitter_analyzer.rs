@@ -4,7 +4,7 @@ use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{AnalyzerStore, PathSymbolRow};
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo,
-    DefinitionLookupIndex, IAnalyzer, ImportInfo, Language, Project, ProjectFile, Range,
+    GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, Project, ProjectFile, Range,
     RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, SummaryFileProjection,
     UsageFactsIndex,
 };
@@ -783,12 +783,12 @@ pub struct TreeSitterAnalyzer<A> {
     transient_file_states: Arc<Mutex<FileStateCache>>,
     source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
-    definition_lookup_index: Arc<OnceLock<DefinitionLookupIndex>>,
+    global_usage_definition_index: Arc<OnceLock<GlobalUsageDefinitionIndex>>,
     usage_facts_index: Arc<OnceLock<UsageFactsIndex>>,
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
-    definition_lookup_index_build_count: Arc<AtomicUsize>,
+    global_usage_definition_index_build_count: Arc<AtomicUsize>,
     workspace_path_scan_count: Arc<AtomicUsize>,
     _state: PhantomData<A>,
 }
@@ -806,13 +806,13 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             transient_file_states: Arc::clone(&self.transient_file_states),
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
-            definition_lookup_index: Arc::clone(&self.definition_lookup_index),
+            global_usage_definition_index: Arc::clone(&self.global_usage_definition_index),
             usage_facts_index: Arc::clone(&self.usage_facts_index),
             full_hydration_count: Arc::clone(&self.full_hydration_count),
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
-            definition_lookup_index_build_count: Arc::clone(
-                &self.definition_lookup_index_build_count,
+            global_usage_definition_index_build_count: Arc::clone(
+                &self.global_usage_definition_index_build_count,
             ),
             workspace_path_scan_count: Arc::clone(&self.workspace_path_scan_count),
             _state: PhantomData,
@@ -950,12 +950,12 @@ where
             summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
-            definition_lookup_index: Arc::new(OnceLock::new()),
+            global_usage_definition_index: Arc::new(OnceLock::new()),
             usage_facts_index: Arc::new(OnceLock::new()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
-            definition_lookup_index_build_count: Arc::new(AtomicUsize::new(0)),
+            global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
@@ -1011,12 +1011,12 @@ where
             summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
-            definition_lookup_index: Arc::new(OnceLock::new()),
+            global_usage_definition_index: Arc::new(OnceLock::new()),
             usage_facts_index: Arc::new(OnceLock::new()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
-            definition_lookup_index_build_count: Arc::new(AtomicUsize::new(0)),
+            global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
@@ -2248,13 +2248,13 @@ where
         out
     }
 
-    fn sql_definition_lookup_index(&self) -> Option<DefinitionLookupIndex> {
-        let _scope = profiling::scope("TreeSitterAnalyzer::sql_definition_lookup_index");
+    fn sql_global_usage_definition_index(&self) -> Option<GlobalUsageDefinitionIndex> {
+        let _scope = profiling::scope("TreeSitterAnalyzer::sql_global_usage_definition_index");
         if profiling::enabled() {
             profiling::note(format!("language={:?}", self.adapter.language()));
         }
         let blob_keys = {
-            let _scope = profiling::scope("definition_lookup_index::enumerate_live_keys");
+            let _scope = profiling::scope("global_usage_definition_index::enumerate_live_keys");
             let snapshot = self.live_snapshot();
             let mut blob_keys = Vec::new();
             for file in snapshot.all_paths() {
@@ -2283,7 +2283,7 @@ where
         };
 
         let rows = {
-            let _scope = profiling::scope("definition_lookup_index::fetch_persisted_rows");
+            let _scope = profiling::scope("global_usage_definition_index::fetch_persisted_rows");
             let rows = self
                 .store_context
                 .store
@@ -2295,16 +2295,17 @@ where
             rows
         };
         let mut units = {
-            let _scope = profiling::scope("definition_lookup_index::resolve_persisted_rows");
+            let _scope = profiling::scope("global_usage_definition_index::resolve_persisted_rows");
             self.resolve_candidate_rows(rows)
         };
         units.retain(|unit| !unit.is_file_scope());
         let dirty_units = {
-            let _scope = profiling::scope("definition_lookup_index::collect_dirty_units");
+            let _scope = profiling::scope("global_usage_definition_index::collect_dirty_units");
             self.dirty_units_matching(true, |_| true)
         };
         let nonpersisted_units = {
-            let _scope = profiling::scope("definition_lookup_index::collect_nonpersisted_units");
+            let _scope =
+                profiling::scope("global_usage_definition_index::collect_nonpersisted_units");
             self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| !unit.is_file_scope())?
         };
         if profiling::enabled() {
@@ -2317,8 +2318,8 @@ where
         }
         units.extend(dirty_units);
         units.extend(nonpersisted_units);
-        let _scope = profiling::scope("definition_lookup_index::build");
-        Some(DefinitionLookupIndex::from_declarations(
+        let _scope = profiling::scope("global_usage_definition_index::build");
+        Some(GlobalUsageDefinitionIndex::from_declarations(
             units.iter(),
             |fqn| self.adapter.normalize_full_name(fqn),
             |unit| self.adapter.simple_type_name(unit),
@@ -2352,14 +2353,14 @@ where
     }
 
     #[doc(hidden)]
-    pub fn reset_definition_lookup_index_build_count_for_test(&self) {
-        self.definition_lookup_index_build_count
+    pub fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.global_usage_definition_index_build_count
             .store(0, Ordering::Relaxed);
     }
 
     #[doc(hidden)]
-    pub fn definition_lookup_index_build_count_for_test(&self) -> usize {
-        self.definition_lookup_index_build_count
+    pub fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.global_usage_definition_index_build_count
             .load(Ordering::Relaxed)
     }
 
@@ -3216,12 +3217,12 @@ where
     /// Owned handle to the workspace definition index. A refcount bump, not a
     /// map clone; used by per-query views that must outlive a borrow of the
     /// analyzer (e.g. Scala's `ProjectTypes` behind `Arc` caches).
-    pub(crate) fn definition_lookup_index_shared(&self) -> Arc<DefinitionLookupIndex> {
-        Arc::new(self.definition_lookup_index().clone())
+    pub(crate) fn global_usage_definition_index_shared(&self) -> Arc<GlobalUsageDefinitionIndex> {
+        Arc::new(self.global_usage_definition_index().clone())
     }
 
     /// Owned handle to the derived callable-facts index; see
-    /// [`Self::definition_lookup_index_shared`].
+    /// [`Self::global_usage_definition_index_shared`].
     pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
         Arc::new(self.usage_facts_index().clone())
     }
@@ -3265,7 +3266,7 @@ where
             }
         }
         UsageFactsIndex::build_from_declarations(
-            self.definition_lookup_index(),
+            self.global_usage_definition_index(),
             declarations.iter(),
             |unit| {
                 facts_by_declaration
@@ -3492,11 +3493,12 @@ where
         )
     }
 
-    fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
-        self.definition_lookup_index.get_or_init(|| {
-            let _scope = profiling::scope("TreeSitterAnalyzer::definition_lookup_index_build");
+    fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
+        self.global_usage_definition_index.get_or_init(|| {
+            let _scope =
+                profiling::scope("TreeSitterAnalyzer::global_usage_definition_index_build");
             let build_count = self
-                .definition_lookup_index_build_count
+                .global_usage_definition_index_build_count
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
             if profiling::enabled() {
@@ -3505,16 +3507,16 @@ where
                     self.adapter.language()
                 ));
             }
-            self.sql_definition_lookup_index().unwrap_or_default()
+            self.sql_global_usage_definition_index().unwrap_or_default()
         })
     }
 
-    fn reset_definition_lookup_index_build_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_definition_lookup_index_build_count_for_test(self);
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_global_usage_definition_index_build_count_for_test(self);
     }
 
-    fn definition_lookup_index_build_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::definition_lookup_index_build_count_for_test(self)
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::global_usage_definition_index_build_count_for_test(self)
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {
@@ -3523,6 +3525,23 @@ where
 
     fn full_declaration_scan_count_for_test(&self) -> usize {
         TreeSitterAnalyzer::full_declaration_scan_count_for_test(self)
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_full_hydration_count_for_test(self);
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_hydration_count_for_test(self)
+            + TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
+    }
+
+    fn full_candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_hydration_count_for_test(self)
+    }
+
+    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
     }
 
     fn reset_workspace_path_scan_count_for_test(&self) {

@@ -157,7 +157,7 @@ pub(super) fn resolve_rust(
                     // The enclosing impl's type may get the associated item from an
                     // implemented trait; the owner fqn is already resolved, so this
                     // enters the shared resolver past its scoped-path step.
-                    let refs = rust.reference_context_of(file);
+                    let refs = rust.forward_reference_context_of(file);
                     candidates =
                         match crate::analyzer::usages::rust_graph::resolve_trait_associated_item(
                             rust, support, &refs, file, &self_type, name,
@@ -172,7 +172,7 @@ pub(super) fn resolve_rust(
                         };
                 }
                 if candidates.is_empty() {
-                    let refs = rust.reference_context_of(file);
+                    let refs = rust.forward_reference_context_of(file);
                     candidates = match crate::analyzer::usages::rust_graph::resolve_trait_associated_item_matching(
                         rust,
                         support,
@@ -199,7 +199,7 @@ pub(super) fn resolve_rust(
             return candidates_outcome(candidates);
         }
     }
-    let refs = rust.reference_context_of(file);
+    let refs = rust.forward_reference_context_of(file);
     if let Some(tree) = tree
         && let Some(outcome) =
             rust_focused_use_path_outcome(rust, support, file, source, tree, site, &refs)
@@ -422,7 +422,7 @@ fn rust_visible_import_resolution(
             }
         }
     }
-    let targets = rust.resolve_imported_export_from_binder(file, &binder, reference);
+    let targets = rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
     let mut candidates = Vec::new();
     for (target_file, target_name) in targets {
         candidates.extend(
@@ -974,7 +974,7 @@ fn resolve_rust_field(
             && rust_field_expression_member_kind(field_expression) == RustMemberKind::Function
             && let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer)
         {
-            let refs = rust.reference_context_of(file);
+            let refs = rust.forward_reference_context_of(file);
             let trait_candidates =
                 match crate::analyzer::usages::rust_graph::resolve_trait_associated_item(
                     rust, support, &refs, file, &owner, member,
@@ -1653,7 +1653,7 @@ pub(crate) fn rust_resolve_type_node_fqn(
         return rust_enclosing_impl_type_fqn(analyzer, support, file, source, type_node);
     }
     if let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) {
-        let refs = rust.reference_context_of(file);
+        let refs = rust.forward_reference_context_of(file);
         if let Some(path) = type_ref.path.as_deref()
             && let Some(resolved) = refs.resolve_scoped(path, name)
             && support
@@ -2001,7 +2001,8 @@ fn rust_imported_export_candidates(
             Vec::new()
         } else {
             let binder = lexical_scope::visible_import_binder_at(&source, reference_byte);
-            let targets = rust.resolve_imported_export_from_binder(file, &binder, reference);
+            let targets =
+                rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
             if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {
                 return Vec::new();
             }
@@ -2009,7 +2010,7 @@ fn rust_imported_export_candidates(
         }
     } else {
         let binder = rust.import_binder_of(file);
-        let targets = rust.resolve_imported_export(file, reference);
+        let targets = rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
         if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {
             return Vec::new();
         }

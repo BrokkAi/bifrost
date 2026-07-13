@@ -8,7 +8,7 @@ mod config;
 mod cpp;
 mod csharp;
 pub(crate) mod declaration_range;
-mod definition_lookup_index;
+mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
 mod java;
@@ -66,8 +66,8 @@ pub(crate) use csharp::{
     csharp_using_directive_is_static, csharp_using_directive_namespace,
     csharp_using_directive_target,
 };
-pub use definition_lookup_index::DefinitionLookupIndex;
-pub(crate) use definition_lookup_index::{
+pub use global_usage_definition_index::GlobalUsageDefinitionIndex;
+pub(crate) use global_usage_definition_index::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
     impl_forward_query_provider,
 };

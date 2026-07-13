@@ -1630,7 +1630,7 @@ pub(super) fn precise_parent_of(
         format!("{}.{}", code_unit.package_name(), owner_name)
     };
     analyzer
-        .definition_lookup_index()
+        .global_usage_definition_index()
         .by_fqn(&owner_fqn)
         .iter()
         .find(|candidate| {
@@ -1662,7 +1662,7 @@ pub(super) fn visible_owner_from_member_name(
         format!("{}.{}", code_unit.package_name(), owner_name)
     };
     ctx.analyzer
-        .definition_lookup_index()
+        .global_usage_definition_index()
         .by_fqn(&owner_fqn)
         .iter()
         .find(|candidate| {

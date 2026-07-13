@@ -1,7 +1,7 @@
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{
-    CodeUnit, DefinitionLookupIndex, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
-    TypeHierarchyProvider,
+    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
+    RustReferenceContext, TypeHierarchyProvider,
 };
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -9,7 +9,7 @@ use tree_sitter::Parser;
 
 /// Owned, query-shaped declaration access used by Rust forward resolution.
 ///
-/// The legacy [`DefinitionLookupIndex`] implementation keeps usage-graph callers
+/// The legacy [`GlobalUsageDefinitionIndex`] implementation keeps usage-graph callers
 /// working, while point lookups can answer these operations from persisted,
 /// bounded analyzer queries without materializing every workspace declaration.
 pub(crate) trait RustDefinitionProvider {
@@ -21,13 +21,13 @@ pub(crate) trait RustDefinitionProvider {
     }
 }
 
-impl RustDefinitionProvider for DefinitionLookupIndex {
+impl RustDefinitionProvider for GlobalUsageDefinitionIndex {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        DefinitionLookupIndex::fqn(self, fqn)
+        GlobalUsageDefinitionIndex::fqn(self, fqn)
     }
 
     fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
-        DefinitionLookupIndex::file_identifier(self, file, identifier)
+        GlobalUsageDefinitionIndex::file_identifier(self, file, identifier)
     }
 }
 

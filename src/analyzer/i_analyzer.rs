@@ -2,7 +2,7 @@ use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
+    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range,
     SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
@@ -94,20 +94,34 @@ pub trait IAnalyzer: Send + Sync + Any {
         Box::new(std::iter::empty())
     }
 
-    fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
-        static EMPTY: OnceLock<DefinitionLookupIndex> = OnceLock::new();
-        EMPTY.get_or_init(DefinitionLookupIndex::default)
+    fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
+        static EMPTY: OnceLock<GlobalUsageDefinitionIndex> = OnceLock::new();
+        EMPTY.get_or_init(GlobalUsageDefinitionIndex::default)
     }
     #[doc(hidden)]
-    fn reset_definition_lookup_index_build_count_for_test(&self) {}
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {}
     #[doc(hidden)]
-    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
         0
     }
     #[doc(hidden)]
     fn reset_full_declaration_scan_count_for_test(&self) {}
     #[doc(hidden)]
     fn full_declaration_scan_count_for_test(&self) -> usize {
+        0
+    }
+    #[doc(hidden)]
+    fn reset_candidate_hydration_count_for_test(&self) {}
+    #[doc(hidden)]
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        0
+    }
+    #[doc(hidden)]
+    fn full_candidate_hydration_count_for_test(&self) -> usize {
+        0
+    }
+    #[doc(hidden)]
+    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
         0
     }
     #[doc(hidden)]

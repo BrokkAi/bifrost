@@ -10,7 +10,7 @@ use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 
 #[derive(Debug, Clone, Default)]
-pub struct DefinitionLookupIndex {
+pub struct GlobalUsageDefinitionIndex {
     by_fqn: HashMap<String, Vec<CodeUnit>>,
     direct_children_by_fqn: HashMap<String, Vec<CodeUnit>>,
     direct_children_by_normalized_fqn: HashMap<String, Vec<CodeUnit>>,
@@ -23,7 +23,7 @@ pub struct DefinitionLookupIndex {
 
 /// Candidate-shaped declaration operations used by forward symbols queries.
 ///
-/// Unlike [`DefinitionLookupIndex`], implementations backed by a persisted
+/// Unlike [`GlobalUsageDefinitionIndex`], implementations backed by a persisted
 /// analyzer must not materialize every workspace declaration.  The legacy
 /// index implements this trait only for explicit whole-workspace graph paths;
 /// forward `get_definition` and `get_type_by_location` dispatches use the
@@ -174,7 +174,7 @@ fn analyzer_for_language(
     }
 }
 
-impl BoundedDefinitionLookup for DefinitionLookupIndex {
+impl BoundedDefinitionLookup for GlobalUsageDefinitionIndex {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         Self::fqn(self, fqn)
     }
@@ -286,7 +286,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     }
 }
 
-impl DefinitionLookupIndex {
+impl GlobalUsageDefinitionIndex {
     pub(crate) fn from_declarations<I, N, S>(
         declarations: I,
         normalize: N,
@@ -552,7 +552,7 @@ mod tests {
                 "Qux",
             ),
         ];
-        let index = DefinitionLookupIndex::from_declarations(&units, str::to_string, |unit| {
+        let index = GlobalUsageDefinitionIndex::from_declarations(&units, str::to_string, |unit| {
             unit.identifier().to_string()
         });
 
@@ -591,7 +591,7 @@ mod tests {
             unit(&root, "src/Foo.scala", "example", "Foo"),
             unit(&root, "src/Helpers.scala", "example", "Helpers$"),
         ];
-        let index = DefinitionLookupIndex::from_declarations(
+        let index = GlobalUsageDefinitionIndex::from_declarations(
             &units,
             |fqn| fqn.replace("$.", ".").trim_end_matches('$').to_string(),
             |unit| unit.identifier().trim_end_matches('$').to_string(),
@@ -628,7 +628,7 @@ mod tests {
                 "Helpers$.run".to_string(),
             ),
         ];
-        let index = DefinitionLookupIndex::from_declarations(
+        let index = GlobalUsageDefinitionIndex::from_declarations(
             &units,
             |fqn| fqn.replace("$.", ".").trim_end_matches('$').to_string(),
             |unit| unit.identifier().trim_end_matches('$').to_string(),
@@ -649,7 +649,7 @@ mod tests {
         let foo = unit(&root, "src/Foo.java", "example", "Foo");
         let bar = unit(&root, "src/Bar.java", "example", "Bar");
 
-        let index = DefinitionLookupIndex::from_declarations(
+        let index = GlobalUsageDefinitionIndex::from_declarations(
             vec![foo.clone(), bar.clone()],
             str::to_string,
             |unit| unit.identifier().to_string(),

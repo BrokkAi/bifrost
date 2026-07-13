@@ -751,7 +751,7 @@ fn collect_imported_class_method_return_types(
 ) {
     let owner_fqn = class_unit.fq_name();
     for member in analyzer
-        .definition_lookup_index()
+        .global_usage_definition_index()
         .fqn_direct_children(&owner_fqn)
     {
         if !member.is_function() {
