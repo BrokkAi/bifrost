@@ -101,6 +101,17 @@ Wrapper forms control the query around the root pattern:
 (not-inside (function :name "test") (call :callee (name "eval")))
 ```
 
+Pipeline wrappers transform the result domain. Inner wrappers execute first:
+
+```lisp
+(enclosing-decl (call :callee (name "audit")))
+(file-of (function :name "handle"))
+(imports-of (file-of (function :name "handle")))
+(importers-of (importers-of (file-of (function :name "target"))))
+```
+
+The last expression performs two direct reverse-import hops. `:json` renders these wrappers as an ordered `steps` array using `enclosing_decl`, `file_of`, `imports_of`, and `importers_of`.
+
 RQL is not yet a stable external API. It is intended to make interactive exploration pleasant while preserving `query_code` and JSON `CodeQuery` as the stable integration surface.
 
 ## Commands

@@ -190,6 +190,63 @@ class CodeQueryCapture:
 
 
 @dataclass(frozen=True)
+class CodeQueryResultRef:
+    result_type: str
+    path: str
+    kind: str | None = None
+    fq_name: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    id: str | None = None
+    node_range: CodeQueryRange | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryResultRef:
+        return cls(
+            result_type=data["result_type"],
+            path=data["path"],
+            kind=data.get("kind"),
+            fq_name=data.get("fq_name"),
+            start_line=int(data["start_line"]) if "start_line" in data else None,
+            end_line=int(data["end_line"]) if "end_line" in data else None,
+            id=data.get("id"),
+            node_range=CodeQueryRange.from_dict(data["node_range"])
+            if "node_range" in data
+            else None,
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryProvenanceStep:
+    op: str
+    result: CodeQueryResultRef
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryProvenanceStep:
+        return cls(op=data["op"], result=CodeQueryResultRef.from_dict(data["result"]))
+
+
+@dataclass(frozen=True)
+class CodeQueryProvenance:
+    seed: CodeQueryResultRef
+    steps: list[CodeQueryProvenanceStep]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryProvenance:
+        return cls(
+            seed=CodeQueryResultRef.from_dict(data["seed"]),
+            steps=[
+                CodeQueryProvenanceStep.from_dict(item)
+                for item in data.get("steps", [])
+            ],
+        )
+
+
+def _query_provenance(data: dict) -> list[CodeQueryProvenance]:
+    return [CodeQueryProvenance.from_dict(item) for item in data.get("provenance", [])]
+
+
+@dataclass(frozen=True)
 class CodeQueryMatch:
     path: str
     language: str
@@ -203,6 +260,8 @@ class CodeQueryMatch:
     decorated_range: CodeQueryRange | None = None
     decorator_ranges: list[CodeQueryRange] = field(default_factory=list)
     enclosing_symbol: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryMatch:
@@ -228,6 +287,8 @@ class CodeQueryMatch:
                 for item in data.get("decorator_ranges", [])
             ],
             enclosing_symbol=data.get("enclosing_symbol"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
@@ -246,6 +307,84 @@ class CodeQueryMatch:
 
 
 @dataclass(frozen=True)
+class CodeQueryDeclaration:
+    path: str
+    language: str
+    kind: str
+    fq_name: str
+    start_line: int
+    end_line: int
+    signature: str | None = None
+    id: str | None = None
+    node_range: CodeQueryRange | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryDeclaration:
+        return cls(
+            path=data["path"],
+            language=data["language"],
+            kind=data["kind"],
+            fq_name=data["fq_name"],
+            start_line=int(data["start_line"]),
+            end_line=int(data["end_line"]),
+            signature=data.get("signature"),
+            id=data.get("id"),
+            node_range=CodeQueryRange.from_dict(data["node_range"])
+            if "node_range" in data
+            else None,
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        lines = (
+            str(self.start_line)
+            if self.start_line == self.end_line
+            else f"{self.start_line}-{self.end_line}"
+        )
+        rendered = f"{self.path}:{lines} [{self.kind}] {self.fq_name}"
+        if self.signature is not None:
+            rendered += f" `{self.signature}`"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryFile:
+    path: str
+    language: str
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFile:
+        return cls(
+            path=data["path"],
+            language=data["language"],
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return f"{self.path} [file; {self.language}]"
+
+
+CodeQueryResultItem = CodeQueryMatch | CodeQueryDeclaration | CodeQueryFile
+
+
+def _code_query_result_item(data: dict) -> CodeQueryResultItem:
+    result_type = data.get("result_type")
+    if result_type == "structural_match":
+        return CodeQueryMatch.from_dict(data)
+    if result_type == "declaration":
+        return CodeQueryDeclaration.from_dict(data)
+    if result_type == "file":
+        return CodeQueryFile.from_dict(data)
+    raise ValueError(f"unknown code query result_type: {result_type!r}")
+
+
+@dataclass(frozen=True)
 class CodeQueryDiagnostic:
     language: str
     message: str
@@ -260,7 +399,7 @@ class CodeQueryDiagnostic:
 
 @dataclass(frozen=True)
 class CodeQueryResult:
-    matches: list[CodeQueryMatch]
+    results: list[CodeQueryResultItem]
     truncated: bool
     diagnostics: list[CodeQueryDiagnostic] = field(default_factory=list)
     rendered_text: str | None = None
@@ -268,7 +407,9 @@ class CodeQueryResult:
     @classmethod
     def from_dict(cls, data: dict, rendered_text: str | None = None) -> CodeQueryResult:
         return cls(
-            matches=[CodeQueryMatch.from_dict(item) for item in data.get("matches", [])],
+            results=[
+                _code_query_result_item(item) for item in data.get("results", [])
+            ],
             truncated=bool(data["truncated"]),
             diagnostics=[
                 CodeQueryDiagnostic.from_dict(item)
@@ -279,20 +420,20 @@ class CodeQueryResult:
 
     @property
     def count(self) -> int:
-        return len(self.matches)
+        return len(self.results)
 
     def render_text(self) -> str:
         if self.rendered_text is not None:
             return self.rendered_text
-        if self.matches:
+        if self.results:
             suffix = " (truncated; refine the query or raise limit)" if self.truncated else ""
             lines = [
-                f"{len(self.matches)} match{'es' if len(self.matches) != 1 else ''}{suffix}",
+                f"{len(self.results)} result{'s' if len(self.results) != 1 else ''}{suffix}",
                 "",
             ]
-            lines.extend(match.render_text() for match in self.matches)
+            lines.extend(result.render_text() for result in self.results)
         else:
-            lines = ["No structural matches."]
+            lines = ["No query results."]
         lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
         return "\n".join(lines).strip()
 

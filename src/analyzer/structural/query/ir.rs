@@ -16,7 +16,98 @@ pub const MAX_KWARGS: usize = 64;
 pub const MAX_STRING_PREDICATE_LENGTH: usize = 4096;
 pub const MAX_CAPTURE_LENGTH: usize = 128;
 pub const MAX_KWARG_NAME_LENGTH: usize = 128;
-pub const SCHEMA_VERSION: u64 = 1;
+pub const MAX_QUERY_STEPS: usize = 16;
+pub const SCHEMA_VERSION: u64 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryValueKind {
+    StructuralMatch,
+    Declaration,
+    File,
+}
+
+impl QueryValueKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StructuralMatch => "structural_match",
+            Self::Declaration => "declaration",
+            Self::File => "file",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryStep {
+    EnclosingDecl,
+    FileOf,
+    ImportsOf,
+    ImportersOf,
+}
+
+impl QueryStep {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EnclosingDecl => "enclosing_decl",
+            Self::FileOf => "file_of",
+            Self::ImportsOf => "imports_of",
+            Self::ImportersOf => "importers_of",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "enclosing_decl" => Some(Self::EnclosingDecl),
+            "file_of" => Some(Self::FileOf),
+            "imports_of" => Some(Self::ImportsOf),
+            "importers_of" => Some(Self::ImportersOf),
+            _ => None,
+        }
+    }
+
+    pub fn output_kind(self, input: QueryValueKind) -> Option<QueryValueKind> {
+        match (self, input) {
+            (Self::EnclosingDecl, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::Declaration)
+            }
+            (Self::FileOf, QueryValueKind::StructuralMatch | QueryValueKind::Declaration) => {
+                Some(QueryValueKind::File)
+            }
+            (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
+                Some(QueryValueKind::File)
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind, QueryError> {
+    if steps.len() > MAX_QUERY_STEPS {
+        return Err(QueryError::new(
+            "steps",
+            format!("at most {MAX_QUERY_STEPS} query steps are allowed"),
+        ));
+    }
+
+    let mut value_kind = QueryValueKind::StructuralMatch;
+    for (index, &step) in steps.iter().enumerate() {
+        let expected_input = match step {
+            QueryStep::EnclosingDecl => "structural_match",
+            QueryStep::FileOf => "structural_match or declaration",
+            QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
+        };
+        value_kind = step.output_kind(value_kind).ok_or_else(|| {
+            QueryError::new(
+                format!("steps[{index}]"),
+                format!(
+                    "step {} requires {expected_input}, but the previous stage produces {}",
+                    step.label(),
+                    value_kind.label()
+                ),
+            )
+        })?;
+    }
+    Ok(value_kind)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeQueryResultDetail {
@@ -59,8 +150,19 @@ pub struct CodeQuery {
     pub inside: Option<Pattern>,
     /// Verifier-only negative containment: never used for candidate pruning.
     pub not_inside: Option<Pattern>,
+    /// Ordered semantic transformations applied after structural matching.
+    pub steps: Vec<QueryStep>,
     pub limit: usize,
     pub result_detail: CodeQueryResultDetail,
+}
+
+impl CodeQuery {
+    /// Validate the semantic pipeline independently of its JSON/RQL origin.
+    /// Embedders may construct this public IR directly, so execution cannot
+    /// rely solely on decoder validation.
+    pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
+        validate_query_steps(&self.steps)
+    }
 }
 
 /// Predicate over a string attribute of a fact (its name or source text).

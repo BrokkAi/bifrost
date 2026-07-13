@@ -3,7 +3,7 @@ title: C#
 description: Query C# null-conditional calls, named arguments, attributes, and using aliases with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 C# exposes object creation, null-conditional access, named arguments, attributes, constructors, properties, and using aliases through normalized structural facts. Alias bindings are represented by their visible alias, not by the terminal name of the target type.
 
@@ -57,12 +57,13 @@ The receiver and argument predicates select the null-conditional call. Named arg
 <!-- code-query-case:conditional-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "App.AppEntry.Main",
       "end_line": 23,
       "kind": "call",
       "language": "csharp",
+      "result_type": "structural_match",
       "path": "csharp/App.cs",
       "start_line": 23,
       "text": "service?.Run(\"optional\")"
@@ -87,7 +88,7 @@ The receiver and argument predicates select the null-conditional call. Named arg
 <!-- code-query-case:named-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "captures": [
         {"name": "value", "start_line": 13, "text": "code"}
@@ -96,6 +97,7 @@ The receiver and argument predicates select the null-conditional call. Named arg
       "end_line": 13,
       "kind": "call",
       "language": "csharp",
+      "result_type": "structural_match",
       "path": "csharp/App.cs",
       "start_line": 13,
       "text": "AuditNamed(code: code)"
@@ -122,12 +124,13 @@ Attributes are decorators on the class. An alias import matches `WriterAlias`, b
 <!-- code-query-case:attribute:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "App.Service",
       "end_line": 18,
       "kind": "class",
       "language": "csharp",
+      "result_type": "structural_match",
       "path": "csharp/App.cs",
       "start_line": 7,
       "text": "[Route(\"/run\")]…"
@@ -150,11 +153,12 @@ Attributes are decorators on the class. An alias import matches `WriterAlias`, b
 <!-- code-query-case:alias:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "end_line": 3,
       "kind": "import",
       "language": "csharp",
+      "result_type": "structural_match",
       "path": "csharp/App.cs",
       "start_line": 3,
       "text": "using WriterAlias = App.Support.Writer;"
@@ -177,7 +181,7 @@ Attributes are decorators on the class. An alias import matches `WriterAlias`, b
 <!-- code-query-case:alias-target-excluded:expected -->
 ```json
 {
-  "matches": [],
+  "results": [],
   "truncated": false
 }
 ```

@@ -212,8 +212,8 @@
         "icon": "$(play)"
       },
       {
-        "command": "bifrost.openRqlQueryMatch",
-        "title": "Bifrost: Open RQL Query Match"
+        "command": "bifrost.openRqlQueryResult",
+        "title": "Bifrost: Open RQL Query Result"
       }
     ],
     "views": {
@@ -227,7 +227,7 @@
     "viewsWelcome": [
       {
         "view": "bifrost.queryResults",
-        "contents": "Run an RQL query from a `.rql` editor to see its matches here."
+        "contents": "Run an RQL query from a `.rql` editor to see its results here."
       }
     ],
     "menus": {
@@ -237,7 +237,7 @@
           "when": "false"
         },
         {
-          "command": "bifrost.openRqlQueryMatch",
+          "command": "bifrost.openRqlQueryResult",
           "when": "false"
         }
       ],

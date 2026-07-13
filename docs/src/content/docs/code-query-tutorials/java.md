@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 Java normalizes methods, constructors, annotations, object creation, member calls, imports, assignments, exceptions, and control flow. The fixture includes two `post` receivers so receiver filtering proves a real exclusion.
 
@@ -74,8 +74,9 @@ class Api {
 <!-- code-query-case:client-post:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "java/App.java",
       "language": "java",
       "kind": "call",
@@ -115,8 +116,9 @@ Java annotations use the normalized `decorators` role. A constructor remains dis
 <!-- code-query-case:annotated-constructor:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "java/App.java",
       "language": "java",
       "kind": "constructor",
@@ -150,8 +152,9 @@ Java annotations use the normalized `decorators` role. A constructor remains dis
 <!-- code-query-case:catch-throw:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "java/App.java",
       "language": "java",
       "kind": "catch",
@@ -181,8 +184,9 @@ Java annotations use the normalized `decorators` role. A constructor remains dis
 <!-- code-query-case:if-throw:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "java/App.java",
       "language": "java",
       "kind": "if",
@@ -216,8 +220,9 @@ Java annotations use the normalized `decorators` role. A constructor remains dis
 <!-- code-query-case:loop-return:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "java/App.java",
       "language": "java",
       "kind": "loop",
@@ -262,7 +267,7 @@ Java has positional arguments but no keyword-argument syntax. Asking for `kwargs
 <!-- code-query-case:unsupported-kwargs:expected -->
 ```json
 {
-  "matches": [],
+  "results": [],
   "truncated": false,
   "diagnostics": [
     {

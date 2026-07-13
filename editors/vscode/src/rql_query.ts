@@ -6,29 +6,56 @@ export interface RqlQueryDocument {
   text: string;
 }
 
-export interface RqlQueryMatch {
+interface RqlQueryResultBase {
   uri: string;
   path: string;
-  kind: string;
-  startLine: number;
-  endLine: number;
-  text: string;
-  enclosingSymbol?: string;
+  provenance?: unknown[];
+  provenance_truncated?: boolean;
 }
+
+export interface RqlStructuralMatchResult extends RqlQueryResultBase {
+  result_type: "structural_match";
+  kind: string;
+  language: string;
+  start_line: number;
+  end_line: number;
+  text: string;
+  enclosing_symbol?: string;
+}
+
+export interface RqlDeclarationResult extends RqlQueryResultBase {
+  result_type: "declaration";
+  kind: string;
+  language: string;
+  fq_name: string;
+  start_line: number;
+  end_line: number;
+  signature?: string;
+}
+
+export interface RqlFileResult extends RqlQueryResultBase {
+  result_type: "file";
+  language: string;
+}
+
+export type RqlQueryResultItem =
+  | RqlStructuralMatchResult
+  | RqlDeclarationResult
+  | RqlFileResult;
 
 export interface RqlQueryResponse {
   text: string;
-  matches?: RqlQueryMatch[];
+  results?: RqlQueryResultItem[];
 }
 
 export interface RqlQueryResult {
   text: string;
-  matches: RqlQueryMatch[];
+  results: RqlQueryResultItem[];
 }
 
 export interface RqlQueryFileGroup {
   path: string;
-  matches: RqlQueryMatch[];
+  results: RqlQueryResultItem[];
 }
 
 export interface RqlQueryRunner {
@@ -53,13 +80,13 @@ export async function runRqlQuery(
 
   try {
     const response = await runner.sendRequest(RUN_RQL_QUERY_METHOD, { query: document.text });
-    if (!Array.isArray(response.matches)) {
+    if (!Array.isArray(response.results)) {
       runner.showError(
         "Bifrost RQL results require an updated language server. Rebuild and restart Bifrost, then run the query again."
       );
       return undefined;
     }
-    return { text: response.text, matches: response.matches };
+    return { text: response.text, results: response.results };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     runner.showError(`Bifrost RQL query failed: ${message}`);
@@ -67,14 +94,14 @@ export async function runRqlQuery(
   }
 }
 
-export function groupRqlQueryMatches(matches: readonly RqlQueryMatch[]): RqlQueryFileGroup[] {
+export function groupRqlQueryResults(results: readonly RqlQueryResultItem[]): RqlQueryFileGroup[] {
   const files = new Map<string, RqlQueryFileGroup>();
-  for (const match of matches) {
-    const existing = files.get(match.path);
+  for (const result of results) {
+    const existing = files.get(result.path);
     if (existing) {
-      existing.matches.push(match);
+      existing.results.push(result);
     } else {
-      files.set(match.path, { path: match.path, matches: [match] });
+      files.set(result.path, { path: result.path, results: [result] });
     }
   }
   return [...files.values()];

@@ -3,7 +3,7 @@ title: C and C++
 description: Query C and C++ together through the cpp structural adapter and language filter.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 C and C++ files share the `cpp` analyzer, structural adapter, and language-filter label. Use `languages: ["cpp"]` for `.c`, `.cc`, `.cpp`, and the supported C-family header extensions; use `where` when source syntax or directory layout needs a narrower boundary.
 
@@ -68,9 +68,9 @@ int main() {
 <!-- code-query-case:both-audits:expected -->
 ```json
 {
-  "matches": [
-    {"path":"c-family/main.c","language":"cpp","kind":"call","start_line":7,"end_line":7,"text":"audit(\"c\")","captures":[{"name":"value","text":"\"c\"","start_line":7}],"enclosing_symbol":"main"},
-    {"path":"c-family/service.cpp","language":"cpp","kind":"call","start_line":17,"end_line":17,"text":"audit(\"cpp\")","captures":[{"name":"value","text":"\"cpp\"","start_line":17}],"enclosing_symbol":"main"}
+  "results": [
+    {"result_type":"structural_match","path":"c-family/main.c","language":"cpp","kind":"call","start_line":7,"end_line":7,"text":"audit(\"c\")","captures":[{"name":"value","text":"\"c\"","start_line":7}],"enclosing_symbol":"main"},
+    {"result_type":"structural_match","path":"c-family/service.cpp","language":"cpp","kind":"call","start_line":17,"end_line":17,"text":"audit(\"cpp\")","captures":[{"name":"value","text":"\"cpp\"","start_line":17}],"enclosing_symbol":"main"}
   ],
   "truncated": false
 }
@@ -103,9 +103,9 @@ The same assignment query matches C's explicit type and C++'s `auto`. `left` and
 <!-- code-query-case:retry-assignments:expected -->
 ```json
 {
-  "matches": [
-    {"path":"c-family/main.c","language":"cpp","kind":"assignment","start_line":6,"end_line":6,"text":"retries = 3","captures":[{"name":"count","text":"3","start_line":6}],"enclosing_symbol":"main"},
-    {"path":"c-family/service.cpp","language":"cpp","kind":"assignment","start_line":14,"end_line":14,"text":"retries = 5","captures":[{"name":"count","text":"5","start_line":14}],"enclosing_symbol":"main"}
+  "results": [
+    {"result_type":"structural_match","path":"c-family/main.c","language":"cpp","kind":"assignment","start_line":6,"end_line":6,"text":"retries = 3","captures":[{"name":"count","text":"3","start_line":6}],"enclosing_symbol":"main"},
+    {"result_type":"structural_match","path":"c-family/service.cpp","language":"cpp","kind":"assignment","start_line":14,"end_line":14,"text":"retries = 5","captures":[{"name":"count","text":"5","start_line":14}],"enclosing_symbol":"main"}
   ],
   "truncated": false
 }
@@ -139,8 +139,8 @@ The path glob excludes the C fixture. Receiver, callee, and argument roles ident
 <!-- code-query-case:service-run:expected -->
 ```json
 {
-  "matches": [
-    {"path":"c-family/service.cpp","language":"cpp","kind":"call","start_line":16,"end_line":16,"text":"service.run(retries)","captures":[{"name":"retries","text":"retries","start_line":16}],"enclosing_symbol":"main"}
+  "results": [
+    {"result_type":"structural_match","path":"c-family/service.cpp","language":"cpp","kind":"call","start_line":16,"end_line":16,"text":"service.run(retries)","captures":[{"name":"retries","text":"retries","start_line":16}],"enclosing_symbol":"main"}
   ],
   "truncated": false
 }
@@ -161,8 +161,8 @@ The path glob excludes the C fixture. Receiver, callee, and argument roles ident
 <!-- code-query-case:constructor:expected -->
 ```json
 {
-  "matches": [
-    {"path":"c-family/service.cpp","language":"cpp","kind":"constructor","start_line":9,"end_line":9,"text":"Service::Service() {}","enclosing_symbol":"Service.Service"}
+  "results": [
+    {"result_type":"structural_match","path":"c-family/service.cpp","language":"cpp","kind":"constructor","start_line":9,"end_line":9,"text":"Service::Service() {}","enclosing_symbol":"Service.Service"}
   ],
   "truncated": false
 }
@@ -181,8 +181,8 @@ The path glob excludes the C fixture. Receiver, callee, and argument roles ident
 <!-- code-query-case:vector-include:expected -->
 ```json
 {
-  "matches": [
-    {"path":"c-family/service.cpp","language":"cpp","kind":"import","start_line":1,"end_line":2,"text":"#include <vector>…"}
+  "results": [
+    {"result_type":"structural_match","path":"c-family/service.cpp","language":"cpp","kind":"import","start_line":1,"end_line":2,"text":"#include <vector>…"}
   ],
   "truncated": false
 }
@@ -190,4 +190,4 @@ The path glob excludes the C fixture. Receiver, callee, and argument roles ident
 
 ## Precision Boundary
 
-C naturally produces only the subset of normalized facts its syntax supports. Neither C nor C++ models `kwargs` or decorators, and version 1 does not resolve the static type of `service`.
+C naturally produces only the subset of normalized facts its syntax supports. Neither C nor C++ models `kwargs` or decorators, and version 2 does not resolve the static type of `service`.

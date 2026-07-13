@@ -32,7 +32,7 @@ struct TutorialCase {
 #[test]
 fn executable_tutorial_marker_contract_runs_end_to_end() {
     let markdown = r#"
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 <!-- code-query-fixture:sample.py -->
 ```python
@@ -54,7 +54,7 @@ audit("ok")
 
 <!-- code-query-case:audit:expected -->
 ```json
-{"matches":[{"path":"sample.py","language":"python","kind":"call","start_line":4,"end_line":4,"text":"audit(\"ok\")","captures":[{"name":"value","text":"\"ok\"","start_line":4}],"enclosing_symbol":"sample"}],"truncated":false}
+{"results":[{"result_type":"structural_match","path":"sample.py","language":"python","kind":"call","start_line":4,"end_line":4,"text":"audit(\"ok\")","captures":[{"name":"value","text":"\"ok\"","start_line":4}],"enclosing_symbol":"sample"}],"truncated":false}
 ```
 "#;
 
@@ -289,7 +289,7 @@ fn parse_tutorial(path: &Path, markdown: &str) -> Tutorial {
         .find_map(|line| {
             line.trim()
                 .strip_prefix("> Last verified end to end: ")
-                .and_then(|rest| rest.strip_suffix(" (`query_code` schema version 1)."))
+                .and_then(|rest| rest.strip_suffix(" (`query_code` schema version 2)."))
         })
         .unwrap_or_else(|| panic!("{} has no last-verified note", path.display()))
         .to_string();

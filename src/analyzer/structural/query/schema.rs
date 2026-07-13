@@ -8,6 +8,8 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
+    Query,
+    QuerySteps,
     Pattern,
     PatternList,
     PatternMap,
@@ -26,6 +28,8 @@ pub enum ValueShape {
 impl ValueShape {
     pub fn description(self) -> &'static str {
         match self {
+            Self::Query => "a query",
+            Self::QuerySteps => "an ordered list of query steps",
             Self::Pattern => "a pattern",
             Self::PatternList => "a list/vector of patterns",
             Self::PatternMap => "a map of names to patterns",
@@ -38,7 +42,7 @@ impl ValueShape {
             Self::LanguageList => "one or more language labels",
             Self::PositiveInteger => "a positive integer",
             Self::ResultDetail => "compact or full",
-            Self::SchemaVersion => "schema version 1",
+            Self::SchemaVersion => "schema version 2",
         }
     }
 }
@@ -122,7 +126,11 @@ macro_rules! rql_forms {
                     | Self::Limit
                     | Self::ResultDetail
                     | Self::Inside
-                    | Self::NotInside => None,
+                    | Self::NotInside
+                    | Self::EnclosingDecl
+                    | Self::FileOf
+                    | Self::ImportsOf
+                    | Self::ImportersOf => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -178,6 +186,34 @@ rql_forms! {
         shape: Pattern,
         signature: "(not-inside container-pattern query)",
         description: "Exclude root matches lexically inside a matching container.",
+    }
+    EnclosingDecl {
+        labels: ["enclosing-decl"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(enclosing-decl query)",
+        description: "Return the smallest real declaration enclosing each structural match.",
+    }
+    FileOf {
+        labels: ["file-of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(file-of query)",
+        description: "Return the workspace file containing each structural match or declaration.",
+    }
+    ImportsOf {
+        labels: ["imports-of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(imports-of query)",
+        description: "Return files directly imported by each input file.",
+    }
+    ImportersOf {
+        labels: ["importers-of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(importers-of query)",
+        description: "Return files that directly import each input file.",
     }
     Name {
         labels: ["name"],
@@ -391,9 +427,10 @@ json_fields! {
     Match { label: "match", shape: Pattern, signature: "\"match\": { pattern }", description: "Define the required root structural pattern." }
     Inside { label: "inside", shape: Pattern, signature: "\"inside\": { pattern }", description: "Require the root match to be inside a matching container." }
     NotInside { label: "not_inside", shape: Pattern, signature: "\"not_inside\": { pattern }", description: "Exclude root matches inside a matching container." }
+    Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }
     Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }
     ResultDetail { label: "result_detail", shape: ResultDetail, signature: "\"result_detail\": \"compact\" | \"full\"", description: "Choose compact output or full capture and source details." }
-    SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": 1", description: "Select the CodeQuery schema version." }
+    SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": 2", description: "Select the CodeQuery schema version." }
 }
 
 json_fields! {

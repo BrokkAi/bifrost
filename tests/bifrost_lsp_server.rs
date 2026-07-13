@@ -650,7 +650,7 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
     );
     assert!(json_response["error"].is_null(), "{json_response}");
     assert_eq!(
-        json_response["result"]["matches"].as_array().unwrap().len(),
+        json_response["result"]["results"].as_array().unwrap().len(),
         2
     );
     let text = response["result"]["text"]
@@ -658,22 +658,56 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
         .unwrap_or_else(|| panic!("expected text result, got {response}"));
     assert!(text.contains("AlphaRoot"), "expected first root in {text}");
     assert!(text.contains("BetaRoot"), "expected second root in {text}");
-    let matches = response["result"]["matches"]
+    let results = response["result"]["results"]
         .as_array()
-        .unwrap_or_else(|| panic!("expected structured match result, got {response}"));
+        .unwrap_or_else(|| panic!("expected typed query results, got {response}"));
     assert_eq!(
-        matches.len(),
+        results.len(),
         2,
         "expected both workspace roots in {response}"
     );
     assert!(
-        matches.iter().all(|matched| {
-            matched["uri"]
-                .as_str()
-                .is_some_and(|uri| uri.starts_with("file://"))
-                && matched["startLine"].as_u64().is_some()
+        results.iter().all(|result| {
+            result["result_type"] == "structural_match"
+                && result["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.starts_with("file://"))
+                && result["start_line"].as_u64().is_some()
         }),
-        "expected navigable match locations in {response}"
+        "expected navigable structural results in {response}"
+    );
+
+    let declarations = server.request(
+        "bifrost/queryCode",
+        json!({"query": "(enclosing-decl (class))"}),
+    );
+    let declaration_results = declarations["result"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected declaration results, got {declarations}"));
+    assert_eq!(declaration_results.len(), 2, "{declarations}");
+    assert!(
+        declaration_results.iter().all(|result| {
+            result["result_type"] == "declaration"
+                && result["fq_name"].as_str().is_some()
+                && result["start_line"].as_u64().is_some()
+        }),
+        "expected navigable declaration results in {declarations}"
+    );
+
+    let files = server.request("bifrost/queryCode", json!({"query": "(file-of (class))"}));
+    let file_results = files["result"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected file results, got {files}"));
+    assert_eq!(file_results.len(), 2, "{files}");
+    assert!(
+        file_results.iter().all(|result| {
+            result["result_type"] == "file"
+                && result["language"] == "java"
+                && result["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.starts_with("file://"))
+        }),
+        "expected navigable file results in {files}"
     );
 
     let invalid = server.request("bifrost/queryCode", json!({"query": "(class"}));

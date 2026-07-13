@@ -770,6 +770,14 @@ impl IAnalyzer for MultiAnalyzer {
             .then_some(self as &dyn ImportAnalysisProvider)
     }
 
+    fn import_analysis_provider_for_file(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<&dyn ImportAnalysisProvider> {
+        self.delegate_for_file(file)
+            .and_then(AnalyzerDelegate::import_analysis_provider)
+    }
+
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         self.delegates
             .values()

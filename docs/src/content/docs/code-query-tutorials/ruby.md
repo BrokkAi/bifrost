@@ -3,7 +3,7 @@ title: Ruby
 description: Query Ruby keyword calls, blocks, imports, qualified classes, and precision boundaries with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 Ruby maps ordinary and receiver calls, keyword arguments, blocks/lambdas, methods, qualified classes, assignments, and static imports. Import refinement is deliberately conservative: receiver calls named `require` and interpolated strings do not become precise import modules.
 
@@ -37,6 +37,244 @@ end
 missing = nil
 ```
 
+<!-- code-query-fixture:ruby/graph/a.rb -->
+```ruby
+require_relative "b"
+
+def graph_seed
+end
+```
+
+<!-- code-query-fixture:ruby/graph/b.rb -->
+```ruby
+require_relative "c"
+
+def graph_middle
+end
+```
+
+<!-- code-query-fixture:ruby/graph/c.rb -->
+```ruby
+def graph_target
+end
+```
+
+## Typed declaration and import pipelines
+
+Pipeline wrappers transform syntax matches into declarations or files. `enclosing-decl` is inclusive and returns the smallest indexed declaration containing the match. `file-of` converts a syntax match or declaration to its exact project file.
+
+<!-- code-query-case:enclosing-decl:rql -->
+```lisp
+(enclosing-decl
+  (language ruby (call :callee (name "audit_named"))))
+```
+
+<!-- code-query-case:enclosing-decl:json -->
+```json
+{"languages":["ruby"],"match":{"kind":"call","callee":{"name":"audit_named"}},"steps":[{"op":"enclosing_decl"}]}
+```
+
+<!-- code-query-case:enclosing-decl:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 12,
+      "fq_name": "App$Service.run",
+      "kind": "function",
+      "language": "ruby",
+      "path": "ruby/app.rb",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 8,
+            "kind": "call",
+            "path": "ruby/app.rb",
+            "result_type": "structural_match",
+            "start_line": 8
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 12,
+                "fq_name": "App$Service.run",
+                "kind": "function",
+                "path": "ruby/app.rb",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "(code)",
+      "start_line": 6
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:file-of:rql -->
+```lisp
+(file-of (language ruby (function :name "graph_target")))
+```
+
+<!-- code-query-case:file-of:json -->
+```json
+{"languages":["ruby"],"match":{"kind":"function","name":"graph_target"},"steps":[{"op":"file_of"}]}
+```
+
+<!-- code-query-case:file-of:expected -->
+```json
+{
+  "results": [
+    {
+      "language": "ruby",
+      "path": "ruby/graph/c.rb",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 2,
+            "kind": "function",
+            "path": "ruby/graph/c.rb",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "file_of",
+              "result": {
+                "path": "ruby/graph/c.rb",
+                "result_type": "file"
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "file"
+    }
+  ],
+  "truncated": false
+}
+```
+
+`imports-of` follows one direct project-local import edge. `importers-of` follows the reverse direct edge; nesting it twice performs two hops rather than silently computing a transitive closure.
+
+<!-- code-query-case:imports-of:rql -->
+```lisp
+(imports-of
+  (file-of (language ruby (function :name "graph_seed"))))
+```
+
+<!-- code-query-case:imports-of:json -->
+```json
+{"languages":["ruby"],"match":{"kind":"function","name":"graph_seed"},"steps":[{"op":"file_of"},{"op":"imports_of"}]}
+```
+
+<!-- code-query-case:imports-of:expected -->
+```json
+{
+  "results": [
+    {
+      "language": "ruby",
+      "path": "ruby/graph/b.rb",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 4,
+            "kind": "function",
+            "path": "ruby/graph/a.rb",
+            "result_type": "structural_match",
+            "start_line": 3
+          },
+          "steps": [
+            {
+              "op": "file_of",
+              "result": {
+                "path": "ruby/graph/a.rb",
+                "result_type": "file"
+              }
+            },
+            {
+              "op": "imports_of",
+              "result": {
+                "path": "ruby/graph/b.rb",
+                "result_type": "file"
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "file"
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:importers-of:rql -->
+```lisp
+(importers-of
+  (importers-of
+    (file-of (language ruby (function :name "graph_target")))))
+```
+
+<!-- code-query-case:importers-of:json -->
+```json
+{"languages":["ruby"],"match":{"kind":"function","name":"graph_target"},"steps":[{"op":"file_of"},{"op":"importers_of"},{"op":"importers_of"}]}
+```
+
+<!-- code-query-case:importers-of:expected -->
+```json
+{
+  "results": [
+    {
+      "language": "ruby",
+      "path": "ruby/graph/a.rb",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 2,
+            "kind": "function",
+            "path": "ruby/graph/c.rb",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "file_of",
+              "result": {
+                "path": "ruby/graph/c.rb",
+                "result_type": "file"
+              }
+            },
+            {
+              "op": "importers_of",
+              "result": {
+                "path": "ruby/graph/b.rb",
+                "result_type": "file"
+              }
+            },
+            {
+              "op": "importers_of",
+              "result": {
+                "path": "ruby/graph/a.rb",
+                "result_type": "file"
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "file"
+    }
+  ],
+  "truncated": false
+}
+```
+
 ## Keyword and receiver calls
 
 The keyword query selects `audit_named(code: code)`. A receiver constraint keeps `loader.require(...)` as a normal call, even though bare `require "..."` is an import shape.
@@ -56,7 +294,7 @@ The keyword query selects `audit_named(code: code)`. A receiver constraint keeps
 <!-- code-query-case:named-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "captures": [
         {"name": "value", "start_line": 8, "text": "code"}
@@ -65,6 +303,7 @@ The keyword query selects `audit_named(code: code)`. A receiver constraint keeps
       "end_line": 8,
       "kind": "call",
       "language": "ruby",
+      "result_type": "structural_match",
       "path": "ruby/app.rb",
       "start_line": 8,
       "text": "audit_named(code: code)"
@@ -88,12 +327,13 @@ The keyword query selects `audit_named(code: code)`. A receiver constraint keeps
 <!-- code-query-case:receiver-require:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "App$Service.run",
       "end_line": 11,
       "kind": "call",
       "language": "ruby",
+      "result_type": "structural_match",
       "path": "ruby/app.rb",
       "start_line": 11,
       "text": "loader.require(\"plugin\")"
@@ -120,11 +360,12 @@ Only fully static strings provide a `module` role. The interpolated `plugins/#{t
 <!-- code-query-case:static-import:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "end_line": 1,
       "kind": "import",
       "language": "ruby",
+      "result_type": "structural_match",
       "path": "ruby/app.rb",
       "start_line": 1,
       "text": "require \"app/support\""
@@ -147,7 +388,7 @@ Only fully static strings provide a `module` role. The interpolated `plugins/#{t
 <!-- code-query-case:dynamic-import-excluded:expected -->
 ```json
 {
-  "matches": [],
+  "results": [],
   "truncated": false
 }
 ```
@@ -169,12 +410,13 @@ Only fully static strings provide a `module` role. The interpolated `plugins/#{t
 <!-- code-query-case:lambda:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "App$Service.run",
       "end_line": 10,
       "kind": "lambda",
       "language": "ruby",
+      "result_type": "structural_match",
       "path": "ruby/app.rb",
       "start_line": 10,
       "text": "->(value) { return value }"
@@ -203,7 +445,7 @@ Only fully static strings provide a `module` role. The interpolated `plugins/#{t
       "message": "structural adapter for ruby does not support role(s): decorators"
     }
   ],
-  "matches": [],
+  "results": [],
   "truncated": false
 }
 ```
@@ -223,11 +465,12 @@ Qualified declarations such as `class App::External` are nameable through their 
 <!-- code-query-case:null-literal:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "end_line": 24,
       "kind": "null_literal",
       "language": "ruby",
+      "result_type": "structural_match",
       "path": "ruby/app.rb",
       "start_line": 24,
       "text": "nil"
@@ -250,11 +493,12 @@ Qualified declarations such as `class App::External` are nameable through their 
 <!-- code-query-case:literal-supertype:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "end_line": 24,
       "kind": "null_literal",
       "language": "ruby",
+      "result_type": "structural_match",
       "path": "ruby/app.rb",
       "start_line": 24,
       "text": "nil"

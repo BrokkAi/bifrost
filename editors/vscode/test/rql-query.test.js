@@ -4,21 +4,21 @@ const test = require("node:test");
 const {
   RQL_LANGUAGE_ID,
   RUN_RQL_QUERY_METHOD,
-  groupRqlQueryMatches,
+  groupRqlQueryResults,
   runRqlQuery
 } = require("../out-test/rql_query.js");
 
 function runner(overrides = {}) {
   return {
     isReady: () => true,
-    sendRequest: async () => ({ text: "1 match\n", matches: [] }),
+    sendRequest: async () => ({ text: "1 result\n", results: [] }),
     showError: () => {},
     showWarning: () => {},
     ...overrides
   };
 }
 
-test("runs unsaved RQL editor text and returns structured matches", async () => {
+test("runs unsaved RQL editor text and returns typed results", async () => {
   const requests = [];
   const response = await runRqlQuery(
     {
@@ -30,13 +30,15 @@ test("runs unsaved RQL editor text and returns structured matches", async () => 
         requests.push([method, params]);
         return {
           text: "1 match\n\nsrc/app.py:1 [class] `class UnsavedClass`\n",
-          matches: [
+          results: [
             {
               uri: "file:///workspace/src/app.py",
               path: "src/app.py",
+              result_type: "structural_match",
               kind: "class",
-              startLine: 1,
-              endLine: 1,
+              language: "python",
+              start_line: 1,
+              end_line: 1,
               text: "class UnsavedClass"
             }
           ]
@@ -48,7 +50,7 @@ test("runs unsaved RQL editor text and returns structured matches", async () => 
   assert.deepEqual(requests, [
     [RUN_RQL_QUERY_METHOD, { query: '(class :name "UnsavedClass")' }]
   ]);
-  assert.equal(response.matches[0].path, "src/app.py");
+  assert.equal(response.results[0].path, "src/app.py");
 });
 
 test("warns without issuing a request when Bifrost is not ready", async () => {
@@ -71,7 +73,7 @@ test("reports request failures through the error UI", async () => {
     { languageId: RQL_LANGUAGE_ID, text: "(class" },
     runner({
       sendRequest: async () => {
-        throw new Error("Failed to parse RQL query: unexpected end of input");
+        throw new Error("Failed to parse query source: unexpected end of input");
       },
       showError: (message) => errors.push(message)
     })
@@ -79,7 +81,7 @@ test("reports request failures through the error UI", async () => {
 
   assert.equal(response, undefined);
   assert.deepEqual(errors, [
-    "Bifrost RQL query failed: Failed to parse RQL query: unexpected end of input"
+    "Bifrost RQL query failed: Failed to parse query source: unexpected end of input"
   ]);
 });
 
@@ -99,15 +101,41 @@ test("reports an outdated server response without attempting to render it", asyn
   ]);
 });
 
-test("groups query matches by path while preserving result order", () => {
-  const grouped = groupRqlQueryMatches([
-    { uri: "file:///a.rs", path: "a.rs", kind: "function", startLine: 1, endLine: 2, text: "a" },
-    { uri: "file:///b.rs", path: "b.rs", kind: "function", startLine: 3, endLine: 4, text: "b" },
-    { uri: "file:///a.rs", path: "a.rs", kind: "class", startLine: 5, endLine: 6, text: "c" }
+test("groups mixed typed results by path while preserving result order", () => {
+  const grouped = groupRqlQueryResults([
+    {
+      uri: "file:///a.rs",
+      path: "a.rs",
+      result_type: "structural_match",
+      kind: "function",
+      language: "rust",
+      start_line: 1,
+      end_line: 2,
+      text: "a"
+    },
+    {
+      uri: "file:///b.rs",
+      path: "b.rs",
+      result_type: "file",
+      language: "rust"
+    },
+    {
+      uri: "file:///a.rs",
+      path: "a.rs",
+      result_type: "declaration",
+      kind: "class",
+      language: "rust",
+      fq_name: "crate::C",
+      start_line: 5,
+      end_line: 6
+    }
   ]);
 
-  assert.deepEqual(grouped.map((group) => [group.path, group.matches.map((match) => match.text)]), [
-    ["a.rs", ["a", "c"]],
-    ["b.rs", ["b"]]
-  ]);
+  assert.deepEqual(
+    grouped.map((group) => [group.path, group.results.map((result) => result.result_type)]),
+    [
+      ["a.rs", ["structural_match", "declaration"]],
+      ["b.rs", ["file"]]
+    ]
+  );
 });

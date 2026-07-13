@@ -499,6 +499,26 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         self.inner.import_info_of(file)
     }
 
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        Some(
+            imports
+                .iter()
+                .flat_map(|import| {
+                    resolve_js_ts_import_paths(
+                        file,
+                        &import.raw_snippet,
+                        Language::TypeScript,
+                        Some(&self.alias_resolver),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         if let Some(cached) = self.relevant_imports.get(code_unit) {
             return (*cached).clone();

@@ -34,6 +34,26 @@ pub(crate) fn find_line_index_for_offset(line_starts: &[usize], offset: usize) -
     }
 }
 
+/// Convert a byte offset to the analyzer's 1-based line and character-column
+/// convention using canonical mixed-line-ending boundaries.
+pub(crate) fn line_column_for_offset(
+    content: &str,
+    line_starts: &[usize],
+    offset: usize,
+) -> (usize, usize) {
+    let bounded = offset.min(content.len());
+    let mut boundary = bounded;
+    while boundary > 0 && !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let line_index = find_line_index_for_offset(line_starts, boundary);
+    let line_start = line_starts.get(line_index).copied().unwrap_or(0);
+    let column = content
+        .get(line_start..boundary)
+        .map_or(1, |prefix| prefix.chars().count() + 1);
+    (line_index + 1, column)
+}
+
 /// Extract the alphanumeric/underscore identifier surrounding `offset` in
 /// `content`. Returns `None` if neither the byte at `offset` nor the byte
 /// immediately before it is part of an identifier.
@@ -357,7 +377,10 @@ fn render_virtual_requested_line(
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_line_starts, find_line_index_for_offset, render_location_diagnostic};
+    use super::{
+        compute_line_starts, find_line_index_for_offset, line_column_for_offset,
+        render_location_diagnostic,
+    };
 
     #[test]
     fn compute_line_starts_handles_mixed_line_endings() {
@@ -366,6 +389,19 @@ mod tests {
         assert_eq!(vec![0, 2, 4], compute_line_starts("x\ry\rz"));
         assert_eq!(vec![0, 3], compute_line_starts("a\r\n"));
         assert_eq!(vec![0], compute_line_starts(""));
+    }
+
+    #[test]
+    fn line_columns_use_canonical_mixed_line_endings() {
+        let source = "a\rb\r\nç\nd";
+        let starts = compute_line_starts(source);
+        assert_eq!(line_column_for_offset(source, &starts, 2), (2, 1));
+        assert_eq!(line_column_for_offset(source, &starts, 5), (3, 1));
+        assert_eq!(line_column_for_offset(source, &starts, 7), (3, 2));
+        assert_eq!(
+            line_column_for_offset(source, &starts, source.len()),
+            (4, 2)
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@ use super::sexp::query_to_json;
 use super::syntax::{Expr, ExprKind, parse_rql};
 use super::{
     CodeQuery, CodeQueryResultDetail, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
-    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_STEPS,
+    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, QueryStep, SCHEMA_VERSION,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
@@ -332,6 +332,15 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
                 validate_rql_pattern(&args[0], field, analysis);
             }
         }
+        RqlForm::EnclosingDecl | RqlForm::FileOf | RqlForm::ImportsOf | RqlForm::ImportersOf => {
+            if args.len() != 1 {
+                analysis.error(
+                    query.range.clone(),
+                    "wrong-value-shape",
+                    format!("{} expects one query", form.label()),
+                );
+            }
+        }
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -539,6 +548,8 @@ fn validate_property_value(
         super::schema::ValueShape::Pattern => validate_rql_pattern(value, &child, analysis),
         super::schema::ValueShape::PatternList
         | super::schema::ValueShape::PatternMap
+        | super::schema::ValueShape::Query
+        | super::schema::ValueShape::QuerySteps
         | super::schema::ValueShape::StringList
         | super::schema::ValueShape::StringPredicate
         | super::schema::ValueShape::RegexPredicate
@@ -965,6 +976,7 @@ fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analys
                     );
                 }
             }
+            QueryField::Steps => validate_json_steps(child, &child_path, analysis),
             QueryField::Limit => {
                 if child
                     .as_number()
@@ -990,11 +1002,11 @@ fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analys
             }
             QueryField::ResultDetail => validate_json_result_detail(child, analysis),
             QueryField::SchemaVersion => {
-                if child.as_number().and_then(serde_json::Number::as_u64) != Some(1) {
+                if child.as_number().and_then(serde_json::Number::as_u64) != Some(SCHEMA_VERSION) {
                     analysis.error(
                         child.range(),
                         "wrong-value-shape",
-                        "expected schema version 1",
+                        format!("expected schema version {SCHEMA_VERSION}"),
                     );
                 }
             }
@@ -1352,6 +1364,86 @@ fn validate_json_languages(value: &spanned::Value, path: &str, analysis: &mut An
     }
 }
 
+fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
+    let Some(steps) = value.as_array() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "expected an array of query step objects",
+        );
+        return;
+    };
+    if steps.len() > MAX_QUERY_STEPS {
+        analysis.error(
+            steps[MAX_QUERY_STEPS].range(),
+            "invalid-query",
+            format!("at most {MAX_QUERY_STEPS} query steps are allowed"),
+        );
+    }
+    for (index, step) in steps.iter().enumerate() {
+        let step_path = format!("{path}[{index}]");
+        analysis.path(&step_path, step.range());
+        let Some(object) = step.as_object() else {
+            analysis.error(
+                step.range(),
+                "wrong-value-shape",
+                "expected a query step object",
+            );
+            continue;
+        };
+        let mut seen_op = false;
+        for (key, child) in object {
+            let child_path = join_path(&step_path, key.get_ref());
+            analysis.path(&child_path, child.range());
+            if key.get_ref() != "op" {
+                analysis.error(
+                    key.range(),
+                    "unknown-property",
+                    format!("unknown query step property '{key}'"),
+                );
+                continue;
+            }
+            if seen_op {
+                analysis.error(key.range(), "duplicate-property", "duplicate property 'op'");
+            }
+            seen_op = true;
+            analysis.add_help(
+                key.range(),
+                "\"op\": \"enclosing_decl\" | \"file_of\" | \"imports_of\" | \"importers_of\"",
+                "Apply one typed query transformation.",
+            );
+            let Some(label) = child.as_string() else {
+                analysis.error(
+                    child.range(),
+                    "wrong-value-shape",
+                    "query step op must be a string",
+                );
+                continue;
+            };
+            let Some(step) = QueryStep::from_label(label) else {
+                analysis.error(
+                    child.range(),
+                    "invalid-query-step",
+                    format!("unknown query step {label:?}"),
+                );
+                continue;
+            };
+            analysis.add_help(child.range(), step.label(), query_step_description(step));
+        }
+    }
+}
+
+fn query_step_description(step: QueryStep) -> &'static str {
+    match step {
+        QueryStep::EnclosingDecl => {
+            "Map structural matches to their smallest real enclosing declarations."
+        }
+        QueryStep::FileOf => "Map structural matches or declarations to their workspace files.",
+        QueryStep::ImportsOf => "Traverse one direct project-local import edge forward.",
+        QueryStep::ImportersOf => "Traverse one direct project-local import edge backward.",
+    }
+}
+
 fn validate_json_result_detail(value: &spanned::Value, analysis: &mut Analysis) {
     let Some(label) = value.as_string() else {
         analysis.error(
@@ -1599,6 +1691,7 @@ mod tests {
             r#"(call :callee "run")"#,
             r#"(import :module "os")"#,
             r#"(result-detail "full" (call))"#,
+            r#"(imports-of (file-of (class)))"#,
         ] {
             CodeQuery::from_source(source)
                 .unwrap_or_else(|error| panic!("{source:?} should execute: {error}"));
@@ -1626,6 +1719,35 @@ mod tests {
             assert_eq!(&source[help.range], expected_range);
         }
         assert!(query_source_help_at(source, source.find("run").unwrap()).is_none());
+    }
+
+    #[test]
+    fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
+        let rql = "(file-of (enclosing-decl (call)))";
+        for token in ["file-of", "enclosing-decl"] {
+            let offset = rql.find(token).unwrap();
+            let help =
+                query_source_help_at(rql, offset).unwrap_or_else(|| panic!("no help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        let json = r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;
+        for token in ["steps", "op", "file_of"] {
+            let offset = json.find(token).unwrap();
+            let help =
+                query_source_help_at(json, offset).unwrap_or_else(|| panic!("no help for {token}"));
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(json).is_empty());
+
+        let invalid =
+            r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"imports_of"}]}"#;
+        let diagnostic = validate_query_source(invalid).pop().expect("diagnostic");
+        assert_eq!(diagnostic.code, "invalid-query");
+        assert_eq!(&invalid[diagnostic.range], r#"{"op":"imports_of"}"#);
+        assert!(diagnostic.message.contains("requires file"));
     }
 
     #[test]

@@ -3,7 +3,7 @@ title: JavaScript
 description: Query JavaScript member calls, arrows, class expressions, field access, and new expressions with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 JavaScript normalizes functions, methods, constructors, arrows, class declarations and expressions, calls and `new`, imports, assignments, and member access. It does not invent keyword arguments for a language that has none.
 
@@ -66,8 +66,9 @@ The fixture contains three `send` calls. Receiver and enclosing-method filters s
 <!-- code-query-case:service-send:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "javascript/app.js",
       "language": "javascript",
       "kind": "call",
@@ -107,8 +108,9 @@ The fixture contains three `send` calls. Receiver and enclosing-method filters s
 <!-- code-query-case:factory-lambda:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "javascript/app.js",
       "language": "javascript",
       "kind": "lambda",
@@ -158,8 +160,9 @@ Anonymous class expressions are queryable as `class`, but the assignment binding
 <!-- code-query-case:inline-class:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "javascript/app.js",
       "language": "javascript",
       "kind": "class",
@@ -195,7 +198,7 @@ Anonymous class expressions are queryable as `class`, but the assignment binding
 <!-- code-query-case:unsupported-kwargs:expected -->
 ```json
 {
-  "matches": [],
+  "results": [],
   "truncated": false,
   "diagnostics": [
     {

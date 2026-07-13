@@ -120,20 +120,82 @@ fn parses_result_detail_mode() {
 #[test]
 fn parses_and_rejects_schema_version() {
     let query = parse_ok(json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "match": { "kind": "call" }
     }));
     assert_eq!(query.schema_version, SCHEMA_VERSION);
-    assert_eq!(query.to_canonical_json()["schema_version"], 1);
+    assert_eq!(query.to_canonical_json()["schema_version"], 2);
 
     let defaulted = parse_ok(json!({ "match": { "kind": "call" } }));
     assert_eq!(defaulted.schema_version, SCHEMA_VERSION);
 
     let error = error_of(json!({
-        "schema_version": 2,
+        "schema_version": 1,
         "match": { "kind": "call" }
     }));
     assert_eq!(error.path, "schema_version");
+}
+
+#[test]
+fn parses_and_validates_typed_steps() {
+    let query = parse_ok(json!({
+        "match": { "kind": "call" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "file_of" },
+            { "op": "imports_of" },
+            { "op": "importers_of" }
+        ]
+    }));
+    assert_eq!(
+        query.steps,
+        vec![
+            QueryStep::EnclosingDecl,
+            QueryStep::FileOf,
+            QueryStep::ImportsOf,
+            QueryStep::ImportersOf,
+        ]
+    );
+    assert_eq!(
+        query.to_canonical_json()["steps"],
+        json!([
+            { "op": "enclosing_decl" },
+            { "op": "file_of" },
+            { "op": "imports_of" },
+            { "op": "importers_of" }
+        ])
+    );
+
+    let error = error_of(json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "imports_of" }]
+    }));
+    assert_eq!(error.path, "steps[0]");
+    assert!(error.message.contains("structural_match"));
+
+    let error = error_of(json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "file_of", "depth": 2 }]
+    }));
+    assert_eq!(error.path, "steps[0].depth");
+
+    let error = error_of(json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "calls_of" }]
+    }));
+    assert_eq!(error.path, "steps[0].op");
+}
+
+#[test]
+fn rejects_more_than_the_step_budget() {
+    let steps = (0..=MAX_QUERY_STEPS)
+        .map(|_| json!({ "op": "file_of" }))
+        .collect::<Vec<_>>();
+    let error = error_of(json!({
+        "match": { "kind": "call" },
+        "steps": steps
+    }));
+    assert_eq!(error.path, "steps");
 }
 
 #[test]

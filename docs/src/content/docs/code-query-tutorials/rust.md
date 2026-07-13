@@ -3,7 +3,7 @@ title: Rust
 description: Query Rust calls, assignments, imports, closures, and method receivers with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 Rust maps turbofish calls, method receivers, grouped `use` declarations, closures, signed literals, and compound assignments into the normalized `query_code` model. The fixture includes both production code and a closure so containment and exclusion remain observable.
 
@@ -48,12 +48,13 @@ The same terminal method name can occur as a generic call or a method call. A re
 <!-- code-query-case:method-call:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "rust.Service.run",
       "end_line": 8,
       "kind": "call",
       "language": "rust",
+      "result_type": "structural_match",
       "path": "rust/lib.rs",
       "start_line": 8,
       "text": "code.parse::<String>()"
@@ -80,11 +81,12 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
 <!-- code-query-case:import:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "end_line": 1,
       "kind": "import",
       "language": "rust",
+      "result_type": "structural_match",
       "path": "rust/lib.rs",
       "start_line": 1,
       "text": "use std::{fmt, io};"
@@ -109,7 +111,7 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
 <!-- code-query-case:negative-limit:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "captures": [
         {"name": "value", "start_line": 3, "text": "-3"}
@@ -118,6 +120,7 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
       "end_line": 3,
       "kind": "assignment",
       "language": "rust",
+      "result_type": "structural_match",
       "path": "rust/lib.rs",
       "start_line": 3,
       "text": "const LIMIT: i32 = -3;"
@@ -144,12 +147,13 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
 <!-- code-query-case:closure:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
       "enclosing_symbol": "rust.audit",
       "end_line": 13,
       "kind": "lambda",
       "language": "rust",
+      "result_type": "structural_match",
       "path": "rust/lib.rs",
       "start_line": 13,
       "text": "|value: i32| { return value; }"
@@ -179,7 +183,7 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
       "message": "structural adapter for rust does not support role(s): kwargs"
     }
   ],
-  "matches": [],
+  "results": [],
   "truncated": false
 }
 ```
