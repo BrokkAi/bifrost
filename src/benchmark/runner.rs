@@ -30,6 +30,13 @@ pub struct RunRequest {
     pub repo_cache_dir: PathBuf,
     pub selected_repo: Option<String>,
     pub max_files: Option<usize>,
+    pub profile: Option<BenchmarkProfile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkProfile {
+    pub output_dir: PathBuf,
+    pub report_path_prefix: PathBuf,
 }
 
 pub fn run_benchmark(
@@ -110,6 +117,7 @@ fn run_repo(
         &workspace_path,
         location_mode_scenarios,
         false,
+        request.profile.as_ref(),
     ));
     scenario_reports.extend(run_mcp_scenarios(
         target,
@@ -117,6 +125,7 @@ fn run_repo(
         &workspace_path,
         reference_scan_scenarios,
         true,
+        request.profile.as_ref(),
     ));
 
     if target
@@ -168,18 +177,21 @@ fn run_mcp_scenarios(
     workspace_path: &Path,
     scenarios: Vec<BenchmarkScenario>,
     no_line_numbers: bool,
+    profile: Option<&BenchmarkProfile>,
 ) -> Vec<ScenarioReport> {
     if scenarios.is_empty() {
         return Vec::new();
     }
 
-    match McpSession::start(workspace_path, no_line_numbers).and_then(|mut session| {
-        session.initialize()?;
-        Ok(session)
-    }) {
+    match McpSession::start(workspace_path, no_line_numbers, profile.is_some()).and_then(
+        |mut session| {
+            session.initialize()?;
+            Ok(session)
+        },
+    ) {
         Ok(mut session) => scenarios
             .into_iter()
-            .map(|scenario| run_mcp_scenario(target, manifest, &mut session, scenario))
+            .map(|scenario| run_mcp_scenario(target, manifest, &mut session, scenario, profile))
             .collect(),
         Err(err) => scenarios
             .into_iter()
@@ -617,22 +629,20 @@ fn run_mcp_scenario(
     manifest: &BenchmarkManifest,
     session: &mut McpSession,
     scenario: BenchmarkScenario,
+    profile: Option<&BenchmarkProfile>,
 ) -> ScenarioReport {
     let mut warmup_durations_ms = Vec::with_capacity(manifest.warmup_iterations);
     let mut measured_durations_ms = Vec::with_capacity(manifest.measured_iterations);
+    let mut profile_artifacts = Vec::new();
 
-    for _ in 0..manifest.warmup_iterations {
-        let start = Instant::now();
-        let outcome = session
-            .call_tool(
-                scenario_tool_name(target, scenario),
-                tool_arguments(target, scenario),
-            )
-            .and_then(|result| assert_scenario_result(target, scenario, &result));
+    for iteration in 0..manifest.warmup_iterations {
+        let (outcome, artifact) =
+            run_mcp_iteration(target, session, scenario, profile, "warmup", iteration + 1);
+        profile_artifacts.extend(artifact);
         match outcome {
-            Ok(()) => warmup_durations_ms.push(elapsed_ms(start)),
+            Ok(duration_ms) => warmup_durations_ms.push(duration_ms),
             Err(err) => {
-                return ScenarioReport::from_timings(
+                let mut report = ScenarioReport::from_timings(
                     scenario,
                     ScenarioTransport::Mcp,
                     false,
@@ -640,22 +650,26 @@ fn run_mcp_scenario(
                     measured_durations_ms,
                     Some(err),
                 );
+                report.profile_artifacts = profile_artifacts;
+                return report;
             }
         }
     }
 
-    for _ in 0..manifest.measured_iterations {
-        let start = Instant::now();
-        let outcome = session
-            .call_tool(
-                scenario_tool_name(target, scenario),
-                tool_arguments(target, scenario),
-            )
-            .and_then(|result| assert_scenario_result(target, scenario, &result));
+    for iteration in 0..manifest.measured_iterations {
+        let (outcome, artifact) = run_mcp_iteration(
+            target,
+            session,
+            scenario,
+            profile,
+            "measured",
+            iteration + 1,
+        );
+        profile_artifacts.extend(artifact);
         match outcome {
-            Ok(()) => measured_durations_ms.push(elapsed_ms(start)),
+            Ok(duration_ms) => measured_durations_ms.push(duration_ms),
             Err(err) => {
-                return ScenarioReport::from_timings(
+                let mut report = ScenarioReport::from_timings(
                     scenario,
                     ScenarioTransport::Mcp,
                     false,
@@ -663,17 +677,127 @@ fn run_mcp_scenario(
                     measured_durations_ms,
                     Some(err),
                 );
+                report.profile_artifacts = profile_artifacts;
+                return report;
             }
         }
     }
 
-    ScenarioReport::from_timings(
+    let mut report = ScenarioReport::from_timings(
         scenario,
         ScenarioTransport::Mcp,
         true,
         warmup_durations_ms,
         measured_durations_ms,
         None,
+    );
+    report.profile_artifacts = profile_artifacts;
+    report
+}
+
+fn run_mcp_iteration(
+    target: &BenchmarkRepoTarget,
+    session: &mut McpSession,
+    scenario: BenchmarkScenario,
+    profile: Option<&BenchmarkProfile>,
+    phase: &str,
+    iteration: usize,
+) -> (Result<f64, String>, Option<PathBuf>) {
+    let cursor = profile.map(|_| session.stderr_cursor());
+    let start = Instant::now();
+    let mut outcome = session
+        .call_tool(
+            scenario_tool_name(target, scenario),
+            tool_arguments(target, scenario),
+        )
+        .and_then(|result| assert_scenario_result(target, scenario, &result))
+        .map(|()| elapsed_ms(start));
+
+    let artifact = profile.and_then(|profile| {
+        let captured = session.stderr_since(cursor.expect("profile cursor"));
+        match write_profile_trace(
+            profile, target, scenario, phase, iteration, &outcome, &captured,
+        ) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                outcome = Err(err);
+                None
+            }
+        }
+    });
+
+    if let Err(err) = outcome {
+        outcome = Err(error_with_stderr_tail(err, session.stderr_tail()));
+    }
+    (outcome, artifact)
+}
+
+fn write_profile_trace(
+    profile: &BenchmarkProfile,
+    target: &BenchmarkRepoTarget,
+    scenario: BenchmarkScenario,
+    phase: &str,
+    iteration: usize,
+    outcome: &Result<f64, String>,
+    captured: &crate::benchmark::mcp_session::CapturedStderr,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(&profile.output_dir).map_err(|err| {
+        format!(
+            "failed to create benchmark profile dir `{}`: {err}",
+            profile.output_dir.display()
+        )
+    })?;
+    let filename = format!(
+        "{}-{}-{phase}-{iteration}.log",
+        artifact_component(&target.name),
+        artifact_component(scenario.label())
+    );
+    let output_path = profile.output_dir.join(&filename);
+    let report_path = profile.report_path_prefix.join(&filename);
+    let (success, duration_ms, failure) = match outcome {
+        Ok(duration_ms) => (true, format!("{duration_ms:.3}"), String::new()),
+        Err(err) => (false, String::new(), format!("failure={err}\n")),
+    };
+    let contents = format!(
+        "repository={}\nscenario={}\nphase={phase}\niteration={iteration}\nsuccess={success}\nduration_ms={duration_ms}\ntruncated={}\n{failure}{}",
+        target.name,
+        scenario.label(),
+        captured.truncated,
+        captured.text
+    );
+    std::fs::write(&output_path, contents).map_err(|err| {
+        format!(
+            "failed to write benchmark profile trace `{}`: {err}",
+            output_path.display()
+        )
+    })?;
+    Ok(report_path)
+}
+
+fn artifact_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn error_with_stderr_tail(
+    error: String,
+    tail: crate::benchmark::mcp_session::CapturedStderr,
+) -> String {
+    if tail.text.trim().is_empty() {
+        return error;
+    }
+    let truncation = if tail.truncated { " (truncated)" } else { "" };
+    format!(
+        "{error}\nbifrost MCP stderr tail{truncation}:\n{}",
+        tail.text
     )
 }
 

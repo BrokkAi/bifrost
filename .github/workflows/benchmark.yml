@@ -18,6 +18,11 @@ on:
         required: false
         default: true
         type: boolean
+      profile:
+        description: 'Capture per-iteration BIFROST_TIMING traces'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -72,6 +77,9 @@ jobs:
           fi
           if [ -n "$BENCHMARK_MAX_FILES" ]; then
             args+=(--max-files "$BENCHMARK_MAX_FILES")
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.profile }}" = "true" ]; then
+            args+=(--profile)
           fi
           BIFROST_BENCHMARK_BIFROST_BIN=./target/debug/bifrost \
             ./target/debug/bifrost_benchmark "${args[@]}"

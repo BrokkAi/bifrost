@@ -15,4 +15,4 @@ pub use report::{
     EnvironmentVarianceReport, ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport,
     ScenarioTransport,
 };
-pub use runner::{RunRequest, run_benchmark};
+pub use runner::{BenchmarkProfile, RunRequest, run_benchmark};

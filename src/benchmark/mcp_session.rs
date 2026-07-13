@@ -184,7 +184,7 @@ pub struct McpSession {
 }
 
 impl McpSession {
-    pub fn start(root: &Path, no_line_numbers: bool) -> Result<Self, String> {
+    pub fn start(root: &Path, no_line_numbers: bool, profile: bool) -> Result<Self, String> {
         let bifrost_binary = bifrost_binary_path()?;
         let mut command = Command::new(&bifrost_binary);
         command
@@ -194,6 +194,9 @@ impl McpSession {
             .arg("searchtools");
         if no_line_numbers {
             command.arg("--no-line-numbers");
+        }
+        if profile {
+            command.env("BIFROST_TIMING", "1");
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -295,8 +298,8 @@ impl McpSession {
         self.stderr.capture_since(cursor)
     }
 
-    pub fn stderr_tail(&self) -> String {
-        self.stderr.tail()
+    pub fn stderr_tail(&self) -> CapturedStderr {
+        self.stderr.capture_since(StderrCursor { next_sequence: 0 })
     }
 
     fn request(&mut self, payload: Value) -> Result<Value, String> {

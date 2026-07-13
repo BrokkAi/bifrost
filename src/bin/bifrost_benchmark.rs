@@ -1,6 +1,6 @@
 use brokk_bifrost::benchmark::{
-    BenchmarkCompareReport, BenchmarkManifest, BenchmarkRunReport, BenchmarkScenario,
-    ManifestLanguage, RunRequest, run_benchmark,
+    BenchmarkCompareReport, BenchmarkManifest, BenchmarkProfile, BenchmarkRunReport,
+    BenchmarkScenario, ManifestLanguage, RunRequest, run_benchmark,
 };
 use chrono::Utc;
 use serde::Serialize;
@@ -50,6 +50,7 @@ fn run() -> Result<(), String> {
             let mut selected_repo = None;
             let mut output_dir = None;
             let mut max_files = None;
+            let mut profile = false;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--manifest" => {
@@ -82,6 +83,7 @@ fn run() -> Result<(), String> {
                         }
                         max_files = Some(parsed);
                     }
+                    "--profile" => profile = true,
                     "--help" | "-h" => {
                         print_run_help();
                         return Ok(());
@@ -89,7 +91,7 @@ fn run() -> Result<(), String> {
                     other => return Err(format!("unknown run argument: {other}")),
                 }
             }
-            run_manifest(manifest_path, selected_repo, output_dir, max_files)
+            run_manifest(manifest_path, selected_repo, output_dir, max_files, profile)
         }
         "compare" => {
             let mut baseline_path = None;
@@ -168,6 +170,7 @@ fn run_manifest(
     selected_repo: Option<String>,
     output_dir_override: Option<PathBuf>,
     max_files: Option<usize>,
+    profile: bool,
 ) -> Result<(), String> {
     let manifest = BenchmarkManifest::load_from_path(&manifest_path)
         .map_err(|err| format!("failed to load `{}`: {err}", manifest_path.display()))?;
@@ -182,6 +185,10 @@ fn run_manifest(
             output_dir.display()
         )
     })?;
+    let profile = profile.then(|| BenchmarkProfile {
+        output_dir: output_dir.join("profiles"),
+        report_path_prefix: PathBuf::from("profiles"),
+    });
 
     let report = run_benchmark(
         &manifest,
@@ -190,6 +197,7 @@ fn run_manifest(
             repo_cache_dir,
             selected_repo,
             max_files,
+            profile,
         },
     )?;
     let report_path = output_dir.join(format!("run-{}.json", Utc::now().format("%Y%m%dT%H%M%SZ")));
@@ -377,7 +385,7 @@ fn print_help() {
     println!("Usage: bifrost_benchmark <subcommand> [options]");
     println!("Subcommands:");
     println!("  validate [--manifest PATH]");
-    println!("  run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N]");
+    println!("  run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N] [--profile]");
     println!("  compare --baseline PATH --candidate PATH [--output PATH] [--strict]");
 }
 
@@ -387,7 +395,7 @@ fn print_validate_help() {
 
 fn print_run_help() {
     println!(
-        "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N]"
+        "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N] [--profile]"
     );
 }
 

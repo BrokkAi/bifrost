@@ -15,7 +15,7 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 - [x] (2026-07-13 09:55Z) Verified issue #697, fetched current refs, and confirmed the checkout is the matching feature branch at the same commit as `origin/master`.
 - [x] (2026-07-13 09:55Z) Traced the MCP session, benchmark runner, CLI/report, workflow, watcher/snapshot, and definition-index code paths.
 - [x] (2026-07-13 10:07Z) Implemented a continuously running standard-error drain with a 256 KiB production tail, sequenced request cursors, explicit child-before-reader shutdown, poison recovery, and focused tests that push over 2 MiB through a bounded socket.
-- [ ] Add opt-in CLI and runner profiling configuration, per-iteration trace artifacts, failure-tail reporting, compact optional report references, and the manual workflow input.
+- [x] (2026-07-13 10:20Z) Added `--profile`, child-only `BIFROST_TIMING`, per-iteration traces and relative report references, bounded failure-tail context, and a manual workflow input; verified both profiled output and profile-disabled report stability with real-child integration tests.
 - [ ] Add disabled-by-default scopes and counters around watcher delta application, snapshot updates, definition batch/language dispatch, live-key enumeration, persisted row fetch, row resolution, dirty/nonpersisted units, and definition-index construction.
 - [ ] Run formatting, focused tests, the benchmark integration suite, Clippy with all targets and features, and the full feature-enabled test suite; update this plan with evidence and outcomes.
 
@@ -32,6 +32,9 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 
 - Observation: `cargo test benchmark::mcp_session` builds every integration-test target before applying the name filter, which made the first focused invocation spend several minutes linking unrelated binaries.
   Evidence: Interrupting that invocation and running `cargo test --lib benchmark::mcp_session` reused the compiled library and completed with 3 passing tests in 0.41 seconds.
+
+- Observation: Request-boundary cursor capture contains the existing nested `BIFROST_TIMING` scopes in real MCP runs without an explicit settling delay.
+  Evidence: `run_subcommand_profile_writes_iteration_traces_and_report_references` found timing lines in both the warmup and measured trace immediately after each JSON-RPC response.
 
 ## Decision Log
 
@@ -53,7 +56,7 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 
 ## Outcomes & Retrospective
 
-The first milestone is complete. Every MCP child now has its standard error consumed from the moment it is spawned, so a full pipe cannot deadlock a request. The drain retains only a bounded newest tail, supports request cursors needed by the next artifact milestone, and shuts down after the child has been killed and waited. Profiling artifacts and hot-path scopes remain to be implemented.
+The first two milestones are complete. Every MCP child now has its standard error consumed from the moment it is spawned, so a full pipe cannot deadlock a request. Opted-in runs enable child timing and preserve one metadata-rich trace per warmup or measured iteration under the uploaded output directory, while ordinary report JSON omits the optional artifact field. Definition-path scopes and full quality gates remain.
 
 ## Context and Orientation
 
@@ -155,3 +158,5 @@ In `src/profiling.rs`, continue to use the existing environment-gated `scope` an
 Plan revision note (2026-07-13 09:55Z): Created the initial self-contained plan after live issue verification and source-path investigation. The design chooses an always-on safety drain with opt-in artifact writing so deadlock prevention is unconditional while report churn remains opt-in.
 
 Plan revision note (2026-07-13 10:07Z): Recorded completion and focused-test evidence for the safe drain milestone, plus the discovery that unit-test filters require `--lib` here to avoid linking all integration targets.
+
+Plan revision note (2026-07-13 10:20Z): Recorded the completed profile artifact milestone and real-child evidence for trace association and disabled-report compatibility.
