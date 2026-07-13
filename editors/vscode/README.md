@@ -87,9 +87,10 @@ set:
 The extension associates `.rql` files with **Bifrost RQL**, provides syntax
 highlighting, and shows a play button in the RQL editor title. The button runs
 the current editor text, including unsaved edits, through the active Bifrost
-language server and displays matches in the **Bifrost Query Results** Explorer
-view. Matches are grouped by file; select one to open and highlight its source
-range. It searches
+language server and displays typed structural-match, declaration, or file
+results in the **Bifrost Query Results** Explorer view. Results are grouped by
+file; select one to open it and, when the result has a source range, highlight
+that range. It searches
 every root currently indexed by that LSP session (all workspace folders by
 default, or the scope configured by `bifrost.roots`). The server must already
 be running and indexed; the button does not start or wait for it.

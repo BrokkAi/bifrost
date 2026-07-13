@@ -21,6 +21,10 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 - [x] (2026-07-13) Ran the guided review against the four issue-715 commits and fixed all eight findings: terminal-type preservation on budget exhaustion, non-synthetic enclosing ancestors, reverse-provider ownership, declaration-free imports, bounded lazy graph construction, canonical newline coordinates, programmatic step validation, and cached full provenance rendering.
 - [x] (2026-07-13) Added focused regression coverage for every guided-review finding; the 21-test pipeline suite, 34 query-IR tests, render-cache unit test, mixed-newline unit test, and 71 related import/docs/tutorial/cross-language tests pass.
 - [x] (2026-07-13) Re-ran all repository gates after the guided-review fixes: formatting and diff checks pass, Clippy passes with every target and feature, all 38 Python tests pass, the full `nlp,python` Rust unit/integration matrix passes, and the CI-equivalent `nlp` doctest gate passes.
+- [x] (2026-07-13) Diagnosed PR #731's six-platform Rust CI failure as a merge-build incompatibility with the newly landed VS Code RQL request from PR #712, then rebased the issue branch onto current `master` without conflicts.
+- [x] (2026-07-13) Migrated the private LSP/VS Code RQL protocol to canonical tagged `results`, retained provenance, added navigable URIs, and taught the Explorer view to render structural matches, declarations, and files.
+- [x] (2026-07-13) Extended the LSP and extension tests across all three result variants; the focused LSP test and all 36 VS Code lint/build/unit checks pass, and strict all-feature Clippy passes.
+- [x] (2026-07-13) Re-ran the broader gates after the master integration: all 178 LSP tests, the full `nlp,python` Rust matrix, 38 Python tests, `nlp` doctests, query/docs/tutorial suites, formatting, strict Clippy, and all 36 VS Code checks pass.
 
 ## Surprises & Discoveries
 
@@ -50,6 +54,9 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 - Observation: Rejecting a synthetic nearest declaration is not equivalent to finding the nearest real declaration.
   Evidence: a C++ call in a synthetic member prototype is still enclosed by its real class declaration. Candidate selection now filters synthetic and file-scope units before choosing the smallest containing range.
+
+- Observation: A concurrent `master` change can break only the pull request's synthetic merge commit even when the feature branch and its local full suite are green.
+  Evidence: PR #712 added `src/lsp/server.rs` after this branch fork and read `CodeQueryResult.matches`; all six Rust CI targets for PR #731 failed on that stale field while the branch itself contained no LSP query consumer.
 
 ## Decision Log
 
@@ -93,11 +100,15 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
   Rationale: CR, LF, and CRLF coordinates must agree everywhere, and provenance fan-out must not repeatedly clone and rescan the same source file.
   Date/Author: 2026-07-13 / Codex guided review
 
+- Decision: The private LSP query response wraps each canonical `CodeQueryResultItem` with a navigable file URI instead of defining a second result schema.
+  Rationale: Reusing the canonical tagged value preserves structural, declaration, file, provenance, and future fields without another schema-v1-shaped consumer drifting from the query API.
+  Date/Author: 2026-07-13 / Codex CI integration
+
 ## Outcomes & Retrospective
 
-The query IR, executor, public surface, and cookbook milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, full-detail stable identities, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. Guided-review regressions additionally prove that truncated pipelines never serialize an intermediate result domain, synthetic nearest units fall through to the smallest real declaration, reverse traversal is governed by source providers, and declaration-free JavaScript/TypeScript/Go/C++ imports still produce direct file edges. The MCP schema, CLI and saved-query mode, Python models/client, and executable tutorial examples now agree on tagged `results`.
+The query IR, executor, public surface, and cookbook milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, full-detail stable identities, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. Guided-review regressions additionally prove that truncated pipelines never serialize an intermediate result domain, synthetic nearest units fall through to the smallest real declaration, reverse traversal is governed by source providers, and declaration-free JavaScript/TypeScript/Go/C++ imports still produce direct file edges. The MCP schema, CLI and saved-query mode, Python models/client, executable tutorial examples, and the concurrently added VS Code RQL runner now agree on tagged `results`.
 
-Final validation is green after the guided-review fixes: the focused pipeline suite passes 21 tests; the query-IR suite passes 34 tests; the render-cache and mixed-newline unit regressions pass; and 71 related import, documentation, tutorial, and cross-language tests pass. `scripts/test_python.sh` passes all 38 Python tests; `cargo clippy --all-targets --all-features -- -D warnings` passes; and every Rust unit and integration target passes with `--features nlp,python`. Because the local Cargo/Rustc installation lacks `rustdoc` and cannot consume the Homebrew toolchain's differently-versioned metadata, doctests were run separately with the Homebrew toolchain and the CI Rust feature set, `--doc --features nlp`; that gate also passes. No regex or text-search import fallback was introduced, all eight guided-review findings are fixed and verified, and no known issue-715 work remains.
+Final validation is green after the guided-review and `master` integration fixes: the focused pipeline suite passes 21 tests; the query-IR suite passes 34 tests; all 178 LSP tests pass; all 36 VS Code lint/build/unit checks pass; and the documentation/tutorial regressions pass. `scripts/test_python.sh` passes all 38 Python tests; `cargo clippy --all-targets --all-features -- -D warnings` passes; and every Rust unit and integration target passes with `--features nlp,python`. Because the local Cargo/Rustc installation lacks `rustdoc` and cannot consume the Homebrew toolchain's differently-versioned metadata, doctests were run separately with the Homebrew toolchain and the CI Rust feature set, `--doc --features nlp`; that gate also passes. No regex or text-search import fallback was introduced, all eight guided-review findings are fixed and verified, the six-platform CI compile failure is covered end to end, and no known issue-715 work remains.
 
 ## Context and Orientation
 
@@ -190,6 +201,10 @@ Revision note (2026-07-13): Completed repository-wide validation, documented the
 Revision note (2026-07-13): Reopened validation after the guided review, documented all eight findings and their fixes, and expanded focused coverage for pipeline invariants, import-edge completeness, graph bounds, source-coordinate consistency, and rendering efficiency.
 
 Revision note (2026-07-13): Completed post-review validation and closed the retrospective with all eight findings applied and verified.
+
+Revision note (2026-07-13): Reopened the plan for PR #731's merge-build failure, rebased onto the concurrent VS Code RQL work, and recorded the typed LSP/editor integration plus focused validation.
+
+Revision note (2026-07-13): Completed post-rebase validation, including the full Rust, LSP, Python, doctest, and VS Code gates, and closed the CI integration milestone.
 
 ## Interfaces and Dependencies
 

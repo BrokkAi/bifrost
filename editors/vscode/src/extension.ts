@@ -39,8 +39,8 @@ import {
 } from "./provisioning";
 import {
   RqlQueryDocument,
-  RqlQueryMatch,
   RqlQueryResponse,
+  RqlQueryResultItem,
   runRqlQuery
 } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
@@ -98,8 +98,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bifrost.runRqlQuery", (resource?: vscode.Uri) =>
       runRqlQueryForEditor(resource)
     ),
-    vscode.commands.registerCommand("bifrost.openRqlQueryMatch", (match: RqlQueryMatch) =>
-      openRqlQueryMatch(match)
+    vscode.commands.registerCommand("bifrost.openRqlQueryResult", (result: RqlQueryResultItem) =>
+      openRqlQueryResult(result)
     ),
     vscode.commands.registerCommand("bifrost.copyMcpConfig", () => copyMcpConfig(context)),
     vscode.commands.registerCommand("bifrost.openMcpSetup", () => openMcpSetup(context))
@@ -186,16 +186,18 @@ async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
 
   rqlQueryResults.update(response);
   await vscode.commands.executeCommand("bifrost.queryResults.focus");
-  if (response.matches.length === 0) {
-    void vscode.window.showInformationMessage("Bifrost RQL query returned no matches.");
+  if (response.results.length === 0) {
+    void vscode.window.showInformationMessage("Bifrost RQL query returned no results.");
   }
 }
 
-async function openRqlQueryMatch(match: RqlQueryMatch): Promise<void> {
-  const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(match.uri));
+async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(result.uri));
   const editor = await vscode.window.showTextDocument(document, { preview: true });
-  const startLine = Math.min(Math.max(0, match.startLine - 1), document.lineCount - 1);
-  const endLine = Math.min(Math.max(startLine, match.endLine - 1), document.lineCount - 1);
+  const resultStartLine = result.result_type === "file" ? 1 : result.start_line;
+  const resultEndLine = result.result_type === "file" ? resultStartLine : result.end_line;
+  const startLine = Math.min(Math.max(0, resultStartLine - 1), document.lineCount - 1);
+  const endLine = Math.min(Math.max(startLine, resultEndLine - 1), document.lineCount - 1);
   const start = new vscode.Position(startLine, 0);
   const end = document.lineAt(endLine).range.end;
   const range = new vscode.Range(start, end);
