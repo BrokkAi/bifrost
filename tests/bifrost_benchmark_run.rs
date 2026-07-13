@@ -205,6 +205,9 @@ definition_queries = [
     let mut combined_traces = String::new();
     for (index, artifact) in artifacts.iter().enumerate() {
         let relative = artifact.as_str().expect("artifact path");
+        let components = Path::new(relative).components().collect::<Vec<_>>();
+        assert_eq!(components.len(), 3, "run-scoped artifact path: {relative}");
+        assert_eq!(components[0].as_os_str(), "profiles");
         let trace = fs::read_to_string(output_dir.join(relative)).expect("read profile trace");
         let expected_phase = if index == 0 { "warmup" } else { "measured" };
         assert!(trace.contains("repository=fixture-java"), "trace: {trace}");

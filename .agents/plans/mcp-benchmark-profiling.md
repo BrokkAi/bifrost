@@ -18,6 +18,8 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 - [x] (2026-07-13 10:20Z) Added `--profile`, child-only `BIFROST_TIMING`, per-iteration traces and relative report references, bounded failure-tail context, and a manual workflow input; verified both profiled output and profile-disabled report stability with real-child integration tests.
 - [x] (2026-07-13 10:26Z) Added disabled-by-default scopes and counters around watcher delta application, snapshot updates, definition batch/language dispatch, live-key enumeration, persisted row fetch, row resolution, dirty/nonpersisted units, and definition-index construction; the real-child profile test asserts every required boundary.
 - [x] (2026-07-13 10:43Z) Ran formatting, focused drain tests, the complete benchmark integration suite, all-target/all-feature Clippy, and the feature-enabled library suite. All runnable gates pass: 3 drain tests, 9 benchmark integration tests, and 729 feature-enabled library tests (3 ignored). The macOS `python` feature cannot link standalone integration binaries because PyO3's `extension-module` configuration deliberately leaves Python symbols unresolved; this pre-existing packaging constraint is recorded below.
+- [x] (2026-07-13 11:06Z) Completed the five-perspective guided review and resolved all six deduplicated findings: bounded transient reads, synchronized request boundaries, collision-resistant run-scoped artifacts, joined initialization diagnostics, guarded startup cleanup, and a shared component sanitizer. Two post-fix edge cases were also corrected, preserving primary child errors and attaching EOF stderr exactly once. Three specialist re-reviews approve the final diff.
+- [x] (2026-07-13 11:06Z) Revalidated the review fixes: 8 focused benchmark unit tests, 5 manifest tests, all 9 benchmark integration tests, clean all-target/all-feature Clippy, and 734 feature-enabled library tests passed with 3 ignored.
 
 ## Surprises & Discoveries
 
@@ -42,6 +44,12 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 - Observation: On this macOS checkout, Cargo cannot link standalone test binaries with the `python` feature because that feature enables PyO3's `extension-module` mode, which intentionally does not link libpython and therefore leaves `Py*` symbols unresolved in ordinary executables.
   Evidence: Both `cargo test --features nlp,python --tests` and an issue-focused `--test bifrost_benchmark_run` invocation fail at the linker with unresolved Python symbols. `PYO3_PYTHON=/opt/homebrew/bin/python3.13 cargo test --features nlp,python --lib` links and passes all 729 non-ignored library tests outside the sandbox. The first sandboxed run had one sidecar test fail because it could not create `~/.cache/uv`; the unrestricted rerun passed.
 
+- Observation: Bounding only retained lines is insufficient because `BufRead::read_until` can grow its temporary line buffer without limit before retention applies.
+  Evidence: Guided review found the original drain could allocate for an arbitrarily long unterminated stderr record. The final drain reads fixed 8 KiB chunks, and a focused test sends more than 2 MiB without a newline while retaining at most the configured tail.
+
+- Observation: A stdout response does not prove that an independent stderr reader thread has consumed preceding timing writes, even when the child wrote stderr first.
+  Evidence: Guided review identified that cursor-only snapshots could omit or shift timing lines. The benchmark now brackets iterations with a private MCP boundary request; the server writes and flushes a sentinel on stderr before replying, and the parent waits until the drain observes that sentinel.
+
 ## Decision Log
 
 - Decision: Keep the current branch and do not rebase or switch branches.
@@ -64,11 +72,19 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
   Rationale: The new hot-path scopes should not allocate strings or call the clock when `BIFROST_TIMING` is absent. This also reduces overhead for all existing disabled scopes while preserving the environment-variable behavior.
   Date/Author: 2026-07-13 / Codex
 
+- Decision: Synchronize trace capture with an internal MCP profile-boundary request instead of sleeping or polling for quiet stderr.
+  Rationale: The boundary creates an explicit happens-before relationship on the child's stderr stream and remains deterministic under scheduler and pipe latency. A timeout and stream-closure state prevent the synchronization wait from hanging indefinitely.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Put traces in a unique directory per profiled invocation and hash the raw repository name into the sanitized filename.
+  Rationale: Reports from reused output directories must not point at traces overwritten by later runs, and distinct manifest names that sanitize identically must remain distinct. Normal non-profile report filenames and JSON remain unchanged.
+  Date/Author: 2026-07-13 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation and validation milestones are complete. Every MCP child now has its standard error consumed from the moment it is spawned, so a full pipe cannot deadlock a request. Opted-in runs enable child timing and preserve one metadata-rich trace per warmup or measured iteration under the uploaded output directory, while ordinary report JSON omits the optional artifact field. Traces expose every requested definition-path boundary and count, and disabled scopes avoid both label allocation and clock reads.
+The implementation, guided review, and validation milestones are complete. Every MCP child now has its standard error consumed from the moment it is spawned in fixed-size chunks, so neither a full pipe nor an unterminated record can defeat the memory bound. Opted-in runs enable child timing and preserve one synchronized, metadata-rich trace per warmup or measured iteration in a unique run directory under the uploaded output directory, while ordinary report JSON and filenames remain unchanged. Traces expose every requested definition-path boundary and count, and disabled scopes avoid both label allocation and clock reads.
 
-The focused and full benchmark suites pass, Clippy is clean across all targets and features, and all feature-enabled library tests pass. The only unavailable gate is linking standalone macOS test binaries with the existing PyO3 `extension-module` feature; this is independent of the benchmark changes and reproduces for the focused integration target itself. No dependencies were added, no reports change without explicit profiling, and the implementation is ready for review on the current branch.
+The focused and full benchmark suites pass, Clippy is clean across all targets and features, and all 734 active feature-enabled library tests pass. The only unavailable gate is linking standalone macOS test binaries with the existing PyO3 `extension-module` feature; this is independent of the benchmark changes and reproduces for the focused integration target itself. No dependencies were added, three specialist re-reviews approve the final fixes, no reports change without explicit profiling, and the implementation is ready to publish from the current branch.
 
 ## Context and Orientation
 
@@ -176,3 +192,5 @@ Plan revision note (2026-07-13 10:20Z): Recorded the completed profile artifact 
 Plan revision note (2026-07-13 10:26Z): Recorded completion of the get-definition instrumentation milestone and the decision to eliminate disabled-scope allocation and clock work.
 
 Plan revision note (2026-07-13 10:43Z): Recorded final validation evidence, including the clean explicit-toolchain Clippy run, the passing 729-test feature-enabled library suite, and the pre-existing macOS PyO3 standalone-test linker limitation.
+
+Plan revision note (2026-07-13 11:06Z): Recorded guided-review findings, the synchronized fixed-size drain and artifact-identity follow-up, post-fix specialist approvals, and final validation evidence.

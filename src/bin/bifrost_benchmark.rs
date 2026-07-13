@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn main() -> ExitCode {
     match run() {
@@ -185,9 +186,12 @@ fn run_manifest(
             output_dir.display()
         )
     })?;
-    let profile = profile.then(|| BenchmarkProfile {
-        output_dir: output_dir.join("profiles"),
-        report_path_prefix: PathBuf::from("profiles"),
+    let profile = profile.then(|| {
+        let profile_run_id = benchmark_profile_run_id();
+        BenchmarkProfile {
+            output_dir: output_dir.join("profiles").join(&profile_run_id),
+            report_path_prefix: PathBuf::from("profiles").join(profile_run_id),
+        }
     });
 
     let report = run_benchmark(
@@ -211,6 +215,16 @@ fn run_manifest(
         ));
     }
     Ok(())
+}
+
+fn benchmark_profile_run_id() -> String {
+    static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{sequence}",
+        Utc::now().format("%Y%m%dT%H%M%S%6fZ"),
+        std::process::id()
+    )
 }
 
 fn compare_reports(
@@ -403,4 +417,14 @@ fn print_compare_help() {
     println!(
         "Usage: bifrost_benchmark compare --baseline PATH --candidate PATH [--output PATH] [--strict]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::benchmark_profile_run_id;
+
+    #[test]
+    fn benchmark_profile_run_ids_are_unique_within_a_process() {
+        assert_ne!(benchmark_profile_run_id(), benchmark_profile_run_id());
+    }
 }

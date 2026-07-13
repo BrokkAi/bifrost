@@ -4,10 +4,15 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use crate::mcp_common::{BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD};
 
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
+const STDERR_READ_BUFFER_BYTES: usize = 8 * 1024;
+const PROFILE_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 pub struct StderrCursor {
@@ -99,31 +104,37 @@ impl StderrTail {
             bytes.extend_from_slice(format!("\n[stderr drain error: {error}]\n").as_bytes());
         }
         CapturedStderr {
-            text: String::from_utf8_lossy(&bytes).into_owned(),
+            text: String::from_utf8_lossy(&bytes).replace(BENCHMARK_PROFILE_BOUNDARY_MARKER, ""),
             truncated,
         }
-    }
-
-    fn tail(&self) -> String {
-        self.capture_since(StderrCursor { next_sequence: 0 }).text
     }
 }
 
 struct StderrDrain {
     tail: Arc<Mutex<StderrTail>>,
+    boundaries: Arc<(Mutex<BoundaryState>, Condvar)>,
     reader: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Default)]
+struct BoundaryState {
+    observed: u64,
+    closed: bool,
 }
 
 impl StderrDrain {
     fn spawn(reader: impl Read + Send + 'static, capacity: usize) -> Result<Self, String> {
         let tail = Arc::new(Mutex::new(StderrTail::new(capacity)));
         let reader_tail = Arc::clone(&tail);
+        let boundaries = Arc::new((Mutex::new(BoundaryState::default()), Condvar::new()));
+        let reader_boundaries = Arc::clone(&boundaries);
         let reader = thread::Builder::new()
             .name("bifrost-benchmark-stderr".to_string())
-            .spawn(move || drain_stderr(reader, &reader_tail))
+            .spawn(move || drain_stderr(reader, &reader_tail, &reader_boundaries))
             .map_err(|err| format!("failed to start bifrost stderr drain: {err}"))?;
         Ok(Self {
             tail,
+            boundaries,
             reader: Some(reader),
         })
     }
@@ -136,8 +147,36 @@ impl StderrDrain {
         self.with_tail(|tail| tail.capture_since(cursor))
     }
 
-    fn tail(&self) -> String {
-        self.with_tail(StderrTail::tail)
+    fn boundary_count(&self) -> u64 {
+        self.boundaries
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observed
+    }
+
+    fn wait_for_boundary(&self, previous_count: u64) -> Result<(), String> {
+        let (state, changed) = &*self.boundaries;
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, timeout) = changed
+            .wait_timeout_while(state, PROFILE_BOUNDARY_TIMEOUT, |state| {
+                state.observed <= previous_count && !state.closed
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.observed > previous_count {
+            Ok(())
+        } else if state.closed {
+            Err("bifrost stderr closed before profile boundary was observed".to_string())
+        } else if timeout.timed_out() {
+            Err(format!(
+                "timed out after {}s waiting for bifrost profile boundary",
+                PROFILE_BOUNDARY_TIMEOUT.as_secs()
+            ))
+        } else {
+            Err("bifrost profile boundary was not observed".to_string())
+        }
     }
 
     fn join(&mut self) {
@@ -155,24 +194,67 @@ impl StderrDrain {
     }
 }
 
-fn drain_stderr(reader: impl Read, tail: &Mutex<StderrTail>) {
-    let mut reader = BufReader::new(reader);
+fn drain_stderr(
+    mut reader: impl Read,
+    tail: &Mutex<StderrTail>,
+    boundaries: &(Mutex<BoundaryState>, Condvar),
+) {
+    let mut buffer = [0_u8; STDERR_READ_BUFFER_BYTES];
+    let mut marker_prefix = Vec::with_capacity(BENCHMARK_PROFILE_BOUNDARY_MARKER.len() - 1);
     loop {
-        let mut bytes = Vec::new();
-        match reader.read_until(b'\n', &mut bytes) {
-            Ok(0) => return,
-            Ok(_) => tail
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(bytes),
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                close_boundary_stream(boundaries);
+                return;
+            }
+            Ok(read) => {
+                let bytes = &buffer[..read];
+                tail.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(bytes.to_vec());
+                let observed = count_profile_boundaries(&mut marker_prefix, bytes);
+                if observed > 0 {
+                    let (state, changed) = boundaries;
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.observed = state.observed.saturating_add(observed as u64);
+                    changed.notify_all();
+                }
+            }
             Err(err) => {
                 tail.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .read_error = Some(err.to_string());
+                close_boundary_stream(boundaries);
                 return;
             }
         }
     }
+}
+
+fn count_profile_boundaries(prefix: &mut Vec<u8>, bytes: &[u8]) -> usize {
+    let marker = BENCHMARK_PROFILE_BOUNDARY_MARKER.as_bytes();
+    let mut searchable = Vec::with_capacity(prefix.len() + bytes.len());
+    searchable.extend_from_slice(prefix);
+    searchable.extend_from_slice(bytes);
+    let count = searchable
+        .windows(marker.len())
+        .filter(|window| *window == marker)
+        .count();
+    let retained = marker.len().saturating_sub(1).min(searchable.len());
+    prefix.clear();
+    prefix.extend_from_slice(&searchable[searchable.len() - retained..]);
+    count
+}
+
+fn close_boundary_stream(boundaries: &(Mutex<BoundaryState>, Condvar)) {
+    let (state, changed) = boundaries;
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.closed = true;
+    changed.notify_all();
 }
 
 pub struct McpSession {
@@ -210,19 +292,35 @@ impl McpSession {
                 )
             })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "missing bifrost stdin".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "missing bifrost stdout".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "missing bifrost stderr".to_string())?;
-        let stderr = StderrDrain::spawn(stderr, STDERR_TAIL_CAPACITY_BYTES)?;
+        let pipes = (|| {
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "missing bifrost stdin".to_string())?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "missing bifrost stdout".to_string())?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "missing bifrost stderr".to_string())?;
+            Ok::<_, String>((stdin, stdout, stderr))
+        })();
+        let (stdin, stdout, stderr) = match pipes {
+            Ok(pipes) => pipes,
+            Err(err) => {
+                terminate_child(&mut child);
+                return Err(err);
+            }
+        };
+        let stderr = match StderrDrain::spawn(stderr, STDERR_TAIL_CAPACITY_BYTES) {
+            Ok(stderr) => stderr,
+            Err(err) => {
+                terminate_child(&mut child);
+                return Err(err);
+            }
+        };
 
         Ok(Self {
             child,
@@ -302,6 +400,26 @@ impl McpSession {
         self.stderr.capture_since(StderrCursor { next_sequence: 0 })
     }
 
+    pub fn profile_boundary(&mut self) -> Result<(), String> {
+        let previous_count = self.stderr.boundary_count();
+        let id = self.take_id();
+        let response = self.request(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": BENCHMARK_PROFILE_BOUNDARY_METHOD,
+            "params": {}
+        }))?;
+        if let Some(error) = response.get("error") {
+            return Err(format!("bifrost profile boundary failed: {error}"));
+        }
+        self.stderr.wait_for_boundary(previous_count)
+    }
+
+    pub fn shutdown_and_stderr_tail(&mut self) -> CapturedStderr {
+        self.shutdown();
+        self.stderr_tail()
+    }
+
     fn request(&mut self, payload: Value) -> Result<Value, String> {
         self.write_line(&payload)?;
         self.read_line()
@@ -325,10 +443,7 @@ impl McpSession {
             .map_err(|err| format!("failed to read MCP response: {err}"))?;
         if bytes == 0 {
             self.shutdown();
-            let stderr = self.stderr.tail();
-            return Err(format!(
-                "bifrost MCP server closed early; stderr:\n{stderr}"
-            ));
+            return Err("bifrost MCP server closed early".to_string());
         }
 
         serde_json::from_str(&line)
@@ -343,10 +458,14 @@ impl McpSession {
 
     fn shutdown(&mut self) {
         let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        terminate_child(&mut self.child);
         self.stderr.join();
     }
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl Drop for McpSession {
@@ -441,6 +560,59 @@ mod tests {
         let captured = tail.capture_since(cursor);
         assert_eq!(captured.text, "23456789");
         assert!(captured.truncated);
+    }
+
+    #[test]
+    fn stderr_drain_bounds_an_unterminated_stream() {
+        const CAPACITY: usize = 16 * 1024;
+        const STREAM_BYTES: usize = 2 * 1024 * 1024;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(&vec![b'x'; STREAM_BYTES]).unwrap();
+            stream.write_all(b"FINAL-DIAGNOSTIC").unwrap();
+        });
+        let (reader, _) = listener.accept().unwrap();
+        let mut drain = StderrDrain::spawn(reader, CAPACITY).unwrap();
+        let cursor = drain.cursor();
+
+        writer.join().unwrap();
+        drain.join();
+
+        let captured = drain.capture_since(cursor);
+        assert!(captured.truncated);
+        assert!(captured.text.len() <= CAPACITY);
+        assert!(captured.text.ends_with("FINAL-DIAGNOSTIC"));
+    }
+
+    #[test]
+    fn stderr_boundary_waits_for_delayed_marker_consumption() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            stream.write_all(b"timing-before-boundary\n").unwrap();
+            stream
+                .write_all(BENCHMARK_PROFILE_BOUNDARY_MARKER.as_bytes())
+                .unwrap();
+        });
+        let (reader, _) = listener.accept().unwrap();
+        let mut drain = StderrDrain::spawn(reader, STDERR_TAIL_CAPACITY_BYTES).unwrap();
+        let cursor = drain.cursor();
+        let previous_count = drain.boundary_count();
+
+        drain.wait_for_boundary(previous_count).unwrap();
+        let captured = drain.capture_since(cursor);
+        assert_eq!(captured.text, "timing-before-boundary\n");
+
+        writer.join().unwrap();
+        drain.join();
     }
 
     #[test]

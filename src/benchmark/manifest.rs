@@ -438,6 +438,17 @@ impl BenchmarkRepoTarget {
         if scenarios.is_empty() {
             errors.push(format!("repo `{name}` must define at least one scenario"));
         }
+        if scenarios.len() != self.scenarios.len() {
+            let mut seen = BTreeSet::new();
+            for scenario in &self.scenarios {
+                if !seen.insert(*scenario) {
+                    errors.push(format!(
+                        "repo `{name}` defines duplicate scenario `{}`",
+                        scenario.label()
+                    ));
+                }
+            }
+        }
 
         for extension in &self.extensions {
             let normalized = normalize_extension(extension);

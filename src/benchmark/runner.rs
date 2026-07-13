@@ -1,3 +1,4 @@
+use crate::benchmark::artifact_path::{sanitize_component, unique_component};
 use crate::benchmark::mcp_session::McpSession;
 use crate::benchmark::repo_cache::prepare_repo;
 use crate::benchmark::report::{
@@ -183,12 +184,16 @@ fn run_mcp_scenarios(
         return Vec::new();
     }
 
-    match McpSession::start(workspace_path, no_line_numbers, profile.is_some()).and_then(
-        |mut session| {
-            session.initialize()?;
-            Ok(session)
+    let session = McpSession::start(workspace_path, no_line_numbers, profile.is_some()).and_then(
+        |mut session| match session.initialize() {
+            Ok(()) => Ok(session),
+            Err(err) => {
+                let tail = session.shutdown_and_stderr_tail();
+                Err(error_with_stderr_tail(err, tail))
+            }
         },
-    ) {
+    );
+    match session {
         Ok(mut session) => scenarios
             .into_iter()
             .map(|scenario| run_mcp_scenario(target, manifest, &mut session, scenario, profile))
@@ -703,7 +708,17 @@ fn run_mcp_iteration(
     phase: &str,
     iteration: usize,
 ) -> (Result<f64, String>, Option<PathBuf>) {
-    let cursor = profile.map(|_| session.stderr_cursor());
+    let cursor = if profile.is_some() {
+        if let Err(err) = session.profile_boundary() {
+            return (
+                Err(error_with_stderr_tail(err, session.stderr_tail())),
+                None,
+            );
+        }
+        Some(session.stderr_cursor())
+    } else {
+        None
+    };
     let start = Instant::now();
     let mut outcome = session
         .call_tool(
@@ -712,6 +727,14 @@ fn run_mcp_iteration(
         )
         .and_then(|result| assert_scenario_result(target, scenario, &result))
         .map(|()| elapsed_ms(start));
+
+    if profile.is_some() {
+        outcome = preserve_outcome_on_boundary_failure(outcome, session.profile_boundary());
+    } else if outcome.is_err() {
+        // Flush stderr written before a normal JSON-RPC error response so the
+        // diagnostic tail below is complete even outside profile mode.
+        let _ = session.profile_boundary();
+    }
 
     let artifact = profile.and_then(|profile| {
         let captured = session.stderr_since(cursor.expect("profile cursor"));
@@ -732,6 +755,21 @@ fn run_mcp_iteration(
     (outcome, artifact)
 }
 
+fn preserve_outcome_on_boundary_failure(
+    outcome: Result<f64, String>,
+    boundary: Result<(), String>,
+) -> Result<f64, String> {
+    match (outcome, boundary) {
+        (outcome, Ok(())) => outcome,
+        (Ok(_), Err(boundary_error)) => Err(format!(
+            "failed to synchronize benchmark profile output: {boundary_error}"
+        )),
+        (Err(request_error), Err(boundary_error)) => Err(format!(
+            "{request_error}\nadditionally failed to synchronize benchmark profile output: {boundary_error}"
+        )),
+    }
+}
+
 fn write_profile_trace(
     profile: &BenchmarkProfile,
     target: &BenchmarkRepoTarget,
@@ -749,8 +787,8 @@ fn write_profile_trace(
     })?;
     let filename = format!(
         "{}-{}-{phase}-{iteration}.log",
-        artifact_component(&target.name),
-        artifact_component(scenario.label())
+        unique_component(&target.name),
+        sanitize_component(scenario.label())
     );
     let output_path = profile.output_dir.join(&filename);
     let report_path = profile.report_path_prefix.join(&filename);
@@ -772,19 +810,6 @@ fn write_profile_trace(
         )
     })?;
     Ok(report_path)
-}
-
-fn artifact_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn error_with_stderr_tail(
@@ -1129,4 +1154,21 @@ fn current_bifrost_commit() -> Option<String> {
     let sha = String::from_utf8(output.stdout).ok()?;
     let trimmed = sha.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preserve_outcome_on_boundary_failure;
+
+    #[test]
+    fn boundary_failure_preserves_the_primary_request_error() {
+        let error = preserve_outcome_on_boundary_failure(
+            Err("MCP child closed early".to_string()),
+            Err("stderr boundary unavailable".to_string()),
+        )
+        .expect_err("combined failure");
+
+        assert!(error.starts_with("MCP child closed early"), "{error}");
+        assert!(error.contains("stderr boundary unavailable"), "{error}");
+    }
 }

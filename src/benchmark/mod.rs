@@ -1,3 +1,4 @@
+mod artifact_path;
 pub mod manifest;
 pub mod mcp_session;
 pub mod repo_cache;
