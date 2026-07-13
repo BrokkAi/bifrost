@@ -23,12 +23,6 @@ pub fn handle(
         uri,
         &params.text_document_position_params.position,
     )?;
-    let candidate = target.candidates.into_iter().next()?;
-    let skeleton = analyzer
-        .get_skeleton_header(&candidate)
-        .or_else(|| analyzer.get_skeleton(&candidate))?;
-    let language_tag = language_for_path(candidate.source().rel_path());
-
     let highlight_range = byte_range_to_lsp_range(
         &target.content,
         &target.line_starts,
@@ -39,6 +33,30 @@ pub fn handle(
             end_line: 0,
         },
     );
+
+    if let Some(definition) = target.lexical_definition {
+        let declaration = target
+            .content
+            .get(definition.declaration_range.start_byte..definition.declaration_range.end_byte)?
+            .trim();
+        if declaration.is_empty() {
+            return None;
+        }
+        let language_tag = language_for_path(target.file.rel_path());
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```{language_tag}\n{declaration}\n```"),
+            }),
+            range: Some(highlight_range),
+        });
+    }
+
+    let candidate = target.candidates.into_iter().next()?;
+    let skeleton = analyzer
+        .get_skeleton_header(&candidate)
+        .or_else(|| analyzer.get_skeleton(&candidate))?;
+    let language_tag = language_for_path(candidate.source().rel_path());
 
     let mut value = format!("```{language_tag}\n{}\n```", skeleton.trim_end());
     if let Some(doc) = leading_doc_comment_for_code_unit(analyzer, &candidate) {

@@ -1640,7 +1640,7 @@ class Consumer {
 }
 
 #[test]
-fn get_definitions_by_reference_reports_scala_call_shape_guidance() {
+fn get_definitions_by_reference_redirects_scala_parameter_to_location_lookup() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
             "app/Consumer.scala",
@@ -1667,20 +1667,14 @@ class Consumer {
     let result = &value["results"][0];
     assert_eq!("no_definition", result["status"], "{value}");
     assert_eq!(
-        "unsupported_scala_call_target_shape", result["diagnostics"][0]["kind"],
+        "local_binding_requires_location", result["diagnostics"][0]["kind"],
         "{value}"
     );
     let message = result["diagnostics"][0]["message"]
         .as_str()
         .expect("diagnostic message");
-    assert!(
-        message.contains("reference tool cannot follow this Scala call target shape yet"),
-        "{message}"
-    );
-    assert!(message.contains("search_symbols"), "{message}");
-    assert!(message.contains("callable/member name"), "{message}");
-    assert!(message.contains("get_symbol_sources"), "{message}");
-    assert!(!message.contains("start_byte"), "{message}");
+    assert!(message.contains("get_definitions_by_location"), "{message}");
+    assert!(message.contains("lexical binding"), "{message}");
 }
 
 #[test]

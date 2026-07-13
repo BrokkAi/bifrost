@@ -143,9 +143,10 @@ fn ra_goto_def_for_fields() {
 
 #[test]
 fn rust_field_access_honors_receiver_focus() {
-    assert_resolves_to_nothing(
+    assert_resolves_to_line(
         "receiver.rs",
         "struct Args {\n    dry_run: bool,\n}\nfn apply(arg: &Args) {\n    let _ = arg<caret>.dry_run;\n}\n",
+        3,
     );
     assert_resolves_to_line(
         "field.rs",
@@ -155,11 +156,11 @@ fn rust_field_access_honors_receiver_focus() {
 }
 
 #[test]
-fn rust_self_method_receiver_resolves_to_enclosing_type() {
+fn rust_self_method_receiver_resolves_to_self_parameter() {
     assert_resolves_to_line(
         "self_receiver.rs",
         "struct Problem;\nimpl Problem {\n    fn execute_shared(&self) {}\n    fn execute(&self) {\n        self<caret>.execute_shared();\n    }\n}\n",
-        0,
+        3,
     );
 }
 
@@ -347,11 +348,16 @@ fn rust_self_variant_honors_owner_focus() {
 }
 
 #[test]
-fn rust_binding_declarations_do_not_resolve_to_same_file_members() {
-    assert_resolves_to_nothing(
+fn rust_parameter_declaration_resolves_to_itself_without_confusing_same_file_members() {
+    assert_resolves_to_line(
         "parameter.rs",
         "struct CallbackPattern;\nstruct BuiltIns;\nimpl BuiltIns {\n    fn call(&self) {}\n}\nfn invoke(call<caret>: &CallbackPattern) {}\n",
+        5,
     );
+}
+
+#[test]
+fn rust_non_parameter_binding_declarations_do_not_resolve_to_same_file_members() {
     assert_resolves_to_nothing(
         "let_binding.rs",
         "struct WrappedResult {\n    actual_sample: usize,\n}\nfn sample() {\n    let mut actual_sample<caret> = 0;\n    actual_sample += 1;\n}\n",
@@ -363,10 +369,11 @@ fn rust_binding_declarations_do_not_resolve_to_same_file_members() {
 }
 
 #[test]
-fn rust_local_references_do_not_resolve_to_same_file_members() {
-    assert_resolves_to_nothing(
+fn rust_parameter_references_resolve_to_parameter_declaration() {
+    assert_resolves_to_line(
         "local_reference.rs",
         "struct WrappedResult {\n    actual_sample: usize,\n}\nfn sample(actual_sample: usize) {\n    let _ = actual_sample<caret>;\n}\n",
+        3,
     );
 }
 

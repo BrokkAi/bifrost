@@ -1,4 +1,7 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::lexical_definitions::{
+    LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
+};
 use crate::analyzer::usages::cpp_graph::{
     CppTargetKind, CppVisibilityIndex, cpp_call_arity, cpp_constructor_type_node,
     cpp_first_type_child, cpp_function_return_type_text, cpp_is_declaration_name,
@@ -179,6 +182,7 @@ pub(crate) struct DefinitionLookupOutcome {
     pub(crate) status: DefinitionLookupStatus,
     pub(crate) reference: Option<ResolvedReferenceSite>,
     pub(crate) definitions: Vec<CodeUnit>,
+    pub(crate) lexical_definition: Option<LexicalDefinition>,
     pub(crate) diagnostics: Vec<DefinitionLookupDiagnostic>,
 }
 
@@ -388,6 +392,32 @@ fn resolve_one(
     };
 
     let tree = context.tree(&request.file, language, &source);
+    if let Some(tree) = tree.as_ref()
+        && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
+    {
+        match resolve_lexical_binding(
+            language,
+            tree.root_node(),
+            &source,
+            site.focus_start_byte,
+            site.focus_end_byte,
+            identifier,
+        ) {
+            Some(LexicalBindingResolution::Parameter(definition)) => {
+                return finish_lookup_outcome(lexical_definition_outcome(definition), site);
+            }
+            Some(LexicalBindingResolution::OtherLocal) => {
+                return finish_lookup_outcome(
+                    no_definition(
+                        "local_binding",
+                        format!("`{identifier}` resolves to a local non-parameter binding"),
+                    ),
+                    site,
+                );
+            }
+            None => {}
+        }
+    }
     let resolved = match language {
         Language::Rust => rust::resolve_rust(
             analyzer,
@@ -622,7 +652,18 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
         status,
         reference: None,
         definitions: candidates,
+        lexical_definition: None,
         diagnostics,
+    }
+}
+
+fn lexical_definition_outcome(definition: LexicalDefinition) -> DefinitionLookupOutcome {
+    DefinitionLookupOutcome {
+        status: DefinitionLookupStatus::Resolved,
+        reference: None,
+        definitions: Vec::new(),
+        lexical_definition: Some(definition),
+        diagnostics: Vec::new(),
     }
 }
 
@@ -672,6 +713,7 @@ fn diagnostic_outcome(
         status,
         reference: None,
         definitions: Vec::new(),
+        lexical_definition: None,
         diagnostics: vec![DefinitionLookupDiagnostic {
             kind: kind.into(),
             message: message.into(),

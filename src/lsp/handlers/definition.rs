@@ -23,6 +23,14 @@ pub fn handle(
         uri,
         &params.text_document_position_params.position,
     )?;
+    if let Some(definition) = target.lexical_definition {
+        let range =
+            byte_range_to_lsp_range(&target.content, &target.line_starts, &definition.name_range);
+        return Some(GotoDefinitionResponse::Array(vec![Location {
+            uri: uri.clone(),
+            range,
+        }]));
+    }
     if target.declaration_site {
         let range = byte_range_to_lsp_range(
             &target.content,
