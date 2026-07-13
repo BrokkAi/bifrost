@@ -587,6 +587,139 @@ export function run(): number {
 }
 
 #[test]
+fn ts_dead_code_smell_proves_typed_local_member_reads_and_writes() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "policy.ts",
+            r#"
+export interface SlmPolicy {
+  stats: string;
+  readStats: string;
+}
+export interface UnrelatedPolicy {
+  stats: string;
+}
+
+export function update(seed: SlmPolicy) {
+  const policy: SlmPolicy = seed;
+  policy.stats = "updated";
+}
+
+export function show(seed: SlmPolicy): string {
+  const policy: SlmPolicy = seed;
+  return policy.readStats;
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let target_file = project.file("policy.ts");
+    let stats = ts_definition(&analyzer, |cu| {
+        cu.is_field() && cu.fq_name() == "SlmPolicy.stats" && cu.source() == &target_file
+    });
+    let read_stats = ts_definition(&analyzer, |cu| {
+        cu.is_field() && cu.fq_name() == "SlmPolicy.readStats" && cu.source() == &target_file
+    });
+    let unrelated_stats = ts_definition(&analyzer, |cu| {
+        cu.is_field() && cu.fq_name() == "UnrelatedPolicy.stats" && cu.source() == &target_file
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["policy.ts".to_string()],
+            fq_names: vec![
+                stats.fq_name(),
+                read_stats.fq_name(),
+                unrelated_stats.fq_name(),
+            ],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result.report.contains(
+            "`SlmPolicy.stats` | `policy.ts:4-4` | 1 | 1 | `one workspace inbound edge from update`"
+        ),
+        "typed-local member write should resolve to SlmPolicy.stats: {}",
+        result.report
+    );
+    assert!(
+        result
+            .report
+            .contains("`SlmPolicy.readStats` | `policy.ts:5-5` | 1 | 1 | `one workspace inbound edge from show`"),
+        "typed-local member read should resolve to SlmPolicy.readStats: {}",
+        result.report
+    );
+    assert!(
+        result.report.contains(
+            "`UnrelatedPolicy.stats` | `policy.ts:8-8` | 0 | 0 | `no non-self usages found`"
+        ),
+        "same-named member on an unrelated owner must stay unused: {}",
+        result.report
+    );
+}
+
+#[test]
+fn ts_dead_code_smell_keeps_unrelated_static_same_member_reportable() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Used {
+  static mark(): void {}
+}
+
+export class Unused {
+  static mark(): void {}
+}
+"#,
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import { Used } from "./service";
+
+export function run(): void {
+  Used.mark();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let used_mark = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Used.mark$static"
+    });
+    let unused_mark = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Unused.mark$static"
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.ts".to_string()],
+            fq_names: vec![used_mark.fq_name(), unused_mark.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result.report.contains(
+            "`Used.mark$static` | `service.ts:4-4` | 1 | 1 | `one workspace inbound edge from run`"
+        ),
+        "named-import static member should resolve to Used.mark$static: {}",
+        result.report
+    );
+    assert!(
+        result.report.contains(
+            "`Unused.mark$static` | `service.ts:8-8` | 0 | 0 | `no non-self usages found`"
+        ),
+        "same-named static member on an unrelated owner must remain reportable: {}",
+        result.report
+    );
+}
+
+#[test]
 fn ts_dead_code_smell_reexport_counts_as_usage() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
