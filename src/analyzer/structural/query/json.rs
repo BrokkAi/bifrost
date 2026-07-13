@@ -38,6 +38,17 @@ impl CodeQuery {
         if let Some(pattern) = &self.not_inside {
             object.insert("not_inside".to_string(), pattern_to_json(pattern));
         }
+        if !self.steps.is_empty() {
+            object.insert(
+                "steps".to_string(),
+                Value::Array(
+                    self.steps
+                        .iter()
+                        .map(|step| json!({ "op": step.label() }))
+                        .collect(),
+                ),
+            );
+        }
         object.insert("limit".to_string(), json!(self.limit));
         object.insert(
             "result_detail".to_string(),

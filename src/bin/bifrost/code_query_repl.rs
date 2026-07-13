@@ -1,7 +1,7 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryMatch, CodeQueryResult, Pattern, StringPredicate,
+    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, StringPredicate,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
@@ -570,13 +570,54 @@ fn run_query(service: &SearchToolsService, value: &Value, use_color: bool) -> St
 
 fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> String {
     let mut out = String::new();
-    if output.matches.is_empty() {
-        out.push_str("No structural matches.\n");
+    if output.results.is_empty() {
+        out.push_str("No query results.\n");
     } else {
-        out.push_str(&format!("{}\n", output.match_count_line()));
-        for matched in &output.matches {
+        out.push_str(&format!("{}\n", output.result_count_line()));
+        for result in &output.results {
             out.push('\n');
-            render_code_query_match(&mut out, matched, use_color);
+            match &result.value {
+                CodeQueryResultValue::StructuralMatch { value } => {
+                    render_code_query_match(&mut out, value, use_color);
+                }
+                CodeQueryResultValue::Declaration { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let name = sanitize_terminal_text(&value.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}-{}\n  {} {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.start_line,
+                        value.end_line,
+                        paint(Style::new().fg(Color::Blue), "declaration:", use_color),
+                        paint(Style::new().bold(), &name, use_color)
+                    ));
+                }
+                CodeQueryResultValue::File { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}\n  {} {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "language:", use_color),
+                        value.language
+                    ));
+                }
+            }
+            if !result.provenance.is_empty() {
+                out.push_str(&format!(
+                    "  provenance: {} path{}{}\n",
+                    result.provenance.len(),
+                    if result.provenance.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    if result.provenance_truncated {
+                        " (truncated)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
         }
     }
 

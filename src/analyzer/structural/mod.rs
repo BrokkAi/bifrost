@@ -38,11 +38,13 @@ pub use provider::{StructuralFactsCache, StructuralSearchProvider};
 pub use query::{
     CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    Pattern, QueryError, SCHEMA_VERSION, StringPredicate,
+    MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
+    MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind, SCHEMA_VERSION,
+    StringPredicate,
 };
 pub use search::{
-    CodeQueryCapture, CodeQueryExecutionLimits, CodeQueryMatch, CodeQueryRange, CodeQueryResult,
-    execute, execute_with_limits,
+    CodeQueryCapture, CodeQueryDeclaration, CodeQueryExecutionLimits, CodeQueryFile,
+    CodeQueryMatch, CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange, CodeQueryResult,
+    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, execute, execute_with_limits,
 };
 pub use spec::{RoleSink, StructuralSpec};

@@ -1,8 +1,9 @@
 use super::ir::{
     CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
-    MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
-    MAX_WHERE_GLOBS, Pattern, QueryError, SCHEMA_VERSION, StringPredicate,
+    MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind,
+    SCHEMA_VERSION, StringPredicate,
 };
 use super::schema::{PatternField, QueryField, StringPredicateField};
 use crate::analyzer::Language;
@@ -63,6 +64,11 @@ impl CodeQuery {
             return Err(QueryError::new("not_inside", "pattern must not be empty"));
         }
 
+        let steps = match fields.steps {
+            None => Vec::new(),
+            Some(value) => decode_steps(value, "steps")?,
+        };
+
         let limit = match fields.limit {
             None => DEFAULT_LIMIT,
             Some(value) => decode_limit(value, "limit")?,
@@ -79,6 +85,7 @@ impl CodeQuery {
             root,
             inside,
             not_inside,
+            steps,
             limit,
             result_detail,
         })
@@ -129,6 +136,7 @@ struct QueryFields<'a> {
     root: Option<&'a Value>,
     inside: Option<&'a Value>,
     not_inside: Option<&'a Value>,
+    steps: Option<&'a Value>,
     limit: Option<&'a Value>,
     result_detail: Option<&'a Value>,
     schema_version: Option<&'a Value>,
@@ -152,6 +160,7 @@ fn collect_query_fields<'a>(
             QueryField::Match => fields.root = Some(value),
             QueryField::Inside => fields.inside = Some(value),
             QueryField::NotInside => fields.not_inside = Some(value),
+            QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
             QueryField::ResultDetail => fields.result_detail = Some(value),
             QueryField::SchemaVersion => fields.schema_version = Some(value),
@@ -224,9 +233,9 @@ fn decode_limit(value: &Value, path: &str) -> Result<usize, QueryError> {
 }
 
 fn decode_schema_version(value: &Value, path: &str) -> Result<u64, QueryError> {
-    let version = value
-        .as_u64()
-        .ok_or_else(|| QueryError::new(path, "expected schema version 1"))?;
+    let version = value.as_u64().ok_or_else(|| {
+        QueryError::new(path, format!("expected schema version {SCHEMA_VERSION}"))
+    })?;
     if version != SCHEMA_VERSION {
         return Err(QueryError::new(
             path,
@@ -234,6 +243,57 @@ fn decode_schema_version(value: &Value, path: &str) -> Result<u64, QueryError> {
         ));
     }
     Ok(version)
+}
+
+fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(path, "expected an array of step objects"))?;
+    if entries.len() > MAX_QUERY_STEPS {
+        return Err(QueryError::new(
+            path,
+            format!("at most {MAX_QUERY_STEPS} query steps are allowed"),
+        ));
+    }
+
+    let mut steps = Vec::with_capacity(entries.len());
+    let mut value_kind = QueryValueKind::StructuralMatch;
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(path, index);
+        let object = as_object(entry, &entry_path)?;
+        check_known_fields(object, &entry_path, &["op"])?;
+        let op_path = child_path(&entry_path, "op");
+        let label = object
+            .get("op")
+            .ok_or_else(|| QueryError::new(&op_path, "required field is missing"))?
+            .as_str()
+            .ok_or_else(|| QueryError::new(&op_path, "expected a step name string"))?;
+        let step = QueryStep::from_label(label).ok_or_else(|| {
+            QueryError::new(
+                &op_path,
+                format!(
+                    "unknown query step {label:?}; expected enclosing_decl, file_of, imports_of, or importers_of"
+                ),
+            )
+        })?;
+        let expected_input = match step {
+            QueryStep::EnclosingDecl => "structural_match",
+            QueryStep::FileOf => "structural_match or declaration",
+            QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
+        };
+        value_kind = step.output_kind(value_kind).ok_or_else(|| {
+            QueryError::new(
+                &entry_path,
+                format!(
+                    "step {} requires {expected_input}, but the previous stage produces {}",
+                    step.label(),
+                    value_kind.label()
+                ),
+            )
+        })?;
+        steps.push(step);
+    }
+    Ok(steps)
 }
 
 fn decode_result_detail(value: &Value, path: &str) -> Result<CodeQueryResultDetail, QueryError> {

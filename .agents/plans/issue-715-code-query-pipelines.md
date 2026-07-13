@@ -12,10 +12,10 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 - [x] (2026-07-13 10:08Z) Confirmed the clean tracked issue branch, fetched its upstream, and rebased it without changes.
 - [x] (2026-07-13 10:08Z) Inspected the existing query IR, decoder, structural executor, import-provider contracts, Python models, and documentation test harness.
-- [ ] Implement schema version 2, typed steps, canonical JSON, RQL lowering, and domain validation.
-- [ ] Implement typed row execution, exact enclosing declarations, direct import edges, deduplication, provenance, and budgets.
+- [x] (2026-07-13 10:42Z) Implemented schema version 2, typed steps, canonical JSON, RQL lowering, and path-aware domain validation.
+- [x] (2026-07-13 10:42Z) Implemented typed row execution, exact enclosing declarations, direct import edges, deduplication, provenance, and budgets.
 - [ ] Update service schemas, CLI rendering/help, and the Python client/models.
-- [ ] Add behavior-focused integration tests and executable cookbook examples for every new step.
+- [ ] Add behavior-focused integration tests and executable cookbook examples for every new step (completed: pipeline integration tests; remaining: executable public cookbook fixtures and examples).
 - [ ] Run formatting, focused tests, Python tests, Clippy, and the full `nlp,python` feature test suite.
 - [ ] Record final evidence and complete the retrospective.
 
@@ -26,6 +26,9 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 - Observation: `ImportAnalysisProvider::referencing_files_of` is not uniformly a direct-edge API.
   Evidence: the Ruby provider intentionally computes transitive referencing files for usage candidate discovery. Query pipelines must instead build direct forward edges from structured import information and invert that graph for `importers-of`.
+
+- Observation: Not every syntax declaration is an indexed `CodeUnit`; for example, a nested Python local function is currently enclosed by its indexed outer declaration.
+  Evidence: the initial nested-local fixture returned `app.outer`, while a class method fixture returned the exact `Outer.inner` declaration. The step therefore correctly promises the smallest indexed declaration rather than an arbitrary AST declaration node.
 
 ## Decision Log
 
@@ -55,7 +58,7 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 ## Outcomes & Retrospective
 
-Implementation has not started. This section will be updated after each milestone with observable behavior, validation evidence, remaining gaps, and lessons learned.
+The query IR and executor milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. Existing cross-language structural search and planner tests remain green. Public schemas, clients, and documentation still need migration before the feature is complete.
 
 ## Context and Orientation
 
@@ -138,6 +141,8 @@ The result domains and legal transitions are:
     file             --importers_of----> file
 
 Revision note (2026-07-13): Created the initial self-contained plan after confirming the issue branch and inspecting the current query, import-analysis, client, and documentation architecture.
+
+Revision note (2026-07-13 10:42Z): Marked the typed IR and executor milestones complete, recorded the indexed-declaration boundary discovered by testing, and captured the passing focused integration evidence.
 
 ## Interfaces and Dependencies
 

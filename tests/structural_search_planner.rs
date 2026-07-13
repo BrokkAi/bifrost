@@ -174,7 +174,7 @@ fn assert_truncation_diagnostic(output: &CodeQueryResult, limit: usize) {
             .any(|diagnostic| diagnostic.language == "workspace"
                 && diagnostic
                     .message
-                    .contains(&format!("returned the first {limit} matches"))
+                    .contains(&format!("returned the first {limit} results"))
                 && diagnostic.message.contains("after scanning")
                 && diagnostic.message.contains("project-relative path")
                 && diagnostic.message.contains("where")
@@ -428,6 +428,7 @@ fn execution_budget_bounds_unanchored_no_match_queries() {
             max_scanned_files: 1,
             max_scanned_source_bytes: usize::MAX,
             max_fact_nodes: usize::MAX,
+            max_pipeline_rows: usize::MAX,
         },
     );
 

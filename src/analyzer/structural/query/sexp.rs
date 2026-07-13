@@ -106,6 +106,24 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             insert_unique(&mut query, field, pattern_to_json(&items[1])?)?;
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::EnclosingDecl | RqlForm::FileOf | RqlForm::ImportsOf | RqlForm::ImportersOf => {
+            expect_len(items, 2, head)?;
+            let mut query = query_object(&items[1])?;
+            let steps = query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| "internal error: steps must be an array".to_string())?;
+            let op = match form {
+                RqlForm::EnclosingDecl => "enclosing_decl",
+                RqlForm::FileOf => "file_of",
+                RqlForm::ImportsOf => "imports_of",
+                RqlForm::ImportersOf => "importers_of",
+                _ => unreachable!("typed pipeline wrapper filtered above"),
+            };
+            steps.push(json!({ "op": op }));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -195,7 +213,11 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
         | RqlForm::Limit
         | RqlForm::ResultDetail
         | RqlForm::Inside
-        | RqlForm::NotInside => unreachable!("wrapper filtered above"),
+        | RqlForm::NotInside
+        | RqlForm::EnclosingDecl
+        | RqlForm::FileOf
+        | RqlForm::ImportsOf
+        | RqlForm::ImportersOf => unreachable!("wrapper filtered above"),
     }
     Ok(Value::Object(object))
 }
@@ -451,6 +473,20 @@ mod tests {
             canonical_json(json!({
                 "result_detail": "full",
                 "match": { "kind": "call", "callee": { "name": "eval" } }
+            }))
+        );
+    }
+
+    #[test]
+    fn structural_query_sexp_lowers_typed_steps_in_execution_order() {
+        assert_eq!(
+            canonical(r#"(imports-of (file-of (call :callee (name "load"))))"#),
+            canonical_json(json!({
+                "match": { "kind": "call", "callee": { "name": "load" } },
+                "steps": [
+                    { "op": "file_of" },
+                    { "op": "imports_of" }
+                ]
             }))
         );
     }
