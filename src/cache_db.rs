@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
+use once_cell::sync::Lazy;
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite_migration::{M, Migrations};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -11,13 +13,17 @@ pub const CACHE_DB_FILE_NAME: &str = "bifrost_cache.db";
 pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
-// Keep this at the version understood by the pre-analyzer unified-cache release.
-// That release rejects a nonzero analyzer namespace without mutating the DB, so
-// it can safely coexist with this cache during an app downgrade.
-pub const LATEST_SCHEMA_VERSION: i64 = 1;
-const PRE_RELEASE_UNIFIED_SCHEMA_VERSION: i64 = 6;
-const LATEST_SEMANTIC_SCHEMA_VERSION: i64 = 1;
-const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 10;
+const BASELINE_MIGRATION_VERSION: i64 = 1;
+const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
+const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
+static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
+    Lazy::new(|| Migrations::new(vec![M::up(CURRENT_BASELINE_SQL)]));
+static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
+    let conn = Connection::open_in_memory().expect("open baseline schema connection");
+    conn.execute_batch(CURRENT_BASELINE_SQL)
+        .expect("create baseline schema");
+    schema_object_definitions(&conn).expect("read baseline schema definitions")
+});
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
@@ -118,54 +124,10 @@ fn reject_symlink(path: &Path, label: &str) -> Result<()> {
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     assert_sqlite_version(conn)?;
-    if !table_exists(conn, "cache_state")? {
-        if user_table_names(conn)?.is_empty() {
-            let tx = conn
-                .transaction()
-                .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-            create_schema(&tx)?;
-            initialize_cache_state(&tx)?;
-            tx.commit()
-                .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-        } else {
-            recreate_schema(conn)?;
-        }
-        return Ok(());
-    }
-    let current = schema_version(conn)?;
-    if current == 0 {
-        recreate_schema(conn)?;
-        return Ok(());
-    }
-    if current == PRE_RELEASE_UNIFIED_SCHEMA_VERSION {
-        conn.execute(
-            "UPDATE cache_state SET schema_version = ?1 WHERE id = 1",
-            [LATEST_SCHEMA_VERSION],
-        )
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    } else if current > LATEST_SCHEMA_VERSION {
-        return Err(format!(
-            "cache DB schema version {current} is newer than this build supports"
-        ));
-    } else if current < LATEST_SCHEMA_VERSION {
-        recreate_schema(conn)?;
-        return Ok(());
-    }
-    let (semantic_version, analyzer_version) = namespace_schema_versions(conn)?;
-    if semantic_version > LATEST_SEMANTIC_SCHEMA_VERSION
-        || analyzer_version > LATEST_ANALYZER_SCHEMA_VERSION
-    {
-        return Err(format!(
-            "cache namespace schema is newer than this build supports (semantic={semantic_version}, analyzer={analyzer_version})"
-        ));
-    }
-    if semantic_version < LATEST_SEMANTIC_SCHEMA_VERSION {
-        recreate_semantic_schema(conn)?;
-    }
-    if analyzer_version < LATEST_ANALYZER_SCHEMA_VERSION {
-        recreate_analyzer_schema(conn)?;
-    }
-    Ok(())
+    prepare_baseline_migration(conn)?;
+    CACHE_MIGRATIONS
+        .to_latest(conn)
+        .map_err(|err| format!("cache DB migration error: {err}"))
 }
 
 pub fn now_unix_seconds() -> i64 {
@@ -232,17 +194,17 @@ fn recreate_schema(conn: &mut Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "OFF")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     let result = (|| {
-        let table_names = user_table_names(conn)?;
+        let schema_objects = user_schema_objects(conn)?;
         let tx = conn
             .transaction()
             .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-        for table_name in table_names {
-            let quoted = format!("\"{}\"", table_name.replace('"', "\"\""));
-            tx.execute_batch(&format!("DROP TABLE {quoted};"))
+        for (object_type, name) in schema_objects {
+            let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+            tx.execute_batch(&format!("DROP {object_type} {quoted};"))
                 .map_err(|err| format!("cache DB SQLite error: {err}"))?;
         }
-        create_schema(&tx)?;
-        initialize_cache_state(&tx)?;
+        tx.execute_batch("PRAGMA user_version = 0;")
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
         tx.commit()
             .map_err(|err| format!("cache DB SQLite error: {err}"))
     })();
@@ -252,6 +214,7 @@ fn recreate_schema(conn: &mut Connection) -> Result<()> {
     result.and(restore)
 }
 
+#[cfg(test)]
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -261,446 +224,118 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-fn user_table_names(conn: &Connection) -> Result<Vec<String>> {
+fn user_schema_objects(conn: &Connection) -> Result<Vec<(String, String)>> {
     let mut statement = conn
         .prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            "SELECT type, name FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+               AND type IN ('view', 'trigger', 'table')
+             ORDER BY CASE type
+                 WHEN 'view' THEN 0
+                 WHEN 'trigger' THEN 1
+                 WHEN 'table' THEN 2
+                 ELSE 3
+             END, name",
         )
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     statement
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|err| format!("cache DB SQLite error: {err}"))?
-        .collect::<std::result::Result<Vec<String>, _>>()
+        .collect::<std::result::Result<Vec<(String, String)>, _>>()
         .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-fn recreate_semantic_schema(conn: &mut Connection) -> Result<()> {
-    let tx = conn
-        .transaction()
+fn schema_object_definitions(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
+             ORDER BY type, name",
+        )
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    drop_semantic_schema(&tx)?;
-    create_semantic_schema(&tx)?;
-    tx.execute(
-        "UPDATE cache_state
-         SET semantic_schema_version = ?1,
-             embed_fingerprint = NULL,
-             chunker_version = NULL,
-             bm25_tokenizer_version = NULL,
-             last_gc_at = 0,
-             blobs_at_last_gc = 0
-         WHERE id = 1",
-        [LATEST_SEMANTIC_SCHEMA_VERSION],
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    tx.commit()
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    Ok(())
+    statement
+        .query_map([], |row| {
+            let sql: String = row.get(2)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                sql.chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect(),
+            ))
+        })
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?
+        .collect::<std::result::Result<Vec<(String, String, String)>, _>>()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-fn recreate_analyzer_schema(conn: &mut Connection) -> Result<()> {
-    let tx = conn
-        .transaction()
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    drop_analyzer_schema(&tx)?;
-    create_analyzer_schema(&tx)?;
-    tx.execute(
-        "UPDATE cache_state
-         SET analyzer_schema_version = ?1,
-             last_gc_at = 0,
-             blobs_at_last_gc = 0
-         WHERE id = 1",
-        [LATEST_ANALYZER_SCHEMA_VERSION],
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    tx.commit()
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    Ok(())
+fn prepare_baseline_migration(conn: &mut Connection) -> Result<()> {
+    let user_version = cache_migration_version(conn)?;
+    if user_version < 0 {
+        return Err(format!(
+            "cache DB migration user_version must not be negative: {user_version}"
+        ));
+    }
+    if user_version > BASELINE_MIGRATION_VERSION {
+        return Ok(());
+    }
+
+    if user_version == 0 && user_schema_objects(conn)?.is_empty() {
+        return Ok(());
+    }
+
+    if baseline_schema_is_valid(conn)? {
+        if user_version == 0 {
+            adopt_current_baseline(conn)?;
+        }
+        return Ok(());
+    }
+
+    recreate_schema(conn)
 }
 
-fn drop_semantic_schema(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        "DROP TABLE IF EXISTS semantic_blob_chunks;
-         DROP TABLE IF EXISTS semantic_blob_summaries;
-         DROP TABLE IF EXISTS semantic_blobs;
-         DROP TABLE IF EXISTS semantic_vectors;
-         DROP TABLE IF EXISTS semantic_component_vectors;
-         DROP TABLE IF EXISTS blob_chunks;
-         DROP TABLE IF EXISTS blob_summaries;
-         DROP TABLE IF EXISTS vectors;
-         DROP TABLE IF EXISTS component_vectors;",
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    Ok(())
+fn cache_migration_version(conn: &Connection) -> Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-fn drop_analyzer_schema(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        "DROP TABLE IF EXISTS import_details;
-         DROP TABLE IF EXISTS import_statements;
-         DROP TABLE IF EXISTS imports;
-         DROP TABLE IF EXISTS type_identifiers;
-         DROP TABLE IF EXISTS blob_meta;
-         DROP TABLE IF EXISTS scala_traits;
-         DROP TABLE IF EXISTS ruby_method_dispatch_modes;
-         DROP TABLE IF EXISTS unit_children;
-         DROP TABLE IF EXISTS unit_supertypes;
-         DROP TABLE IF EXISTS unit_signature_metadata;
-         DROP TABLE IF EXISTS unit_signatures;
-         DROP TABLE IF EXISTS unit_ranges;
-         DROP TABLE IF EXISTS code_units;
-         DROP TABLE IF EXISTS blobs;
-         DROP TABLE IF EXISTS analysis_epochs;",
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    Ok(())
-}
-
-fn create_schema(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        r#"
-        CREATE TABLE cache_state(
-          id                       INTEGER PRIMARY KEY CHECK(id = 1),
-          schema_version           INTEGER NOT NULL,
-          semantic_schema_version  INTEGER NOT NULL,
-          analyzer_schema_version  INTEGER NOT NULL,
-          last_gc_at               INTEGER NOT NULL DEFAULT 0,
-          blobs_at_last_gc         INTEGER NOT NULL DEFAULT 0,
-          gc_claim_until           INTEGER NOT NULL DEFAULT 0,
-          embed_fingerprint        TEXT,
-          chunker_version          TEXT,
-          bm25_tokenizer_version   TEXT
-        ) STRICT;
-        "#,
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    create_semantic_schema(tx)?;
-    create_analyzer_schema(tx)?;
-    Ok(())
-}
-
-fn create_semantic_schema(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        r#"
-        CREATE TABLE semantic_blobs(
-          blob_oid        TEXT PRIMARY KEY CHECK(length(blob_oid) = 40 AND blob_oid NOT GLOB '*[^0-9a-f]*'),
-          language        TEXT,
-          materialized_at TEXT NOT NULL DEFAULT (datetime('now'))
-        ) STRICT;
-
-        CREATE TABLE semantic_blob_summaries(
-          blob_summary_id INTEGER PRIMARY KEY,
-          hash            BLOB NOT NULL UNIQUE CHECK(length(hash) = 32)
-        ) STRICT;
-
-        CREATE TABLE semantic_blob_chunks(
-          blob_oid          TEXT NOT NULL REFERENCES semantic_blobs(blob_oid) ON DELETE CASCADE,
-          chunk_ord         INTEGER NOT NULL,
-          kind              TEXT NOT NULL,
-          symbol            TEXT,
-          start_line        INTEGER,
-          end_line          INTEGER,
-          fts_tokens        TEXT NOT NULL,
-          hash              BLOB NOT NULL CHECK(length(hash) = 32),
-          parent_summary_id INTEGER REFERENCES semantic_blob_summaries(blob_summary_id),
-          composed_hash     BLOB NOT NULL CHECK(length(composed_hash) = 32),
-          PRIMARY KEY(blob_oid, chunk_ord)
-        ) WITHOUT ROWID, STRICT;
-        CREATE INDEX semantic_blob_chunks_by_hash
-          ON semantic_blob_chunks(hash);
-        CREATE INDEX semantic_blob_chunks_by_parent
-          ON semantic_blob_chunks(parent_summary_id);
-        CREATE INDEX semantic_blob_chunks_by_composed
-          ON semantic_blob_chunks(composed_hash);
-
-        CREATE TABLE semantic_component_vectors(
-          hash   BLOB PRIMARY KEY CHECK(length(hash) = 32),
-          dim    INTEGER NOT NULL,
-          vector BLOB NOT NULL
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE semantic_vectors(
-          composed_hash BLOB PRIMARY KEY CHECK(length(composed_hash) = 32),
-          dim           INTEGER NOT NULL,
-          vector        BLOB NOT NULL
-        ) WITHOUT ROWID, STRICT;
-        "#,
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    Ok(())
-}
-
-fn create_analyzer_schema(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        r#"
-        CREATE TABLE analysis_epochs(
-          lang  TEXT PRIMARY KEY,
-          epoch TEXT NOT NULL
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE blobs(
-          blob_oid TEXT NOT NULL CHECK(length(blob_oid) = 40 AND blob_oid NOT GLOB '*[^0-9a-f]*'),
-          lang     TEXT NOT NULL,
-          PRIMARY KEY(blob_oid, lang)
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE code_units(
-          blob_oid                 TEXT    NOT NULL,
-          lang                     TEXT    NOT NULL,
-          unit_key                 INTEGER NOT NULL,
-          kind                     INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 5),
-          short_name               TEXT    NOT NULL,
-          identifier               TEXT    NOT NULL,
-          content_qualifier        TEXT    NOT NULL,
-          exact_fqn                TEXT,
-          normalized_fqn           TEXT,
-          simple_type_name         TEXT,
-          signature                TEXT,
-          synthetic                INTEGER NOT NULL CHECK(synthetic IN (0, 1)),
-          is_type_alias            INTEGER NOT NULL CHECK(is_type_alias IN (0, 1)),
-          top_level_ordinal        INTEGER CHECK(top_level_ordinal IS NULL OR top_level_ordinal >= 0),
-          in_declarations          INTEGER NOT NULL CHECK(in_declarations IN (0, 1)),
-          in_definition_lookup     INTEGER NOT NULL CHECK(in_definition_lookup IN (0, 1)),
-          PRIMARY KEY(blob_oid, lang, unit_key),
-          CHECK(kind <> 5),
-          CHECK(NOT (kind = 3 AND lang IN ('javascript', 'python', 'typescript'))),
-          FOREIGN KEY(blob_oid, lang)
-            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE INDEX idx_code_units_lang_short_name
-          ON code_units(lang, short_name);
-
-        CREATE INDEX idx_code_units_lang_identifier_declarations
-          ON code_units(lang, identifier)
-          WHERE in_declarations = 1;
-
-        CREATE INDEX idx_code_units_lang_exact_fqn_declarations
-          ON code_units(lang, exact_fqn)
-          WHERE in_declarations = 1;
-
-        CREATE INDEX idx_code_units_lang_normalized_fqn_declarations
-          ON code_units(lang, normalized_fqn)
-          WHERE in_declarations = 1;
-
-        CREATE INDEX idx_code_units_lang_package_simple_type_declarations
-          ON code_units(lang, content_qualifier, simple_type_name)
-          WHERE in_declarations = 1 AND kind = 0;
-
-        CREATE INDEX idx_code_units_lang_content_qualifier_declarations
-          ON code_units(lang, content_qualifier)
-          WHERE in_declarations = 1;
-
-        CREATE TABLE unit_ranges(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          unit_key    INTEGER NOT NULL,
-          ordinal     INTEGER NOT NULL,
-          start_byte  INTEGER NOT NULL,
-          end_byte    INTEGER NOT NULL,
-          start_line  INTEGER NOT NULL,
-          end_line    INTEGER NOT NULL,
-          PRIMARY KEY(blob_oid, lang, unit_key, ordinal),
-          CHECK(start_byte >= 0 AND end_byte >= start_byte AND start_line >= 0 AND end_line >= start_line),
-          FOREIGN KEY(blob_oid, lang, unit_key)
-            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE INDEX idx_unit_ranges_lang_blob_ordinal
-          ON unit_ranges(lang, blob_oid, ordinal);
-
-        CREATE TABLE unit_signatures(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          unit_key    INTEGER NOT NULL,
-          ordinal     INTEGER NOT NULL,
-          text        TEXT    NOT NULL,
-          PRIMARY KEY(blob_oid, lang, unit_key, ordinal),
-          FOREIGN KEY(blob_oid, lang, unit_key)
-            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE unit_signature_metadata(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          unit_key    INTEGER NOT NULL,
-          ordinal     INTEGER NOT NULL,
-          metadata    BLOB    NOT NULL,
-          PRIMARY KEY(blob_oid, lang, unit_key, ordinal),
-          FOREIGN KEY(blob_oid, lang, unit_key)
-            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE unit_supertypes(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          unit_key    INTEGER NOT NULL,
-          ordinal     INTEGER NOT NULL,
-          raw         TEXT    NOT NULL,
-          PRIMARY KEY(blob_oid, lang, unit_key, ordinal),
-          FOREIGN KEY(blob_oid, lang, unit_key)
-            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE unit_children(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          parent_key  INTEGER NOT NULL,
-          child_key   INTEGER NOT NULL,
-          ordinal     INTEGER NOT NULL,
-          PRIMARY KEY(blob_oid, lang, parent_key, child_key, ordinal),
-          CHECK(parent_key <> child_key),
-          FOREIGN KEY(blob_oid, lang, parent_key)
-            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE,
-          FOREIGN KEY(blob_oid, lang, child_key)
-            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE ruby_method_dispatch_modes(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          unit_key    INTEGER NOT NULL,
-          mode        INTEGER NOT NULL CHECK(mode BETWEEN 0 AND 2),
-          PRIMARY KEY(blob_oid, lang, unit_key),
-          FOREIGN KEY(blob_oid, lang, unit_key)
-            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE scala_traits(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          unit_key    INTEGER NOT NULL,
-          PRIMARY KEY(blob_oid, lang, unit_key),
-          FOREIGN KEY(blob_oid, lang, unit_key)
-            REFERENCES code_units(blob_oid, lang, unit_key) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE import_statements(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          ordinal     INTEGER NOT NULL,
-          statement   TEXT    NOT NULL,
-          PRIMARY KEY(blob_oid, lang, ordinal),
-          FOREIGN KEY(blob_oid, lang)
-            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE import_details(
-          blob_oid    TEXT    NOT NULL,
-          lang        TEXT    NOT NULL,
-          ordinal     INTEGER NOT NULL,
-          info        BLOB    NOT NULL,
-          PRIMARY KEY(blob_oid, lang, ordinal),
-          FOREIGN KEY(blob_oid, lang)
-            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE blob_meta(
-          blob_oid           TEXT    NOT NULL,
-          lang               TEXT    NOT NULL,
-          contains_tests     INTEGER NOT NULL CHECK(contains_tests IN (0, 1)),
-          content_package    TEXT    NOT NULL,
-          stored_unit_count  INTEGER NOT NULL CHECK(stored_unit_count >= 0),
-          range_count         INTEGER NOT NULL CHECK(range_count >= 0),
-          signature_count     INTEGER NOT NULL CHECK(signature_count >= 0),
-          signature_metadata_count INTEGER NOT NULL CHECK(signature_metadata_count >= 0),
-          supertype_count     INTEGER NOT NULL CHECK(supertype_count >= 0),
-          child_count         INTEGER NOT NULL CHECK(child_count >= 0),
-          import_statement_count INTEGER NOT NULL CHECK(import_statement_count >= 0),
-          import_count        INTEGER NOT NULL CHECK(import_count >= 0),
-          type_identifier_count INTEGER NOT NULL CHECK(type_identifier_count >= 0),
-          ruby_dispatch_count INTEGER NOT NULL CHECK(ruby_dispatch_count >= 0),
-          scala_trait_count   INTEGER NOT NULL CHECK(scala_trait_count >= 0),
-          is_complete         INTEGER NOT NULL CHECK(is_complete IN (0, 1)),
-          PRIMARY KEY(blob_oid, lang),
-          FOREIGN KEY(blob_oid, lang)
-            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-
-        CREATE TABLE type_identifiers(
-          blob_oid         TEXT NOT NULL,
-          lang             TEXT NOT NULL,
-          type_identifier  TEXT NOT NULL,
-          PRIMARY KEY(blob_oid, lang, type_identifier),
-          FOREIGN KEY(blob_oid, lang)
-            REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
-        ) WITHOUT ROWID, STRICT;
-        "#,
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    Ok(())
-}
-
-fn initialize_cache_state(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute(
-        "INSERT INTO cache_state(
-           id, schema_version, semantic_schema_version, analyzer_schema_version,
-           last_gc_at, blobs_at_last_gc, gc_claim_until
-         ) VALUES(1, ?1, ?2, ?3, 0, 0, 0)",
-        [
-            LATEST_SCHEMA_VERSION,
-            LATEST_SEMANTIC_SCHEMA_VERSION,
-            LATEST_ANALYZER_SCHEMA_VERSION,
-        ],
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    Ok(())
-}
-
-fn namespace_schema_versions(conn: &Connection) -> Result<(i64, i64)> {
-    conn.query_row(
-        "SELECT semantic_schema_version, analyzer_schema_version
+fn baseline_schema_is_valid(conn: &Connection) -> Result<bool> {
+    if !quick_check_is_ok(conn)? {
+        return Ok(false);
+    }
+    if schema_object_definitions(conn)? != *BASELINE_SCHEMA_OBJECTS {
+        return Ok(false);
+    }
+    let versions = conn.query_row(
+        "SELECT schema_version, semantic_schema_version, analyzer_schema_version
          FROM cache_state WHERE id = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
 }
 
-fn schema_version(conn: &Connection) -> Result<i64> {
-    let state_exists: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cache_state'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
+fn quick_check_is_ok(conn: &Connection) -> Result<bool> {
+    let result: String = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    if state_exists.is_some() {
-        return conn
-            .query_row(
-                "SELECT schema_version FROM cache_state WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map(|version| version.unwrap_or(0))
-            .map_err(|err| format!("cache DB SQLite error: {err}"));
+    Ok(result == "ok")
+}
+
+fn adopt_current_baseline(conn: &mut Connection) -> Result<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    if cache_migration_version(&tx)? != 0 {
+        return Ok(());
     }
-    let meta_exists: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    if meta_exists.is_none() {
-        return Ok(0);
+    if !baseline_schema_is_valid(&tx)? {
+        return Err("cache DB baseline changed while being adopted".to_string());
     }
-    let legacy: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
+    tx.execute_batch("PRAGMA user_version = 1;")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    legacy
-        .as_deref()
-        .unwrap_or("0")
-        .parse::<i64>()
-        .map_err(|err| format!("invalid cache DB schema version: {err}"))
+    tx.commit()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
 fn assert_sqlite_version(conn: &Connection) -> Result<()> {
@@ -729,13 +364,255 @@ fn parse_sqlite_version(version: &str) -> Option<(u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use rusqlite_migration::{M, Migrations};
+
     use super::*;
+
+    fn open_in_memory_cache() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        conn
+    }
+
+    fn create_current_baseline_without_migration() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        conn.execute_batch(CURRENT_BASELINE_SQL).unwrap();
+        conn
+    }
+
+    fn future_migrations(sql: &'static str) -> Migrations<'static> {
+        Migrations::new(vec![M::up(CURRENT_BASELINE_SQL), M::up(sql)])
+    }
 
     fn create_legacy_cache(path: &Path) {
         let connection = Connection::open(path).unwrap();
         connection
             .execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
             .unwrap();
+    }
+
+    #[test]
+    fn baseline_migration_validates() {
+        CACHE_MIGRATIONS.validate().unwrap();
+    }
+
+    #[test]
+    fn fresh_cache_applies_baseline_migration() {
+        let conn = open_in_memory_cache();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(baseline_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn current_pre_migration_cache_is_adopted_without_dropping_rows() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.execute(
+            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
+            ["1111111111111111111111111111111111111111"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            ["2222222222222222222222222222222222222222"],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let semantic_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| row.get(0))
+            .unwrap();
+        let analyzer_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert_eq!(semantic_count, 1);
+        assert_eq!(analyzer_count, 1);
+    }
+
+    #[test]
+    fn incomplete_pre_migration_cache_is_rebuilt() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        conn.execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
+            .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(!table_exists(&conn, "legacy_cache").unwrap());
+        assert!(baseline_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn pre_migration_cache_with_unrecognized_table_is_rebuilt() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
+            .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(!table_exists(&conn, "legacy_cache").unwrap());
+        assert!(baseline_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn pre_migration_cache_with_incomplete_table_shape_is_rebuilt() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.execute_batch(
+            "DROP TABLE blob_meta;
+             CREATE TABLE blob_meta(
+               blob_oid TEXT NOT NULL,
+               lang TEXT NOT NULL,
+               PRIMARY KEY(blob_oid, lang)
+             ) WITHOUT ROWID, STRICT;",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let has_content_package: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('blob_meta')
+                   WHERE name = 'content_package'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(has_content_package);
+        assert!(baseline_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn pre_migration_cache_with_unrecognized_view_is_rebuilt() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.execute_batch("CREATE VIEW legacy_view AS SELECT 1 AS value;")
+            .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let legacy_view_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'legacy_view'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(!legacy_view_exists);
+        assert!(baseline_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn incomplete_current_cache_is_rebuilt() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.execute_batch(
+            "DROP TABLE semantic_vectors;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(baseline_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn future_migration_preserves_baseline_rows() {
+        let mut conn = open_in_memory_cache();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            ["2222222222222222222222222222222222222222"],
+        )
+        .unwrap();
+        let migrations =
+            future_migrations("CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;");
+
+        migrations.to_latest(&mut conn).unwrap();
+
+        let analyzer_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 2);
+        assert_eq!(analyzer_count, 1);
+        assert!(table_exists(&conn, "migration_probe").unwrap());
+    }
+
+    #[test]
+    fn failing_migration_rolls_back_schema_and_version() {
+        let mut conn = open_in_memory_cache();
+        let migrations = future_migrations(
+            "CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;
+             this is not valid SQL;",
+        );
+
+        assert!(migrations.to_latest(&mut conn).is_err());
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(!table_exists(&conn, "migration_probe").unwrap());
+    }
+
+    #[test]
+    fn locked_migration_retries_after_writer_releases_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let mut conn = Connection::open(&db_path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+
+        let mut blocker = Connection::open(&db_path).unwrap();
+        blocker.busy_timeout(Duration::ZERO).unwrap();
+        let writer = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let migrations =
+            future_migrations("CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;");
+
+        assert!(migrations.to_latest(&mut conn).is_err());
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(!table_exists(&conn, "migration_probe").unwrap());
+
+        writer.rollback().unwrap();
+        migrations.to_latest(&mut conn).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 2);
+        assert!(table_exists(&conn, "migration_probe").unwrap());
+    }
+
+    #[test]
+    fn newer_migration_version_is_refused_without_mutating_cache() {
+        let mut conn = open_in_memory_cache();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            ["2222222222222222222222222222222222222222"],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+
+        let err = migrate(&mut conn).unwrap_err();
+
+        let analyzer_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            err.contains("DatabaseTooFarAhead"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(cache_migration_version(&conn).unwrap(), 2);
+        assert_eq!(analyzer_count, 1);
     }
 
     #[test]
@@ -754,6 +631,26 @@ mod tests {
         for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
             assert!(!cache_dir.join(name).exists());
         }
+    }
+
+    #[test]
+    fn baseline_adoption_does_not_remove_legacy_caches() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join(".brokk");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
+        create_legacy_cache(&legacy);
+
+        let unified = cache_dir.join(CACHE_DB_FILE_NAME);
+        let mut pre_migration = Connection::open(&unified).unwrap();
+        configure_connection(&mut pre_migration).unwrap();
+        pre_migration.execute_batch(CURRENT_BASELINE_SQL).unwrap();
+        drop(pre_migration);
+
+        let connection = open_unified_connection(&unified).unwrap();
+
+        assert_eq!(cache_migration_version(&connection).unwrap(), 1);
+        assert!(legacy.exists());
     }
 
     #[test]
@@ -829,96 +726,5 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(!outside.exists());
-    }
-
-    #[test]
-    fn callable_metadata_upgrade_rebuilds_analyzer_and_preserves_semantic_tables() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-        conn.execute(
-            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
-            ["1111111111111111111111111111111111111111"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            ["2222222222222222222222222222222222222222"],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE cache_state SET analyzer_schema_version = ?1 WHERE id = 1",
-            [LATEST_ANALYZER_SCHEMA_VERSION - 1],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let semantic_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| row.get(0))
-            .unwrap();
-        let analyzer_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
-            .unwrap();
-        let (_, analyzer_version) = namespace_schema_versions(&conn).unwrap();
-        assert_eq!(semantic_count, 1);
-        assert_eq!(analyzer_count, 0);
-        assert_eq!(analyzer_version, LATEST_ANALYZER_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn newer_namespace_is_refused_without_mutating_cache() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            ["2222222222222222222222222222222222222222"],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE cache_state SET analyzer_schema_version = ?1 WHERE id = 1",
-            [LATEST_ANALYZER_SCHEMA_VERSION + 1],
-        )
-        .unwrap();
-
-        let err = migrate(&mut conn).unwrap_err();
-        assert!(err.contains("newer than this build supports"), "{err}");
-        let analyzer_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(analyzer_count, 1);
-    }
-
-    #[test]
-    fn pre_release_global_schema_is_adopted_without_dropping_namespaces() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            ["2222222222222222222222222222222222222222"],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE cache_state SET schema_version = ?1 WHERE id = 1",
-            [PRE_RELEASE_UNIFIED_SCHEMA_VERSION],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let schema_version: i64 = conn
-            .query_row(
-                "SELECT schema_version FROM cache_state WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let analyzer_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(schema_version, LATEST_SCHEMA_VERSION);
-        assert_eq!(analyzer_count, 1);
     }
 }
