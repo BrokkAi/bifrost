@@ -64,17 +64,10 @@ fn python_project(root: &Path) -> Arc<dyn Project> {
     ))
 }
 
-fn go_python_project(root: &Path) -> Arc<dyn Project> {
+fn language_python_project(root: &Path, language: Language) -> Arc<dyn Project> {
     Arc::new(TestProject::with_languages(
         root.canonicalize().unwrap(),
-        BTreeSet::from([Language::Go, Language::Python]),
-    ))
-}
-
-fn csharp_python_project(root: &Path) -> Arc<dyn Project> {
-    Arc::new(TestProject::with_languages(
-        root.canonicalize().unwrap(),
-        BTreeSet::from([Language::CSharp, Language::Python]),
+        BTreeSet::from([language, Language::Python]),
     ))
 }
 
@@ -84,6 +77,39 @@ fn parsed_file_count(events: &[BuildProgressEvent]) -> usize {
         .filter(|event| event.phase == BuildProgressPhase::Parse)
         .filter(|event| event.file.is_some())
         .count()
+}
+
+fn assert_warm_multilanguage_definition_query(
+    project: Arc<dyn Project>,
+    query: brokk_bifrost::searchtools::DefinitionReferenceQuery,
+    expected_fqn: &str,
+) {
+    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let events = Arc::clone(&warm_events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    let analyzer = warm.analyzer();
+    assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+
+    let result = brokk_bifrost::searchtools::get_definitions_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![query],
+        },
+    );
+
+    assert_eq!(result.results[0].status, "resolved");
+    assert_eq!(
+        result.results[0].definitions[0].fqn.as_deref(),
+        Some(expected_fqn)
+    );
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
 }
 
 fn declaration_names(analyzer: &dyn IAnalyzer) -> BTreeSet<String> {
@@ -111,38 +137,15 @@ fn warm_multilanguage_go_definition_query_does_not_build_full_definition_index()
     write_file(root, "other.py", "def unrelated():\n    return 1\n");
     let repo = init_git_repo(root);
     commit_all(&repo, "init");
-    let project = go_python_project(root);
-
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
-    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
-    let analyzer = warm.analyzer();
-    assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
-    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
-
-    let result = brokk_bifrost::searchtools::get_definitions_by_location(
-        analyzer,
-        brokk_bifrost::searchtools::GetDefinitionParams {
-            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
-                path: "main.go".to_string(),
-                line: Some(5),
-                column: Some(18),
-            }],
+    assert_warm_multilanguage_definition_query(
+        language_python_project(root, Language::Go),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "main.go".to_string(),
+            line: Some(5),
+            column: Some(18),
         },
+        "example.com/app/generated/client.Helper",
     );
-
-    assert_eq!(result.results[0].status, "resolved");
-    assert_eq!(
-        result.results[0].definitions[0].fqn.as_deref(),
-        Some("example.com/app/generated/client.Helper")
-    );
-    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
 }
 
 #[test]
@@ -159,45 +162,48 @@ fn warm_multilanguage_csharp_definition_query_does_not_build_full_definition_ind
     write_file(root, "other.py", "def unrelated():\n    return 1\n");
     let repo = init_git_repo(root);
     commit_all(&repo, "init");
-    let project = csharp_python_project(root);
-
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
-    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
-    let analyzer = warm.analyzer();
-    assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
-    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
-
     let call_line = caller.lines().nth(1).unwrap();
-    let result = brokk_bifrost::searchtools::get_definitions_by_location(
-        analyzer,
-        brokk_bifrost::searchtools::GetDefinitionParams {
-            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
-                path: "App/Controller.cs".to_string(),
-                line: Some(2),
-                column: Some(call_line.find("Run").unwrap() + 1),
-            }],
+    assert_warm_multilanguage_definition_query(
+        language_python_project(root, Language::CSharp),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "App/Controller.cs".to_string(),
+            line: Some(2),
+            column: Some(call_line.find("Run").unwrap() + 1),
         },
+        "Lib.Service.Run",
     );
+}
 
-    assert_eq!(result.results[0].status, "resolved");
-    assert_eq!(
-        result.results[0].definitions[0].fqn.as_deref(),
-        Some("Lib.Service.Run")
+#[test]
+fn warm_multilanguage_rust_definition_query_does_not_build_full_definition_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let value_source = "pub struct Number;\n\npub enum Value {\n    Number(Number),\n}\n\npub fn classify(value: Value) {\n    match value {\n        Value::Number(_) => {}\n    }\n}\n";
+    write_file(root, "src/value/mod.rs", value_source);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let (reference_line_index, reference_line) = value_source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Value::Number"))
+        .unwrap();
+    assert_warm_multilanguage_definition_query(
+        language_python_project(root, Language::Rust),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "src/value/mod.rs".to_string(),
+            line: Some(reference_line_index + 1),
+            column: Some(reference_line.find("Number").unwrap() + 1),
+        },
+        "value.Value.Number",
     );
-    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
 }
 
 #[test]
 fn csharp_package_existence_ignores_stale_complete_blobs() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
+    write_file(root, ".gitignore", ".brokk/\n");
     write_file(
         root,
         "Types.cs",

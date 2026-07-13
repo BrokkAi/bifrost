@@ -260,6 +260,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         expected
     });
     assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
+    assert_definition_lookup_schema_limits_and_requires_location(tools);
     assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");
     assert_scan_usages_location_schema(tools);
     assert_type_lookup_schema_limits_and_requires_location(tools);
@@ -2047,6 +2048,20 @@ fn assert_type_lookup_schema_limits_and_requires_location(tools: &[Value]) {
     let serialized = serde_json::to_string(schema).unwrap();
     assert!(!serialized.contains("start_byte"), "{serialized}");
     assert!(!serialized.contains("end_byte"), "{serialized}");
+}
+
+fn assert_definition_lookup_schema_limits_and_requires_location(tools: &[Value]) {
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_definitions_by_location")
+        .expect("missing get_definitions_by_location descriptor");
+    let schema = &tool["inputSchema"];
+
+    assert_eq!(schema["properties"]["references"]["maxItems"], 100);
+    assert_eq!(
+        schema["properties"]["references"]["items"]["required"],
+        json!(["path", "line"])
+    );
 }
 
 fn assert_rename_symbol_schema_requires_location_and_new_name(tools: &[Value]) {

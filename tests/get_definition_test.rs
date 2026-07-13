@@ -1396,6 +1396,48 @@ pub fn format_value() {}
 }
 
 #[test]
+fn rust_definition_lookup_ignores_other_language_normalized_fqn_collisions() {
+    let rust_source = "pub struct Widget;\n\nimpl Widget {\n    pub fn build() -> Self {\n        Self\n    }\n}\n";
+    let project = InlineTestProject::new()
+        .file("src/shared/mod.rs", rust_source)
+        .file(
+            "src/shared/Widget.scala",
+            "package shared\nobject Widget { def create(): Widget.type = this }\n",
+        )
+        .build();
+    let (reference_line_index, reference_line) = rust_source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.trim() == "Self")
+        .unwrap();
+
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "src/shared/mod.rs",
+                "line": reference_line_index + 1,
+                "column": column_of(reference_line, "Self")
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "shared.Widget", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/shared/mod.rs",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_grouped_use_prefix_resolves_to_module_declaration() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -3263,6 +3305,29 @@ fn type_lookup_rejects_oversized_batches() {
         .collect::<Vec<_>>()
         .join(",");
     let value = lookup_type(
+        project.root(),
+        &format!(r#"{{"references":[{references}]}}"#),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "invalid_location", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "too_many_references",
+        "{value}"
+    );
+}
+
+#[test]
+fn definition_lookup_rejects_oversized_batches() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub struct Widget;\n")
+        .build();
+
+    let references = (0..101)
+        .map(|_| r#"{"path":"lib.rs","line":1,"column":12}"#)
+        .collect::<Vec<_>>()
+        .join(",");
+    let value = lookup(
         project.root(),
         &format!(r#"{{"references":[{references}]}}"#),
     );

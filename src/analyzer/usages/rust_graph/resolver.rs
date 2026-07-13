@@ -7,6 +7,30 @@ use crate::hash::HashSet;
 use std::collections::BTreeSet;
 use tree_sitter::Parser;
 
+/// Owned, query-shaped declaration access used by Rust forward resolution.
+///
+/// The legacy [`DefinitionLookupIndex`] implementation keeps usage-graph callers
+/// working, while point lookups can answer these operations from persisted,
+/// bounded analyzer queries without materializing every workspace declaration.
+pub(crate) trait RustDefinitionProvider {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
+    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit>;
+
+    fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
+        self.fqn(&format!("{owner_fqn}.{name}"))
+    }
+}
+
+impl RustDefinitionProvider for DefinitionLookupIndex {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        DefinitionLookupIndex::fqn(self, fqn)
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        DefinitionLookupIndex::file_identifier(self, file, identifier)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RustGraphSeedKind {
     Export,
@@ -124,7 +148,7 @@ fn trait_member(rust: &RustAnalyzer, trait_unit: &CodeUnit, member_name: &str) -
 
 pub(crate) fn resolve_scoped_associated_item(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
     path: &str,
@@ -151,7 +175,7 @@ pub(crate) fn resolve_scoped_associated_item(
 /// comes from the enclosing impl, not from a scoped path) shares one resolver.
 pub(crate) fn resolve_trait_associated_item(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
     owner_fqn: &str,
@@ -170,7 +194,7 @@ pub(crate) fn resolve_trait_associated_item(
 
 pub(crate) fn resolve_trait_associated_item_matching(
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
     owner_fqn: &str,
@@ -203,7 +227,7 @@ pub(crate) fn resolve_trait_associated_item_matching(
             .filter(|trait_unit| trait_visible_at_call_site(rust, refs, file, trait_unit))
             .flat_map(|trait_unit| {
                 support
-                    .fqn_direct_children(&trait_unit.fq_name())
+                    .members_for_owner_name(&trait_unit.fq_name(), item_name)
                     .into_iter()
                     .filter(move |candidate| {
                         item_matches(candidate)
