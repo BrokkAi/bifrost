@@ -16,7 +16,7 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
 - [x] (2026-07-13 09:55Z) Traced the MCP session, benchmark runner, CLI/report, workflow, watcher/snapshot, and definition-index code paths.
 - [x] (2026-07-13 10:07Z) Implemented a continuously running standard-error drain with a 256 KiB production tail, sequenced request cursors, explicit child-before-reader shutdown, poison recovery, and focused tests that push over 2 MiB through a bounded socket.
 - [x] (2026-07-13 10:20Z) Added `--profile`, child-only `BIFROST_TIMING`, per-iteration traces and relative report references, bounded failure-tail context, and a manual workflow input; verified both profiled output and profile-disabled report stability with real-child integration tests.
-- [ ] Add disabled-by-default scopes and counters around watcher delta application, snapshot updates, definition batch/language dispatch, live-key enumeration, persisted row fetch, row resolution, dirty/nonpersisted units, and definition-index construction.
+- [x] (2026-07-13 10:26Z) Added disabled-by-default scopes and counters around watcher delta application, snapshot updates, definition batch/language dispatch, live-key enumeration, persisted row fetch, row resolution, dirty/nonpersisted units, and definition-index construction; the real-child profile test asserts every required boundary.
 - [ ] Run formatting, focused tests, the benchmark integration suite, Clippy with all targets and features, and the full feature-enabled test suite; update this plan with evidence and outcomes.
 
 ## Surprises & Discoveries
@@ -54,9 +54,13 @@ After this change, a developer can run `bifrost_benchmark run --profile ...` saf
   Rationale: This preserves byte-for-byte report shape for ordinary scheduled benchmarks while making profile artifacts discoverable from an opt-in report.
   Date/Author: 2026-07-13 / Codex
 
+- Decision: Make disabled `profiling::Scope` values hold no label and no start timestamp.
+  Rationale: The new hot-path scopes should not allocate strings or call the clock when `BIFROST_TIMING` is absent. This also reduces overhead for all existing disabled scopes while preserving the environment-variable behavior.
+  Date/Author: 2026-07-13 / Codex
+
 ## Outcomes & Retrospective
 
-The first two milestones are complete. Every MCP child now has its standard error consumed from the moment it is spawned, so a full pipe cannot deadlock a request. Opted-in runs enable child timing and preserve one metadata-rich trace per warmup or measured iteration under the uploaded output directory, while ordinary report JSON omits the optional artifact field. Definition-path scopes and full quality gates remain.
+The implementation milestones are complete. Every MCP child now has its standard error consumed from the moment it is spawned, so a full pipe cannot deadlock a request. Opted-in runs enable child timing and preserve one metadata-rich trace per warmup or measured iteration under the uploaded output directory, while ordinary report JSON omits the optional artifact field. Traces now expose every requested definition-path boundary and count. Full repository quality gates remain.
 
 ## Context and Orientation
 
@@ -160,3 +164,5 @@ Plan revision note (2026-07-13 09:55Z): Created the initial self-contained plan 
 Plan revision note (2026-07-13 10:07Z): Recorded completion and focused-test evidence for the safe drain milestone, plus the discovery that unit-test filters require `--lib` here to avoid linking all integration targets.
 
 Plan revision note (2026-07-13 10:20Z): Recorded the completed profile artifact milestone and real-child evidence for trace association and disabled-report compatibility.
+
+Plan revision note (2026-07-13 10:26Z): Recorded completion of the get-definition instrumentation milestone and the decision to eliminate disabled-scope allocation and clock work.

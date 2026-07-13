@@ -202,6 +202,7 @@ definition_queries = [
         .expect("profile artifact array");
     assert_eq!(artifacts.len(), 2, "report: {report}");
 
+    let mut combined_traces = String::new();
     for (index, artifact) in artifacts.iter().enumerate() {
         let relative = artifact.as_str().expect("artifact path");
         let trace = fs::read_to_string(output_dir.join(relative)).expect("read profile trace");
@@ -214,6 +215,26 @@ definition_queries = [
         );
         assert!(trace.contains("iteration=1"), "trace: {trace}");
         assert!(trace.contains("[bifrost-timing]"), "trace: {trace}");
+        combined_traces.push_str(&trace);
+    }
+    for expected in [
+        "SearchToolsService::snapshot_for_query",
+        "SearchToolsService::apply_watcher_delta",
+        "get_definition::resolve_definition_batch",
+        "language=Java",
+        "get_definition::language_dispatch",
+        "definition_lookup_index::enumerate_live_keys",
+        "AnalyzerStore::definition_lookup_rows_by_keys",
+        "definition_lookup_index::resolve_persisted_rows",
+        "definition_lookup_index::collect_dirty_units",
+        "definition_lookup_index::collect_nonpersisted_units",
+        "definition_lookup_index::build",
+        "build_count=1",
+    ] {
+        assert!(
+            combined_traces.contains(expected),
+            "profile traces missing `{expected}`:\n{combined_traces}"
+        );
     }
 }
 
