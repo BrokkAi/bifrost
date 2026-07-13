@@ -23,6 +23,7 @@ export interface BifrostInitializationOptions {
   roots: string[];
   exclude: string[];
   formatterCommands: BifrostFormatterCommandRule[];
+  unrecognizedSymbolDiagnostics: boolean;
 }
 
 export interface BifrostFormatterCommandRule {
@@ -288,12 +289,14 @@ export function buildBifrostInitializationOptions(
   workspaceRoot: string,
   roots: string[],
   exclude: string[],
-  formatterCommands: BifrostFormatterCommandRule[]
+  formatterCommands: BifrostFormatterCommandRule[],
+  unrecognizedSymbolDiagnostics: boolean
 ): BifrostInitializationOptions {
   return {
     roots: parsePathSettings(roots, workspaceRoot),
     exclude: parsePathSettings(exclude, workspaceRoot),
-    formatterCommands
+    formatterCommands,
+    unrecognizedSymbolDiagnostics
   };
 }
 
