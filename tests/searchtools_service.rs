@@ -4560,7 +4560,7 @@ fn scan_usages_location_target_selects_js_object_literal_method() {
         only_result(&value)["symbol"],
         "{value}"
     );
-    assert_eq!(2, only_result(&value)["total_hits"], "{value}");
+    assert_eq!(3, only_result(&value)["total_hits"], "{value}");
 
     let files = only_result(&value)["files"].as_array().unwrap();
     assert!(
