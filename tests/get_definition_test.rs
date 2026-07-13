@@ -2796,6 +2796,48 @@ namespace App {
 }
 
 #[test]
+fn csharp_attribute_shorthand_type_lookup_prefers_imported_attribute_suffix() {
+    let source = r#"
+using System.Management.Automation;
+
+namespace Demo.Runtime.PowerShell {
+    internal class Parameter { }
+
+    [Parameter]
+    public sealed class ExportProxyCmdlet { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file(
+            "Automation/ParameterAttribute.cs",
+            "namespace System.Management.Automation { public class ParameterAttribute : System.Attribute { } }\n",
+        )
+        .file("Generated/ExportProxyCmdlet.cs", source)
+        .build();
+
+    let attribute = source.find("Parameter]").expect("attribute shorthand");
+    let value = lookup_type(
+        project.root(),
+        &location_reference("Generated/ExportProxyCmdlet.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["types"][0]["fqn"], "System.Management.Automation.ParameterAttribute",
+        "{value}"
+    );
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "Automation/ParameterAttribute.cs",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_type_lookup_preserves_ambiguous_visible_type_candidates() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file("A/Widget.cs", "namespace A { public class Widget {} }\n")
@@ -11467,6 +11509,377 @@ fn csharp_using_type_resolves_to_definition() {
     assert_eq!(result["definitions"][0]["fqn"], "Lib.Service", "{value}");
     assert_eq!(
         result["definitions"][0]["path"], "Lib/Service.cs",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_attribute_shorthand_definition_prefers_imported_attribute_suffix() {
+    let source = r#"
+using System.Management.Automation;
+
+namespace Demo.Runtime.PowerShell {
+    internal class Parameter { }
+
+    [Parameter]
+    public sealed class ExportProxyCmdlet { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file(
+            "Automation/ParameterAttribute.cs",
+            "namespace System.Management.Automation { public class ParameterAttribute : System.Attribute { } }\n",
+        )
+        .file("Generated/ExportProxyCmdlet.cs", source)
+        .build();
+
+    let attribute = source.find("Parameter]").expect("attribute shorthand");
+    let value = lookup(
+        project.root(),
+        &location_reference("Generated/ExportProxyCmdlet.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "System.Management.Automation.ParameterAttribute",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "Automation/ParameterAttribute.cs",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_attribute_shorthand_rejects_explicit_object_base_exact_candidate() {
+    let source = r#"
+using System.Management.Automation;
+
+namespace Demo.Runtime.PowerShell {
+    internal class Parameter : object { }
+
+    [Parameter]
+    public sealed class ExportProxyCmdlet { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file(
+            "Automation/ParameterAttribute.cs",
+            "namespace System.Management.Automation { public class ParameterAttribute : System.Attribute { } }\n",
+        )
+        .file("Generated/ExportProxyCmdlet.cs", source)
+        .build();
+
+    let attribute = source.find("Parameter]").expect("attribute shorthand");
+    let value = lookup(
+        project.root(),
+        &location_reference("Generated/ExportProxyCmdlet.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "System.Management.Automation.ParameterAttribute",
+        "an explicit object base proves the exact Parameter is not an attribute: {value}"
+    );
+}
+
+#[test]
+fn csharp_attribute_shorthand_rejects_explicit_object_base_with_unresolved_interface() {
+    let source = r#"
+using System.Management.Automation;
+using External.Contracts;
+
+namespace Demo.Runtime.PowerShell {
+    internal class Parameter : object, IExternalInterface { }
+
+    [Parameter]
+    public sealed class ExportProxyCmdlet { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file(
+            "Automation/ParameterAttribute.cs",
+            "namespace System.Management.Automation { public class ParameterAttribute : System.Attribute { } }\n",
+        )
+        .file("Generated/ExportProxyCmdlet.cs", source)
+        .build();
+
+    let attribute = source.find("Parameter]").expect("attribute shorthand");
+    let value = lookup(
+        project.root(),
+        &location_reference("Generated/ExportProxyCmdlet.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "System.Management.Automation.ParameterAttribute",
+        "the explicit object base decisively proves the exact Parameter is not an attribute even when another base is unresolved: {value}"
+    );
+}
+
+#[test]
+fn csharp_attribute_shorthand_external_suffix_reports_boundary() {
+    let source = r#"
+using System.Management.Automation;
+
+namespace Demo.Runtime.PowerShell {
+    internal class Parameter { }
+
+    [Parameter(Mandatory = true)]
+    public sealed class ExportProxyCmdlet { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Generated/ExportProxyCmdlet.cs", source)
+        .build();
+
+    let attribute = source
+        .find("Parameter(Mandatory")
+        .expect("production-shaped attribute shorthand");
+    let value = lookup(
+        project.root(),
+        &location_reference("Generated/ExportProxyCmdlet.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_none_or(|definitions| definitions
+                .iter()
+                .all(|definition| { definition["fqn"] != "Demo.Runtime.PowerShell.Parameter" })),
+        "an external ParameterAttribute boundary must never resolve the local non-attribute Parameter: {value}"
+    );
+}
+
+#[test]
+fn csharp_attribute_shorthand_with_two_valid_forms_is_ambiguous() {
+    let source = r#"
+namespace Demo {
+    public class Marker : System.Attribute { }
+    public class MarkerAttribute : System.Attribute { }
+
+    [Marker]
+    public sealed class Consumer { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file("Consumer.cs", source)
+        .build();
+
+    let attribute = source.find("Marker]").expect("ambiguous attribute");
+    let value = lookup(
+        project.root(),
+        &location_reference("Consumer.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let mut fqns = result["definitions"]
+        .as_array()
+        .expect("ambiguous definitions")
+        .iter()
+        .map(|definition| definition["fqn"].as_str().expect("definition fqn"))
+        .collect::<Vec<_>>();
+    fqns.sort_unstable();
+    assert_eq!(fqns, ["Demo.Marker", "Demo.MarkerAttribute"], "{value}");
+}
+
+#[test]
+fn csharp_attribute_two_successful_alias_spellings_to_same_type_are_ambiguous() {
+    let source = r#"
+using Marker = Attributes.SharedAttribute;
+using MarkerAttribute = Attributes.SharedAttribute;
+
+namespace Demo {
+    [Marker]
+    public sealed class Consumer { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file(
+            "Attributes/SharedAttribute.cs",
+            "namespace Attributes { public class SharedAttribute : System.Attribute { } }\n",
+        )
+        .file("Consumer.cs", source)
+        .build();
+
+    let attribute = source.find("Marker]").expect("aliased attribute");
+    let value = lookup(
+        project.root(),
+        &location_reference("Consumer.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "ambiguous",
+        "both successful attribute-name spellings are ambiguous even when they name the same logical type: {value}"
+    );
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_some_and(|definitions| definitions
+                .iter()
+                .any(|definition| definition["fqn"] == "Attributes.SharedAttribute")),
+        "{value}"
+    );
+
+    let value = lookup_type(
+        project.root(),
+        &location_reference("Consumer.cs", source, attribute),
+    );
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "ambiguous",
+        "type lookup must preserve ambiguity between both successful attribute-name spellings even when they name the same logical type: {value}"
+    );
+}
+
+#[test]
+fn csharp_attribute_partial_base_preserves_all_definition_locations() {
+    let source = r#"
+using Demo.Attributes;
+
+namespace Demo {
+    [Marker]
+    public sealed class Consumer { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file(
+            "Attributes/MarkerAttribute.First.cs",
+            "namespace Demo.Attributes { public partial class MarkerAttribute { } }\n",
+        )
+        .file(
+            "Attributes/MarkerAttribute.Second.cs",
+            "namespace Demo.Attributes { public partial class MarkerAttribute : System.Attribute { } }\n",
+        )
+        .file("Consumer.cs", source)
+        .build();
+
+    let attribute = source.find("Marker]").expect("partial attribute");
+    let value = lookup(
+        project.root(),
+        &location_reference("Consumer.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let mut paths = result["definitions"]
+        .as_array()
+        .expect("partial attribute definitions")
+        .iter()
+        .map(|definition| definition["path"].as_str().expect("definition path"))
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "Attributes/MarkerAttribute.First.cs",
+            "Attributes/MarkerAttribute.Second.cs"
+        ],
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_attribute_shorthand_discards_ambiguous_exact_lookup_before_suffix() {
+    let source = r#"
+using ExactAttribute;
+using ExactNonAttribute;
+using Suffixed;
+
+namespace Demo {
+    [Marker]
+    public sealed class Consumer { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file(
+            "ExactAttribute/Marker.cs",
+            "namespace ExactAttribute { public class Marker : System.Attribute { } }\n",
+        )
+        .file(
+            "ExactNonAttribute/Marker.cs",
+            "namespace ExactNonAttribute { public class Marker { } }\n",
+        )
+        .file(
+            "Suffixed/MarkerAttribute.cs",
+            "namespace Suffixed { public class MarkerAttribute : System.Attribute { } }\n",
+        )
+        .file("Consumer.cs", source)
+        .build();
+
+    let attribute = source.find("Marker]").expect("attribute shorthand");
+    let value = lookup(
+        project.root(),
+        &location_reference("Consumer.cs", source, attribute),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Suffixed.MarkerAttribute",
+        "an ambiguous exact type-name lookup is suppressed before attribute ancestry is considered: {value}"
+    );
+}
+
+#[test]
+fn csharp_attribute_namespace_alias_external_suffix_reports_boundary() {
+    let source = r#"
+using PS = System.Management.Automation;
+
+namespace Demo {
+    [PS::Parameter]
+    public sealed class ExportProxyCmdlet { }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Generated/ExportProxyCmdlet.cs", source)
+        .build();
+
+    let attribute = source
+        .find("Parameter]")
+        .expect("namespace-alias attribute shorthand");
+    let value = lookup(
+        project.root(),
+        &location_reference("Generated/ExportProxyCmdlet.cs", source, attribute),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
         "{value}"
     );
 }

@@ -422,6 +422,11 @@ fn collect_csharp_type_identifiers(
     identifiers: &mut HashSet<String>,
 ) {
     walk_named_tree_preorder(node, true, |node| {
+        if node.kind() == "attribute"
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            identifiers.extend(super::csharp_attribute_type_names(name, source));
+        }
         if is_csharp_type_position_node(node)
             && !is_nested_type_reference_component(node)
             && matches!(

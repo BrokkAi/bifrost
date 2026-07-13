@@ -138,6 +138,38 @@ fn nested_partial_type_references_edge_to_nested_type() {
 }
 
 #[test]
+fn attribute_reference_edges_to_attribute_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        )
+        .file(
+            "Attributes/MarkerAttribute.cs",
+            "namespace Demo.Attributes { public class MarkerAttribute : System.Attribute { } }\n",
+        )
+        .file(
+            "Consumer.cs",
+            r#"
+using Demo.Attributes;
+
+namespace Demo {
+    [Marker]
+    public sealed class Consumer { }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "Demo.Consumer", "Demo.Attributes.MarkerAttribute"),
+        "expected Consumer -> MarkerAttribute: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn nested_type_references_do_not_edge_through_type_parameter_shadow() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

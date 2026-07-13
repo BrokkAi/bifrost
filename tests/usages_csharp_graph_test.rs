@@ -450,6 +450,414 @@ namespace App {
 }
 
 #[test]
+fn usage_finder_csharp_finds_fully_qualified_attribute_in_authoritative_and_default_scope() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        ),
+        (
+            "Runtime/PSArgumentCompleterAttribute.cs",
+            r#"
+namespace Microsoft.Azure.PowerShell.Cmdlets.NetworkCloud.Runtime {
+    public sealed class PSArgumentCompleterAttribute : System.Attribute { }
+}
+"#,
+        ),
+        (
+            "Generated/Model.cs",
+            r#"
+namespace Microsoft.Azure.PowerShell.Cmdlets.NetworkCloud.Models {
+    public sealed class Model {
+        [Microsoft.Azure.PowerShell.Cmdlets.NetworkCloud.Runtime.PSArgumentCompleterAttribute]
+        public string Name { get; set; }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(
+        &analyzer,
+        "Microsoft.Azure.PowerShell.Cmdlets.NetworkCloud.Runtime.PSArgumentCompleterAttribute",
+    );
+    let consumer = project.file("Generated/Model.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let attribute_start = source
+        .find("PSArgumentCompleterAttribute")
+        .expect("fully-qualified attribute name");
+    let attribute_end = attribute_start + "PSArgumentCompleterAttribute".len();
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let authoritative = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        authoritative.candidate_files,
+        std::iter::once(consumer.clone()).collect()
+    );
+    let authoritative_hits = authoritative
+        .result
+        .into_either()
+        .expect("authoritative attribute query should resolve");
+    assert!(
+        authoritative_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= attribute_start
+                && attribute_end <= hit.end_offset
+        }),
+        "authoritative inverse lookup should find the explicit attribute name: {authoritative_hits:#?}"
+    );
+
+    let default_query = UsageFinder::new().query(&analyzer, &[target], 1000, 1000);
+    assert!(
+        default_query.candidate_files.contains(&consumer),
+        "persisted candidate routing should include the explicit attribute consumer"
+    );
+    let default_hits = default_query
+        .result
+        .into_either()
+        .expect("default attribute query should resolve");
+    assert!(
+        default_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= attribute_start
+                && attribute_end <= hit.end_offset
+        }),
+        "default inverse lookup should find the explicit attribute name: {default_hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_attribute_shorthand_targets_suffix_not_local_nonattribute() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        ),
+        (
+            "Automation/ParameterAttribute.cs",
+            "namespace System.Management.Automation { public class ParameterAttribute : System.Attribute { } }\n",
+        ),
+        (
+            "Generated/ExportProxyCmdlet.cs",
+            r#"
+using System.Management.Automation;
+
+namespace Demo.Runtime.PowerShell {
+    internal class Parameter { }
+
+    [Parameter]
+    public sealed class ExportProxyCmdlet { }
+}
+"#,
+        ),
+    ]);
+
+    let attribute_target =
+        type_definition(&analyzer, "System.Management.Automation.ParameterAttribute");
+    let local_nonattribute = type_definition(&analyzer, "Demo.Runtime.PowerShell.Parameter");
+    let consumer = project.file("Generated/ExportProxyCmdlet.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let attribute_start = source.find("Parameter]").expect("attribute shorthand");
+    let attribute_end = attribute_start + "Parameter".len();
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let authoritative = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&attribute_target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let authoritative_hits = authoritative
+        .result
+        .into_either()
+        .expect("authoritative shorthand attribute query should resolve");
+    assert!(
+        authoritative_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= attribute_start
+                && attribute_end <= hit.end_offset
+        }),
+        "authoritative lookup should bind shorthand Parameter to ParameterAttribute: {authoritative_hits:#?}"
+    );
+
+    let default_query = UsageFinder::new().query(
+        &analyzer,
+        std::slice::from_ref(&attribute_target),
+        1000,
+        1000,
+    );
+    assert!(
+        default_query.candidate_files.contains(&consumer),
+        "persisted candidate routing should include a consumer that omits the Attribute suffix"
+    );
+    let default_hits = default_query
+        .result
+        .into_either()
+        .expect("default shorthand attribute query should resolve");
+    assert!(
+        default_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= attribute_start
+                && attribute_end <= hit.end_offset
+        }),
+        "default lookup should bind shorthand Parameter to ParameterAttribute: {default_hits:#?}"
+    );
+
+    let local_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &[local_nonattribute], Some(&provider), 1, 1000);
+    let local_hits = local_query
+        .result
+        .into_either()
+        .expect("local non-attribute query should resolve");
+    assert!(
+        local_hits.iter().all(|hit| {
+            hit.file != consumer
+                || hit.end_offset <= attribute_start
+                || attribute_end <= hit.start_offset
+        }),
+        "the shorthand annotation must not count as a usage of the local non-attribute Parameter: {local_hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_partial_attribute_base_proves_shorthand_usage() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        ),
+        (
+            "Attributes/MarkerAttribute.First.cs",
+            "namespace Demo.Attributes { public partial class MarkerAttribute { } }\n",
+        ),
+        (
+            "Attributes/MarkerAttribute.Second.cs",
+            "namespace Demo.Attributes { public partial class MarkerAttribute : System.Attribute { } }\n",
+        ),
+        (
+            "Generated/Consumer.cs",
+            r#"
+using Demo.Attributes;
+
+namespace Demo.Generated {
+    [Marker]
+    public sealed class Consumer { }
+}
+"#,
+        ),
+    ]);
+
+    let targets = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "Demo.Attributes.MarkerAttribute"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        2,
+        "expected both partial attribute declarations"
+    );
+    let consumer = project.file("Generated/Consumer.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let attribute_start = source.find("Marker]").expect("partial attribute shorthand");
+    let attribute_end = attribute_start + "Marker".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+    let hits = query
+        .result
+        .into_either()
+        .expect("partial attribute usage query should resolve");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= attribute_start
+                && attribute_end <= hit.end_offset
+        }),
+        "a base declared on one partial part should prove the shorthand attribute usage: {hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_ambiguous_attribute_name_is_not_a_proven_usage() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        ),
+        (
+            "Attributes/Marker.cs",
+            r#"
+namespace Demo.Attributes {
+    public class Marker : System.Attribute { }
+    public class MarkerAttribute : System.Attribute { }
+}
+"#,
+        ),
+        (
+            "Generated/Consumer.cs",
+            r#"
+using Demo.Attributes;
+
+namespace Demo.Generated {
+    [Marker]
+    public sealed class Consumer { }
+}
+"#,
+        ),
+    ]);
+
+    let exact = type_definition(&analyzer, "Demo.Attributes.Marker");
+    let suffixed = type_definition(&analyzer, "Demo.Attributes.MarkerAttribute");
+    let consumer = project.file("Generated/Consumer.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let attribute_start = source.find("Marker]").expect("ambiguous attribute");
+    let attribute_end = attribute_start + "Marker".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for target in [exact, suffixed] {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &[target], Some(&provider), 1, 1000);
+        let hits = query
+            .result
+            .into_either()
+            .expect("ambiguous attribute query should complete");
+        assert!(
+            hits.iter().all(|hit| {
+                hit.file != consumer
+                    || hit.end_offset <= attribute_start
+                    || attribute_end <= hit.start_offset
+            }),
+            "ambiguous attribute syntax must not be a proven usage of either candidate: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn usage_finder_csharp_routes_namespace_alias_and_global_attribute_names_by_default() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "System/Attribute.cs",
+            "namespace System { public class Attribute { } }\n",
+        ),
+        (
+            "Runtime/PSArgumentCompleterAttribute.cs",
+            r#"
+namespace External.Runtime {
+    public sealed class PSArgumentCompleterAttribute : System.Attribute { }
+}
+"#,
+        ),
+        (
+            "AliasConsumer/Consumer.cs",
+            r#"
+using PS = External.Runtime;
+
+namespace Demo.Generated {
+    [PS::PSArgumentCompleterAttribute]
+    public sealed class AliasConsumer { }
+}
+"#,
+        ),
+        (
+            "GlobalConsumer/Consumer.cs",
+            r#"
+namespace Demo.Generated {
+    [global::External.Runtime.PSArgumentCompleterAttribute]
+    public sealed class GlobalConsumer { }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "External.Runtime.PSArgumentCompleterAttribute");
+    let consumers = [
+        project.file("AliasConsumer/Consumer.cs"),
+        project.file("GlobalConsumer/Consumer.cs"),
+    ];
+    let attribute_spans = consumers
+        .iter()
+        .map(|consumer| {
+            let source = consumer.read_to_string().expect("consumer source");
+            let start = source
+                .find("PSArgumentCompleterAttribute")
+                .expect("qualified attribute name");
+            (
+                consumer.clone(),
+                start,
+                start + "PSArgumentCompleterAttribute".len(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let provider = ExplicitCandidateProvider::new(Arc::new(consumers.iter().cloned().collect()));
+    let authoritative = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            2,
+            1000,
+        );
+    let authoritative_hits = authoritative
+        .result
+        .into_either()
+        .expect("authoritative qualified attribute query should resolve");
+    for (consumer, start, end) in &attribute_spans {
+        assert!(
+            authoritative_hits.iter().any(|hit| {
+                hit.file == *consumer && hit.start_offset <= *start && *end <= hit.end_offset
+            }),
+            "authoritative lookup should find both alias and global attribute names: {authoritative_hits:#?}"
+        );
+    }
+
+    let default_query = UsageFinder::new().query(&analyzer, &[target], 1000, 1000);
+    for consumer in &consumers {
+        assert!(
+            default_query.candidate_files.contains(consumer),
+            "default routing must independently include {consumer}"
+        );
+    }
+    let default_hits = default_query
+        .result
+        .into_either()
+        .expect("default qualified attribute query should resolve");
+    for (consumer, start, end) in attribute_spans {
+        assert!(
+            default_hits.iter().any(|hit| {
+                hit.file == consumer && hit.start_offset <= start && end <= hit.end_offset
+            }),
+            "default lookup should find both alias and global attribute names: {default_hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn usage_finder_csharp_finds_fully_qualified_partial_type_in_authoritative_file_scope() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (

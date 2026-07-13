@@ -87,6 +87,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 03:45Z) Added failing forward and inverse inline regressions for same-named generic/nongeneric constructors, then implemented metadata-style arity identity for every declared C# type segment, same-file partial-body merging, structured generic-reference arity, exact-before-normalized lookup, source-facing display, and a C# epoch bump.
 - [x] (2026-07-13 04:35Z) Completed three delegated read-only audits and fixed every generic-root finding: receiver inference preserves arity, grouped overloads all scan, exact candidate routing is symmetric, and visible structured lookup never normalizes an arity miss. The complete all-feature suite and affected all-feature clippy targets pass; production exact validation is blocked only on explicit outside-sandbox approval.
 - [x] (2026-07-13 11:35Z) Filed #726 and completed the final exact CDN production rerun in 341.0 seconds. The former false-forward now resolves to `RestException`1.RestException(System.Net.Http.HttpResponseMessage,T)` and has a proven covering inverse hit; zero exact findings remain.
+- [x] (2026-07-13 12:10Z) Pushed and closed #726 after merging concurrent `master`; the complete post-fix C# run at `b75f6b53` finished in 621.0 seconds with 1,902 consistent, 40 unproven, 8,019 inconclusive, and 39 missing sites. All ten generic-constructor misses disappeared; the residual partition is 23 functions, twelve attribute names, and four fields.
+- [x] (2026-07-13 13:40Z) Verified #727 was assigned only to `jbellis`, then reduced the twelve-site attribute boundary with delegated tests and review. C# attribute lookup now models exact and `Attribute`-suffixed AST identities independently, rejects indexed non-attribute ancestry, preserves partial declarations, reports ambiguous spellings, shares the role with forward/type lookup and both inverse graph paths, persists both routing identities, and handles alias/global qualification without per-target global lookup amplification. Exact Azure reruns now classify the external `[Parameter]` spelling as an honest unresolved `ParameterAttribute` import boundary and prove the fully qualified `PSArgumentCompleterAttribute` inverse hit. The complete `cargo test --features nlp,python` gate passes outside the filesystem sandbox; focused all-feature clippy passes, while all-target clippy remains blocked only by the preserved pre-existing `tests/rust_analyzer_goto_definition.rs:65` needless borrow.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -174,6 +176,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: All 33 post-#706 cast-family class misses are the same grammar-field mismatch.
   Evidence: Clean-`v0.8.0` primary and delegated fixtures failed for singular and partial targets because the typed operand is `as_expression.right`, not a field literally named `type`. The shared role fixes authoritative inverse scanning and default persisted routing; unrelated RHS and left-expression negatives remain excluded. `/tmp/csharp-exact-as-type-707-fixed.jsonl` confirms the rebuilt production path is consistent.
+
+- Observation: C# attribute spellings require two independently resolved structural identities, not suffix normalization before lookup.
+  Evidence: `/tmp/csharp-exact-attribute-727-parameter.jsonl` completed in 474.9 seconds and reports `[Parameter]` as an unresolved external `ParameterAttribute` boundary instead of resolving to the workspace non-attribute model. `/tmp/csharp-exact-attribute-727-psargument.jsonl` completed in 269.3 seconds and reports the fully qualified `PSArgumentCompleterAttribute` reference consistent with a proven inverse hit covering bytes `5405..5492`.
 
 ## Decision Log
 
@@ -351,3 +356,5 @@ Revision note (2026-07-13): Recorded post-release resumption, delegated #707 ana
 Revision note (2026-07-13): Recorded pushed/closed #707, the complete post-fix 1,000-target record and its 38-site residual, plus the reduced generic-identity boundary and local structured fix awaiting production validation.
 
 Revision note (2026-07-13): Recorded #726, the audited generic identity fix, and exact Azure validation before the fixing checkpoint.
+
+Revision note (2026-07-13): Recorded #727's delegated reduction and review, dual-spelling structured attribute resolution, complete feature-suite validation, and both exact Azure production outcomes.

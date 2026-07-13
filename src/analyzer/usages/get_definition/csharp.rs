@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{csharp_attribute_name_node, csharp_attribute_type_names};
 
 pub(super) struct CSharpDefinitionProvider<'a> {
     csharp: &'a CSharpAnalyzer,
@@ -47,6 +48,7 @@ pub(crate) enum CSharpTypeLookupResolution {
         fqn: String,
         candidates: Vec<CodeUnit>,
         target_kind: TypeLookupTargetKind,
+        ambiguous: bool,
     },
     InappropriateSymbolContext,
 }
@@ -97,6 +99,9 @@ pub(super) fn resolve_csharp(
     }
 
     match csharp_reference_node(node) {
+        Some(CSharpReferenceNode::Attribute(name)) => {
+            csharp_attribute_outcome(csharp, definitions, file, name, source)
+        }
         Some(CSharpReferenceNode::Type(type_node)) => {
             let reference = csharp_reference_type_text(type_node, source);
             // Prefer a type in the lexically enclosing scope (namespace/class) over
@@ -240,6 +245,17 @@ fn csharp_type_lookup_node_resolution(
     root: Node<'_>,
     node: Node<'_>,
 ) -> Option<CSharpTypeLookupResolution> {
+    if let Some(name) = csharp_attribute_name_node(node) {
+        let names = csharp_attribute_type_names(name, source);
+        let (candidates, ambiguous) = csharp.attribute_type_candidates_with_ambiguity(file, &names);
+        return csharp_type_candidates_resolution_with_kind(
+            names.first().map(String::as_str).unwrap_or_default(),
+            candidates,
+            TypeLookupTargetKind::TypeReference,
+            ambiguous,
+        );
+    }
+
     if node.kind() == "member_access_expression"
         && let Some(receiver) = csharp_member_access_receiver(node)
     {
@@ -254,6 +270,7 @@ fn csharp_type_lookup_node_resolution(
             &reference,
             csharp_visible_type_output_candidates(csharp, definitions, file, &reference),
             TypeLookupTargetKind::TypeReference,
+            false,
         );
     }
 
@@ -426,6 +443,7 @@ fn csharp_type_node_resolution(
         reference,
         csharp_visible_type_output_candidates(csharp, definitions, file, reference),
         TypeLookupTargetKind::ValueExpression,
+        false,
     )
 }
 
@@ -437,6 +455,7 @@ fn csharp_type_candidates_resolution(
         reference,
         candidates,
         TypeLookupTargetKind::ValueExpression,
+        false,
     )
 }
 
@@ -444,6 +463,7 @@ fn csharp_type_candidates_resolution_with_kind(
     reference: &str,
     candidates: Vec<CodeUnit>,
     target_kind: TypeLookupTargetKind,
+    ambiguous: bool,
 ) -> Option<CSharpTypeLookupResolution> {
     if candidates.is_empty() {
         return None;
@@ -457,6 +477,7 @@ fn csharp_type_candidates_resolution_with_kind(
         fqn,
         candidates,
         target_kind,
+        ambiguous,
     })
 }
 
@@ -633,6 +654,7 @@ pub(super) fn parse_csharp_tree(source: &str) -> Option<Tree> {
 }
 
 enum CSharpReferenceNode<'tree> {
+    Attribute(Node<'tree>),
     Type(Node<'tree>),
     Constructor(Node<'tree>),
     Member {
@@ -644,6 +666,10 @@ enum CSharpReferenceNode<'tree> {
 }
 
 fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
+    if let Some(name) = csharp_attribute_name_node(node) {
+        return Some(CSharpReferenceNode::Attribute(name));
+    }
+
     let original = node;
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -785,6 +811,76 @@ fn csharp_type_outcome(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed C# type"),
     )
+}
+
+fn csharp_attribute_outcome(
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    name: Node<'_>,
+    source: &str,
+) -> DefinitionLookupOutcome {
+    let names = csharp_attribute_type_names(name, source);
+    let (candidates, ambiguous_spelling) =
+        csharp.attribute_type_candidates_with_ambiguity(file, &names);
+    if !candidates.is_empty() {
+        let mut outcome = candidates_outcome(candidates);
+        if ambiguous_spelling {
+            outcome.status = DefinitionLookupStatus::Ambiguous;
+            outcome.diagnostics = vec![DefinitionLookupDiagnostic {
+                kind: "ambiguous_definition".to_string(),
+                message: "C# attribute name has multiple successful type-name spellings"
+                    .to_string(),
+            }];
+        }
+        return outcome;
+    }
+    if csharp_attribute_alias_boundary(csharp, definitions, file, name, source)
+        || names
+            .iter()
+            .any(|name| csharp_import_boundary_for_type(csharp, definitions, file, name))
+    {
+        let reference = names.first().map(String::as_str).unwrap_or_default();
+        return boundary(format!(
+            "`{reference}` appears to cross a C# using boundary not indexed in this workspace"
+        ));
+    }
+    let reference = names.first().map(String::as_str).unwrap_or_default();
+    no_definition(
+        "no_indexed_definition",
+        format!("`{reference}` did not resolve to an indexed C# attribute type"),
+    )
+}
+
+fn csharp_attribute_alias_boundary(
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    name: Node<'_>,
+    source: &str,
+) -> bool {
+    let mut stack = vec![name];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "alias_qualified_name" {
+            let Some(alias) = current
+                .child_by_field_name("alias")
+                .or_else(|| current.child_by_field_name("qualifier"))
+                .or_else(|| current.named_child(0))
+            else {
+                return false;
+            };
+            let alias = csharp_node_text(alias, source);
+            return csharp
+                .using_aliases_of(file)
+                .get(alias)
+                .is_some_and(|target| {
+                    !definitions.type_exists(target) && !definitions.package_exists(target)
+                });
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
 }
 
 fn csharp_member_outcome(

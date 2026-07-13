@@ -27,7 +27,8 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_normalize_full_name,
+    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_type_names,
+    csharp_normalize_full_name,
 };
 use crate::hash::HashSet;
 use tree_sitter::Node;
@@ -136,6 +137,18 @@ fn record_reference(
     bindings: &LocalInferenceEngine<String>,
 ) {
     match node.kind() {
+        "attribute" => {
+            let Some(name) = node.child_by_field_name("name") else {
+                return;
+            };
+            let names = csharp_attribute_type_names(name, ctx.source);
+            for candidate in ctx
+                .csharp
+                .unambiguous_attribute_type_candidates(ctx.file, &names)
+            {
+                ctx.record(candidate.fq_name(), name);
+            }
+        }
         // A type reference (`Foo x`, `new Foo()`, generics) resolves to the type
         // node. `new Foo()`'s type child is itself a type reference, so it is
         // covered here without a separate object-creation case.

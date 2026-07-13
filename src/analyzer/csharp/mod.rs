@@ -409,6 +409,15 @@ pub(crate) fn csharp_source_name_segment(segment: &str) -> &str {
 }
 
 pub(crate) fn csharp_type_node_identity(node: Node<'_>, source: &str) -> String {
+    csharp_type_node_identity_with_terminal_suffix(node, source, "", false)
+}
+
+fn csharp_type_node_identity_with_terminal_suffix(
+    node: Node<'_>,
+    source: &str,
+    terminal_suffix: &str,
+    strip_terminal_verbatim_prefix: bool,
+) -> String {
     let mut segments = Vec::new();
     let mut stack = vec![node];
     let mut alias_qualified = false;
@@ -485,11 +494,78 @@ pub(crate) fn csharp_type_node_identity(node: Node<'_>, source: &str) -> String 
             }
         }
     }
+    if let Some(terminal) = segments.last_mut() {
+        if strip_terminal_verbatim_prefix && terminal.starts_with('@') {
+            terminal.remove(0);
+        }
+        terminal.push_str(terminal_suffix);
+    }
     if alias_qualified && segments.len() > 1 {
         format!("{}::{}", segments[0], segments[1..].join("."))
     } else {
         segments.join(".")
     }
+}
+
+/// Return the structured name node when `node` is inside a C# attribute's name.
+/// Identifiers in an attribute argument deliberately do not count.
+pub(crate) fn csharp_attribute_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let mut current = node;
+    loop {
+        if current.kind() == "attribute" {
+            return current
+                .child_by_field_name("name")
+                .filter(|name| name.start_byte() <= start && end <= name.end_byte());
+        }
+        current = current.parent()?;
+    }
+}
+
+/// C# attribute lookup considers both the written type name and the same name
+/// with `Attribute` appended to its terminal AST segment. A verbatim identifier
+/// suppresses the suffix form.
+pub(crate) fn csharp_attribute_type_names(name: Node<'_>, source: &str) -> Vec<String> {
+    let exact = csharp_type_node_identity_with_terminal_suffix(name, source, "", true);
+    if exact.is_empty() {
+        return Vec::new();
+    }
+
+    let verbatim = csharp_attribute_terminal_name(name, source)
+        .is_some_and(|terminal| terminal.starts_with('@'));
+    if verbatim {
+        return vec![exact];
+    }
+
+    let suffixed = csharp_type_node_identity_with_terminal_suffix(name, source, "Attribute", false);
+    if suffixed == exact {
+        vec![exact]
+    } else {
+        vec![exact, suffixed]
+    }
+}
+
+pub(crate) fn csharp_attribute_terminal_name<'a>(
+    name: Node<'_>,
+    source: &'a str,
+) -> Option<&'a str> {
+    let mut terminal = name;
+    while let Some(next) = match terminal.kind() {
+        "qualified_name" | "alias_qualified_name" => terminal
+            .child_by_field_name("name")
+            .or_else(|| terminal.named_child(terminal.named_child_count().saturating_sub(1))),
+        "generic_name" => terminal
+            .child_by_field_name("name")
+            .or_else(|| terminal.named_child(0)),
+        _ => None,
+    } {
+        terminal = next;
+    }
+    source
+        .get(terminal.start_byte()..terminal.end_byte())
+        .map(str::trim)
+        .filter(|terminal| !terminal.is_empty())
 }
 
 pub(crate) fn csharp_signature_arity(signature: Option<&str>) -> usize {

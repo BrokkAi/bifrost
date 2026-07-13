@@ -34,7 +34,8 @@ pub(super) fn resolve_csharp_type(
             fqn,
             candidates,
             target_kind,
-        } => csharp_candidates_outcome(csharp, fqn, candidates, target_kind),
+            ambiguous,
+        } => csharp_candidates_outcome(csharp, fqn, candidates, target_kind, ambiguous),
         CSharpTypeLookupResolution::InappropriateSymbolContext => no_type(
             "inappropriate_symbol_context",
             format!(
@@ -50,12 +51,13 @@ fn csharp_candidates_outcome(
     fqn: String,
     mut candidates: Vec<CodeUnit>,
     target_kind: crate::analyzer::usages::target_kind::TypeLookupTargetKind,
+    ambiguous: bool,
 ) -> TypeLookupOutcome {
     candidates = csharp_expand_logical_type_parts(csharp, candidates);
     sort_units(&mut candidates);
     candidates.dedup();
     let logical_type_count = csharp.logical_type_count(&candidates);
-    let status = if logical_type_count <= 1 {
+    let status = if !ambiguous && logical_type_count <= 1 {
         TypeLookupStatus::Resolved
     } else {
         TypeLookupStatus::Ambiguous

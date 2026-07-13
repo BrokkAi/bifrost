@@ -109,19 +109,35 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
                 ]
             })
             .collect();
-        if self
-            .inner
-            .type_identifiers_of(source_file)
-            .is_some_and(|identifiers| {
-                identifiers
-                    .iter()
-                    .any(|identifier| target_names.contains(identifier))
-            })
-        {
-            return true;
+        let source_aliases = self.using_aliases_of(source_file);
+        if let Some(identifiers) = self.inner.type_identifiers_of(source_file) {
+            for identifier in identifiers {
+                if target_names.contains(&identifier) {
+                    return true;
+                }
+                if identifier
+                    .strip_prefix("global::")
+                    .is_some_and(|global_name| target_names.contains(global_name))
+                {
+                    return true;
+                }
+                let uses_namespace_alias = source_aliases.keys().any(|alias| {
+                    identifier
+                        .strip_prefix(alias)
+                        .is_some_and(|suffix| suffix.starts_with("::"))
+                });
+                if uses_namespace_alias {
+                    let candidates = self.visible_type_candidates(source_file, &identifier);
+                    if target_classes
+                        .iter()
+                        .any(|target| candidates.contains(target))
+                    {
+                        return true;
+                    }
+                }
+            }
         }
         let source_imports = self.using_namespaces_of(source_file);
-        let source_aliases = self.using_aliases_of(source_file);
         imports
             .iter()
             .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
@@ -194,6 +210,17 @@ impl CSharpAnalyzer {
                     }
                     if let Some(fq_targets) = by_fq_name.get(&identifier) {
                         resolved_targets.extend(fq_targets.iter().cloned());
+                    }
+                    // Attribute names can be structurally alias-qualified or
+                    // `global::` qualified. Resolve only those uncommon persisted
+                    // identities through the normal C# visible-type resolver so
+                    // default candidate routing agrees with authoritative scanning.
+                    if identifier.contains("::") {
+                        resolved_targets.extend(
+                            self.visible_type_candidates(candidate, &identifier)
+                                .into_iter()
+                                .map(|unit| unit.source().clone()),
+                        );
                     }
                 }
                 resolved_targets

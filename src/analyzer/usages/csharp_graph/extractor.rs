@@ -12,7 +12,10 @@ use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{
+    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_terminal_name,
+    csharp_attribute_type_names,
+};
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
@@ -113,6 +116,10 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "attribute" {
+        scan_attribute_reference(node, ctx);
+        return;
+    }
     if !matches!(node.kind(), "identifier" | "type") || is_declaration_name(node) {
         return;
     }
@@ -133,6 +140,35 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let reference = reference_type_text(reference_node, ctx.source);
     if type_reference_resolves_to_target(node, ctx, &reference) {
         push_hit(reference_node, ctx);
+    }
+}
+
+fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let Some(raw_terminal) = csharp_attribute_terminal_name(name, ctx.source) else {
+        return;
+    };
+    let terminal = raw_terminal.strip_prefix('@').unwrap_or(raw_terminal);
+    let target_name = ctx.spec.member_name.as_str();
+    let exact_or_shorthand = terminal == target_name
+        || target_name
+            .strip_suffix("Attribute")
+            .is_some_and(|stem| stem == terminal);
+    let aliases = ctx.csharp.using_aliases_of(ctx.file);
+    let alias = aliases.contains_key(raw_terminal) || aliases.contains_key(terminal);
+    if !exact_or_shorthand && !alias {
+        return;
+    }
+    let names = csharp_attribute_type_names(name, ctx.source);
+    if ctx
+        .csharp
+        .unambiguous_attribute_type_candidates(ctx.file, &names)
+        .into_iter()
+        .any(|candidate| type_identity_matches(&candidate.fq_name(), &ctx.spec.target.fq_name()))
+    {
+        push_hit(name, ctx);
     }
 }
 
