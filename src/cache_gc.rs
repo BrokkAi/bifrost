@@ -157,8 +157,8 @@ fn sweep_with_claim(
 fn live_bloom(repo: &Repository) -> Result<GrowableBloom, String> {
     let mut live = gitblob::reachable_bloom(repo)?;
     for root in gitblob::worktree_roots(repo)? {
-        if let Ok(dirty) = gitblob::uncommitted_oids(&root) {
-            for oid in dirty {
+        if let Ok(working_tree) = gitblob::existing_working_tree_oids(&root) {
+            for oid in working_tree {
                 live.insert(oid);
             }
         }
