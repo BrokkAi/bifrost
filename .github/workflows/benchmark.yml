@@ -14,9 +14,9 @@ on:
         required: false
         type: string
       strict_compare:
-        description: 'Fail the workflow if compare detects regressions'
+        description: 'Fail on actionable regressions; disable only for exploratory runs'
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -31,6 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SLACK_DAILY_PERF_WEBHOOK_URL: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}
+      BENCHMARK_REPO: ${{ inputs.repo || '' }}
+      BENCHMARK_MAX_FILES: ${{ inputs.max_files || '' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -65,11 +67,11 @@ jobs:
           set -euo pipefail
           mkdir -p benchmark/benchmark-output
           args=(run --manifest benchmark/targets.toml --output benchmark-output)
-          if [ -n "${{ inputs.repo || '' }}" ]; then
-            args+=(--repo "${{ inputs.repo }}")
+          if [ -n "$BENCHMARK_REPO" ]; then
+            args+=(--repo "$BENCHMARK_REPO")
           fi
-          if [ -n "${{ inputs.max_files || '' }}" ]; then
-            args+=(--max-files "${{ inputs.max_files }}")
+          if [ -n "$BENCHMARK_MAX_FILES" ]; then
+            args+=(--max-files "$BENCHMARK_MAX_FILES")
           fi
           BIFROST_BENCHMARK_BIFROST_BIN=./target/debug/bifrost \
             ./target/debug/bifrost_benchmark "${args[@]}"
@@ -88,6 +90,11 @@ jobs:
           echo "baseline_path=benchmark/baselines/ubuntu-latest.json" >> "$GITHUB_OUTPUT"
           echo "compare_path=benchmark/benchmark-output/compare-${GITHUB_RUN_ID}.json" >> "$GITHUB_OUTPUT"
           echo "compare_summary_path=benchmark/benchmark-output/compare-summary.txt" >> "$GITHUB_OUTPUT"
+          effective_strict_compare="true"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            effective_strict_compare="${{ inputs.strict_compare }}"
+          fi
+          echo "effective_strict_compare=${effective_strict_compare}" >> "$GITHUB_OUTPUT"
 
       - name: Compare against blessed baseline
         id: compare
@@ -102,7 +109,7 @@ jobs:
             --candidate "${{ steps.paths.outputs.report_path }}"
             --output "${{ steps.paths.outputs.compare_path }}"
           )
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.strict_compare }}" = "true" ]; then
+          if [ "${{ steps.paths.outputs.effective_strict_compare }}" = "true" ]; then
             args+=(--strict)
           fi
           ./target/debug/bifrost_benchmark "${args[@]}" | tee "${{ steps.paths.outputs.compare_summary_path }}"
@@ -219,10 +226,7 @@ jobs:
             summary_text="$(cat "$compare_summary_path")"
           fi
 
-          strict_compare="false"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.strict_compare || false }}" = "true" ]; then
-            strict_compare="true"
-          fi
+          strict_compare="${{ steps.paths.outputs.effective_strict_compare }}"
 
           ok="true"
           error_text=""
@@ -249,8 +253,8 @@ jobs:
               --arg head_sha_short "$head_sha_short" \
               --arg base_sha_short "$base_sha_short" \
               --arg event_name "${{ github.event_name }}" \
-              --arg repo_input "${{ inputs.repo || '' }}" \
-              --arg max_files_input "${{ inputs.max_files || '' }}" \
+              --arg repo_input "$BENCHMARK_REPO" \
+              --arg max_files_input "$BENCHMARK_MAX_FILES" \
               --arg run_outcome "$run_outcome" \
               --arg compare_outcome "$compare_outcome" \
               --arg report_path "$report_path" \
