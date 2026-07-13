@@ -1004,7 +1004,11 @@ fn ts_local_barrel_reexport_is_followed() {
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
     );
 
-    assert_eq!(1, hits.len());
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected the barrel and consumer references: {hits:?}"
+    );
 }
 
 #[test]
@@ -1034,7 +1038,78 @@ fn ts_chained_local_barrel_reexport_is_followed() {
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
     );
 
-    assert_eq!(1, hits.len());
+    assert_eq!(
+        3,
+        hits.len(),
+        "expected both barrel references and the consumer reference: {hits:?}"
+    );
+}
+
+#[test]
+fn ts_export_specifier_value_references_are_reported_without_aliases() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("source.ts", "export class SuccessCorpus {}\n")
+            .file(
+                "local-exports.ts",
+                r#"
+import { SuccessCorpus } from "./source";
+
+export { SuccessCorpus };
+export { type SuccessCorpus };
+export type { SuccessCorpus as TypeSuccessCorpus };
+export { SuccessCorpus as default };
+export { SuccessCorpus as RenamedSuccessCorpus };
+"#,
+            )
+            .file(
+                "cross-file-export.ts",
+                "export type { SuccessCorpus as CrossFileSuccessCorpus } from \"./source\";\n",
+            )
+            .file(
+                "unrelated.ts",
+                r#"
+class UnrelatedSuccessCorpus {}
+export { UnrelatedSuccessCorpus as SuccessCorpus };
+"#,
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("source.ts"), |cu| {
+        cu.identifier() == "SuccessCorpus" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(6, hits.len(), "expected one hit per export value: {hits:?}");
+    assert!(
+        hits.iter()
+            .filter(|hit| hit.file == project.file("local-exports.ts"))
+            .count()
+            == 5,
+        "local named, type, default, and renamed export values should resolve: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("cross-file-export.ts")),
+        "cross-file type re-export should resolve to the source declaration: {hits:?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            let source = hit.file.read_to_string().expect("read hit source");
+            source
+                .get(hit.start_offset..hit.end_offset)
+                .is_some_and(|text| text == "SuccessCorpus")
+        }),
+        "only export-specifier value names, never aliases, should be reported: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("unrelated.ts")),
+        "an unrelated export alias must not count as a SuccessCorpus reference: {hits:?}"
+    );
 }
 
 #[test]
@@ -1542,6 +1617,69 @@ fn ts_interface_property_usages_include_typed_reads_and_contextual_return_keys()
     assert!(
         other_hits.is_empty(),
         "unrelated same-name interface property must not match: {other_hits:?}"
+    );
+}
+
+#[test]
+fn ts_interface_property_usages_include_typed_iterable_and_receiver_destructuring_labels() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "api.ts",
+            "export interface SyncSourceEntry { source: string; }\nexport interface OtherEntry { source: string; }\n",
+        )
+        .file(
+            "app.ts",
+            "import { SyncSourceEntry, OtherEntry } from './api';\nfunction collect(entries: Array<SyncSourceEntry>) {\n  for (const { source } of entries) {\n    consume(source);\n  }\n}\nfunction collectRenamed(entries: SyncSourceEntry[]) {\n  for (const { source: sourceValue } of entries) {\n    consume(sourceValue);\n  }\n}\nfunction collectSet(entries: Set<SyncSourceEntry>) {\n  for (const { source: setSource } of entries) {\n    consume(setSource);\n  }\n}\nfunction collectIterable(entries: Iterable<SyncSourceEntry>) {\n  for (const { source: iterableSource } of entries) {\n    consume(iterableSource);\n  }\n}\nfunction direct(entry: SyncSourceEntry) {\n  const { source: directSource } = entry;\n  consume(directSource);\n}\nfunction forIn(entry: SyncSourceEntry) {\n  for (const { source } in entry) {\n    consume(source);\n  }\n}\nfunction unrelated(entries: OtherEntry[]) {\n  for (const { source } of entries) {\n    consume(source);\n  }\n}\ndeclare function consume(value: string): void;\n",
+        )
+        .build()
+    });
+
+    let source = find_ts_target(&analyzer, &project.file("api.ts"), |cu| {
+        cu.fq_name() == "SyncSourceEntry.source" && cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&source)),
+    );
+
+    let app_hits: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.file == project.file("app.ts"))
+        .collect();
+    assert_eq!(
+        5,
+        app_hits.len(),
+        "SyncSourceEntry.source hits: {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source }")),
+        "expected shorthand destructuring label, got {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source: sourceValue }")),
+        "expected renamed destructuring label, got {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source: directSource }")),
+        "expected typed receiver destructuring label, got {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source: setSource }")),
+        "expected Set element destructuring label, got {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source: iterableSource }")),
+        "expected Iterable element destructuring label, got {app_hits:?}"
     );
 }
 

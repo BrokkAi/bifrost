@@ -588,7 +588,11 @@ fn query_code_tool_returns_structural_matches() {
     let payload: Value = serde_json::from_slice(&output.stdout).expect("query_code JSON output");
     assert_eq!(payload["isError"], false, "{payload}");
     assert_eq!(
-        payload["structuredContent"]["matches"][0]["kind"], "class",
+        payload["structuredContent"]["results"][0]["kind"], "class",
+        "{payload}"
+    );
+    assert_eq!(
+        payload["structuredContent"]["results"][0]["result_type"], "structural_match",
         "{payload}"
     );
 }
@@ -599,7 +603,7 @@ fn query_file_runs_rql_from_the_current_workspace() {
     fs::write(root.path().join("app.py"), "class App:\n    pass\n").expect("source file");
     let queries = root.path().join("queries");
     fs::create_dir(&queries).expect("query directory");
-    fs::write(queries.join("app.rql"), "(class :name \"App\")\n").expect("RQL query");
+    fs::write(queries.join("app.rql"), "(file-of (class :name \"App\"))\n").expect("RQL query");
 
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .current_dir(root.path())
@@ -616,7 +620,11 @@ fn query_file_runs_rql_from_the_current_workspace() {
     let payload: Value = serde_json::from_slice(&output.stdout).expect("query-file JSON output");
     assert_eq!(payload["isError"], false, "{payload}");
     assert_eq!(
-        payload["structuredContent"]["matches"][0]["kind"], "class",
+        payload["structuredContent"]["results"][0]["result_type"], "file",
+        "{payload}"
+    );
+    assert_eq!(
+        payload["structuredContent"]["results"][0]["path"], "app.py",
         "{payload}"
     );
 }
@@ -649,7 +657,7 @@ fn query_file_runs_json_with_an_explicit_root() {
     let payload: Value = serde_json::from_slice(&output.stdout).expect("query-file JSON output");
     assert_eq!(payload["isError"], false, "{payload}");
     assert_eq!(
-        payload["structuredContent"]["matches"][0]["path"], "app.py",
+        payload["structuredContent"]["results"][0]["path"], "app.py",
         "{payload}"
     );
 }
@@ -749,7 +757,8 @@ fn query_code_help_includes_boundary_example_and_guide() {
         stdout.contains("query_code  (toolset: extended)"),
         "{stdout}"
     );
-    assert!(stdout.contains("does not traverse call graphs"), "{stdout}");
+    assert!(stdout.contains("typed semantic steps"), "{stdout}");
+    assert!(stdout.contains("imports_of"), "{stdout}");
     assert!(stdout.contains(r#"{"match":{"kind":"call""#), "{stdout}");
     assert!(!stdout.contains("search_ast"), "{stdout}");
     assert!(

@@ -94,7 +94,7 @@ test("registers Bifrost RQL as a distinct .rql language", () => {
   ]);
   assert.deepEqual(manifest.contributes.menus.commandPalette, [
     { command: "bifrost.runRqlQuery", when: "false" },
-    { command: "bifrost.openRqlQueryMatch", when: "false" }
+    { command: "bifrost.openRqlQueryResult", when: "false" }
   ]);
   assert.deepEqual(manifest.contributes.views.explorer, [
     { id: "bifrost.queryResults", name: "Bifrost Query Results" }

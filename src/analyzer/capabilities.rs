@@ -70,6 +70,27 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
     }
 }
 
+/// Resolve direct project-file edges from structured import facts. Prefer a
+/// provider's file-level resolver so imports whose target has no declarations
+/// remain visible; otherwise conservatively project resolved declaration
+/// identities back to their source files.
+pub(crate) fn resolve_imported_files_from_infos(
+    provider: &dyn ImportAnalysisProvider,
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+) -> HashSet<ProjectFile> {
+    provider
+        .imported_files_from_infos(file, imports)
+        .unwrap_or_else(|| {
+            provider
+                .imported_code_units_from_infos(file, imports)
+                .unwrap_or_else(|| provider.imported_code_units_of(file))
+                .into_iter()
+                .map(|unit| unit.source().clone())
+                .collect()
+        })
+}
+
 pub(crate) fn build_reverse_import_index<F>(
     files: &[ProjectFile],
     resolve_imported: F,

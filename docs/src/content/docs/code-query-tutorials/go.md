@@ -3,7 +3,7 @@ title: Go
 description: Query Go selector calls, multi-value assignments, imports, methods, and capability diagnostics with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 Go normalizes selector calls, functions and methods, type declarations and aliases, function literals, grouped imports, multi-value assignments, returns, conditionals, and loops. It does not model keyword arguments or decorators.
 
@@ -75,8 +75,9 @@ Both services call `Send`. `not_has` removes the call containing the literal `"b
 <!-- code-query-case:foreground-send:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "go/app.go",
       "language": "go",
       "kind": "call",
@@ -119,8 +120,9 @@ Go attaches repeated structured left and right targets. This query selects the a
 <!-- code-query-case:load-assignment:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "go/app.go",
       "language": "go",
       "kind": "assignment",
@@ -155,8 +157,9 @@ The module role is the imported path, not the local alias used by later Go expre
 <!-- code-query-case:import-path:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "go/app.go",
       "language": "go",
       "kind": "import",
@@ -183,7 +186,7 @@ The module role is the imported path, not the local alias used by later Go expre
 
 <!-- code-query-case:unsupported-kwargs:expected -->
 ```json
-{"matches":[],"truncated":false,"diagnostics":[{"language":"go","message":"structural adapter for go does not support role(s): kwargs"}]}
+{"results":[],"truncated":false,"diagnostics":[{"language":"go","message":"structural adapter for go does not support role(s): kwargs"}]}
 ```
 
 <!-- code-query-case:unsupported-decorators:rql -->
@@ -198,7 +201,7 @@ The module role is the imported path, not the local alias used by later Go expre
 
 <!-- code-query-case:unsupported-decorators:expected -->
 ```json
-{"matches":[],"truncated":false,"diagnostics":[{"language":"go","message":"structural adapter for go does not support role(s): decorators"}]}
+{"results":[],"truncated":false,"diagnostics":[{"language":"go","message":"structural adapter for go does not support role(s): decorators"}]}
 ```
 
 ## Precision Boundary

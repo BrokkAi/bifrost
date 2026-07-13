@@ -1,6 +1,6 @@
 ---
 title: RQL in VS Code
-description: Run Rune Query Language files from VS Code and navigate their structural matches.
+description: Run Rune Query Language files from VS Code and navigate typed query results.
 ---
 
 The Bifrost VS Code extension recognizes `.rql` files as **Bifrost RQL**. RQL,
@@ -17,8 +17,11 @@ the active LSP session, so you can refine a query without first saving it.
     (function :name "handle_run_rql_query_request")))
 ```
 
-The **Bifrost Query Results** Explorer view groups matches by file. Select a
-match to open its file and highlight the matched source range.
+The **Bifrost Query Results** Explorer view groups tagged structural-match,
+declaration, and file results by path. Select a structural match or declaration
+to open its file and highlight the source range; selecting a file result opens
+the file at its first line. Pipeline wrappers such as `enclosing-decl` and
+`file-of` therefore remain navigable from the same view.
 
 ![An RQL query in VS Code, grouped query results in Explorer, and the selected Rust match.](/images/rql-vscode-query-results.png)
 

@@ -58,6 +58,20 @@ impl ImportAnalysisProvider for GoAnalyzer {
         self.inner.import_info_of(file)
     }
 
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        Some(
+            imports
+                .iter()
+                .filter_map(|import| extract_go_import_path(&import.raw_snippet))
+                .flat_map(|path| self.direct_import_files(file, &path))
+                .collect(),
+        )
+    }
+
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let source = self.inner.get_source(code_unit, false).unwrap_or_default();
         let mut relevant = HashSet::default();
@@ -200,6 +214,29 @@ impl GoAnalyzer {
             }
         }
         matching
+    }
+
+    fn direct_import_files(
+        &self,
+        source_file: &ProjectFile,
+        import_path: &str,
+    ) -> Vec<ProjectFile> {
+        let resolved = self.matching_import_files(source_file, import_path);
+        if !resolved.is_empty() {
+            return resolved;
+        }
+
+        let directories: HashSet<_> = self
+            .workspace_path_index()
+            .import_files(source_file, import_path)
+            .into_iter()
+            .map(|file| file.parent())
+            .collect();
+        self.inner
+            .all_files()
+            .into_iter()
+            .filter(|file| file != source_file && directories.contains(&file.parent()))
+            .collect()
     }
 
     fn package_files(&self) -> &HashMap<String, Arc<Vec<ProjectFile>>> {

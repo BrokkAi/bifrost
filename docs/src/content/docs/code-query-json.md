@@ -5,14 +5,14 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-Version 1 queries normalized syntactic structure. It does not traverse the call graph, resolve types or aliases, or perform control-flow or data-flow analysis. Those are possible future query facets, not fields accepted by the current schema.
+Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations and direct project import edges. It does not yet traverse call graphs, resolve arbitrary types or aliases, or perform control-flow or data-flow analysis.
 
 ## Minimal Query
 
 <!-- code-query-test:json:minimal-call -->
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "match": {
     "kind": "call",
     "callee": {
@@ -28,13 +28,14 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Omit it for version 1 or pass `1` explicitly. Other versions are rejected. |
+| `schema_version` | integer | Optional. Omit it for version 2 or pass `2` explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
 | `inside` | pattern | Require the root match to be lexically inside a matching ancestor. |
 | `not_inside` | pattern | Reject the root match when a matching ancestor exists. |
-| `limit` | integer | Maximum returned matches. Defaults to `100`; valid range is `1` through `1000`. |
+| `steps` | step array | Ordered typed transformations applied after structural matching. At most `16`. |
+| `limit` | integer | Maximum terminal results after pipeline deduplication. Defaults to `100`; valid range is `1` through `1000`. |
 | `result_detail` | string | `compact` by default or `full` for stable IDs and precise ranges. |
 
 Unknown fields are rejected rather than ignored.
@@ -121,7 +122,7 @@ Roles are normalized edges from one structural fact to a related node or source 
 | `decorators` | list | callable or class-like declarations | Decorators, annotations, or attributes. |
 | `object`, `field` | one each | `field_access` | Object and terminal field sides of member access. |
 
-Each `args` pattern must match a distinct positional argument in source order, but the matches need not be contiguous and do not assert exact arity. For exact positions or arity, narrow the surrounding source shape in a follow-up query; version 1 has no positional-index operator.
+Each `args` pattern must match a distinct positional argument in source order, but the matches need not be contiguous and do not assert exact arity. For exact positions or arity, narrow the surrounding source shape in a follow-up query; version 2 has no positional-index operator.
 
 `kwargs` support is adapter-specific. Python, PHP, Scala, C#, and Ruby expose normalized named arguments; languages without that role return a capability diagnostic.
 
@@ -131,7 +132,7 @@ Each `args` pattern must match a distinct positional argument in source order, b
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-Each result also includes the matched path, language, kind, line range, a bounded text snippet, and a best-effort `enclosing_symbol`. `enclosing_symbol` describes the root match's nearest indexed declaration; it is not another implicit capture.
+The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
 
 With `result_detail: "full"`, results additionally include:
 
@@ -140,6 +141,31 @@ With `result_detail: "full"`, results additionally include:
 - capture ranges and kinds
 - `decorator_ranges` for matched declarations
 - `decorated_range`, the union of the declaration and its decorators
+
+Derived declaration and file results include `provenance`. Each provenance path records the original structural seed and every ordered step result. Compact mode keeps minimal identities; full mode adds stable IDs and precise ranges. At most sixteen paths are retained per terminal result, with `provenance_truncated: true` when more paths converge.
+
+## Typed Pipeline Steps
+
+Steps execute in array order and are validated before the workspace is searched:
+
+| Operation | Input | Output | Meaning |
+| --- | --- | --- | --- |
+| `enclosing_decl` | structural match | declaration | Smallest non-synthetic indexed declaration containing the exact match range, inclusive of a matched declaration itself. |
+| `file_of` | structural match or declaration | file | Exact project file containing the value. |
+| `imports_of` | file | file | Direct project-local files imported by the input file. |
+| `importers_of` | file | file | Direct project-local files importing the input file. |
+
+Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
+
+```json
+{
+  "match": {"kind": "function", "name": "handle"},
+  "steps": [
+    {"op": "file_of"},
+    {"op": "imports_of"}
+  ]
+}
+```
 
 ## Containment And Descendants
 
@@ -304,7 +330,7 @@ That diagnostic means the affected language was not searched for that feature; i
 
 ## Limits And Validation Errors
 
-Version 1 enforces these budgets:
+Version 2 enforces these budgets:
 
 | Budget | Maximum |
 | --- | --- |
@@ -318,6 +344,9 @@ Version 1 enforces these budgets:
 | Named arguments | `64`; names at most `128` bytes |
 | Name predicate source (exact or regex) and text regex source | `4096` bytes |
 | Capture label | `128` bytes |
+| Pipeline steps | `16` |
+| Seed and edge rows per execution | `50000` |
+| Provenance paths per terminal result | `16` |
 
 Validation failures carry a JSON path so agents can correct the precise field. For example, this misspelling:
 

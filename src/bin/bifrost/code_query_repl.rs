@@ -1,7 +1,7 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryMatch, CodeQueryResult, Pattern, StringPredicate,
+    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, StringPredicate,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
@@ -508,6 +508,17 @@ fn query_summary_text(query: &CodeQuery) -> String {
     if let Some(pattern) = &query.not_inside {
         parts.push(format!("not inside {}", pattern_summary(pattern)));
     }
+    if !query.steps.is_empty() {
+        parts.push(format!(
+            "steps {}",
+            query
+                .steps
+                .iter()
+                .map(|step| step.label())
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        ));
+    }
     parts.push(format!("limit {}", query.limit));
     parts.push(format!("detail {}", query.result_detail.label()));
     parts.join("; ")
@@ -570,13 +581,54 @@ fn run_query(service: &SearchToolsService, value: &Value, use_color: bool) -> St
 
 fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> String {
     let mut out = String::new();
-    if output.matches.is_empty() {
-        out.push_str("No structural matches.\n");
+    if output.results.is_empty() {
+        out.push_str("No query results.\n");
     } else {
-        out.push_str(&format!("{}\n", output.match_count_line()));
-        for matched in &output.matches {
+        out.push_str(&format!("{}\n", output.result_count_line()));
+        for result in &output.results {
             out.push('\n');
-            render_code_query_match(&mut out, matched, use_color);
+            match &result.value {
+                CodeQueryResultValue::StructuralMatch { value } => {
+                    render_code_query_match(&mut out, value, use_color);
+                }
+                CodeQueryResultValue::Declaration { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let name = sanitize_terminal_text(&value.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}-{}\n  {} {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.start_line,
+                        value.end_line,
+                        paint(Style::new().fg(Color::Blue), "declaration:", use_color),
+                        paint(Style::new().bold(), &name, use_color)
+                    ));
+                }
+                CodeQueryResultValue::File { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}\n  {} {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "language:", use_color),
+                        value.language
+                    ));
+                }
+            }
+            if !result.provenance.is_empty() {
+                out.push_str(&format!(
+                    "  provenance: {} path{}{}\n",
+                    result.provenance.len(),
+                    if result.provenance.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    if result.provenance_truncated {
+                        " (truncated)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
         }
     }
 
@@ -935,7 +987,7 @@ fn balanced_delimiters(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost::analyzer::structural::CodeQueryCapture;
+    use brokk_bifrost::analyzer::structural::{CodeQueryCapture, CodeQueryResultItem};
 
     #[test]
     fn code_query_repl_loads_sexp_with_human_summary() {
@@ -1056,27 +1108,36 @@ mod tests {
 
     #[test]
     fn code_query_repl_renders_query_code_matches_as_multiline_entries() {
+        let matched = CodeQueryMatch {
+            path: "editors/vscode/src/provisioning.ts".to_string(),
+            language: "typescript",
+            kind: "function",
+            start_line: 259,
+            end_line: 269,
+            text:
+                "async function probeBifrostVersion(binaryPath: string): Promise<VersionProbe> {…"
+                    .to_string(),
+            id: None,
+            node_range: None,
+            decorated_range: None,
+            decorator_ranges: Vec::new(),
+            captures: vec![CodeQueryCapture {
+                name: "callee".to_string(),
+                text: "probe".to_string(),
+                start_line: 260,
+                range: None,
+                kind: None,
+            }],
+            enclosing_symbol: Some("probeBifrostVersion".to_string()),
+        };
         let output = render_code_query_repl_output(
             &CodeQueryResult {
-                matches: vec![CodeQueryMatch {
-                    path: "editors/vscode/src/provisioning.ts".to_string(),
-                    language: "typescript",
-                    kind: "function",
-                    start_line: 259,
-                    end_line: 269,
-                    text: "async function probeBifrostVersion(binaryPath: string): Promise<VersionProbe> {…".to_string(),
-                    id: None,
-                    node_range: None,
-                    decorated_range: None,
-                    decorator_ranges: Vec::new(),
-                    captures: vec![CodeQueryCapture {
-                        name: "callee".to_string(),
-                        text: "probe".to_string(),
-                        start_line: 260,
-                        range: None,
-                        kind: None,
-                    }],
-                    enclosing_symbol: Some("probeBifrostVersion".to_string()),
+                results: vec![CodeQueryResultItem {
+                    value: CodeQueryResultValue::StructuralMatch {
+                        value: matched.clone(),
+                    },
+                    provenance: Vec::new(),
+                    provenance_truncated: false,
                 }],
                 truncated: false,
                 diagnostics: Vec::new(),
@@ -1084,7 +1145,7 @@ mod tests {
             false,
         );
 
-        assert!(output.contains("1 match"), "{output}");
+        assert!(output.contains("1 result"), "{output}");
         assert!(
             output.contains("editors/vscode/src/provisioning.ts:259-269"),
             "{output}"
@@ -1103,21 +1164,28 @@ mod tests {
 
     #[test]
     fn code_query_repl_sanitizes_terminal_control_sequences() {
+        let matched = CodeQueryMatch {
+            path: "src/\u{1b}]52;c;secret\u{07}.rs".to_string(),
+            language: "rust",
+            kind: "function",
+            start_line: 1,
+            end_line: 1,
+            text: "fn demo() {}\u{1b}[2J".to_string(),
+            id: None,
+            node_range: None,
+            decorated_range: None,
+            decorator_ranges: Vec::new(),
+            captures: Vec::new(),
+            enclosing_symbol: None,
+        };
         let output = render_code_query_repl_output(
             &CodeQueryResult {
-                matches: vec![CodeQueryMatch {
-                    path: "src/\u{1b}]52;c;secret\u{07}.rs".to_string(),
-                    language: "rust",
-                    kind: "function",
-                    start_line: 1,
-                    end_line: 1,
-                    text: "fn demo() {}\u{1b}[2J".to_string(),
-                    id: None,
-                    node_range: None,
-                    decorated_range: None,
-                    decorator_ranges: Vec::new(),
-                    captures: Vec::new(),
-                    enclosing_symbol: None,
+                results: vec![CodeQueryResultItem {
+                    value: CodeQueryResultValue::StructuralMatch {
+                        value: matched.clone(),
+                    },
+                    provenance: Vec::new(),
+                    provenance_truncated: false,
                 }],
                 truncated: false,
                 diagnostics: Vec::new(),

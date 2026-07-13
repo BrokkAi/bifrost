@@ -526,6 +526,7 @@ fn forward_resolve_sites(
     summary: &mut ReferenceDifferentialSummary,
     file_errors: &mut Vec<ReferenceDifferentialFileError>,
 ) -> (Vec<ReferenceDifferentialSite>, Vec<ResolvedSite>) {
+    let _scope = crate::profiling::scope("reference_differential::forward_resolve_sites");
     let mut by_file: BTreeMap<ProjectFile, Vec<SampledSite>> = BTreeMap::new();
     for site in sampled {
         by_file.entry(site.file.clone()).or_default().push(site);

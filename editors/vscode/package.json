@@ -2,9 +2,9 @@
   "name": "bifrost-vscode",
   "displayName": "Bifrost: Multi-Language LSP & MCP Server",
   "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "bifrost": {
-    "binaryVersion": "0.8.0",
+    "binaryVersion": "0.8.1",
     "archiveSha256": {
       "aarch64-pc-windows-msvc": "0b6f39af681ebc554bb5b6352d8c1ff2fae7201c14abe8e3fc91c5f310626d10",
       "aarch64-unknown-linux-gnu": "13afc4f3f4ca38ad145de403c5e5287050ba824400eda5f7fe888d217a6996f3",
@@ -212,8 +212,8 @@
         "icon": "$(play)"
       },
       {
-        "command": "bifrost.openRqlQueryMatch",
-        "title": "Bifrost: Open RQL Query Match"
+        "command": "bifrost.openRqlQueryResult",
+        "title": "Bifrost: Open RQL Query Result"
       }
     ],
     "views": {
@@ -227,7 +227,7 @@
     "viewsWelcome": [
       {
         "view": "bifrost.queryResults",
-        "contents": "Run an RQL query from a `.rql` editor to see its matches here."
+        "contents": "Run an RQL query from a `.rql` editor to see its results here."
       }
     ],
     "menus": {
@@ -237,7 +237,7 @@
           "when": "false"
         },
         {
-          "command": "bifrost.openRqlQueryMatch",
+          "command": "bifrost.openRqlQueryResult",
           "when": "false"
         }
       ],

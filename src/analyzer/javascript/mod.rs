@@ -445,6 +445,26 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         self.inner.import_info_of(file)
     }
 
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        Some(
+            imports
+                .iter()
+                .flat_map(|import| {
+                    resolve_js_ts_import_paths(
+                        file,
+                        &import.raw_snippet,
+                        Language::JavaScript,
+                        Some(&self.alias_resolver),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         if let Some(cached) = self.memo_caches.relevant_imports.get(code_unit) {
             return (*cached).clone();

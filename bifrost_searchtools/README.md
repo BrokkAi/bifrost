@@ -62,7 +62,7 @@ exposes:
 | Method | Purpose |
 | --- | --- |
 | `search_symbols(patterns, *, include_tests=False, limit=20)` | Find symbols by name pattern. |
-| `query_code(pattern, *, inside=None, not_inside=None, where=None, languages=None, limit=None, result_detail=None, schema_version=None)` | Query normalized code structure across supported languages. |
+| `query_code(pattern, *, inside=None, not_inside=None, where=None, languages=None, steps=None, limit=None, result_detail=None, schema_version=None)` | Query normalized code structure and apply typed declaration/import steps. |
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
@@ -114,16 +114,13 @@ passed through `options` (keys map 1:1 to the Rust tool arguments).
 
 ## `query_code` detail and ranges
 
-`query_code` is the version-1 normalized structural query surface. Omit
-`schema_version` for v1 or pass `schema_version=1` explicitly when callers want
-to pin the shape. Version 1 is syntactic: it does not traverse call graphs,
-resolve types or aliases, or perform control/data-flow analysis.
-Compact output is the default: matches include project-relative path, language,
-normalized kind, line range, a short snippet, captures, and an enclosing symbol
-when available. Pass `result_detail="full"` when a rule, refactoring step, or
-follow-up tool call needs precise locations. Full detail adds deterministic
-match ids plus 1-based character columns for matches and
-captures.
+`query_code` is the version-2 typed query surface. Omit `schema_version` for v2
+or pass `schema_version=2` explicitly. The structural `pattern` can be followed
+by ordered `steps` using `enclosing_decl`, `file_of`, `imports_of`, and
+`importers_of`. Import operations traverse one direct project-local edge per
+step. Results are tagged as structural matches, declarations, or files.
+Compact output retains minimal pipeline provenance. Pass `result_detail="full"`
+when follow-up tooling needs deterministic IDs and precise ranges.
 
 For decorated or annotated declarations, `node_range` is the matched normalized
 node's parser-backed range. `decorator_ranges` are the decorator or annotation
@@ -146,7 +143,8 @@ is the canonical reference:
 | Imports and aliases | Import matching is based on syntactic module/import spans. It does not resolve aliases or follow re-exports. |
 | Receiver and callee | `callee.name` and `receiver.name` are derived from AST fields and terminal names, not type resolution. Chained calls stay syntactic. |
 | Decorators and annotations | Decorators/annotations are exposed through the `decorators` role. Full detail reports `node_range`, `decorator_ranges`, and `decorated_range`. |
-| Positional arguments | `args` patterns match positional arguments in order as a subsequence; v1 does not require exact positions or arity. |
+| Positional arguments | `args` patterns match positional arguments in order as a subsequence; v2 does not require exact positions or arity. |
+| Typed pipelines | `enclosing_decl` and `file_of` preserve exact indexed identities; import steps follow direct workspace file edges and may be repeated. |
 | Unsupported capabilities | Queries against unsupported normalized kinds or roles return diagnostics instead of silently pretending the language can answer them. |
 
 ## Semantic search

@@ -249,6 +249,16 @@ pub trait IAnalyzer: Send + Sync + Any {
         None
     }
 
+    /// Import provider for one file. Composite analyzers override this to
+    /// distinguish a language with no import capability from a supported
+    /// language whose file simply has no imports.
+    fn import_analysis_provider_for_file(
+        &self,
+        _file: &ProjectFile,
+    ) -> Option<&dyn ImportAnalysisProvider> {
+        self.import_analysis_provider()
+    }
+
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         None
     }

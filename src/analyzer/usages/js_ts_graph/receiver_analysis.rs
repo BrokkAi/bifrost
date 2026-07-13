@@ -72,6 +72,45 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         }
     }
 
+    pub(crate) fn resolve_receiver_node(
+        &self,
+        node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        let _scope = profiling::scope("jsts.receiver_analysis.resolve_receiver_node");
+        let mut tracker = ReceiverAnalysisBudgetTracker::new(budget);
+        self.resolve_expression(node, 0, budget, &mut tracker)
+    }
+
+    pub(crate) fn resolve_iterable_element(
+        &self,
+        node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        if self.language != Language::TypeScript {
+            return ReceiverAnalysisOutcome::Unknown;
+        }
+        let Some(name) = matches!(node.kind(), "identifier" | "type_identifier")
+            .then(|| slice(node, self.source))
+            .filter(|name| !name.is_empty())
+        else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        let mut tracker = ReceiverAnalysisBudgetTracker::new(budget);
+        for scope in lexical_scopes_for_node(node) {
+            if let Some(outcome) = self.latest_iterable_element_binding_in_scope(
+                scope,
+                name,
+                node.start_byte(),
+                budget,
+                &mut tracker,
+            ) {
+                return outcome;
+            }
+        }
+        ReceiverAnalysisOutcome::Unknown
+    }
+
     pub(crate) fn resolve_member_targets(
         &self,
         receiver: Node<'tree>,
@@ -411,6 +450,56 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         ReceiverAnalysisOutcome::Unknown
     }
 
+    fn latest_iterable_element_binding_in_scope(
+        &self,
+        scope: Node<'tree>,
+        receiver: &str,
+        before_byte: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
+        let mut latest = None;
+        let mut stack = vec![scope];
+        while let Some(node) = stack.pop() {
+            if let Err(limit) = tracker.record_scope_node() {
+                return Some(limit.exceeded());
+            }
+            if node.start_byte() >= before_byte {
+                continue;
+            }
+            if node.id() != scope.id() && is_scope_boundary(node.kind()) {
+                continue;
+            }
+            if matches!(node.kind(), "required_parameter" | "optional_parameter")
+                && node
+                    .child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("pattern"))
+                    .is_some_and(|name| node_text_matches(name, self.source, receiver))
+                && let Some(type_node) = node.child_by_field_name("type")
+            {
+                latest = Some(self.iterable_element_type_outcome(type_node, budget));
+            } else if binding_node_shadows_receiver(node, self.source, receiver) {
+                latest = Some(ReceiverAnalysisOutcome::Unknown);
+            } else if node.kind() == "variable_declarator"
+                && let Some(name) = node.child_by_field_name("name")
+                && node_text_matches(name, self.source, receiver)
+            {
+                latest = Some(
+                    node.child_by_field_name("type")
+                        .map(|type_node| self.iterable_element_type_outcome(type_node, budget))
+                        .unwrap_or(ReceiverAnalysisOutcome::Unknown),
+                );
+            }
+
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        latest
+    }
+
     fn latest_identifier_binding_in_scope(
         &self,
         scope: Node<'tree>,
@@ -523,6 +612,21 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         .take(budget.max_targets)
         .map(ReceiverValue::InstanceType)
         .collect()
+    }
+
+    fn iterable_element_type_outcome(
+        &self,
+        type_node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        let values = iterable_element_type(type_node, self.source)
+            .map(|element_type| self.type_annotation_receiver_values(element_type, budget))
+            .unwrap_or_default();
+        if values.is_empty() {
+            ReceiverAnalysisOutcome::Unknown
+        } else {
+            ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
+        }
     }
 
     fn contextual_object_literal_receiver_values(
@@ -1068,6 +1172,38 @@ impl ReceiverFactProvider for JsTsReceiverFactProvider<'_, '_> {
             };
         }
         self.summarize_call_node(node, query.context.byte, 0, query.budget, &mut tracker)
+    }
+}
+
+fn iterable_element_type<'tree>(type_node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut type_node = if type_node.kind() == "type_annotation" {
+        type_node.named_child(0)?
+    } else {
+        type_node
+    };
+    loop {
+        match type_node.kind() {
+            "array_type" => return type_node.named_child(0),
+            "generic_type" => {
+                let name = type_node.child_by_field_name("name")?;
+                if !matches!(
+                    slice(name, source),
+                    "Array"
+                        | "ReadonlyArray"
+                        | "Set"
+                        | "ReadonlySet"
+                        | "Iterable"
+                        | "AsyncIterable"
+                ) {
+                    return None;
+                }
+                return type_node
+                    .child_by_field_name("type_arguments")
+                    .and_then(|arguments| arguments.named_child(0));
+            }
+            "parenthesized_type" | "readonly_type" => type_node = type_node.named_child(0)?,
+            _ => return None,
+        }
     }
 }
 

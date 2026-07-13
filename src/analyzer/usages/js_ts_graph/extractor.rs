@@ -17,10 +17,7 @@ use crate::analyzer::usages::js_ts_graph::resolver::{
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinder, UsageHit};
 use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
-use crate::analyzer::usages::receiver_analysis::{
-    ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverContext,
-    ReceiverFactProvider,
-};
+use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -111,6 +108,16 @@ pub(super) fn scan_files_for_seeds(
             binding_engine.seed_symbol(target_short.clone(), TARGET_BINDING);
         }
 
+        let root = tree_ref.root_node();
+        let receiver_facts = JsTsReceiverFactProvider::new(
+            analyzer,
+            analyzer.definition_lookup_index(),
+            language,
+            file,
+            source_str,
+            root,
+            imports.clone(),
+        );
         let mut scan_ctx = ScanCtx {
             file,
             source: source_str,
@@ -127,8 +134,7 @@ pub(super) fn scan_files_for_seeds(
             target_owner_source: target_owner_source.as_ref(),
             imports,
             aliases,
-            language,
-            root: tree_ref.root_node(),
+            receiver_facts,
             scope_stack: vec![HashMap::default()],
             binding_engine,
             hits: &mut local_hits,
@@ -182,8 +188,7 @@ pub(super) struct ScanCtx<'a> {
     target_owner_source: Option<&'a ProjectFile>,
     imports: ImportBinder,
     aliases: AliasResolver,
-    language: Language,
-    root: Node<'a>,
+    receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -265,12 +270,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // Skip import statements outright — bindings declared there are not usages.
     if matches!(
         kind,
-        "import_statement"
-            | "import_clause"
-            | "import_specifier"
-            | "namespace_import"
-            | "export_clause"
-            | "export_specifier"
+        "import_statement" | "import_clause" | "import_specifier" | "namespace_import"
     ) {
         if kind == "import_statement" {
             handle_import_statement(node, ctx);
@@ -279,6 +279,13 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.scope_stack.pop();
             ctx.binding_engine.exit_scope();
         }
+        return;
+    }
+    // An export specifier's `name` is a value-side reference, whereas its optional
+    // `alias` is a newly declared export name. Handle the former directly rather
+    // than recursively visiting both identifiers.
+    if kind == "export_specifier" {
+        handle_export_specifier(node, ctx);
         return;
     }
     if kind == "expression_statement" && is_commonjs_export_statement(node, ctx.source) {
@@ -294,6 +301,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if kind == "variable_declarator" && !is_commonjs_require_declarator(node, ctx.source) {
         register_local_binding(node, ctx);
         register_declaration(node, ctx);
+    }
+    if kind == "for_in_statement" {
+        register_for_in_destructuring_bindings(node, ctx);
     }
 
     match kind {
@@ -387,7 +397,9 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     if name_node.kind() == "object_pattern" {
         register_pattern_bindings(name_node, ctx);
-        if expression_carries_target_object(value_node, ctx) {
+        if expression_carries_target_object(value_node, ctx)
+            || expression_resolves_to_target_owner(value_node, ctx)
+        {
             seed_target_destructuring_bindings(name_node, ctx);
         }
         return;
@@ -423,6 +435,29 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     ctx.binding_engine.alias_symbol(lhs.to_string(), rhs);
 }
 
+/// Records object-pattern field labels when a typed `for .. of` iterable yields the target owner.
+fn register_for_in_destructuring_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node
+        .child_by_field_name("operator")
+        .is_none_or(|operator| operator.kind() != "of")
+    {
+        return;
+    }
+    let Some(iterable) = node.child_by_field_name("right") else {
+        return;
+    };
+    if !expression_iterates_target_owner(iterable, ctx) {
+        return;
+    }
+    let Some(left) = node.child_by_field_name("left") else {
+        return;
+    };
+    if left.kind() == "object_pattern" {
+        let pattern = left;
+        seed_target_destructuring_bindings(pattern, ctx);
+    }
+}
+
 fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(target_member) = ctx.target_member else {
         return;
@@ -446,10 +481,12 @@ fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) 
             _ => continue,
         };
         if key == target_member && !local.is_empty() {
-            ctx.binding_engine
-                .seed_symbol(local.to_string(), TARGET_VALUE_BINDING);
+            // The pattern key is an immediate field reference. The introduced local is
+            // separately seeded only to carry that field value through later expressions.
             let key_node = property.child_by_field_name("key").unwrap_or(property);
             record_hit(key_node, ctx);
+            ctx.binding_engine
+                .seed_symbol(local.to_string(), TARGET_VALUE_BINDING);
         }
     }
 }
@@ -685,6 +722,21 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     record_hit(node, ctx);
 }
 
+fn handle_export_specifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let exported_name = node.child_by_field_name("alias").unwrap_or(name);
+    let exported_name = slice(exported_name, ctx.source);
+    if ctx.binds_target(slice(name, ctx.source))
+        || ctx
+            .seeds
+            .contains(&(ctx.file.clone(), exported_name.to_string()))
+    {
+        record_hit(name, ctx);
+    }
+}
+
 fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // member_expression has `object` (expr) and `property` (property_identifier).
     let Some(object) = node.child_by_field_name("object") else {
@@ -899,17 +951,9 @@ fn handle_jsx_element(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .filter(|name| slice(*name, ctx.source) == target_member)
             .collect::<Vec<_>>();
         if !matching_attributes.is_empty() {
-            let provider = JsTsReceiverFactProvider::new(
-                ctx.analyzer,
-                ctx.analyzer.definition_lookup_index(),
-                ctx.language,
-                ctx.file,
-                ctx.source,
-                ctx.root,
-                ctx.imports.clone(),
-            );
             for name in matching_attributes {
-                if provider
+                if ctx
+                    .receiver_facts
                     .resolve_jsx_attribute_targets(name, ReceiverAnalysisBudget::default())
                     .is_some_and(|targets| {
                         targets.iter().any(|target| {
@@ -1022,25 +1066,10 @@ fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatc
     let Some(owner) = ctx.target_owner else {
         return ReceiverMatchStatus::Unproven;
     };
-    let provider = JsTsReceiverFactProvider::new(
-        ctx.analyzer,
-        ctx.analyzer.definition_lookup_index(),
-        ctx.language,
-        ctx.file,
-        ctx.source,
-        ctx.root,
-        ctx.imports.clone(),
-    );
-    let query = ReceiverAnalysisQuery {
-        language: ctx.language,
-        file: ctx.file,
-        receiver_text: slice(node, ctx.source),
-        receiver_range: Some(node_range(node)),
-        member_name: ctx.target_member,
-        context: ReceiverContext::new(None, node.start_byte()),
-        budget: ReceiverAnalysisBudget::default(),
-    };
-    match provider.resolve_receiver(query) {
+    match ctx
+        .receiver_facts
+        .resolve_receiver_node(node, ReceiverAnalysisBudget::default())
+    {
         ReceiverAnalysisOutcome::Precise(values) => {
             if values.iter().any(|value| {
                 let resolved = value.owner();
@@ -1149,26 +1178,28 @@ fn expression_resolves_to_target_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> boo
     let Some(owner) = ctx.target_owner else {
         return false;
     };
-    let provider = JsTsReceiverFactProvider::new(
-        ctx.analyzer,
-        ctx.analyzer.definition_lookup_index(),
-        ctx.language,
-        ctx.file,
-        ctx.source,
-        ctx.root,
-        ctx.imports.clone(),
-    );
-    let query = ReceiverAnalysisQuery {
-        language: ctx.language,
-        file: ctx.file,
-        receiver_text: slice(node, ctx.source),
-        receiver_range: Some(node_range(node)),
-        member_name: ctx.target_member,
-        context: ReceiverContext::new(None, node.start_byte()),
-        budget: ReceiverAnalysisBudget::default(),
-    };
     matches!(
-        provider.resolve_receiver(query),
+        ctx.receiver_facts
+            .resolve_receiver_node(node, ReceiverAnalysisBudget::default()),
+        ReceiverAnalysisOutcome::Precise(values)
+            if values.iter().any(|value| {
+                let resolved = value.owner();
+                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
+            })
+    )
+}
+
+fn expression_iterates_target_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner) = ctx.target_owner else {
+        return false;
+    };
+    if expression_carries_target_object(node, ctx) || expression_resolves_to_target_owner(node, ctx)
+    {
+        return true;
+    }
+    matches!(
+        ctx.receiver_facts
+            .resolve_iterable_element(node, ReceiverAnalysisBudget::default()),
         ReceiverAnalysisOutcome::Precise(values)
             if values.iter().any(|value| {
                 let resolved = value.owner();
@@ -1218,15 +1249,6 @@ fn name_subtree_mentions_target_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool 
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(|child| name_subtree_mentions_target_type(child, ctx))
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
 }
 
 fn simple_identifier_text_for_source<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {

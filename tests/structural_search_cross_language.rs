@@ -130,7 +130,7 @@ fn remaining_languages_search_without_unsupported_adapter_diagnostics_during_iss
     );
 
     let rows: Vec<_> = output
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.language, m.path.as_str(), m.text.as_str()))
         .collect();
@@ -169,9 +169,9 @@ fn cpp_function_like_macro_invocation_matches_call_callee_query() {
     );
 
     assert!(output.diagnostics.is_empty(), "{output:?}");
-    assert_eq!(1, output.matches.len(), "{output:?}");
-    assert_eq!("cpp/macros.cpp", output.matches[0].path);
-    assert_eq!("TEST_DECLARE(value)", output.matches[0].text);
+    assert_eq!(1, output.structural_matches().len(), "{output:?}");
+    assert_eq!("cpp/macros.cpp", output.structural_matches()[0].path);
+    assert_eq!("TEST_DECLARE(value)", output.structural_matches()[0].text);
 }
 
 #[test]
@@ -258,7 +258,10 @@ fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnosti
         "all analyzable languages should have structural adapters: {:?}",
         output.diagnostics
     );
-    assert_eq!(output.matches.len(), Language::ANALYZABLE.len());
+    assert_eq!(
+        output.structural_matches().len(),
+        Language::ANALYZABLE.len()
+    );
 
     let expected_languages: BTreeSet<_> = Language::ANALYZABLE
         .iter()
@@ -267,7 +270,11 @@ fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnosti
     let case_languages: BTreeSet<_> = cases.iter().map(|(language, _, _, _)| *language).collect();
     assert_eq!(case_languages, expected_languages);
 
-    let actual_languages: BTreeSet<_> = output.matches.iter().map(|mat| mat.language).collect();
+    let actual_languages: BTreeSet<_> = output
+        .structural_matches()
+        .iter()
+        .map(|mat| mat.language)
+        .collect();
     assert_eq!(actual_languages, expected_languages);
 
     let expected_rows: BTreeSet<_> = cases
@@ -275,7 +282,7 @@ fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnosti
         .map(|(language, path, _, text)| (*language, *path, *text))
         .collect();
     let rows: BTreeSet<_> = output
-        .matches
+        .structural_matches()
         .iter()
         .map(|mat| (mat.language, mat.path.as_str(), mat.text.as_str()))
         .collect();
@@ -328,9 +335,9 @@ func (s Service) Run(code string) {
         }),
     );
     assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
-    assert_eq!(audit.matches.len(), 1);
-    assert_eq!(audit.matches[0].text, "audit(code)");
-    assert_eq!(audit.matches[0].captures[0].text, "code");
+    assert_eq!(audit.structural_matches().len(), 1);
+    assert_eq!(audit.structural_matches()[0].text, "audit(code)");
+    assert_eq!(audit.structural_matches()[0].captures[0].text, "code");
 
     let assignment = run_query_with_files(
         &[("go/app.go", GO_APP)],
@@ -348,9 +355,15 @@ func (s Service) Run(code string) {
         "{:?}",
         assignment.diagnostics
     );
-    assert_eq!(assignment.matches.len(), 1);
-    assert_eq!(assignment.matches[0].text, r#"password = "hunter2""#);
-    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+    assert_eq!(assignment.structural_matches().len(), 1);
+    assert_eq!(
+        assignment.structural_matches()[0].text,
+        r#"password = "hunter2""#
+    );
+    assert_eq!(
+        assignment.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
 
     let multi_assignment = run_query_with_files(
         &[("go/app.go", GO_APP)],
@@ -368,9 +381,15 @@ func (s Service) Run(code string) {
         "{:?}",
         multi_assignment.diagnostics
     );
-    assert_eq!(multi_assignment.matches.len(), 1);
-    assert_eq!(multi_assignment.matches[0].text, "retries, attempts = 3, 4");
-    assert_eq!(multi_assignment.matches[0].captures[0].text, "4");
+    assert_eq!(multi_assignment.structural_matches().len(), 1);
+    assert_eq!(
+        multi_assignment.structural_matches()[0].text,
+        "retries, attempts = 3, 4"
+    );
+    assert_eq!(
+        multi_assignment.structural_matches()[0].captures[0].text,
+        "4"
+    );
 
     let field_access = run_query_with_files(
         &[("go/app.go", GO_APP)],
@@ -388,8 +407,8 @@ func (s Service) Run(code string) {
         "{:?}",
         field_access.diagnostics
     );
-    assert_eq!(field_access.matches.len(), 1);
-    assert_eq!(field_access.matches[0].text, "service.Name");
+    assert_eq!(field_access.structural_matches().len(), 1);
+    assert_eq!(field_access.structural_matches()[0].text, "service.Name");
 
     let import = run_query_with_files(
         &[("go/app.go", GO_APP)],
@@ -399,8 +418,8 @@ func (s Service) Run(code string) {
         }),
     );
     assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
-    assert_eq!(import.matches.len(), 1);
-    assert_eq!(import.matches[0].text, "import (…");
+    assert_eq!(import.structural_matches().len(), 1);
+    assert_eq!(import.structural_matches()[0].text, "import (…");
 
     let declarations = run_query_with_files(
         &[("go/app.go", GO_APP)],
@@ -415,7 +434,7 @@ func (s Service) Run(code string) {
         declarations.diagnostics
     );
     let declaration_rows: Vec<_> = declarations
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.kind, m.text.as_str()))
         .collect();
@@ -442,9 +461,12 @@ func (s Service) Run(code string) {
         type_identifier.diagnostics
     );
     assert!(
-        type_identifier.matches.iter().any(|m| m.text == "Alias"),
+        type_identifier
+            .structural_matches()
+            .iter()
+            .any(|m| m.text == "Alias"),
         "expected Alias type identifier match: {:?}",
-        type_identifier.matches
+        type_identifier.structural_matches()
     );
 
     let lambda = run_query_with_files(
@@ -455,8 +477,11 @@ func (s Service) Run(code string) {
         }),
     );
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
-    assert_eq!(lambda.matches.len(), 1);
-    assert_eq!(lambda.matches[0].text, "func(value string) string {…");
+    assert_eq!(lambda.structural_matches().len(), 1);
+    assert_eq!(
+        lambda.structural_matches()[0].text,
+        "func(value string) string {…"
+    );
 
     let unsupported = run_query_with_files(
         &[("go/app.go", GO_APP)],
@@ -529,9 +554,9 @@ std::string audit(const std::string& code) {
         }),
     );
     assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
-    assert_eq!(audit.matches.len(), 1);
-    assert_eq!(audit.matches[0].text, "audit(code)");
-    assert_eq!(audit.matches[0].captures[0].text, "code");
+    assert_eq!(audit.structural_matches().len(), 1);
+    assert_eq!(audit.structural_matches()[0].text, "audit(code)");
+    assert_eq!(audit.structural_matches()[0].captures[0].text, "code");
 
     let scoped_call = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -550,8 +575,11 @@ std::string audit(const std::string& code) {
         "{:?}",
         scoped_call.diagnostics
     );
-    assert_eq!(scoped_call.matches.len(), 1);
-    assert_eq!(scoped_call.matches[0].text, "Service::Run(code)");
+    assert_eq!(scoped_call.structural_matches().len(), 1);
+    assert_eq!(
+        scoped_call.structural_matches()[0].text,
+        "Service::Run(code)"
+    );
 
     let allocation = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -568,8 +596,8 @@ std::string audit(const std::string& code) {
         "{:?}",
         allocation.diagnostics
     );
-    assert_eq!(allocation.matches.len(), 1);
-    assert_eq!(allocation.matches[0].text, "new Service()");
+    assert_eq!(allocation.structural_matches().len(), 1);
+    assert_eq!(allocation.structural_matches()[0].text, "new Service()");
 
     let assignment = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -587,9 +615,15 @@ std::string audit(const std::string& code) {
         "{:?}",
         assignment.diagnostics
     );
-    assert_eq!(assignment.matches.len(), 1);
-    assert_eq!(assignment.matches[0].text, r#"password = "hunter2""#);
-    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+    assert_eq!(assignment.structural_matches().len(), 1);
+    assert_eq!(
+        assignment.structural_matches()[0].text,
+        r#"password = "hunter2""#
+    );
+    assert_eq!(
+        assignment.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
 
     let char_literal = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -603,8 +637,8 @@ std::string audit(const std::string& code) {
         "{:?}",
         char_literal.diagnostics
     );
-    assert_eq!(char_literal.matches.len(), 1);
-    assert_eq!(char_literal.matches[0].text, "'x'");
+    assert_eq!(char_literal.structural_matches().len(), 1);
+    assert_eq!(char_literal.structural_matches()[0].text, "'x'");
 
     let field_access = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -622,8 +656,8 @@ std::string audit(const std::string& code) {
         "{:?}",
         field_access.diagnostics
     );
-    assert_eq!(field_access.matches.len(), 1);
-    assert_eq!(field_access.matches[0].text, "service.Name");
+    assert_eq!(field_access.structural_matches().len(), 1);
+    assert_eq!(field_access.structural_matches()[0].text, "service.Name");
 
     let import = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -633,8 +667,8 @@ std::string audit(const std::string& code) {
         }),
     );
     assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
-    assert_eq!(import.matches.len(), 1);
-    assert_eq!(import.matches[0].text, "#include <vector>…");
+    assert_eq!(import.structural_matches().len(), 1);
+    assert_eq!(import.structural_matches()[0].text, "#include <vector>…");
 
     let declarations = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -649,7 +683,7 @@ std::string audit(const std::string& code) {
         declarations.diagnostics
     );
     let declaration_rows: Vec<_> = declarations
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.kind, m.text.as_str()))
         .collect();
@@ -676,8 +710,11 @@ std::string audit(const std::string& code) {
         "{:?}",
         constructor.diagnostics
     );
-    assert_eq!(constructor.matches.len(), 1);
-    assert_eq!(constructor.matches[0].text, "Service::Service() {}");
+    assert_eq!(constructor.structural_matches().len(), 1);
+    assert_eq!(
+        constructor.structural_matches()[0].text,
+        "Service::Service() {}"
+    );
 
     let lambda = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -687,8 +724,8 @@ std::string audit(const std::string& code) {
         }),
     );
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
-    assert_eq!(lambda.matches.len(), 1);
-    assert_eq!(lambda.matches[0].text, "[](int value) {…");
+    assert_eq!(lambda.structural_matches().len(), 1);
+    assert_eq!(lambda.structural_matches()[0].text, "[](int value) {…");
 
     let unsupported = run_query_with_files(
         &[("cpp/app.cpp", CPP_APP)],
@@ -767,9 +804,9 @@ fn parse<T>(value: &str) -> String {
         }),
     );
     assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
-    assert_eq!(audit.matches.len(), 1);
-    assert_eq!(audit.matches[0].text, "audit(code)");
-    assert_eq!(audit.matches[0].captures[0].text, "code");
+    assert_eq!(audit.structural_matches().len(), 1);
+    assert_eq!(audit.structural_matches()[0].text, "audit(code)");
+    assert_eq!(audit.structural_matches()[0].captures[0].text, "code");
 
     let method_call = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -787,8 +824,8 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         method_call.diagnostics
     );
-    assert_eq!(method_call.matches.len(), 1);
-    assert_eq!(method_call.matches[0].text, "code.to_string()");
+    assert_eq!(method_call.structural_matches().len(), 1);
+    assert_eq!(method_call.structural_matches()[0].text, "code.to_string()");
 
     let generic_call = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -806,8 +843,11 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         generic_call.diagnostics
     );
-    assert_eq!(generic_call.matches.len(), 1);
-    assert_eq!(generic_call.matches[0].text, "parse::<String>(code)");
+    assert_eq!(generic_call.structural_matches().len(), 1);
+    assert_eq!(
+        generic_call.structural_matches()[0].text,
+        "parse::<String>(code)"
+    );
 
     let assignment = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -825,9 +865,15 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         assignment.diagnostics
     );
-    assert_eq!(assignment.matches.len(), 1);
-    assert_eq!(assignment.matches[0].text, r#"let password = "hunter2";"#);
-    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+    assert_eq!(assignment.structural_matches().len(), 1);
+    assert_eq!(
+        assignment.structural_matches()[0].text,
+        r#"let password = "hunter2";"#
+    );
+    assert_eq!(
+        assignment.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
 
     let mutable_assignment = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -845,13 +891,13 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         mutable_assignment.diagnostics
     );
-    assert_eq!(mutable_assignment.matches.len(), 1);
+    assert_eq!(mutable_assignment.structural_matches().len(), 1);
     assert_eq!(
-        mutable_assignment.matches[0].text,
+        mutable_assignment.structural_matches()[0].text,
         r#"let mut service = Service { name: "primary".to_string(), count: 0 };"#
     );
     assert_eq!(
-        mutable_assignment.matches[0].captures[0].text,
+        mutable_assignment.structural_matches()[0].captures[0].text,
         r#"Service { name: "primary".to_string(), count: 0 }"#
     );
 
@@ -871,9 +917,15 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         const_assignment.diagnostics
     );
-    assert_eq!(const_assignment.matches.len(), 1);
-    assert_eq!(const_assignment.matches[0].text, "const LIMIT: i32 = -3;");
-    assert_eq!(const_assignment.matches[0].captures[0].text, "-3");
+    assert_eq!(const_assignment.structural_matches().len(), 1);
+    assert_eq!(
+        const_assignment.structural_matches()[0].text,
+        "const LIMIT: i32 = -3;"
+    );
+    assert_eq!(
+        const_assignment.structural_matches()[0].captures[0].text,
+        "-3"
+    );
 
     let static_assignment = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -891,12 +943,15 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         static_assignment.diagnostics
     );
-    assert_eq!(static_assignment.matches.len(), 1);
+    assert_eq!(static_assignment.structural_matches().len(), 1);
     assert_eq!(
-        static_assignment.matches[0].text,
+        static_assignment.structural_matches()[0].text,
         "static ENABLED: bool = false;"
     );
-    assert_eq!(static_assignment.matches[0].captures[0].text, "false");
+    assert_eq!(
+        static_assignment.structural_matches()[0].captures[0].text,
+        "false"
+    );
 
     let compound_assignment = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -914,9 +969,15 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         compound_assignment.diagnostics
     );
-    assert_eq!(compound_assignment.matches.len(), 1);
-    assert_eq!(compound_assignment.matches[0].text, "service.count += 1");
-    assert_eq!(compound_assignment.matches[0].captures[0].text, "1");
+    assert_eq!(compound_assignment.structural_matches().len(), 1);
+    assert_eq!(
+        compound_assignment.structural_matches()[0].text,
+        "service.count += 1"
+    );
+    assert_eq!(
+        compound_assignment.structural_matches()[0].captures[0].text,
+        "1"
+    );
 
     let boolean_literal = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -930,8 +991,8 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         boolean_literal.diagnostics
     );
-    assert_eq!(boolean_literal.matches.len(), 1);
-    assert_eq!(boolean_literal.matches[0].text, "true");
+    assert_eq!(boolean_literal.structural_matches().len(), 1);
+    assert_eq!(boolean_literal.structural_matches()[0].text, "true");
 
     let generic_method_call = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -949,9 +1010,9 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         generic_method_call.diagnostics
     );
-    assert_eq!(generic_method_call.matches.len(), 1);
+    assert_eq!(generic_method_call.structural_matches().len(), 1);
     assert_eq!(
-        generic_method_call.matches[0].text,
+        generic_method_call.structural_matches()[0].text,
         "code.parse::<String>()"
     );
 
@@ -971,8 +1032,8 @@ fn parse<T>(value: &str) -> String {
         "{:?}",
         field_access.diagnostics
     );
-    assert_eq!(field_access.matches.len(), 1);
-    assert_eq!(field_access.matches[0].text, "service.name");
+    assert_eq!(field_access.structural_matches().len(), 1);
+    assert_eq!(field_access.structural_matches()[0].text, "service.name");
 
     let import = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -982,8 +1043,8 @@ fn parse<T>(value: &str) -> String {
         }),
     );
     assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
-    assert_eq!(import.matches.len(), 1);
-    assert_eq!(import.matches[0].text, "use std::{fmt, io};");
+    assert_eq!(import.structural_matches().len(), 1);
+    assert_eq!(import.structural_matches()[0].text, "use std::{fmt, io};");
 
     let declarations = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -998,7 +1059,7 @@ fn parse<T>(value: &str) -> String {
         declarations.diagnostics
     );
     let declaration_rows: Vec<_> = declarations
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.kind, m.text.as_str()))
         .collect();
@@ -1022,8 +1083,8 @@ fn parse<T>(value: &str) -> String {
         }),
     );
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
-    assert_eq!(lambda.matches.len(), 1);
-    assert_eq!(lambda.matches[0].text, "|value: i32| {…");
+    assert_eq!(lambda.structural_matches().len(), 1);
+    assert_eq!(lambda.structural_matches()[0].text, "|value: i32| {…");
 
     let unsupported = run_query_with_files(
         &[("rust/lib.rs", RUST_APP)],
@@ -1100,9 +1161,9 @@ $service->run("input");
         }),
     );
     assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
-    assert_eq!(audit.matches.len(), 1);
-    assert_eq!(audit.matches[0].text, "audit($code)");
-    assert_eq!(audit.matches[0].captures[0].text, "$code");
+    assert_eq!(audit.structural_matches().len(), 1);
+    assert_eq!(audit.structural_matches()[0].text, "audit($code)");
+    assert_eq!(audit.structural_matches()[0].captures[0].text, "$code");
 
     let method_call = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1120,8 +1181,11 @@ $service->run("input");
         "{:?}",
         method_call.diagnostics
     );
-    assert_eq!(method_call.matches.len(), 1);
-    assert_eq!(method_call.matches[0].text, r#"$service->run("input")"#);
+    assert_eq!(method_call.structural_matches().len(), 1);
+    assert_eq!(
+        method_call.structural_matches()[0].text,
+        r#"$service->run("input")"#
+    );
 
     let scoped_call = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1139,8 +1203,11 @@ $service->run("input");
         "{:?}",
         scoped_call.diagnostics
     );
-    assert_eq!(scoped_call.matches.len(), 1);
-    assert_eq!(scoped_call.matches[0].text, "Formatter::format($code)");
+    assert_eq!(scoped_call.structural_matches().len(), 1);
+    assert_eq!(
+        scoped_call.structural_matches()[0].text,
+        "Formatter::format($code)"
+    );
 
     let object_creation = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1154,8 +1221,11 @@ $service->run("input");
         "{:?}",
         object_creation.diagnostics
     );
-    assert_eq!(object_creation.matches.len(), 1);
-    assert_eq!(object_creation.matches[0].text, "new Service()");
+    assert_eq!(object_creation.structural_matches().len(), 1);
+    assert_eq!(
+        object_creation.structural_matches()[0].text,
+        "new Service()"
+    );
 
     let named_argument = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1175,9 +1245,15 @@ $service->run("input");
         "{:?}",
         named_argument.diagnostics
     );
-    assert_eq!(named_argument.matches.len(), 1);
-    assert_eq!(named_argument.matches[0].text, "audit_named(code: $code)");
-    assert_eq!(named_argument.matches[0].captures[0].text, "$code");
+    assert_eq!(named_argument.structural_matches().len(), 1);
+    assert_eq!(
+        named_argument.structural_matches()[0].text,
+        "audit_named(code: $code)"
+    );
+    assert_eq!(
+        named_argument.structural_matches()[0].captures[0].text,
+        "$code"
+    );
 
     let assignment = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1195,9 +1271,15 @@ $service->run("input");
         "{:?}",
         assignment.diagnostics
     );
-    assert_eq!(assignment.matches.len(), 1);
-    assert_eq!(assignment.matches[0].text, r#"$password = "hunter2""#);
-    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+    assert_eq!(assignment.structural_matches().len(), 1);
+    assert_eq!(
+        assignment.structural_matches()[0].text,
+        r#"$password = "hunter2""#
+    );
+    assert_eq!(
+        assignment.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
 
     let property_assignment = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1215,10 +1297,13 @@ $service->run("input");
         "{:?}",
         property_assignment.diagnostics
     );
-    assert_eq!(property_assignment.matches.len(), 1);
-    assert_eq!(property_assignment.matches[0].text, r#"$name = "primary""#);
+    assert_eq!(property_assignment.structural_matches().len(), 1);
     assert_eq!(
-        property_assignment.matches[0].captures[0].text,
+        property_assignment.structural_matches()[0].text,
+        r#"$name = "primary""#
+    );
+    assert_eq!(
+        property_assignment.structural_matches()[0].captures[0].text,
         r#""primary""#
     );
 
@@ -1238,9 +1323,12 @@ $service->run("input");
         "{:?}",
         const_assignment.diagnostics
     );
-    assert_eq!(const_assignment.matches.len(), 1);
-    assert_eq!(const_assignment.matches[0].text, "LIMIT = -3");
-    assert_eq!(const_assignment.matches[0].captures[0].text, "-3");
+    assert_eq!(const_assignment.structural_matches().len(), 1);
+    assert_eq!(const_assignment.structural_matches()[0].text, "LIMIT = -3");
+    assert_eq!(
+        const_assignment.structural_matches()[0].captures[0].text,
+        "-3"
+    );
 
     let boolean_literal = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1254,8 +1342,8 @@ $service->run("input");
         "{:?}",
         boolean_literal.diagnostics
     );
-    assert_eq!(boolean_literal.matches.len(), 1);
-    assert_eq!(boolean_literal.matches[0].text, "true");
+    assert_eq!(boolean_literal.structural_matches().len(), 1);
+    assert_eq!(boolean_literal.structural_matches()[0].text, "true");
 
     let field_access = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1273,8 +1361,8 @@ $service->run("input");
         "{:?}",
         field_access.diagnostics
     );
-    assert_eq!(field_access.matches.len(), 1);
-    assert_eq!(field_access.matches[0].text, "$this->name");
+    assert_eq!(field_access.structural_matches().len(), 1);
+    assert_eq!(field_access.structural_matches()[0].text, "$this->name");
 
     let static_field_access = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1292,8 +1380,11 @@ $service->run("input");
         "{:?}",
         static_field_access.diagnostics
     );
-    assert_eq!(static_field_access.matches.len(), 1);
-    assert_eq!(static_field_access.matches[0].text, "Service::LIMIT");
+    assert_eq!(static_field_access.structural_matches().len(), 1);
+    assert_eq!(
+        static_field_access.structural_matches()[0].text,
+        "Service::LIMIT"
+    );
 
     let import = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1303,8 +1394,11 @@ $service->run("input");
         }),
     );
     assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
-    assert_eq!(import.matches.len(), 1);
-    assert_eq!(import.matches[0].text, "use App\\Support\\Formatter;");
+    assert_eq!(import.structural_matches().len(), 1);
+    assert_eq!(
+        import.structural_matches()[0].text,
+        "use App\\Support\\Formatter;"
+    );
 
     let full_import = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1318,8 +1412,11 @@ $service->run("input");
         "{:?}",
         full_import.diagnostics
     );
-    assert_eq!(full_import.matches.len(), 1);
-    assert_eq!(full_import.matches[0].text, "use App\\Support\\Formatter;");
+    assert_eq!(full_import.structural_matches().len(), 1);
+    assert_eq!(
+        full_import.structural_matches()[0].text,
+        "use App\\Support\\Formatter;"
+    );
 
     let grouped_import = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1333,9 +1430,9 @@ $service->run("input");
         "{:?}",
         grouped_import.diagnostics
     );
-    assert_eq!(grouped_import.matches.len(), 1);
+    assert_eq!(grouped_import.structural_matches().len(), 1);
     assert_eq!(
-        grouped_import.matches[0].text,
+        grouped_import.structural_matches()[0].text,
         "use App\\Support\\{Logger, Writer as WriterAlias};"
     );
 
@@ -1351,9 +1448,9 @@ $service->run("input");
         "{:?}",
         aliased_import.diagnostics
     );
-    assert_eq!(aliased_import.matches.len(), 1);
+    assert_eq!(aliased_import.structural_matches().len(), 1);
     assert_eq!(
-        aliased_import.matches[0].text,
+        aliased_import.structural_matches()[0].text,
         "use App\\Support\\{Logger, Writer as WriterAlias};"
     );
 
@@ -1370,7 +1467,7 @@ $service->run("input");
         shared_import_prefix.diagnostics
     );
     assert!(
-        shared_import_prefix.matches.is_empty(),
+        shared_import_prefix.structural_matches().is_empty(),
         "unexpected shared-prefix import match: {shared_import_prefix:?}"
     );
 
@@ -1387,7 +1484,7 @@ $service->run("input");
         declarations.diagnostics
     );
     let declaration_rows: Vec<_> = declarations
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.kind, m.text.as_str()))
         .collect();
@@ -1417,8 +1514,11 @@ $service->run("input");
         "{:?}",
         decorated_class.diagnostics
     );
-    assert_eq!(decorated_class.matches.len(), 1);
-    assert_eq!(decorated_class.matches[0].text, "#[Route('/run')]…");
+    assert_eq!(decorated_class.structural_matches().len(), 1);
+    assert_eq!(
+        decorated_class.structural_matches()[0].text,
+        "#[Route('/run')]…"
+    );
 
     let lambda = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1428,8 +1528,8 @@ $service->run("input");
         }),
     );
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
-    assert_eq!(lambda.matches.len(), 1);
-    assert_eq!(lambda.matches[0].text, "function ($value) {…");
+    assert_eq!(lambda.structural_matches().len(), 1);
+    assert_eq!(lambda.structural_matches()[0].text, "function ($value) {…");
 
     let trait_use_is_not_import = run_query_with_files(
         &[("php/app.php", PHP_APP)],
@@ -1444,7 +1544,7 @@ $service->run("input");
         trait_use_is_not_import.diagnostics
     );
     assert!(
-        trait_use_is_not_import.matches.is_empty(),
+        trait_use_is_not_import.structural_matches().is_empty(),
         "unexpected trait-use import match: {trait_use_is_not_import:?}"
     );
 }
@@ -1497,9 +1597,9 @@ object App {
         }),
     );
     assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
-    assert_eq!(audit.matches.len(), 1);
-    assert_eq!(audit.matches[0].text, "audit(code)");
-    assert_eq!(audit.matches[0].captures[0].text, "code");
+    assert_eq!(audit.structural_matches().len(), 1);
+    assert_eq!(audit.structural_matches()[0].text, "audit(code)");
+    assert_eq!(audit.structural_matches()[0].captures[0].text, "code");
 
     let method_call = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1517,8 +1617,11 @@ object App {
         "{:?}",
         method_call.diagnostics
     );
-    assert_eq!(method_call.matches.len(), 1);
-    assert_eq!(method_call.matches[0].text, r#"service.run("input")"#);
+    assert_eq!(method_call.structural_matches().len(), 1);
+    assert_eq!(
+        method_call.structural_matches()[0].text,
+        r#"service.run("input")"#
+    );
 
     let generic_call = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1536,8 +1639,11 @@ object App {
         "{:?}",
         generic_call.diagnostics
     );
-    assert_eq!(generic_call.matches.len(), 1);
-    assert_eq!(generic_call.matches[0].text, "parse[String](code)");
+    assert_eq!(generic_call.structural_matches().len(), 1);
+    assert_eq!(
+        generic_call.structural_matches()[0].text,
+        "parse[String](code)"
+    );
 
     let block_argument = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1555,9 +1661,9 @@ object App {
         "{:?}",
         block_argument.diagnostics
     );
-    assert_eq!(block_argument.matches.len(), 1);
+    assert_eq!(block_argument.structural_matches().len(), 1);
     assert_eq!(
-        block_argument.matches[0].text,
+        block_argument.structural_matches()[0].text,
         "ListBuffer(1).foreach { value => audit(value.toString) }"
     );
 
@@ -1579,12 +1685,15 @@ object App {
         "{:?}",
         named_argument.diagnostics
     );
-    assert_eq!(named_argument.matches.len(), 1);
+    assert_eq!(named_argument.structural_matches().len(), 1);
     assert_eq!(
-        named_argument.matches[0].text,
+        named_argument.structural_matches()[0].text,
         r#"auditNamed(code = "named")"#
     );
-    assert_eq!(named_argument.matches[0].captures[0].text, r#""named""#);
+    assert_eq!(
+        named_argument.structural_matches()[0].captures[0].text,
+        r#""named""#
+    );
 
     let named_argument_is_not_assignment = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1603,7 +1712,9 @@ object App {
         named_argument_is_not_assignment.diagnostics
     );
     assert!(
-        named_argument_is_not_assignment.matches.is_empty(),
+        named_argument_is_not_assignment
+            .structural_matches()
+            .is_empty(),
         "unexpected named-argument assignment match: {named_argument_is_not_assignment:?}"
     );
 
@@ -1623,9 +1734,15 @@ object App {
         "{:?}",
         assignment.diagnostics
     );
-    assert_eq!(assignment.matches.len(), 1);
-    assert_eq!(assignment.matches[0].text, r#"val password = "hunter2""#);
-    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+    assert_eq!(assignment.structural_matches().len(), 1);
+    assert_eq!(
+        assignment.structural_matches()[0].text,
+        r#"val password = "hunter2""#
+    );
+    assert_eq!(
+        assignment.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
 
     let signed_numeric = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1643,9 +1760,15 @@ object App {
         "{:?}",
         signed_numeric.diagnostics
     );
-    assert_eq!(signed_numeric.matches.len(), 1);
-    assert_eq!(signed_numeric.matches[0].text, "val limit = -3");
-    assert_eq!(signed_numeric.matches[0].captures[0].text, "-3");
+    assert_eq!(signed_numeric.structural_matches().len(), 1);
+    assert_eq!(
+        signed_numeric.structural_matches()[0].text,
+        "val limit = -3"
+    );
+    assert_eq!(
+        signed_numeric.structural_matches()[0].captures[0].text,
+        "-3"
+    );
 
     let boolean_literal = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1659,8 +1782,8 @@ object App {
         "{:?}",
         boolean_literal.diagnostics
     );
-    assert_eq!(boolean_literal.matches.len(), 1);
-    assert_eq!(boolean_literal.matches[0].text, "true");
+    assert_eq!(boolean_literal.structural_matches().len(), 1);
+    assert_eq!(boolean_literal.structural_matches()[0].text, "true");
 
     let field_access = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1678,8 +1801,8 @@ object App {
         "{:?}",
         field_access.diagnostics
     );
-    assert_eq!(field_access.matches.len(), 1);
-    assert_eq!(field_access.matches[0].text, "this.name");
+    assert_eq!(field_access.structural_matches().len(), 1);
+    assert_eq!(field_access.structural_matches()[0].text, "this.name");
 
     let import = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1689,8 +1812,8 @@ object App {
         }),
     );
     assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
-    assert_eq!(import.matches.len(), 1);
-    assert_eq!(import.matches[0].text, "import scala.util.Try");
+    assert_eq!(import.structural_matches().len(), 1);
+    assert_eq!(import.structural_matches()[0].text, "import scala.util.Try");
 
     let full_import = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1704,8 +1827,11 @@ object App {
         "{:?}",
         full_import.diagnostics
     );
-    assert_eq!(full_import.matches.len(), 1);
-    assert_eq!(full_import.matches[0].text, "import scala.util.Try");
+    assert_eq!(full_import.structural_matches().len(), 1);
+    assert_eq!(
+        full_import.structural_matches()[0].text,
+        "import scala.util.Try"
+    );
 
     let grouped_import = run_query_with_files(
         &[("scala/App.scala", SCALA_APP)],
@@ -1719,9 +1845,9 @@ object App {
         "{:?}",
         grouped_import.diagnostics
     );
-    assert_eq!(grouped_import.matches.len(), 1);
+    assert_eq!(grouped_import.structural_matches().len(), 1);
     assert_eq!(
-        grouped_import.matches[0].text,
+        grouped_import.structural_matches()[0].text,
         "import scala.collection.mutable.{ListBuffer, Map as MutableMap}"
     );
 
@@ -1737,9 +1863,9 @@ object App {
         "{:?}",
         aliased_import.diagnostics
     );
-    assert_eq!(aliased_import.matches.len(), 1);
+    assert_eq!(aliased_import.structural_matches().len(), 1);
     assert_eq!(
-        aliased_import.matches[0].text,
+        aliased_import.structural_matches()[0].text,
         "import scala.collection.mutable.{ListBuffer, Map as MutableMap}"
     );
 
@@ -1756,7 +1882,7 @@ object App {
         shared_import_prefix.diagnostics
     );
     assert!(
-        shared_import_prefix.matches.is_empty(),
+        shared_import_prefix.structural_matches().is_empty(),
         "unexpected shared-prefix import match: {shared_import_prefix:?}"
     );
 
@@ -1773,7 +1899,7 @@ object App {
         declarations.diagnostics
     );
     let declaration_rows: Vec<_> = declarations
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.kind, m.text.as_str()))
         .collect();
@@ -1796,7 +1922,11 @@ object App {
         }),
     );
     assert!(methods.diagnostics.is_empty(), "{:?}", methods.diagnostics);
-    let method_rows: Vec<_> = methods.matches.iter().map(|m| m.text.as_str()).collect();
+    let method_rows: Vec<_> = methods
+        .structural_matches()
+        .iter()
+        .map(|m| m.text.as_str())
+        .collect();
     assert_eq!(
         method_rows,
         vec![
@@ -1820,9 +1950,9 @@ object App {
         "{:?}",
         decorated_class.diagnostics
     );
-    assert_eq!(decorated_class.matches.len(), 1);
+    assert_eq!(decorated_class.structural_matches().len(), 1);
     assert_eq!(
-        decorated_class.matches[0].text,
+        decorated_class.structural_matches()[0].text,
         "@deprecated(\"use Service2\", \"1.0\")…"
     );
 
@@ -1834,8 +1964,8 @@ object App {
         }),
     );
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
-    assert_eq!(lambda.matches.len(), 1);
-    assert_eq!(lambda.matches[0].text, "(value: String) => {…");
+    assert_eq!(lambda.structural_matches().len(), 1);
+    assert_eq!(lambda.structural_matches()[0].text, "(value: String) => {…");
 }
 
 #[test]
@@ -1899,9 +2029,9 @@ class AppEntry {
         }),
     );
     assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
-    assert_eq!(audit.matches.len(), 1);
-    assert_eq!(audit.matches[0].text, "audit(code)");
-    assert_eq!(audit.matches[0].captures[0].text, "code");
+    assert_eq!(audit.structural_matches().len(), 1);
+    assert_eq!(audit.structural_matches()[0].text, "audit(code)");
+    assert_eq!(audit.structural_matches()[0].captures[0].text, "code");
 
     let method_call = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -1920,8 +2050,11 @@ class AppEntry {
         "{:?}",
         method_call.diagnostics
     );
-    assert_eq!(method_call.matches.len(), 1);
-    assert_eq!(method_call.matches[0].text, r#"service.Run("input")"#);
+    assert_eq!(method_call.structural_matches().len(), 1);
+    assert_eq!(
+        method_call.structural_matches()[0].text,
+        r#"service.Run("input")"#
+    );
 
     let conditional_method_call = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -1940,9 +2073,9 @@ class AppEntry {
         "{:?}",
         conditional_method_call.diagnostics
     );
-    assert_eq!(conditional_method_call.matches.len(), 1);
+    assert_eq!(conditional_method_call.structural_matches().len(), 1);
     assert_eq!(
-        conditional_method_call.matches[0].text,
+        conditional_method_call.structural_matches()[0].text,
         r#"service?.Run("optional")"#
     );
 
@@ -1962,9 +2095,9 @@ class AppEntry {
         "{:?}",
         static_generic_call.diagnostics
     );
-    assert_eq!(static_generic_call.matches.len(), 1);
+    assert_eq!(static_generic_call.structural_matches().len(), 1);
     assert_eq!(
-        static_generic_call.matches[0].text,
+        static_generic_call.structural_matches()[0].text,
         r#"Service.Parse<string>("value")"#
     );
 
@@ -1980,8 +2113,11 @@ class AppEntry {
         "{:?}",
         object_creation.diagnostics
     );
-    assert_eq!(object_creation.matches.len(), 1);
-    assert_eq!(object_creation.matches[0].text, "new Service()");
+    assert_eq!(object_creation.structural_matches().len(), 1);
+    assert_eq!(
+        object_creation.structural_matches()[0].text,
+        "new Service()"
+    );
 
     let named_argument = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2001,9 +2137,15 @@ class AppEntry {
         "{:?}",
         named_argument.diagnostics
     );
-    assert_eq!(named_argument.matches.len(), 1);
-    assert_eq!(named_argument.matches[0].text, "AuditNamed(code: code)");
-    assert_eq!(named_argument.matches[0].captures[0].text, "code");
+    assert_eq!(named_argument.structural_matches().len(), 1);
+    assert_eq!(
+        named_argument.structural_matches()[0].text,
+        "AuditNamed(code: code)"
+    );
+    assert_eq!(
+        named_argument.structural_matches()[0].captures[0].text,
+        "code"
+    );
 
     let assignment = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2021,9 +2163,15 @@ class AppEntry {
         "{:?}",
         assignment.diagnostics
     );
-    assert_eq!(assignment.matches.len(), 1);
-    assert_eq!(assignment.matches[0].text, r#"password = "hunter2""#);
-    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+    assert_eq!(assignment.structural_matches().len(), 1);
+    assert_eq!(
+        assignment.structural_matches()[0].text,
+        r#"password = "hunter2""#
+    );
+    assert_eq!(
+        assignment.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
 
     let signed_numeric = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2041,9 +2189,12 @@ class AppEntry {
         "{:?}",
         signed_numeric.diagnostics
     );
-    assert_eq!(signed_numeric.matches.len(), 1);
-    assert_eq!(signed_numeric.matches[0].text, "Limit = -3");
-    assert_eq!(signed_numeric.matches[0].captures[0].text, "-3");
+    assert_eq!(signed_numeric.structural_matches().len(), 1);
+    assert_eq!(signed_numeric.structural_matches()[0].text, "Limit = -3");
+    assert_eq!(
+        signed_numeric.structural_matches()[0].captures[0].text,
+        "-3"
+    );
 
     let uninitialized_field = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2058,7 +2209,7 @@ class AppEntry {
         uninitialized_field.diagnostics
     );
     assert!(
-        uninitialized_field.matches.is_empty(),
+        uninitialized_field.structural_matches().is_empty(),
         "unexpected uninitialized field assignment match: {uninitialized_field:?}"
     );
 
@@ -2074,8 +2225,8 @@ class AppEntry {
         "{:?}",
         boolean_literal.diagnostics
     );
-    assert_eq!(boolean_literal.matches.len(), 1);
-    assert_eq!(boolean_literal.matches[0].text, "true");
+    assert_eq!(boolean_literal.structural_matches().len(), 1);
+    assert_eq!(boolean_literal.structural_matches()[0].text, "true");
 
     let field_access = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2093,8 +2244,8 @@ class AppEntry {
         "{:?}",
         field_access.diagnostics
     );
-    assert_eq!(field_access.matches.len(), 1);
-    assert_eq!(field_access.matches[0].text, "this.Name");
+    assert_eq!(field_access.structural_matches().len(), 1);
+    assert_eq!(field_access.structural_matches()[0].text, "this.Name");
 
     let conditional_field_access = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2112,8 +2263,11 @@ class AppEntry {
         "{:?}",
         conditional_field_access.diagnostics
     );
-    assert_eq!(conditional_field_access.matches.len(), 1);
-    assert_eq!(conditional_field_access.matches[0].text, "service?.Name");
+    assert_eq!(conditional_field_access.structural_matches().len(), 1);
+    assert_eq!(
+        conditional_field_access.structural_matches()[0].text,
+        "service?.Name"
+    );
 
     let system_import = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2127,8 +2281,8 @@ class AppEntry {
         "{:?}",
         system_import.diagnostics
     );
-    assert_eq!(system_import.matches.len(), 1);
-    assert_eq!(system_import.matches[0].text, "using System;");
+    assert_eq!(system_import.structural_matches().len(), 1);
+    assert_eq!(system_import.structural_matches()[0].text, "using System;");
 
     let import = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2138,8 +2292,8 @@ class AppEntry {
         }),
     );
     assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
-    assert_eq!(import.matches.len(), 1);
-    assert_eq!(import.matches[0].text, "using App.Support;");
+    assert_eq!(import.structural_matches().len(), 1);
+    assert_eq!(import.structural_matches()[0].text, "using App.Support;");
 
     let full_import = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2153,8 +2307,11 @@ class AppEntry {
         "{:?}",
         full_import.diagnostics
     );
-    assert_eq!(full_import.matches.len(), 1);
-    assert_eq!(full_import.matches[0].text, "using App.Support;");
+    assert_eq!(full_import.structural_matches().len(), 1);
+    assert_eq!(
+        full_import.structural_matches()[0].text,
+        "using App.Support;"
+    );
 
     let aliased_import = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2168,9 +2325,9 @@ class AppEntry {
         "{:?}",
         aliased_import.diagnostics
     );
-    assert_eq!(aliased_import.matches.len(), 1);
+    assert_eq!(aliased_import.structural_matches().len(), 1);
     assert_eq!(
-        aliased_import.matches[0].text,
+        aliased_import.structural_matches()[0].text,
         "using WriterAlias = App.Support.Writer;"
     );
 
@@ -2187,7 +2344,7 @@ class AppEntry {
         alias_target_terminal.diagnostics
     );
     assert!(
-        alias_target_terminal.matches.is_empty(),
+        alias_target_terminal.structural_matches().is_empty(),
         "unexpected aliased target terminal import match: {alias_target_terminal:?}"
     );
 
@@ -2204,7 +2361,7 @@ class AppEntry {
         shared_import_prefix.diagnostics
     );
     assert!(
-        shared_import_prefix.matches.is_empty(),
+        shared_import_prefix.structural_matches().is_empty(),
         "unexpected shared-prefix import match: {shared_import_prefix:?}"
     );
 
@@ -2221,7 +2378,7 @@ class AppEntry {
         declarations.diagnostics
     );
     let declaration_rows: Vec<_> = declarations
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.kind, m.text.as_str()))
         .collect();
@@ -2254,8 +2411,11 @@ class AppEntry {
         "{:?}",
         decorated_class.diagnostics
     );
-    assert_eq!(decorated_class.matches.len(), 1);
-    assert_eq!(decorated_class.matches[0].text, "[Route(\"/run\")]…");
+    assert_eq!(decorated_class.structural_matches().len(), 1);
+    assert_eq!(
+        decorated_class.structural_matches()[0].text,
+        "[Route(\"/run\")]…"
+    );
 
     let lambda = run_query_with_files(
         &[("csharp/App.cs", CSHARP_APP)],
@@ -2265,8 +2425,8 @@ class AppEntry {
         }),
     );
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
-    assert_eq!(lambda.matches.len(), 1);
-    assert_eq!(lambda.matches[0].text, "value => {…");
+    assert_eq!(lambda.structural_matches().len(), 1);
+    assert_eq!(lambda.structural_matches()[0].text, "value => {…");
 }
 
 #[test]
@@ -2319,9 +2479,9 @@ end
         }),
     );
     assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
-    assert_eq!(audit.matches.len(), 1);
-    assert_eq!(audit.matches[0].text, "audit(code)");
-    assert_eq!(audit.matches[0].captures[0].text, "code");
+    assert_eq!(audit.structural_matches().len(), 1);
+    assert_eq!(audit.structural_matches()[0].text, "audit(code)");
+    assert_eq!(audit.structural_matches()[0].captures[0].text, "code");
 
     let method_call = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2339,8 +2499,11 @@ end
         "{:?}",
         method_call.diagnostics
     );
-    assert_eq!(method_call.matches.len(), 1);
-    assert_eq!(method_call.matches[0].text, r#"service.run("input")"#);
+    assert_eq!(method_call.structural_matches().len(), 1);
+    assert_eq!(
+        method_call.structural_matches()[0].text,
+        r#"service.run("input")"#
+    );
 
     let named_argument = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2360,9 +2523,15 @@ end
         "{:?}",
         named_argument.diagnostics
     );
-    assert_eq!(named_argument.matches.len(), 1);
-    assert_eq!(named_argument.matches[0].text, "audit_named(code: code)");
-    assert_eq!(named_argument.matches[0].captures[0].text, "code");
+    assert_eq!(named_argument.structural_matches().len(), 1);
+    assert_eq!(
+        named_argument.structural_matches()[0].text,
+        "audit_named(code: code)"
+    );
+    assert_eq!(
+        named_argument.structural_matches()[0].captures[0].text,
+        "code"
+    );
 
     let assignment = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2380,9 +2549,15 @@ end
         "{:?}",
         assignment.diagnostics
     );
-    assert_eq!(assignment.matches.len(), 1);
-    assert_eq!(assignment.matches[0].text, r#"password = "hunter2""#);
-    assert_eq!(assignment.matches[0].captures[0].text, r#""hunter2""#);
+    assert_eq!(assignment.structural_matches().len(), 1);
+    assert_eq!(
+        assignment.structural_matches()[0].text,
+        r#"password = "hunter2""#
+    );
+    assert_eq!(
+        assignment.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
 
     let signed_numeric = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2400,9 +2575,12 @@ end
         "{:?}",
         signed_numeric.diagnostics
     );
-    assert_eq!(signed_numeric.matches.len(), 1);
-    assert_eq!(signed_numeric.matches[0].text, "LIMIT = -3");
-    assert_eq!(signed_numeric.matches[0].captures[0].text, "-3");
+    assert_eq!(signed_numeric.structural_matches().len(), 1);
+    assert_eq!(signed_numeric.structural_matches()[0].text, "LIMIT = -3");
+    assert_eq!(
+        signed_numeric.structural_matches()[0].captures[0].text,
+        "-3"
+    );
 
     let boolean_literal = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2416,8 +2594,8 @@ end
         "{:?}",
         boolean_literal.diagnostics
     );
-    assert_eq!(boolean_literal.matches.len(), 1);
-    assert_eq!(boolean_literal.matches[0].text, "true");
+    assert_eq!(boolean_literal.structural_matches().len(), 1);
+    assert_eq!(boolean_literal.structural_matches()[0].text, "true");
 
     let field_access = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2435,10 +2613,10 @@ end
         "{:?}",
         field_access.diagnostics
     );
-    assert_eq!(field_access.matches.len(), 2);
+    assert_eq!(field_access.structural_matches().len(), 2);
     assert!(
         field_access
-            .matches
+            .structural_matches()
             .iter()
             .all(|m| m.text == "App::Service")
     );
@@ -2451,8 +2629,11 @@ end
         }),
     );
     assert!(import.diagnostics.is_empty(), "{:?}", import.diagnostics);
-    assert_eq!(import.matches.len(), 1);
-    assert_eq!(import.matches[0].text, r#"require "app/support""#);
+    assert_eq!(import.structural_matches().len(), 1);
+    assert_eq!(
+        import.structural_matches()[0].text,
+        r#"require "app/support""#
+    );
 
     let dynamic_import_module = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2467,7 +2648,7 @@ end
         dynamic_import_module.diagnostics
     );
     assert!(
-        dynamic_import_module.matches.is_empty(),
+        dynamic_import_module.structural_matches().is_empty(),
         "dynamic require module names should not be exposed as precise module roles: {dynamic_import_module:?}"
     );
 
@@ -2487,9 +2668,9 @@ end
         "{:?}",
         receiver_require_call.diagnostics
     );
-    assert_eq!(receiver_require_call.matches.len(), 1);
+    assert_eq!(receiver_require_call.structural_matches().len(), 1);
     assert_eq!(
-        receiver_require_call.matches[0].text,
+        receiver_require_call.structural_matches()[0].text,
         r#"loader.require("plugin")"#
     );
 
@@ -2506,7 +2687,9 @@ end
         receiver_require_is_not_import.diagnostics
     );
     assert!(
-        receiver_require_is_not_import.matches.is_empty(),
+        receiver_require_is_not_import
+            .structural_matches()
+            .is_empty(),
         "receiver require calls should not be classified as imports: {receiver_require_is_not_import:?}"
     );
 
@@ -2522,8 +2705,11 @@ end
         "{:?}",
         qualified_class.diagnostics
     );
-    assert_eq!(qualified_class.matches.len(), 1);
-    assert_eq!(qualified_class.matches[0].text, "class App::External…");
+    assert_eq!(qualified_class.structural_matches().len(), 1);
+    assert_eq!(
+        qualified_class.structural_matches()[0].text,
+        "class App::External…"
+    );
 
     let declarations = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2538,7 +2724,7 @@ end
         declarations.diagnostics
     );
     let declaration_rows: Vec<_> = declarations
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.kind, m.text.as_str()))
         .collect();
@@ -2561,8 +2747,8 @@ end
         }),
     );
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
-    assert_eq!(lambda.matches.len(), 1);
-    assert_eq!(lambda.matches[0].text, "->(value) {…");
+    assert_eq!(lambda.structural_matches().len(), 1);
+    assert_eq!(lambda.structural_matches()[0].text, "->(value) {…");
 
     let unsupported_decorator = run_query_with_files(
         &[("ruby/app.rb", RUBY_APP)],
@@ -2601,10 +2787,10 @@ fn same_eval_call_query_matches_python_java_javascript_and_typescript() {
         "all project languages should have structural adapters: {:?}",
         output.diagnostics
     );
-    assert_eq!(output.matches.len(), 4);
+    assert_eq!(output.structural_matches().len(), 4);
 
     let rows: Vec<_> = output
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.language, m.path.as_str(), m.text.as_str()))
         .collect();
@@ -2618,7 +2804,7 @@ fn same_eval_call_query_matches_python_java_javascript_and_typescript() {
         ]
     );
 
-    for m in &output.matches {
+    for m in &output.structural_matches() {
         assert!(
             m.captures
                 .iter()
@@ -2643,8 +2829,8 @@ fn assignment_query_matches_variable_initializers_across_languages() {
     }));
 
     assert!(output.diagnostics.is_empty());
-    assert_eq!(output.matches.len(), 4);
-    for m in &output.matches {
+    assert_eq!(output.structural_matches().len(), 4);
+    for m in &output.structural_matches() {
         assert_eq!(
             m.captures.len(),
             1,
@@ -2664,7 +2850,10 @@ fn assignment_query_does_not_match_uninitialized_declarations() {
         }
     }));
 
-    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+    assert!(
+        output.structural_matches().is_empty(),
+        "unexpected matches: {output:?}"
+    );
 }
 
 #[test]
@@ -2679,7 +2868,7 @@ fn decorator_query_matches_python_decorators_java_annotations_and_js_ts_decorato
 
     assert!(output.diagnostics.is_empty());
     let rows: Vec<_> = output
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.language, m.path.as_str(), m.kind))
         .collect();
@@ -2693,7 +2882,11 @@ fn decorator_query_matches_python_decorators_java_annotations_and_js_ts_decorato
         ]
     );
 
-    let snippets: Vec<_> = output.matches.iter().map(|m| m.text.as_str()).collect();
+    let snippets: Vec<_> = output
+        .structural_matches()
+        .iter()
+        .map(|m| m.text.as_str())
+        .collect();
     assert_eq!(
         snippets,
         vec![
@@ -2716,8 +2909,8 @@ fn full_detail_reports_decorator_ranges_for_decorated_callables() {
         "result_detail": "full"
     }));
 
-    assert_eq!(output.matches.len(), 4);
-    for m in &output.matches {
+    assert_eq!(output.structural_matches().len(), 4);
+    for m in &output.structural_matches() {
         let node_range = m.node_range.expect("full detail node range");
         assert_eq!(
             m.decorator_ranges.len(),
@@ -2808,9 +3001,9 @@ class TsController {}
     );
 
     assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-    assert_eq!(output.matches.len(), 4);
+    assert_eq!(output.structural_matches().len(), 4);
     let mut languages = output
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| m.language)
         .collect::<Vec<_>>();
@@ -2819,7 +3012,7 @@ class TsController {}
         languages,
         vec!["java", "javascript", "python", "typescript"]
     );
-    for m in &output.matches {
+    for m in &output.structural_matches() {
         assert_eq!(m.kind, "class");
         assert_eq!(m.decorator_ranges.len(), 1, "{m:?}");
         assert!(m.decorated_range.is_some(), "{m:?}");
@@ -2834,10 +3027,10 @@ fn js_ts_constructors_are_refined_and_excluded_from_named_callable_queries() {
         "match": { "kind": "constructor" }
     }));
     assert!(constructors.diagnostics.is_empty());
-    assert_eq!(constructors.matches.len(), 2);
+    assert_eq!(constructors.structural_matches().len(), 2);
     assert!(
         constructors
-            .matches
+            .structural_matches()
             .iter()
             .all(|m| m.kind == "constructor" && m.text.starts_with("constructor")),
         "unexpected constructor matches: {constructors:?}"
@@ -2849,7 +3042,7 @@ fn js_ts_constructors_are_refined_and_excluded_from_named_callable_queries() {
     }));
     assert!(
         named_callables
-            .matches
+            .structural_matches()
             .iter()
             .all(|m| !m.text.starts_with("constructor")),
         "constructors should be excluded: {named_callables:?}"
@@ -2872,9 +3065,12 @@ fn js_ts_class_expressions_and_type_alias_names_are_searchable() {
         json!({ "match": { "kind": "class" } }),
     );
     assert!(output.diagnostics.is_empty());
-    assert_eq!(output.matches.len(), 2);
+    assert_eq!(output.structural_matches().len(), 2);
     assert!(
-        output.matches.iter().all(|m| m.text.starts_with("class")),
+        output
+            .structural_matches()
+            .iter()
+            .all(|m| m.text.starts_with("class")),
         "expected class-expression matches: {output:?}"
     );
 
@@ -2883,8 +3079,8 @@ fn js_ts_class_expressions_and_type_alias_names_are_searchable() {
         json!({ "match": { "kind": "declaration", "name": "UserId" } }),
     );
     assert!(alias.diagnostics.is_empty());
-    assert_eq!(alias.matches.len(), 1);
-    assert_eq!(alias.matches[0].text, "type UserId = string;");
+    assert_eq!(alias.structural_matches().len(), 1);
+    assert_eq!(alias.structural_matches()[0].text, "type UserId = string;");
 }
 
 #[test]
@@ -2903,9 +3099,12 @@ fn js_ts_import_modules_match_by_unquoted_module_name() {
         }),
     );
     assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].path, "javascript/imports.js");
-    assert_eq!(output.matches[0].text, r#"import React from "react";"#);
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(output.structural_matches()[0].path, "javascript/imports.js");
+    assert_eq!(
+        output.structural_matches()[0].text,
+        r#"import React from "react";"#
+    );
 
     let relative = run_query_with_files(
         &[(
@@ -2922,8 +3121,11 @@ fn js_ts_import_modules_match_by_unquoted_module_name() {
         "{:?}",
         relative.diagnostics
     );
-    assert_eq!(relative.matches.len(), 1);
-    assert_eq!(relative.matches[0].path, "typescript/imports.ts");
+    assert_eq!(relative.structural_matches().len(), 1);
+    assert_eq!(
+        relative.structural_matches()[0].path,
+        "typescript/imports.ts"
+    );
 }
 
 #[test]
@@ -2937,9 +3139,12 @@ fn java_import_modules_match_by_full_scoped_name() {
     );
 
     assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].path, "java/App.java");
-    assert_eq!(output.matches[0].text, "import java.util.List;");
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(output.structural_matches()[0].path, "java/App.java");
+    assert_eq!(
+        output.structural_matches()[0].text,
+        "import java.util.List;"
+    );
 }
 
 #[test]
@@ -2974,7 +3179,7 @@ fn member_call_callee_is_terminal_name_and_receiver_carries_object() {
 
     assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
     let rows: Vec<_> = output
-        .matches
+        .structural_matches()
         .iter()
         .map(|m| (m.language, m.path.as_str(), m.text.as_str()))
         .collect();
@@ -3010,9 +3215,9 @@ fn tsx_files_use_the_tsx_grammar_for_structural_search() {
     );
 
     assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].path, "typescript/widget.tsx");
-    assert_eq!(output.matches[0].text, "eval(code)");
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(output.structural_matches()[0].path, "typescript/widget.tsx");
+    assert_eq!(output.structural_matches()[0].text, "eval(code)");
 }
 
 #[test]

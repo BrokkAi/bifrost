@@ -174,7 +174,7 @@ fn assert_truncation_diagnostic(output: &CodeQueryResult, limit: usize) {
             .any(|diagnostic| diagnostic.language == "workspace"
                 && diagnostic
                     .message
-                    .contains(&format!("returned the first {limit} matches"))
+                    .contains(&format!("returned the first {limit} results"))
                 && diagnostic.message.contains("after scanning")
                 && diagnostic.message.contains("project-relative path")
                 && diagnostic.message.contains("where")
@@ -220,8 +220,8 @@ fn anchor_pruning_skips_files_without_the_anchor() {
         analyzer,
         json!({ "match": { "kind": "call", "callee": { "name": "eval" } } }),
     );
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].path, "src/uses_eval.py");
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(output.structural_matches()[0].path, "src/uses_eval.py");
     assert_eq!(
         extraction_count(analyzer),
         1,
@@ -237,12 +237,12 @@ fn facts_cache_serves_repeated_queries() {
     // Unanchored query: both files are parsed once.
     let broad = json!({ "match": { "kind": "callable" } });
     let first = run(analyzer, broad.clone());
-    assert_eq!(first.matches.len(), 2);
+    assert_eq!(first.structural_matches().len(), 2);
     assert_eq!(extraction_count(analyzer), 2);
 
     // Same query again: served entirely from the facts cache.
     let second = run(analyzer, broad);
-    assert_eq!(second.matches.len(), 2);
+    assert_eq!(second.structural_matches().len(), 2);
     assert_eq!(
         extraction_count(analyzer),
         2,
@@ -273,8 +273,8 @@ fn negative_constraints_never_prune() {
             "not_inside": { "kind": "class", "name": "Sandbox" }
         }),
     );
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].path, "src/no_eval.py");
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(output.structural_matches()[0].path, "src/no_eval.py");
 }
 
 #[test]
@@ -286,7 +286,7 @@ fn where_globs_prune_before_any_parse() {
         analyzer,
         json!({ "where": ["lib/**/*.py"], "match": { "kind": "call" } }),
     );
-    assert!(output.matches.is_empty());
+    assert!(output.structural_matches().is_empty());
     assert_eq!(
         extraction_count(analyzer),
         0,
@@ -306,8 +306,8 @@ fn where_globs_allow_matching_project_relative_paths() {
             "match": { "kind": "call", "callee": { "name": "eval" } }
         }),
     );
-    assert_eq!(output.matches.len(), 1);
-    assert_eq!(output.matches[0].path, "src/uses_eval.py");
+    assert_eq!(output.structural_matches().len(), 1);
+    assert_eq!(output.structural_matches()[0].path, "src/uses_eval.py");
 }
 
 #[test]
@@ -319,10 +319,10 @@ fn limit_truncates_across_files_deterministically() {
         analyzer,
         json!({ "match": { "kind": "callable" }, "limit": 1 }),
     );
-    assert_eq!(output.matches.len(), 1);
+    assert_eq!(output.structural_matches().len(), 1);
     assert!(output.truncated);
     // Files are visited in sorted path order: no_eval.py before uses_eval.py.
-    assert_eq!(output.matches[0].path, "src/no_eval.py");
+    assert_eq!(output.structural_matches()[0].path, "src/no_eval.py");
     assert_truncation_diagnostic(&output, 1);
 }
 
@@ -341,7 +341,7 @@ fn limit_stops_after_global_truncation_is_known() {
         analyzer,
         json!({ "match": { "kind": "callable" }, "limit": 1 }),
     );
-    assert_eq!(output.matches.len(), 1);
+    assert_eq!(output.structural_matches().len(), 1);
     assert!(output.truncated);
     assert_truncation_diagnostic(&output, 1);
     assert_eq!(
@@ -375,7 +375,7 @@ fn anchored_and_scoped_queries_do_not_get_broad_guidance() {
         analyzer,
         json!({ "match": { "kind": "call", "callee": { "name": "eval" } } }),
     );
-    assert_eq!(anchored.matches.len(), 1);
+    assert_eq!(anchored.structural_matches().len(), 1);
     assert!(!anchored.truncated);
     assert_no_broad_query_diagnostic(&anchored);
 
@@ -403,7 +403,10 @@ fn broad_unanchored_large_complete_queries_get_guidance() {
 
     let output = run(analyzer, json!({ "match": { "kind": "class" } }));
 
-    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+    assert!(
+        output.structural_matches().is_empty(),
+        "unexpected matches: {output:?}"
+    );
     assert!(!output.truncated);
     assert_broad_query_diagnostic(&output);
 }
@@ -428,10 +431,14 @@ fn execution_budget_bounds_unanchored_no_match_queries() {
             max_scanned_files: 1,
             max_scanned_source_bytes: usize::MAX,
             max_fact_nodes: usize::MAX,
+            max_pipeline_rows: usize::MAX,
         },
     );
 
-    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+    assert!(
+        output.structural_matches().is_empty(),
+        "unexpected matches: {output:?}"
+    );
     assert!(output.truncated, "budget exhaustion should mark truncation");
     assert!(
         output
@@ -465,7 +472,10 @@ fn analyzer_language_without_provider_surfaces_as_diagnostic() {
         json!({ "match": { "kind": "call", "callee": { "name": "eval" } } }),
     );
 
-    assert!(output.matches.is_empty(), "unexpected matches: {output:?}");
+    assert!(
+        output.structural_matches().is_empty(),
+        "unexpected matches: {output:?}"
+    );
     assert!(
         output
             .diagnostics
@@ -492,8 +502,12 @@ fn formerly_unsupported_languages_are_searched_after_adapter_registration() {
         analyzer,
         json!({ "match": { "kind": "call", "callee": { "name": "eval" } } }),
     );
-    assert_eq!(output.matches.len(), 2);
-    let languages: Vec<_> = output.matches.iter().map(|mat| mat.language).collect();
+    assert_eq!(output.structural_matches().len(), 2);
+    let languages: Vec<_> = output
+        .structural_matches()
+        .iter()
+        .map(|mat| mat.language)
+        .collect();
     assert_eq!(languages, vec!["python", "ruby"]);
     assert!(
         output.diagnostics.is_empty(),
@@ -506,8 +520,8 @@ fn formerly_unsupported_languages_are_searched_after_adapter_registration() {
         analyzer,
         json!({ "languages": ["ruby"], "match": { "kind": "call" } }),
     );
-    assert_eq!(filtered.matches.len(), 1);
-    assert_eq!(filtered.matches[0].language, "ruby");
+    assert_eq!(filtered.structural_matches().len(), 1);
+    assert_eq!(filtered.structural_matches()[0].language, "ruby");
     assert!(
         filtered.diagnostics.is_empty(),
         "explicit ruby search should not produce adapter diagnostics: {:?}",
@@ -532,7 +546,7 @@ fn where_scope_suppresses_out_of_scope_language_diagnostics() {
         }),
     );
 
-    assert_eq!(output.matches.len(), 1);
+    assert_eq!(output.structural_matches().len(), 1);
     assert!(
         output.diagnostics.is_empty(),
         "ruby is outside the where scope and should not warn: {:?}",

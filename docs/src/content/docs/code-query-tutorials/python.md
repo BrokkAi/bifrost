@@ -3,7 +3,7 @@ title: Python
 description: Query Python calls, decorators, assignments, keyword arguments, and callable containment with query_code.
 ---
 
-> Last verified end to end: 2026-07-10 (`query_code` schema version 1).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
 
 Python exposes calls, receiver/member access, positional and keyword arguments, imports, assignments, decorated declarations, callable refinements, literals, and control-flow nodes through the normalized model. These examples deliberately include two `client.post(...)` calls so the narrowing query has something real to exclude.
 
@@ -68,8 +68,9 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
 <!-- code-query-case:filtered-post:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "python/app.py",
       "language": "python",
       "kind": "call",
@@ -125,8 +126,9 @@ This query requires a `route` decorator and an assignment whose left side is the
 <!-- code-query-case:decorated-assignment:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "python/app.py",
       "language": "python",
       "kind": "method",
@@ -174,8 +176,9 @@ This query requires a `route` decorator and an assignment whose left side is the
 <!-- code-query-case:named-callables:expected -->
 ```json
 {
-  "matches": [
+  "results": [
     {
+      "result_type": "structural_match",
       "path": "python/app.py",
       "language": "python",
       "kind": "method",

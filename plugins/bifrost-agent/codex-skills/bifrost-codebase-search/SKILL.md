@@ -35,7 +35,7 @@ that matches the thing you are looking for.
   analyzer-backed path and should be preferred over grep for code references.
 - Use `query_code` for normalized syntactic shapes such as calls by callee,
   assignments by left/right roles, imports, decorators, containment, or
-  captures. Version 1 is syntactic; use `scan_usages_by_location` or `usage_graph` when
+  captures. Version 2 also supports typed enclosing-declaration and direct import-file steps; use `scan_usages_by_location` or `usage_graph` when
   symbol identity or resolved caller/callee edges matter. The schema reference
   is https://brokkai.github.io/bifrost/code-query-json/.
 - Use `find_filenames` for path globs, basename searches, and repository file

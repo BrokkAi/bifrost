@@ -37,7 +37,7 @@ use lsp_types::{
 };
 
 use crate::analyzer::structural::query::{query_source_help_at, validate_query_source};
-use crate::analyzer::structural::{CodeQuery, execute};
+use crate::analyzer::structural::{CodeQuery, CodeQueryResultItem, CodeQueryResultValue, execute};
 use crate::analyzer::{
     AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
     OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
@@ -884,19 +884,22 @@ fn handle_run_rql_query_request(req: Request, workspace: &WorkspaceAnalyzer) -> 
     };
     let query_result = execute(workspace.analyzer(), &query);
     let workspace_root = workspace.analyzer().project().root();
+    let text = query_result.render_text();
     let result = RunRqlQueryResult {
-        text: query_result.render_text(),
-        matches: query_result
-            .matches
-            .iter()
-            .map(|matched| RunRqlQueryMatch {
-                uri: path_to_uri_string(&workspace_root.join(&matched.path)),
-                path: matched.path.clone(),
-                kind: matched.kind.to_owned(),
-                start_line: matched.start_line,
-                end_line: matched.end_line,
-                text: matched.text.clone(),
-                enclosing_symbol: matched.enclosing_symbol.clone(),
+        text,
+        results: query_result
+            .results
+            .into_iter()
+            .map(|result| {
+                let path = match &result.value {
+                    CodeQueryResultValue::StructuralMatch { value } => &value.path,
+                    CodeQueryResultValue::Declaration { value } => &value.path,
+                    CodeQueryResultValue::File { value } => &value.path,
+                };
+                RunRqlQueryResultItem {
+                    uri: path_to_uri_string(&workspace_root.join(path)),
+                    result,
+                }
             })
             .collect(),
     };
@@ -1697,7 +1700,11 @@ enum RunRqlQuery {}
 
 impl lsp_types::request::Request for RunRqlQuery {
     type Params = RunRqlQueryParams;
-    type Result = RunRqlQueryResult;
+    // The canonical CodeQuery result models are output-only because they
+    // contain analyzer-owned static metadata. This private request serializes
+    // that exact tagged shape rather than maintaining a second deserializable
+    // protocol model.
+    type Result = serde_json::Value;
 
     const METHOD: &'static str = "bifrost/queryCode";
 }
@@ -1707,23 +1714,18 @@ struct RunRqlQueryParams {
     query: String,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRqlQueryResult {
     text: String,
-    matches: Vec<RunRqlQueryMatch>,
+    results: Vec<RunRqlQueryResultItem>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RunRqlQueryMatch {
+#[derive(serde::Serialize)]
+struct RunRqlQueryResultItem {
     uri: String,
-    path: String,
-    kind: String,
-    start_line: usize,
-    end_line: usize,
-    text: String,
-    enclosing_symbol: Option<String>,
+    #[serde(flatten)]
+    result: CodeQueryResultItem,
 }
 
 /// Source-only query validation for the RQL editor. This deliberately has no

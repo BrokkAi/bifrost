@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Bifrost plugins for multi-language code intelligence and engineering workflows.",
-    "version": "0.8.0"
+    "version": "0.8.1"
   },
   "plugins": [
     {
       "name": "bifrost",
       "source": "plugins/bifrost-agent",
       "description": "Bifrost by Brokk: multi-language code intelligence and MCP workflows.",
-      "version": "0.8.0",
+      "version": "0.8.1",
       "author": {
         "name": "Brokk"
       },
