@@ -1409,6 +1409,11 @@ namespace App {
                 Some("Other.Target".to_string()),
                 Some("Alias".to_string()),
             ),
+            (
+                "using static Shared.Target;".to_string(),
+                Some("Shared.Target".to_string()),
+                None,
+            ),
         ],
         imports
     );
@@ -1602,6 +1607,315 @@ namespace App {
             "grouped overload order changed hits: {hits:#?}"
         );
     }
+}
+
+#[test]
+fn usage_finder_csharp_accepts_optional_and_params_arity_ranges() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Service.cs",
+            r#"
+namespace Domain {
+    public sealed class Service {
+        public Service(string label = "default") {}
+        public void Send(int required, string note = "default") {}
+        public void Pack(string head, params object[] tail) {}
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public sealed class Consumer {
+        public void Run(Service service) {
+            new Service();
+            new Service("named");
+            new Service("too", "many");
+            service.Send(1);
+            service.Send(1, "note");
+            service.Send();
+            service.Send(1, "note", "extra");
+            service.Pack("head");
+            service.Pack("head", 1, 2);
+            service.Pack();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let constructor = member_function(&analyzer, "Domain.Service", "Service");
+    let send = member_function(&analyzer, "Domain.Service", "Send");
+    let pack = member_function(&analyzer, "Domain.Service", "Pack");
+    let consumer = project.file("App/Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let source = consumer.read_to_string().expect("consumer source");
+    let constructor_offsets = source
+        .match_indices("new Service")
+        .map(|(start, _)| start + "new ".len())
+        .collect::<Vec<_>>();
+    let send_offsets = source
+        .match_indices("service.Send")
+        .map(|(start, _)| start + "service.".len())
+        .collect::<Vec<_>>();
+    let pack_offsets = source
+        .match_indices("service.Pack")
+        .map(|(start, _)| start + "service.".len())
+        .collect::<Vec<_>>();
+
+    for (target, expected_offsets, rejected_offsets) in [
+        (
+            constructor,
+            constructor_offsets[..2].to_vec(),
+            constructor_offsets[2..].to_vec(),
+        ),
+        (send, send_offsets[..2].to_vec(), send_offsets[2..].to_vec()),
+        (pack, pack_offsets[..2].to_vec(), pack_offsets[2..].to_vec()),
+    ] {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            );
+        assert_eq!(
+            query.candidate_files,
+            std::iter::once(consumer.clone()).collect()
+        );
+        let hits = query
+            .result
+            .into_either()
+            .unwrap_or_else(|error| panic!("{} should resolve: {error}", target.fq_name()));
+        assert_eq!(
+            hits.len(),
+            expected_offsets.len(),
+            "{} accepted the wrong arity sites: {hits:#?}",
+            target.fq_name()
+        );
+        for offset in expected_offsets {
+            assert!(
+                hits.iter()
+                    .any(|hit| hit.start_offset <= offset && offset < hit.end_offset),
+                "{} omitted byte {offset}: {hits:#?}",
+                target.fq_name()
+            );
+        }
+        for offset in rejected_offsets {
+            assert!(
+                hits.iter()
+                    .all(|hit| !(hit.start_offset <= offset && offset < hit.end_offset)),
+                "{} accepted invalid-arity byte {offset}: {hits:#?}",
+                target.fq_name()
+            );
+        }
+    }
+}
+
+#[test]
+fn usage_finder_csharp_optional_extension_distinguishes_call_syntax() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Extensions.cs",
+            r#"
+namespace Domain {
+    public static class Extensions {
+        public static string Tag(this string value, string suffix = "") => value + suffix;
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public sealed class Consumer {
+        public void Run(string name) {
+            name.Tag();
+            name.Tag("x");
+            Extensions.Tag(name);
+            Extensions.Tag();
+            name.Tag("x", "y");
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = member_function(&analyzer, "Domain.Extensions", "Tag");
+    let consumer = project.file("App/Consumer.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let offsets = source
+        .match_indices("Tag")
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("optional extension query should resolve");
+
+    assert_eq!(
+        3,
+        hits.len(),
+        "only valid extension calls should match: {hits:#?}"
+    );
+    for offset in &offsets[..3] {
+        assert!(
+            hits.iter()
+                .any(|hit| hit.start_offset <= *offset && *offset < hit.end_offset),
+            "valid extension call at byte {offset} was omitted: {hits:#?}"
+        );
+    }
+    for offset in &offsets[3..] {
+        assert!(
+            hits.iter()
+                .all(|hit| !(hit.start_offset <= *offset && *offset < hit.end_offset)),
+            "invalid extension call at byte {offset} was accepted: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn csharp_graph_optional_factory_call_seeds_receiver_type() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Types.cs",
+            r#"
+namespace Domain {
+    public sealed class Product {
+        public void Use() {}
+    }
+    public sealed class Factory {
+        public Product Create(string label = "") => new Product();
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+namespace App {
+    public sealed class Consumer {
+        public void Run(Factory factory) {
+            var product = factory.Create();
+            product.Use();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = member_function(&analyzer, "Domain.Product", "Use");
+    let consumer = project.file("App/Consumer.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let use_offset = source.find("Use").expect("Use call");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("optional factory return should type its receiver");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.start_offset <= use_offset && use_offset < hit.end_offset),
+        "optional factory return did not seed Product receiver: {hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_graph_factory_return_keeps_overlapping_arity_untyped() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[(
+        "App.cs",
+        r#"
+namespace App {
+    public sealed class ExactProduct { public void Use() {} }
+    public sealed class OptionalProduct { public void Use() {} }
+    public sealed class FixedProduct { public void Use() {} }
+    public sealed class ParamsProduct { public void Use() {} }
+    public sealed class Factory {
+        public ExactProduct Create() => new ExactProduct();
+        public OptionalProduct Create(int count = 0) => new OptionalProduct();
+        public FixedProduct Make(string head, object tail) => new FixedProduct();
+        public ParamsProduct Make(string head, params object[] tail) => new ParamsProduct();
+    }
+    public sealed class Consumer {
+        public void Exact(Factory factory) {
+            var product = factory.Create();
+            product.Use();
+        }
+        public void Fixed(Factory factory) {
+            var product = factory.Make("head", "tail");
+            product.Use();
+        }
+    }
+}
+"#,
+    )]);
+
+    assert!(
+        graph_hits(
+            &analyzer,
+            &member_function(&analyzer, "App.ExactProduct", "Use")
+        )
+        .is_empty(),
+        "overlapping exact and optional overloads need argument-type evidence"
+    );
+    assert!(
+        graph_hits(
+            &analyzer,
+            &member_function(&analyzer, "App.OptionalProduct", "Use")
+        )
+        .is_empty(),
+        "overlapping exact and optional overloads must remain conservatively untyped"
+    );
+    assert!(
+        graph_hits(
+            &analyzer,
+            &member_function(&analyzer, "App.FixedProduct", "Use")
+        )
+        .is_empty(),
+        "equal-total fixed and params overloads need argument-type evidence"
+    );
+    assert!(
+        graph_hits(
+            &analyzer,
+            &member_function(&analyzer, "App.ParamsProduct", "Use")
+        )
+        .is_empty(),
+        "equal-total fixed and params overloads must remain conservatively untyped"
+    );
 }
 
 #[test]

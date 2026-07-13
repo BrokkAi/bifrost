@@ -1,5 +1,7 @@
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata};
+use crate::analyzer::{
+    CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata,
+};
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
@@ -586,9 +588,10 @@ fn csharp_constructor_skeleton(node: Node<'_>, source: &str) -> String {
 }
 
 fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let callable_arity = csharp_callable_arity(node);
     let parameter_text = csharp_rendered_parameter_text(node, source);
     let Some(parameters_start) = signature.find(&parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return SignatureMetadata::new(signature, Vec::new()).with_callable_arity(callable_arity);
     };
     let parameters_end = parameters_start + parameter_text.len();
     let mut search_start = parameters_start;
@@ -607,7 +610,41 @@ fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
+    SignatureMetadata::new(signature, parameters).with_callable_arity(callable_arity)
+}
+
+fn csharp_callable_arity(node: Node<'_>) -> CallableArity {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return CallableArity::exact(0);
+    };
+    let mut required = 0usize;
+    let mut total = 0usize;
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "parameter" {
+            continue;
+        }
+        total += 1;
+        let mut parameter_cursor = parameter.walk();
+        let optional = parameter
+            .children(&mut parameter_cursor)
+            .any(|child| child.kind() == "=");
+        if !optional {
+            required += 1;
+        }
+    }
+    let repeated = csharp_parameter_list_has_params(parameters);
+    if repeated {
+        total += 1;
+    }
+    CallableArity::new(required, total, repeated)
+}
+
+fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
+    let mut cursor = parameters.walk();
+    parameters
+        .children(&mut cursor)
+        .any(|child| child.kind() == "params")
 }
 
 fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
@@ -638,6 +675,11 @@ fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
             labels.push(name);
         }
     }
+    if csharp_parameter_list_has_params(parameters)
+        && let Some(name) = parameters.child_by_field_name("name")
+    {
+        labels.push(name);
+    }
     labels
 }
 
@@ -660,6 +702,11 @@ fn csharp_parameter_key(node: Node<'_>, source: &str) -> String {
             .map(|type_node| normalize_cs_whitespace(cs_node_text(type_node, source)))
             .unwrap_or_else(|| normalize_cs_whitespace(cs_node_text(child, source)));
         parts.push(part);
+    }
+    if csharp_parameter_list_has_params(parameters)
+        && let Some(type_node) = parameters.child_by_field_name("type")
+    {
+        parts.push(normalize_cs_whitespace(cs_node_text(type_node, source)));
     }
     format!("({})", parts.join(", "))
 }

@@ -10,7 +10,7 @@ mod tests;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CallableArity, CodeUnit, IAnalyzer,
     ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
     UsageFactsIndex,
@@ -24,7 +24,9 @@ use tree_sitter::Node;
 use adapter::CSharpAdapter;
 use cache::CSharpMemoCaches;
 use clones::{build_csharp_clone_candidate_data, refine_csharp_clone_similarity};
-use imports::{csharp_using_alias_from_import, csharp_using_namespace};
+use imports::{
+    csharp_static_using_from_import, csharp_using_alias_from_import, csharp_using_namespace,
+};
 use tests::detect_csharp_test_assertion_smells;
 
 pub(crate) fn csharp_using_directive_is_static(node: Node<'_>) -> bool {
@@ -189,6 +191,28 @@ impl CSharpAnalyzer {
         aliases
     }
 
+    pub(crate) fn static_using_types_of(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+        if let Some(cached) = self.memo_caches.static_using_types.get(file) {
+            return (*cached).clone();
+        }
+
+        let mut types = self
+            .inner
+            .import_info_of(file)
+            .iter()
+            .filter(|import| !import.raw_snippet.trim_start().starts_with("global using "))
+            .filter_map(csharp_static_using_from_import)
+            .flat_map(|target| self.visible_type_candidates(file, target))
+            .collect::<Vec<_>>();
+        types.extend(self.global_static_using_types().iter().cloned());
+        types.sort();
+        types.dedup();
+        self.memo_caches
+            .static_using_types
+            .insert(file.clone(), Arc::new(types.clone()));
+        types
+    }
+
     fn global_using_namespaces(&self) -> &HashSet<String> {
         self.memo_caches.global_using_namespaces.get_or_init(|| {
             self.inner
@@ -210,6 +234,27 @@ impl CSharpAnalyzer {
                 .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
                 .filter_map(|import| csharp_using_alias_from_import(&import))
                 .collect()
+        })
+    }
+
+    fn global_static_using_types(&self) -> &Vec<CodeUnit> {
+        self.memo_caches.global_static_using_types.get_or_init(|| {
+            let mut types = Vec::new();
+            for file in self.inner.all_files() {
+                types.extend(
+                    self.inner
+                        .import_info_of(&file)
+                        .iter()
+                        .filter(|import| {
+                            import.raw_snippet.trim_start().starts_with("global using ")
+                        })
+                        .filter_map(csharp_static_using_from_import)
+                        .flat_map(|target| self.visible_type_candidates(&file, target)),
+                );
+            }
+            types.sort();
+            types.dedup();
+            types
         })
     }
 
@@ -581,6 +626,14 @@ pub(crate) fn csharp_signature_arity(signature: Option<&str>) -> usize {
         return 0;
     }
     count_top_level_comma_separated(inner)
+}
+
+pub(crate) fn csharp_callable_arity(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> CallableArity {
+    analyzer
+        .signature_metadata(unit)
+        .into_iter()
+        .find_map(|metadata| metadata.callable_arity())
+        .unwrap_or_else(|| CallableArity::exact(csharp_signature_arity(unit.signature())))
 }
 
 pub(crate) fn csharp_signature_return_type(signature: &str, name: &str) -> Option<String> {

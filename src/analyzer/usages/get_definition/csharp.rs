@@ -1,7 +1,9 @@
 use super::*;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{csharp_attribute_name_node, csharp_attribute_type_names};
+use crate::analyzer::{
+    csharp_attribute_name_node, csharp_attribute_type_names, csharp_normalize_full_name,
+};
 
 pub(super) struct CSharpDefinitionProvider<'a> {
     csharp: &'a CSharpAnalyzer,
@@ -137,13 +139,33 @@ pub(super) fn resolve_csharp(
                 receiver,
             );
             let arity = csharp_invocation_arity(name, source);
-            let outcome = csharp_member_outcome(analyzer, definitions, owners, member, arity);
+            let outcome =
+                csharp_member_outcome(analyzer, definitions, owners.clone(), member, arity, false);
             if outcome.status == DefinitionLookupStatus::NoDefinition {
-                let extensions =
-                    csharp_extension_method_candidates(csharp, analyzer, file, member, arity);
+                let extensions = csharp_extension_method_candidates(
+                    csharp, analyzer, file, &owners, member, arity, false,
+                );
                 if !extensions.is_empty() {
                     return candidates_outcome(extensions);
                 }
+                let fallback = csharp_member_outcome(
+                    analyzer,
+                    definitions,
+                    owners.clone(),
+                    member,
+                    arity,
+                    true,
+                );
+                if fallback.status != DefinitionLookupStatus::NoDefinition {
+                    return fallback;
+                }
+                let extensions = csharp_extension_method_candidates(
+                    csharp, analyzer, file, &owners, member, arity, true,
+                );
+                if !extensions.is_empty() {
+                    return candidates_outcome(extensions);
+                }
+                return fallback;
             }
             outcome
         }
@@ -167,7 +189,7 @@ pub(super) fn resolve_csharp(
                 .into_iter()
                 .collect();
             let arity = csharp_invocation_arity(name, source);
-            let outcome = csharp_member_outcome(analyzer, definitions, owners, member, arity);
+            let outcome = csharp_member_outcome(analyzer, definitions, owners, member, arity, true);
             if outcome.status == DefinitionLookupStatus::NoDefinition
                 && csharp_static_using_boundary_for_member(csharp, definitions, file)
             {
@@ -210,7 +232,7 @@ pub(super) fn resolve_csharp(
                         csharp_enclosing_class(analyzer, file, identifier.start_byte())
                 {
                     let outcome =
-                        csharp_member_outcome(analyzer, definitions, vec![owner], text, None);
+                        csharp_member_outcome(analyzer, definitions, vec![owner], text, None, true);
                     if outcome.status != DefinitionLookupStatus::NoDefinition {
                         return outcome;
                     }
@@ -778,10 +800,14 @@ fn resolve_csharp_constructor(
     }
     sort_units(&mut constructors);
     constructors.dedup();
-    constructors = csharp_filter_candidates_by_arity(
-        constructors,
+    let applicable = csharp_filter_candidates_by_arity(
+        csharp,
+        &constructors,
         Some(csharp_argument_count(creation, source)),
     );
+    if !applicable.is_empty() {
+        return candidates_outcome(applicable);
+    }
     if !constructors.is_empty() {
         return candidates_outcome(constructors);
     }
@@ -889,6 +915,7 @@ fn csharp_member_outcome(
     owners: Vec<CodeUnit>,
     member: &str,
     arity: Option<usize>,
+    fallback_when_inapplicable: bool,
 ) -> DefinitionLookupOutcome {
     if owners.is_empty() {
         return no_definition(
@@ -920,9 +947,19 @@ fn csharp_member_outcome(
     }
     sort_units(&mut direct_candidates);
     direct_candidates.dedup();
-    let direct_candidates = csharp_filter_candidates_by_arity(direct_candidates, arity);
+    let applicable = csharp_filter_candidates_by_arity(analyzer, &direct_candidates, arity);
+    if !applicable.is_empty() {
+        return candidates_outcome(applicable);
+    }
     if !direct_candidates.is_empty() {
-        return candidates_outcome(direct_candidates);
+        return if fallback_when_inapplicable {
+            candidates_outcome(direct_candidates)
+        } else {
+            no_definition(
+                "no_applicable_overload",
+                format!("no C# member `{member}` overload accepts this call"),
+            )
+        };
     }
 
     if let Some(provider) = analyzer.type_hierarchy_provider() {
@@ -945,9 +982,19 @@ fn csharp_member_outcome(
             }
             sort_units(&mut level_candidates);
             level_candidates.dedup();
-            let level_candidates = csharp_filter_candidates_by_arity(level_candidates, arity);
+            let applicable = csharp_filter_candidates_by_arity(analyzer, &level_candidates, arity);
+            if !applicable.is_empty() {
+                return candidates_outcome(applicable);
+            }
             if !level_candidates.is_empty() {
-                return candidates_outcome(level_candidates);
+                return if fallback_when_inapplicable {
+                    candidates_outcome(level_candidates)
+                } else {
+                    no_definition(
+                        "no_applicable_overload",
+                        format!("no inherited C# member `{member}` overload accepts this call"),
+                    )
+                };
             }
             level = next_level;
         }
@@ -986,6 +1033,7 @@ fn csharp_object_initializer_label_outcome(
         vec![owner],
         csharp_node_text(label, source),
         None,
+        true,
     ))
 }
 
@@ -1020,68 +1068,132 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
 }
 
 fn csharp_filter_candidates_by_arity(
-    candidates: Vec<CodeUnit>,
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
     arity: Option<usize>,
 ) -> Vec<CodeUnit> {
     let Some(expected) = arity else {
-        return candidates;
+        return candidates.to_vec();
     };
-    let filtered: Vec<_> = candidates
+    let applicable: Vec<_> = candidates
         .iter()
-        .filter(|unit| unit.is_function() && csharp_signature_arity(unit.signature()) == expected)
-        .cloned()
+        .filter_map(|unit| {
+            if !unit.is_function() {
+                return None;
+            }
+            let callable_arity = csharp_callable_arity(analyzer, unit);
+            callable_arity
+                .accepts(expected)
+                .then(|| (unit.clone(), callable_arity))
+        })
         .collect();
-    if filtered.is_empty() {
-        candidates
-    } else {
-        filtered
-    }
+    applicable.into_iter().map(|(unit, _)| unit).collect()
 }
 
 fn csharp_extension_method_candidates(
     csharp: &CSharpAnalyzer,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
+    receiver_owners: &[CodeUnit],
     member: &str,
     arity: Option<usize>,
+    fallback_when_inapplicable: bool,
 ) -> Vec<CodeUnit> {
     let mut namespaces = csharp.using_namespaces_of(file);
+    let static_using_types = csharp.static_using_types_of(file);
     let file_namespace = csharp.namespace_of_file(file);
     if !file_namespace.is_empty() {
         namespaces.push(file_namespace);
     }
     namespaces.sort();
     namespaces.dedup();
+    let receiver_type_names = csharp_compatible_receiver_type_names(analyzer, receiver_owners);
 
     let mut candidates: Vec<_> = csharp
         .declaration_candidates_by_identifier(member)
         .into_iter()
         .filter(|unit| unit.is_function() && unit.identifier() == member)
-        .filter(|unit| csharp_extension_declaring_type_is_visible(&namespaces, unit))
+        .filter(|unit| {
+            csharp_extension_declaring_type_is_visible(
+                analyzer,
+                &namespaces,
+                &static_using_types,
+                unit,
+            )
+        })
         .filter(|unit| csharp_is_extension_method(analyzer, unit))
+        .filter(|unit| {
+            csharp_extension_receiver_is_compatible(analyzer, &receiver_type_names, unit)
+        })
         .collect();
     sort_units(&mut candidates);
     candidates.dedup();
 
     if let Some(call_arity) = arity {
         let expected = call_arity + 1;
-        let exact: Vec<_> = candidates
-            .iter()
-            .filter(|unit| csharp_signature_arity(unit.signature()) == expected)
-            .cloned()
-            .collect();
-        if !exact.is_empty() {
-            return exact;
+        let applicable = csharp_filter_candidates_by_arity(analyzer, &candidates, Some(expected));
+        if !applicable.is_empty() {
+            return applicable;
         }
+        return if fallback_when_inapplicable {
+            candidates
+        } else {
+            Vec::new()
+        };
     }
 
     candidates
 }
 
-fn csharp_extension_declaring_type_is_visible(namespaces: &[String], unit: &CodeUnit) -> bool {
+fn csharp_extension_declaring_type_is_visible(
+    analyzer: &dyn IAnalyzer,
+    namespaces: &[String],
+    static_using_types: &[CodeUnit],
+    unit: &CodeUnit,
+) -> bool {
     namespaces
         .iter()
         .any(|namespace| unit.package_name() == namespace)
+        || analyzer.parent_of(unit).is_some_and(|owner| {
+            let owner = csharp_normalize_full_name(&owner.fq_name());
+            static_using_types
+                .iter()
+                .any(|target| csharp_normalize_full_name(&target.fq_name()) == owner)
+        })
+}
+
+fn csharp_extension_receiver_is_compatible(
+    analyzer: &dyn IAnalyzer,
+    receiver_type_names: &HashSet<String>,
+    extension: &CodeUnit,
+) -> bool {
+    if receiver_type_names.is_empty() {
+        return true;
+    }
+    let Some(extension_receiver) = csharp_extension_method_receiver_type(analyzer, extension)
+    else {
+        return true;
+    };
+    receiver_type_names.contains(&csharp_normalize_full_name(&extension_receiver))
+}
+
+fn csharp_compatible_receiver_type_names(
+    analyzer: &dyn IAnalyzer,
+    receiver_owners: &[CodeUnit],
+) -> HashSet<String> {
+    let mut compatible = HashSet::default();
+    for owner in receiver_owners {
+        compatible.insert(csharp_normalize_full_name(&owner.fq_name()));
+        if let Some(provider) = analyzer.type_hierarchy_provider() {
+            compatible.extend(
+                provider
+                    .get_ancestors(owner)
+                    .into_iter()
+                    .map(|ancestor| csharp_normalize_full_name(&ancestor.fq_name())),
+            );
+        }
+    }
+    compatible
 }
 
 fn csharp_receiver_type_units(

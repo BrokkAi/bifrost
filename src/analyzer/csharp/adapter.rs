@@ -68,9 +68,12 @@ impl LanguageAdapter for CSharpAdapter {
     fn callable_arity(
         &self,
         signature: &str,
-        _metadata: Option<&SignatureMetadata>,
+        metadata: Option<&SignatureMetadata>,
     ) -> Option<usize> {
-        Some(csharp_signature_arity(Some(signature)))
+        metadata
+            .and_then(SignatureMetadata::callable_arity)
+            .map(|arity| arity.total())
+            .or_else(|| Some(csharp_signature_arity(Some(signature))))
     }
 
     fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {

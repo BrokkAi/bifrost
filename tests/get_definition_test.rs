@@ -12322,6 +12322,246 @@ fn csharp_extension_method_resolves_from_visible_namespace() {
 }
 
 #[test]
+fn csharp_inapplicable_direct_member_yields_to_matching_extension() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/IListener.cs",
+            "namespace Demo { public interface IListener { void Signal(string id, int token, object data); } }\n",
+        )
+        .file(
+            "Demo/ListenerExtensions.cs",
+            "namespace Demo { public static class ListenerExtensions { public static void Signal(this IListener listener, string id) {} } }\n",
+        )
+        .file(
+            "App/Consumer.cs",
+            "using static Demo.ListenerExtensions;\nnamespace App { public sealed class Consumer { public void Run(Demo.IListener listener) { listener.Signal(\"ready\"); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public sealed class Consumer { public void Run(Demo.IListener listener) { listener.Signal(\"ready\"); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ListenerExtensions.Signal",
+        "an inapplicable direct member must not block a matching extension: {value}"
+    );
+}
+
+#[test]
+fn csharp_static_using_resolves_short_target_in_enclosing_namespace() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/Types.cs",
+            r#"namespace Demo {
+    using static ListenerExtensions;
+    public interface IListener { void Signal(string id, int token, object data); }
+    public static class ListenerExtensions {
+        public static void Signal(this IListener listener, string id) {}
+    }
+    public sealed class Consumer {
+        public void Run(IListener listener) { listener.Signal("ready"); }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        public void Run(IListener listener) { listener.Signal(\"ready\"); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"Demo/Types.cs","line":8,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Demo.ListenerExtensions.Signal",
+        "a short static-using target must resolve in its enclosing namespace: {value}"
+    );
+}
+
+#[test]
+fn csharp_global_static_using_applies_across_files() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/IListener.cs",
+            "namespace Demo { public interface IListener { void Signal(string id, int token, object data); } }\n",
+        )
+        .file(
+            "Demo/ListenerExtensions.cs",
+            "namespace Demo { public static class ListenerExtensions { public static void Signal(this IListener listener, string id) {} } }\n",
+        )
+        .file(
+            "GlobalUsings.cs",
+            "global using static Demo.ListenerExtensions;\n",
+        )
+        .file(
+            "App/Consumer.cs",
+            "namespace App { public sealed class Consumer { public void Run(Demo.IListener listener) { listener.Signal(\"ready\"); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public sealed class Consumer { public void Run(Demo.IListener listener) { listener.Signal(\"ready\"); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Demo.ListenerExtensions.Signal",
+        "a global static using must make extensions visible in other files: {value}"
+    );
+}
+
+#[test]
+fn csharp_inapplicable_direct_member_rejects_unrelated_extension_receiver() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/Listener.cs",
+            "namespace Demo { public sealed class Listener { public void Signal(string id, int token, object data) {} } }\n",
+        )
+        .file(
+            "Visible/Extensions.cs",
+            "namespace Visible { public static class Extensions { public static void Signal(this string value, string id) {} } }\n",
+        )
+        .file(
+            "App/Consumer.cs",
+            "using Demo;\nusing Visible;\nnamespace App { public sealed class Consumer { public void Run(Listener listener) { listener.Signal(\"ready\"); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public sealed class Consumer { public void Run(Listener listener) { listener.Signal(\"ready\"); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":3,"column":{}}}]}}"#,
+            column_of(line, "Signal")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Demo.Listener.Signal",
+        "an extension with an incompatible known receiver must not replace the legacy direct fallback: {value}"
+    );
+}
+
+#[test]
+fn csharp_callable_applicability_filters_without_guessing_overload_rank() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo/Listener.cs",
+            r#"namespace Demo {
+    public sealed class Listener {
+        public void Signal(string id) {}
+        public void Run() {}
+        public void Run(int count = 0) {}
+        public void Pack(string head) {}
+        public void Pack(string head, params object[] tail) {}
+        public void Pick(string head, object tail) {}
+        public void Pick(string head, params object[] tail) {}
+    }
+    public static class ListenerExtensions {
+        public static void Signal(this Listener listener, string id) {}
+    }
+}
+"#,
+        )
+        .file(
+            "App/Consumer.cs",
+            r#"using Demo;
+namespace App {
+    public sealed class Consumer {
+        public void Execute(Listener listener) {
+            listener.Signal("ready");
+            listener.Run();
+            listener.Run(1);
+            listener.Pack("head");
+            listener.Pack("head", 1, 2);
+            listener.Pick("head", "tail");
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let references = [
+        (5, "            listener.Signal(\"ready\");", "Signal"),
+        (6, "            listener.Run();", "Run"),
+        (7, "            listener.Run(1);", "Run"),
+        (8, "            listener.Pack(\"head\");", "Pack"),
+        (9, "            listener.Pack(\"head\", 1, 2);", "Pack"),
+        (10, "            listener.Pick(\"head\", \"tail\");", "Pick"),
+    ]
+    .into_iter()
+    .map(|(line, source, name)| {
+        format!(
+            r#"{{"path":"App/Consumer.cs","line":{line},"column":{}}}"#,
+            column_of(source, name)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+    let value = lookup(
+        project.root(),
+        &format!(r#"{{"references":[{references}]}}"#),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(6, results.len(), "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "Demo.Listener.Signal",
+        "an applicable direct member must retain precedence: {value}"
+    );
+    let signatures = results
+        .iter()
+        .map(|result| {
+            let mut signatures = result["definitions"]
+                .as_array()
+                .expect("definitions")
+                .iter()
+                .map(|definition| {
+                    definition["signature"]
+                        .as_str()
+                        .expect("definition signature")
+                })
+                .collect::<Vec<_>>();
+            signatures.sort_unstable();
+            signatures
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        signatures,
+        vec![
+            vec!["(string)"],
+            vec!["()", "(int)"],
+            vec!["(int)"],
+            vec!["(string)", "(string, object[])"],
+            vec!["(string, object[])"],
+            vec!["(string, object)", "(string, object[])"],
+        ],
+        "arity must reject impossible overloads without guessing between overlapping applicable ranges: {value}"
+    );
+}
+
+#[test]
 fn csharp_extension_lookup_uses_identifier_index_and_preserves_proof_filters() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

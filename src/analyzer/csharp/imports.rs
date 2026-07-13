@@ -262,12 +262,38 @@ pub(super) fn csharp_import_info_from_using_directive(
     if csharp_using_namespace(&raw).is_some() {
         return Some(csharp_import_info(raw));
     }
+    if super::csharp_using_directive_is_static(node) {
+        let mut cursor = node.walk();
+        let target = node
+            .named_children(&mut cursor)
+            .find(|child| {
+                matches!(
+                    child.kind(),
+                    "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name"
+                )
+            })
+            .map(|target| super::csharp_type_node_identity(target, source))?;
+        return (!target.is_empty()).then_some(ImportInfo {
+            raw_snippet: raw,
+            is_wildcard: false,
+            identifier: Some(target),
+            alias: None,
+        });
+    }
     csharp_using_alias_from_node(node, source).map(|(alias, target)| ImportInfo {
         raw_snippet: raw,
         is_wildcard: false,
         identifier: Some(target),
         alias: Some(alias),
     })
+}
+
+pub(super) fn csharp_static_using_from_import(import: &ImportInfo) -> Option<&str> {
+    if !import.is_wildcard && import.alias.is_none() {
+        import.identifier.as_deref()
+    } else {
+        None
+    }
 }
 
 pub(super) fn csharp_using_alias_from_import(import: &ImportInfo) -> Option<(String, String)> {

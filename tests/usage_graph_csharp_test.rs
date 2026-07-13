@@ -420,6 +420,97 @@ public class Consumer {
 }
 
 #[test]
+fn optional_factory_return_type_seeds_inverted_receiver_edge() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            r#"
+namespace App;
+
+public sealed class Product {
+    public void Use() {}
+}
+
+public sealed class Factory {
+    public Product Create(string label = "") => new Product();
+}
+
+public sealed class Consumer {
+    public void Run(Factory factory) {
+        var product = factory.Create();
+        product.Use();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "App.Consumer.Run", "App.Product.Use"),
+        "optional factory return should type the inverted receiver edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn inverted_factory_return_keeps_overlapping_arity_untyped() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            r#"
+namespace App;
+
+public sealed class ExactProduct { public void Use() {} }
+public sealed class OptionalProduct { public void Use() {} }
+public sealed class FixedProduct { public void Use() {} }
+public sealed class ParamsProduct { public void Use() {} }
+
+public sealed class Factory {
+    public ExactProduct Create() => new ExactProduct();
+    public OptionalProduct Create(int count = 0) => new OptionalProduct();
+    public FixedProduct Make(string head, object tail) => new FixedProduct();
+    public ParamsProduct Make(string head, params object[] tail) => new ParamsProduct();
+}
+
+public sealed class Consumer {
+    public void Exact(Factory factory) {
+        var product = factory.Create();
+        product.Use();
+    }
+    public void Fixed(Factory factory) {
+        var product = factory.Make("head", "tail");
+        product.Use();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&value, "App.Consumer.Exact", "App.ExactProduct.Use"),
+        "overlapping exact and optional overloads need argument-type evidence: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.Exact", "App.OptionalProduct.Use"),
+        "overlapping exact and optional overloads must remain conservatively untyped: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.Fixed", "App.FixedProduct.Use"),
+        "equal-total fixed and params overloads need argument-type evidence: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.Fixed", "App.ParamsProduct.Use"),
+        "equal-total fixed and params overloads must remain conservatively untyped: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn factory_return_resolves_in_callee_namespace() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

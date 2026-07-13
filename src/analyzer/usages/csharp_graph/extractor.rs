@@ -253,8 +253,8 @@ fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if ctx
         .spec
-        .method_arity
-        .is_some_and(|arity| argument_count(node, ctx.source) != arity)
+        .callable_arity
+        .is_some_and(|arity| !arity.accepts(argument_count(node, ctx.source)))
     {
         return;
     }
@@ -276,10 +276,13 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let extension_call_arity_matches = extension_call_arity_matches(node, ctx);
+    let ordinary_call_arity_matches = enclosing_invocation(node).is_none_or(|invocation| {
+        ctx.spec
+            .callable_arity
+            .is_none_or(|arity| arity.accepts(argument_count(invocation, ctx.source)))
+    });
     if ctx.spec.kind == TargetKind::Method
-        && let Some(invocation) = enclosing_invocation(node)
-        && let Some(arity) = ctx.spec.method_arity
-        && argument_count(invocation, ctx.source) != arity
+        && !ordinary_call_arity_matches
         && !extension_call_arity_matches
     {
         return;
@@ -296,6 +299,9 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     if resolves_to_target(ctx.csharp, ctx.file, receiver, &ctx.spec.owner) {
+        if ctx.spec.kind == TargetKind::Method && !ordinary_call_arity_matches {
+            return;
+        }
         push_hit(name_node, ctx);
         return;
     }
@@ -350,14 +356,14 @@ fn extension_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if ctx.spec.kind != TargetKind::Method || !ctx.spec.is_extension_method() {
         return false;
     }
-    let Some(declared_arity) = ctx.spec.method_arity else {
+    let Some(declared_arity) = ctx.spec.callable_arity else {
         return false;
     };
-    let Some(extension_arity) = declared_arity.checked_sub(1) else {
-        return false;
-    };
-    enclosing_invocation(node)
-        .is_some_and(|invocation| argument_count(invocation, ctx.source) == extension_arity)
+    enclosing_invocation(node).is_some_and(|invocation| {
+        argument_count(invocation, ctx.source)
+            .checked_add(1)
+            .is_some_and(|arity| declared_arity.accepts(arity))
+    })
 }
 
 fn extension_receiver_type_matches(
@@ -483,8 +489,8 @@ fn unqualified_method_call_resolves_to_owner(node: Node<'_>, ctx: &ScanCtx<'_>) 
     }
     if ctx
         .spec
-        .method_arity
-        .is_some_and(|arity| argument_count(invocation, ctx.source) != arity)
+        .callable_arity
+        .is_some_and(|arity| !arity.accepts(argument_count(invocation, ctx.source)))
     {
         return false;
     }

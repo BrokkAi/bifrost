@@ -424,15 +424,24 @@ fn csharp_method_return_types_for_owner(
                 .filter(|method| method.is_function())
                 .filter_map(|method| {
                     let facts = ctx.csharp.usage_facts_index().fact_for_declaration(method);
-                    let method_arity = facts
-                        .and_then(|facts| facts.arity)
-                        .unwrap_or_else(|| signature_arity(method.signature()));
-                    if method_arity != arity {
+                    let callable_arity = facts
+                        .and_then(|facts| facts.callable_arity)
+                        .unwrap_or_else(|| {
+                            crate::analyzer::CallableArity::exact(
+                                facts
+                                    .and_then(|facts| facts.arity)
+                                    .unwrap_or_else(|| signature_arity(method.signature())),
+                            )
+                        });
+                    if !callable_arity.accepts(arity) {
                         return None;
                     }
-                    facts
+                    let return_type = facts
                         .and_then(|facts| facts.return_type_fqn.clone())
-                        .or_else(|| method_unit_return_type_fq_name(ctx.csharp, &candidate, method))
+                        .or_else(|| {
+                            method_unit_return_type_fq_name(ctx.csharp, &candidate, method)
+                        })?;
+                    Some(return_type)
                 }),
         );
     }

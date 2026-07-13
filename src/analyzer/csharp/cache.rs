@@ -10,6 +10,7 @@ pub(super) struct CSharpMemoCaches {
     budget_bytes: u64,
     pub(super) using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
     pub(super) using_aliases: Cache<ProjectFile, Arc<HashMap<String, String>>>,
+    pub(super) static_using_types: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
@@ -20,6 +21,7 @@ pub(super) struct CSharpMemoCaches {
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) global_using_namespaces: OnceLock<HashSet<String>>,
     pub(super) global_using_aliases: OnceLock<HashMap<String, String>>,
+    pub(super) global_static_using_types: OnceLock<Vec<CodeUnit>>,
 }
 
 impl CSharpMemoCaches {
@@ -28,6 +30,10 @@ impl CSharpMemoCaches {
             budget_bytes,
             using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
             using_aliases: build_weighted_cache(budget_bytes / 8, weight_string_map),
+            static_using_types: build_weighted_cache(
+                budget_bytes / 8,
+                weight_project_code_unit_vec,
+            ),
             imported_code_units: build_weighted_cache(
                 budget_bytes / 4,
                 weight_project_code_unit_set,
@@ -43,6 +49,7 @@ impl CSharpMemoCaches {
             implicit_reference_index: PoolSafeMemo::new(),
             global_using_namespaces: OnceLock::new(),
             global_using_aliases: OnceLock::new(),
+            global_static_using_types: OnceLock::new(),
         }
     }
 
@@ -69,6 +76,10 @@ fn weight_string_map(_key: &ProjectFile, value: &Arc<HashMap<String, String>>) -
 
 fn weight_project_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     weight_bytes(estimate_code_unit_set(value.as_ref()))
+}
+
+fn weight_project_code_unit_vec(_key: &ProjectFile, value: &Arc<Vec<CodeUnit>>) -> u32 {
+    weight_bytes(estimate_code_unit_vec(value.as_ref()))
 }
 
 fn weight_code_unit_vec(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {

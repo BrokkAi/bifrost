@@ -3,10 +3,10 @@ pub(super) use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_as_expression_type_operand,
-    csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
-    csharp_source_identifier, csharp_type_node_identity, csharp_using_directive_is_static,
-    resolve_analyzer,
+    CSharpAnalyzer, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
+    csharp_as_expression_type_operand, csharp_callable_arity, csharp_normalize_full_name,
+    csharp_signature_arity, csharp_signature_return_type, csharp_source_identifier,
+    csharp_type_node_identity, csharp_using_directive_is_static, resolve_analyzer,
 };
 use tree_sitter::Node;
 
@@ -23,7 +23,7 @@ pub(super) struct TargetSpec {
     pub(super) kind: TargetKind,
     pub(super) owner: CodeUnit,
     pub(super) member_name: String,
-    pub(super) method_arity: Option<usize>,
+    pub(super) callable_arity: Option<CallableArity>,
     pub(super) is_extension_method: bool,
     pub(super) extension_receiver_type: Option<String>,
 }
@@ -36,7 +36,7 @@ impl TargetSpec {
                 kind: TargetKind::Type,
                 owner: target.clone(),
                 member_name: csharp_source_identifier(target).to_string(),
-                method_arity: None,
+                callable_arity: None,
                 is_extension_method: false,
                 extension_receiver_type: None,
             });
@@ -56,8 +56,8 @@ impl TargetSpec {
             kind,
             owner,
             member_name: target.identifier().to_string(),
-            method_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
-                .then(|| signature_arity(target.signature())),
+            callable_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
+                .then(|| csharp_callable_arity(analyzer, target)),
             is_extension_method: kind == TargetKind::Method
                 && is_extension_method(analyzer, target),
             extension_receiver_type: (kind == TargetKind::Method)
@@ -499,18 +499,26 @@ pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
         .filter(|unit| unit.is_function() && unit.fq_name() == method_fqn)
         .filter_map(|unit| {
             let facts = csharp.usage_facts_index().fact_for_declaration(unit);
-            let unit_arity = facts
-                .and_then(|facts| facts.arity)
-                .unwrap_or_else(|| signature_arity(unit.signature()));
-            if arity.is_some_and(|arity| unit_arity != arity) {
+            let callable_arity =
+                facts
+                    .and_then(|facts| facts.callable_arity)
+                    .unwrap_or_else(|| {
+                        CallableArity::exact(
+                            facts
+                                .and_then(|facts| facts.arity)
+                                .unwrap_or_else(|| signature_arity(unit.signature())),
+                        )
+                    });
+            if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
                 return None;
             }
-            facts
+            let return_type = facts
                 .and_then(|facts| facts.return_type_fqn.clone())
                 .or_else(|| {
                     let type_text = method_return_type(csharp, unit)?;
                     resolve_member_type_fq_name(csharp, unit.source(), owner, &type_text)
-                })
+                })?;
+            Some(return_type)
         })
         .collect::<Vec<_>>();
     resolved.sort();

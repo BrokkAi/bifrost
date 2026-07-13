@@ -89,6 +89,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 11:35Z) Filed #726 and completed the final exact CDN production rerun in 341.0 seconds. The former false-forward now resolves to `RestException`1.RestException(System.Net.Http.HttpResponseMessage,T)` and has a proven covering inverse hit; zero exact findings remain.
 - [x] (2026-07-13 12:10Z) Pushed and closed #726 after merging concurrent `master`; the complete post-fix C# run at `b75f6b53` finished in 621.0 seconds with 1,902 consistent, 40 unproven, 8,019 inconclusive, and 39 missing sites. All ten generic-constructor misses disappeared; the residual partition is 23 functions, twelve attribute names, and four fields.
 - [x] (2026-07-13 13:40Z) Verified #727 was assigned only to `jbellis`, then reduced the twelve-site attribute boundary with delegated tests and review. C# attribute lookup now models exact and `Attribute`-suffixed AST identities independently, rejects indexed non-attribute ancestry, preserves partial declarations, reports ambiguous spellings, shares the role with forward/type lookup and both inverse graph paths, persists both routing identities, and handles alias/global qualification without per-target global lookup amplification. Exact Azure reruns now classify the external `[Parameter]` spelling as an honest unresolved `ParameterAttribute` import boundary and prove the fully qualified `PSArgumentCompleterAttribute` inverse hit. The complete `cargo test --features nlp,python` gate passes outside the filesystem sandbox; focused all-feature clippy passes, while all-target clippy remains blocked only by the preserved pre-existing `tests/rust_analyzer_goto_definition.rs:65` needless borrow.
+- [x] (2026-07-13 14:05Z) Pushed `5a75ab33`, closed #727, and completed the post-fix Azure PowerShell run from merged/pushed `1a14bc92` in 517.8 seconds: 1,961 consistent, 36 unproven, 23 missing, and 7,980 inconclusive sites. All twelve attribute misses disappeared. The remaining actionable set is nineteen functions and four fields; delegated read-only triage partitions it into callable applicability, local-function method groups, inherited members, cast/local receivers, generic member names, partial-type initializer identity, and one deliberate `nameof` surface mismatch.
+- [x] (2026-07-13 16:05Z) Filed #732 after verifying assignment only to `jbellis`, reduced both callable-applicability directions, and completed delegated read-only review. C# now persists required/total/repeated arity, applies intervals in forward/inverse/constructor/extension/return-type consumers, keeps overlapping intervals conservative, lets applicable extensions beat inapplicable direct members, persists local and global static-using owners, and filters only structurally proven incompatible extension receivers. Focused validation passes 55 get-definition, 75 forward graph, and 23 inverted graph tests; the complete `cargo test --features nlp,python` gate and affected all-feature clippy targets pass, while all-target clippy remains blocked only by the preserved pre-existing `tests/rust_analyzer_goto_definition.rs:65` needless borrow. The epoch-rebuilt Azure `eventListener.Signal` exact run is consistent in 618.6 seconds with seven applicable extension overloads and an exact inverse hit; the optional `AddMultipleTypeNameIntoPSObject` exact run changes the former miss to a retained exact-range unproven hit in 332.6 seconds.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -180,6 +182,15 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - Observation: C# attribute spellings require two independently resolved structural identities, not suffix normalization before lookup.
   Evidence: `/tmp/csharp-exact-attribute-727-parameter.jsonl` completed in 474.9 seconds and reports `[Parameter]` as an unresolved external `ParameterAttribute` boundary instead of resolving to the workspace non-attribute model. `/tmp/csharp-exact-attribute-727-psargument.jsonl` completed in 269.3 seconds and reports the fully qualified `PSArgumentCompleterAttribute` reference consistent with a proven inverse hit covering bytes `5405..5492`.
 
+- Observation: Callable applicability is the largest post-#727 C# correctness boundary and already has a shared persisted representation.
+  Evidence: `/tmp/csharp-n1-727-fixed.jsonl` retains seven wrong-forward `IEventListener.Signal` sites plus one sampled optional-argument inverse miss. Read-only reduction found that C# does not populate or consume the existing `CallableArity { required, total, repeated }` metadata used by Scala: forward filtering falls back to inapplicable direct members before extension lookup, while inverse filtering requires exact total arity.
+
+- Observation: Arity intervals establish applicability but cannot rank overlapping C# overloads without argument-type evidence.
+  Evidence: delegated .NET 8 reductions prove both counterexamples: `M(object)` loses to `M(string, int = 0)` for a string argument despite the former's exact total, while fixed and `params` overloads exchange precedence depending on whether the final argument is an array. #732 therefore retains every interval-applicable forward overload and leaves return inference untyped when applicable declarations disagree.
+
+- Observation: Static-using extension visibility must come from persisted structured import identities, not a per-click syntax-tree walk.
+  Evidence: `/tmp/csharp-exact-callable-732-signal-final.jsonl` rebuilt the C# store under the new epoch and resolved the production `using static ...Runtime.Extensions` owner to seven receiver-compatible overloads with a proven exact inverse hit. Inline coverage also proves same-namespace short targets, project-wide global static usings, external receiver best effort, and rejection of a known incompatible receiver.
+
 ## Decision Log
 
 - Decision: Implement a library-owned engine plus a dedicated Rust binary, not a unit test or brokkbench production trajectory.
@@ -221,6 +232,10 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - Decision: Resolve indexed Rust path dependencies through one cached Cargo route index shared by forward module lookup and the inverse usage index.
   Rationale: Per-reference manifest parsing would be a hot-path regression, while a forward-only filesystem fallback would recreate definition/usage disagreement. The compact route index parses indexed manifests once, preserves importer-scoped aliases and library names, and refuses to guess registry dependencies from coincidental workspace names.
   Date/Author: 2026-07-12 / Codex
+
+- Decision: Use persisted callable arity only to reject inapplicable C# declarations; do not rank overlapping intervals without structured argument-type evidence.
+  Rationale: Required/total/repeated counts can prove that a declaration cannot accept a call, but C# overload precedence also depends on conversions and normal versus expanded `params` form. Preserving grouped candidates and declining conflicting return inference is safer than introducing wrong definitions or receiver types.
+  Date/Author: 2026-07-13 / Codex
 
 ## Outcomes & Retrospective
 
@@ -358,3 +373,7 @@ Revision note (2026-07-13): Recorded pushed/closed #707, the complete post-fix 1
 Revision note (2026-07-13): Recorded #726, the audited generic identity fix, and exact Azure validation before the fixing checkpoint.
 
 Revision note (2026-07-13): Recorded #727's delegated reduction and review, dual-spelling structured attribute resolution, complete feature-suite validation, and both exact Azure production outcomes.
+
+Revision note (2026-07-13): Recorded pushed/closed #727, the complete post-fix C# record, elimination of every attribute miss, and delegated prioritization of the nineteen-function/four-field residual.
+
+Revision note (2026-07-13): Recorded #732's delegated review, conservative callable-interval implementation, persisted local/global static-import visibility, receiver compatibility, focused validation, and both exact Azure production outcomes.

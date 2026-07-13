@@ -8,15 +8,16 @@ pub(in crate::analyzer::usages) use extractor::{
     is_declaration_name as csharp_is_declaration_name, member_access_name, member_access_receiver,
 };
 pub(in crate::analyzer::usages) use resolver::{
-    argument_count as csharp_argument_count, first_type_child as csharp_first_type_child,
-    is_extension_method as csharp_is_extension_method,
+    argument_count as csharp_argument_count,
+    extension_method_receiver_type as csharp_extension_method_receiver_type,
+    first_type_child as csharp_first_type_child, is_extension_method as csharp_is_extension_method,
     is_type_reference_node as csharp_is_type_reference_node,
     member_declared_type_fq_name as csharp_member_declared_type_fq_name,
     method_return_type_fq_name as csharp_method_return_type_fq_name, node_text as csharp_node_text,
     object_created_type as csharp_object_created_type,
     object_initializer_for_label as csharp_object_initializer_for_label,
     reference_type_text as csharp_reference_type_text,
-    seed_bindings_before as seed_csharp_bindings_before, signature_arity as csharp_signature_arity,
+    seed_bindings_before as seed_csharp_bindings_before,
 };
 
 use crate::analyzer::usages::common::language_for_target;

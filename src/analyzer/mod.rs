@@ -58,9 +58,9 @@ pub(crate) use cpp::{
 pub use csharp::CSharpAnalyzer;
 pub(crate) use csharp::{
     csharp_as_expression_type_operand, csharp_attribute_name_node, csharp_attribute_terminal_name,
-    csharp_attribute_type_names, csharp_normalize_full_name, csharp_signature_arity,
-    csharp_signature_return_type, csharp_source_identifier, csharp_source_name_segment,
-    csharp_type_node_identity, csharp_using_directive_is_static,
+    csharp_attribute_type_names, csharp_callable_arity, csharp_normalize_full_name,
+    csharp_signature_arity, csharp_signature_return_type, csharp_source_identifier,
+    csharp_source_name_segment, csharp_type_node_identity, csharp_using_directive_is_static,
 };
 pub use definition_lookup_index::DefinitionLookupIndex;
 pub use go::GoAnalyzer;
