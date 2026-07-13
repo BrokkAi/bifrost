@@ -228,6 +228,45 @@ pub fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
     Ok(out)
 }
 
+/// Blob OIDs (hex) for every existing tracked file and every untracked file in
+/// `root`'s working tree.
+///
+/// GC must retain the bytes analyzers actually parsed, even when Git considers
+/// those bytes clean after line-ending conversion. Missing tracked files and
+/// files that cannot be hashed are skipped because they cannot back an active
+/// working-tree analysis.
+pub fn existing_working_tree_oids(root: &Path) -> Result<HashSet<String>> {
+    let Some(repo) = discover(root) else {
+        return Ok(HashSet::new());
+    };
+    let workdir = workdir(&repo)?.to_path_buf();
+    let index = repo.index().map_err(|e| e.to_string())?;
+    let mut tracked_paths = HashSet::with_capacity(index.len());
+    let mut out = HashSet::with_capacity(index.len());
+
+    for entry in index.iter() {
+        let Ok(rel) = index_path_to_string(&entry) else {
+            continue;
+        };
+        tracked_paths.insert(rel.clone());
+        if workdir.join(&rel).is_file()
+            && let Ok(oid) = hash_working_file(&workdir, &rel)
+        {
+            out.insert(oid.to_string());
+        }
+    }
+
+    for rel in dirty_paths(&repo)? {
+        if !tracked_paths.contains(&rel)
+            && workdir.join(&rel).is_file()
+            && let Ok(oid) = hash_working_file(&workdir, &rel)
+        {
+            out.insert(oid.to_string());
+        }
+    }
+    Ok(out)
+}
+
 fn workdir(repo: &Repository) -> Result<&Path> {
     repo.workdir()
         .ok_or_else(|| "repository has no working directory".to_string())
@@ -421,5 +460,35 @@ pub(crate) mod tests {
                 .unwrap()
                 .to_string()
         );
+    }
+
+    #[test]
+    fn gc_oids_include_existing_tracked_and_untracked_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
+        std::fs::write(temp.path().join("changed.txt"), "committed\n").unwrap();
+        std::fs::write(temp.path().join("deleted.txt"), "deleted\n").unwrap();
+        commit_all(&repo, "init");
+
+        std::fs::write(temp.path().join("changed.txt"), "working\r\n").unwrap();
+        std::fs::remove_file(temp.path().join("deleted.txt")).unwrap();
+        std::fs::write(temp.path().join("untracked.txt"), "untracked\n").unwrap();
+
+        let oids = existing_working_tree_oids(temp.path()).unwrap();
+        for bytes in [
+            b"clean\n".as_slice(),
+            b"working\r\n".as_slice(),
+            b"untracked\n".as_slice(),
+        ] {
+            let oid = Oid::hash_object(ObjectType::Blob, bytes)
+                .unwrap()
+                .to_string();
+            assert!(oids.contains(&oid), "missing working-tree OID {oid}");
+        }
+        let deleted_oid = Oid::hash_object(ObjectType::Blob, b"deleted\n")
+            .unwrap()
+            .to_string();
+        assert!(!oids.contains(&deleted_oid));
     }
 }

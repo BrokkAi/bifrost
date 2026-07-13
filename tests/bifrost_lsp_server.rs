@@ -643,6 +643,16 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
         response["error"].is_null(),
         "unexpected query response: {response}"
     );
+
+    let json_response = server.request(
+        "bifrost/queryCode",
+        json!({"query": r#"{"match":{"kind":"class"}}"#}),
+    );
+    assert!(json_response["error"].is_null(), "{json_response}");
+    assert_eq!(
+        json_response["result"]["matches"].as_array().unwrap().len(),
+        2
+    );
     let text = response["result"]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("expected text result, got {response}"));
@@ -671,8 +681,81 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
     assert!(
         invalid["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("Failed to parse RQL query")),
-        "expected RQL parse error, got {invalid}"
+            .is_some_and(|message| message.contains("Failed to parse query source")),
+        "expected source parse error, got {invalid}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let mut server = LspServer::start(&root);
+
+    for query in ["", "(call", "(call :callee", "{\"match\":"] {
+        let response = server.request("bifrost/validateQuery", json!({"query": query}));
+        assert_eq!(response["result"]["diagnostics"], json!([]), "{response}");
+    }
+
+    let rql = "(call :name \"😀\" :wat 1 :capture 2)";
+    let response = server.request("bifrost/validateQuery", json!({"query": rql}));
+    let diagnostics = response["result"]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2, "{response}");
+    let wat_byte = rql.find(":wat").unwrap();
+    let wat_utf16 = rql[..wat_byte].encode_utf16().count() as u64;
+    assert_eq!(diagnostics[0]["range"]["start"]["character"], wat_utf16);
+    assert_eq!(diagnostics[0]["range"]["end"]["character"], wat_utf16 + 4);
+    assert_eq!(diagnostics[0]["source"], "Bifrost RQL");
+
+    let json_query = r#"{"match":{"kind":"banana","capture":3}}"#;
+    let response = server.request("bifrost/validateQuery", json!({"query": json_query}));
+    assert_eq!(
+        response["result"]["diagnostics"].as_array().unwrap().len(),
+        2
+    );
+
+    let malformed_json = r#"{"note":"😀","λ":1,]"#;
+    let response = server.request("bifrost/validateQuery", json!({"query": malformed_json}));
+    let diagnostic = &response["result"]["diagnostics"][0];
+    let bad_byte = malformed_json.find(']').unwrap();
+    let bad_utf16 = malformed_json[..bad_byte].encode_utf16().count() as u64;
+    assert_eq!(diagnostic["range"]["start"]["character"], bad_utf16);
+    assert_eq!(diagnostic["range"]["end"]["character"], bad_utf16 + 1);
+
+    let hover = server.request(
+        "bifrost/queryHover",
+        json!({"query": "(call :callee (name \"run\"))", "position": {"line": 0, "character": 2}}),
+    );
+    assert_eq!(hover["result"]["range"]["start"]["character"], 1);
+    assert_eq!(hover["result"]["range"]["end"]["character"], 5);
+    assert!(
+        hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("Match call expressions")),
+        "{hover}"
+    );
+
+    let no_hover = server.request(
+        "bifrost/queryHover",
+        json!({"query": "(call ; comment\n)", "position": {"line": 0, "character": 9}}),
+    );
+    assert!(no_hover["result"].is_null(), "{no_hover}");
+
+    let partial_json = r#"{"match":{"kind":"#;
+    let partial_hover = server.request(
+        "bifrost/queryHover",
+        json!({
+            "query": partial_json,
+            "position": {"line": 0, "character": 11}
+        }),
+    );
+    assert_eq!(partial_hover["result"]["range"]["start"]["character"], 10);
+    assert_eq!(partial_hover["result"]["range"]["end"]["character"], 16);
+    assert!(
+        partial_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("normalized node kinds")),
+        "{partial_hover}"
     );
 }
 
@@ -6382,6 +6465,18 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
+    let re_enabled_publish = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        re_enabled_publish["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["code"] == "python_unrecognized_symbol")
+            }),
+        "re-enabling the opt-in must refresh existing push diagnostics: {re_enabled_publish}"
+    );
+
     fs::write(temp_root.join("app.py"), "def run(\n    missing_value\n")
         .expect("write malformed app.py");
     server.notify_value(json!({

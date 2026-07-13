@@ -975,7 +975,7 @@ fn visit_ts_ambient_declarations(
     }
 }
 
-fn ts_is_global_internal_module(node: Node<'_>, source: &str) -> bool {
+pub(crate) fn ts_is_global_internal_module(node: Node<'_>, source: &str) -> bool {
     node.kind() == "internal_module"
         && node
             .child_by_field_name("name")

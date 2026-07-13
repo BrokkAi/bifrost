@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::js_ts::syntax::{is_declaration_identifier, is_explicit_object_literal_key};
+use crate::analyzer::typescript::ts_is_global_internal_module;
 use std::cell::{Cell, RefCell};
 
 const MAX_TS_RECEIVER_RESOLUTION_DEPTH: usize = 64;
@@ -329,20 +330,21 @@ pub(super) fn resolve_js_ts(
             let inferred_receivers = ts_local_receiver_owner_candidates(
                 analyzer, support, file, source, tree, site, &imports, &aliases, qualifier,
             );
-            let mut inferred_member_candidates =
+            let inferred_member_candidates =
                 ts_member_candidates(analyzer, support, inferred_receivers, name, value_position);
-            if inferred_member_candidates.is_empty() {
-                let inferred_receivers = ts_local_receiver_owner_candidates(
-                    analyzer, support, file, source, tree, site, &imports, &aliases, qualifier,
-                );
-                inferred_member_candidates = jsts_member_candidates(
-                    analyzer,
-                    support,
-                    inferred_receivers,
-                    name,
-                    value_position,
-                );
+            if !inferred_member_candidates.is_empty() {
+                return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
             }
+            let inferred_receivers = ts_local_receiver_owner_candidates(
+                analyzer, support, file, source, tree, site, &imports, &aliases, qualifier,
+            );
+            let inferred_member_candidates = jsts_file_scoped_member_candidates(
+                analyzer,
+                support,
+                inferred_receivers,
+                name,
+                value_position,
+            );
             if !inferred_member_candidates.is_empty() {
                 return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
             }
@@ -359,10 +361,18 @@ pub(super) fn resolve_js_ts(
                 }
             }
         }
-        let exact_project =
-            jsts_exact_dotted_candidates(analyzer, support, file, reference, value_position);
-        if !exact_project.is_empty() {
-            return js_ts_candidates_outcome(analyzer, exact_project);
+        if language == Language::TypeScript {
+            let exact_global =
+                ts_exact_global_dotted_candidates(analyzer, support, reference, value_position);
+            if !exact_global.is_empty() {
+                return js_ts_candidates_outcome(analyzer, exact_global);
+            }
+        } else {
+            let exact_project =
+                jsts_exact_dotted_candidates(analyzer, support, file, reference, value_position);
+            if !exact_project.is_empty() {
+                return js_ts_candidates_outcome(analyzer, exact_project);
+            }
         }
         return no_definition(
             "no_indexed_definition",
@@ -714,6 +724,98 @@ fn jsts_exact_dotted_candidates(
         candidates = jsts_type_space_candidates(analyzer, candidates);
     }
     candidates
+}
+
+fn ts_exact_global_dotted_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = support
+        .fqn(reference)
+        .into_iter()
+        .filter(|candidate| ts_unit_is_global_declaration(analyzer, candidate))
+        .collect();
+    if value_position {
+        candidates = jsts_value_space_candidates(analyzer, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(analyzer, candidates);
+    }
+    candidates
+}
+
+fn ts_unit_is_global_declaration(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    let Ok(source) = unit.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_js_ts_tree(unit.source(), &source, Language::TypeScript) else {
+        return false;
+    };
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let is_external_module = root
+        .named_children(&mut cursor)
+        .any(|child| matches!(child.kind(), "import_statement" | "export_statement"));
+    if !is_external_module {
+        return true;
+    }
+    let global_namespace_exports = ts_global_namespace_exports(root, &source);
+
+    analyzer.ranges(unit).iter().any(|range| {
+        let Some(mut node) = smallest_named_node_covering(root, range.start_byte, range.end_byte)
+        else {
+            return false;
+        };
+        loop {
+            if ts_is_global_internal_module(node, &source) {
+                return true;
+            }
+            if node.kind() == "internal_module"
+                && node
+                    .child_by_field_name("name")
+                    .map(|name| node_text(name, &source).to_string())
+                    .is_some_and(|name| global_namespace_exports.contains(&name))
+            {
+                return true;
+            }
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            node = parent;
+        }
+    })
+}
+
+fn ts_global_namespace_exports(root: Node<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::default();
+    let mut cursor = root.walk();
+    for statement in root
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "export_statement")
+    {
+        let mut has_as = false;
+        let mut has_namespace = false;
+        for index in 0..statement.child_count() {
+            let Some(child) = statement.child(index) else {
+                continue;
+            };
+            match child.kind() {
+                "as" => has_as = true,
+                "namespace" => has_namespace = true,
+                _ => {}
+            }
+        }
+        if has_as
+            && has_namespace
+            && let Some(name) = statement
+                .named_children(&mut statement.walk())
+                .find(|child| child.kind() == "identifier")
+        {
+            names.insert(node_text(name, source).to_string());
+        }
+    }
+    names
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1093,6 +1195,26 @@ fn jsts_member_candidates(
     } else {
         jsts_type_space_candidates(analyzer, candidates)
     }
+}
+
+fn jsts_file_scoped_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    receiver_candidates: Vec<CodeUnit>,
+    member: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for receiver in receiver_candidates {
+        candidates.extend(jsts_file_scoped_dotted_candidates(
+            analyzer,
+            support,
+            receiver.source(),
+            &format!("{}.{}", receiver.fq_name(), member),
+            value_position,
+        ));
+    }
+    candidates
 }
 
 fn ts_member_candidates(
@@ -1516,10 +1638,9 @@ fn jsts_enclosing_class(
     file: &ProjectFile,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let fqn = ClassRangeIndex::build(analyzer, file)
-        .enclosing(byte)?
-        .to_string();
-    analyzer.definitions(&fqn).next()
+    ClassRangeIndex::build(analyzer, file)
+        .enclosing_unit(byte)
+        .cloned()
 }
 
 fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {

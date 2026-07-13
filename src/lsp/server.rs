@@ -27,14 +27,16 @@ use lsp_types::request::{
     WorkspaceConfiguration, WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CancelParams, ConfigurationItem, ConfigurationParams, DidChangeConfigurationParams,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    FileChangeType, InitializeParams, NumberOrString, ProgressToken, PublishDiagnosticsParams,
+    CancelParams, ConfigurationItem, ConfigurationParams, Diagnostic, DiagnosticSeverity,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, FileChangeType, Hover, HoverContents, InitializeParams,
+    MarkupContent, MarkupKind, NumberOrString, Position, ProgressToken, PublishDiagnosticsParams,
     Registration, RegistrationParams, Uri, WorkDoneProgress, WorkDoneProgressBegin,
     WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
 };
 
+use crate::analyzer::structural::query::{query_source_help_at, validate_query_source};
 use crate::analyzer::structural::{CodeQuery, execute};
 use crate::analyzer::{
     AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
@@ -42,7 +44,9 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::lsp::capabilities::server_capabilities;
-use crate::lsp::conversion::{path_to_uri_string, uri_to_path};
+use crate::lsp::conversion::{
+    byte_offset_to_position, path_to_uri_string, position_to_byte_offset, uri_to_path,
+};
 use crate::lsp::handlers::util::{
     project_file_for_abs_path, project_file_for_uri as resolve_project_file,
     project_file_for_uri_allow_missing as resolve_project_file_allow_missing,
@@ -57,6 +61,7 @@ use crate::lsp::request_context::{RequestCancelled, RequestContext};
 use crate::lsp::text_sync::apply_content_changes;
 #[cfg(test)]
 use crate::path_normalization::NormalizePath;
+use crate::text_utils::compute_line_starts;
 use crate::util::throttled_log::ThrottledLog;
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -676,6 +681,12 @@ fn handle_request(
     let method = req.method.clone();
     let response = match req.method.as_str() {
         RunRqlQuery::METHOD => handle_run_rql_query_request(req, &state.workspace),
+        ValidateQuery::METHOD => {
+            decode_and_run::<ValidateQuery, _>(req, |params| Ok(validate_query_request(params)))
+        }
+        QueryHover::METHOD => {
+            decode_and_run::<QueryHover, _>(req, |params| Ok(query_hover_request(params)))
+        }
         DocumentSymbolRequest::METHOD => {
             decode_and_run::<DocumentSymbolRequest, _>(req, |params| {
                 Ok(document_symbol::handle(
@@ -861,13 +872,13 @@ fn handle_run_rql_query_request(req: Request, workspace: &WorkspaceAnalyzer) -> 
         }
     };
 
-    let query = match CodeQuery::from_sexp(&params.query) {
+    let query = match CodeQuery::from_source(&params.query) {
         Ok(query) => query,
         Err(error) => {
             return Response::new_err(
                 id,
                 ErrorCode::InvalidParams as i32,
-                format!("Failed to parse RQL query: {error}"),
+                format!("Failed to parse query source: {error}"),
             );
         }
     };
@@ -1713,6 +1724,83 @@ struct RunRqlQueryMatch {
     end_line: usize,
     text: String,
     enclosing_symbol: Option<String>,
+}
+
+/// Source-only query validation for the RQL editor. This deliberately has no
+/// workspace, project, or analyzer parameter.
+enum ValidateQuery {}
+
+impl lsp_types::request::Request for ValidateQuery {
+    type Params = QuerySourceParams;
+    type Result = ValidateQueryResult;
+
+    const METHOD: &'static str = "bifrost/validateQuery";
+}
+
+/// Source-only schema hover for the RQL editor.
+enum QueryHover {}
+
+impl lsp_types::request::Request for QueryHover {
+    type Params = QueryHoverParams;
+    type Result = Option<Hover>;
+
+    const METHOD: &'static str = "bifrost/queryHover";
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct QuerySourceParams {
+    query: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct QueryHoverParams {
+    query: String,
+    position: Position,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ValidateQueryResult {
+    diagnostics: Vec<Diagnostic>,
+}
+
+fn validate_query_request(params: QuerySourceParams) -> ValidateQueryResult {
+    let line_starts = compute_line_starts(&params.query);
+    let diagnostics = validate_query_source(&params.query)
+        .into_iter()
+        .map(|diagnostic| {
+            let range = lsp_types::Range {
+                start: byte_offset_to_position(&params.query, &line_starts, diagnostic.range.start),
+                end: byte_offset_to_position(&params.query, &line_starts, diagnostic.range.end),
+            };
+            Diagnostic::new(
+                range,
+                Some(DiagnosticSeverity::ERROR),
+                Some(NumberOrString::String(diagnostic.code.to_string())),
+                Some("Bifrost RQL".to_string()),
+                diagnostic.message,
+                None,
+                None,
+            )
+        })
+        .collect();
+    ValidateQueryResult { diagnostics }
+}
+
+fn query_hover_request(params: QueryHoverParams) -> Option<Hover> {
+    let line_starts = compute_line_starts(&params.query);
+    let offset = position_to_byte_offset(&params.query, &line_starts, &params.position);
+    let help = query_source_help_at(&params.query, offset)?;
+    let range = lsp_types::Range {
+        start: byte_offset_to_position(&params.query, &line_starts, help.range.start),
+        end: byte_offset_to_position(&params.query, &line_starts, help.range.end),
+    };
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("```rql\n{}\n```\n\n{}", help.signature, help.description),
+        }),
+        range: Some(range),
+    })
 }
 
 #[derive(Clone)]
