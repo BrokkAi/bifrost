@@ -7420,6 +7420,72 @@ const options = { createConnection: run };
 }
 
 #[test]
+fn typescript_for_of_bindings_block_same_named_indexed_fields() {
+    let source = r#"
+class SortItem {
+  field = "indexed";
+  key = "indexed";
+  config = "indexed";
+  uid = "indexed";
+  source = "indexed";
+}
+
+function consume(...values: unknown[]) {}
+
+function render(entries: unknown[], fallback: string) {
+  for (const field of entries) {
+    consume(field);
+  }
+  for (const [key, config] of entries) {
+    consume("array", key, config);
+  }
+  for (const { key, config } of entries) {
+    consume("object", key, config);
+  }
+  for (const { uid, source: { config = fallback }, ...source } of entries) {
+    consume("nested", uid, config, source);
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", source)
+        .build();
+
+    for (marker, identifiers) in [
+        ("consume(field)", &["field"][..]),
+        ("consume(\"array\", key, config)", &["key", "config"][..]),
+        ("consume(\"object\", key, config)", &["key", "config"][..]),
+        (
+            "consume(\"nested\", uid, config, source)",
+            &["uid", "config", "source"][..],
+        ),
+    ] {
+        let line_start = source.find(marker).expect("loop-body marker");
+        for identifier in identifiers {
+            let start = line_start + marker.find(identifier).expect("identifier in marker");
+            let value = lookup(project.root(), &location_reference("app.ts", source, start));
+            let result = &value["results"][0];
+            assert_eq!(result["status"], "no_definition", "{value}");
+            assert!(result["definitions"].is_null(), "{value}");
+            assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+        }
+    }
+
+    let fallback = source
+        .find("config = fallback")
+        .expect("default initializer")
+        + "config = ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app.ts", source, fallback),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "fallback", "{value}");
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
+}
+
+#[test]
 fn javascript_member_assignment_function_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
