@@ -1,4 +1,5 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
+use super::schema::{RqlForm, RqlFormClass, RqlProperty};
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Number, Value, json};
@@ -191,8 +192,14 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
     let Some(head) = head_symbol(items)? else {
         return Ok(None);
     };
-    match head {
-        "where" => {
+    let Some(form) = RqlForm::from_label(head) else {
+        return Ok(None);
+    };
+    if form.class() != RqlFormClass::Wrapper {
+        return Ok(None);
+    }
+    match form {
+        RqlForm::Where => {
             if items.len() < 3 {
                 return Err("(where ...) requires at least one glob and a query".to_string());
             }
@@ -204,7 +211,7 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             insert_unique(&mut query, "where", array_of_strings(globs))?;
             Ok(Some(Value::Object(query)))
         }
-        "language" | "languages" => {
+        RqlForm::Language => {
             if items.len() < 3 {
                 return Err("(language ...) requires at least one label and a query".to_string());
             }
@@ -216,13 +223,13 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             insert_unique(&mut query, "languages", array_of_strings(labels))?;
             Ok(Some(Value::Object(query)))
         }
-        "limit" => {
+        RqlForm::Limit => {
             expect_len(items, 3, "limit")?;
             let mut query = query_object(&items[2])?;
             insert_unique(&mut query, "limit", number_value(&items[1], "limit")?)?;
             Ok(Some(Value::Object(query)))
         }
-        "result-detail" | "result_detail" => {
+        RqlForm::ResultDetail => {
             expect_len(items, 3, head)?;
             let mut query = query_object(&items[2])?;
             insert_unique(
@@ -232,10 +239,10 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             )?;
             Ok(Some(Value::Object(query)))
         }
-        "inside" | "not-inside" => {
+        RqlForm::Inside | RqlForm::NotInside => {
             expect_len(items, 3, head)?;
             let mut query = query_object(&items[2])?;
-            let field = if head == "inside" {
+            let field = if form == RqlForm::Inside {
                 "inside"
             } else {
                 "not_inside"
@@ -243,7 +250,13 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             insert_unique(&mut query, field, pattern_to_json(&items[1])?)?;
             Ok(Some(Value::Object(query)))
         }
-        _ => Ok(None),
+        RqlForm::Name
+        | RqlForm::NameRegex
+        | RqlForm::TextRegex
+        | RqlForm::Capture
+        | RqlForm::Has
+        | RqlForm::NotHas
+        | RqlForm::NotKind => unreachable!("predicate filtered above"),
     }
 }
 
@@ -269,12 +282,18 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
         return Ok(Value::Object(object));
     }
 
-    match head {
-        "name" => {
+    let Some(form) = RqlForm::from_label(head) else {
+        return Err(format!("unknown S-expression form `{head}`"));
+    };
+    if form.class() != RqlFormClass::Predicate {
+        return Err(format!("S-expression wrapper `{head}` is not a pattern"));
+    }
+    match form {
+        RqlForm::Name => {
             expect_len(items, 2, "name")?;
             insert_unique(&mut object, "name", Value::String(string_arg(&items[1])?))?;
         }
-        "name/regex" => {
+        RqlForm::NameRegex => {
             expect_len(items, 2, "name/regex")?;
             insert_unique(
                 &mut object,
@@ -282,7 +301,7 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
                 json!({ "regex": string_arg(&items[1])? }),
             )?;
         }
-        "text/regex" => {
+        RqlForm::TextRegex => {
             expect_len(items, 2, "text/regex")?;
             insert_unique(
                 &mut object,
@@ -290,7 +309,7 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
                 json!({ "regex": string_arg(&items[1])? }),
             )?;
         }
-        "capture" => {
+        RqlForm::Capture => {
             expect_len(items, 2, "capture")?;
             insert_unique(
                 &mut object,
@@ -298,19 +317,29 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
                 Value::String(string_arg(&items[1])?),
             )?;
         }
-        "has" | "not-has" => {
+        RqlForm::Has | RqlForm::NotHas => {
             expect_len(items, 2, head)?;
             insert_unique(
                 &mut object,
-                if head == "has" { "has" } else { "not_has" }.to_string(),
+                if form == RqlForm::Has {
+                    "has"
+                } else {
+                    "not_has"
+                }
+                .to_string(),
                 pattern_to_json(&items[1])?,
             )?;
         }
-        "not-kind" => {
+        RqlForm::NotKind => {
             expect_len(items, 2, "not-kind")?;
             insert_unique(&mut object, "not_kind", kind_value(&items[1])?)?;
         }
-        other => return Err(format!("unknown S-expression form `{other}`")),
+        RqlForm::Where
+        | RqlForm::Language
+        | RqlForm::Limit
+        | RqlForm::ResultDetail
+        | RqlForm::Inside
+        | RqlForm::NotInside => unreachable!("wrapper filtered above"),
     }
     Ok(Value::Object(object))
 }
@@ -342,14 +371,24 @@ fn parse_pattern_tail(object: &mut Map<String, Value>, tail: &[Expr]) -> Result<
 }
 
 fn insert_keyword(object: &mut Map<String, Value>, key: &str, value: &Expr) -> Result<(), String> {
+    if let Some(property) = RqlProperty::from_label(key) {
+        return match property {
+            RqlProperty::Name => insert_unique(object, "name", Value::String(string_arg(value)?)),
+            RqlProperty::NameRegex => {
+                insert_unique(object, "name", json!({ "regex": string_arg(value)? }))
+            }
+            RqlProperty::TextRegex => {
+                insert_unique(object, "text", json!({ "regex": string_arg(value)? }))
+            }
+            RqlProperty::Capture => {
+                insert_unique(object, "capture", Value::String(string_arg(value)?))
+            }
+            RqlProperty::NotKind => insert_unique(object, "not_kind", kind_value(value)?),
+            RqlProperty::Has => insert_unique(object, "has", pattern_to_json(value)?),
+            RqlProperty::NotHas => insert_unique(object, "not_has", pattern_to_json(value)?),
+        };
+    }
     match key {
-        "name" => insert_unique(object, "name", Value::String(string_arg(value)?)),
-        "name/regex" => insert_unique(object, "name", json!({ "regex": string_arg(value)? })),
-        "text/regex" => insert_unique(object, "text", json!({ "regex": string_arg(value)? })),
-        "capture" => insert_unique(object, "capture", Value::String(string_arg(value)?)),
-        "not-kind" | "not_kind" => insert_unique(object, "not_kind", kind_value(value)?),
-        "has" => insert_unique(object, "has", pattern_to_json(value)?),
-        "not-has" | "not_has" => insert_unique(object, "not_has", pattern_to_json(value)?),
         role_label => {
             let Some(role) = Role::from_label(role_label) else {
                 return Err(format!("unknown pattern field `:{key}`"));

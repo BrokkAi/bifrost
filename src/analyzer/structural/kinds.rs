@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 macro_rules! normalized_kinds {
-    ($($variant:ident => $label:literal,)+) => {
+    ($($variant:ident => $label:literal: $description:literal,)+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum NormalizedKind {
@@ -38,37 +38,47 @@ macro_rules! normalized_kinds {
             pub fn from_label(label: &str) -> Option<NormalizedKind> {
                 ALL_KINDS.iter().copied().find(|kind| kind.label() == label)
             }
+
+            pub fn signature(self) -> &'static str {
+                self.label()
+            }
+
+            pub fn description(self) -> &'static str {
+                match self {
+                    $(NormalizedKind::$variant => $description,)+
+                }
+            }
         }
     };
 }
 
 normalized_kinds! {
     // declaration branch
-    Declaration => "declaration",
-    Callable => "callable",
-    Function => "function",
-    Method => "method",
-    Constructor => "constructor",
-    Lambda => "lambda",
-    Class => "class",
-    Import => "import",
+    Declaration => "declaration": "Match any declaration, including callable, class, and import declarations.",
+    Callable => "callable": "Match any callable declaration, including functions, methods, constructors, and lambdas.",
+    Function => "function": "Match a named free-standing function declaration.",
+    Method => "method": "Match a method declared on a class or similar container.",
+    Constructor => "constructor": "Match a constructor declaration.",
+    Lambda => "lambda": "Match an anonymous function or lambda expression.",
+    Class => "class": "Match a class-like declaration.",
+    Import => "import": "Match an import declaration.",
     // expression-ish kinds (kept flat; see ExecPlan decision log)
-    Call => "call",
-    Assignment => "assignment",
-    FieldAccess => "field_access",
-    Identifier => "identifier",
-    Literal => "literal",
-    StringLiteral => "string_literal",
-    NumericLiteral => "numeric_literal",
-    BooleanLiteral => "boolean_literal",
-    NullLiteral => "null_literal",
+    Call => "call": "Match call expressions for functions, methods, or constructors.",
+    Assignment => "assignment": "Match an assignment expression or statement.",
+    FieldAccess => "field_access": "Match member or field access.",
+    Identifier => "identifier": "Match an identifier reference.",
+    Literal => "literal": "Match any literal value.",
+    StringLiteral => "string_literal": "Match a string literal.",
+    NumericLiteral => "numeric_literal": "Match a numeric literal.",
+    BooleanLiteral => "boolean_literal": "Match a boolean literal.",
+    NullLiteral => "null_literal": "Match a null-like literal.",
     // statement-ish kinds
-    Return => "return",
-    Throw => "throw",
-    Catch => "catch",
-    If => "if",
-    Loop => "loop",
-    Decorator => "decorator",
+    Return => "return": "Match a return statement.",
+    Throw => "throw": "Match a throw or raise statement.",
+    Catch => "catch": "Match a catch or exception-handler clause.",
+    If => "if": "Match a conditional statement or expression.",
+    Loop => "loop": "Match a loop construct.",
+    Decorator => "decorator": "Match a decorator or annotation.",
 }
 
 impl NormalizedKind {
@@ -110,7 +120,7 @@ impl fmt::Display for NormalizedKind {
 /// AST fields by each language's structural spec. Which roles a pattern may
 /// constrain depends on its kind — see [`Role::valid_for`].
 macro_rules! roles {
-    ($($variant:ident => $label:literal,)+) => {
+    ($($variant:ident => $label:literal: $shape:ident, $description:literal,)+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum Role {
             $($variant,)+
@@ -132,21 +142,48 @@ macro_rules! roles {
             pub fn from_label(label: &str) -> Option<Role> {
                 ALL_ROLES.iter().copied().find(|role| role.label() == label)
             }
+
+            pub fn value_shape(self) -> RoleValueShape {
+                match self {
+                    $(Role::$variant => RoleValueShape::$shape,)+
+                }
+            }
+
+            pub fn signature(self) -> &'static str {
+                match self.value_shape() {
+                    RoleValueShape::Pattern => "pattern",
+                    RoleValueShape::PatternList => "[pattern ...]",
+                    RoleValueShape::PatternMap => "[(name pattern) ...]",
+                }
+            }
+
+            pub fn description(self) -> &'static str {
+                match self {
+                    $(Role::$variant => $description,)+
+                }
+            }
         }
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleValueShape {
+    Pattern,
+    PatternList,
+    PatternMap,
+}
+
 roles! {
-    Callee => "callee",
-    Receiver => "receiver",
-    Arg => "args",
-    Kwarg => "kwargs",
-    Left => "left",
-    Right => "right",
-    Module => "module",
-    Decorator => "decorators",
-    Object => "object",
-    Field => "field",
+    Callee => "callee": Pattern, "Constrain the call target name or expression.",
+    Receiver => "receiver": Pattern, "Constrain the receiver of a method call.",
+    Arg => "args": PatternList, "Constrain positional arguments in order.",
+    Kwarg => "kwargs": PatternMap, "Constrain named arguments by argument name.",
+    Left => "left": Pattern, "Constrain the left-hand side of an assignment.",
+    Right => "right": Pattern, "Constrain the right-hand side of an assignment.",
+    Module => "module": Pattern, "Constrain the module referenced by an import.",
+    Decorator => "decorators": PatternList, "Constrain decorators or annotations.",
+    Object => "object": Pattern, "Constrain the object of a field access.",
+    Field => "field": Pattern, "Constrain the field portion of a field access.",
 }
 
 pub const SINGLE_TARGET_ROLES: &[Role] = &[

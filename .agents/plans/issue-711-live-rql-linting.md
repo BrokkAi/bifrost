@@ -12,7 +12,7 @@ The implementation also removes the current maintenance trap in which the S-expr
 
 - [x] (2026-07-13 10:37Z) Investigated issue #711, the RQL parser/decoder, REPL metadata, LSP custom-request path, VS Code query action, and extension tests; refreshed remote refs and confirmed the issue branch is 0/0 against its upstream and `origin/master`.
 - [x] (2026-07-13 10:37Z) Milestone 0: created this ExecPlan with the source-schema, diagnostic, hover, LSP, and extension design.
-- [ ] Milestone 1: centralize query vocabulary/help metadata and add span-aware source parsing, multi-diagnostic validation, JSON-shaped source support, and focused Rust tests.
+- [x] (2026-07-13 10:57Z) Milestone 1: centralized query vocabulary/help metadata and added byte-spanned RQL/JSON source analysis, multi-diagnostic validation, `CodeQuery::from_source`, schema-backed REPL help/completion, and focused Rust tests.
 - [ ] Milestone 2: expose non-executing validation and hover requests through LSP, make query execution use the shared source parser, and add integration tests.
 - [ ] Milestone 3: add debounced/cancellable VS Code diagnostics and hover integration with pure unit-tested lifecycle logic.
 - [ ] Milestone 4: document the maintenance contract in `AGENTS.md`, run focused/full validation, manually inspect the Extension Development Host, and complete review fixes.
@@ -30,6 +30,9 @@ The implementation also removes the current maintenance trap in which the S-expr
 
 - Observation: The required `git rebase` was rejected by the execution environment because the issue branch was already 0/0 with its upstream.
   Evidence: A subsequent permitted `git fetch` confirmed `HEAD...@{upstream}` and `HEAD...origin/master` are both `0 0`; no history update is needed.
+
+- Observation: `json-spanned-value` preserves exact half-open ranges for both object keys and nested values, and rejects duplicate object fields by default.
+  Evidence: Source validation tests assert key/value slices directly, while the dependency's default `Settings` keeps `allow_duplicate_keys` false.
 
 ## Decision Log
 
@@ -55,7 +58,7 @@ The implementation also removes the current maintenance trap in which the S-expr
 
 ## Outcomes & Retrospective
 
-No implementation milestone is complete yet. Milestone 0 established a restartable design and recorded the current server-startup boundary, parser/help duplication, branch state, and chosen source ownership rules.
+Milestone 1 is complete. A required-metadata macro registry now owns RQL forms/properties and JSON fields, while the kind/role registries own their help and shapes. Parser and decoder dispatch use generated enums with exhaustive matches, the REPL consumes the same descriptions, and source APIs provide byte ranges, independent diagnostics, hover tokens, and JSON-or-RQL execution. The 38 focused library tests and 11 focused REPL tests pass.
 
 ## Context and Orientation
 
@@ -146,3 +149,5 @@ The private LSP wire contracts are:
 Add `json-spanned-value = "0.2.2"` to the Rust dependencies. Do not add a TypeScript schema copy or a generic JSON-language selector.
 
 Revision note, 2026-07-13: Initial ExecPlan created from issue #711, the existing query/parser/LSP/extension implementation, and the approved schema-driven diagnostics, all-token hover, `.rql`-only JSON ownership, and milestone-commit decisions.
+
+Revision note, 2026-07-13: Milestone 1 completed with macro-generated schema metadata, exhaustive parser/decoder handling, spanned RQL and JSON source analysis, shared execution parsing, and schema-backed REPL documentation.

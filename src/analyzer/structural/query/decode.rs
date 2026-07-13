@@ -4,8 +4,9 @@ use super::ir::{
     MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
     MAX_WHERE_GLOBS, Pattern, QueryError, SCHEMA_VERSION, StringPredicate,
 };
+use super::schema::{PatternField, QueryField, StringPredicateField};
 use crate::analyzer::Language;
-use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
+use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
 use regex::Regex;
 use serde_json::{Map, Value};
 
@@ -13,20 +14,7 @@ impl CodeQuery {
     pub fn from_json(value: &Value) -> Result<Self, QueryError> {
         let object = as_object(value, "")?;
         let mut budget = QueryBudget::default();
-        check_known_fields(
-            object,
-            "",
-            &[
-                "where",
-                "languages",
-                "match",
-                "inside",
-                "not_inside",
-                "limit",
-                "result_detail",
-                "schema_version",
-            ],
-        )?;
+        check_query_fields(object, "")?;
         let schema_version = match object.get("schema_version") {
             None => SCHEMA_VERSION,
             Some(value) => decode_schema_version(value, "schema_version")?,
@@ -134,17 +122,25 @@ fn index_path(path: &str, index: usize) -> String {
     format!("{path}[{index}]")
 }
 
-fn check_known_fields(
-    object: &Map<String, Value>,
-    path: &str,
-    known: &[&str],
-) -> Result<(), QueryError> {
+fn check_query_fields(object: &Map<String, Value>, path: &str) -> Result<(), QueryError> {
     for key in object.keys() {
-        if !known.contains(&key.as_str()) {
+        let Some(field) = QueryField::from_label(key) else {
             return Err(QueryError::new(
                 child_path(path, key),
-                format!("unknown field; expected one of: {}", known.join(", ")),
+                "unknown field in query object",
             ));
+        };
+        // This exhaustive match is intentionally separate from lookup. A new
+        // registered field cannot compile until decoding acknowledges it.
+        match field {
+            QueryField::Where
+            | QueryField::Languages
+            | QueryField::Match
+            | QueryField::Inside
+            | QueryField::NotInside
+            | QueryField::Limit
+            | QueryField::ResultDetail
+            | QueryField::SchemaVersion => {}
         }
     }
     Ok(())
@@ -248,14 +244,6 @@ fn reject_too_long(text: &str, path: &str, max_len: usize, label: &str) -> Resul
     ))
 }
 
-const BASE_PATTERN_FIELDS: &[&str] = &[
-    "kind", "not_kind", "name", "text", "capture", "has", "not_has",
-];
-
-fn is_known_pattern_field(field: &str) -> bool {
-    BASE_PATTERN_FIELDS.contains(&field) || Role::from_label(field).is_some()
-}
-
 fn decode_pattern(
     value: &Value,
     path: &str,
@@ -277,16 +265,21 @@ fn decode_pattern(
     }
     let object = as_object(value, path)?;
     for key in object.keys() {
-        if !is_known_pattern_field(key) {
-            let expected = BASE_PATTERN_FIELDS
-                .iter()
-                .copied()
-                .chain(ALL_ROLES.iter().map(|role| role.label()))
-                .collect::<Vec<_>>()
-                .join(", ");
+        if let Some(field) = PatternField::from_label(key) {
+            // Keep lowering exhaustive over the declarative registry.
+            match field {
+                PatternField::Kind
+                | PatternField::NotKind
+                | PatternField::Name
+                | PatternField::Text
+                | PatternField::Capture
+                | PatternField::Has
+                | PatternField::NotHas => {}
+            }
+        } else if Role::from_label(key).is_none() {
             return Err(QueryError::new(
                 child_path(path, key),
-                format!("unknown field; expected one of: {expected}"),
+                "unknown field in pattern object",
             ));
         }
     }
@@ -405,7 +398,17 @@ fn decode_string_predicate(
             Ok(StringPredicate::Exact(text.clone()))
         }
         Value::Object(object) => {
-            check_known_fields(object, path, &["regex"])?;
+            for key in object.keys() {
+                let Some(field) = StringPredicateField::from_label(key) else {
+                    return Err(QueryError::new(
+                        child_path(path, key),
+                        "unknown field in string predicate object",
+                    ));
+                };
+                match field {
+                    StringPredicateField::Regex => {}
+                }
+            }
             let regex_path = child_path(path, "regex");
             let source = object
                 .get("regex")

@@ -1,4 +1,5 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
+use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryMatch, CodeQueryResult, Pattern, StringPredicate,
 };
@@ -34,60 +35,6 @@ const COMMANDS: &[MetadataEntry] = &[
     MetadataEntry::new(":run", "Run the current query through query_code."),
     MetadataEntry::new(":clear", "Clear the current query."),
     MetadataEntry::new(":quit", "Exit the REPL."),
-];
-
-const FORMS: &[MetadataEntry] = &[
-    MetadataEntry::new(
-        "call",
-        "Match call expressions; roles include :callee, :receiver, :args, :kwargs.",
-    ),
-    MetadataEntry::new("function", "Match function declarations."),
-    MetadataEntry::new("method", "Match method declarations."),
-    MetadataEntry::new("class", "Match class declarations."),
-    MetadataEntry::new(
-        "import",
-        "Match import declarations; use :module to constrain the imported module.",
-    ),
-    MetadataEntry::new(
-        "assignment",
-        "Match assignments; roles include :left and :right.",
-    ),
-    MetadataEntry::new(
-        "field_access",
-        "Match member/field access; roles include :object and :field.",
-    ),
-    MetadataEntry::new("name", "Predicate form: (name \"exactName\")."),
-    MetadataEntry::new("name/regex", "Predicate form: (name/regex \"Service$\")."),
-    MetadataEntry::new("text/regex", "Predicate form: (text/regex \"eval\\\\(\")."),
-    MetadataEntry::new(
-        "capture",
-        "Predicate form: (capture \"label\") for matched subnodes.",
-    ),
-    MetadataEntry::new(
-        "has",
-        "Predicate form: (has pattern), requiring a descendant match.",
-    ),
-    MetadataEntry::new(
-        "not-has",
-        "Predicate form: (not-has pattern), excluding a descendant match.",
-    ),
-    MetadataEntry::new(
-        "not-kind",
-        "Predicate form: (not-kind constructor), excluding a normalized kind.",
-    ),
-    MetadataEntry::new(
-        "comments",
-        "Use ; after whitespace for a comment through the next newline; RQL has no block comments.",
-    ),
-    MetadataEntry::new("where", "Wrapper: (where \"src/**/*.py\" query)."),
-    MetadataEntry::new("language", "Wrapper: (language python query)."),
-    MetadataEntry::new("limit", "Wrapper: (limit 25 query)."),
-    MetadataEntry::new(
-        "result-detail",
-        "Wrapper: (result-detail full query), choosing compact or full output.",
-    ),
-    MetadataEntry::new("inside", "Wrapper: (inside container query)."),
-    MetadataEntry::new("not-inside", "Wrapper: (not-inside container query)."),
 ];
 
 const EXAMPLES: &[Example] = &[
@@ -774,7 +721,7 @@ fn kinds_text() -> String {
 fn roles_text() -> String {
     ALL_ROLES
         .iter()
-        .map(|role| format!(":{:<12} {}", role.label(), role_doc(*role)))
+        .map(|role| format!(":{:<12} {}", role.label(), role.description()))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -795,21 +742,36 @@ fn doc_text(name: &str) -> String {
     if let Some(command) = COMMANDS.iter().find(|entry| entry.name == name) {
         return format!("{} — {}", command.name, command.doc);
     }
-    if let Some(form) = FORMS.iter().find(|entry| entry.name == normalized) {
-        return format!("{} — {}", form.name, form.doc);
+    if let Some(form) = ALL_RQL_FORMS
+        .iter()
+        .find(|form| form.labels().contains(&normalized))
+    {
+        return format!(
+            "{} — {}\n{}",
+            form.label(),
+            form.description(),
+            form.signature()
+        );
     }
     if let Some(example) = example_by_name(normalized) {
         return format!("{} — {}\n{}", example.name, example.doc, example.query);
     }
     if let Some(kind) = ALL_KINDS.iter().find(|kind| kind.label() == normalized) {
         return format!(
-            "{} — normalized structural kind; subtype parent: {}",
+            "{} — {} Subtype parent: {}",
             kind.label(),
+            kind.description(),
             kind.parent().map_or("none", |parent| parent.label())
         );
     }
     if let Some(role) = Role::from_label(normalized) {
-        return format!(":{} — {}", role.label(), role_doc(role));
+        return format!(
+            ":{} — {}\n:{} {}",
+            role.label(),
+            role.description(),
+            role.label(),
+            role.signature()
+        );
     }
     if Language::ANALYZABLE
         .iter()
@@ -818,21 +780,6 @@ fn doc_text(name: &str) -> String {
         return format!("{normalized} — language filter label for query_code.");
     }
     format!("No docs for `{name}`.")
-}
-
-fn role_doc(role: Role) -> &'static str {
-    match role {
-        Role::Callee => "single role for call target names/expressions",
-        Role::Receiver => "single role for call receiver/object expressions",
-        Role::Arg => "ordered list role for positional call arguments",
-        Role::Kwarg => "map role for named/keyword call arguments",
-        Role::Left => "single role for assignment left-hand side",
-        Role::Right => "single role for assignment right-hand side",
-        Role::Module => "single role for imported module paths",
-        Role::Decorator => "list role for decorators/annotations",
-        Role::Object => "single role for field-access receiver/object",
-        Role::Field => "single role for field/member name",
-    }
 }
 
 fn example_by_name(name: &str) -> Option<&'static Example> {
@@ -857,17 +804,19 @@ impl ReplCompleter {
             value: entry.name.to_string(),
             description: entry.doc.to_string(),
         }));
-        entries.extend(FORMS.iter().map(|entry| CompletionEntry {
-            value: entry.name.to_string(),
-            description: entry.doc.to_string(),
+        entries.extend(ALL_RQL_FORMS.iter().flat_map(|form| {
+            form.labels().iter().map(|label| CompletionEntry {
+                value: (*label).to_string(),
+                description: form.description().to_string(),
+            })
         }));
         entries.extend(ALL_KINDS.iter().map(|kind| CompletionEntry {
             value: kind.label().to_string(),
-            description: "normalized structural kind".to_string(),
+            description: kind.description().to_string(),
         }));
         entries.extend(ALL_ROLES.iter().map(|role| CompletionEntry {
             value: format!(":{}", role.label()),
-            description: role_doc(*role).to_string(),
+            description: role.description().to_string(),
         }));
         entries.extend(Language::ANALYZABLE.iter().map(|language| CompletionEntry {
             value: language.config_label().to_string(),
