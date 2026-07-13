@@ -1,12 +1,15 @@
 use crate::analyzer::csharp_normalize_full_name;
 use crate::analyzer::usages::csharp_graph::hits::{push_hit, push_unproven_hit};
 use crate::analyzer::usages::csharp_graph::resolver::{
-    TargetKind, TargetSpec, argument_count, binding_scope_node, class_field_receiver_type,
-    enclosing_declared_type, expression_resolves_to_type, first_type_child, is_type_reference_node,
+    TargetKind, TargetSpec, UnqualifiedMethodGroupResolution, argument_count, binding_scope_node,
+    class_field_receiver_type, class_unit_for_fq_name, enclosing_declared_type,
+    expression_resolves_to_type, first_type_child, is_type_reference_node,
     member_name_is_locally_bound, node_text, normalize_type_text, object_initializer_for_label,
-    receiver_targets_owner, reference_type_node, reference_type_text, resolves_to_target,
-    resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
-    unqualified_member_resolves_to_owner,
+    receiver_targets_owner, reference_type_node, reference_type_text,
+    resolve_unqualified_method_group_for_owner, resolves_to_target, resolves_to_target_at,
+    same_node, seed_visible_bindings_at, type_identity_matches,
+    unqualified_member_resolves_to_owner, unqualified_method_group_has_local_binding,
+    unqualified_method_group_has_structured_shadow,
 };
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::SymbolResolution;
@@ -430,6 +433,52 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 push_unproven_hit(node, ctx);
             }
         }
+        TargetKind::Method if is_unqualified_method_group_argument(node, ctx.source) => {
+            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+            seed_visible_bindings_at(
+                binding_scope_node(node),
+                node,
+                ctx.csharp,
+                ctx.file,
+                ctx.source,
+                &mut bindings,
+            );
+            if unqualified_method_group_has_local_binding(node, ctx.source, &bindings)
+                || unqualified_method_group_has_structured_shadow(node, ctx.source)
+            {
+                return;
+            }
+            let Some(owner_fqn) = ctx
+                .class_ranges
+                .enclosing(node.start_byte())
+                .map(str::to_string)
+            else {
+                return;
+            };
+            let Some(owner) = class_unit_for_fq_name(ctx.csharp, &owner_fqn) else {
+                return;
+            };
+            match resolve_unqualified_method_group_for_owner(
+                ctx.analyzer,
+                ctx.csharp,
+                &owner,
+                node_text(node, ctx.source),
+            ) {
+                UnqualifiedMethodGroupResolution::Unique(candidate)
+                    if candidate == ctx.spec.target =>
+                {
+                    push_hit(node, ctx);
+                }
+                UnqualifiedMethodGroupResolution::Ambiguous(candidates)
+                    if candidates.contains(&ctx.spec.target) =>
+                {
+                    push_unproven_hit(node, ctx);
+                }
+                UnqualifiedMethodGroupResolution::Unique(_)
+                | UnqualifiedMethodGroupResolution::Ambiguous(_)
+                | UnqualifiedMethodGroupResolution::NoMember => {}
+            }
+        }
         TargetKind::Field if !is_type_reference_node(node) => {
             // `nameof(Field)` is a compile-time string, not a member reference.
             if is_nameof_argument(node, ctx.source) {
@@ -478,6 +527,43 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         _ => {}
     }
+}
+
+pub(super) fn is_unqualified_method_group_argument(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "identifier"
+        || is_declaration_name(node)
+        || is_type_reference_node(node)
+        || is_nameof_argument(node, source)
+    {
+        return false;
+    }
+    let Some(argument) = containing_argument_through_transparent_expressions(node) else {
+        return false;
+    };
+    argument.child_by_field_name("name") != Some(node)
+}
+
+fn containing_argument_through_transparent_expressions(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "argument" {
+            return Some(parent);
+        }
+        if transparent_expression_parent(current, parent) {
+            current = parent;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
+    matches!(
+        parent.kind(),
+        "parenthesized_expression" | "checked_expression"
+    ) || (parent.kind() == "cast_expression"
+        && parent.child_by_field_name("value") == Some(current))
 }
 
 fn unqualified_method_call_resolves_to_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -578,6 +664,7 @@ fn is_nameof_argument(node: Node<'_>, source: &str) -> bool {
                     .or_else(|| parent.named_child(0))
                     .is_some_and(|function| node_text(function, source) == "nameof");
             }
+            _ if transparent_expression_parent(current, parent) => current = parent,
             _ => return false,
         }
     }

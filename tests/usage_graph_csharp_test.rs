@@ -51,6 +51,67 @@ fn resolves_instance_static_and_unqualified_calls() {
 }
 
 #[test]
+fn inverted_graph_resolves_unique_method_group_and_respects_shadowing() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo.cs",
+            r#"
+namespace Demo;
+
+public delegate void Handler(int value);
+
+public sealed class Command {
+    private void onDefault(int value) {}
+    private void Accept(int marker, Handler callback, object state) {}
+
+    public void Run() {
+        Accept(1, onDefault, this);
+    }
+
+    public void RunShadowed(Handler onDefault) {
+        Accept(1, onDefault, this);
+    }
+}
+
+public class BaseCommand {
+    protected void inherited(int value) {}
+}
+
+public sealed class HiddenCommand : BaseCommand {
+    private Handler inherited;
+    private void Accept(Handler callback) {}
+
+    public void Run() {
+        Accept(inherited);
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "Demo.Command.Run", "Demo.Command.onDefault"),
+        "unique method group should produce an inverted edge: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.Command.RunShadowed", "Demo.Command.onDefault"),
+        "same-named parameter must shadow the member method group: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "Demo.HiddenCommand.Run",
+            "Demo.BaseCommand.inherited"
+        ),
+        "a nearer delegate field must hide the base method group: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn receiver_typing_is_type_based_not_name_based() {
     let value = usage_graph();
 

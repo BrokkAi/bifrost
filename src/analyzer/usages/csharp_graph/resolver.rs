@@ -8,6 +8,7 @@ use crate::analyzer::{
     csharp_signature_arity, csharp_signature_return_type, csharp_source_identifier,
     csharp_type_node_identity, csharp_using_directive_is_static, resolve_analyzer,
 };
+use crate::hash::HashSet;
 use tree_sitter::Node;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -416,7 +417,7 @@ pub(super) fn enclosing_declared_type(
     class_unit_for_fq_name(csharp, fqn)
 }
 
-fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
+pub(super) fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
     let mut candidates = type_declarations_for_fq_name(csharp, fqn);
     csharp.sort_dedup_type_candidates(&mut candidates);
     (candidates.len() == 1).then(|| candidates.remove(0))
@@ -1002,6 +1003,219 @@ pub(super) fn member_name_is_locally_bound(
         bindings.resolve_symbol(member_name),
         SymbolResolution::Unknown
     ) || bindings.is_shadowed(member_name)
+}
+
+#[derive(Clone)]
+pub(super) enum UnqualifiedMethodGroupResolution {
+    Unique(CodeUnit),
+    Ambiguous(Vec<CodeUnit>),
+    NoMember,
+}
+
+pub(super) fn unqualified_method_group_has_local_binding(
+    node: Node<'_>,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    member_name_is_locally_bound(node_text(node, source), bindings)
+}
+
+pub(super) fn unqualified_method_group_has_structured_shadow(node: Node<'_>, source: &str) -> bool {
+    let name = node_text(node, source);
+    local_function_name_is_in_scope(node, source, name)
+        || structured_local_name_is_in_scope(node, source, name)
+}
+
+pub(super) fn resolve_unqualified_method_group_for_owner(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+    name: &str,
+) -> UnqualifiedMethodGroupResolution {
+    let hierarchy = analyzer.type_hierarchy_provider();
+    let mut seen = HashSet::default();
+    let mut level = csharp.partial_type_parts(owner);
+    if level.is_empty() {
+        level.push(owner.clone());
+    }
+    while !level.is_empty() {
+        let mut members = Vec::new();
+        let mut candidates = Vec::new();
+        let mut next_level = Vec::new();
+        for current in level {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let current_members = csharp
+                .member_candidates_for_owner(&current.fq_name(), name)
+                .into_iter()
+                .filter(|candidate| candidate.identifier() == name)
+                .collect::<Vec<_>>();
+            candidates.extend(
+                current_members
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.is_function()
+                            && candidate.identifier() != csharp_source_identifier(&current)
+                    })
+                    .cloned(),
+            );
+            members.extend(current_members);
+            if let Some(hierarchy) = hierarchy {
+                for ancestor in hierarchy.get_direct_ancestors(&current) {
+                    let mut parts = csharp.partial_type_parts(&ancestor);
+                    if parts.is_empty() {
+                        parts.push(ancestor);
+                    }
+                    next_level.extend(parts);
+                }
+            }
+        }
+        members.sort();
+        members.dedup();
+        if members.is_empty() {
+            level = next_level;
+            continue;
+        }
+        candidates.sort();
+        candidates.dedup();
+        if candidates.len() != members.len() {
+            return UnqualifiedMethodGroupResolution::NoMember;
+        }
+        if candidates.len() == 1 {
+            return UnqualifiedMethodGroupResolution::Unique(candidates.remove(0));
+        }
+        return UnqualifiedMethodGroupResolution::Ambiguous(candidates);
+    }
+    UnqualifiedMethodGroupResolution::NoMember
+}
+
+fn local_function_name_is_in_scope(node: Node<'_>, source: &str, name: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "block" | "switch_section") {
+            let mut cursor = parent.walk();
+            if parent.named_children(&mut cursor).any(|child| {
+                child.kind() == "local_function_statement"
+                    && child
+                        .child_by_field_name("name")
+                        .is_some_and(|candidate| node_text(candidate, source) == name)
+            }) {
+                return true;
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+fn structured_local_name_is_in_scope(node: Node<'_>, source: &str, name: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "foreach_statement"
+            && parent
+                .child_by_field_name("body")
+                .is_some_and(|body| node_covers(body, node))
+            && parent
+                .child_by_field_name("left")
+                .is_some_and(|left| binding_container_has_name(left, source, name))
+        {
+            return true;
+        }
+
+        let mut cursor = parent.walk();
+        for sibling in parent.named_children(&mut cursor) {
+            if same_node(sibling, current) || sibling.start_byte() >= current.start_byte() {
+                break;
+            }
+            if prior_node_declares_local_name(sibling, source, name) {
+                return true;
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+fn prior_node_declares_local_name(root: Node<'_>, source: &str, name: &str) -> bool {
+    if LOCAL_BINDING_SCOPE_BARRIERS.contains(&root.kind()) {
+        return false;
+    }
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if !same_node(current, root) && LOCAL_BINDING_SCOPE_BARRIERS.contains(&current.kind()) {
+            continue;
+        }
+        if matches!(
+            current.kind(),
+            "variable_declarator"
+                | "declaration_expression"
+                | "declaration_pattern"
+                | "catch_declaration"
+                | "tuple_pattern"
+                | "parenthesized_variable_designation"
+        ) && binding_container_has_name(current, source, name)
+        {
+            return true;
+        }
+        let mut cursor = current.walk();
+        let mut children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        children.reverse();
+        stack.extend(children);
+    }
+    false
+}
+
+const LOCAL_BINDING_SCOPE_BARRIERS: &[&str] = &[
+    "block",
+    "method_declaration",
+    "constructor_declaration",
+    "destructor_declaration",
+    "operator_declaration",
+    "property_declaration",
+    "accessor_declaration",
+    "local_function_statement",
+    "lambda_expression",
+    "anonymous_method_expression",
+    "class_declaration",
+    "interface_declaration",
+    "struct_declaration",
+    "record_declaration",
+    "record_struct_declaration",
+    "for_statement",
+    "foreach_statement",
+    "using_statement",
+    "catch_clause",
+];
+
+fn binding_container_has_name(node: Node<'_>, source: &str, name: &str) -> bool {
+    if node.kind() == "identifier" {
+        return node_text(node, source) == name;
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        for index in 0..current.child_count() {
+            let Some(child) = current.child(index) else {
+                continue;
+            };
+            if !child.is_named() {
+                continue;
+            }
+            if current.field_name_for_child(index as u32) == Some("name")
+                && child.kind() == "identifier"
+                && node_text(child, source) == name
+            {
+                return true;
+            }
+            if matches!(
+                child.kind(),
+                "tuple_pattern" | "parenthesized_variable_designation"
+            ) {
+                stack.push(child);
+            }
+        }
+    }
+    false
 }
 
 /// An unqualified identifier (no receiver) that matches a field/property name resolves to

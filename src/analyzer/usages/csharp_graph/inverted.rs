@@ -17,10 +17,15 @@
 //! re-deriving the namespace. Receivers needing return-type inference (method
 //! chains) are an unhandled recall gap, not a wrong edge.
 
-use super::extractor::{is_declaration_name, member_access_name, member_access_receiver};
+use super::extractor::{
+    is_declaration_name, is_unqualified_method_group_argument, member_access_name,
+    member_access_receiver,
+};
 use super::resolver::{
-    argument_count, first_type_child, is_type_reference_node, method_unit_return_type_fq_name,
-    node_text, reference_type_text, resolve_type_fq_name_at, signature_arity,
+    UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name, first_type_child,
+    is_type_reference_node, method_unit_return_type_fq_name, node_text, reference_type_text,
+    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, signature_arity,
+    unqualified_method_group_has_local_binding, unqualified_method_group_has_structured_shadow,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
@@ -30,7 +35,7 @@ use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_type_names,
     csharp_normalize_full_name,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 pub(super) fn build_csharp_edges<F>(
@@ -52,6 +57,7 @@ where
                 file,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
+                method_group_cache: HashMap::default(),
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -66,6 +72,7 @@ struct CsScan<'a, 'b> {
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
+    method_group_cache: HashMap<(String, String), UnqualifiedMethodGroupResolution>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -95,6 +102,11 @@ impl CsScan<'_, '_> {
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
         self.collector
             .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
+
+    fn record_unproven_callee(&mut self, callee: String, node: Node<'_>) {
+        self.collector
+            .record_unproven(callee, node.start_byte(), node.end_byte());
     }
 }
 
@@ -159,6 +171,56 @@ fn record_reference(
                     let name = node_text(node, ctx.source);
                     if let Some(owner) = ctx.enclosing_class(node.start_byte()) {
                         ctx.record(format!("{owner}.{name}"), node);
+                    }
+                } else if is_unqualified_method_group_argument(node, ctx.source) {
+                    let Some(owner_fqn) = ctx
+                        .class_ranges
+                        .enclosing(node.start_byte())
+                        .map(str::to_string)
+                    else {
+                        return;
+                    };
+                    let name = node_text(node, ctx.source).to_string();
+                    if unqualified_method_group_has_local_binding(node, ctx.source, bindings) {
+                        return;
+                    }
+                    let key = (owner_fqn.clone(), name.clone());
+                    let resolution = if let Some(cached) = ctx.method_group_cache.get(&key) {
+                        cached.clone()
+                    } else {
+                        let Some(owner) = class_unit_for_fq_name(ctx.csharp, &owner_fqn) else {
+                            return;
+                        };
+                        let resolution = resolve_unqualified_method_group_for_owner(
+                            ctx.analyzer,
+                            ctx.csharp,
+                            &owner,
+                            &name,
+                        );
+                        ctx.method_group_cache.insert(key, resolution.clone());
+                        resolution
+                    };
+                    if matches!(&resolution, UnqualifiedMethodGroupResolution::NoMember)
+                        || unqualified_method_group_has_structured_shadow(node, ctx.source)
+                    {
+                        return;
+                    }
+                    match resolution {
+                        UnqualifiedMethodGroupResolution::Unique(candidate) => {
+                            ctx.record(candidate.fq_name(), node);
+                        }
+                        UnqualifiedMethodGroupResolution::Ambiguous(candidates) => {
+                            let mut callees = candidates
+                                .into_iter()
+                                .map(|candidate| candidate.fq_name())
+                                .collect::<Vec<_>>();
+                            callees.sort();
+                            callees.dedup();
+                            for callee in callees {
+                                ctx.record_unproven_callee(callee, node);
+                            }
+                        }
+                        UnqualifiedMethodGroupResolution::NoMember => {}
                     }
                 }
                 return;

@@ -2677,6 +2677,260 @@ namespace Domain {
 }
 
 #[test]
+fn usage_finder_csharp_finds_unique_private_method_group_argument() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Command.cs",
+        r#"
+namespace Demo {
+    public sealed class Response {}
+    public sealed class Reply {}
+    public delegate void Handler(Response response, Reply reply);
+
+    public sealed class Command {
+        private void onDefault(Response response, Reply reply) {}
+        private void Accept(int marker, Handler callback, object state) {}
+        private bool TryGet(out Handler handler) { handler = null; return false; }
+
+        public void Run() {
+            Accept(1, onDefault, this);
+        }
+
+        public void RunWrapped() {
+            Accept(1, ((Handler)onDefault), this);
+        }
+
+        public void RunShadowed(Handler onDefault) {
+            Accept(1, onDefault, this);
+        }
+
+        public void RunPattern(object value) {
+            if (value is Handler onDefault) { Accept(1, onDefault, this); }
+        }
+
+        public void RunForeach(Handler[] handlers) {
+            foreach (Handler onDefault in handlers) { Accept(1, onDefault, this); }
+        }
+
+        public void RunCatch() {
+            try {} catch (System.Exception onDefault) { Accept(1, onDefault, this); }
+        }
+
+        public void RunDeconstruction((Handler, Handler) handlers) {
+            var (onDefault, other) = handlers;
+            Accept(1, onDefault, this);
+        }
+
+        public void RunOut() {
+            if (TryGet(out Handler onDefault)) { Accept(1, onDefault, this); }
+        }
+
+        public void RunLocal() {
+            void onDefault(Response response, Reply reply) {}
+            Accept(1, onDefault, this);
+        }
+
+        public void RunSwitch(int value) {
+            switch (value) {
+                case 0:
+                    void onDefault(Response response, Reply reply) {}
+                    Accept(1, onDefault, this);
+                    break;
+            }
+        }
+    }
+}
+"#,
+    )]);
+
+    let target = member_function_with_arity(&analyzer, "Demo.Command", "onDefault", 2);
+    let consumer = project.file("Demo/Command.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let source = consumer.read_to_string().expect("consumer source");
+    let use_start = source
+        .find("Accept(1, onDefault, this)")
+        .expect("method-group argument")
+        + "Accept(1, ".len();
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Command.cs",
+        use_start,
+        use_start + "onDefault".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the reduced method group must remain forward-resolved: {forward}"
+    );
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.Command.onDefault",
+        "{forward}"
+    );
+    let wrapped_start = source
+        .find("((Handler)onDefault)")
+        .expect("wrapped method-group argument")
+        + "((Handler)".len();
+
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect()
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("unique private method-group query should resolve");
+    assert_eq!(
+        2,
+        hits.len(),
+        "structured local bindings must shadow the member method group: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= use_start
+                && use_start + "onDefault".len() <= hit.end_offset
+        }),
+        "inverse lookup should find the structurally unique private method-group argument: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= wrapped_start
+                && wrapped_start + "onDefault".len() <= hit.end_offset
+        }),
+        "inverse lookup should follow transparent method-group wrappers: {hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_method_group_overloads_remain_unproven_without_delegate_parameter_resolution() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Command.cs",
+        r#"
+namespace Demo {
+    public sealed class Response {}
+    public sealed class Reply {}
+    public delegate void Handler(Response response, Reply reply);
+
+    public sealed class Command {
+        private void onDefault(Response response) {}
+        private void onDefault(Response response, Reply reply) {}
+        private void Accept(int marker, Handler callback, object state) {}
+
+        public void Run() {
+            Accept(1, onDefault, this);
+        }
+    }
+}
+"#,
+    )]);
+
+    let target = member_function_with_arity(&analyzer, "Demo.Command", "onDefault", 2);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&target)
+                    .is_none_or(|hits| hits.is_empty()),
+                "delegate parameter typing is required to prove one overload"
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&target),
+                "the ambiguous method group should remain visible as unproven"
+            );
+        }
+        other => panic!("expected an unproven overload group, got {other:#?}"),
+    }
+}
+
+#[test]
+fn usage_finder_csharp_finds_unique_inherited_method_group_argument() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/Base.cs",
+            r#"
+namespace Demo {
+    public delegate void Handler(int value);
+
+    public class BaseCommand {
+        protected void onDefault(int value) {}
+    }
+}
+"#,
+        ),
+        (
+            "Demo/Command.Part1.cs",
+            r#"
+namespace Demo {
+    public sealed partial class Command {
+        private void Accept(Handler callback) {}
+
+        public void Run() {
+            Accept(onDefault);
+        }
+    }
+
+    public sealed class HiddenCommand : BaseCommand {
+        private Handler onDefault;
+        private void Accept(Handler callback) {}
+
+        public void Run() {
+            Accept(onDefault);
+        }
+    }
+}
+"#,
+        ),
+        (
+            "Demo/Command.Part2.cs",
+            "namespace Demo { public sealed partial class Command : BaseCommand {} }\n",
+        ),
+    ]);
+
+    let target = member_function_with_arity(&analyzer, "Demo.BaseCommand", "onDefault", 1);
+    let consumer = project.file("Demo/Command.Part1.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &[target], Some(&provider), 1, 1000);
+    let hits = query
+        .result
+        .into_either()
+        .expect("unique inherited method-group query should resolve");
+    assert_eq!(1, hits.len(), "{hits:#?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Accept(onDefault)"))
+    );
+}
+
+#[test]
 fn csharp_graph_finds_unqualified_same_class_async_member_calls_with_arguments() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
         "MudTabs.cs",
