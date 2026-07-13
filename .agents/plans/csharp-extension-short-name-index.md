@@ -37,7 +37,9 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-13 00:37Z) Reproduced the 34-site `using static` boundary in the shared inline harness, filed #706, and added one shared AST predicate to inverse type scanning and persisted type-identifier routing with a C# epoch bump.
 - [x] (2026-07-13 00:54Z) Changed exact MachineLearningServices bytes `498..508` from missing to consistent with a covering `482..569` inverse hit after the required persisted C# rebuild; all 62 C# usage tests and affected all-feature clippy pass.
 - [x] (2026-07-13 00:58Z) Passed the complete `cargo test --features nlp,python` gate for #706.
-- [ ] Push and close #706, then rerun the full C# corpus and repartition the expected 69-site residual.
+- [x] (2026-07-13 01:01Z) Pushed `2a365fce` and closed #706.
+- [x] (2026-07-13 01:19Z) Completed the valid post-#706 full C# rerun: all 1,000 target groups queried with zero scope-loss notes, 1,875 consistent, 40 unproven, 69 missing, and 8,016 inconclusive sites in 1,008.2 seconds.
+- [ ] Reduce the dominant residual class boundary: 16 fully qualified `IAsyncCommandRuntimeExtensions` types in `as` casts, then determine whether 10 `EventData` and seven `JsonArray` sites share it.
 
 ## Surprises & Discoveries
 
@@ -73,6 +75,8 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: Delegated isolated fixtures with three partial target declarations failed in authoritative inverse scanning until `using_directive` with an unnamed `static` child was recognized. Default routing still failed until the same role was added to persisted C# type-identifier collection. Ordinary namespace using, unrelated alias RHS, and unrelated same-terminal static imports remained negative. Changing persisted identifiers requires a C# analyzer epoch bump.
 - Observation: The shared `using static` role survives persisted production rebuilding and exact differential comparison.
   Evidence: `/tmp/csharp-exact-using-static-706-fixed.jsonl` rebuilt the bumped C# epoch, audited only `ExportProxyCmdlet.cs`, and changed the forward-resolved `PsHelpers` import type to consistent with a proven full-directive hit at bytes `482..569`. The exact record reports one eligible, audited, sampled, resolved, queried, and consistent site in 831.1 seconds.
+- Observation: #706 removed the complete 34-site static-import cluster from the trustworthy full corpus residual.
+  Evidence: `/tmp/csharp-n1-706-fixed.jsonl` is pinned to pushed `2a365fce`, retains the same repository head/fingerprint, 1,000 audited files, 10,000 sampled sites, and zero scope-loss notes, and reports 69 missing sites versus 103 before #706. No remaining missing evidence begins with `using static`. The residual is 34 classes, 33 functions, and two fields; class terminals are 16 `IAsyncCommandRuntimeExtensions`, 10 `EventData`, seven `JsonArray`, and one `Parameter`.
 
 ## Decision Log
 
@@ -141,6 +145,8 @@ The fixed #704 exact result is `/tmp/csharp-exact-generic-type-704-fixed.jsonl`.
 
 The canonical post-#704 result is `/tmp/csharp-n1-704-fixed.jsonl`, pinned to pushed HEAD `cf2743dec7cdce53b4437f799412cabf3d43689a`. It completed in 1,132.3 seconds with all 1,000 configured target groups queried, zero candidate-scope-loss notes, 1,834 consistent, 40 unproven, 103 missing, and 8,023 inconclusive sites.
 
+The canonical post-#706 result is `/tmp/csharp-n1-706-fixed.jsonl`, pinned to pushed HEAD `2a365fce4142b2b92c712b9b7233fc8bd14c7a35`. It completed in 1,008.2 seconds with all 1,000 configured target groups queried, zero candidate-scope-loss notes, 1,875 consistent, 40 unproven, 69 missing, and 8,016 inconclusive sites.
+
 `cargo clippy --all-targets --all-features -- -D warnings` reached an unrelated uncommitted `tests/rust_analyzer_goto_definition.rs` edit and failed on its line 65 `needless_borrow`. That file was left untouched. `cargo clippy --lib --all-features -- -D warnings` and `cargo clippy --test get_definition_test --all-features -- -D warnings` both pass for this change.
 
 ## Interfaces and Dependencies
@@ -166,3 +172,5 @@ Revision note (2026-07-12): Recorded pushed/closed #704, its complete 1,000-targ
 Revision note (2026-07-13): Recorded #705 reduction/fix and production timing, plus the delegated `using static` root boundary across inverse scanning, persisted routing, and cache epoching.
 
 Revision note (2026-07-13): Recorded pushed/closed #705 and #706's shared-role implementation, cache epoch bump, focused validation, and exact persisted production proof.
+
+Revision note (2026-07-13): Recorded pushed/closed #706, its valid complete corpus rerun, the eliminated static-import cluster, and the 69-site residual partition.

@@ -74,6 +74,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 00:37Z) Reproduced and filed #706 for the 34-site `using static` cluster; shared its structured AST role across inverse scanning and persisted candidate routing and bumped the C# analyzer epoch.
 - [x] (2026-07-13 00:54Z) Exact production validation changed MachineLearningServices `PsHelpers` bytes `498..508` from missing to consistent after the expected C# persisted-index rebuild.
 - [x] (2026-07-13 00:58Z) Passed the complete `cargo test --features nlp,python` validation gate for #706.
+- [x] (2026-07-13 01:01Z) Pushed `2a365fce` and closed #706.
+- [x] (2026-07-13 01:19Z) Completed the valid post-#706 full C# run with all 1,000 target groups, zero scope-loss notes, and 69 missing sites, exactly 34 fewer than before the static-import fix.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -155,6 +157,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: #706's cache-aware fix is exact-validated on the rebuilt production index.
   Evidence: `/tmp/csharp-exact-using-static-706-fixed.jsonl` reports one consistent MachineLearningServices `PsHelpers` import-type site with a proven hit covering the full `using static` directive. It completed in 831.1 seconds with one truthful eligible/audited file and no actionable finding.
+
+- Observation: The full post-#706 corpus confirms every static-import miss was removed.
+  Evidence: `/tmp/csharp-n1-706-fixed.jsonl` is pinned to pushed `2a365fce`, queried all 1,000 target groups with zero scope-loss notes, and reports 1,875 consistent, 40 unproven, 69 missing, and 8,016 inconclusive sites in 1,008.2 seconds. The remaining 34 classes partition into 16 `IAsyncCommandRuntimeExtensions`, 10 `EventData`, seven `JsonArray`, and one `Parameter`; 33 functions and two fields remain.
 
 ## Decision Log
 
@@ -322,3 +327,5 @@ Revision note (2026-07-12): Recorded pushed/closed #704, the valid post-fix full
 Revision note (2026-07-13): Recorded reduced #705, its production timing and truthful summary semantics, and the delegated shared `using static` type-role boundary.
 
 Revision note (2026-07-13): Recorded pushed/closed #705 and #706's reduced shared-role fix, persistence epoch bump, focused validation, and exact production proof.
+
+Revision note (2026-07-13): Recorded pushed/closed #706, the valid complete post-fix C# record, removal of all 34 static-import misses, and the 69-site residual partition.
