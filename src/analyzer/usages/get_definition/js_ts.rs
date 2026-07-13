@@ -320,13 +320,8 @@ pub(super) fn resolve_js_ts(
                 format!("`{reference}` did not resolve to an indexed JS/TS definition"),
             );
         }
-        let exact_same_file = jsts_exact_same_file_dotted_candidates(
-            analyzer,
-            support,
-            file,
-            reference,
-            value_position,
-        );
+        let exact_same_file =
+            jsts_file_scoped_dotted_candidates(analyzer, support, file, reference, value_position);
         if !exact_same_file.is_empty() {
             return js_ts_candidates_outcome(analyzer, exact_same_file);
         }
@@ -633,7 +628,9 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
     candidates
 }
 
-fn jsts_exact_same_file_dotted_candidates(
+/// Resolve a dotted FQN within one exact declaration file. JS/TS FQNs omit module
+/// paths, so callers that have already resolved a receiver must retain this scope.
+fn jsts_file_scoped_dotted_candidates(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
@@ -1111,16 +1108,32 @@ fn ts_member_candidates(
         let static_fqn = format!("{plain_fqn}$static");
         let static_access = value_position && receiver.is_class();
 
-        let mut members =
-            ts_filtered_member_candidates(analyzer, support, &plain_fqn, value_position);
+        let mut members = jsts_file_scoped_dotted_candidates(
+            analyzer,
+            support,
+            &plain_fqn,
+            receiver.source(),
+            value_position,
+        );
         if static_access {
-            let static_members =
-                ts_filtered_member_candidates(analyzer, support, &static_fqn, value_position);
+            let static_members = jsts_file_scoped_dotted_candidates(
+                analyzer,
+                support,
+                &static_fqn,
+                receiver.source(),
+                value_position,
+            );
             if !static_members.is_empty() {
                 members = static_members;
             }
         } else if members.is_empty() {
-            members = ts_filtered_member_candidates(analyzer, support, &static_fqn, value_position);
+            members = jsts_file_scoped_dotted_candidates(
+                analyzer,
+                support,
+                &static_fqn,
+                receiver.source(),
+                value_position,
+            );
         }
 
         let has_synthetic = members.iter().any(CodeUnit::is_synthetic);
@@ -1136,20 +1149,6 @@ fn ts_member_candidates(
         }
     }
     candidates
-}
-
-fn ts_filtered_member_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    fqn: &str,
-    value_position: bool,
-) -> Vec<CodeUnit> {
-    let members = support.fqn(fqn);
-    if value_position {
-        jsts_value_space_candidates(analyzer, members)
-    } else {
-        jsts_type_space_candidates(analyzer, members)
-    }
 }
 
 fn ts_synthetic_member_is_supported_by_receiver_initializer(

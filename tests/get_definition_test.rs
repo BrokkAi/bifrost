@@ -2210,6 +2210,51 @@ export function boot() {
 }
 
 #[test]
+fn typescript_imported_static_member_keeps_receiver_file_identity() {
+    let app = r#"
+import { KibanaServices as SecurityServices } from "./security/services";
+import CasesServices from "./cases/services";
+
+export function boot() {
+  SecurityServices.get();
+  CasesServices.get();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "security/services.ts",
+            "export class KibanaServices { static get() {} }\n",
+        )
+        .file(
+            "cases/services.ts",
+            "export default class KibanaServices { static get() {} }\n",
+        )
+        .file("app.ts", app)
+        .build();
+
+    for (receiver, expected_path) in [
+        ("SecurityServices", "security/services.ts"),
+        ("CasesServices", "cases/services.ts"),
+    ] {
+        let start = app.find(&format!("{receiver}.get")).expect("static call") + receiver.len() + 1;
+        let value = lookup(project.root(), &location_reference("app.ts", app, start));
+        let result = &value["results"][0];
+
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().unwrap().len(),
+            1,
+            "{value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"], "KibanaServices.get$static",
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["path"], expected_path, "{value}");
+    }
+}
+
+#[test]
 fn typescript_parameter_shadow_blocks_outer_factory_receiver_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
