@@ -157,6 +157,14 @@ macro_rules! roles {
                 }
             }
 
+            pub fn rql_signature(self) -> &'static str {
+                match self.value_shape() {
+                    RoleValueShape::Pattern => r#"pattern | "name""#,
+                    RoleValueShape::PatternList => "[pattern ...]",
+                    RoleValueShape::PatternMap => "[(name pattern) ...]",
+                }
+            }
+
             pub fn description(self) -> &'static str {
                 match self {
                     $(Role::$variant => $description,)+

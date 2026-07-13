@@ -153,3 +153,10 @@ export function queryHoverParams(
 ): { query: string; position: WirePosition } {
   return { query, position };
 }
+
+/** Clear pending work and published diagnostics when the LSP connection dies. */
+export function handleRqlServerClosed(
+  controller: Pick<RqlValidationController<unknown>, "stop"> | undefined
+): void {
+  controller?.stop();
+}

@@ -6,6 +6,7 @@ const {
   RQL_VALIDATION_DELAY_MS,
   RqlValidationController,
   VALIDATE_RQL_QUERY_METHOD,
+  handleRqlServerClosed,
   queryHoverParams
 } = require("../out-test/rql_validation.js");
 const { RQL_LANGUAGE_ID } = require("../out-test/rql_query.js");
@@ -138,6 +139,14 @@ test("close and stop cancel work and clear diagnostics", () => {
   h.controller.stop();
   assert.equal(h.timers[1].cleared, true);
   assert.deepEqual(h.cleared, ["file:///query.rql", "file:///second.rql"]);
+});
+
+test("unexpected server closure cancels work and clears diagnostics", () => {
+  const h = harness();
+  h.schedule(1, "(call)");
+  handleRqlServerClosed(h.controller);
+  assert.equal(h.timers[0].cleared, true);
+  assert.deepEqual(h.cleared, ["file:///query.rql"]);
 });
 
 test("ignores ordinary JSON documents even when they look like CodeQuery", () => {

@@ -15,6 +15,7 @@ mod json;
 pub mod schema;
 pub mod sexp;
 mod source;
+mod syntax;
 
 pub use ir::{
     CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,

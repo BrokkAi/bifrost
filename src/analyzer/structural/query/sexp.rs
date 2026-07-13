@@ -1,11 +1,13 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
 use super::schema::{RqlForm, RqlFormClass, RqlProperty};
+#[cfg(test)]
+use super::syntax::MAX_RQL_DEPTH;
+use super::syntax::{Expr, ExprKind, parse_rql};
 use crate::analyzer::Language;
-use crate::analyzer::structural::kinds::{NormalizedKind, Role};
+use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
 use serde_json::{Map, Number, Value, json};
 
 const MAX_SEXP_INPUT_BYTES: usize = 64 * 1024;
-const MAX_SEXP_DEPTH: usize = 128;
 
 impl CodeQuery {
     pub fn from_sexp(input: &str) -> Result<Self, String> {
@@ -22,163 +24,17 @@ pub fn sexp_to_json(input: &str) -> Result<Value, String> {
             MAX_SEXP_INPUT_BYTES
         ));
     }
-    let mut parser = Parser::new(input);
-    let expr = parser.parse_expr()?;
-    parser.skip_ws();
-    if !parser.is_eof() {
-        return Err(format!("unexpected input at byte {}", parser.pos));
+    let parsed = parse_rql(input).map_err(|error| error.message)?;
+    if let Some(error) = parsed.incomplete {
+        return Err(error.message);
     }
+    let expr = parsed
+        .expr
+        .ok_or_else(|| "expected expression, found end of input".to_string())?;
     query_to_json(&expr)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum Expr {
-    List(Vec<Expr>),
-    Vector(Vec<Expr>),
-    String(String),
-    Symbol(String),
-    Number(u64),
-}
-
-struct Parser<'a> {
-    input: &'a str,
-    pos: usize,
-}
-
-impl<'a> Parser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
-    }
-
-    fn is_eof(&self) -> bool {
-        self.pos >= self.input.len()
-    }
-
-    fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_expr_at_depth(0)
-    }
-
-    fn parse_expr_at_depth(&mut self, depth: usize) -> Result<Expr, String> {
-        if depth > MAX_SEXP_DEPTH {
-            return Err(format!(
-                "S-expression nesting exceeds maximum depth {MAX_SEXP_DEPTH}"
-            ));
-        }
-        self.skip_ws();
-        let Some(byte) = self.peek() else {
-            return Err("expected expression, found end of input".to_string());
-        };
-        match byte {
-            b'(' => self.parse_delimited(b'(', b')', depth + 1).map(Expr::List),
-            b'[' => self
-                .parse_delimited(b'[', b']', depth + 1)
-                .map(Expr::Vector),
-            b'"' => self.parse_string().map(Expr::String),
-            b'0'..=b'9' => self.parse_number().map(Expr::Number),
-            _ => self.parse_symbol().map(Expr::Symbol),
-        }
-    }
-
-    fn parse_delimited(&mut self, open: u8, close: u8, depth: usize) -> Result<Vec<Expr>, String> {
-        self.expect(open)?;
-        let mut items = Vec::new();
-        loop {
-            self.skip_ws();
-            if self.peek() == Some(close) {
-                self.pos += 1;
-                return Ok(items);
-            }
-            if self.is_eof() {
-                return Err(format!("missing `{}`", close as char));
-            }
-            items.push(self.parse_expr_at_depth(depth)?);
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        let start = self.pos;
-        self.expect(b'"')?;
-        let mut escaped = false;
-        while let Some(byte) = self.peek() {
-            self.pos += 1;
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match byte {
-                b'\\' => escaped = true,
-                b'"' => {
-                    return serde_json::from_str(&self.input[start..self.pos])
-                        .map_err(|error| format!("invalid string at byte {start}: {error}"));
-                }
-                _ => {}
-            }
-        }
-        Err(format!("unterminated string at byte {start}"))
-    }
-
-    fn parse_number(&mut self) -> Result<u64, String> {
-        let start = self.pos;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        self.input[start..self.pos]
-            .parse()
-            .map_err(|error| format!("invalid number at byte {start}: {error}"))
-    }
-
-    fn parse_symbol(&mut self) -> Result<String, String> {
-        let start = self.pos;
-        while let Some(byte) = self.peek() {
-            if byte.is_ascii_whitespace() || matches!(byte, b'(' | b')' | b'[' | b']') {
-                break;
-            }
-            self.pos += 1;
-        }
-        if start == self.pos {
-            return Err(format!("expected symbol at byte {start}"));
-        }
-        Ok(self.input[start..self.pos].to_string())
-    }
-
-    fn skip_ws(&mut self) {
-        loop {
-            while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-                self.pos += 1;
-            }
-            if self.peek() == Some(b';') {
-                while self.peek().is_some_and(|byte| byte != b'\n') {
-                    self.pos += 1;
-                }
-                continue;
-            }
-            break;
-        }
-    }
-
-    fn expect(&mut self, expected: u8) -> Result<(), String> {
-        match self.peek() {
-            Some(byte) if byte == expected => {
-                self.pos += 1;
-                Ok(())
-            }
-            Some(byte) => Err(format!(
-                "expected `{}`, found `{}` at byte {}",
-                expected as char, byte as char, self.pos
-            )),
-            None => Err(format!(
-                "expected `{}`, found end of input",
-                expected as char
-            )),
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.input.as_bytes().get(self.pos).copied()
-    }
-}
-
-fn query_to_json(expr: &Expr) -> Result<Value, String> {
+pub(crate) fn query_to_json(expr: &Expr) -> Result<Value, String> {
     if let Some(value) = wrapper_query_to_json(expr)? {
         return Ok(value);
     }
@@ -186,7 +42,7 @@ fn query_to_json(expr: &Expr) -> Result<Value, String> {
 }
 
 fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
-    let Expr::List(items) = expr else {
+    let Some(items) = expr.as_list() else {
         return Ok(None);
     };
     let Some(head) = head_symbol(items)? else {
@@ -268,7 +124,7 @@ fn query_object(expr: &Expr) -> Result<Map<String, Value>, String> {
 }
 
 fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
-    let Expr::List(items) = expr else {
+    let Some(items) = expr.as_list() else {
         return Err("pattern must be an S-expression list".to_string());
     };
     let Some(head) = head_symbol(items)? else {
@@ -347,22 +203,22 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
 fn parse_pattern_tail(object: &mut Map<String, Value>, tail: &[Expr]) -> Result<(), String> {
     let mut index = 0;
     while index < tail.len() {
-        match &tail[index] {
-            Expr::Symbol(keyword) if keyword.starts_with(':') => {
+        match &tail[index].kind {
+            ExprKind::Symbol(keyword) if keyword.starts_with(':') => {
                 if index + 1 >= tail.len() {
                     return Err(format!("keyword `{keyword}` requires a value"));
                 }
                 insert_keyword(object, &keyword[1..], &tail[index + 1])?;
                 index += 2;
             }
-            Expr::List(_) => {
+            ExprKind::List(_) => {
                 merge_pattern_fragment(object, pattern_to_json(&tail[index])?)?;
                 index += 1;
             }
-            other => {
+            _ => {
                 return Err(format!(
                     "unexpected pattern argument {}; use :field value or a predicate form",
-                    describe_expr(other)
+                    describe_expr(&tail[index])
                 ));
             }
         }
@@ -391,12 +247,10 @@ fn insert_keyword(object: &mut Map<String, Value>, key: &str, value: &Expr) -> R
     let Some(role) = Role::from_label(key) else {
         return Err(format!("unknown pattern field `:{key}`"));
     };
-    if Role::single_target_roles().contains(&role) {
-        insert_unique(object, role.label(), single_role_value(value)?)
-    } else if Role::list_target_roles().contains(&role) {
-        insert_unique(object, role.label(), pattern_array(value)?)
-    } else {
-        insert_unique(object, role.label(), kwargs_object(value)?)
+    match role.value_shape() {
+        RoleValueShape::Pattern => insert_unique(object, role.label(), single_role_value(value)?),
+        RoleValueShape::PatternList => insert_unique(object, role.label(), pattern_array(value)?),
+        RoleValueShape::PatternMap => insert_unique(object, role.label(), kwargs_object(value)?),
     }
 }
 
@@ -425,17 +279,16 @@ fn insert_unique(
 }
 
 fn single_role_value(expr: &Expr) -> Result<Value, String> {
-    match expr {
-        Expr::String(value) => Ok(json!({ "name": value })),
-        _ => pattern_to_json(expr),
+    match expr.as_string() {
+        Some(value) => Ok(json!({ "name": value })),
+        None => pattern_to_json(expr),
     }
 }
 
 fn pattern_array(expr: &Expr) -> Result<Value, String> {
-    let items = match expr {
-        Expr::Vector(items) | Expr::List(items) => items,
-        _ => return Err("expected a list/vector of patterns".to_string()),
-    };
+    let items = expr
+        .as_sequence()
+        .ok_or_else(|| "expected a list/vector of patterns".to_string())?;
     items
         .iter()
         .map(pattern_to_json)
@@ -444,13 +297,12 @@ fn pattern_array(expr: &Expr) -> Result<Value, String> {
 }
 
 fn kwargs_object(expr: &Expr) -> Result<Value, String> {
-    let pairs = match expr {
-        Expr::Vector(items) | Expr::List(items) => items,
-        _ => return Err("expected a list/vector of keyword argument pairs".to_string()),
-    };
+    let pairs = expr
+        .as_sequence()
+        .ok_or_else(|| "expected a list/vector of keyword argument pairs".to_string())?;
     let mut object = Map::new();
     for pair in pairs {
-        let Expr::List(items) = pair else {
+        let Some(items) = pair.as_list() else {
             return Err("keyword argument entry must be a list".to_string());
         };
         expect_len(items, 2, "kwargs entry")?;
@@ -461,13 +313,13 @@ fn kwargs_object(expr: &Expr) -> Result<Value, String> {
 }
 
 fn kind_value(expr: &Expr) -> Result<Value, String> {
-    match expr {
-        Expr::Vector(items) | Expr::List(items) => items
+    match expr.as_sequence() {
+        Some(items) => items
             .iter()
             .map(kind_label)
             .collect::<Result<Vec<_>, _>>()
             .map(array_of_strings),
-        _ => Ok(Value::String(kind_label(expr)?)),
+        None => Ok(Value::String(kind_label(expr)?)),
     }
 }
 
@@ -495,27 +347,22 @@ fn result_detail_arg(expr: &Expr) -> Result<String, String> {
 }
 
 fn string_arg(expr: &Expr) -> Result<String, String> {
-    match expr {
-        Expr::String(value) => Ok(value.clone()),
-        _ => Err(format!("expected string, got {}", describe_expr(expr))),
-    }
+    expr.as_string()
+        .map(str::to_string)
+        .ok_or_else(|| format!("expected string, got {}", describe_expr(expr)))
 }
 
 fn symbol_or_string(expr: &Expr) -> Result<String, String> {
-    match expr {
-        Expr::String(value) | Expr::Symbol(value) => Ok(value.clone()),
-        _ => Err(format!(
-            "expected symbol or string, got {}",
-            describe_expr(expr)
-        )),
-    }
+    expr.as_string()
+        .or_else(|| expr.as_symbol())
+        .map(str::to_string)
+        .ok_or_else(|| format!("expected symbol or string, got {}", describe_expr(expr)))
 }
 
 fn number_value(expr: &Expr, context: &str) -> Result<Value, String> {
-    match expr {
-        Expr::Number(value) => Ok(Value::Number(Number::from(*value))),
-        _ => Err(format!("({context} ...) requires a number")),
-    }
+    expr.as_number()
+        .map(|value| Value::Number(Number::from(value)))
+        .ok_or_else(|| format!("({context} ...) requires a number"))
 }
 
 fn array_of_strings(values: Vec<String>) -> Value {
@@ -524,7 +371,7 @@ fn array_of_strings(values: Vec<String>) -> Value {
 
 fn head_symbol(items: &[Expr]) -> Result<Option<&str>, String> {
     match items.first() {
-        Some(Expr::Symbol(symbol)) => Ok(Some(symbol.as_str())),
+        Some(expr) if expr.as_symbol().is_some() => Ok(expr.as_symbol()),
         Some(other) => Err(format!(
             "S-expression head must be a symbol, got {}",
             describe_expr(other)
@@ -546,12 +393,12 @@ fn expect_len(items: &[Expr], len: usize, form: &str) -> Result<(), String> {
 }
 
 fn describe_expr(expr: &Expr) -> &'static str {
-    match expr {
-        Expr::List(_) => "a list",
-        Expr::Vector(_) => "a vector",
-        Expr::String(_) => "a string",
-        Expr::Symbol(_) => "a symbol",
-        Expr::Number(_) => "a number",
+    match &expr.kind {
+        ExprKind::List(_) => "a list",
+        ExprKind::Vector(_) => "a vector",
+        ExprKind::String(_) => "a string",
+        ExprKind::Symbol(_) => "a symbol",
+        ExprKind::Number(_) => "a number",
     }
 }
 
@@ -678,11 +525,11 @@ mod tests {
     #[test]
     fn structural_query_sexp_reports_excessive_parser_depth() {
         let mut input = String::new();
-        for _ in 0..=MAX_SEXP_DEPTH + 1 {
+        for _ in 0..=MAX_RQL_DEPTH + 1 {
             input.push('(');
         }
         input.push_str("call");
-        for _ in 0..=MAX_SEXP_DEPTH + 1 {
+        for _ in 0..=MAX_RQL_DEPTH + 1 {
             input.push(')');
         }
         let error = CodeQuery::from_sexp(&input).unwrap_err();

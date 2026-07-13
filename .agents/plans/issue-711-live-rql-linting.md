@@ -16,6 +16,7 @@ The implementation also removes the current maintenance trap in which the S-expr
 - [x] (2026-07-13 11:01Z) Milestone 2: exposed analyzer-free validation and hover requests through LSP, switched query execution to the shared source parser, and added focused UTF-16/JSON/RQL integration tests.
 - [x] (2026-07-13 11:05Z) Milestone 3: added `.rql`-only debounced/cancellable VS Code diagnostics and hover integration with pure unit-tested lifecycle logic.
 - [x] (2026-07-13 11:24Z) Milestone 4: documented the maintenance contract in `AGENTS.md`, completed review fixes, and passed formatting, focused Rust/LSP/extension tests, all-target/all-feature clippy, and the full `nlp,python` test gate. Automated coverage exercised the editor lifecycle and wire behavior; a graphical Extension Development Host was not available in this environment, so manual Problems/hover inspection remains a delivery note rather than a claimed result.
+- [x] (2026-07-13 12:19Z) Post-milestone guided review: fixed all 11 queued findings by sharing the spanned RQL parser, making typed schema collectors drive decoding, bounding source analysis, preserving incomplete hover, reporting independent semantic errors, correcting UTF-8 JSON ranges and canonical paths, clearing diagnostics on unexpected server closure, and restoring REPL/grammar vocabulary coverage. Re-ran every focused and full gate successfully.
 
 ## Surprises & Discoveries
 
@@ -46,6 +47,15 @@ The implementation also removes the current maintenance trap in which the S-expr
 - Observation: On macOS the full Python-feature test gate needs PyO3's dynamic symbol lookup flags, and the sandbox needs a writable uv cache.
   Evidence: The successful full command used `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' UV_CACHE_DIR=/tmp/bifrost-uv-cache BIFROST_SEMANTIC_INDEX=off cargo test --all-targets --features nlp,python`; it exited 0 after all targets completed.
 
+- Observation: Keeping a separate source-analysis RQL parser caused accepted execution shorthand to be rejected by live linting and made incomplete tokens lose hover metadata.
+  Evidence: Both `CodeQuery::from_sexp` and source analysis now consume `query/syntax.rs`; regression tests cover single-role string shorthand, quoted result detail, excessive depth, and incomplete role hover.
+
+- Observation: Exhaustively acknowledging registry enum variants was not enough while the decoder still fetched fields through hard-coded string keys.
+  Evidence: `QueryFields` and `PatternFields` are now populated by exhaustive matches over `QueryField` and `PatternField`, and all typed lowering reads those collected slots.
+
+- Observation: `json-spanned-value` correctly reports completed invalid UTF-8 JSON offsets, but EOF input needs a parser-backed completion to recover hover spans.
+  Evidence: completed malformed JSON after multibyte characters highlights the exact byte/UTF-16 token; incomplete JSON hover uses bounded synthetic suffixes accepted by the same parser and retains only ranges wholly inside the original source.
+
 ## Decision Log
 
 - Decision: Use declarative `macro_rules!` registries, not a procedural field attribute.
@@ -68,11 +78,21 @@ The implementation also removes the current maintenance trap in which the S-expr
   Rationale: The same metadata can provide broad useful help without duplicating descriptions in TypeScript.
   Date/Author: 2026-07-13 / dave + Codex.
 
+- Decision: Bound source-oriented analysis to 64 KiB, 100 diagnostics, 1,000 help items, and bounded parser/completion depth.
+  Rationale: Validation and hover run synchronously on the LSP request thread, so explicit limits keep malformed unsaved input from monopolizing server responsiveness.
+  Date/Author: 2026-07-13 / Codex guided-review follow-up.
+
+- Decision: Perform locally attributable semantic checks during the spanned source traversal, then run `CodeQuery` validation only when structural diagnostics are absent.
+  Rationale: Regex, glob, limits, capture constraints, root anchors, and role/kind compatibility can be reported independently with exact ranges while malformed prerequisites still suppress cascades.
+  Date/Author: 2026-07-13 / Codex guided-review follow-up.
+
 ## Outcomes & Retrospective
 
 All four milestones are complete. A required-metadata macro registry owns RQL forms/properties and JSON fields, while the kind/role registries own their help and shapes. Parser and decoder dispatch use generated enums with exhaustive matches, the REPL consumes the same descriptions, and source APIs provide byte ranges, independent diagnostics, hover tokens, and JSON-or-RQL execution. Private LSP validation and hover handlers convert those ranges to UTF-16 without receiving analyzer state, and Play execution accepts the same JSON-or-RQL source. VS Code now owns a dedicated RQL diagnostic collection, rejects non-`bifrost-rql` documents before scheduling work, cancels stale requests, and adapts server hover Markdown. `AGENTS.md` records the schema-first maintenance contract and grammar/test obligations.
 
-Final verification passed: 6 focused source-analysis tests, 2 focused LSP query tests, all 43 VS Code tests, pinned-toolchain `cargo clippy --all-targets --all-features -- -D warnings`, and the complete `cargo test --all-targets --features nlp,python` gate with semantic indexing disabled. The full library target alone reported 733 passed, 0 failed, and 3 ignored; the LSP integration target reported 179 passed. No graphical Extension Development Host was available, so Problems-panel presentation and rendered hover appearance were not manually inspected; the server ranges/content and extension publication, cancellation, clearing, lifecycle, and ordinary-JSON exclusion paths are covered automatically.
+The post-review result closes all 11 queued findings. RQL execution and linting now share one byte-spanned parser; typed query/pattern collectors make the declarative registry drive actual decoding; source analysis is bounded and reports independently attributable semantic errors; incomplete RQL and JSON retain schema hover; JSON error offsets and semantic paths remain byte/UTF-16 correct; unexpected LSP closure clears diagnostics; and REPL comments plus underscore predicate aliases remain documented and highlighted.
+
+Final verification passed: all 14 source-analysis tests, all 46 focused query tests, 11 REPL tests, the focused LSP test plus the complete 179-test LSP target, all 45 VS Code tests, pinned-toolchain `cargo clippy --all-targets --all-features -- -D warnings`, and the complete `cargo test --all-targets --features nlp,python` gate with semantic indexing disabled. The full library target alone reported 741 passed, 0 failed, and 3 ignored; the broad all-target command exited 0. No graphical Extension Development Host was available, so Problems-panel presentation and rendered hover appearance were not manually inspected; the server ranges/content and extension publication, cancellation, clearing, lifecycle, and ordinary-JSON exclusion paths are covered automatically.
 
 ## Context and Orientation
 
@@ -171,3 +191,5 @@ Revision note, 2026-07-13: Milestone 2 completed with analyzer-free `bifrost/val
 Revision note, 2026-07-13: Milestone 3 completed with a dedicated RQL diagnostic collection, debounced/cancellable generation-and-version guarded validation, close/server cleanup, schema hover wiring, and explicit ordinary-JSON exclusion tests.
 
 Revision note, 2026-07-13: Milestone 4 completed with the schema maintenance rule, final full-keyword diagnostic ranges, lint cleanup, and all automated verification gates passing; recorded the unavailable graphical Extension Development Host check explicitly.
+
+Revision note, 2026-07-13: Post-milestone guided review applied all 11 queued findings, consolidated the parser and decoder authority, added bounded independent source validation and incomplete hover recovery, repaired editor lifecycle/docs/grammar gaps, and re-ran the full verification matrix successfully.

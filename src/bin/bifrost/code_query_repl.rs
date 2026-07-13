@@ -37,6 +37,11 @@ const COMMANDS: &[MetadataEntry] = &[
     MetadataEntry::new(":quit", "Exit the REPL."),
 ];
 
+const LANGUAGE_TOPICS: &[MetadataEntry] = &[MetadataEntry::new(
+    "comments",
+    "Use ; at a token boundary for a comment through the next newline; RQL has no block comments.",
+)];
+
 const EXAMPLES: &[Example] = &[
     Example::new(
         "calls",
@@ -742,6 +747,12 @@ fn doc_text(name: &str) -> String {
     if let Some(command) = COMMANDS.iter().find(|entry| entry.name == name) {
         return format!("{} — {}", command.name, command.doc);
     }
+    if let Some(topic) = LANGUAGE_TOPICS
+        .iter()
+        .find(|entry| entry.name == normalized)
+    {
+        return format!("{} — {}", topic.name, topic.doc);
+    }
     if let Some(form) = ALL_RQL_FORMS
         .iter()
         .find(|form| form.labels().contains(&normalized))
@@ -801,6 +812,10 @@ impl ReplCompleter {
     fn new() -> Self {
         let mut entries = Vec::new();
         entries.extend(COMMANDS.iter().map(|entry| CompletionEntry {
+            value: entry.name.to_string(),
+            description: entry.doc.to_string(),
+        }));
+        entries.extend(LANGUAGE_TOPICS.iter().map(|entry| CompletionEntry {
             value: entry.name.to_string(),
             description: entry.doc.to_string(),
         }));
@@ -961,7 +976,7 @@ mod tests {
     fn code_query_repl_exposes_doc_metadata() {
         assert!(doc_text(":run").contains("Run"));
         assert!(doc_text("call").contains("Match call"));
-        assert!(doc_text("comments").contains("comment"));
+        assert!(doc_text("comments").contains("no block comments"));
         assert!(doc_text("callee").contains("call target"));
         assert!(doc_text("calls").contains("eval"));
     }
@@ -982,6 +997,12 @@ mod tests {
             suggestions
                 .iter()
                 .any(|suggestion| suggestion.value == ":run")
+        );
+        assert!(
+            completer
+                .complete("comm", 4)
+                .iter()
+                .any(|suggestion| suggestion.value == "comments")
         );
         assert!(
             suggestions

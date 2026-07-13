@@ -714,6 +714,14 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
         2
     );
 
+    let malformed_json = r#"{"note":"😀","λ":1,]"#;
+    let response = server.request("bifrost/validateQuery", json!({"query": malformed_json}));
+    let diagnostic = &response["result"]["diagnostics"][0];
+    let bad_byte = malformed_json.find(']').unwrap();
+    let bad_utf16 = malformed_json[..bad_byte].encode_utf16().count() as u64;
+    assert_eq!(diagnostic["range"]["start"]["character"], bad_utf16);
+    assert_eq!(diagnostic["range"]["end"]["character"], bad_utf16 + 1);
+
     let hover = server.request(
         "bifrost/queryHover",
         json!({"query": "(call :callee (name \"run\"))", "position": {"line": 0, "character": 2}}),
@@ -732,6 +740,23 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
         json!({"query": "(call ; comment\n)", "position": {"line": 0, "character": 9}}),
     );
     assert!(no_hover["result"].is_null(), "{no_hover}");
+
+    let partial_json = r#"{"match":{"kind":"#;
+    let partial_hover = server.request(
+        "bifrost/queryHover",
+        json!({
+            "query": partial_json,
+            "position": {"line": 0, "character": 11}
+        }),
+    );
+    assert_eq!(partial_hover["result"]["range"]["start"]["character"], 10);
+    assert_eq!(partial_hover["result"]["range"]["end"]["character"], 16);
+    assert!(
+        partial_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("normalized node kinds")),
+        "{partial_hover}"
+    );
 }
 
 #[test]

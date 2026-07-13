@@ -3,14 +3,26 @@
 use super::schema::{
     PatternField, QueryField, RqlForm, RqlFormClass, RqlProperty, StringPredicateField,
 };
-use super::sexp::sexp_to_json;
-use super::{CodeQuery, CodeQueryResultDetail};
+use super::sexp::query_to_json;
+use super::syntax::{Expr, ExprKind, parse_rql};
+use super::{
+    CodeQuery, CodeQueryResultDetail, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+};
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
-use json_spanned_value::spanned;
+use json_spanned_value::{ErrorExt, spanned};
+use regex::Regex;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+
+pub const MAX_QUERY_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_SOURCE_DIAGNOSTICS: usize = 100;
+const MAX_SOURCE_HELP_ITEMS: usize = 1_000;
+const MAX_JSON_COMPLETION_DEPTH: usize = 6;
+const MAX_JSON_COMPLETION_SOURCE_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuerySourceDiagnostic {
@@ -30,6 +42,13 @@ impl CodeQuery {
     /// Parse RQL or canonical JSON. JSON is selected only when the first
     /// non-whitespace character is an opening brace.
     pub fn from_source(source: &str) -> Result<Self, String> {
+        if source.len() > MAX_QUERY_SOURCE_BYTES {
+            return Err(format!(
+                "query source is too large: {} bytes exceeds {}",
+                source.len(),
+                MAX_QUERY_SOURCE_BYTES
+            ));
+        }
         if is_json_source(source) {
             let parsed: spanned::Value =
                 json_spanned_value::from_str(source).map_err(|error| error.to_string())?;
@@ -41,10 +60,24 @@ impl CodeQuery {
 }
 
 pub fn validate_query_source(source: &str) -> Vec<QuerySourceDiagnostic> {
+    if source.len() > MAX_QUERY_SOURCE_BYTES {
+        return vec![QuerySourceDiagnostic {
+            range: 0..source.len(),
+            code: "query-too-large",
+            message: format!(
+                "query source is too large: {} bytes exceeds {}",
+                source.len(),
+                MAX_QUERY_SOURCE_BYTES
+            ),
+        }];
+    }
     analyze_source(source).diagnostics
 }
 
 pub fn query_source_help_at(source: &str, byte_offset: usize) -> Option<QuerySourceHelp> {
+    if source.len() > MAX_QUERY_SOURCE_BYTES {
+        return None;
+    }
     analyze_source(source)
         .help
         .into_iter()
@@ -60,10 +93,14 @@ struct Analysis {
     diagnostics: Vec<QuerySourceDiagnostic>,
     help: Vec<QuerySourceHelp>,
     paths: HashMap<String, Range<usize>>,
+    incomplete: bool,
 }
 
 impl Analysis {
     fn error(&mut self, range: Range<usize>, code: &'static str, message: impl Into<String>) {
+        if self.diagnostics.len() >= MAX_SOURCE_DIAGNOSTICS {
+            return;
+        }
         self.diagnostics.push(QuerySourceDiagnostic {
             range,
             code,
@@ -77,6 +114,9 @@ impl Analysis {
         signature: impl Into<String>,
         description: impl Into<String>,
     ) {
+        if self.help.len() >= MAX_SOURCE_HELP_ITEMS {
+            return;
+        }
         self.help.push(QuerySourceHelp {
             range,
             signature: signature.into(),
@@ -112,214 +152,24 @@ fn analyze_source(source: &str) -> Analysis {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Expr {
-    kind: ExprKind,
-    range: Range<usize>,
-}
-
-#[derive(Debug, Clone)]
-enum ExprKind {
-    List(Vec<Expr>),
-    Vector(Vec<Expr>),
-    String,
-    Symbol(String),
-    Number(u64),
-}
-
-#[derive(Debug)]
-struct ParseError {
-    range: Range<usize>,
-    message: String,
-    incomplete: bool,
-}
-
-struct Parser<'a> {
-    source: &'a str,
-    pos: usize,
-}
-
-impl<'a> Parser<'a> {
-    fn new(source: &'a str) -> Self {
-        Self { source, pos: 0 }
-    }
-
-    fn parse(mut self) -> Result<Option<Expr>, ParseError> {
-        self.skip_trivia();
-        if self.pos == self.source.len() {
-            return Ok(None);
-        }
-        let expr = self.expr(0)?;
-        self.skip_trivia();
-        if self.pos != self.source.len() {
-            return Err(self.error_here("unexpected input after the query", false));
-        }
-        Ok(Some(expr))
-    }
-
-    fn expr(&mut self, depth: usize) -> Result<Expr, ParseError> {
-        if depth > 128 {
-            return Err(self.error_here("RQL nesting exceeds 128 levels", false));
-        }
-        self.skip_trivia();
-        let start = self.pos;
-        let Some(byte) = self.peek() else {
-            return Err(self.error_here("expected an expression", true));
-        };
-        match byte {
-            b'(' => self.delimited(b')', depth, true),
-            b'[' => self.delimited(b']', depth, false),
-            b')' | b']' => {
-                self.pos += 1;
-                Err(ParseError {
-                    range: start..self.pos,
-                    message: format!("unexpected '{}'", byte as char),
-                    incomplete: false,
-                })
-            }
-            b'"' => self.string(),
-            b'0'..=b'9' => self.number(),
-            _ => self.symbol(),
-        }
-    }
-
-    fn delimited(&mut self, close: u8, depth: usize, list: bool) -> Result<Expr, ParseError> {
-        let start = self.pos;
-        self.pos += 1;
-        let mut values = Vec::new();
-        loop {
-            self.skip_trivia();
-            match self.peek() {
-                Some(byte) if byte == close => {
-                    self.pos += 1;
-                    return Ok(Expr {
-                        kind: if list {
-                            ExprKind::List(values)
-                        } else {
-                            ExprKind::Vector(values)
-                        },
-                        range: start..self.pos,
-                    });
-                }
-                None => {
-                    return Err(ParseError {
-                        range: start..self.source.len(),
-                        message: format!("missing '{}'", close as char),
-                        incomplete: true,
-                    });
-                }
-                _ => values.push(self.expr(depth + 1)?),
-            }
-        }
-    }
-
-    fn string(&mut self) -> Result<Expr, ParseError> {
-        let start = self.pos;
-        self.pos += 1;
-        let mut escaped = false;
-        while let Some(byte) = self.peek() {
-            self.pos += 1;
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                return serde_json::from_str::<String>(&self.source[start..self.pos])
-                    .map(|_| Expr {
-                        kind: ExprKind::String,
-                        range: start..self.pos,
-                    })
-                    .map_err(|error| ParseError {
-                        range: start..self.pos,
-                        message: format!("invalid string: {error}"),
-                        incomplete: false,
-                    });
-            }
-        }
-        Err(ParseError {
-            range: start..self.source.len(),
-            message: "unfinished string".to_string(),
-            incomplete: true,
-        })
-    }
-
-    fn number(&mut self) -> Result<Expr, ParseError> {
-        let start = self.pos;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        let number = self.source[start..self.pos]
-            .parse()
-            .map_err(|error| ParseError {
-                range: start..self.pos,
-                message: format!("invalid number: {error}"),
-                incomplete: false,
-            })?;
-        Ok(Expr {
-            kind: ExprKind::Number(number),
-            range: start..self.pos,
-        })
-    }
-
-    fn symbol(&mut self) -> Result<Expr, ParseError> {
-        let start = self.pos;
-        while let Some(byte) = self.peek() {
-            if byte.is_ascii_whitespace() || matches!(byte, b'(' | b')' | b'[' | b']' | b';') {
-                break;
-            }
-            self.pos += 1;
-        }
-        if start == self.pos {
-            return Err(self.error_here("expected a symbol", false));
-        }
-        Ok(Expr {
-            kind: ExprKind::Symbol(self.source[start..self.pos].to_string()),
-            range: start..self.pos,
-        })
-    }
-
-    fn skip_trivia(&mut self) {
-        loop {
-            while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-                self.pos += 1;
-            }
-            if self.peek() != Some(b';') {
-                break;
-            }
-            while self.peek().is_some_and(|byte| byte != b'\n') {
-                self.pos += 1;
-            }
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.source.as_bytes().get(self.pos).copied()
-    }
-
-    fn error_here(&self, message: &str, incomplete: bool) -> ParseError {
-        ParseError {
-            range: self.pos..self.pos.saturating_add(1).min(self.source.len()),
-            message: message.to_string(),
-            incomplete,
-        }
-    }
-}
-
 fn analyze_rql(source: &str) -> Analysis {
     let mut analysis = Analysis::default();
-    let expr = match Parser::new(source).parse() {
-        Ok(Some(expr)) => expr,
-        Ok(None) => return analysis,
-        Err(error) if error.incomplete => return analysis,
+    let parsed = match parse_rql(source) {
+        Ok(parsed) => parsed,
         Err(error) => {
             analysis.error(error.range, "invalid-syntax", error.message);
             return analysis;
         }
     };
+    let Some(expr) = parsed.expr else {
+        return analysis;
+    };
 
     validate_rql_query(&expr, "match", &mut analysis);
-    if analysis.diagnostics.is_empty() {
-        match sexp_to_json(source) {
+    if parsed.incomplete.is_some() || analysis.incomplete {
+        analysis.diagnostics.clear();
+    } else if analysis.diagnostics.is_empty() {
+        match query_to_json(&expr) {
             Ok(json) => {
                 if let Err(error) = CodeQuery::from_json(&json) {
                     analysis.semantic_error(error, expr.range.clone());
@@ -359,7 +209,29 @@ fn validate_rql_query(expr: &Expr, path: &str, analysis: &mut Analysis) {
         validate_wrapper(form, args, path, analysis);
     } else {
         validate_rql_pattern(expr, path, analysis);
+        if path == "match" && rql_pattern_anchors_root(expr) == Some(false) {
+            analysis.error(
+                expr.range.clone(),
+                "invalid-query",
+                "root pattern must constrain at least one of kind, name, or text",
+            );
+        }
     }
+}
+
+fn rql_pattern_anchors_root(expr: &Expr) -> Option<bool> {
+    let (head, _, _) = list_head(expr)?;
+    if NormalizedKind::from_label(head).is_some() {
+        return Some(true);
+    }
+    let form = RqlForm::from_label(head)?;
+    if form.class() != RqlFormClass::Predicate {
+        return None;
+    }
+    Some(matches!(
+        form.property(),
+        Some(RqlProperty::Name | RqlProperty::NameRegex | RqlProperty::TextRegex)
+    ))
 }
 
 fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Analysis) {
@@ -368,12 +240,43 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
     };
     match form {
         RqlForm::Where => {
-            for arg in &args[..args.len().saturating_sub(1)] {
-                require_string(arg, analysis);
+            let values = &args[..args.len().saturating_sub(1)];
+            if values.is_empty() {
+                analysis.error(
+                    query.range.clone(),
+                    "wrong-value-shape",
+                    "where expects at least one glob and a query",
+                );
+            } else if values.len() > MAX_WHERE_GLOBS {
+                analysis.error(
+                    values[MAX_WHERE_GLOBS].range.clone(),
+                    "invalid-query",
+                    format!("at most {MAX_WHERE_GLOBS} globs are allowed"),
+                );
+            }
+            for (index, arg) in values.iter().enumerate() {
+                let child = format!("where[{index}]");
+                analysis.path(&child, arg.range.clone());
+                validate_glob(arg, &child, analysis);
             }
         }
         RqlForm::Language => {
-            for arg in &args[..args.len().saturating_sub(1)] {
+            let values = &args[..args.len().saturating_sub(1)];
+            if values.is_empty() {
+                analysis.error(
+                    query.range.clone(),
+                    "wrong-value-shape",
+                    "language expects at least one label and a query",
+                );
+            } else if values.len() > MAX_LANGUAGE_FILTERS {
+                analysis.error(
+                    values[MAX_LANGUAGE_FILTERS].range.clone(),
+                    "invalid-query",
+                    format!("at most {MAX_LANGUAGE_FILTERS} language filters are allowed"),
+                );
+            }
+            for (index, arg) in values.iter().enumerate() {
+                analysis.path(format!("languages[{index}]"), arg.range.clone());
                 validate_language(arg, analysis);
             }
         }
@@ -390,6 +293,15 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
                     "wrong-value-shape",
                     "expected a positive integer",
                 );
+            } else if matches!(args[0].kind, ExprKind::Number(value) if value > MAX_LIMIT as u64) {
+                analysis.error(
+                    args[0].range.clone(),
+                    "invalid-query",
+                    format!("limit must be at most {MAX_LIMIT}"),
+                );
+            }
+            if let Some(value) = args.first() {
+                analysis.path("limit", value.range.clone());
             }
         }
         RqlForm::ResultDetail => {
@@ -400,6 +312,7 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
                     "result-detail expects a value and query",
                 );
             } else {
+                analysis.path("result_detail", args[0].range.clone());
                 validate_result_detail(&args[0], analysis);
             }
         }
@@ -450,6 +363,8 @@ fn validate_rql_pattern(expr: &Expr, path: &str, analysis: &mut Analysis) {
                     let label = &keyword[1..];
                     let key_range = args[index].range.clone();
                     if index + 1 == args.len() {
+                        add_rql_property_help(label, key_range, analysis);
+                        analysis.incomplete = true;
                         return;
                     }
                     validate_rql_property(
@@ -457,6 +372,7 @@ fn validate_rql_pattern(expr: &Expr, path: &str, analysis: &mut Analysis) {
                         key_range,
                         &args[index + 1],
                         path,
+                        kind,
                         &mut seen,
                         analysis,
                     );
@@ -523,7 +439,9 @@ fn validate_predicate_fragment(
         );
         return;
     }
-    let property = RqlProperty::from_label(form.label()).expect("predicate has property metadata");
+    let property = form
+        .property()
+        .expect("predicate forms have an explicit property lowering");
     validate_property_value(property, &args[0], path, analysis);
     record_duplicate(property.label(), head_range, seen, analysis);
 }
@@ -533,6 +451,7 @@ fn validate_rql_property(
     range: Range<usize>,
     value: &Expr,
     path: &str,
+    kind: NormalizedKind,
     seen: &mut HashSet<String>,
     analysis: &mut Analysis,
 ) {
@@ -543,12 +462,24 @@ fn validate_rql_property(
     } else if let Some(role) = Role::from_label(label) {
         analysis.add_help(
             range.clone(),
-            format!(":{} {}", role.label(), role.signature()),
+            format!(":{} {}", role.label(), role.rql_signature()),
             role.description(),
         );
         let child = format!("{path}.{}", role.label());
         analysis.path(&child, value.range.clone());
+        if !role.valid_for(kind) {
+            analysis.error(
+                range.clone(),
+                "invalid-query",
+                format!(
+                    "role {:?} is not valid for kind {}",
+                    role.label(),
+                    kind.label()
+                ),
+            );
+        }
         match role.value_shape() {
+            RoleValueShape::Pattern if matches!(value.kind, ExprKind::String(_)) => {}
             RoleValueShape::Pattern => validate_rql_pattern(value, &child, analysis),
             RoleValueShape::PatternList => validate_pattern_list(value, &child, analysis),
             RoleValueShape::PatternMap => validate_pattern_map(value, &child, analysis),
@@ -559,6 +490,18 @@ fn validate_rql_property(
             range,
             "unknown-property",
             format!("unknown pattern property ':{label}'"),
+        );
+    }
+}
+
+fn add_rql_property_help(label: &str, range: Range<usize>, analysis: &mut Analysis) {
+    if let Some(property) = RqlProperty::from_label(label) {
+        analysis.add_help(range, property.signature(), property.description());
+    } else if let Some(role) = Role::from_label(label) {
+        analysis.add_help(
+            range,
+            format!(":{} {}", role.label(), role.rql_signature()),
+            role.description(),
         );
     }
 }
@@ -584,17 +527,90 @@ fn validate_property_value(
     path: &str,
     analysis: &mut Analysis,
 ) {
-    let child = format!("{path}.{}", property.label().replace('-', "_"));
+    let child = rql_property_path(path, property);
     analysis.path(&child, value.range.clone());
-    match property {
-        RqlProperty::Name
-        | RqlProperty::NameRegex
-        | RqlProperty::TextRegex
-        | RqlProperty::Capture => {
+    match property.value_shape() {
+        super::schema::ValueShape::String => {
             require_string(value, analysis);
+            validate_plain_string(property, value, analysis);
         }
-        RqlProperty::NotKind => validate_kind_value(value, analysis),
-        RqlProperty::Has | RqlProperty::NotHas => validate_rql_pattern(value, &child, analysis),
+        super::schema::ValueShape::RegexString => validate_rql_regex(value, &child, analysis),
+        super::schema::ValueShape::KindList => validate_kind_value(value, &child, analysis),
+        super::schema::ValueShape::Pattern => validate_rql_pattern(value, &child, analysis),
+        super::schema::ValueShape::PatternList
+        | super::schema::ValueShape::PatternMap
+        | super::schema::ValueShape::StringList
+        | super::schema::ValueShape::StringPredicate
+        | super::schema::ValueShape::RegexPredicate
+        | super::schema::ValueShape::LanguageList
+        | super::schema::ValueShape::PositiveInteger
+        | super::schema::ValueShape::ResultDetail
+        | super::schema::ValueShape::SchemaVersion => {
+            unreachable!("unsupported value shape for an RQL pattern property")
+        }
+    }
+}
+
+fn rql_property_path(path: &str, property: RqlProperty) -> String {
+    let suffix = match property {
+        RqlProperty::Name => "name",
+        RqlProperty::NameRegex => "name.regex",
+        RqlProperty::TextRegex => "text.regex",
+        RqlProperty::Capture => "capture",
+        RqlProperty::NotKind => "not_kind",
+        RqlProperty::Has => "has",
+        RqlProperty::NotHas => "not_has",
+    };
+    format!("{path}.{suffix}")
+}
+
+fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Analysis) {
+    let ExprKind::String(text) = &value.kind else {
+        return;
+    };
+    let (label, max, reject_empty) = match property {
+        RqlProperty::Name => ("exact string", MAX_STRING_PREDICATE_LENGTH, false),
+        RqlProperty::Capture => ("capture label", MAX_CAPTURE_LENGTH, true),
+        RqlProperty::NameRegex
+        | RqlProperty::TextRegex
+        | RqlProperty::NotKind
+        | RqlProperty::Has
+        | RqlProperty::NotHas => unreachable!("property is not a plain string"),
+    };
+    if reject_empty && text.is_empty() {
+        analysis.error(
+            value.range.clone(),
+            "invalid-query",
+            format!("{label} must not be empty"),
+        );
+    } else if text.len() > max {
+        analysis.error(
+            value.range.clone(),
+            "invalid-query",
+            format!("{label} must be at most {max} bytes"),
+        );
+    }
+}
+
+fn validate_rql_regex(value: &Expr, path: &str, analysis: &mut Analysis) {
+    let ExprKind::String(source) = &value.kind else {
+        require_string(value, analysis);
+        return;
+    };
+    validate_regex(source, value.range.clone(), path, analysis);
+}
+
+fn validate_regex(source: &str, range: Range<usize>, path: &str, analysis: &mut Analysis) {
+    if source.len() > MAX_STRING_PREDICATE_LENGTH {
+        analysis.error(
+            range,
+            "invalid-query",
+            format!("regex must be at most {MAX_STRING_PREDICATE_LENGTH} bytes"),
+        );
+    } else if let Err(error) = Regex::new(source) {
+        analysis.error(range, "invalid-query", format!("invalid regex: {error}"));
+    } else {
+        analysis.path(path, range);
     }
 }
 
@@ -610,6 +626,13 @@ fn validate_pattern_list(value: &Expr, path: &str, analysis: &mut Analysis) {
             return;
         }
     };
+    if items.len() > MAX_ROLE_LIST_ENTRIES {
+        analysis.error(
+            items[MAX_ROLE_LIST_ENTRIES].range.clone(),
+            "invalid-query",
+            format!("role array may contain at most {MAX_ROLE_LIST_ENTRIES} entries"),
+        );
+    }
     for (index, item) in items.iter().enumerate() {
         validate_rql_pattern(item, &format!("{path}[{index}]"), analysis);
     }
@@ -627,6 +650,14 @@ fn validate_pattern_map(value: &Expr, path: &str, analysis: &mut Analysis) {
             return;
         }
     };
+    if pairs.len() > MAX_KWARGS {
+        analysis.error(
+            pairs[MAX_KWARGS].range.clone(),
+            "invalid-query",
+            format!("kwargs may contain at most {MAX_KWARGS} entries"),
+        );
+    }
+    let mut seen = HashSet::new();
     for pair in pairs {
         let ExprKind::List(items) = &pair.kind else {
             analysis.error(
@@ -643,13 +674,46 @@ fn validate_pattern_map(value: &Expr, path: &str, analysis: &mut Analysis) {
                 "named pattern entry expects a name and pattern",
             );
         } else {
-            validate_rql_pattern(&items[1], path, analysis);
+            let key = match &items[0].kind {
+                ExprKind::Symbol(key) | ExprKind::String(key) => Some(key.as_str()),
+                _ => {
+                    analysis.error(
+                        items[0].range.clone(),
+                        "wrong-value-shape",
+                        "keyword argument name must be a symbol or string",
+                    );
+                    None
+                }
+            };
+            let child = key.map_or_else(
+                || path.to_string(),
+                |key| {
+                    let child = format!("{path}.{key}");
+                    analysis.path(&child, items[1].range.clone());
+                    if key.len() > MAX_KWARG_NAME_LENGTH {
+                        analysis.error(
+                            items[0].range.clone(),
+                            "invalid-query",
+                            format!("keyword must be at most {MAX_KWARG_NAME_LENGTH} bytes"),
+                        );
+                    }
+                    if !seen.insert(key.to_string()) {
+                        analysis.error(
+                            items[0].range.clone(),
+                            "duplicate-property",
+                            format!("duplicate keyword argument '{key}'"),
+                        );
+                    }
+                    child
+                },
+            );
+            validate_rql_pattern(&items[1], &child, analysis);
         }
     }
 }
 
 fn require_string(value: &Expr, analysis: &mut Analysis) {
-    if !matches!(value.kind, ExprKind::String) {
+    if !matches!(value.kind, ExprKind::String(_)) {
         analysis.error(
             value.range.clone(),
             "wrong-value-shape",
@@ -658,7 +722,29 @@ fn require_string(value: &Expr, analysis: &mut Analysis) {
     }
 }
 
-fn validate_kind_value(value: &Expr, analysis: &mut Analysis) {
+fn validate_glob(value: &Expr, path: &str, analysis: &mut Analysis) {
+    let ExprKind::String(pattern) = &value.kind else {
+        require_string(value, analysis);
+        return;
+    };
+    if pattern.len() > MAX_GLOB_LENGTH {
+        analysis.error(
+            value.range.clone(),
+            "invalid-query",
+            format!("glob must be at most {MAX_GLOB_LENGTH} bytes"),
+        );
+    } else if let Err(error) = glob::Pattern::new(pattern) {
+        analysis.error(
+            value.range.clone(),
+            "invalid-query",
+            format!("invalid glob: {error}"),
+        );
+    } else {
+        analysis.path(path, value.range.clone());
+    }
+}
+
+fn validate_kind_value(value: &Expr, path: &str, analysis: &mut Analysis) {
     match &value.kind {
         ExprKind::Symbol(label) => {
             if let Some(kind) = NormalizedKind::from_label(label) {
@@ -672,11 +758,34 @@ fn validate_kind_value(value: &Expr, analysis: &mut Analysis) {
             }
         }
         ExprKind::Vector(items) | ExprKind::List(items) => {
-            for item in items {
-                validate_kind_value(item, analysis);
+            if items.is_empty() {
+                analysis.error(
+                    value.range.clone(),
+                    "wrong-value-shape",
+                    "kind list must not be empty",
+                );
+            } else if items.len() > MAX_KIND_LIST_ENTRIES {
+                analysis.error(
+                    items[MAX_KIND_LIST_ENTRIES].range.clone(),
+                    "invalid-query",
+                    format!("kind list may contain at most {MAX_KIND_LIST_ENTRIES} entries"),
+                );
+            }
+            for (index, item) in items.iter().enumerate() {
+                let child = format!("{path}[{index}]");
+                analysis.path(&child, item.range.clone());
+                validate_kind_value(item, &child, analysis);
             }
         }
-        ExprKind::String => {}
+        ExprKind::String(label) => {
+            if NormalizedKind::from_label(label).is_none() {
+                analysis.error(
+                    value.range.clone(),
+                    "invalid-kind",
+                    format!("unknown normalized kind '{label}'"),
+                );
+            }
+        }
         _ => analysis.error(
             value.range.clone(),
             "wrong-value-shape",
@@ -702,7 +811,15 @@ fn validate_language(value: &Expr, analysis: &mut Analysis) {
                 );
             }
         }
-        ExprKind::String => {}
+        ExprKind::String(label) => {
+            if Language::from_config_label(label).is_none() {
+                analysis.error(
+                    value.range.clone(),
+                    "invalid-language",
+                    format!("unknown language label '{label}'"),
+                );
+            }
+        }
         _ => analysis.error(
             value.range.clone(),
             "wrong-value-shape",
@@ -712,13 +829,16 @@ fn validate_language(value: &Expr, analysis: &mut Analysis) {
 }
 
 fn validate_result_detail(value: &Expr, analysis: &mut Analysis) {
-    let ExprKind::Symbol(label) = &value.kind else {
-        analysis.error(
-            value.range.clone(),
-            "wrong-value-shape",
-            "expected compact or full",
-        );
-        return;
+    let label = match &value.kind {
+        ExprKind::Symbol(label) | ExprKind::String(label) => label,
+        _ => {
+            analysis.error(
+                value.range.clone(),
+                "wrong-value-shape",
+                "expected compact or full",
+            );
+            return;
+        }
     };
     if CodeQueryResultDetail::from_label(label).is_some() {
         analysis.add_help(
@@ -743,9 +863,11 @@ fn analyze_json(source: &str) -> Analysis {
     let mut analysis = Analysis::default();
     let parsed: spanned::Value = match json_spanned_value::from_str(source) {
         Ok(value) => value,
-        Err(error) if error.classify() == serde_json::error::Category::Eof => return analysis,
+        Err(error) if error.classify() == serde_json::error::Category::Eof => {
+            return analyze_incomplete_json(source);
+        }
         Err(error) => {
-            let offset = json_error_offset(source, error.line(), error.column());
+            let offset = error.offset_within(source).unwrap_or(source.len());
             let end = source[offset..]
                 .chars()
                 .next()
@@ -763,6 +885,41 @@ fn analyze_json(source: &str) -> Analysis {
     analysis
 }
 
+fn analyze_incomplete_json(source: &str) -> Analysis {
+    if source.len() > MAX_JSON_COMPLETION_SOURCE_BYTES {
+        return Analysis::default();
+    }
+
+    // Ask the real JSON parser whether a bounded synthetic suffix completes
+    // the document. This recovers spans for already-complete keys without
+    // maintaining a second JSON lexer/parser in the editor path.
+    let terminals = ["", "null", ":null", "\"", "\"__incomplete\":null"];
+    for depth in 1..=MAX_JSON_COMPLETION_DEPTH {
+        let permutations = 1usize << depth;
+        for terminal in terminals {
+            for mask in 0..permutations {
+                let mut completed = String::with_capacity(source.len() + terminal.len() + depth);
+                completed.push_str(source);
+                completed.push_str(terminal);
+                for index in 0..depth {
+                    completed.push(if mask & (1 << index) == 0 { '}' } else { ']' });
+                }
+                let Ok(parsed) = json_spanned_value::from_str::<spanned::Value>(&completed) else {
+                    continue;
+                };
+                let mut analysis = Analysis::default();
+                validate_json_query(&parsed, "", &mut analysis);
+                analysis.diagnostics.clear();
+                analysis.help.retain(|item| item.range.end <= source.len());
+                analysis.paths.retain(|_, range| range.end <= source.len());
+                analysis.incomplete = true;
+                return analysis;
+            }
+        }
+    }
+    Analysis::default()
+}
+
 fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
     analysis.path(path, value.range());
     let Some(object) = value.as_object() else {
@@ -773,6 +930,7 @@ fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analys
         );
         return;
     };
+    let mut seen = HashSet::new();
     for (key, child) in object {
         let child_path = join_path(path, key.get_ref());
         analysis.path(&child_path, child.range());
@@ -784,12 +942,28 @@ fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analys
             );
             continue;
         };
+        record_json_duplicate(field.label(), key.range(), &mut seen, analysis);
         analysis.add_help(key.range(), field.signature(), field.description());
         match field {
-            QueryField::Where => validate_string_array(child, "where", analysis),
-            QueryField::Languages => validate_json_languages(child, analysis),
+            QueryField::Where => validate_json_globs(child, &child_path, analysis),
+            QueryField::Languages => validate_json_languages(child, &child_path, analysis),
             QueryField::Match | QueryField::Inside | QueryField::NotInside => {
                 validate_json_pattern(child, &child_path, analysis);
+                if field == QueryField::Match && json_pattern_anchors_root(child) == Some(false) {
+                    analysis.error(
+                        child.range(),
+                        "invalid-query",
+                        "root pattern must constrain at least one of kind, name, or text",
+                    );
+                } else if field != QueryField::Match
+                    && child.as_object().is_some_and(|object| object.is_empty())
+                {
+                    analysis.error(
+                        child.range(),
+                        "invalid-query",
+                        "containment pattern must not be empty",
+                    );
+                }
             }
             QueryField::Limit => {
                 if child
@@ -801,6 +975,16 @@ fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analys
                         child.range(),
                         "wrong-value-shape",
                         "expected a positive integer",
+                    );
+                } else if child
+                    .as_number()
+                    .and_then(serde_json::Number::as_u64)
+                    .is_some_and(|number| number > MAX_LIMIT as u64)
+                {
+                    analysis.error(
+                        child.range(),
+                        "invalid-query",
+                        format!("limit must be at most {MAX_LIMIT}"),
                     );
                 }
             }
@@ -828,27 +1012,63 @@ fn validate_json_pattern(value: &spanned::Value, path: &str, analysis: &mut Anal
         );
         return;
     };
+    let kind_field_present = object
+        .iter()
+        .any(|(key, _)| PatternField::from_label(key.get_ref()) == Some(PatternField::Kind));
+    let declared_kinds = object
+        .iter()
+        .find(|(key, _)| PatternField::from_label(key.get_ref()) == Some(PatternField::Kind))
+        .map_or_else(Vec::new, |(_, value)| collect_json_kinds(value));
+    let mut seen = HashSet::new();
     for (key, child) in object {
         let child_path = join_path(path, key.get_ref());
         analysis.path(&child_path, child.range());
         if let Some(field) = PatternField::from_label(key.get_ref()) {
+            record_json_duplicate(field.label(), key.range(), &mut seen, analysis);
             analysis.add_help(key.range(), field.signature(), field.description());
             match field {
-                PatternField::Kind | PatternField::NotKind => validate_json_kinds(child, analysis),
-                PatternField::Name | PatternField::Text => {
-                    validate_string_predicate(child, analysis)
+                PatternField::Kind | PatternField::NotKind => {
+                    validate_json_kinds(child, &child_path, analysis)
                 }
-                PatternField::Capture => require_json_string(child, analysis),
+                PatternField::Name => validate_string_predicate(child, &child_path, true, analysis),
+                PatternField::Text => {
+                    validate_string_predicate(child, &child_path, false, analysis)
+                }
+                PatternField::Capture => validate_json_capture(child, analysis),
                 PatternField::Has | PatternField::NotHas => {
                     validate_json_pattern(child, &child_path, analysis);
                 }
             }
         } else if let Some(role) = Role::from_label(key.get_ref()) {
+            record_json_duplicate(role.label(), key.range(), &mut seen, analysis);
             analysis.add_help(
                 key.range(),
                 format!("\"{}\": {}", role.label(), role.signature()),
                 role.description(),
             );
+            if !kind_field_present {
+                analysis.error(
+                    key.range(),
+                    "invalid-query",
+                    format!(
+                        "role {:?} requires the pattern to declare a kind",
+                        role.label()
+                    ),
+                );
+            } else if !declared_kinds.is_empty()
+                && !declared_kinds.iter().any(|&kind| role.valid_for(kind))
+            {
+                let kinds = declared_kinds
+                    .iter()
+                    .map(|kind| kind.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                analysis.error(
+                    key.range(),
+                    "invalid-query",
+                    format!("role {:?} is not valid for kind(s) {kinds}", role.label()),
+                );
+            }
             match role.value_shape() {
                 RoleValueShape::Pattern => validate_json_pattern(child, &child_path, analysis),
                 RoleValueShape::PatternList => {
@@ -868,7 +1088,33 @@ fn validate_json_pattern(value: &spanned::Value, path: &str, analysis: &mut Anal
     }
 }
 
-fn validate_json_kinds(value: &spanned::Value, analysis: &mut Analysis) {
+fn json_pattern_anchors_root(value: &spanned::Value) -> Option<bool> {
+    let object = value.as_object()?;
+    if object.iter().any(|(key, _)| {
+        PatternField::from_label(key.get_ref()).is_none()
+            && Role::from_label(key.get_ref()).is_none()
+    }) {
+        return None;
+    }
+    Some(object.iter().any(|(key, _)| {
+        matches!(
+            PatternField::from_label(key.get_ref()),
+            Some(PatternField::Kind | PatternField::Name | PatternField::Text)
+        )
+    }))
+}
+
+fn collect_json_kinds(value: &spanned::Value) -> Vec<NormalizedKind> {
+    if let Some(label) = value.as_string() {
+        NormalizedKind::from_label(label).into_iter().collect()
+    } else if let Some(values) = value.as_array() {
+        values.iter().flat_map(collect_json_kinds).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn validate_json_kinds(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
     if let Some(label) = value.as_string() {
         if let Some(kind) = NormalizedKind::from_label(label) {
             analysis.add_help(value.range(), kind.signature(), kind.description());
@@ -880,8 +1126,17 @@ fn validate_json_kinds(value: &spanned::Value, analysis: &mut Analysis) {
             );
         }
     } else if let Some(values) = value.as_array() {
-        for value in values {
-            validate_json_kinds(value, analysis);
+        if values.is_empty() {
+            analysis.error(
+                value.range(),
+                "wrong-value-shape",
+                "kind array must not be empty",
+            );
+        }
+        for (index, value) in values.iter().enumerate() {
+            let child = format!("{path}[{index}]");
+            analysis.path(&child, value.range());
+            validate_json_kinds(value, &child, analysis);
         }
     } else {
         analysis.error(
@@ -892,19 +1147,47 @@ fn validate_json_kinds(value: &spanned::Value, analysis: &mut Analysis) {
     }
 }
 
-fn validate_string_predicate(value: &spanned::Value, analysis: &mut Analysis) {
-    if value.is_string() {
+fn validate_string_predicate(
+    value: &spanned::Value,
+    path: &str,
+    allow_exact: bool,
+    analysis: &mut Analysis,
+) {
+    if let Some(exact) = value.as_string() {
+        if allow_exact {
+            if exact.len() > MAX_STRING_PREDICATE_LENGTH {
+                analysis.error(
+                    value.range(),
+                    "invalid-query",
+                    format!("exact string must be at most {MAX_STRING_PREDICATE_LENGTH} bytes"),
+                );
+            }
+        } else {
+            analysis.error(
+                value.range(),
+                "wrong-value-shape",
+                "expected { \"regex\": string }",
+            );
+        }
         return;
     }
     let Some(object) = value.as_object() else {
         analysis.error(
             value.range(),
             "wrong-value-shape",
-            "expected a string or { \"regex\": string }",
+            if allow_exact {
+                "expected a string or { \"regex\": string }"
+            } else {
+                "expected { \"regex\": string }"
+            },
         );
         return;
     };
+    let mut seen = HashSet::new();
+    let mut has_regex = false;
     for (key, value) in object {
+        let child_path = join_path(path, key.get_ref());
+        analysis.path(&child_path, value.range());
         if StringPredicateField::from_label(key.get_ref()).is_none() {
             analysis.error(
                 key.range(),
@@ -912,13 +1195,26 @@ fn validate_string_predicate(value: &spanned::Value, analysis: &mut Analysis) {
                 "string predicate only accepts 'regex'",
             );
         } else {
+            has_regex = true;
+            record_json_duplicate("regex", key.range(), &mut seen, analysis);
             analysis.add_help(
                 key.range(),
                 "\"regex\": \"pattern\"",
                 "Match the value with a regular expression.",
             );
-            require_json_string(value, analysis);
+            if let Some(source) = value.as_string() {
+                validate_regex(source, value.range(), &child_path, analysis);
+            } else {
+                require_json_string(value, analysis);
+            }
         }
+    }
+    if !has_regex {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "required field 'regex' is missing",
+        );
     }
 }
 
@@ -931,6 +1227,13 @@ fn validate_json_pattern_array(value: &spanned::Value, path: &str, analysis: &mu
         );
         return;
     };
+    if values.len() > MAX_ROLE_LIST_ENTRIES {
+        analysis.error(
+            values[MAX_ROLE_LIST_ENTRIES].range(),
+            "invalid-query",
+            format!("role array may contain at most {MAX_ROLE_LIST_ENTRIES} entries"),
+        );
+    }
     for (index, value) in values.iter().enumerate() {
         validate_json_pattern(value, &format!("{path}[{index}]"), analysis);
     }
@@ -945,26 +1248,69 @@ fn validate_json_pattern_map(value: &spanned::Value, path: &str, analysis: &mut 
         );
         return;
     };
+    if values.len() > MAX_KWARGS
+        && let Some((key, _)) = values.iter().nth(MAX_KWARGS)
+    {
+        analysis.error(
+            key.range(),
+            "invalid-query",
+            format!("kwargs may contain at most {MAX_KWARGS} entries"),
+        );
+    }
     for (key, value) in values {
-        validate_json_pattern(value, &join_path(path, key.get_ref()), analysis);
+        let child = join_path(path, key.get_ref());
+        analysis.path(&child, value.range());
+        if key.get_ref().len() > MAX_KWARG_NAME_LENGTH {
+            analysis.error(
+                key.range(),
+                "invalid-query",
+                format!("keyword must be at most {MAX_KWARG_NAME_LENGTH} bytes"),
+            );
+        }
+        validate_json_pattern(value, &child, analysis);
     }
 }
 
-fn validate_string_array(value: &spanned::Value, label: &str, analysis: &mut Analysis) {
+fn validate_json_globs(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
     let Some(values) = value.as_array() else {
         analysis.error(
             value.range(),
             "wrong-value-shape",
-            format!("{label} must be an array of strings"),
+            "where must be an array of strings",
         );
         return;
     };
-    for value in values {
-        require_json_string(value, analysis);
+    if values.len() > MAX_WHERE_GLOBS {
+        analysis.error(
+            values[MAX_WHERE_GLOBS].range(),
+            "invalid-query",
+            format!("at most {MAX_WHERE_GLOBS} globs are allowed"),
+        );
+    }
+    for (index, value) in values.iter().enumerate() {
+        let child = format!("{path}[{index}]");
+        analysis.path(&child, value.range());
+        let Some(pattern) = value.as_string() else {
+            require_json_string(value, analysis);
+            continue;
+        };
+        if pattern.len() > MAX_GLOB_LENGTH {
+            analysis.error(
+                value.range(),
+                "invalid-query",
+                format!("glob must be at most {MAX_GLOB_LENGTH} bytes"),
+            );
+        } else if let Err(error) = glob::Pattern::new(pattern) {
+            analysis.error(
+                value.range(),
+                "invalid-query",
+                format!("invalid glob: {error}"),
+            );
+        }
     }
 }
 
-fn validate_json_languages(value: &spanned::Value, analysis: &mut Analysis) {
+fn validate_json_languages(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
     let Some(values) = value.as_array() else {
         analysis.error(
             value.range(),
@@ -973,7 +1319,15 @@ fn validate_json_languages(value: &spanned::Value, analysis: &mut Analysis) {
         );
         return;
     };
-    for value in values {
+    if values.len() > MAX_LANGUAGE_FILTERS {
+        analysis.error(
+            values[MAX_LANGUAGE_FILTERS].range(),
+            "invalid-query",
+            format!("at most {MAX_LANGUAGE_FILTERS} language filters are allowed"),
+        );
+    }
+    for (index, value) in values.iter().enumerate() {
+        analysis.path(format!("{path}[{index}]"), value.range());
         let Some(label) = value.as_string() else {
             analysis.error(
                 value.range(),
@@ -1032,6 +1386,41 @@ fn require_json_string(value: &spanned::Value, analysis: &mut Analysis) {
     }
 }
 
+fn validate_json_capture(value: &spanned::Value, analysis: &mut Analysis) {
+    let Some(label) = value.as_string() else {
+        require_json_string(value, analysis);
+        return;
+    };
+    if label.is_empty() {
+        analysis.error(
+            value.range(),
+            "invalid-query",
+            "capture label must not be empty",
+        );
+    } else if label.len() > MAX_CAPTURE_LENGTH {
+        analysis.error(
+            value.range(),
+            "invalid-query",
+            format!("capture label must be at most {MAX_CAPTURE_LENGTH} bytes"),
+        );
+    }
+}
+
+fn record_json_duplicate(
+    canonical: &str,
+    range: Range<usize>,
+    seen: &mut HashSet<String>,
+    analysis: &mut Analysis,
+) {
+    if !seen.insert(canonical.to_string()) {
+        analysis.error(
+            range,
+            "duplicate-property",
+            format!("duplicate property '{canonical}'"),
+        );
+    }
+}
+
 fn join_path(path: &str, field: &str) -> String {
     if path.is_empty() {
         field.to_string()
@@ -1056,22 +1445,6 @@ fn spanned_to_json(value: &spanned::Value) -> Value {
                 .collect::<Map<_, _>>(),
         ),
     }
-}
-
-fn json_error_offset(source: &str, line: usize, column: usize) -> usize {
-    let line_start = source
-        .split_inclusive('\n')
-        .take(line.saturating_sub(1))
-        .map(str::len)
-        .sum::<usize>();
-    line_start
-        + source[line_start..]
-            .char_indices()
-            .nth(column.saturating_sub(1))
-            .map_or_else(
-                || source.len().saturating_sub(line_start),
-                |(offset, _)| offset,
-            )
 }
 
 #[cfg(test)]
@@ -1114,6 +1487,102 @@ mod tests {
     }
 
     #[test]
+    fn reports_independent_semantic_errors_with_unknown_properties() {
+        for source in [
+            r#"(call :unknown 1 :name/regex "[")"#,
+            r#"{"unknown":1,"match":{"kind":"call","name":{"regex":"["}}}"#,
+        ] {
+            let diagnostics = validate_query_source(source);
+            assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:#?}");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "unknown-property")
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("invalid regex"))
+            );
+        }
+    }
+
+    #[test]
+    fn reports_role_compatibility_without_waiting_for_typed_lowering() {
+        for source in [
+            r#"(assignment :unknown 1 :callee (name "run"))"#,
+            r#"{"unknown":1,"match":{"kind":"assignment","callee":{"name":"run"}}}"#,
+        ] {
+            let diagnostics = validate_query_source(source);
+            assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:#?}");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("not valid for kind"))
+            );
+        }
+    }
+
+    #[test]
+    fn text_predicate_requires_regex_object_in_json() {
+        let source = r#"{"match":{"text":"exact"}}"#;
+        let diagnostic = validate_query_source(source).pop().expect("diagnostic");
+        assert_eq!(diagnostic.code, "wrong-value-shape");
+        assert_eq!(&source[diagnostic.range], "\"exact\"");
+    }
+
+    #[test]
+    fn malformed_json_range_is_byte_correct_after_utf8() {
+        let source = r#"{"λ": 1, ]"#;
+        let diagnostic = validate_query_source(source).pop().expect("diagnostic");
+        assert_eq!(diagnostic.code, "invalid-json");
+        assert_eq!(&source[diagnostic.range], "]");
+    }
+
+    #[test]
+    fn incomplete_rql_keeps_help_for_completed_tokens() {
+        let source = "(call :callee";
+        let offset = source.find(":callee").unwrap() + 1;
+        let help = query_source_help_at(source, offset).expect("role help");
+        assert_eq!(&source[help.range], ":callee");
+        assert!(validate_query_source(source).is_empty());
+    }
+
+    #[test]
+    fn incomplete_json_keeps_help_for_completed_keys() {
+        for (source, token) in [
+            (r#"{"match":"#, "match"),
+            (r#"{"match":{"kind":"#, "kind"),
+            (r#"{"match":{"kind":"call","callee":"#, "callee"),
+        ] {
+            let offset = source.find(token).unwrap();
+            let help = query_source_help_at(source, offset)
+                .unwrap_or_else(|| panic!("no help for {token} in {source}"));
+            assert_eq!(&source[help.range], format!("\"{token}\""));
+            assert!(validate_query_source(source).is_empty());
+        }
+    }
+
+    #[test]
+    fn source_and_diagnostic_budgets_are_bounded() {
+        let oversized = " ".repeat(MAX_QUERY_SOURCE_BYTES + 1);
+        let diagnostics = validate_query_source(&oversized);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "query-too-large");
+        assert!(query_source_help_at(&oversized, 0).is_none());
+
+        let mut many_errors = String::from("(call");
+        for index in 0..=MAX_SOURCE_DIAGNOSTICS {
+            many_errors.push_str(&format!(" :unknown-{index} 1"));
+        }
+        many_errors.push(')');
+        assert_eq!(
+            validate_query_source(&many_errors).len(),
+            MAX_SOURCE_DIAGNOSTICS
+        );
+    }
+
+    #[test]
     fn canonical_json_and_rql_execute_equivalently() {
         let rql = CodeQuery::from_source("(language rust (call :callee (name \"run\")))")
             .expect("RQL query");
@@ -1122,6 +1591,22 @@ mod tests {
         )
         .expect("JSON query");
         assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+    }
+
+    #[test]
+    fn accepted_rql_shorthands_have_no_live_diagnostics() {
+        for source in [
+            r#"(call :callee "run")"#,
+            r#"(import :module "os")"#,
+            r#"(result-detail "full" (call))"#,
+        ] {
+            CodeQuery::from_source(source)
+                .unwrap_or_else(|error| panic!("{source:?} should execute: {error}"));
+            assert!(
+                validate_query_source(source).is_empty(),
+                "{source:?} should lint cleanly"
+            );
+        }
     }
 
     #[test]

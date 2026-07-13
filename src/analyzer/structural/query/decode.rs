@@ -14,23 +14,23 @@ impl CodeQuery {
     pub fn from_json(value: &Value) -> Result<Self, QueryError> {
         let object = as_object(value, "")?;
         let mut budget = QueryBudget::default();
-        check_query_fields(object, "")?;
-        let schema_version = match object.get("schema_version") {
+        let fields = collect_query_fields(object, "")?;
+        let schema_version = match fields.schema_version {
             None => SCHEMA_VERSION,
             Some(value) => decode_schema_version(value, "schema_version")?,
         };
 
-        let where_globs = match object.get("where") {
+        let where_globs = match fields.where_globs {
             None => Vec::new(),
             Some(value) => decode_globs(value, "where")?,
         };
 
-        let languages = match object.get("languages") {
+        let languages = match fields.languages {
             None => Vec::new(),
             Some(value) => decode_languages(value, "languages")?,
         };
 
-        let root = match object.get("match") {
+        let root = match fields.root {
             Some(value) => decode_pattern(value, "match", &mut budget, 0)?,
             None => return Err(QueryError::new("match", "required field is missing")),
         };
@@ -43,8 +43,8 @@ impl CodeQuery {
             ));
         }
 
-        let inside = object
-            .get("inside")
+        let inside = fields
+            .inside
             .map(|value| decode_pattern(value, "inside", &mut budget, 0))
             .transpose()?;
         if let Some(pattern) = &inside
@@ -53,8 +53,8 @@ impl CodeQuery {
             return Err(QueryError::new("inside", "pattern must not be empty"));
         }
 
-        let not_inside = object
-            .get("not_inside")
+        let not_inside = fields
+            .not_inside
             .map(|value| decode_pattern(value, "not_inside", &mut budget, 0))
             .transpose()?;
         if let Some(pattern) = &not_inside
@@ -63,11 +63,11 @@ impl CodeQuery {
             return Err(QueryError::new("not_inside", "pattern must not be empty"));
         }
 
-        let limit = match object.get("limit") {
+        let limit = match fields.limit {
             None => DEFAULT_LIMIT,
             Some(value) => decode_limit(value, "limit")?,
         };
-        let result_detail = match object.get("result_detail") {
+        let result_detail = match fields.result_detail {
             None => CodeQueryResultDetail::Compact,
             Some(value) => decode_result_detail(value, "result_detail")?,
         };
@@ -122,28 +122,42 @@ fn index_path(path: &str, index: usize) -> String {
     format!("{path}[{index}]")
 }
 
-fn check_query_fields(object: &Map<String, Value>, path: &str) -> Result<(), QueryError> {
-    for key in object.keys() {
+#[derive(Default)]
+struct QueryFields<'a> {
+    where_globs: Option<&'a Value>,
+    languages: Option<&'a Value>,
+    root: Option<&'a Value>,
+    inside: Option<&'a Value>,
+    not_inside: Option<&'a Value>,
+    limit: Option<&'a Value>,
+    result_detail: Option<&'a Value>,
+    schema_version: Option<&'a Value>,
+}
+
+fn collect_query_fields<'a>(
+    object: &'a Map<String, Value>,
+    path: &str,
+) -> Result<QueryFields<'a>, QueryError> {
+    let mut fields = QueryFields::default();
+    for (key, value) in object {
         let Some(field) = QueryField::from_label(key) else {
             return Err(QueryError::new(
                 child_path(path, key),
                 "unknown field in query object",
             ));
         };
-        // This exhaustive match is intentionally separate from lookup. A new
-        // registered field cannot compile until decoding acknowledges it.
         match field {
-            QueryField::Where
-            | QueryField::Languages
-            | QueryField::Match
-            | QueryField::Inside
-            | QueryField::NotInside
-            | QueryField::Limit
-            | QueryField::ResultDetail
-            | QueryField::SchemaVersion => {}
+            QueryField::Where => fields.where_globs = Some(value),
+            QueryField::Languages => fields.languages = Some(value),
+            QueryField::Match => fields.root = Some(value),
+            QueryField::Inside => fields.inside = Some(value),
+            QueryField::NotInside => fields.not_inside = Some(value),
+            QueryField::Limit => fields.limit = Some(value),
+            QueryField::ResultDetail => fields.result_detail = Some(value),
+            QueryField::SchemaVersion => fields.schema_version = Some(value),
         }
     }
-    Ok(())
+    Ok(fields)
 }
 
 fn decode_globs(value: &Value, path: &str) -> Result<Vec<glob::Pattern>, QueryError> {
@@ -244,6 +258,46 @@ fn reject_too_long(text: &str, path: &str, max_len: usize, label: &str) -> Resul
     ))
 }
 
+#[derive(Default)]
+struct PatternFields<'a> {
+    kind: Option<&'a Value>,
+    not_kind: Option<&'a Value>,
+    name: Option<&'a Value>,
+    text: Option<&'a Value>,
+    capture: Option<&'a Value>,
+    has: Option<&'a Value>,
+    not_has: Option<&'a Value>,
+    roles: Vec<(Role, &'a Value)>,
+}
+
+fn collect_pattern_fields<'a>(
+    object: &'a Map<String, Value>,
+    path: &str,
+) -> Result<PatternFields<'a>, QueryError> {
+    let mut fields = PatternFields::default();
+    for (key, value) in object {
+        if let Some(field) = PatternField::from_label(key) {
+            match field {
+                PatternField::Kind => fields.kind = Some(value),
+                PatternField::NotKind => fields.not_kind = Some(value),
+                PatternField::Name => fields.name = Some(value),
+                PatternField::Text => fields.text = Some(value),
+                PatternField::Capture => fields.capture = Some(value),
+                PatternField::Has => fields.has = Some(value),
+                PatternField::NotHas => fields.not_has = Some(value),
+            }
+        } else if let Some(role) = Role::from_label(key) {
+            fields.roles.push((role, value));
+        } else {
+            return Err(QueryError::new(
+                child_path(path, key),
+                "unknown field in pattern object",
+            ));
+        }
+    }
+    Ok(fields)
+}
+
 fn decode_pattern(
     value: &Value,
     path: &str,
@@ -264,47 +318,29 @@ fn decode_pattern(
         ));
     }
     let object = as_object(value, path)?;
-    for key in object.keys() {
-        if let Some(field) = PatternField::from_label(key) {
-            // Keep lowering exhaustive over the declarative registry.
-            match field {
-                PatternField::Kind
-                | PatternField::NotKind
-                | PatternField::Name
-                | PatternField::Text
-                | PatternField::Capture
-                | PatternField::Has
-                | PatternField::NotHas => {}
-            }
-        } else if Role::from_label(key).is_none() {
-            return Err(QueryError::new(
-                child_path(path, key),
-                "unknown field in pattern object",
-            ));
-        }
-    }
+    let fields = collect_pattern_fields(object, path)?;
 
-    let kinds = match object.get("kind") {
+    let kinds = match fields.kind {
         None => Vec::new(),
         Some(value) => decode_kind_list(value, &child_path(path, "kind"))?,
     };
-    let not_kinds = match object.get("not_kind") {
+    let not_kinds = match fields.not_kind {
         None => Vec::new(),
         Some(value) => decode_kind_list(value, &child_path(path, "not_kind"))?,
     };
 
-    let name = object
-        .get("name")
+    let name = fields
+        .name
         .map(|value| decode_string_predicate(value, &child_path(path, "name"), true))
         .transpose()?;
 
-    let text = object
-        .get("text")
+    let text = fields
+        .text
         .map(|value| decode_string_predicate(value, &child_path(path, "text"), false))
         .transpose()?;
 
-    let capture = object
-        .get("capture")
+    let capture = fields
+        .capture
         .map(|value| {
             let capture_path = child_path(path, "capture");
             let label = value
@@ -321,8 +357,8 @@ fn decode_pattern(
         })
         .transpose()?;
 
-    let has = decode_boxed_sub_pattern(object, path, "has", budget, depth + 1)?;
-    let not_has = decode_boxed_sub_pattern(object, path, "not_has", budget, depth + 1)?;
+    let has = decode_boxed_sub_pattern(fields.has, path, "has", budget, depth + 1)?;
+    let not_has = decode_boxed_sub_pattern(fields.not_has, path, "not_has", budget, depth + 1)?;
 
     let mut pattern = Pattern {
         kinds,
@@ -335,7 +371,7 @@ fn decode_pattern(
         ..Pattern::default()
     };
 
-    decode_role_fields(object, path, &mut pattern, budget, depth + 1)?;
+    decode_role_fields(&fields.roles, path, &mut pattern, budget, depth + 1)?;
     Ok(pattern)
 }
 
@@ -429,13 +465,13 @@ fn decode_string_predicate(
 }
 
 fn decode_boxed_sub_pattern(
-    object: &Map<String, Value>,
+    value: Option<&Value>,
     path: &str,
     field: &str,
     budget: &mut QueryBudget,
     depth: usize,
 ) -> Result<Option<Box<Pattern>>, QueryError> {
-    match object.get(field) {
+    match value {
         None => Ok(None),
         Some(value) => {
             let field_path = child_path(path, field);
@@ -451,19 +487,13 @@ fn decode_boxed_sub_pattern(
 /// Decode the role fields (`callee`, `args`, `left`, ...) into `pattern`,
 /// enforcing that each present role is valid for the pattern's declared kind.
 fn decode_role_fields(
-    object: &Map<String, Value>,
+    roles: &[(Role, &Value)],
     path: &str,
     pattern: &mut Pattern,
     budget: &mut QueryBudget,
     depth: usize,
 ) -> Result<(), QueryError> {
-    let present_roles: Vec<Role> = Role::single_target_roles()
-        .iter()
-        .chain(Role::list_target_roles().iter())
-        .chain(Role::map_target_roles().iter())
-        .copied()
-        .filter(|role| object.contains_key(role.label()))
-        .collect();
+    let present_roles = roles.iter().map(|(role, _)| *role).collect::<Vec<_>>();
     if present_roles.is_empty() {
         return Ok(());
     }
@@ -498,7 +528,7 @@ fn decode_role_fields(
     }
 
     for &role in Role::single_target_roles() {
-        if let Some(value) = object.get(role.label()) {
+        if let Some(value) = role_value(roles, role) {
             let role_path = child_path(path, role.label());
             let sub_pattern = Box::new(decode_pattern(value, &role_path, budget, depth)?);
             match role {
@@ -515,7 +545,7 @@ fn decode_role_fields(
     }
 
     for &role in Role::list_target_roles() {
-        if let Some(value) = object.get(role.label()) {
+        if let Some(value) = role_value(roles, role) {
             let role_path = child_path(path, role.label());
             let entries = value
                 .as_array()
@@ -550,7 +580,7 @@ fn decode_role_fields(
         }
     }
 
-    if let Some(value) = object.get(Role::Kwarg.label()) {
+    if let Some(value) = role_value(roles, Role::Kwarg) {
         let role_path = child_path(path, Role::Kwarg.label());
         let entries = as_object(value, &role_path)?;
         if entries.len() > MAX_KWARGS {
@@ -572,4 +602,10 @@ fn decode_role_fields(
     }
 
     Ok(())
+}
+
+fn role_value<'a>(roles: &[(Role, &'a Value)], expected: Role) -> Option<&'a Value> {
+    roles
+        .iter()
+        .find_map(|(role, value)| (*role == expected).then_some(*value))
 }

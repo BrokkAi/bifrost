@@ -12,8 +12,10 @@ pub enum ValueShape {
     PatternList,
     PatternMap,
     String,
+    RegexString,
     StringList,
     StringPredicate,
+    RegexPredicate,
     KindList,
     LanguageList,
     PositiveInteger,
@@ -28,8 +30,10 @@ impl ValueShape {
             Self::PatternList => "a list/vector of patterns",
             Self::PatternMap => "a map of names to patterns",
             Self::String => "a string",
+            Self::RegexString => "a regular expression string",
             Self::StringList => "one or more strings",
             Self::StringPredicate => "an exact string or regex predicate",
+            Self::RegexPredicate => "a regex predicate object",
             Self::KindList => "a normalized kind or list of kinds",
             Self::LanguageList => "one or more language labels",
             Self::PositiveInteger => "a positive integer",
@@ -103,6 +107,29 @@ macro_rules! rql_forms {
             pub fn description(self) -> &'static str {
                 match self {
                     $(Self::$variant => $description,)+
+                }
+            }
+
+            /// Return the pattern property lowered by a predicate form.
+            ///
+            /// Keeping this match exhaustive makes adding a form require an
+            /// explicit lowering decision rather than relying on coincidental
+            /// equality between two registry labels.
+            pub fn property(self) -> Option<RqlProperty> {
+                match self {
+                    Self::Where
+                    | Self::Language
+                    | Self::Limit
+                    | Self::ResultDetail
+                    | Self::Inside
+                    | Self::NotInside => None,
+                    Self::Name => Some(RqlProperty::Name),
+                    Self::NameRegex => Some(RqlProperty::NameRegex),
+                    Self::TextRegex => Some(RqlProperty::TextRegex),
+                    Self::Capture => Some(RqlProperty::Capture),
+                    Self::Has => Some(RqlProperty::Has),
+                    Self::NotHas => Some(RqlProperty::NotHas),
+                    Self::NotKind => Some(RqlProperty::NotKind),
                 }
             }
         }
@@ -269,13 +296,13 @@ rql_properties! {
     }
     NameRegex {
         labels: ["name/regex"],
-        shape: String,
+        shape: RegexString,
         signature: ":name/regex \"pattern\"",
         description: "Match the normalized name with a regular expression.",
     }
     TextRegex {
         labels: ["text/regex"],
-        shape: String,
+        shape: RegexString,
         signature: ":text/regex \"pattern\"",
         description: "Match source text with a regular expression.",
     }
@@ -381,7 +408,7 @@ json_fields! {
     Kind { label: "kind", shape: KindList, signature: "\"kind\": \"kind\" | [\"kinds\", ...]", description: "Match one or more normalized node kinds." }
     NotKind { label: "not_kind", shape: KindList, signature: "\"not_kind\": \"kind\" | [\"kinds\", ...]", description: "Exclude one or more normalized node kinds." }
     Name { label: "name", shape: StringPredicate, signature: "\"name\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's normalized name." }
-    Text { label: "text", shape: StringPredicate, signature: "\"text\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's source text." }
+    Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
     Capture { label: "capture", shape: String, signature: "\"capture\": \"label\"", description: "Capture the matching node under a result label." }
     Has { label: "has", shape: Pattern, signature: "\"has\": { pattern }", description: "Require a matching descendant." }
     NotHas { label: "not_has", shape: Pattern, signature: "\"not_has\": { pattern }", description: "Exclude nodes containing a matching descendant." }

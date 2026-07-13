@@ -50,6 +50,7 @@ import {
   VALIDATE_RQL_QUERY_METHOD,
   WireDiagnostic,
   WireHover,
+  handleRqlServerClosed,
   queryHoverParams,
   validationDocument
 } from "./rql_validation";
@@ -343,6 +344,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
       },
       closed: () => {
         log("Bifrost language server connection closed.");
+        handleRqlServerClosed(rqlValidation);
         setStatus("$(circle-slash) Bifrost", "Bifrost language server is stopped.");
         return { action: CloseAction.DoNotRestart, handled: true };
       }
