@@ -40,7 +40,12 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-13 01:01Z) Pushed `2a365fce` and closed #706.
 - [x] (2026-07-13 01:19Z) Completed the valid post-#706 full C# rerun: all 1,000 target groups queried with zero scope-loss notes, 1,875 consistent, 40 unproven, 69 missing, and 8,016 inconclusive sites in 1,008.2 seconds.
 - [x] (2026-07-13 01:22Z) Paused the C# triage campaign at the user's requested post-#706 boundary to cut release `0.8.0`.
-- [ ] After the release, reduce the dominant residual class boundary: 16 fully qualified `IAsyncCommandRuntimeExtensions` types in `as` casts, then determine whether 10 `EventData` and seven `JsonArray` sites share it.
+- [x] (2026-07-13 02:01Z) Resumed after the successful `0.8.0` release and delegated the cast families to oldskool with an independent child reduction for `EventData`/`JsonArray`.
+- [x] (2026-07-13 02:06Z) Reproduced the `as_expression.right` boundary in the shared inline harness, filed #707, and added one shared structured role to inverse scanning and persisted type-identifier routing with a C# epoch bump.
+- [x] (2026-07-13 02:09Z) Independent fixtures and all 33 archived offsets confirmed one root across 16 `IAsyncCommandRuntimeExtensions`, 10 `EventData`, and seven `JsonArray` sites; partial targets, authoritative/default routing, and negative left/unrelated expressions pass.
+- [x] (2026-07-13 02:31Z) Changed exact Automanage bytes `27236..27266` from missing to consistent with a covering `27171..27266` inverse hit after rebuilding the C# epoch.
+- [x] (2026-07-13 02:34Z) Passed the complete `cargo test --features nlp,python` gate for #707; all 63 C# usage tests and affected all-feature clippy targets also pass.
+- [ ] Push and close #707, then rerun the full C# corpus and triage the expected 36-site residual.
 
 ## Surprises & Discoveries
 
@@ -78,6 +83,10 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: `/tmp/csharp-exact-using-static-706-fixed.jsonl` rebuilt the bumped C# epoch, audited only `ExportProxyCmdlet.cs`, and changed the forward-resolved `PsHelpers` import type to consistent with a proven full-directive hit at bytes `482..569`. The exact record reports one eligible, audited, sampled, resolved, queried, and consistent site in 831.1 seconds.
 - Observation: #706 removed the complete 34-site static-import cluster from the trustworthy full corpus residual.
   Evidence: `/tmp/csharp-n1-706-fixed.jsonl` is pinned to pushed `2a365fce`, retains the same repository head/fingerprint, 1,000 audited files, 10,000 sampled sites, and zero scope-loss notes, and reports 69 missing sites versus 103 before #706. No remaining missing evidence begins with `using static`. The residual is 34 classes, 33 functions, and two fields; class terminals are 16 `IAsyncCommandRuntimeExtensions`, 10 `EventData`, seven `JsonArray`, and one `Parameter`.
+- Observation: C# `as_expression` names its semantically typed operand `right`, which the generic type-role field checks did not recognize.
+  Evidence: The primary and delegated fixtures failed with empty authoritative hits and omitted default candidates on clean `v0.8.0`. A shared `as_expression`/`right` AST predicate made singular and partial target fixtures pass while unrelated same-terminal RHS types and same-named left expressions stayed negative. Source-offset auditing placed all 33 cast-family production sites inside the same field.
+- Observation: #707 survives a rebuilt persisted production index.
+  Evidence: `/tmp/csharp-exact-as-type-707-fixed.jsonl` reports the Automanage `IAsyncCommandRuntimeExtensions` focus as consistent with a proven full qualified RHS hit after the required epoch rebuild. It audited one file/site and queried one target group in 1,299.5 seconds.
 
 ## Decision Log
 
@@ -177,3 +186,5 @@ Revision note (2026-07-13): Recorded pushed/closed #705 and #706's shared-role i
 Revision note (2026-07-13): Recorded pushed/closed #706, its valid complete corpus rerun, the eliminated static-import cluster, and the 69-site residual partition.
 
 Revision note (2026-07-13): Marked the campaign intentionally paused after #706 for the `0.8.0` release, preserving the exact resumption boundary.
+
+Revision note (2026-07-13): Recorded post-release resumption, aggressively delegated #707 reduction, the shared inverse/persisted role fix, 33-site scope, and exact production proof.

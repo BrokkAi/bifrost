@@ -3,9 +3,9 @@ pub(super) use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_normalize_full_name,
-    csharp_signature_arity, csharp_signature_return_type, csharp_using_directive_is_static,
-    resolve_analyzer,
+    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_as_expression_type_operand,
+    csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
+    csharp_using_directive_is_static, resolve_analyzer,
 };
 use tree_sitter::Node;
 
@@ -981,6 +981,9 @@ pub(super) fn unqualified_member_resolves_to_owner(
 
 pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
+        if csharp_as_expression_type_operand(parent, node) {
+            return true;
+        }
         if parent
             .child_by_field_name("type")
             .is_some_and(|type_node| same_node(type_node, node))

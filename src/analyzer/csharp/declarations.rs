@@ -431,6 +431,9 @@ fn collect_csharp_type_identifiers(
 
 fn is_csharp_type_position_node(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
+        if super::csharp_as_expression_type_operand(parent, node) {
+            return true;
+        }
         if parent
             .child_by_field_name("type")
             .is_some_and(|type_node| same_cs_node(type_node, node))

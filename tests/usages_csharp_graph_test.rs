@@ -709,6 +709,111 @@ namespace Demo.Runtime {
 }
 
 #[test]
+fn usage_finder_csharp_finds_as_expression_type_in_authoritative_and_default_scope() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Runtime/IAsyncCommandRuntimeExtensions.First.cs",
+            "namespace Demo.Runtime.PowerShell { internal partial interface IAsyncCommandRuntimeExtensions { } }\n",
+        ),
+        (
+            "Runtime/IAsyncCommandRuntimeExtensions.Second.cs",
+            "namespace Demo.Runtime.PowerShell { internal partial interface IAsyncCommandRuntimeExtensions { } }\n",
+        ),
+        (
+            "Other/IAsyncCommandRuntimeExtensions.cs",
+            "namespace Other { internal interface IAsyncCommandRuntimeExtensions { } }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+namespace App {
+    public sealed class Consumer {
+        public object CommandRuntime { get; set; }
+
+        public void Run() {
+            object IAsyncCommandRuntimeExtensions = this.CommandRuntime;
+            var unrelated = IAsyncCommandRuntimeExtensions as Other.IAsyncCommandRuntimeExtensions;
+            var runtime = this.CommandRuntime as Demo.Runtime.PowerShell.IAsyncCommandRuntimeExtensions;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let targets: Vec<_> = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "Demo.Runtime.PowerShell.IAsyncCommandRuntimeExtensions"
+        })
+        .cloned()
+        .collect();
+    assert_eq!(targets.len(), 2, "expected both partial type declarations");
+    let consumer = project.file("App/Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let authoritative = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+    let authoritative_hits = authoritative
+        .result
+        .into_either()
+        .expect("authoritative as-expression type query should resolve");
+
+    let source = consumer.read_to_string().expect("consumer source");
+    let positive_start = source
+        .find("Demo.Runtime.PowerShell.IAsyncCommandRuntimeExtensions")
+        .expect("positive as-expression type");
+    let positive_end =
+        positive_start + "Demo.Runtime.PowerShell.IAsyncCommandRuntimeExtensions".len();
+    assert!(
+        authoritative_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= positive_start
+                && positive_end <= hit.end_offset
+        }),
+        "as-expression RHS type should be a proven structural reference: {authoritative_hits:#?}"
+    );
+
+    let unrelated_start = source
+        .find("Other.IAsyncCommandRuntimeExtensions")
+        .expect("unrelated RHS type");
+    let unrelated_end = unrelated_start + "Other.IAsyncCommandRuntimeExtensions".len();
+    let left_start = source
+        .find("IAsyncCommandRuntimeExtensions as Other")
+        .expect("same-named left expression");
+    let left_end = left_start + "IAsyncCommandRuntimeExtensions".len();
+    for (start, end) in [(unrelated_start, unrelated_end), (left_start, left_end)] {
+        assert!(
+            authoritative_hits
+                .iter()
+                .all(|hit| !(hit.start_offset <= start && end <= hit.end_offset)),
+            "unrelated RHS and left expressions must not match the target: {authoritative_hits:#?}"
+        );
+    }
+
+    let routed = UsageFinder::new().query(&analyzer, &targets, 1000, 1000);
+    assert!(
+        routed.candidate_files.contains(&consumer),
+        "persisted type identifiers must route the as-expression consumer"
+    );
+    let routed_hits = routed
+        .result
+        .into_either()
+        .expect("default as-expression type query should resolve");
+    assert!(
+        routed_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= positive_start
+                && positive_end <= hit.end_offset
+        }),
+        "default routing should preserve the as-expression type hit: {routed_hits:#?}"
+    );
+}
+
+#[test]
 fn usage_finder_csharp_finds_using_static_type_in_authoritative_and_default_scope() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (

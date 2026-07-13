@@ -38,6 +38,13 @@ pub(crate) fn csharp_using_directive_is_static(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "static")
 }
 
+pub(crate) fn csharp_as_expression_type_operand(parent: Node<'_>, node: Node<'_>) -> bool {
+    parent.kind() == "as_expression"
+        && parent.child_by_field_name("right").is_some_and(|right| {
+            right.start_byte() == node.start_byte() && right.end_byte() == node.end_byte()
+        })
+}
+
 #[derive(Clone)]
 pub struct CSharpAnalyzer {
     inner: TreeSitterAnalyzer<CSharpAdapter>,

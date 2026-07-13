@@ -77,6 +77,11 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 01:01Z) Pushed `2a365fce` and closed #706.
 - [x] (2026-07-13 01:19Z) Completed the valid post-#706 full C# run with all 1,000 target groups, zero scope-loss notes, and 69 missing sites, exactly 34 fewer than before the static-import fix.
 - [x] (2026-07-13 01:22Z) Paused post-#706 triage at the user's request to cut release `0.8.0`; the 69-site C# record is the explicit resumption boundary.
+- [x] (2026-07-13 02:01Z) Resumed the campaign after `v0.8.0` published successfully and delegated the three cast-type families across oldskool and a child read-only reducer.
+- [x] (2026-07-13 02:06Z) Filed #707 from a primary failing regression and shared the grammar-specific `as_expression.right` type role across inverse scanning and persisted candidate routing with a C# epoch bump.
+- [x] (2026-07-13 02:09Z) Independently confirmed all 33 cast-family class misses share #707: 16 `IAsyncCommandRuntimeExtensions`, 10 `EventData`, and seven `JsonArray`.
+- [x] (2026-07-13 02:31Z) Exact Automanage production validation changed the former cast-type miss to consistent after the persisted C# rebuild.
+- [x] (2026-07-13 02:34Z) Passed the complete `cargo test --features nlp,python` gate for #707; focused C# and affected all-feature clippy validation also pass.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -161,6 +166,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: The full post-#706 corpus confirms every static-import miss was removed.
   Evidence: `/tmp/csharp-n1-706-fixed.jsonl` is pinned to pushed `2a365fce`, queried all 1,000 target groups with zero scope-loss notes, and reports 1,875 consistent, 40 unproven, 69 missing, and 8,016 inconclusive sites in 1,008.2 seconds. The remaining 34 classes partition into 16 `IAsyncCommandRuntimeExtensions`, 10 `EventData`, seven `JsonArray`, and one `Parameter`; 33 functions and two fields remain.
+
+- Observation: All 33 post-#706 cast-family class misses are the same grammar-field mismatch.
+  Evidence: Clean-`v0.8.0` primary and delegated fixtures failed for singular and partial targets because the typed operand is `as_expression.right`, not a field literally named `type`. The shared role fixes authoritative inverse scanning and default persisted routing; unrelated RHS and left-expression negatives remain excluded. `/tmp/csharp-exact-as-type-707-fixed.jsonl` confirms the rebuilt production path is consistent.
 
 ## Decision Log
 
@@ -332,3 +340,5 @@ Revision note (2026-07-13): Recorded pushed/closed #705 and #706's reduced share
 Revision note (2026-07-13): Recorded pushed/closed #706, the valid complete post-fix C# record, removal of all 34 static-import misses, and the 69-site residual partition.
 
 Revision note (2026-07-13): Marked the campaign deliberately paused after #706 for release `0.8.0` without changing the remaining campaign scope.
+
+Revision note (2026-07-13): Recorded post-release resumption, delegated #707 analysis across all cast families, the shared persisted/inverse fix, and exact production validation.
