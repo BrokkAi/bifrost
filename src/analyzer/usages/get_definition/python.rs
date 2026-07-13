@@ -1,8 +1,10 @@
 use super::*;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) fn resolve_python(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    context: &mut DefinitionBatchContext<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -35,7 +37,8 @@ pub(super) fn resolve_python(
         );
     }
 
-    let ctx = PythonDefinitionContext::build(py, analyzer, support, file, source);
+    let support = context.support();
+    let ctx = context.python_context(py, file);
     let reference = python_reference_node(node);
     match reference {
         Some(PythonReferenceNode::Attribute { object, attribute }) => {
@@ -67,6 +70,7 @@ pub(super) fn resolve_python(
                 analyzer,
                 py,
                 support,
+                &ctx,
                 file,
                 source,
                 tree.root_node(),
@@ -138,6 +142,7 @@ pub(super) fn resolve_python(
                 analyzer,
                 py,
                 support,
+                &ctx,
                 file,
                 source,
                 tree.root_node(),
@@ -171,19 +176,21 @@ pub(super) fn parse_python_tree(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
-struct PythonDefinitionContext {
+pub(super) struct PythonDefinitionContext {
     named: HashMap<String, String>,
     namespace: HashMap<String, String>,
     same_file: HashMap<String, Vec<CodeUnit>>,
+    scope_facts: OnceLock<Arc<HashMap<CodeUnit, LocalBindingsSnapshot<String>>>>,
+    #[cfg(test)]
+    build_counters: Arc<PythonDefinitionBuildCounters>,
 }
 
 impl PythonDefinitionContext {
-    fn build(
+    pub(super) fn build(
         py: &PythonAnalyzer,
         analyzer: &dyn IAnalyzer,
-        _support: &DefinitionLookupIndex,
         file: &ProjectFile,
-        _source: &str,
+        #[cfg(test)] build_counters: Arc<PythonDefinitionBuildCounters>,
     ) -> Self {
         let binder = py.import_binder_of(file);
         let mut named = HashMap::default();
@@ -218,6 +225,9 @@ impl PythonDefinitionContext {
             named,
             namespace,
             same_file,
+            scope_facts: OnceLock::new(),
+            #[cfg(test)]
+            build_counters,
         }
     }
 
@@ -246,6 +256,35 @@ impl PythonDefinitionContext {
             .find(|unit| unit.is_class())
             .cloned()
     }
+
+    fn scope_facts(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        py: &PythonAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        root: Node<'_>,
+    ) -> Arc<HashMap<CodeUnit, LocalBindingsSnapshot<String>>> {
+        self.scope_facts
+            .get_or_init(|| {
+                let _scope = crate::profiling::scope("get_definition::python::scope_facts");
+                #[cfg(test)]
+                self.build_counters
+                    .scope_fact_builds
+                    .fetch_add(1, Ordering::Relaxed);
+                Arc::new(collect_scope_facts_from_parsed_source(
+                    analyzer, py, file, "", source, root,
+                ))
+            })
+            .clone()
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct PythonDefinitionBuildCounters {
+    pub(super) context_builds: AtomicUsize,
+    pub(super) scope_fact_builds: AtomicUsize,
 }
 
 enum PythonReferenceNode<'tree> {
@@ -399,10 +438,12 @@ fn python_workspace_module_exists(support: &DefinitionLookupIndex, module: &str)
     support.package_exists(module) || support.fqn_exists(module)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn python_receiver_type_unit(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
     support: &DefinitionLookupIndex,
+    context: &PythonDefinitionContext,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -417,8 +458,7 @@ fn python_receiver_type_unit(
                 return Some(unit);
             }
             // A typed-variable receiver: use the local/parameter's inferred type.
-            let facts_by_scope =
-                collect_scope_facts_from_parsed_source(analyzer, py, file, "", source, root);
+            let facts_by_scope = context.scope_facts(analyzer, py, file, source, root);
             if let Some(facts) = enclosing_scope_facts(analyzer, file, &facts_by_scope, object)
                 && let Some(raw_type) = facts
                     .resolution_for(receiver)
@@ -442,7 +482,9 @@ fn python_receiver_type_unit(
         }
         // A call receiver: `Foo().bar` (construction) or `make().bar` (the
         // called function/method's return type).
-        "call" => python_call_result_type(analyzer, py, support, file, source, root, object),
+        "call" => {
+            python_call_result_type(analyzer, py, support, context, file, source, root, object)
+        }
         _ => None,
     }
 }
@@ -450,17 +492,20 @@ fn python_receiver_type_unit(
 /// The type produced by a call expression: the class for a construction
 /// (`Foo()`), or the resolved return type of the called function/method
 /// (`make()`, `obj.make()`).
+#[allow(clippy::too_many_arguments)]
 fn python_call_result_type(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
     support: &DefinitionLookupIndex,
+    context: &PythonDefinitionContext,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     call: Node<'_>,
 ) -> Option<CodeUnit> {
     let function = call.child_by_field_name("function")?;
-    let callee = python_resolve_callable(analyzer, py, support, file, source, root, function)?;
+    let callee =
+        python_resolve_callable(analyzer, py, support, context, file, source, root, function)?;
     if callee.is_class() {
         return Some(callee);
     }
@@ -469,10 +514,12 @@ fn python_call_result_type(
 
 /// Resolve a call's callee expression to the class or function/method being
 /// called.
+#[allow(clippy::too_many_arguments)]
 fn python_resolve_callable(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
     support: &DefinitionLookupIndex,
+    context: &PythonDefinitionContext,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -492,8 +539,9 @@ fn python_resolve_callable(
         "attribute" => {
             let receiver = function.child_by_field_name("object")?;
             let method = python_slice(function.child_by_field_name("attribute")?, source);
-            let receiver_type =
-                python_receiver_type_unit(analyzer, py, support, file, source, root, receiver)?;
+            let receiver_type = python_receiver_type_unit(
+                analyzer, py, support, context, file, source, root, receiver,
+            )?;
             analyzer
                 .definitions(&format!("{}.{}", receiver_type.fq_name(), method))
                 .next()
