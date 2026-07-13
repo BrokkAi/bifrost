@@ -31,7 +31,9 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 23:24Z) Passed the complete `cargo test --features nlp,python` gate for #704; affected all-feature library and C# test clippy targets also pass.
 - [x] (2026-07-12 23:27Z) Pushed `cf2743de` and closed #704 with focused, exact-production, and complete-suite evidence.
 - [x] (2026-07-12 23:49Z) Completed the valid post-#704 C# N=1 rerun: all 1,000 target groups queried, zero candidate-scope-loss notes, 1,834 consistent, 40 unproven, 103 missing, and 8,023 inconclusive sites in 1,132.3 seconds.
-- [ ] Reduce the dominant residual, 34 fully qualified C# `using static` class references, while separately removing exact mode's redundant full analyzed-file inventory.
+- [x] (2026-07-13 00:10Z) Filed #705 after a reduced observable-inventory regression proved exact mode called the full inventory before retaining one path; switched exact selection to safe project-relative point lookup and preserved full-workspace semantic resolution.
+- [x] (2026-07-13 00:26Z) Exact BillingBenefits production validation remained consistent and fell from 1,134.4 to 865.2 seconds while truthful eligibility counts changed from 126,829/1 to 1/1; the remaining startup cost is separate from the eliminated runner pass.
+- [ ] Push and close #705, then implement the independently reduced 34-site `using static` root fix across both inverse type roles and persisted candidate routing.
 
 ## Surprises & Discoveries
 
@@ -61,6 +63,10 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: `/tmp/csharp-n1-704-fixed.jsonl` has the same repository head, run fingerprint, 1,000 audited files, 10,000 sampled sites, and zero candidate-loss notes as the valid pre-fix record. Missing sites fell from 144 to 103 while consistent sites rose by 41. The residual partitions into 34 `using static` classes, 34 other class roles, 33 functions, and two fields.
 - Observation: Exact filtering currently occurs only after the expensive analyzer inventory.
   Evidence: `run_reference_differential` calls `analyzer.analyzed_files()`, filters and sorts the complete live snapshot, and only then lets `select_audited_files` retain the requested path. The exact path can instead be validated and point-checked with `Project::file_by_rel_path` plus `IAnalyzer::is_analyzed`, while retaining the full persisted analyzer for external target resolution.
+- Observation: Removing the redundant exact inventory saves meaningful time but does not make persisted analyzer construction cheap.
+  Evidence: `/tmp/csharp-exact-generic-type-705-fixed.jsonl` audited the same BillingBenefits bytes with the same two external partial targets and consistent covering hit in 865.2 seconds, down 269.2 seconds or 23.7%. It reports one eligible and one audited file because no repository-wide eligibility inventory was computed. The remaining elapsed time occurs while constructing/reconciling the full persisted analyzer and is a distinct optimization boundary.
+- Observation: `using static` needs one shared structural type-role rule at both scanning and candidate-routing layers.
+  Evidence: Delegated isolated fixtures with three partial target declarations failed in authoritative inverse scanning until `using_directive` with an unnamed `static` child was recognized. Default routing still failed until the same role was added to persisted C# type-identifier collection. Ordinary namespace using, unrelated alias RHS, and unrelated same-terminal static imports remained negative. Changing persisted identifiers requires a C# analyzer epoch bump.
 
 ## Decision Log
 
@@ -150,3 +156,5 @@ Revision note (2026-07-12): Recorded the valid post-#701/#703 1,000-target rerun
 Revision note (2026-07-12): Recorded delegated #704 reduction, negative coverage, exact production proof, and the newly measured exact-mode inventory cost.
 
 Revision note (2026-07-12): Recorded pushed/closed #704, its complete 1,000-target rerun, the 103-site residual partition, and the independently reviewed exact-mode inventory seam.
+
+Revision note (2026-07-13): Recorded #705 reduction/fix and production timing, plus the delegated `using static` root boundary across inverse scanning, persisted routing, and cache epoching.

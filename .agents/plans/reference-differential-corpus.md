@@ -68,6 +68,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 23:24Z) Passed the complete `cargo test --features nlp,python` validation gate for #704; affected all-feature library and C# test clippy targets also pass.
 - [x] (2026-07-12 23:27Z) Pushed `cf2743de` and closed #704.
 - [x] (2026-07-12 23:49Z) Completed a valid post-#704 full C# rerun: all 1,000 target groups queried with zero candidate-scope-loss notes, and missing sites fell from 144 to 103.
+- [x] (2026-07-13 00:10Z) Filed #705 from a reduced failing inventory-observer regression and made exact-site selection validate and point-check one project file without calling the full analyzed-file inventory.
+- [x] (2026-07-13 00:26Z) Production-validated #705 on the same BillingBenefits reference: consistent semantics, one truthful eligible/audited file, and runtime reduced from 1,134.4 to 865.2 seconds.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -140,6 +142,12 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: The exact-site inventory cost has a direct engine seam independent of analyzer construction.
   Evidence: `run_reference_differential` calls `analyzer.analyzed_files()` before `select_audited_files` applies the exact-path filter. A safe fast path can validate the requested relative `ProjectFile`, apply the same language/test eligibility rules, point-check `is_analyzed`, and then reuse the unchanged semantic pipeline against the full persisted analyzer.
+
+- Observation: The exact-site point lookup removes 23.7% of end-to-end time while exposing persisted analyzer startup as the remaining dominant cost.
+  Evidence: `/tmp/csharp-exact-generic-type-705-fixed.jsonl` completed the same consistent BillingBenefits site in 865.2 seconds versus 1,134.4 seconds before #705. Its summary truthfully reports one eligible, audited, sampled, resolved, and consistent item. Full analyzer construction is retained so declarations outside the exact file remain resolvable.
+
+- Observation: The 34-site `using static` cluster spans both inverse recognition and default candidate routing.
+  Evidence: Delegated partial-target authoritative fixtures failed because `is_type_reference_node` rejected `qualified_name -> using_directive(static)`. Adding that structured role fixed inverse scanning, but default `UsageFinder` required the same role in persisted type-identifier collection. Negative ordinary/alias/unrelated-static imports pass, and the persisted identifier change requires a C# epoch bump.
 
 ## Decision Log
 
@@ -303,3 +311,5 @@ Revision note (2026-07-12): Recorded the valid post-#701/#703 full C# rerun and 
 Revision note (2026-07-12): Recorded delegated #704 investigation, exact production proof, and exact-mode full-inventory cost for the next engine optimization.
 
 Revision note (2026-07-12): Recorded pushed/closed #704, the valid post-fix full C# record, its 103-site residual partition, and the reviewed exact-mode fast-path boundary.
+
+Revision note (2026-07-13): Recorded reduced #705, its production timing and truthful summary semantics, and the delegated shared `using static` type-role boundary.

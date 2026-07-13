@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 const SOURCE_EVIDENCE_MAX_BYTES: usize = 512;
@@ -224,16 +225,9 @@ pub fn run_reference_differential(
     let mut summary = ReferenceDifferentialSummary::default();
     let mut file_errors = Vec::new();
 
-    let mut eligible: Vec<ProjectFile> = analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| corpus_file_matches(file, &config.corpus_language, requested_language))
-        .filter(|file| {
-            config.include_tests
-                || !test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
-        })
-        .collect();
-    eligible.sort();
+    let eligible = eligible_files_with_inventory(analyzer, config, requested_language, || {
+        analyzer.analyzed_files()
+    })?;
     summary.eligible_files = eligible.len();
 
     let audited = select_audited_files(eligible, config);
@@ -269,6 +263,86 @@ pub fn run_reference_differential(
         sites: records,
         file_errors,
     })
+}
+
+fn eligible_files_with_inventory(
+    analyzer: &dyn IAnalyzer,
+    config: &ReferenceDifferentialConfig,
+    requested_language: Language,
+    inventory: impl FnOnce() -> Vec<ProjectFile>,
+) -> Result<Vec<ProjectFile>, String> {
+    if let Some(exact) = &config.exact_site {
+        let rel_path = exact_project_path(&exact.path)?;
+        let file = analyzer
+            .project()
+            .file_by_rel_path(&rel_path)
+            .ok_or_else(|| {
+                format!(
+                    "exact site path `{}` is not a project file",
+                    normalize_report_path(&exact.path)
+                )
+            })?;
+        if !corpus_file_matches(&file, &config.corpus_language, requested_language) {
+            return Err(format!(
+                "exact site path `{}` does not match corpus language `{}`",
+                rel_path_string(&file),
+                config.corpus_language
+            ));
+        }
+        if !config.include_tests
+            && test_paths::is_test_like_path(&rel_path_string(&file), language_for_file(&file))
+        {
+            return Err(format!(
+                "exact site path `{}` is excluded because test paths are disabled",
+                rel_path_string(&file)
+            ));
+        }
+        if !analyzer.is_analyzed(&file) {
+            return Err(format!(
+                "exact site path `{}` is not indexed by the analyzer",
+                rel_path_string(&file)
+            ));
+        }
+        return Ok(vec![file]);
+    }
+
+    let mut eligible: Vec<ProjectFile> = inventory()
+        .into_iter()
+        .filter(|file| corpus_file_matches(file, &config.corpus_language, requested_language))
+        .filter(|file| {
+            config.include_tests
+                || !test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
+        })
+        .collect();
+    eligible.sort();
+    Ok(eligible)
+}
+
+fn exact_project_path(path: &str) -> Result<PathBuf, String> {
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with('/')
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+    {
+        return Err("exact site path must be workspace-relative".to_string());
+    }
+
+    let mut rel_path = PathBuf::new();
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => rel_path.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("exact site path must be workspace-relative".to_string());
+            }
+        }
+    }
+    if rel_path.as_os_str().is_empty() {
+        return Err("exact site path must name a project file".to_string());
+    }
+    Ok(rel_path)
 }
 
 fn validate_config(config: &ReferenceDifferentialConfig) -> Result<(), String> {
@@ -951,6 +1025,7 @@ fn file_error(path: &str, kind: &str, message: &str) -> ReferenceDifferentialFil
 mod tests {
     use super::*;
     use crate::analyzer::{AnalyzerConfig, TestProject, WorkspaceAnalyzer};
+    use std::cell::Cell;
     use std::fs;
 
     struct RoundTripFixture {
@@ -1149,6 +1224,93 @@ mod tests {
             withheld[0].note.as_deref(),
             Some("forward-resolved site is absent from the complete inverse result")
         );
+    }
+
+    #[test]
+    fn exact_site_selection_does_not_enumerate_the_full_analyzed_file_inventory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::write(
+            root.join("Target.cs"),
+            "namespace Demo { class Target { } }\n",
+        )
+        .expect("target fixture");
+        let consumer_source =
+            "namespace Demo { class Consumer { Target Make() => new Target(); } }\n";
+        fs::write(root.join("Consumer.cs"), consumer_source).expect("consumer fixture");
+        let project = Arc::new(TestProject::new(&root, Language::CSharp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let inventory_calls = Cell::new(0);
+        let config = ReferenceDifferentialConfig {
+            corpus_language: "csharp".to_string(),
+            exact_site: Some(ExactReferenceSite {
+                path: "Consumer.cs".to_string(),
+                start_byte: consumer_source.find("new Target").expect("reference") + 4,
+                end_byte: None,
+            }),
+            ..ReferenceDifferentialConfig::default()
+        };
+
+        let eligible =
+            eligible_files_with_inventory(workspace.analyzer(), &config, Language::CSharp, || {
+                inventory_calls.set(inventory_calls.get() + 1);
+                workspace.analyzer().analyzed_files()
+            })
+            .expect("select exact file");
+
+        assert_eq!(
+            inventory_calls.get(),
+            0,
+            "exact mode must use a point lookup"
+        );
+        assert_eq!(eligible, vec![ProjectFile::new(&root, "Consumer.cs")]);
+
+        let report = run_reference_differential(workspace.analyzer(), &config)
+            .expect("run exact differential through the full semantic pipeline");
+        assert_eq!(report.summary.eligible_files, 1);
+        assert_eq!(report.summary.audited_files, 1);
+        assert_eq!(report.summary.sampled_sites, 1);
+        assert_eq!(report.sites.len(), 1);
+        assert_eq!(
+            report.sites[0].classification,
+            ReferenceClassification::Consistent,
+            "the exact consumer reference should still resolve to the external target declaration"
+        );
+
+        let broad_config = ReferenceDifferentialConfig {
+            corpus_language: "csharp".to_string(),
+            ..ReferenceDifferentialConfig::default()
+        };
+        let broad = eligible_files_with_inventory(
+            workspace.analyzer(),
+            &broad_config,
+            Language::CSharp,
+            || {
+                inventory_calls.set(inventory_calls.get() + 1);
+                workspace.analyzer().analyzed_files()
+            },
+        )
+        .expect("select broad inventory");
+        assert_eq!(inventory_calls.get(), 1, "broad mode requires inventory");
+        assert_eq!(broad.len(), 2);
+
+        let unsafe_config = ReferenceDifferentialConfig {
+            corpus_language: "csharp".to_string(),
+            exact_site: Some(ExactReferenceSite {
+                path: "../Consumer.cs".to_string(),
+                start_byte: 0,
+                end_byte: None,
+            }),
+            ..ReferenceDifferentialConfig::default()
+        };
+        let error = eligible_files_with_inventory(
+            workspace.analyzer(),
+            &unsafe_config,
+            Language::CSharp,
+            || panic!("unsafe exact paths must fail before inventory"),
+        )
+        .expect_err("parent traversal must be rejected");
+        assert!(error.contains("workspace-relative"), "{error}");
     }
 
     #[test]
