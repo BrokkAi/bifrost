@@ -6,14 +6,27 @@ fn checked_in_workflow() -> String {
         .join(".github")
         .join("workflows")
         .join("benchmark.yml");
-    fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+    let workflow = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    normalize_newlines(&workflow)
+}
+
+fn normalize_newlines(contents: &str) -> String {
+    contents.replace("\r\n", "\n")
 }
 
 fn step_position(workflow: &str, name: &str) -> usize {
     workflow
         .find(name)
         .unwrap_or_else(|| panic!("workflow is missing step `{name}`"))
+}
+
+#[test]
+fn workflow_contract_normalizes_windows_line_endings() {
+    assert_eq!(
+        normalize_newlines("on:\r\n  schedule:\r\n"),
+        "on:\n  schedule:\n"
+    );
 }
 
 #[test]
