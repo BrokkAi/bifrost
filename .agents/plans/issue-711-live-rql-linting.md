@@ -15,7 +15,7 @@ The implementation also removes the current maintenance trap in which the S-expr
 - [x] (2026-07-13 10:57Z) Milestone 1: centralized query vocabulary/help metadata and added byte-spanned RQL/JSON source analysis, multi-diagnostic validation, `CodeQuery::from_source`, schema-backed REPL help/completion, and focused Rust tests.
 - [x] (2026-07-13 11:01Z) Milestone 2: exposed analyzer-free validation and hover requests through LSP, switched query execution to the shared source parser, and added focused UTF-16/JSON/RQL integration tests.
 - [x] (2026-07-13 11:05Z) Milestone 3: added `.rql`-only debounced/cancellable VS Code diagnostics and hover integration with pure unit-tested lifecycle logic.
-- [ ] Milestone 4: document the maintenance contract in `AGENTS.md`, run focused/full validation, manually inspect the Extension Development Host, and complete review fixes.
+- [x] (2026-07-13 11:24Z) Milestone 4: documented the maintenance contract in `AGENTS.md`, completed review fixes, and passed formatting, focused Rust/LSP/extension tests, all-target/all-feature clippy, and the full `nlp,python` test gate. Automated coverage exercised the editor lifecycle and wire behavior; a graphical Extension Development Host was not available in this environment, so manual Problems/hover inspection remains a delivery note rather than a claimed result.
 
 ## Surprises & Discoveries
 
@@ -39,6 +39,12 @@ The implementation also removes the current maintenance trap in which the S-expr
 
 - Observation: The extension can test every validation race without importing the `vscode` module.
   Evidence: `RqlValidationController` depends on injected timer, cancellation, request, current-document, publish, and clear functions; 7 focused controller/contract tests cover debounce, cancellation, stale versions, clearing, lifecycle stop, hover params, and JSON-language exclusion.
+
+- Observation: The `cargo-clippy` found first on `PATH` came from Homebrew while `cargo` and `rustc` came from the pinned rustup 1.96.0 toolchain, producing an LLVM identity mismatch before project linting began.
+  Evidence: Running `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/cargo-clippy clippy --all-targets --all-features -- -D warnings` used one coherent toolchain and passed after the one reported project lint was fixed.
+
+- Observation: On macOS the full Python-feature test gate needs PyO3's dynamic symbol lookup flags, and the sandbox needs a writable uv cache.
+  Evidence: The successful full command used `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' UV_CACHE_DIR=/tmp/bifrost-uv-cache BIFROST_SEMANTIC_INDEX=off cargo test --all-targets --features nlp,python`; it exited 0 after all targets completed.
 
 ## Decision Log
 
@@ -64,7 +70,9 @@ The implementation also removes the current maintenance trap in which the S-expr
 
 ## Outcomes & Retrospective
 
-Milestones 1 through 3 are complete. A required-metadata macro registry owns RQL forms/properties and JSON fields, while the kind/role registries own their help and shapes. Parser and decoder dispatch use generated enums with exhaustive matches, the REPL consumes the same descriptions, and source APIs provide byte ranges, independent diagnostics, hover tokens, and JSON-or-RQL execution. Private LSP validation and hover handlers convert those ranges to UTF-16 without receiving analyzer state, and Play execution accepts the same JSON-or-RQL source. VS Code now owns a dedicated RQL diagnostic collection, rejects non-`bifrost-rql` documents before scheduling work, cancels stale requests, and adapts server hover Markdown. The 38 focused library tests, 11 focused REPL tests, 2 focused LSP integration tests, and all 43 extension tests pass.
+All four milestones are complete. A required-metadata macro registry owns RQL forms/properties and JSON fields, while the kind/role registries own their help and shapes. Parser and decoder dispatch use generated enums with exhaustive matches, the REPL consumes the same descriptions, and source APIs provide byte ranges, independent diagnostics, hover tokens, and JSON-or-RQL execution. Private LSP validation and hover handlers convert those ranges to UTF-16 without receiving analyzer state, and Play execution accepts the same JSON-or-RQL source. VS Code now owns a dedicated RQL diagnostic collection, rejects non-`bifrost-rql` documents before scheduling work, cancels stale requests, and adapts server hover Markdown. `AGENTS.md` records the schema-first maintenance contract and grammar/test obligations.
+
+Final verification passed: 6 focused source-analysis tests, 2 focused LSP query tests, all 43 VS Code tests, pinned-toolchain `cargo clippy --all-targets --all-features -- -D warnings`, and the complete `cargo test --all-targets --features nlp,python` gate with semantic indexing disabled. The full library target alone reported 733 passed, 0 failed, and 3 ignored; the LSP integration target reported 179 passed. No graphical Extension Development Host was available, so Problems-panel presentation and rendered hover appearance were not manually inspected; the server ranges/content and extension publication, cancellation, clearing, lifecycle, and ordinary-JSON exclusion paths are covered automatically.
 
 ## Context and Orientation
 
@@ -111,8 +119,8 @@ Implement and verify Milestone 3 from the extension directory:
 Run final repository gates from the root:
 
     cargo fmt
-    cargo clippy --all-targets --all-features -- -D warnings
-    BIFROST_SEMANTIC_INDEX=off cargo test --all-targets --features nlp,python
+    /Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/cargo-clippy clippy --all-targets --all-features -- -D warnings
+    RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' UV_CACHE_DIR=/tmp/bifrost-uv-cache BIFROST_SEMANTIC_INDEX=off cargo test --all-targets --features nlp,python
     npm --prefix editors/vscode test
     git diff --check
 
@@ -136,7 +144,7 @@ Keep milestone commits bisectable. Never stage unrelated files or use `git add -
 
 ## Artifacts and Notes
 
-The branch began at commit `0018134b` and was 0/0 against both `origin/711-add-live-rql-query-linting-in-vs-code` and `origin/master` after the 2026-07-13 fetch. Store focused test results, manual Extension Development Host observations, review findings, and milestone commit hashes in the living sections above.
+The branch began at commit `0018134b` and was 0/0 against both `origin/711-add-live-rql-query-linting-in-vs-code` and `origin/master` after the 2026-07-13 fetch. Milestone commits are `02421ff6` (plan), `afa3cac0` (schema/source analysis), `90644c62` (LSP), and `c286c8c9` (VS Code); the final maintenance/verification milestone is committed immediately after this plan update. The graphical Extension Development Host was not available during this run, and that manual inspection is intentionally not represented as completed evidence.
 
 ## Interfaces and Dependencies
 
@@ -161,3 +169,5 @@ Revision note, 2026-07-13: Milestone 1 completed with macro-generated schema met
 Revision note, 2026-07-13: Milestone 2 completed with analyzer-free `bifrost/validateQuery` and `bifrost/queryHover` handlers, UTF-16 range conversion, and shared JSON-or-RQL query execution.
 
 Revision note, 2026-07-13: Milestone 3 completed with a dedicated RQL diagnostic collection, debounced/cancellable generation-and-version guarded validation, close/server cleanup, schema hover wiring, and explicit ordinary-JSON exclusion tests.
+
+Revision note, 2026-07-13: Milestone 4 completed with the schema maintenance rule, final full-keyword diagnostic ranges, lint cleanup, and all automated verification gates passing; recorded the unavailable graphical Extension Development Host check explicitly.

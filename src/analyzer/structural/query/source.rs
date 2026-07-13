@@ -448,7 +448,7 @@ fn validate_rql_pattern(expr: &Expr, path: &str, analysis: &mut Analysis) {
             match &args[index].kind {
                 ExprKind::Symbol(keyword) if keyword.starts_with(':') => {
                     let label = &keyword[1..];
-                    let key_range = (args[index].range.start + 1)..args[index].range.end;
+                    let key_range = args[index].range.clone();
                     if index + 1 == args.len() {
                         return;
                     }
@@ -1097,9 +1097,9 @@ mod tests {
         let source = "(call :wat 1 :name 2 :also-nope 3)";
         let diagnostics = validate_query_source(source);
         assert_eq!(diagnostics.len(), 3);
-        assert_eq!(&source[diagnostics[0].range.clone()], "wat");
+        assert_eq!(&source[diagnostics[0].range.clone()], ":wat");
         assert_eq!(&source[diagnostics[1].range.clone()], "2");
-        assert_eq!(&source[diagnostics[2].range.clone()], "also-nope");
+        assert_eq!(&source[diagnostics[2].range.clone()], ":also-nope");
     }
 
     #[test]
@@ -1127,12 +1127,18 @@ mod tests {
     #[test]
     fn help_covers_forms_properties_roles_kinds_and_values() {
         let source = "(result-detail full (call :callee (name \"run\")))";
-        for token in ["result-detail", "full", "call", "callee", "name"] {
+        for (token, expected_range) in [
+            ("result-detail", "result-detail"),
+            ("full", "full"),
+            ("call", "call"),
+            ("callee", ":callee"),
+            ("name", "name"),
+        ] {
             let offset = source.find(token).unwrap();
             let help = query_source_help_at(source, offset)
                 .unwrap_or_else(|| panic!("no help for {token}"));
             assert!(!help.description.is_empty());
-            assert_eq!(&source[help.range], token);
+            assert_eq!(&source[help.range], expected_range);
         }
         assert!(query_source_help_at(source, source.find("run").unwrap()).is_none());
     }
@@ -1141,6 +1147,6 @@ mod tests {
     fn byte_ranges_preserve_utf8_boundaries() {
         let source = "(call :unknown-λ 1)";
         let diagnostic = validate_query_source(source).pop().expect("diagnostic");
-        assert_eq!(&source[diagnostic.range], "unknown-λ");
+        assert_eq!(&source[diagnostic.range], ":unknown-λ");
     }
 }

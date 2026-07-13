@@ -388,19 +388,15 @@ fn insert_keyword(object: &mut Map<String, Value>, key: &str, value: &Expr) -> R
             RqlProperty::NotHas => insert_unique(object, "not_has", pattern_to_json(value)?),
         };
     }
-    match key {
-        role_label => {
-            let Some(role) = Role::from_label(role_label) else {
-                return Err(format!("unknown pattern field `:{key}`"));
-            };
-            if Role::single_target_roles().contains(&role) {
-                insert_unique(object, role.label(), single_role_value(value)?)
-            } else if Role::list_target_roles().contains(&role) {
-                insert_unique(object, role.label(), pattern_array(value)?)
-            } else {
-                insert_unique(object, role.label(), kwargs_object(value)?)
-            }
-        }
+    let Some(role) = Role::from_label(key) else {
+        return Err(format!("unknown pattern field `:{key}`"));
+    };
+    if Role::single_target_roles().contains(&role) {
+        insert_unique(object, role.label(), single_role_value(value)?)
+    } else if Role::list_target_roles().contains(&role) {
+        insert_unique(object, role.label(), pattern_array(value)?)
+    } else {
+        insert_unique(object, role.label(), kwargs_object(value)?)
     }
 }
 

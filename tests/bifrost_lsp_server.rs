@@ -701,10 +701,10 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
     let response = server.request("bifrost/validateQuery", json!({"query": rql}));
     let diagnostics = response["result"]["diagnostics"].as_array().unwrap();
     assert_eq!(diagnostics.len(), 2, "{response}");
-    let wat_byte = rql.find("wat").unwrap();
+    let wat_byte = rql.find(":wat").unwrap();
     let wat_utf16 = rql[..wat_byte].encode_utf16().count() as u64;
     assert_eq!(diagnostics[0]["range"]["start"]["character"], wat_utf16);
-    assert_eq!(diagnostics[0]["range"]["end"]["character"], wat_utf16 + 3);
+    assert_eq!(diagnostics[0]["range"]["end"]["character"], wat_utf16 + 4);
     assert_eq!(diagnostics[0]["source"], "Bifrost RQL");
 
     let json_query = r#"{"match":{"kind":"banana","capture":3}}"#;
