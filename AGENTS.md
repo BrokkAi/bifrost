@@ -63,6 +63,18 @@ skips every `#![cfg(feature = "nlp")]` integration suite (they report `ok. 0 pas
 We are okay with allow(clippy::too_many_arguments) rather than packing necessary parms into a struct just to
 make clippy shut up.
 
+# RQL syntax maintenance
+
+All new CodeQuery JSON fields, RQL forms, properties, roles, kinds, aliases, and constrained values must enter through
+the declarative schema registries under `src/analyzer/structural/query/schema.rs` or the kind/role registries in
+`src/analyzer/structural/kinds.rs`. Every entry must provide its accepted spellings, value shape, signature, description,
+and exhaustive parser/decoder/validator handling; do not add private keyword lists or editor-only documentation tables.
+
+When visible RQL vocabulary changes, add behavior-focused parser, validation-range, hover, and execution tests as
+appropriate, and update the conservative TextMate grammar in `editors/vscode/syntaxes/bifrost-rql.tmLanguage.json`.
+Keep ordinary JSON documents outside the RQL editor integration: JSON-shaped CodeQuery source is recognized only after
+the host has identified the document as `bifrost-rql`.
+
 # Design philosophy
 
 We build for correctness and generality. Adding narrow "fallbacks" is a smell. Always follow problems

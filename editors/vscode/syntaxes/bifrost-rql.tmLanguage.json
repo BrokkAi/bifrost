@@ -54,7 +54,7 @@
     },
     {
       "name": "support.function.predicate.bifrost-rql",
-      "match": "\\b(?:capture|has|name(?:/regex)?|not-has|not-kind|text/regex)\\b"
+      "match": "\\b(?:capture|has|name(?:/regex)?|not[-_]has|not[-_]kind|text/regex)\\b"
     },
     {
       "name": "meta.limit.bifrost-rql",

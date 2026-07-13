@@ -119,3 +119,9 @@ test("tokenizes nested RQL structure, literals, and incomplete input", async () 
   const unknown = tokens.find((candidate) => candidate.text.includes("custom_identifier :unexpected true false null 7"));
   assert.deepEqual(unknown?.scopes, [scopeName]);
 });
+
+test("highlights registered underscore predicate aliases", async () => {
+  const tokens = tokenize(await grammar(), "(not_has (call)) (not_kind class)");
+  assertScoped(tokens, "not_has", "support.function.predicate.bifrost-rql");
+  assertScoped(tokens, "not_kind", "support.function.predicate.bifrost-rql");
+});
