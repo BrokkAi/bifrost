@@ -39,7 +39,8 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-13 00:58Z) Passed the complete `cargo test --features nlp,python` gate for #706.
 - [x] (2026-07-13 01:01Z) Pushed `2a365fce` and closed #706.
 - [x] (2026-07-13 01:19Z) Completed the valid post-#706 full C# rerun: all 1,000 target groups queried with zero scope-loss notes, 1,875 consistent, 40 unproven, 69 missing, and 8,016 inconclusive sites in 1,008.2 seconds.
-- [ ] Reduce the dominant residual class boundary: 16 fully qualified `IAsyncCommandRuntimeExtensions` types in `as` casts, then determine whether 10 `EventData` and seven `JsonArray` sites share it.
+- [x] (2026-07-13 01:22Z) Paused the C# triage campaign at the user's requested post-#706 boundary to cut release `0.8.0`.
+- [ ] After the release, reduce the dominant residual class boundary: 16 fully qualified `IAsyncCommandRuntimeExtensions` types in `as` casts, then determine whether 10 `EventData` and seven `JsonArray` sites share it.
 
 ## Surprises & Discoveries
 
@@ -174,3 +175,5 @@ Revision note (2026-07-13): Recorded #705 reduction/fix and production timing, p
 Revision note (2026-07-13): Recorded pushed/closed #705 and #706's shared-role implementation, cache epoch bump, focused validation, and exact persisted production proof.
 
 Revision note (2026-07-13): Recorded pushed/closed #706, its valid complete corpus rerun, the eliminated static-import cluster, and the 69-site residual partition.
+
+Revision note (2026-07-13): Marked the campaign intentionally paused after #706 for the `0.8.0` release, preserving the exact resumption boundary.

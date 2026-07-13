@@ -76,6 +76,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 00:58Z) Passed the complete `cargo test --features nlp,python` validation gate for #706.
 - [x] (2026-07-13 01:01Z) Pushed `2a365fce` and closed #706.
 - [x] (2026-07-13 01:19Z) Completed the valid post-#706 full C# run with all 1,000 target groups, zero scope-loss notes, and 69 missing sites, exactly 34 fewer than before the static-import fix.
+- [x] (2026-07-13 01:22Z) Paused post-#706 triage at the user's request to cut release `0.8.0`; the 69-site C# record is the explicit resumption boundary.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -329,3 +330,5 @@ Revision note (2026-07-13): Recorded reduced #705, its production timing and tru
 Revision note (2026-07-13): Recorded pushed/closed #705 and #706's reduced shared-role fix, persistence epoch bump, focused validation, and exact production proof.
 
 Revision note (2026-07-13): Recorded pushed/closed #706, the valid complete post-fix C# record, removal of all 34 static-import misses, and the 69-site residual partition.
+
+Revision note (2026-07-13): Marked the campaign deliberately paused after #706 for release `0.8.0` without changing the remaining campaign scope.
