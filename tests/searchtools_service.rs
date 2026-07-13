@@ -188,10 +188,10 @@ fn service_normalizes_query_code_absolute_where_globs() {
         .call_tool_value("query_code", arguments)
         .expect("query_code should accept an absolute where path");
 
-    assert_eq!(value["matches"][0]["path"], "A.java", "payload: {value}");
-    assert_eq!(value["matches"][0]["kind"], "class", "payload: {value}");
+    assert_eq!(value["results"][0]["path"], "A.java", "payload: {value}");
+    assert_eq!(value["results"][0]["kind"], "class", "payload: {value}");
     assert_eq!(
-        value["matches"][0]["enclosing_symbol"], "A",
+        value["results"][0]["enclosing_symbol"], "A",
         "payload: {value}"
     );
 }

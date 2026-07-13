@@ -16,8 +16,8 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 - [x] (2026-07-13 10:42Z) Implemented typed row execution, exact enclosing declarations, direct import edges, deduplication, provenance, and budgets.
 - [x] (2026-07-13 11:36Z) Updated the MCP schema, CLI rendering/help, and Python client/models for typed `results` and pipeline `steps`.
 - [x] (2026-07-13 11:36Z) Added behavior-focused integration tests and executable cookbook examples for every new step, including repeated direct import traversal.
-- [ ] Run formatting, focused tests, Python tests, Clippy, and the full `nlp,python` feature test suite.
-- [ ] Record final evidence and complete the retrospective.
+- [x] (2026-07-13) Ran formatting, the 114-test focused Rust matrix, all 38 Python tests, Clippy with every feature and target, the full `nlp,python` Rust unit/integration matrix, and the CI-equivalent `nlp` doctest gate.
+- [x] (2026-07-13) Recorded final validation evidence and completed the retrospective.
 
 ## Surprises & Discoveries
 
@@ -29,6 +29,12 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 - Observation: Not every syntax declaration is an indexed `CodeUnit`; for example, a nested Python local function is currently enclosed by its indexed outer declaration.
   Evidence: the initial nested-local fixture returned `app.outer`, while a class method fixture returned the exact `Outer.inner` declaration. The step therefore correctly promises the smallest indexed declaration rather than an arbitrary AST declaration node.
+
+- Observation: This workstation has Cargo/Rustc and Rustdoc/Clippy installations built against different LLVM patch releases, and the user-local Rust installation has no `rustdoc` binary.
+  Evidence: mixing the installations produced Rust metadata error E0514, while pinning Clippy and doctests to `/opt/homebrew/bin` succeeded. The complete `nlp,python` unit/integration run passed with the user-local Cargo/Rustc and macOS Python dynamic-link flags; the CI-equivalent `nlp` doctest run then passed independently with the Homebrew toolchain.
+
+- Observation: The repository-wide service suite found one v1-shaped assertion that the focused query tests did not exercise.
+  Evidence: `service_normalizes_query_code_absolute_where_globs` still indexed `value["matches"]`; changing that assertion to the schema-v2 `value["results"]` shape made the focused service test and the subsequent full unit/integration matrix pass.
 
 ## Decision Log
 
@@ -62,7 +68,9 @@ The behavior is visible through the existing `query_code` MCP/CLI surface. A JSO
 
 ## Outcomes & Retrospective
 
-The query IR, executor, public-surface, and cookbook milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, full-detail stable identities, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. The MCP schema, CLI and saved-query mode, Python models/client, and executable tutorial examples now agree on tagged `results`. The focused Rust matrix passes 114 tests across pipeline, documentation, CLI, cross-language, Python-structural, and planner targets. Repository-wide Python, Clippy, and full-feature validation remain before completion.
+The query IR, executor, public surface, and cookbook milestones are complete. Version-2 JSON and RQL steps validate into one ordered typed IR. Integration tests prove inclusive method declarations, full-detail stable identities, file deduplication, sixteen-trace provenance caps, direct Ruby forward/reverse edges, repeated multi-hop traversal, cycles, unsupported-provider diagnostics, terminal limits, and pipeline-budget truncation. The MCP schema, CLI and saved-query mode, Python models/client, and executable tutorial examples now agree on tagged `results`.
+
+Final validation is green: the focused Rust matrix passes 114 tests across pipeline, documentation, CLI, cross-language, Python-structural, and planner targets; `scripts/test_python.sh` passes all 38 Python tests; `cargo clippy --all-targets --all-features -- -D warnings` passes; and every Rust unit and integration target passes with `--features nlp,python`. Because the local Cargo/Rustc installation lacks `rustdoc` and cannot consume the Homebrew toolchain's differently-versioned metadata, doctests were run separately with the Homebrew toolchain and the CI Rust feature set, `--doc --features nlp`; that gate also passes. No regex or text-search import fallback was introduced, and no known issue-715 work remains.
 
 ## Context and Orientation
 
@@ -149,6 +157,8 @@ Revision note (2026-07-13): Created the initial self-contained plan after confir
 Revision note (2026-07-13 10:42Z): Marked the typed IR and executor milestones complete, recorded the indexed-declaration boundary discovered by testing, and captured the passing focused integration evidence.
 
 Revision note (2026-07-13 11:36Z): Marked the public API and executable cookbook milestones complete, recorded the clean removal of the legacy Rust `matches` collection, and captured the passing 114-test focused Rust matrix.
+
+Revision note (2026-07-13): Completed repository-wide validation, documented the split local Rust toolchain required to run the full-feature unit/integration and doctest gates, fixed the final stale v1 service assertion, and closed the retrospective.
 
 ## Interfaces and Dependencies
 
