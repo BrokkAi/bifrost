@@ -1,8 +1,32 @@
+use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
 pub(super) struct ScalaSupertypeFact {
     pub(super) raw: String,
-    pub(super) lookup_path: String,
+    pub(super) lookup_path: ScalaSupertypeLookupPath,
+}
+
+/// Parser-derived path used to resolve a Scala supertype without reparsing its
+/// display text. Keeping the segments structured is important for nested
+/// owners such as `Outer.Base`, where the first and last identifiers carry
+/// different resolution semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ScalaSupertypeLookupPath {
+    segments: Vec<String>,
+}
+
+impl ScalaSupertypeLookupPath {
+    pub(crate) fn segments(&self) -> &[String] {
+        &self.segments
+    }
+
+    pub(super) fn encode(&self) -> String {
+        serde_json::to_string(self).expect("Scala supertype lookup path is serializable")
+    }
+
+    pub(crate) fn decode(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok()
+    }
 }
 
 pub(super) fn extract_scala_supertypes(
@@ -18,10 +42,36 @@ pub(super) fn extract_scala_supertypes(
             let lookup_node = supertype_lookup_node(parent)?;
             Some(ScalaSupertypeFact {
                 raw: node_text(parent, source).to_string(),
-                lookup_path: node_text(lookup_node, source).to_string(),
+                lookup_path: ScalaSupertypeLookupPath {
+                    segments: lookup_path_segments(lookup_node, source),
+                },
             })
         })
+        .filter(|fact| !fact.lookup_path.segments.is_empty())
         .collect()
+}
+
+fn lookup_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" | "operator_identifier" | "type_identifier" => {
+                let segment = node_text(current, source).trim();
+                if !segment.is_empty() {
+                    segments.push(segment.to_string());
+                }
+            }
+            "type_arguments" | "arguments" | "annotation" | "structural_type" => {}
+            _ => {
+                let mut cursor = current.walk();
+                let mut children = current.named_children(&mut cursor).collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children);
+            }
+        }
+    }
+    segments
 }
 
 fn supertype_lookup_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -106,7 +156,7 @@ mod tests {
             {
                 return extract_scala_supertypes(node, source)
                     .into_iter()
-                    .map(|fact| (fact.raw, fact.lookup_path))
+                    .map(|fact| (fact.raw, fact.lookup_path.segments.join(".")))
                     .collect();
             }
             let mut cursor = node.walk();

@@ -4,7 +4,7 @@ use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{AnalyzerDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::sync::Arc;
@@ -75,25 +75,27 @@ pub(crate) fn resolve_type_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<TypeLookupRequest>,
 ) -> Vec<TypeLookupOutcome> {
-    let mut context = TypeBatchContext::new();
+    let mut context = TypeBatchContext::new(analyzer);
     requests
         .into_iter()
         .map(|request| resolve_one(analyzer, &mut context, request))
         .collect()
 }
 
-struct TypeBatchContext {
+struct TypeBatchContext<'a> {
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     rust_cache: RustTypeLookupCache,
+    support: AnalyzerDefinitionLookup<'a>,
 }
 
-impl TypeBatchContext {
-    fn new() -> Self {
+impl<'a> TypeBatchContext<'a> {
+    fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self {
             sources: HashMap::default(),
             trees: HashMap::default(),
             rust_cache: RustTypeLookupCache::default(),
+            support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
         }
     }
 
@@ -116,9 +118,9 @@ impl TypeBatchContext {
     }
 }
 
-fn resolve_one(
-    analyzer: &dyn IAnalyzer,
-    context: &mut TypeBatchContext,
+fn resolve_one<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    context: &mut TypeBatchContext<'a>,
     request: TypeLookupRequest,
 ) -> TypeLookupOutcome {
     let file = request.file.clone();
@@ -173,23 +175,29 @@ fn resolve_one(
             csharp::resolve_csharp_type(analyzer, &file, &source, tree.as_ref(), &site)
         }
         Language::Go => go::resolve_go_type(analyzer, &file, &source, tree.as_ref(), &site),
-        Language::Java => java::resolve_java_type(
-            analyzer,
-            &crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, language),
-            &file,
-            &source,
-            tree.as_ref(),
-            &site,
-        ),
-        Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts_type(
-            analyzer,
-            &crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, language),
-            &file,
-            language,
-            &source,
-            tree.as_ref(),
-            &site,
-        ),
+        Language::Java => {
+            context.support.set_language(language);
+            java::resolve_java_type(
+                analyzer,
+                &context.support,
+                &file,
+                &source,
+                tree.as_ref(),
+                &site,
+            )
+        }
+        Language::JavaScript | Language::TypeScript => {
+            context.support.set_language(language);
+            js_ts::resolve_js_ts_type(
+                analyzer,
+                &context.support,
+                &file,
+                language,
+                &source,
+                tree.as_ref(),
+                &site,
+            )
+        }
         Language::Rust => rust::resolve_rust_type(
             analyzer,
             &file,
@@ -199,7 +207,15 @@ fn resolve_one(
             &mut context.rust_cache,
         ),
         Language::Scala => {
-            scala::resolve_scala_type(analyzer, context, &file, &source, tree.as_ref(), &site)
+            context.support.set_language(language);
+            scala::resolve_scala_type(
+                analyzer,
+                &context.support,
+                &file,
+                &source,
+                tree.as_ref(),
+                &site,
+            )
         }
         _ => unreachable!("unsupported language handled above"),
     };

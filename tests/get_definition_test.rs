@@ -16532,6 +16532,69 @@ fn scala_missing_imported_type_annotation_does_not_fall_back_to_same_package_typ
 }
 
 #[test]
+fn scala_ambiguous_wildcard_type_does_not_fall_back_to_same_package_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\nclass Child { def local: Int = 0 }\n",
+        )
+        .file(
+            "one/Model.scala",
+            "package one\nclass Child { def first: Int = 1 }\n",
+        )
+        .file(
+            "two/Model.scala",
+            "package two\nclass Child { def second: Int = 2 }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nimport one.*\nimport two.*\nclass Controller { def run(child: Child): Int = child.local }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(child: Child): Int = child.local }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":4,"column":{}}}]}}"#,
+            column_of(line, "local")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_qualified_nested_supertype_preserves_the_complete_lookup_path() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\nobject Outer { trait Base { def value: Int = 1 } }\nclass Child extends Outer.Base\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(child: Child): Int = child.value }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(child: Child): Int = child.value }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer$.Base.value",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_nested_class_ancestor_does_not_leak_to_outer_owner() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

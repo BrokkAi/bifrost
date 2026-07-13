@@ -135,10 +135,36 @@ impl RubyVisitor<'_> {
         self.parsed
             .add_signature(code_unit.clone(), first_line(node, self.source));
 
-        let supertypes = extract_ruby_supertypes(node, self.source);
-        if !supertypes.is_empty() {
-            self.parsed
-                .set_raw_supertypes(code_unit.clone(), supertypes);
+        let mut owner_relations = extract_ruby_supertypes(node, self.source)
+            .into_iter()
+            .map(|target| {
+                let encoded = super::mixins::encode_superclass_relation(&target);
+                (target, encoded)
+            })
+            .collect::<Vec<_>>();
+        owner_relations.extend(
+            super::mixins::raw_mixin_specs_for_type(node, self.source)
+                .into_iter()
+                .map(|spec| {
+                    let encoded = super::mixins::encode_mixin_relation(&spec);
+                    (spec.raw_target, encoded)
+                }),
+        );
+        if !owner_relations.is_empty() {
+            self.parsed.set_raw_supertypes(
+                code_unit.clone(),
+                owner_relations
+                    .iter()
+                    .map(|(target, _)| target.clone())
+                    .collect(),
+            );
+            self.parsed.set_supertype_lookup_paths(
+                code_unit.clone(),
+                owner_relations
+                    .into_iter()
+                    .map(|(_, encoded)| encoded)
+                    .collect(),
+            );
         }
 
         self.visit_scope_field_assignments(

@@ -42,13 +42,14 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-13) Pass 436 definition tests, 35 persistence tests, 18 cache migration tests, all-target/all-feature clippy, formatting, and the complete `nlp,python` gate under the macOS CI linker configuration.
 - [x] (2026-07-13) Make asynchronous unified-cache GC snapshot eligible rows before its Git reachability walk, preventing an in-flight cold-build GC from deleting dirty/stale blobs written by a concurrent warm build; the 35-case persistence suite passes 20 consecutive stress runs.
 - [x] (2026-07-13) Run Brokk guided review over the complete branch diff; record two HIGH, seven MEDIUM, and two LOW findings covering projection durability, package-prefix boundedness, Scala resolution outcomes, Rust path safety, Ruby request-time parsing, batch caching, warm projection reconciliation, and duplicated forward fact walkers.
-- [ ] Make path-projection writes durable or retryable, refresh only changed/deleted projections after the initial backfill, and test write-failure recovery without a live-path scan fallback.
-- [ ] Replace package-prefix candidate hydration with a literal, indexed existence query that cannot interpret `%` or `_` as wildcards and stops after a live validated match.
-- [ ] Preserve Scala ambiguity and missing-import outcomes through every fallback tier; persist and resolve structured qualified supertype paths; share one iterative ancestry walker.
-- [ ] Share `AnalyzerDefinitionLookup` across an entire type batch and add multi-reference query-count coverage.
-- [ ] Bound Rust Cargo route resolution to the workspace while sharing manifest/dependency parsing between forward and inverse paths.
-- [ ] Persist Ruby mixin-kind facts so warm forward ancestry never reparses source, and share the fact extractor with inverse analysis.
-- [ ] Centralize path-projection row encoding/decoding, run focused regressions, then rerun formatting, clippy, persistence, definition, and full feature gates.
+- [x] (2026-07-13) Make path-projection writes retryable with a generation-local dirty overlay, invalidate incremental snapshot markers, and prove failed persistence remains queryable without a live-path scan fallback.
+- [x] (2026-07-13) Replace package-prefix materialization with literal half-open index ranges, cursor paging, and early exit after the first live validated match; cover underscore-containing packages.
+- [x] (2026-07-13) Preserve Scala ambiguity and missing-import outcomes through fallback tiers, persist parser-derived ordered supertype segments, resolve nested singleton owners, and share one iterative ancestry walker.
+- [x] (2026-07-13) Share one `AnalyzerDefinitionLookup` across an entire type batch so positive and negative candidate results survive between references.
+- [x] (2026-07-13) Bound Rust Cargo dependency and library paths lexically and canonically to the workspace, and share crate/manifest parsing between forward and inverse route construction.
+- [x] (2026-07-13) Persist Ruby superclass and mixin-kind owner facts together so warm forward ancestry hydrates one owner file and inverse analysis consumes the same parser output.
+- [x] (2026-07-13) Centralize path-projection row encoding/decoding, add unchanged-snapshot fingerprints, and pass focused Scala, Rust, Ruby, cache-migration, and persistence regressions plus all-target/all-feature clippy.
+- [ ] Rerun the complete definition and feature-enabled workspace gates, then record the final review-remediation outcome.
 
 ## Surprises & Discoveries
 
@@ -139,6 +140,9 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - Observation: Warm Ruby forward mixin resolution reads and reparses the exact owner source because mixin relation kind is not persisted with raw supertypes; current build-progress parse counters cannot observe this request-time parser.
   Evidence: `RubySemanticIndex::forward_owner_facts` calls `RubyAnalyzer::forward_mixin_specs`, which reads the source and calls `parse_ruby_tree` on every uncached owner.
 
+- Observation: `cargo clippy` selected Homebrew's `cargo-clippy`/`clippy-driver` from `PATH` even though Cargo and Rust were selected through rustup; both report Rust 1.96.0 but use LLVM 22.1.6 and 22.1.2 respectively, which makes existing `.rmeta` files incompatible.
+  Evidence: the default gate failed with E0514 before checking source; prefixing `PATH` with the rustup toolchain's `bin` directory ran the same all-target/all-feature warning-as-error gate successfully.
+
 ## Decision Log
 
 - Decision: Reject immutable Arc-backed `DefinitionLookupIndex` shards.
@@ -221,9 +225,13 @@ Opening a warm persisted workspace must finish without reconstructing every decl
   Rationale: Qualified Scala owners and Ruby mixin kinds are already known at declaration-collection time. Persisting ordered Scala path segments and Ruby relation kinds gives forward and inverse consumers one fact source and eliminates delimiter parsing and request-time tree construction.
   Date/Author: 2026-07-13 / Codex
 
+- Decision: Store a deterministic per-language fingerprint for the path-projection snapshot and invalidate it on every incremental replacement.
+  Rationale: A clean warm open already has the live path/OID inventory needed to compute the projection rows. A snapshot fingerprint makes the unchanged case one indexed metadata read instead of hydrating and comparing the complete projection table, while invalidation guarantees the next full build reconciles after an incremental change.
+  Date/Author: 2026-07-13 / Codex
+
 ## Outcomes & Retrospective
 
-The initial request-scoped forward query layer and typed Scala forward resolver passed the full local gates, but guided review showed that the completion claim was premature. Path projection writes can silently diverge from parsed blobs, package-prefix existence can scan and hydrate a language partition, Scala loses ambiguity and qualified-owner structure in fallback paths, type batches recreate their lookup session per reference, Rust follows unbounded Cargo paths, and Ruby reparses owner source for mixin facts. The milestones above remain open until those behaviors have direct regressions and the complete gates pass again.
+The guided-review findings are now implemented and covered by focused regressions. Projection writes retry and fall back to a live-OID-validated dirty overlay; unchanged warm snapshots skip table reconciliation. Package-prefix checks page literal indexed ranges. Scala carries typed terminal outcomes and JSON-encoded parser segments through persisted ancestry. Type batches reuse one bounded session. Rust rejects lexical, absolute, and symlink workspace escapes. Ruby forward and inverse resolution share persisted parser-derived relation facts. The 52-case focused Scala suite, 37-case persistence suite, Rust Cargo safety tests, Ruby mixin tests, cache migration tests, formatting, and all-target/all-feature clippy are green; only the final wide definition and feature gates remain.
 
 The final local gates pass: 436 definition tests, 35 persistence tests, 18 cache migration tests, the complete Scala LSP click-around regression, formatting, warning-as-error all-target/all-feature clippy, and the complete feature-enabled workspace suite. The persistence matrix covers every supported definition language and every type-enabled language, asserts zero warm parses, full declaration scans, global-index builds, Scala `ProjectTypes` builds, and request-time path scans, and keeps candidate hydration below a 32-file unrelated sentinel. The requested AWS rerun cannot be performed in this worktree because `/mnt/T9/repo-clones/aws__aws-sdk-go-v2` is not mounted; the prior schema-v9 artifacts remain the latest real-corpus evidence and this environmental limitation does not weaken the deterministic bounded-work regressions.
 

@@ -1,12 +1,7 @@
-#![allow(dead_code)]
-
 use super::RubyAnalyzer;
-use super::declarations::{
-    extract_name_segments, is_descendable_container, parse_ruby_tree, qualified_internal_name,
-    ruby_node_text,
-};
+use super::declarations::{is_descendable_container, qualified_internal_name, ruby_node_text};
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
-use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
@@ -26,171 +21,69 @@ impl RubyAnalyzer {
     fn collect_mixin_relations(&self) -> Vec<TypeRelation> {
         let mut relations = Vec::new();
         for file in self.get_analyzed_files() {
-            let Ok(source) = self.project().read_source(&file) else {
-                continue;
-            };
-            let Some(tree) = parse_ruby_tree(&source) else {
-                continue;
-            };
-
-            let mut stack = Vec::new();
-            push_children(tree.root_node(), &[], &mut stack);
-            while let Some((node, segments)) = stack.pop() {
-                self.collect_mixin_relation_statement(
-                    &file,
-                    &source,
-                    node,
-                    &segments,
-                    &mut relations,
-                    &mut stack,
-                );
+            for owner in self
+                .declarations(&file)
+                .into_iter()
+                .filter(|unit| unit.is_class() || unit.is_module())
+            {
+                for spec in self.forward_mixin_specs(&owner) {
+                    if let Some(target) = self.resolve_mixin_target(&file, &spec.raw_target) {
+                        relations.push(TypeRelation {
+                            from: owner.clone(),
+                            to: target,
+                            kind: spec.kind,
+                        });
+                    }
+                }
             }
         }
         relations
     }
 
-    /// Extract mixin statements only from the exact requested owner. This is
-    /// the forward-query counterpart to the global relation collector used by
-    /// inverse analysis.
+    /// Reads parser-derived mixin facts for exactly one owner file. Forward
+    /// definition lookup therefore never reparses Ruby source or constructs the
+    /// global mixin graph.
     pub(crate) fn forward_mixin_specs(&self, owner: &CodeUnit) -> Vec<RubyForwardMixinSpec> {
-        let Ok(source) = self.project().read_source(owner.source()) else {
-            return Vec::new();
-        };
-        let Some(tree) = parse_ruby_tree(&source) else {
-            return Vec::new();
-        };
-
-        let mut stack = Vec::new();
-        push_children(tree.root_node(), &[], &mut stack);
-        while let Some((node, segments)) = stack.pop() {
-            match node.kind() {
-                "class" | "module" => {
-                    let Some(name_node) = node.child_by_field_name("name") else {
-                        continue;
-                    };
-                    let name_segments = extract_name_segments(name_node, &source);
-                    if name_segments.is_empty() {
-                        continue;
-                    }
-                    let mut type_segments = segments.clone();
-                    type_segments.extend(name_segments);
-                    if type_segments.join("$") == owner.fq_name() {
-                        return raw_mixin_specs_for_type(node, &source);
-                    }
-                    if let Some(body) = node.child_by_field_name("body") {
-                        push_children(body, &type_segments, &mut stack);
-                    }
-                }
-                "singleton_class" => {
-                    if let Some(body) = node.child_by_field_name("body") {
-                        push_children(body, &segments, &mut stack);
-                    }
-                }
-                "method" | "singleton_method" => {}
-                kind if is_descendable_container(kind) => {
-                    push_children(node, &segments, &mut stack)
-                }
-                _ => {}
-            }
-        }
-        Vec::new()
+        self.forward_owner_relation_facts(owner)
+            .into_iter()
+            .filter_map(|fact| {
+                fact.kind.map(|kind| RubyForwardMixinSpec {
+                    kind,
+                    raw_target: fact.raw_target,
+                })
+            })
+            .collect()
     }
 
-    fn collect_mixin_relation_statement<'tree>(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        node: Node<'tree>,
-        segments: &[String],
-        relations: &mut Vec<TypeRelation>,
-        stack: &mut Vec<(Node<'tree>, Vec<String>)>,
-    ) {
-        match node.kind() {
-            "class" | "module" => {
-                let Some(name_node) = node.child_by_field_name("name") else {
-                    return;
-                };
-                let name_segments = extract_name_segments(name_node, source);
-                if name_segments.is_empty() {
-                    return;
-                }
-
-                let mut type_segments = segments.to_vec();
-                type_segments.extend(name_segments);
-                let owner = CodeUnit::new(
-                    file.clone(),
-                    if node.kind() == "module" {
-                        CodeUnitType::Module
-                    } else {
-                        CodeUnitType::Class
-                    },
-                    String::new(),
-                    type_segments.join("$"),
-                );
-                self.collect_mixin_relations_for_type(file, source, node, &owner, relations);
-
-                if let Some(body) = node.child_by_field_name("body") {
-                    push_children(body, &type_segments, stack);
-                }
-            }
-            "singleton_class" => {
-                if let Some(body) = node.child_by_field_name("body") {
-                    push_children(body, segments, stack);
-                }
-            }
-            "method" | "singleton_method" => {}
-            kind if is_descendable_container(kind) => push_children(node, segments, stack),
-            _ => {}
-        }
+    pub(crate) fn forward_superclass_targets(&self, owner: &CodeUnit) -> Vec<String> {
+        self.forward_owner_relation_facts(owner)
+            .into_iter()
+            .filter(|fact| fact.kind.is_none())
+            .map(|fact| fact.raw_target)
+            .collect()
     }
 
-    fn collect_mixin_relations_for_type(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        node: Node<'_>,
-        owner: &CodeUnit,
-        relations: &mut Vec<TypeRelation>,
-    ) {
-        let Some(body) = node.child_by_field_name("body") else {
-            return;
+    fn forward_owner_relation_facts(&self, owner: &CodeUnit) -> Vec<RubyOwnerRelationFact> {
+        let Some(state) = self.inner.fetch_file_state(owner.source()) else {
+            return Vec::new();
         };
-
-        let mut stack = vec![body];
-        while let Some(current) = stack.pop() {
-            let mut cursor = current.walk();
-            for child in current.named_children(&mut cursor) {
-                match child.kind() {
-                    "call" => {
-                        let Some(kind) = mixin_call_kind(child, source) else {
-                            continue;
-                        };
-                        let Some(arguments) = child.child_by_field_name("arguments") else {
-                            continue;
-                        };
-                        let mut arg_cursor = arguments.walk();
-                        let mut targets = Vec::new();
-                        for arg in arguments.named_children(&mut arg_cursor) {
-                            if matches!(arg.kind(), "constant" | "scope_resolution")
-                                && let Some(name) = qualified_internal_name(arg, source)
-                                && let Some(target) = self.resolve_mixin_target(file, &name)
-                            {
-                                targets.push(target);
-                            }
-                        }
-                        for target in targets.into_iter().rev() {
-                            relations.push(TypeRelation {
-                                from: owner.clone(),
-                                to: target,
-                                kind,
-                            });
-                        }
-                    }
-                    kind if is_descendable_container(kind) => stack.push(child),
-                    _ => {}
-                }
-            }
+        if !state.declarations.contains(owner) {
+            return Vec::new();
         }
+        state
+            .raw_supertypes
+            .get(owner)
+            .into_iter()
+            .flatten()
+            .zip(
+                state
+                    .supertype_lookup_paths
+                    .get(owner)
+                    .into_iter()
+                    .flatten(),
+            )
+            .filter_map(|(raw, encoded)| decode_owner_relation(encoded, raw))
+            .collect()
     }
 
     fn resolve_mixin_target(&self, file: &ProjectFile, raw: &str) -> Option<CodeUnit> {
@@ -227,7 +120,7 @@ impl RubyAnalyzer {
     }
 }
 
-fn raw_mixin_specs_for_type(node: Node<'_>, source: &str) -> Vec<RubyForwardMixinSpec> {
+pub(super) fn raw_mixin_specs_for_type(node: Node<'_>, source: &str) -> Vec<RubyForwardMixinSpec> {
     let Some(body) = node.child_by_field_name("body") else {
         return Vec::new();
     };
@@ -263,16 +156,43 @@ fn raw_mixin_specs_for_type(node: Node<'_>, source: &str) -> Vec<RubyForwardMixi
     specs
 }
 
-fn push_children<'tree>(
-    node: Node<'tree>,
-    segments: &[String],
-    stack: &mut Vec<(Node<'tree>, Vec<String>)>,
-) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    for child in children.into_iter().rev() {
-        stack.push((child, segments.to_vec()));
+struct RubyOwnerRelationFact {
+    kind: Option<TypeRelationKind>,
+    raw_target: String,
+}
+
+pub(super) fn encode_superclass_relation(raw_target: &str) -> String {
+    encode_owner_relation("superclass", raw_target)
+}
+
+pub(super) fn encode_mixin_relation(spec: &RubyForwardMixinSpec) -> String {
+    let kind = match spec.kind {
+        TypeRelationKind::MixinInclude => "include",
+        TypeRelationKind::MixinPrepend => "prepend",
+        TypeRelationKind::MixinExtend => "extend",
+        _ => unreachable!("Ruby mixin extractor only emits mixin relations"),
+    };
+    encode_owner_relation(kind, &spec.raw_target)
+}
+
+fn encode_owner_relation(kind: &str, raw_target: &str) -> String {
+    serde_json::json!({ "kind": kind, "target": raw_target }).to_string()
+}
+
+fn decode_owner_relation(encoded: &str, expected_target: &str) -> Option<RubyOwnerRelationFact> {
+    let value: serde_json::Value = serde_json::from_str(encoded).ok()?;
+    let raw_target = value.get("target")?.as_str()?.to_string();
+    if raw_target != expected_target {
+        return None;
     }
+    let kind = match value.get("kind")?.as_str()? {
+        "superclass" => None,
+        "include" => Some(TypeRelationKind::MixinInclude),
+        "prepend" => Some(TypeRelationKind::MixinPrepend),
+        "extend" => Some(TypeRelationKind::MixinExtend),
+        _ => return None,
+    };
+    Some(RubyOwnerRelationFact { kind, raw_target })
 }
 
 fn ruby_type_matches(unit: &CodeUnit, raw: &str) -> bool {

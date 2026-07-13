@@ -134,7 +134,7 @@ impl RubyAnalyzer {
     }
 
     pub(crate) fn forward_raw_supertypes(&self, unit: &CodeUnit) -> Vec<String> {
-        self.inner.raw_supertypes_of(unit)
+        self.forward_superclass_targets(unit)
     }
 }
 

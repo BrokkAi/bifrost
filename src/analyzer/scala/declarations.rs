@@ -198,7 +198,7 @@ impl<'a> ScalaVisitor<'a> {
                 code_unit.clone(),
                 raw_supertypes
                     .into_iter()
-                    .map(|fact| fact.lookup_path)
+                    .map(|fact| fact.lookup_path.encode())
                     .collect(),
             );
         }

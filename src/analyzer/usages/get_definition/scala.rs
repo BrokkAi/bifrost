@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::ImportInfo;
+use crate::analyzer::scala::ScalaSupertypeLookupPath;
 use crate::analyzer::usages::scala_graph::syntax::call_arity_for_reference;
 use crate::analyzer::usages::scala_graph::{
     method_call_arity_applies, method_signature_arity, resolved_extension_receiver_type,
@@ -80,6 +81,30 @@ impl<'a> ForwardScalaNameResolver<'a> {
         let Some(simple) = scala_forward_simple_name(raw) else {
             return ScalaNameResolution::Unresolved;
         };
+        self.resolve_owner_segments(&[simple.to_string()], kind)
+    }
+
+    fn resolve_lookup_path(
+        &self,
+        path: &ScalaSupertypeLookupPath,
+        kind: ScalaOwnerKind,
+    ) -> ScalaNameResolution {
+        self.resolve_owner_segments(path.segments(), kind)
+    }
+
+    fn resolve_owner_segments(
+        &self,
+        segments: &[String],
+        kind: ScalaOwnerKind,
+    ) -> ScalaNameResolution {
+        let Some(simple) = segments.last().map(String::as_str) else {
+            return ScalaNameResolution::Unresolved;
+        };
+        let binding = if segments.len() > 1 {
+            segments[0].as_str()
+        } else {
+            simple
+        };
         let mut matching_explicit_import = false;
         let mut explicit_candidates = Vec::new();
         for import in &self.imports {
@@ -91,10 +116,15 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     .identifier
                     .as_deref()
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path))
-                    == simple
+                    == binding
             {
                 matching_explicit_import = true;
-                explicit_candidates.extend(import_candidate_fq_names(&path, &self.package));
+                let tail = &segments[1..];
+                explicit_candidates.extend(
+                    import_candidate_fq_names(&path, &self.package)
+                        .into_iter()
+                        .flat_map(|candidate| scala_nested_type_candidates(candidate, tail, true)),
+                );
             }
         }
         match self.resolve_candidate_tier(explicit_candidates, kind) {
@@ -114,7 +144,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 wildcard_candidates.extend(
                     import_candidate_fq_names(&path, &self.package)
                         .into_iter()
-                        .map(|package| format!("{package}.{simple}")),
+                        .flat_map(|package| scala_nested_type_candidates(package, segments, false)),
                 );
             }
         }
@@ -124,11 +154,15 @@ impl<'a> ForwardScalaNameResolver<'a> {
         }
 
         let mut local_candidates = Vec::new();
-        if raw.trim().contains('.') || self.package.is_empty() {
-            local_candidates.push(raw.trim().to_string());
+        if segments.len() > 1 || self.package.is_empty() {
+            local_candidates.extend(scala_nested_type_candidates(String::new(), segments, false));
         }
         if !self.package.is_empty() {
-            local_candidates.push(format!("{}.{}", self.package, simple));
+            local_candidates.extend(scala_nested_type_candidates(
+                self.package.clone(),
+                segments,
+                false,
+            ));
         }
         self.resolve_candidate_tier(local_candidates, kind)
     }
@@ -249,6 +283,42 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     })
             })
             .collect()
+    }
+}
+
+fn scala_nested_type_candidates(
+    prefix: String,
+    segments: &[String],
+    prefix_is_owner: bool,
+) -> Vec<String> {
+    let mut direct = prefix.clone();
+    for segment in segments {
+        if !direct.is_empty() {
+            direct.push('.');
+        }
+        direct.push_str(segment);
+    }
+    if segments.is_empty() {
+        return vec![direct];
+    }
+
+    let mut singleton_qualified = prefix;
+    if prefix_is_owner {
+        singleton_qualified.push('$');
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        if !singleton_qualified.is_empty() {
+            singleton_qualified.push('.');
+        }
+        singleton_qualified.push_str(segment);
+        if index + 1 < segments.len() {
+            singleton_qualified.push('$');
+        }
+    }
+    if singleton_qualified == direct {
+        vec![direct]
+    } else {
+        vec![direct, singleton_qualified]
     }
 }
 
@@ -1345,56 +1415,64 @@ fn scala_ancestor_member_candidate_units(
     owner_fqn: &str,
     member: &str,
 ) -> Vec<CodeUnit> {
-    let mut queue = VecDeque::new();
-    queue.extend(
-        ctx.support
-            .fqn(owner_fqn)
-            .into_iter()
-            .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
-            .map(|unit| (unit, 0_usize)),
-    );
-    let mut seen = HashSet::default();
+    let owners = ctx
+        .support
+        .fqn(owner_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn);
     let mut matching_depth = None;
     let mut matches = Vec::new();
-
-    while let Some((owner, depth)) = queue.pop_front() {
-        if matching_depth.is_some_and(|found| depth >= found) {
-            continue;
-        }
-        if !seen.insert(owner.fq_name()) {
-            continue;
-        }
-        let Some(facts) = ctx.scala.forward_owner_facts(&owner) else {
-            continue;
-        };
-        let owner_resolver = ScalaNameResolver::for_file(ctx.scala, ctx.support, owner.source());
-        for (_raw, lookup_path) in facts
-            .raw_supertypes
-            .into_iter()
-            .zip(facts.supertype_lookup_paths)
-        {
-            let Some(ancestor_fqn) = owner_resolver.resolve(&lookup_path) else {
-                continue;
-            };
-            let candidate_depth = depth + 1;
-            let direct = scala_direct_member_candidate_units(ctx.support, &ancestor_fqn, member);
-            if !direct.is_empty() {
-                matching_depth = Some(candidate_depth);
-                matches.extend(direct);
-                continue;
+    for owner in owners {
+        for (ancestor, depth) in scala_ancestor_owners(ctx.scala, ctx.support, owner) {
+            if matching_depth.is_some_and(|found| depth > found) {
+                break;
             }
-            queue.extend(
-                ctx.support
-                    .fqn(&ancestor_fqn)
-                    .into_iter()
-                    .filter(|unit| unit.is_class() && unit.fq_name() == ancestor_fqn)
-                    .map(|unit| (unit, candidate_depth)),
-            );
+            let direct =
+                scala_direct_member_candidate_units(ctx.support, &ancestor.fq_name(), member);
+            if !direct.is_empty() {
+                matching_depth = Some(depth);
+                matches.extend(direct);
+            }
         }
     }
     sort_units(&mut matches);
     matches.dedup();
     matches
+}
+
+fn scala_ancestor_owners(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: CodeUnit,
+) -> Vec<(CodeUnit, usize)> {
+    let mut queue = VecDeque::from([(owner.clone(), 0_usize)]);
+    let mut discovered = HashSet::from_iter([owner.fq_name()]);
+    let mut ancestors = Vec::new();
+    while let Some((current, depth)) = queue.pop_front() {
+        let Some(facts) = scala.forward_owner_facts(&current) else {
+            continue;
+        };
+        let resolver = ScalaNameResolver::for_file(scala, support, current.source());
+        for lookup_path in facts.supertype_lookup_paths {
+            let ScalaNameResolution::Resolved(identity) =
+                resolver.resolve_lookup_path(&lookup_path, ScalaOwnerKind::Class)
+            else {
+                continue;
+            };
+            for ancestor in support
+                .fqn(&identity.fqn)
+                .into_iter()
+                .filter(|unit| unit.is_class() && unit.fq_name() == identity.fqn)
+            {
+                if discovered.insert(ancestor.fq_name()) {
+                    let ancestor_depth = depth + 1;
+                    ancestors.push((ancestor.clone(), ancestor_depth));
+                    queue.push_back((ancestor, ancestor_depth));
+                }
+            }
+        }
+    }
+    ancestors
 }
 
 fn scala_direct_member_candidate_units(
@@ -1834,10 +1912,18 @@ fn scala_resolve_visible_type_annotation(
     reference_byte: usize,
 ) -> Option<String> {
     if let Some(base) = type_text.trim().strip_suffix(".type") {
-        return resolver.resolve_singleton(base);
+        return match resolver.resolve_owner(base, ScalaOwnerKind::SingletonObject) {
+            ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
+            ScalaNameResolution::MissingExplicitImport
+            | ScalaNameResolution::Ambiguous
+            | ScalaNameResolution::Unresolved => None,
+        };
     }
-    if let Some(resolved) = scala_resolve_type_annotation(resolver, type_text) {
-        return Some(resolved);
+    let base = scala_type_base_text(type_text.trim()).unwrap_or(type_text);
+    match resolver.resolve_owner(base, ScalaOwnerKind::Class) {
+        ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => return None,
+        ScalaNameResolution::Unresolved => {}
     }
     if scala_type_annotation_has_explicit_import(ctx, type_text) {
         return None;
@@ -1985,37 +2071,9 @@ fn scala_enclosing_member_shadows_bare_call(
     if scala_owner_declares_member(support, &owner, name) {
         return true;
     }
-    let mut seen = HashSet::default();
-    let mut queue = VecDeque::from([owner]);
-    while let Some(current) = queue.pop_front() {
-        if !seen.insert(current.fq_name()) {
-            continue;
-        }
-        let Some(facts) = scala.forward_owner_facts(&current) else {
-            continue;
-        };
-        let resolver = ScalaNameResolver::for_file(scala, support, current.source());
-        for (_raw, lookup_path) in facts
-            .raw_supertypes
-            .into_iter()
-            .zip(facts.supertype_lookup_paths)
-        {
-            let Some(ancestor_fqn) = resolver.resolve(&lookup_path) else {
-                continue;
-            };
-            for ancestor in support
-                .fqn(&ancestor_fqn)
-                .into_iter()
-                .filter(|unit| unit.is_class() && unit.fq_name() == ancestor_fqn)
-            {
-                if scala_owner_declares_member(support, &ancestor, name) {
-                    return true;
-                }
-                queue.push_back(ancestor);
-            }
-        }
-    }
-    false
+    scala_ancestor_owners(scala, support, owner)
+        .into_iter()
+        .any(|(ancestor, _)| scala_owner_declares_member(support, &ancestor, name))
 }
 
 fn scala_owner_declares_member(

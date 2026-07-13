@@ -366,6 +366,7 @@ struct DirtyFileState {
 struct AnalyzerRuntimeState {
     fresh_parse_errors: HashMap<ProjectFile, Vec<crate::analyzer::ParseError>>,
     dirty_file_states: Mutex<HashMap<FileStateCacheKey, DirtyFileState>>,
+    dirty_path_symbol_rows: Mutex<HashMap<ProjectFile, (String, PathSymbolRow)>>,
     seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
 }
 
@@ -373,11 +374,13 @@ impl AnalyzerRuntimeState {
     fn new(
         fresh_parse_errors: HashMap<ProjectFile, Vec<crate::analyzer::ParseError>>,
         dirty_file_states: HashMap<FileStateCacheKey, DirtyFileState>,
+        dirty_path_symbol_rows: HashMap<ProjectFile, (String, PathSymbolRow)>,
         seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
     ) -> Self {
         Self {
             fresh_parse_errors,
             dirty_file_states: Mutex::new(dirty_file_states),
+            dirty_path_symbol_rows: Mutex::new(dirty_path_symbol_rows),
             seeded_file_states,
         }
     }
@@ -392,6 +395,13 @@ impl AnalyzerRuntimeState {
         self.dirty_file_states
             .lock()
             .expect("dirty file-state mutex poisoned")
+            .clone()
+    }
+
+    fn dirty_path_symbol_snapshot(&self) -> HashMap<ProjectFile, (String, PathSymbolRow)> {
+        self.dirty_path_symbol_rows
+            .lock()
+            .expect("dirty path-symbol mutex poisoned")
             .clone()
     }
 
@@ -417,6 +427,7 @@ struct ReconcileFileStates {
     replace_live_paths: bool,
     progress: Option<BuildProgress>,
     dirty_file_states: HashMap<FileStateCacheKey, DirtyFileState>,
+    dirty_path_symbol_rows: HashMap<ProjectFile, (String, PathSymbolRow)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1251,9 +1262,18 @@ where
                 replace_live_paths: true,
                 progress: progress.clone(),
                 dirty_file_states: HashMap::default(),
+                dirty_path_symbol_rows: HashMap::default(),
             },
         );
-        Self::sync_path_symbol_units(adapter, &analyzable_files, store_context);
+        state
+            .dirty_path_symbol_rows
+            .lock()
+            .expect("dirty path-symbol mutex poisoned")
+            .extend(Self::sync_path_symbol_units(
+                adapter,
+                &analyzable_files,
+                store_context,
+            ));
 
         if let Some(progress) = progress.as_ref() {
             let total = analyzable_files.len();
@@ -1288,13 +1308,13 @@ where
         adapter: &A,
         files: &[ProjectFile],
         store_context: &AnalyzerStoreContext,
-    ) {
+    ) -> HashMap<ProjectFile, (String, PathSymbolRow)> {
         if !adapter.has_path_synthetic_module_units() {
-            return;
+            return HashMap::default();
         }
 
         let snapshot = store_context.live_paths.snapshot();
-        let mut rows_by_language: HashMap<String, Vec<PathSymbolRow>> = adapter
+        let mut rows_by_language: HashMap<String, Vec<(ProjectFile, PathSymbolRow)>> = adapter
             .storage_language_keys()
             .into_iter()
             .map(|(lang, _)| (lang, Vec::new()))
@@ -1309,17 +1329,44 @@ where
             rows_by_language
                 .entry(adapter.storage_language_key_for_file(file))
                 .or_default()
-                .push(row);
+                .push((file.clone(), row));
         }
-        for (lang, rows) in rows_by_language {
-            let _ = store_context.store.sync_path_symbol_units(&lang, &rows);
+        let mut dirty = HashMap::default();
+        for (lang, entries) in rows_by_language {
+            let rows = entries
+                .iter()
+                .map(|(_, row)| row.clone())
+                .collect::<Vec<_>>();
+            let mut persisted = false;
+            for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
+                if store_context
+                    .store
+                    .sync_path_symbol_units(&lang, &rows)
+                    .is_ok()
+                {
+                    persisted = true;
+                    break;
+                }
+                if attempt < STORE_WRITE_IMMEDIATE_RETRIES {
+                    std::thread::sleep(Duration::from_millis(10 * (attempt + 1) as u64));
+                }
+            }
+            if !persisted {
+                dirty.extend(
+                    entries
+                        .into_iter()
+                        .map(|(file, row)| (file, (lang.clone(), row))),
+                );
+            }
         }
+        dirty
     }
 
     fn refresh_path_symbol_units(
         adapter: &A,
         files: &BTreeSet<ProjectFile>,
         store_context: &AnalyzerStoreContext,
+        dirty: &mut HashMap<ProjectFile, (String, PathSymbolRow)>,
     ) {
         if !adapter.has_path_synthetic_module_units() {
             return;
@@ -1332,17 +1379,30 @@ where
             .collect::<Vec<_>>();
         let snapshot = store_context.live_paths.snapshot();
         for file in files {
+            dirty.remove(file);
             let rel_path = crate::path_utils::rel_path_string(file);
             let replacement = snapshot
                 .validated_oid_for_path(file)
                 .and_then(|blob_oid| Self::path_symbol_row(adapter, file, blob_oid))
                 .map(|row| (adapter.storage_language_key_for_file(file), row));
             let replacement_ref = replacement.as_ref().map(|(lang, row)| (lang.as_str(), row));
-            let _ = store_context.store.replace_path_symbol_unit(
-                &storage_languages,
-                &rel_path,
-                replacement_ref,
-            );
+            let mut persisted = false;
+            for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
+                if store_context
+                    .store
+                    .replace_path_symbol_unit(&storage_languages, &rel_path, replacement_ref)
+                    .is_ok()
+                {
+                    persisted = true;
+                    break;
+                }
+                if attempt < STORE_WRITE_IMMEDIATE_RETRIES {
+                    std::thread::sleep(Duration::from_millis(10 * (attempt + 1) as u64));
+                }
+            }
+            if !persisted && let Some((lang, row)) = replacement {
+                dirty.insert(file.clone(), (lang, row));
+            }
         }
     }
 
@@ -1358,6 +1418,7 @@ where
             replace_live_paths,
             progress,
             mut dirty_file_states,
+            dirty_path_symbol_rows,
         } = input;
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
@@ -1518,7 +1579,12 @@ where
             }
         }
 
-        AnalyzerRuntimeState::new(fresh_parse_errors, dirty_file_states, seeded_file_states)
+        AnalyzerRuntimeState::new(
+            fresh_parse_errors,
+            dirty_file_states,
+            dirty_path_symbol_rows,
+            seeded_file_states,
+        )
     }
 
     fn source_snapshot_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
@@ -2092,30 +2158,51 @@ where
         let snapshot = self.live_snapshot();
         let mut units = Vec::with_capacity(rows.len());
         for (lang, row) in rows {
-            let file = ProjectFile::new(self.project.root().to_path_buf(), &row.rel_path);
-            if self.adapter.storage_language_key_for_file(&file) != lang
-                || snapshot.validated_oid_for_path(&file) != Some(row.blob_oid)
-            {
-                continue;
-            }
-            let Some(unit) = self.adapter.path_synthetic_module_unit(&file) else {
-                continue;
-            };
-            if unit.kind() != row.kind
-                || unit.package_name() != row.package_name
-                || unit.short_name() != row.short_name
-                || unit.fq_name() != row.exact_fqn
-                || self.adapter.normalize_full_name(&unit.fq_name()) != row.normalized_fqn
-            {
-                continue;
-            }
-            if unit.fq_name() == fq_name
-                || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+            if let Some(unit) = self.live_path_symbol_unit(&lang, &row, &snapshot)
+                && (unit.fq_name() == fq_name
+                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized)
             {
                 units.push(unit);
             }
         }
+        for (lang, row) in self
+            .state
+            .dirty_path_symbol_rows
+            .lock()
+            .expect("dirty path-symbol mutex poisoned")
+            .values()
+        {
+            if let Some(unit) = self.live_path_symbol_unit(lang, row, &snapshot)
+                && (unit.fq_name() == fq_name
+                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized)
+            {
+                units.push(unit);
+            }
+        }
+        units.sort_by_cached_key(|unit| self.definition_sort_key_for_unit(unit));
+        units.dedup();
         Some(units)
+    }
+
+    fn live_path_symbol_unit(
+        &self,
+        lang: &str,
+        row: &PathSymbolRow,
+        snapshot: &LiveSnapshot,
+    ) -> Option<CodeUnit> {
+        let file = ProjectFile::new(self.project.root().to_path_buf(), &row.rel_path);
+        if self.adapter.storage_language_key_for_file(&file) != lang
+            || snapshot.validated_oid_for_path(&file) != Some(row.blob_oid)
+        {
+            return None;
+        }
+        let unit = self.adapter.path_synthetic_module_unit(&file)?;
+        (unit.kind() == row.kind
+            && unit.package_name() == row.package_name
+            && unit.short_name() == row.short_name
+            && unit.fq_name() == row.exact_fqn
+            && self.adapter.normalize_full_name(&unit.fq_name()) == row.normalized_fqn)
+            .then_some(unit)
     }
 
     fn rebase_live_file_to_project_root(&self, file: &ProjectFile) -> Option<ProjectFile> {
@@ -2409,19 +2496,50 @@ where
 
     pub(crate) fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool {
         let nested = format!("{prefix}.");
-        let rows = self
-            .store_context
-            .store
-            .declaration_rows_by_package_prefix_for_langs(
-                &self.storage_language_keys_for_queries(),
-                prefix,
-            )
-            .unwrap_or_default();
-        self.resolve_candidate_rows(rows).into_iter().any(|unit| {
+        let matches = |unit: &CodeUnit| {
             unit.package_name() == prefix
                 || unit.package_name().starts_with(&nested)
                 || unit.fq_name().starts_with(&nested)
-        })
+        };
+        if self
+            .dirty_units_matching(false, matches)
+            .into_iter()
+            .any(|_| true)
+        {
+            return true;
+        }
+
+        const PAGE_SIZE: usize = 64;
+        for lang in self.storage_language_keys_for_queries() {
+            let mut after: Option<(String, Oid, i64)> = None;
+            loop {
+                let rows = self
+                    .store_context
+                    .store
+                    .declaration_rows_by_package_prefix_page(
+                        &lang,
+                        prefix,
+                        after.as_ref().map(|(qualifier, oid, unit_key)| {
+                            (qualifier.as_str(), *oid, *unit_key)
+                        }),
+                        PAGE_SIZE,
+                    )
+                    .unwrap_or_default();
+                let Some(last) = rows.last() else {
+                    break;
+                };
+                let next = (last.content_qualifier.clone(), last.blob_oid, last.unit_key);
+                let complete = rows.len() < PAGE_SIZE;
+                if self.resolve_candidate_rows(rows).iter().any(matches) {
+                    return true;
+                }
+                if complete {
+                    break;
+                }
+                after = Some(next);
+            }
+        }
+        false
     }
 
     #[doc(hidden)]
@@ -3394,6 +3512,7 @@ where
         store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
         let mut to_update = Vec::new();
         let mut dirty_file_states = self.state.dirty_snapshot();
+        let mut dirty_path_symbol_rows = self.state.dirty_path_symbol_snapshot();
 
         for file in changed_files {
             Self::remove_dirty_for_file(&mut dirty_file_states, file);
@@ -3419,9 +3538,20 @@ where
                 replace_live_paths: false,
                 progress: None,
                 dirty_file_states,
+                dirty_path_symbol_rows,
             },
         );
-        Self::refresh_path_symbol_units(self.adapter.as_ref(), changed_files, &store_context);
+        dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
+        Self::refresh_path_symbol_units(
+            self.adapter.as_ref(),
+            changed_files,
+            &store_context,
+            &mut dirty_path_symbol_rows,
+        );
+        *state
+            .dirty_path_symbol_rows
+            .lock()
+            .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows;
         store_context
             .gc
             .schedule(self.project.root(), Arc::clone(&store_context.store));
@@ -4071,7 +4201,7 @@ mod tests {
             project,
             adapter,
             config.clone(),
-            AnalyzerRuntimeState::new(HashMap::default(), dirty, Vec::new()),
+            AnalyzerRuntimeState::new(HashMap::default(), dirty, HashMap::default(), Vec::new()),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
             )),
@@ -4099,6 +4229,57 @@ mod tests {
                 .iter()
                 .any(|unit| unit.is_module() && unit.fq_name() == "pkg.dirty"),
             "exact identifier candidates must retain non-persisted path modules"
+        );
+    }
+
+    #[test]
+    fn dirty_path_projection_is_authoritative_for_exact_module_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        let source = "def helper():\n    pass\n";
+        std::fs::write(root.join("pkg/util.py"), source).unwrap();
+        let file = ProjectFile::new(root.clone(), "pkg/util.py");
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+        let adapter = Arc::new(PythonAdapter);
+        let row = TreeSitterAnalyzer::<PythonAdapter>::path_symbol_row(&*adapter, &file, oid)
+            .expect("python path projection");
+        let mut dirty_path_symbol_rows = HashMap::default();
+        dirty_path_symbol_rows.insert(file.clone(), ("python".to_string(), row));
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let live_paths = Arc::new(LivePathMap::default());
+        live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
+        let store_context = AnalyzerStoreContext {
+            store: Arc::new(AnalyzerStore::open_in_memory().unwrap()),
+            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
+            liveness: None,
+            live_paths,
+        };
+        let config = AnalyzerConfig::default();
+        let analyzer = TreeSitterAnalyzer::from_state(
+            project,
+            adapter,
+            config.clone(),
+            AnalyzerRuntimeState::new(
+                HashMap::default(),
+                HashMap::default(),
+                dirty_path_symbol_rows,
+                Vec::new(),
+            ),
+            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
+                &config,
+            )),
+            store_context,
+        );
+
+        assert_eq!(
+            analyzer
+                .get_definitions("pkg.util")
+                .into_iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<_>>(),
+            vec!["pkg.util".to_string()]
         );
     }
 
@@ -4149,7 +4330,7 @@ mod tests {
             project,
             adapter,
             config.clone(),
-            AnalyzerRuntimeState::new(HashMap::default(), dirty, Vec::new()),
+            AnalyzerRuntimeState::new(HashMap::default(), dirty, HashMap::default(), Vec::new()),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
             )),

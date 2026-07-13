@@ -12,14 +12,14 @@ pub(super) fn resolve_module_package_for_file(
     let (route_root, nested) = rust_external_module_route(module_specifier)?;
     let manifest_directory = nearest_manifest_directory(importing_file)?;
     let project_root = importing_file.root();
-    let manifest = read_manifest(project_root, &manifest_directory)?;
-    let current = cargo_crate(project_root, manifest_directory.clone(), manifest.clone())?;
+    let current = load_cargo_crate(project_root, manifest_directory.clone())?;
+    let manifest = &current.manifest;
     let normalized_route = normalize_crate_name(route_root);
 
     let mut resolved =
         (current.library_name == normalized_route).then(|| current.root_package.clone());
     if resolved.is_none() {
-        'dependencies: for dependencies in cargo_dependency_tables(&manifest) {
+        'dependencies: for dependencies in cargo_dependency_tables(manifest) {
             for (exposed_name, dependency) in dependencies {
                 let Some(path) = dependency
                     .as_table()
@@ -28,11 +28,12 @@ pub(super) fn resolve_module_package_for_file(
                 else {
                     continue;
                 };
-                let directory = normalize_relative_path(&manifest_directory.join(path));
-                let Some(target_manifest) = read_manifest(project_root, &directory) else {
+                let Some(directory) =
+                    workspace_relative_path(project_root, &manifest_directory, Path::new(path))
+                else {
                     continue;
                 };
-                let Some(target) = cargo_crate(project_root, directory, target_manifest) else {
+                let Some(target) = load_cargo_crate(project_root, directory) else {
                     continue;
                 };
                 let is_renamed = dependency
@@ -63,6 +64,11 @@ fn read_manifest(root: &Path, directory: &Path) -> Option<toml::Value> {
         .and_then(|source| toml::from_str(&source).ok())
 }
 
+fn load_cargo_crate(root: &Path, directory: PathBuf) -> Option<CargoCrate> {
+    let manifest = read_manifest(root, &directory)?;
+    cargo_crate(root, directory, manifest)
+}
+
 fn cargo_crate(root: &Path, directory: PathBuf, manifest: toml::Value) -> Option<CargoCrate> {
     let package_name = manifest
         .get("package")?
@@ -81,7 +87,8 @@ fn cargo_crate(root: &Path, directory: PathBuf, manifest: toml::Value) -> Option
         .and_then(toml::Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("src/lib.rs"));
-    let root_file = ProjectFile::new(root.to_path_buf(), directory.join(library_path));
+    let library_path = workspace_relative_path(root, &directory, &library_path)?;
+    let root_file = ProjectFile::new(root.to_path_buf(), library_path);
     Some(CargoCrate {
         directory,
         library_name,
@@ -109,48 +116,18 @@ impl RustCargoRouteIndex {
             return Self::default();
         };
         let mut manifest_by_file = HashMap::default();
-        let mut manifests: HashMap<PathBuf, Option<toml::Value>> = HashMap::default();
+        let mut manifest_directories = crate::hash::HashSet::default();
         for file in files {
             let Some(directory) = nearest_manifest_directory(file) else {
                 continue;
             };
             manifest_by_file.insert(file.clone(), directory.clone());
-            manifests.entry(directory.clone()).or_insert_with(|| {
-                std::fs::read_to_string(root.join(&directory).join("Cargo.toml"))
-                    .ok()
-                    .and_then(|source| toml::from_str(&source).ok())
-            });
+            manifest_directories.insert(directory);
         }
 
-        let crates: Vec<_> = manifests
+        let crates: Vec<_> = manifest_directories
             .into_iter()
-            .filter_map(|(directory, manifest)| {
-                let manifest = manifest?;
-                let package_name = manifest
-                    .get("package")?
-                    .get("name")?
-                    .as_str()
-                    .map(normalize_crate_name)?;
-                let library_name = manifest
-                    .get("lib")
-                    .and_then(|lib| lib.get("name"))
-                    .and_then(toml::Value::as_str)
-                    .map(normalize_crate_name)
-                    .unwrap_or_else(|| package_name.clone());
-                let library_path = manifest
-                    .get("lib")
-                    .and_then(|lib| lib.get("path"))
-                    .and_then(toml::Value::as_str)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("src/lib.rs"));
-                let root_file = ProjectFile::new(root.to_path_buf(), directory.join(library_path));
-                Some(CargoCrate {
-                    directory,
-                    library_name,
-                    root_package: rust_package_name(&root_file),
-                    manifest,
-                })
-            })
+            .filter_map(|directory| load_cargo_crate(root, directory))
             .collect();
 
         let mut crate_by_directory = HashMap::default();
@@ -172,7 +149,9 @@ impl RustCargoRouteIndex {
                         .as_table()
                         .and_then(|dependency| dependency.get("path"))
                         .and_then(toml::Value::as_str)
-                        .map(|path| normalize_relative_path(&cargo_crate.directory.join(path)))
+                        .and_then(|path| {
+                            workspace_relative_path(root, &cargo_crate.directory, Path::new(path))
+                        })
                         .and_then(|directory| crate_by_directory.get(&directory).copied());
                     if let Some(target) = target {
                         let is_renamed = dependency
@@ -245,19 +224,26 @@ fn nearest_manifest_directory(file: &ProjectFile) -> Option<PathBuf> {
     }
 }
 
-fn normalize_relative_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
+fn workspace_relative_path(root: &Path, base: &Path, path: &Path) -> Option<PathBuf> {
+    let mut normalized = base.to_path_buf();
     for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                if !normalized.pop() {
+                    return None;
+                }
             }
             Component::Normal(component) => normalized.push(component),
-            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+            Component::RootDir | Component::Prefix(_) => return None,
         }
     }
-    normalized
+    let canonical_root = root.canonicalize().ok()?;
+    let canonical_target = root.join(&normalized).canonicalize().ok()?;
+    canonical_target
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 fn normalize_crate_name(name: &str) -> String {
@@ -316,6 +302,76 @@ mod tests {
             routes.resolve_module_package(&consumer, "matcher_package"),
             None
         );
+        assert_eq!(
+            resolve_module_package_for_file(&consumer, "matcher_lib"),
+            Some("matcher.src".to_string())
+        );
+    }
+
+    #[test]
+    fn cargo_routes_reject_paths_outside_the_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        let root = root.canonicalize().expect("canonical root");
+        let outside = temp.path().join("outside");
+        write(
+            temp.path(),
+            "outside/Cargo.toml",
+            "[package]\nname = \"outside\"\nversion = \"0.1.0\"\n",
+        );
+        write(temp.path(), "outside/src/lib.rs", "pub struct Escaped;\n");
+        write(
+            &root,
+            "consumer/Cargo.toml",
+            &format!(
+                "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[dependencies]\nparent_escape = {{ path = \"../../outside\" }}\nabsolute_escape = {{ path = {:?} }}\n",
+                outside.to_string_lossy()
+            ),
+        );
+        write(&root, "consumer/src/lib.rs", "pub fn run() {}\n");
+        let consumer = ProjectFile::new(root.clone(), "consumer/src/lib.rs");
+
+        let routes = RustCargoRouteIndex::build(std::slice::from_ref(&consumer));
+        for name in ["parent_escape", "absolute_escape"] {
+            assert_eq!(routes.resolve_module_package(&consumer, name), None);
+            assert_eq!(resolve_module_package_for_file(&consumer, name), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_routes_reject_symlinked_dependency_and_library_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        let root = root.canonicalize().expect("canonical root");
+        write(
+            temp.path(),
+            "outside/Cargo.toml",
+            "[package]\nname = \"outside\"\nversion = \"0.1.0\"\n",
+        );
+        write(temp.path(), "outside/src/lib.rs", "pub struct Escaped;\n");
+        symlink(temp.path().join("outside"), root.join("linked")).expect("dependency symlink");
+        write(
+            &root,
+            "consumer/Cargo.toml",
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[dependencies]\nlinked = { path = \"../linked\" }\n",
+        );
+        write(&root, "consumer/src/lib.rs", "pub fn run() {}\n");
+        let consumer = ProjectFile::new(root.clone(), "consumer/src/lib.rs");
+
+        assert_eq!(resolve_module_package_for_file(&consumer, "linked"), None);
+
+        write(
+            &root,
+            "bad_lib/Cargo.toml",
+            "[package]\nname = \"bad-lib\"\nversion = \"0.1.0\"\n[lib]\npath = \"../linked/src/lib.rs\"\n",
+        );
+        let manifest = read_manifest(&root, Path::new("bad_lib")).expect("manifest");
+        assert!(cargo_crate(&root, PathBuf::from("bad_lib"), manifest).is_none());
     }
 
     fn write(root: &Path, relative: &str, contents: &str) {

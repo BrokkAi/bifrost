@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use git2::Oid;
 use growable_bloom_filter::GrowableBloom;
 use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, params, params_from_iter};
+use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
@@ -158,6 +159,80 @@ pub(crate) struct PathSymbolRow {
     pub(crate) normalized_fqn: String,
 }
 
+fn decode_path_symbol_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<PathSymbolRow> {
+    let oid_text: String = row.get(offset + 1)?;
+    let blob_oid = Oid::from_str(&oid_text).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 1,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })?;
+    let kind_raw: i64 = row.get(offset + 2)?;
+    let kind = code_unit_kind_from_i64(kind_raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 2,
+            rusqlite::types::Type::Integer,
+            Box::new(err),
+        )
+    })?;
+    Ok(PathSymbolRow {
+        rel_path: row.get(offset)?,
+        blob_oid,
+        kind,
+        package_name: row.get(offset + 3)?,
+        short_name: row.get(offset + 4)?,
+        exact_fqn: row.get(offset + 5)?,
+        normalized_fqn: row.get(offset + 6)?,
+    })
+}
+
+fn path_symbol_fingerprint(rows: &[PathSymbolRow]) -> String {
+    let mut ordered = rows.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.rel_path
+            .cmp(&right.rel_path)
+            .then_with(|| left.exact_fqn.cmp(&right.exact_fqn))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    let mut digest = Sha256::new();
+    for row in ordered {
+        for value in [
+            row.rel_path.as_bytes(),
+            row.blob_oid.as_bytes(),
+            row.package_name.as_bytes(),
+            row.short_name.as_bytes(),
+            row.exact_fqn.as_bytes(),
+            row.normalized_fqn.as_bytes(),
+        ] {
+            digest.update(value.len().to_le_bytes());
+            digest.update(value);
+        }
+        digest.update([code_unit_kind_to_i64(row.kind) as u8]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn insert_path_symbol_row(
+    statement: &mut rusqlite::Statement<'_>,
+    lang: &str,
+    row: &PathSymbolRow,
+) -> rusqlite::Result<usize> {
+    statement.execute(params![
+        lang,
+        row.rel_path,
+        row.blob_oid.to_string(),
+        code_unit_kind_to_i64(row.kind),
+        row.package_name,
+        row.short_name,
+        row.exact_fqn,
+        row.normalized_fqn,
+    ])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchCandidateRow {
     pub candidate: CandidateRow,
@@ -176,41 +251,27 @@ pub struct UsageFactRow {
 
 impl AnalyzerStore {
     pub(crate) fn sync_path_symbol_units(&self, lang: &str, rows: &[PathSymbolRow]) -> Result<()> {
+        let fingerprint = path_symbol_fingerprint(rows);
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
+        let existing_fingerprint = tx
+            .query_row(
+                "SELECT fingerprint FROM path_symbol_snapshots WHERE lang = ?1",
+                params![lang],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            tx.commit()?;
+            return Ok(());
+        }
         let existing = {
             let mut stmt = tx.prepare(
                 "SELECT rel_path, blob_oid, kind, package_name, short_name,
                         exact_fqn, normalized_fqn
                  FROM path_symbol_units WHERE lang = ?1",
             )?;
-            let mapped = stmt.query_map(params![lang], |row| {
-                let oid_text: String = row.get(1)?;
-                let oid = Oid::from_str(&oid_text).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?;
-                let kind_raw: i64 = row.get(2)?;
-                let kind = code_unit_kind_from_i64(kind_raw).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Integer,
-                        Box::new(err),
-                    )
-                })?;
-                Ok(PathSymbolRow {
-                    rel_path: row.get(0)?,
-                    blob_oid: oid,
-                    kind,
-                    package_name: row.get(3)?,
-                    short_name: row.get(4)?,
-                    exact_fqn: row.get(5)?,
-                    normalized_fqn: row.get(6)?,
-                })
-            })?;
+            let mapped = stmt.query_map(params![lang], |row| decode_path_symbol_row(row, 0))?;
             mapped
                 .map(|row| row.map(|row| (row.rel_path.clone(), row)))
                 .collect::<std::result::Result<HashMap<_, _>, _>>()?
@@ -240,18 +301,14 @@ impl AnalyzerStore {
             if existing.get(rel_path) == Some(row) {
                 continue;
             }
-            insert.execute(params![
-                lang,
-                row.rel_path,
-                row.blob_oid.to_string(),
-                code_unit_kind_to_i64(row.kind),
-                row.package_name,
-                row.short_name,
-                row.exact_fqn,
-                row.normalized_fqn,
-            ])?;
+            insert_path_symbol_row(&mut insert, lang, row)?;
         }
         drop(insert);
+        tx.execute(
+            "INSERT INTO path_symbol_snapshots(lang, fingerprint) VALUES(?1, ?2)
+             ON CONFLICT(lang) DO UPDATE SET fingerprint = excluded.fingerprint",
+            params![lang, fingerprint],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -279,34 +336,7 @@ impl AnalyzerStore {
         for lang in langs {
             let mut stmt = conn.prepare(sql)?;
             let mapped = stmt.query_map(params![lang, exact_fqn, normalized_fqn], |row| {
-                let oid_text: String = row.get(2)?;
-                let oid = Oid::from_str(&oid_text).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?;
-                let kind_raw: i64 = row.get(3)?;
-                let kind = code_unit_kind_from_i64(kind_raw).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Integer,
-                        Box::new(err),
-                    )
-                })?;
-                Ok((
-                    row.get(0)?,
-                    PathSymbolRow {
-                        rel_path: row.get(1)?,
-                        blob_oid: oid,
-                        kind,
-                        package_name: row.get(4)?,
-                        short_name: row.get(5)?,
-                        exact_fqn: row.get(6)?,
-                        normalized_fqn: row.get(7)?,
-                    },
-                ))
+                Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
             })?;
             out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
         }
@@ -326,24 +356,19 @@ impl AnalyzerStore {
                 "DELETE FROM path_symbol_units WHERE lang = ?1 AND rel_path = ?2",
                 params![lang, rel_path],
             )?;
+            tx.execute(
+                "DELETE FROM path_symbol_snapshots WHERE lang = ?1",
+                params![lang],
+            )?;
         }
         if let Some((lang, row)) = replacement {
-            tx.execute(
+            let mut insert = tx.prepare(
                 "INSERT INTO path_symbol_units(
                    lang, rel_path, blob_oid, kind, package_name, short_name,
                    exact_fqn, normalized_fqn
                  ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    lang,
-                    row.rel_path,
-                    row.blob_oid.to_string(),
-                    code_unit_kind_to_i64(row.kind),
-                    row.package_name,
-                    row.short_name,
-                    row.exact_fqn,
-                    row.normalized_fqn,
-                ],
             )?;
+            insert_path_symbol_row(&mut insert, lang, row)?;
         }
         tx.commit()?;
         Ok(())
@@ -838,26 +863,63 @@ impl AnalyzerStore {
         candidate_rows_for_languages(&conn, langs.iter().map(String::as_str), &sql, &[&package])
     }
 
-    /// Candidate rows whose persisted content qualifier is a package/module
-    /// prefix. Callers must still resolve rows against the live snapshot and
-    /// verify the hydrated package identity, because some adapters derive that
-    /// identity from the live path.
-    pub(crate) fn declaration_rows_by_package_prefix_for_langs(
+    /// One literal, index-ordered page of candidate rows whose persisted
+    /// content qualifier is exactly `package` or is nested beneath it.
+    ///
+    /// The caller must still resolve rows against the live snapshot because
+    /// some adapters derive the hydrated package identity from the live path.
+    /// Paging lets that validation stop at the first live match without
+    /// materializing the complete package subtree.
+    pub(crate) fn declaration_rows_by_package_prefix_page(
         &self,
-        langs: &[String],
+        lang: &str,
         package: &str,
+        after: Option<(&str, Oid, i64)>,
+        limit: usize,
     ) -> Result<Vec<CandidateRow>> {
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let nested = format!("{package}.");
-        let sql = declaration_candidate_sql(
-            "units.lang = ?1 AND (units.content_qualifier = ?2 OR units.content_qualifier LIKE ?3 || '%')",
+        // '/' is the immediate ASCII successor of '.', so the half-open range
+        // ["pkg.", "pkg/") contains exactly strings with the literal "pkg."
+        // prefix. Unlike LIKE, '%' and '_' in a legal package name remain data.
+        let upper = format!("{package}/");
+        let cursor_predicate = if after.is_some() {
+            "AND (units.content_qualifier, units.blob_oid, units.unit_key) > (?5, ?6, ?7)"
+        } else {
+            ""
+        };
+        let predicate = format!(
+            "units.lang = ?1
+             AND (units.content_qualifier = ?2
+                  OR (units.content_qualifier >= ?3 AND units.content_qualifier < ?4))
+             {cursor_predicate}"
         );
-        candidate_rows_for_languages(
-            &conn,
-            langs.iter().map(String::as_str),
-            &sql,
-            &[&package, &nested],
-        )
+        let sql = declaration_candidate_sql_with_order(
+            &predicate,
+            "units.content_qualifier, units.blob_oid, units.unit_key",
+        );
+        let sql = format!("{sql} LIMIT ?{}", if after.is_some() { 8 } else { 5 });
+        let mut statement = conn.prepare(&sql)?;
+        let mapped = match after {
+            Some((after_qualifier, after_oid, after_unit_key)) => statement.query_map(
+                params![
+                    lang,
+                    package,
+                    nested,
+                    upper,
+                    after_qualifier,
+                    after_oid.to_string(),
+                    after_unit_key,
+                    limit as i64,
+                ],
+                candidate_row_from_row,
+            )?,
+            None => statement.query_map(
+                params![lang, package, nested, upper, limit as i64],
+                candidate_row_from_row,
+            )?,
+        };
+        collect_candidate_rows(mapped)
     }
 
     pub fn declaration_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<CandidateRow>> {
@@ -1284,12 +1346,18 @@ impl AnalyzerStore {
 }
 
 fn declaration_candidate_sql(predicate: &str) -> String {
-    candidate_rows_sql(
+    declaration_candidate_sql_with_order(predicate, "units.blob_oid, units.unit_key")
+}
+
+fn declaration_candidate_sql_with_order(predicate: &str, order_by: &str) -> String {
+    candidate_rows_sql_with_membership(
         "units",
         "FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
         predicate,
+        "units.in_declarations = 1",
+        order_by,
     )
 }
 
@@ -1301,6 +1369,7 @@ fn definition_lookup_candidate_sql(predicate: &str) -> String {
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
         predicate,
         "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+        "units.blob_oid, units.unit_key",
     )
 }
 
@@ -1310,6 +1379,7 @@ fn candidate_rows_sql(candidate_alias: &str, from_clause: &str, predicate: &str)
         from_clause,
         predicate,
         &format!("{candidate_alias}.in_declarations = 1"),
+        &format!("{candidate_alias}.blob_oid, {candidate_alias}.unit_key"),
     )
 }
 
@@ -1318,6 +1388,7 @@ fn candidate_rows_sql_with_membership(
     from_clause: &str,
     predicate: &str,
     membership: &str,
+    order_by: &str,
 ) -> String {
     format!(
         "SELECT {candidate_alias}.blob_oid, {candidate_alias}.lang, {candidate_alias}.unit_key,
@@ -1329,7 +1400,7 @@ fn candidate_rows_sql_with_membership(
          {from_clause}
          WHERE {predicate} AND {membership}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY {candidate_alias}.blob_oid, {candidate_alias}.unit_key"
+         ORDER BY {order_by}"
     )
 }
 
@@ -3487,6 +3558,80 @@ mod tests {
                 .iter()
                 .all(|oid| missing.contains(&(*oid, "python".to_string())))
         );
+    }
+
+    #[test]
+    fn package_prefix_pages_are_literal_and_cursor_bounded() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let adapter = JavaAdapter;
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        for (path, source) in [
+            ("src/a_b/One.java", "package a_b; class One {}\n"),
+            (
+                "src/a_b/child/Two.java",
+                "package a_b.child; class Two {}\n",
+            ),
+            ("src/aXb/Other.java", "package aXb; class Other {}\n"),
+        ] {
+            let file = write_file(root, path, source);
+            let oid = oid_for(source.as_bytes());
+            store
+                .write_parsed_blob(oid, "java", &adapter, &parse_state(&adapter, &file))
+                .unwrap();
+        }
+
+        let first = store
+            .declaration_rows_by_package_prefix_page("java", "a_b", None, 1)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            first[0].content_qualifier.as_str(),
+            "a_b" | "a_b.child"
+        ));
+        let cursor = (
+            first[0].content_qualifier.as_str(),
+            first[0].blob_oid,
+            first[0].unit_key,
+        );
+        let second = store
+            .declaration_rows_by_package_prefix_page("java", "a_b", Some(cursor), 16)
+            .unwrap();
+        let qualifiers = first
+            .iter()
+            .chain(&second)
+            .map(|row| row.content_qualifier.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            qualifiers,
+            ["a_b", "a_b.child"].into_iter().collect::<HashSet<_>>()
+        );
+        assert!(!qualifiers.contains("aXb"));
+    }
+
+    #[test]
+    fn unchanged_path_symbol_snapshot_skips_table_reconciliation() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let row = PathSymbolRow {
+            rel_path: "pkg/model.py".to_string(),
+            blob_oid: oid_for(b"class Model:\n    pass\n"),
+            kind: CodeUnitType::Module,
+            package_name: "pkg".to_string(),
+            short_name: "model".to_string(),
+            exact_fqn: "pkg.model".to_string(),
+            normalized_fqn: "pkg.model".to_string(),
+        };
+
+        store
+            .sync_path_symbol_units("python", std::slice::from_ref(&row))
+            .unwrap();
+        let changes_after_cold_sync = store.conn.lock().expect("store mutex").total_changes();
+        store
+            .sync_path_symbol_units("python", std::slice::from_ref(&row))
+            .unwrap();
+        let changes_after_warm_sync = store.conn.lock().expect("store mutex").total_changes();
+
+        assert_eq!(changes_after_warm_sync, changes_after_cold_sync);
     }
 
     #[test]

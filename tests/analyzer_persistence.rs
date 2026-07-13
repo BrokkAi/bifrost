@@ -759,6 +759,28 @@ fn warm_ruby_inherited_receiver_query_uses_owner_scoped_facts() {
 }
 
 #[test]
+fn warm_ruby_mixin_receiver_query_uses_persisted_owner_facts() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let caller = "module Auditable\n  def audit\n  end\nend\n\nclass Admin\n  include Auditable\nend\n\nclass App\n  def run\n    Admin.new.audit\n  end\nend\n";
+    write_file(root, "app.rb", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    write_unrelated_generated_files(root, "rb", "module Unrelated\nend\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let line = caller.lines().nth(11).unwrap();
+    assert_warm_multilanguage_definition_query(
+        language_python_project(root, Language::Ruby),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "app.rb".to_string(),
+            line: Some(12),
+            column: Some(line.find("audit").unwrap() + 1),
+        },
+        "Auditable.audit",
+    );
+}
+
+#[test]
 fn warm_scala_inherited_member_query_is_candidate_bounded() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -818,6 +840,33 @@ fn warm_scala_wildcard_imported_supertype_is_candidate_bounded() {
             column: Some(line.find("value").unwrap() + 1),
         },
         "lib.Base.value",
+    );
+}
+
+#[test]
+fn warm_scala_nested_supertype_uses_structured_persisted_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "app/Model.scala",
+        "package app\nobject Outer { trait Base { def value: Int = 1 } }\nclass Child extends Outer.Base\n",
+    );
+    let caller = "package app\nclass Controller { def run(child: Child): Int = child.value }\n";
+    write_file(root, "app/Controller.scala", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    write_unrelated_generated_files(root, "scala", "package generated\nclass Unrelated\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let line = caller.lines().nth(1).unwrap();
+    assert_warm_multilanguage_definition_query(
+        language_python_project(root, Language::Scala),
+        brokk_bifrost::searchtools::DefinitionReferenceQuery {
+            path: "app/Controller.scala".to_string(),
+            line: Some(2),
+            column: Some(line.find("value").unwrap() + 1),
+        },
+        "app.Outer$.Base.value",
     );
 }
 

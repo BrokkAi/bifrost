@@ -30,6 +30,7 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
+pub(crate) use supertypes::ScalaSupertypeLookupPath;
 use tests::detect_scala_test_assertion_smells;
 
 pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {
@@ -47,8 +48,7 @@ pub(crate) fn scala_simple_type_name(unit: &CodeUnit) -> String {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScalaForwardOwnerFacts {
-    pub(crate) raw_supertypes: Vec<String>,
-    pub(crate) supertype_lookup_paths: Vec<String>,
+    pub(crate) supertype_lookup_paths: Vec<ScalaSupertypeLookupPath>,
     pub(crate) signatures: Vec<String>,
     pub(crate) is_trait: bool,
 }
@@ -161,13 +161,14 @@ impl ScalaAnalyzer {
         let supertype_lookup_paths = state
             .supertype_lookup_paths
             .get(code_unit)
-            .cloned()
-            .unwrap_or_default();
+            .into_iter()
+            .flatten()
+            .map(|path| ScalaSupertypeLookupPath::decode(path))
+            .collect::<Option<Vec<_>>>()?;
         if raw_supertypes.len() != supertype_lookup_paths.len() {
             return None;
         }
         Some(ScalaForwardOwnerFacts {
-            raw_supertypes,
             supertype_lookup_paths,
             signatures: state.signatures.get(code_unit).cloned().unwrap_or_default(),
             is_trait: state.scala_traits.contains(code_unit),

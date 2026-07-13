@@ -15,14 +15,16 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
 #[cfg(test)]
-const CURRENT_MIGRATION_VERSION: i64 = 2;
+const CURRENT_MIGRATION_VERSION: i64 = 3;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
+const FORWARD_FACTS_SQL: &str = include_str!("../migrations/cache/0003-forward-facts.sql");
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
     Migrations::new(vec![
         M::up(CURRENT_BASELINE_SQL),
         M::up(PATH_SYMBOL_UNITS_SQL),
+        M::up(FORWARD_FACTS_SQL),
     ])
 });
 static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
@@ -38,6 +40,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("create baseline schema");
     conn.execute_batch(PATH_SYMBOL_UNITS_SQL)
         .expect("apply path symbol migration");
+    conn.execute_batch(FORWARD_FACTS_SQL)
+        .expect("apply forward facts migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -421,6 +425,7 @@ mod tests {
         Migrations::new(vec![
             M::up(CURRENT_BASELINE_SQL),
             M::up(PATH_SYMBOL_UNITS_SQL),
+            M::up(FORWARD_FACTS_SQL),
             M::up(sql),
         ])
     }
@@ -603,7 +608,7 @@ mod tests {
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 3);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
         assert_eq!(analyzer_count, 1);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
@@ -652,7 +657,7 @@ mod tests {
         writer.rollback().unwrap();
         migrations.to_latest(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 3);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
 
@@ -664,7 +669,7 @@ mod tests {
             ["2222222222222222222222222222222222222222"],
         )
         .unwrap();
-        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
 
         let err = migrate(&mut conn).unwrap_err();
 
@@ -675,7 +680,7 @@ mod tests {
             err.contains("DatabaseTooFarAhead"),
             "unexpected error: {err}"
         );
-        assert_eq!(cache_migration_version(&conn).unwrap(), 3);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
         assert_eq!(analyzer_count, 1);
     }
 
