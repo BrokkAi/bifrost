@@ -45,7 +45,12 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-13 02:09Z) Independent fixtures and all 33 archived offsets confirmed one root across 16 `IAsyncCommandRuntimeExtensions`, 10 `EventData`, and seven `JsonArray` sites; partial targets, authoritative/default routing, and negative left/unrelated expressions pass.
 - [x] (2026-07-13 02:31Z) Changed exact Automanage bytes `27236..27266` from missing to consistent with a covering `27171..27266` inverse hit after rebuilding the C# epoch.
 - [x] (2026-07-13 02:34Z) Passed the complete `cargo test --features nlp,python` gate for #707; all 63 C# usage tests and affected all-feature clippy targets also pass.
-- [ ] Push and close #707, then rerun the full C# corpus and triage the expected 36-site residual.
+- [x] (2026-07-13 03:00Z) Pushed `062ae98e`, closed #707, and reran the full C# corpus. The valid record queried all 1,000 targets with zero scope-loss notes and reports 38 missing sites: 33 functions, three classes, and two fields.
+- [x] (2026-07-13 03:20Z) Delegated the full residual audit and independently reduced the dominant ten-site generic-constructor cluster. Same-file `RestException` and `RestException<T>` shared one class identity, so duplicate suppression discarded the generic body and forward lookup selected the nongeneric constructor.
+- [x] (2026-07-13 03:45Z) Implemented metadata-style arity identities, merged same-file partial declarations, structured exact generic-reference routing, exact-before-normalized selector lookup, source-facing C# display, and the required epoch bump. Same-arity generic/nongeneric forward and inverse regressions, partial-body coverage, metadata selectors, all focused C# tests, and affected all-feature clippy pass.
+- [x] (2026-07-13 04:35Z) Three delegated read-only audits drove fixes for receiver arity, grouped-overload order dependence, inverse routing in both arity directions, and normalized exact-miss false forwards. The authoritative consumer-only regression combines same-file generic/nongeneric owners, a second partial generic declaration, `ExplicitCandidateProvider`, fully qualified construction, and parameter, `var`, and explicit-local receiver seeding. The complete all-feature suite and every affected all-feature clippy target pass.
+- [x] (2026-07-13 11:35Z) Filed #726 and reran the exact CDN site outside the sandbox with the final release binary. `/tmp/csharp-exact-generic-constructor-final2.jsonl` completed in 341.0 seconds with the arity-bearing `RestException`1.RestException` target, signature `(System.Net.Http.HttpResponseMessage, T)`, and a proven inverse hit covering `36070..36192` around focus `36080..36085`.
+- [ ] Pass the final current-tree suite, commit and push #726, close it with evidence, then rerun the full C# corpus.
 
 ## Surprises & Discoveries
 
@@ -87,6 +92,10 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: The primary and delegated fixtures failed with empty authoritative hits and omitted default candidates on clean `v0.8.0`. A shared `as_expression`/`right` AST predicate made singular and partial target fixtures pass while unrelated same-terminal RHS types and same-named left expressions stayed negative. Source-offset auditing placed all 33 cast-family production sites inside the same field.
 - Observation: #707 survives a rebuilt persisted production index.
   Evidence: `/tmp/csharp-exact-as-type-707-fixed.jsonl` reports the Automanage `IAsyncCommandRuntimeExtensions` focus as consistent with a proven full qualified RHS hit after the required epoch rebuild. It audited one file/site and queried one target group in 1,299.5 seconds.
+- Observation: The complete post-#707 record is 38 sites, not the provisional 36.
+  Evidence: `/tmp/csharp-n1-707-fixed.jsonl` reports 1,899 consistent, 40 unproven, 38 missing, and 8,023 inconclusive sites in 1,265.0 seconds. The two added sites are StreamAnalytics and Support `[Parameter]` annotations that forward lookup incorrectly binds to internal non-attribute model classes; they share the already identified ContainerInstance attribute-context root.
+- Observation: Generic arity must be part of every declared type segment, not only a class signature discriminator.
+  Evidence: Child CodeUnits derive their owners from `parent.short_name()`. Encoding `Foo`, `Foo`1`, and nested `Outer`1$Inner`2` structurally prevents same-signature members from colliding, while the existing normalized FQN projection and a source-identifier helper retain C# source lookup and human display. Removing the duplicate early return lets identical same-file partial parts contribute every range, signature, supertype, and body.
 
 ## Decision Log
 
@@ -188,3 +197,7 @@ Revision note (2026-07-13): Recorded pushed/closed #706, its valid complete corp
 Revision note (2026-07-13): Marked the campaign intentionally paused after #706 for the `0.8.0` release, preserving the exact resumption boundary.
 
 Revision note (2026-07-13): Recorded post-release resumption, aggressively delegated #707 reduction, the shared inverse/persisted role fix, 33-site scope, and exact production proof.
+
+Revision note (2026-07-13): Recorded pushed/closed #707, the valid 38-site post-fix residual, and the locally validated generic-type identity correction pending issue creation and production proof.
+
+Revision note (2026-07-13): Recorded #726, three delegated audits, complete local validation, and exact persisted Azure proof for the generic/non-generic type identity correction.

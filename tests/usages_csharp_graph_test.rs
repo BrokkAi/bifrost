@@ -1179,6 +1179,292 @@ namespace App {
     assert_eq!(1, graph_hits(&analyzer, &create_one).len());
     assert_eq!(2, graph_hits(&analyzer, &run_zero).len());
     assert_eq!(1, graph_hits(&analyzer, &run_one).len());
+
+    for overloads in [
+        vec![run_zero.clone(), run_one.clone()],
+        vec![run_one, run_zero],
+    ] {
+        let hits = UsageFinder::new()
+            .find_usages_default(&analyzer, &overloads)
+            .into_either()
+            .expect("grouped overload query should resolve");
+        assert_eq!(
+            3,
+            hits.len(),
+            "grouped overload order changed hits: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn csharp_graph_authoritative_scope_keeps_generic_local_receiver_identity() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Types.cs",
+            r#"
+namespace Domain {
+    public class Box {
+        public void Read() {}
+    }
+
+    public partial class Box<T> {
+        public void Read() {}
+    }
+}
+"#,
+        ),
+        (
+            "Domain/GenericBox.Partial.cs",
+            r#"
+namespace Domain {
+    public partial class Box<T> {
+        public T Value { get; set; }
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+namespace App {
+    public class Consumer {
+        public void Execute(Domain.Box<string> parameter) {
+            parameter.Read();
+            var inferred = new global::Domain.Box<string>();
+            inferred.Read();
+            Domain.Box<string> box = new global::Domain.Box<string>();
+            box.Read();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let generic_read = member_function_with_arity(&analyzer, "Domain.Box`1", "Read", 0);
+    let ordinary_read = member_function_with_arity(&analyzer, "Domain.Box", "Read", 0);
+    let consumer = project.file("App/Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let generic_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &[generic_read], Some(&provider), 1, 1000);
+    assert_eq!(
+        generic_query.candidate_files,
+        std::iter::once(consumer.clone()).collect()
+    );
+    let generic_hits = generic_query
+        .result
+        .into_either()
+        .expect("generic local receiver query should resolve");
+    assert_eq!(3, generic_hits.len(), "{generic_hits:#?}");
+    assert!(
+        generic_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("box.Read()"))
+    );
+    assert!(
+        generic_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("parameter.Read()"))
+    );
+    assert!(
+        generic_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("inferred.Read()"))
+    );
+
+    let ordinary_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &[ordinary_read], Some(&provider), 1, 1000);
+    let ordinary_hits = ordinary_query
+        .result
+        .into_either()
+        .expect("ordinary local receiver query should resolve");
+    assert!(ordinary_hits.is_empty(), "{ordinary_hits:#?}");
+}
+
+#[test]
+fn csharp_default_candidates_keep_generic_reference_arity() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Legacy/Box.cs",
+            "namespace Domain { public class Box {} }\n",
+        ),
+        (
+            "Domain/GenericBox.cs",
+            "namespace Domain { public class Box<T> {} }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            "namespace App { public class Consumer { Domain.Box<string> value; } }\n",
+        ),
+        (
+            "App/LegacyConsumer.cs",
+            "namespace App { public class LegacyConsumer { Domain.Box value; } }\n",
+        ),
+    ]);
+    let generic = type_definition(&analyzer, "Domain.Box`1");
+    assert_eq!(generic.source(), &project.file("Domain/GenericBox.cs"));
+    let referencing = analyzer
+        .import_analysis_provider()
+        .expect("C# import analysis")
+        .referencing_files_of(generic.source());
+    assert!(
+        !referencing.contains(&project.file("Legacy/Box.cs")),
+        "generic reverse-reference index included nongeneric declaration: {referencing:#?}"
+    );
+    let query = UsageFinder::new().query(&analyzer, &[generic], 1000, 1000);
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("App/Consumer.cs")),
+        "{:#?}",
+        query.candidate_files
+    );
+    assert!(
+        !query
+            .candidate_files
+            .contains(&project.file("Legacy/Box.cs")),
+        "nongeneric declaration file was routed for a generic target: {:#?}",
+        query.candidate_files
+    );
+    assert!(
+        !query
+            .candidate_files
+            .contains(&project.file("App/LegacyConsumer.cs")),
+        "nongeneric reference was routed for a generic target: {:#?}",
+        query.candidate_files
+    );
+}
+
+#[test]
+fn csharp_graph_distinguishes_generic_and_nongeneric_constructor_owners() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Exceptions.cs",
+            r#"
+namespace Domain {
+    public class Response {}
+    public class Error {}
+    public class RestException {
+        public RestException(Response response, Error body) {}
+        public Error Body { get; set; }
+    }
+    public partial class RestException<T> {
+        public RestException(Response response, T body) {}
+        public T Body { get; set; }
+    }
+    public partial class RestException<T> {
+        public T Read() => Body;
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Execute(Response response, Error error) {
+            var ordinary = new RestException(response, error);
+            var generic = new RestException<Error>(response, error);
+            var initializedOrdinary = new RestException(response, error) { Body = error };
+            var initializedGeneric = new RestException<Error>(response, error) { Body = error };
+            var read = new RestException<Error>(response, error).Read();
+        }
+    }
+}
+"#,
+        ),
+        (
+            "App/FullyQualified.cs",
+            r#"
+namespace App {
+    public class FullyQualified {
+        public void Execute(Domain.Response response, Domain.Error error) {
+            var generic = new global::Domain.RestException<Domain.Error>(response, error);
+        }
+    }
+}
+"#,
+        ),
+        (
+            "App/Aliased.cs",
+            r#"
+using Failure = Domain.RestException<Domain.Error>;
+
+namespace App {
+    public class Aliased {
+        public void Execute(Domain.Response response, Domain.Error error) {
+            var generic = new Failure(response, error);
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let ordinary = member_function_with_signature(
+        &analyzer,
+        "Domain.RestException",
+        "RestException",
+        "(Response, Error)",
+    );
+    let generic = member_function_with_signature(
+        &analyzer,
+        "Domain.RestException`1",
+        "RestException",
+        "(Response, T)",
+    );
+    let ordinary_body = member_field(&analyzer, "Domain.RestException", "Body");
+    let generic_body = member_field(&analyzer, "Domain.RestException`1", "Body");
+
+    let ordinary_hits = graph_hits(&analyzer, &ordinary);
+    assert_eq!(2, ordinary_hits.len(), "{ordinary_hits:#?}");
+    assert!(
+        ordinary_hits
+            .iter()
+            .next()
+            .expect("ordinary constructor hit")
+            .snippet
+            .contains("new RestException(response, error)"),
+        "{ordinary_hits:#?}"
+    );
+    let generic_hits = graph_hits(&analyzer, &generic);
+    assert_eq!(5, generic_hits.len(), "{generic_hits:#?}");
+    assert!(
+        generic_hits.iter().any(|hit| hit
+            .snippet
+            .contains("new RestException<Error>(response, error)")),
+        "{generic_hits:#?}"
+    );
+    assert!(
+        generic_hits.iter().any(|hit| hit
+            .snippet
+            .contains("new global::Domain.RestException<Domain.Error>(response, error)")),
+        "{generic_hits:#?}"
+    );
+    assert!(
+        generic_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("new Failure(response, error)")),
+        "{generic_hits:#?}"
+    );
+
+    let routed = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&generic))
+        .into_either()
+        .expect("default generic constructor routing");
+    assert_eq!(5, routed.len(), "{routed:#?}");
+
+    let ordinary_body_hits = graph_hits(&analyzer, &ordinary_body);
+    assert_eq!(1, ordinary_body_hits.len(), "{ordinary_body_hits:#?}");
+    let generic_body_hits = graph_hits(&analyzer, &generic_body);
+    assert_eq!(1, generic_body_hits.len(), "{generic_body_hits:#?}");
 }
 
 #[test]

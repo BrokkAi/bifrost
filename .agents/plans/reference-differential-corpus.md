@@ -82,6 +82,11 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 02:09Z) Independently confirmed all 33 cast-family class misses share #707: 16 `IAsyncCommandRuntimeExtensions`, 10 `EventData`, and seven `JsonArray`.
 - [x] (2026-07-13 02:31Z) Exact Automanage production validation changed the former cast-type miss to consistent after the persisted C# rebuild.
 - [x] (2026-07-13 02:34Z) Passed the complete `cargo test --features nlp,python` gate for #707; focused C# and affected all-feature clippy validation also pass.
+- [x] (2026-07-13 03:00Z) Pushed `062ae98e`, closed #707, and completed the valid post-#707 C# rerun: all 1,000 targets were queried with zero scope-loss notes, 1,899 consistent, 40 unproven, 38 missing, and 8,023 inconclusive sites in 1,265.0 seconds.
+- [x] (2026-07-13 03:20Z) Delegated the 38-site residual audit. It contains 33 functions, three attribute-context `Parameter` false forwards, and two fields; the dominant ten-site `RestException<T>` cluster is a same-file generic/nongeneric declaration identity collision.
+- [x] (2026-07-13 03:45Z) Added failing forward and inverse inline regressions for same-named generic/nongeneric constructors, then implemented metadata-style arity identity for every declared C# type segment, same-file partial-body merging, structured generic-reference arity, exact-before-normalized lookup, source-facing display, and a C# epoch bump.
+- [x] (2026-07-13 04:35Z) Completed three delegated read-only audits and fixed every generic-root finding: receiver inference preserves arity, grouped overloads all scan, exact candidate routing is symmetric, and visible structured lookup never normalizes an arity miss. The complete all-feature suite and affected all-feature clippy targets pass; production exact validation is blocked only on explicit outside-sandbox approval.
+- [x] (2026-07-13 11:35Z) Filed #726 and completed the final exact CDN production rerun in 341.0 seconds. The former false-forward now resolves to `RestException`1.RestException(System.Net.Http.HttpResponseMessage,T)` and has a proven covering inverse hit; zero exact findings remain.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -342,3 +347,7 @@ Revision note (2026-07-13): Recorded pushed/closed #706, the valid complete post
 Revision note (2026-07-13): Marked the campaign deliberately paused after #706 for release `0.8.0` without changing the remaining campaign scope.
 
 Revision note (2026-07-13): Recorded post-release resumption, delegated #707 analysis across all cast families, the shared persisted/inverse fix, and exact production validation.
+
+Revision note (2026-07-13): Recorded pushed/closed #707, the complete post-fix 1,000-target record and its 38-site residual, plus the reduced generic-identity boundary and local structured fix awaiting production validation.
+
+Revision note (2026-07-13): Recorded #726, the audited generic identity fix, and exact Azure validation before the fixing checkpoint.

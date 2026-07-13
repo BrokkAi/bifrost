@@ -675,6 +675,15 @@ impl ParsedFile {
         self.raw_supertypes.insert(code_unit, raw_supertypes);
     }
 
+    pub fn add_raw_supertypes(&mut self, code_unit: CodeUnit, raw_supertypes: Vec<String>) {
+        let entries = self.raw_supertypes.entry(code_unit).or_default();
+        for raw_supertype in raw_supertypes {
+            if !entries.contains(&raw_supertype) {
+                entries.push(raw_supertype);
+            }
+        }
+    }
+
     pub fn add_signature(&mut self, code_unit: CodeUnit, signature: String) {
         let entries = self.signatures.entry(code_unit).or_default();
         if !entries.contains(&signature) {
@@ -2278,10 +2287,12 @@ where
         Some(units)
     }
 
-    fn definition_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
-        let mut names = self
-            .adapter
-            .lookup_candidate_short_names(normalized_fq_name);
+    fn definition_candidate_short_names(&self, fq_name: &str) -> Vec<String> {
+        let mut names = self.adapter.lookup_candidate_short_names(fq_name);
+        let normalized = self.adapter.normalize_full_name(fq_name);
+        if normalized != fq_name {
+            names.extend(self.adapter.lookup_candidate_short_names(&normalized));
+        }
         names.sort();
         names.dedup();
         names
@@ -2310,7 +2321,7 @@ where
     fn sql_definitions_vec(&self, fq_name: &str) -> Option<Vec<CodeUnit>> {
         let normalized = self.adapter.normalize_full_name(fq_name);
         let langs = self.storage_language_keys_for_queries();
-        let candidate_names = self.definition_candidate_short_names(&normalized);
+        let candidate_names = self.definition_candidate_short_names(fq_name);
         let rows = if candidate_names.is_empty() {
             self.store_context
                 .store
@@ -2328,19 +2339,28 @@ where
             }
             rows
         };
-        let mut matches: Vec<_> = self
-            .resolve_candidate_rows(rows)
-            .into_iter()
-            .filter(|unit| self.adapter.normalize_full_name(&unit.fq_name()) == normalized)
-            .collect();
-        matches.extend(self.dirty_units_matching(false, |unit| {
-            self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+        let mut candidates = self.resolve_candidate_rows(rows);
+        candidates.extend(self.dirty_units_matching(false, |unit| {
+            unit.fq_name() == fq_name
+                || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
         }));
-        matches.extend(
+        candidates.extend(
             self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-                self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+                unit.fq_name() == fq_name
+                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
             })?,
         );
+        let has_exact = candidates.iter().any(|unit| unit.fq_name() == fq_name);
+        let mut matches: Vec<_> = candidates
+            .into_iter()
+            .filter(|unit| {
+                if has_exact {
+                    unit.fq_name() == fq_name
+                } else {
+                    self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+                }
+            })
+            .collect();
         matches.sort_by_cached_key(|code_unit| self.definition_sort_key_for_unit(code_unit));
         matches.dedup();
 
@@ -2360,8 +2380,7 @@ where
     }
 
     fn sql_lookup_candidates_by_short_name(&self, symbol: &str) -> Option<BTreeSet<CodeUnit>> {
-        let normalized = self.adapter.normalize_full_name(symbol);
-        let candidate_names = self.definition_candidate_short_names(&normalized);
+        let candidate_names = self.definition_candidate_short_names(symbol);
         if candidate_names.is_empty() {
             return Some(BTreeSet::new());
         }
@@ -2458,37 +2477,6 @@ where
                     unit.fq_name()
                 };
                 candidate == lookup
-            })
-            .unwrap_or_default(),
-        );
-        matches
-    }
-
-    pub(crate) fn lookup_types_by_package_simple(
-        &self,
-        package: &str,
-        simple: &str,
-    ) -> BTreeSet<CodeUnit> {
-        let rows = self
-            .store_context
-            .store
-            .declaration_type_rows_by_package_simple_for_langs(
-                &self.storage_language_keys_for_queries(),
-                package,
-                simple,
-            )
-            .unwrap_or_default();
-        let mut matches: BTreeSet<_> = self.resolve_candidate_rows(rows).into_iter().collect();
-        matches.extend(self.dirty_units_matching(false, |unit| {
-            unit.is_class()
-                && unit.package_name() == package
-                && self.adapter.simple_type_name(unit) == simple
-        }));
-        matches.extend(
-            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-                unit.is_class()
-                    && unit.package_name() == package
-                    && self.adapter.simple_type_name(unit) == simple
             })
             .unwrap_or_default(),
         );

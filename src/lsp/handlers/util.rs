@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::analyzer::common::language_for_file;
+use crate::analyzer::common::{language_for_file, source_identifier_for_target};
 use crate::analyzer::declaration_range::code_unit_declaration_name_range;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
@@ -221,7 +221,7 @@ pub(super) fn identifier_selection_range(
     fallback: &ByteRange,
 ) -> Option<LspRange> {
     let slice = content.get(fallback.start_byte..fallback.end_byte)?;
-    let name = code_unit.identifier();
+    let name = source_identifier_for_target(code_unit);
     if name.is_empty() {
         return None;
     }

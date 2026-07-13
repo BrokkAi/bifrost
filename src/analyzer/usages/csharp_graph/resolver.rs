@@ -5,7 +5,8 @@ use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResol
 use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_as_expression_type_operand,
     csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
-    csharp_using_directive_is_static, resolve_analyzer,
+    csharp_source_identifier, csharp_type_node_identity, csharp_using_directive_is_static,
+    resolve_analyzer,
 };
 use tree_sitter::Node;
 
@@ -34,7 +35,7 @@ impl TargetSpec {
                 target: target.clone(),
                 kind: TargetKind::Type,
                 owner: target.clone(),
-                member_name: target.identifier().to_string(),
+                member_name: csharp_source_identifier(target).to_string(),
                 method_arity: None,
                 is_extension_method: false,
                 extension_receiver_type: None,
@@ -44,7 +45,7 @@ impl TargetSpec {
         let owner = analyzer.parent_of(target)?;
         let kind = if target.is_field() {
             TargetKind::Field
-        } else if target.identifier() == owner.identifier() {
+        } else if target.identifier() == csharp_source_identifier(&owner) {
             TargetKind::Constructor
         } else {
             TargetKind::Method
@@ -207,7 +208,7 @@ fn seed_variable_declaration(
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
-    let type_text = node_text(type_node, source);
+    let type_text = reference_type_text(type_node, source);
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -219,8 +220,11 @@ fn seed_variable_declaration(
         };
         if type_text == "var" {
             if let Some(initializer_type) = object_created_type(child)
-                && let Some(target) =
-                    resolve_type_fq_name(csharp, file, node_text(initializer_type, source))
+                && let Some(target) = resolve_type_fq_name(
+                    csharp,
+                    file,
+                    &reference_type_text(initializer_type, source),
+                )
             {
                 bindings.seed_symbol(node_text(name_node, source), target);
             } else if let Some(target) =
@@ -574,7 +578,9 @@ fn seed_symbol_for_type(
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if let Some(target) = resolve_type_fq_name(csharp, file, node_text(type_node, source)) {
+    if let Some(target) =
+        resolve_type_fq_name(csharp, file, &reference_type_text(type_node, source))
+    {
         bindings.seed_symbol(node_text(name_node, source), target);
     } else {
         bindings.declare_shadow(node_text(name_node, source));
@@ -630,7 +636,7 @@ pub(super) fn resolve_type_fq_name_at(
     node: Node<'_>,
     source: &str,
 ) -> Option<String> {
-    let normalized = normalize_type_text(reference);
+    let normalized = expand_alias_qualified_type(csharp, file, &normalize_type_text(reference));
     if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
         return None;
     }
@@ -639,11 +645,7 @@ pub(super) fn resolve_type_fq_name_at(
     }
     resolve_in_enclosing_class_ranges(csharp, class_ranges, &normalized, node.start_byte())
         .map(|unit| unit.fq_name())
-        .or_else(|| {
-            csharp
-                .resolve_visible_type(file, &normalized)
-                .map(|unit| unit.fq_name())
-        })
+        .or_else(|| resolve_visible_type_fq_name(csharp, file, &normalized))
         .or_else(|| class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name()))
 }
 
@@ -652,14 +654,49 @@ fn resolve_type_fq_name(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
-    let normalized = normalize_type_text(reference);
+    let normalized = expand_alias_qualified_type(csharp, file, &normalize_type_text(reference));
     if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
         return Some(canonical.to_string());
     }
-    if let Some(target) = csharp.resolve_visible_type(file, &normalized) {
-        return Some(target.fq_name());
+    if let Some(target) = resolve_visible_type_fq_name(csharp, file, &normalized) {
+        return Some(target);
     }
     class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name())
+}
+
+fn expand_alias_qualified_type(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+) -> String {
+    let Some((alias, suffix)) = reference.split_once("::") else {
+        return reference.to_string();
+    };
+    if alias == "global" {
+        return suffix.to_string();
+    }
+    csharp
+        .using_aliases_of(file)
+        .get(alias)
+        .map(|target| {
+            if suffix.is_empty() {
+                target.clone()
+            } else {
+                format!("{target}.{suffix}")
+            }
+        })
+        .unwrap_or_else(|| reference.to_string())
+}
+
+fn resolve_visible_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+) -> Option<String> {
+    let candidates = csharp.visible_type_candidates(file, reference);
+    (csharp.logical_type_count(&candidates) == 1)
+        .then(|| csharp.first_logical_type_fqn(&candidates))
+        .flatten()
 }
 
 fn resolve_in_enclosing_class_ranges(
@@ -851,7 +888,7 @@ pub(in crate::analyzer::usages) fn reference_type_node(mut node: Node<'_>) -> No
 }
 
 pub(in crate::analyzer::usages) fn reference_type_text(node: Node<'_>, source: &str) -> String {
-    normalize_type_text(node_text(reference_type_node(node), source))
+    csharp_type_node_identity(reference_type_node(node), source)
 }
 
 pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {

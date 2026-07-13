@@ -205,7 +205,7 @@ fn receiver_type_fqn(
             .enclosing_class(receiver.start_byte())
             .map(str::to_string),
         "qualified_name" | "generic_name" => {
-            ctx.resolve_type_fqn_at(node_text(receiver, ctx.source), receiver)
+            ctx.resolve_type_fqn_at(&reference_type_text(receiver, ctx.source), receiver)
         }
         _ => None,
     }
@@ -226,7 +226,7 @@ fn seed_declaration(
             };
             seed_typed(
                 name,
-                ctx.resolve_type_fqn_at(node_text(type_node, ctx.source), type_node),
+                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node),
                 ctx,
                 bindings,
             );
@@ -244,7 +244,7 @@ fn seed_variable_declaration(
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
-    let type_text = node_text(type_node, ctx.source);
+    let type_text = reference_type_text(type_node, ctx.source);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() != "variable_declarator" {
@@ -257,11 +257,11 @@ fn seed_variable_declaration(
         let resolved = if type_text == "var" {
             object_created_type(child)
                 .and_then(|type_node| {
-                    ctx.resolve_type_fqn_at(node_text(type_node, ctx.source), type_node)
+                    ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
                 })
                 .or_else(|| var_initializer_type(child, ctx, bindings))
         } else {
-            ctx.resolve_type_fqn_at(type_text, type_node)
+            ctx.resolve_type_fqn_at(&type_text, type_node)
         };
         seed_typed(name, resolved, ctx, bindings);
     }
@@ -335,7 +335,7 @@ fn expression_type_fqn(
 ) -> Option<String> {
     match expression.kind() {
         "object_creation_expression" => object_created_type(expression).and_then(|type_node| {
-            ctx.resolve_type_fqn_at(node_text(type_node, ctx.source), type_node)
+            ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
         }),
         "invocation_expression" => invocation_return_type_fqn(expression, ctx, bindings),
         "identifier" => {

@@ -3,7 +3,7 @@ use crate::analyzer::{CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, Si
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
-use super::imports::{csharp_import_info_from_using_directive, normalize_csharp_type_name};
+use super::imports::csharp_import_info_from_using_directive;
 
 pub(super) fn parse_csharp_file(
     file: &ProjectFile,
@@ -187,10 +187,19 @@ impl<'a> CSharpVisitor<'a> {
             return;
         }
 
-        let short_name = if let Some(parent) = &scope.class_unit {
-            format!("{}${name}", parent.short_name())
-        } else {
+        let arity = node
+            .child_by_field_name("type_parameters")
+            .or_else(|| first_named_child_of_kind(node, "type_parameter_list"))
+            .map_or(0, count_type_parameters);
+        let identity_name = if arity == 0 {
             name.to_string()
+        } else {
+            format!("{name}`{arity}")
+        };
+        let short_name = if let Some(parent) = &scope.class_unit {
+            format!("{}${identity_name}", parent.short_name())
+        } else {
+            identity_name
         };
         let code_unit = CodeUnit::new(
             self.file.clone(),
@@ -198,9 +207,6 @@ impl<'a> CSharpVisitor<'a> {
             scope.package_name.clone(),
             short_name,
         );
-        if self.parsed.declarations.contains(&code_unit) {
-            return;
-        }
         self.parsed.add_code_unit(
             code_unit.clone(),
             node,
@@ -208,7 +214,7 @@ impl<'a> CSharpVisitor<'a> {
             scope.class_unit.clone(),
             None,
         );
-        self.parsed.set_raw_supertypes(
+        self.parsed.add_raw_supertypes(
             code_unit.clone(),
             extract_csharp_supertypes(node, self.source),
         );
@@ -403,6 +409,13 @@ impl<'a> CSharpVisitor<'a> {
     }
 }
 
+fn count_type_parameters(node: Node<'_>) -> usize {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "type_parameter")
+        .count()
+}
+
 fn collect_csharp_type_identifiers(
     node: Node<'_>,
     source: &str,
@@ -410,6 +423,7 @@ fn collect_csharp_type_identifiers(
 ) {
     walk_named_tree_preorder(node, true, |node| {
         if is_csharp_type_position_node(node)
+            && !is_nested_type_reference_component(node)
             && matches!(
                 node.kind(),
                 "identifier"
@@ -420,13 +434,30 @@ fn collect_csharp_type_identifiers(
                     | "type"
             )
         {
-            let text = normalize_csharp_type_name(cs_node_text(node, source));
+            let text = super::csharp_type_node_identity(node, source);
             if !text.is_empty() {
                 identifiers.insert(text);
             }
         }
         WalkControl::Continue
     });
+}
+
+fn is_nested_type_reference_component(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_name"
+                | "alias_qualified_name"
+                | "generic_name"
+                | "nullable_type"
+                | "array_type"
+                | "pointer_type"
+                | "type"
+                | "simple_base_type"
+                | "primary_constructor_base_type"
+        ) && is_csharp_type_position_node(parent)
+    })
 }
 
 fn is_csharp_type_position_node(mut node: Node<'_>) -> bool {
@@ -531,20 +562,9 @@ fn extract_csharp_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
     let mut supertypes = Vec::new();
     let mut cursor = base_list.walk();
     for child in base_list.named_children(&mut cursor) {
-        match child.kind() {
-            "identifier"
-            | "qualified_name"
-            | "generic_name"
-            | "alias_qualified_name"
-            | "nullable_type"
-            | "array_type"
-            | "predefined_type" => {
-                let text = normalize_cs_whitespace(cs_node_text(child, source));
-                if !text.is_empty() {
-                    supertypes.push(text);
-                }
-            }
-            _ => {}
+        let text = super::csharp_type_node_identity(child, source);
+        if !text.is_empty() {
+            supertypes.push(text);
         }
     }
     supertypes

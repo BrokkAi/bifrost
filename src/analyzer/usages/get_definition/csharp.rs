@@ -1,5 +1,4 @@
 use super::*;
-use crate::analyzer::csharp::normalize_csharp_type_fragment;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 
@@ -23,26 +22,6 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
         self.csharp
             .declaration_candidates_by_fqn(fqn, true)
-            .into_iter()
-            .collect()
-    }
-
-    fn type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut candidates: Vec<_> = self
-            .csharp
-            .declaration_candidates_by_fqn(fqn, false)
-            .into_iter()
-            .chain(self.csharp.declaration_candidates_by_fqn(fqn, true))
-            .filter(CodeUnit::is_class)
-            .collect();
-        sort_units(&mut candidates);
-        candidates.dedup();
-        candidates
-    }
-
-    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
-        self.csharp
-            .type_candidates_in_package(package, simple)
             .into_iter()
             .collect()
     }
@@ -766,8 +745,10 @@ fn resolve_csharp_constructor(
     let owners = csharp_logical_visible_type_candidates(csharp, definitions, file, &reference);
     let mut constructors = Vec::new();
     for owner in &owners {
-        constructors
-            .extend(definitions.members_for_owner_name(&owner.fq_name(), owner.identifier()));
+        constructors.extend(definitions.members_for_owner_name(
+            &owner.fq_name(),
+            crate::analyzer::csharp_source_identifier(owner),
+        ));
     }
     sort_units(&mut constructors);
     constructors.dedup();
@@ -897,8 +878,8 @@ fn csharp_object_initializer_label_outcome(
     let type_node = object_creation
         .child_by_field_name("type")
         .or_else(|| csharp_first_type_child(object_creation))?;
-    let type_name = csharp_node_text(type_node, source);
-    let mut owners = csharp_logical_visible_type_candidates(csharp, definitions, file, type_name);
+    let type_name = csharp_reference_type_text(type_node, source);
+    let mut owners = csharp_logical_visible_type_candidates(csharp, definitions, file, &type_name);
     if owners.len() != 1 {
         return None;
     }
@@ -1072,7 +1053,7 @@ fn csharp_receiver_type_units(
             csharp,
             definitions,
             file,
-            csharp_node_text(receiver, source),
+            &csharp_reference_type_text(receiver, source),
         ),
         // `new Foo().Member` — the receiver is typed by the class being constructed.
         "object_creation_expression" => receiver
@@ -1082,7 +1063,7 @@ fn csharp_receiver_type_units(
                     csharp,
                     definitions,
                     file,
-                    csharp_node_text(type_node, source),
+                    &csharp_reference_type_text(type_node, source),
                 )
             })
             .unwrap_or_default(),
@@ -1253,41 +1234,8 @@ fn csharp_visible_type_candidates(
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
-    csharp_visible_type_candidates_inner(csharp, definitions, file, name, true)
-}
-
-fn csharp_visible_type_candidates_inner(
-    csharp: &CSharpAnalyzer,
-    definitions: &CSharpDefinitionProvider<'_>,
-    file: &ProjectFile,
-    name: &str,
-    resolve_aliases: bool,
-) -> Vec<CodeUnit> {
-    let normalized = normalize_csharp_type_fragment(name);
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-    if resolve_aliases
-        && let Some(target) = csharp.using_aliases_of(file).get(&normalized)
-        && target != &normalized
-    {
-        return csharp_visible_type_candidates_inner(csharp, definitions, file, target, false);
-    }
-
-    let mut candidates = definitions.type_candidates_by_fqn(&normalized);
-    if !normalized.contains('.') {
-        let mut namespaces = csharp.using_namespaces_of(file);
-        let file_namespace = csharp.namespace_of_file(file);
-        if !file_namespace.is_empty() {
-            namespaces.push(file_namespace);
-        }
-        namespaces.sort();
-        namespaces.dedup();
-        for namespace in namespaces {
-            candidates.extend(definitions.types_in_package(&namespace, &normalized));
-        }
-    }
-    candidates
+    let _ = definitions;
+    csharp.visible_type_candidates(file, name)
 }
 
 fn csharp_enclosing_class(

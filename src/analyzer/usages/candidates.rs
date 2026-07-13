@@ -1,3 +1,4 @@
+use crate::analyzer::common::source_identifier_for_target;
 use crate::analyzer::usages::common::{
     analyzed_files_for_language, language_for_file, language_for_target,
 };
@@ -300,7 +301,7 @@ fn find_text_candidates(
     analyzer: &dyn IAnalyzer,
     cancellation: Option<&CancellationToken>,
 ) -> HashSet<ProjectFile> {
-    let identifier = target.identifier();
+    let identifier = source_identifier_for_target(target);
     if identifier.trim().is_empty() {
         return HashSet::default();
     }

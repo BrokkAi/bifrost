@@ -202,15 +202,17 @@ fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     else {
         return;
     };
-    if !resolves_to_target_at(
+    let reference = reference_type_text(type_node, ctx.source);
+    let resolved = resolves_to_target_at(
         ctx.file,
         &ctx.class_ranges,
-        node_text(type_node, ctx.source),
+        &reference,
         type_node,
         ctx.source,
         &ctx.spec.owner,
         ctx.csharp,
-    ) {
+    );
+    if !resolved {
         return;
     }
     if ctx
@@ -496,7 +498,7 @@ fn object_initializer_label_owner_resolution(
             if resolves_to_target(
                 ctx.csharp,
                 ctx.file,
-                node_text(type_node, ctx.source),
+                &reference_type_text(type_node, ctx.source),
                 &ctx.spec.owner,
             ) =>
         {
@@ -505,7 +507,7 @@ fn object_initializer_label_owner_resolution(
         crate::analyzer::usages::local_inference::SymbolResolution::Unknown
             if ctx
                 .csharp
-                .resolve_visible_type(ctx.file, node_text(type_node, ctx.source))
+                .resolve_visible_type(ctx.file, &reference_type_text(type_node, ctx.source))
                 .is_some() =>
         {
             LabelOwnerResolution::KnownOther

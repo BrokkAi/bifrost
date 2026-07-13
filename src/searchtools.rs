@@ -2099,8 +2099,14 @@ fn definition_candidate_from_range(
     unit: &CodeUnit,
     range: Range,
 ) -> DefinitionCandidate {
+    let language = language_for_target(unit);
+    let name = if language == Language::CSharp {
+        crate::analyzer::common::display_identifier_for_target(unit)
+    } else {
+        unit.identifier().to_string()
+    };
     DefinitionCandidate {
-        name: unit.identifier().to_string(),
+        name,
         fqn: Some(unit.fq_name()),
         path: rel_path_string(unit.source()),
         start_line: range.start_line,
@@ -2110,7 +2116,7 @@ fn definition_candidate_from_range(
             .signature()
             .map(str::to_string)
             .or_else(|| analyzer.signatures(unit).first().cloned()),
-        language: language_name(language_for_target(unit)),
+        language: language_name(language),
     }
 }
 

@@ -5,6 +5,7 @@ use lsp_types::{
 use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer,
+    csharp_source_name_segment,
 };
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::{find_word, identifier_selection_range, read_document_for_uri};
@@ -229,7 +230,8 @@ fn constructor_matches_owner(code_unit: &CodeUnit) -> bool {
     let mut parts = code_unit.short_name().rsplit('.');
     let last = parts.next();
     let prev = parts.next();
-    matches!((prev, last), (Some(parent), Some(method)) if !parent.is_empty() && parent == method)
+    matches!((prev, last), (Some(parent), Some(method)) if !parent.is_empty()
+        && csharp_source_name_segment(parent) == method)
 }
 
 fn is_constant(code_unit: &CodeUnit) -> bool {

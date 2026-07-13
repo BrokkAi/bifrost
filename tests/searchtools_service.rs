@@ -424,6 +424,41 @@ fn rename_symbol_returns_non_mutating_edit_set() {
 }
 
 #[test]
+fn rename_symbol_selects_generic_csharp_type_source_identifier() {
+    let source = r#"namespace Demo;
+
+public class Box<T> {}
+public class UseBox { private Box<int> value; }
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Types.cs", source)
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("C# service");
+    let declaration_line = "public class Box<T> {}";
+    let args = serde_json::json!({
+        "path": "Types.cs",
+        "line": line_of(source, declaration_line),
+        "column": declaration_line.find("Box").unwrap() + 1,
+        "new_name": "Container"
+    });
+
+    let payload = service
+        .call_tool_json("rename_symbol", &args.to_string())
+        .expect("rename generic C# type");
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(value["status"], "ok", "{value}");
+    assert_eq!(value["old_name"], "Box", "{value}");
+    let edits = value["edits"][0]["edits"].as_array().expect("edits");
+    assert_eq!(edits.len(), 2, "{value}");
+    assert!(
+        edits.iter().all(|edit| edit["old_text"] == "Box"),
+        "{value}"
+    );
+}
+
+#[test]
 fn rename_symbol_includes_self_receiver_references() {
     let source = r#"
 class Foo {

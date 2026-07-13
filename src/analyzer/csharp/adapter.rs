@@ -1,10 +1,13 @@
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
-use crate::analyzer::{Language, LanguageAdapter, ProjectFile, SignatureMetadata};
+use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
 use tree_sitter::{Language as TsLanguage, Tree};
 
 use super::declarations::parse_csharp_file;
 use super::tests::csharp_contains_tests;
-use super::{csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type};
+use super::{
+    csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
+    csharp_source_identifier, strip_csharp_generic_arity,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct CSharpAdapter;
@@ -34,12 +37,25 @@ impl LanguageAdapter for CSharpAdapter {
         csharp_normalize_full_name(fq_name)
     }
 
+    fn simple_type_name(&self, unit: &CodeUnit) -> String {
+        csharp_source_identifier(unit).to_string()
+    }
+
     fn persist_content_stable_lookup_keys(&self) -> bool {
         true
     }
 
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
         let mut candidates = lookup_suffix_candidates(normalized_fq_name, &[".", "::"]);
+        if let Some((owner, leaf)) = normalized_fq_name.rsplit_once('.') {
+            let source_leaf = strip_csharp_generic_arity(leaf);
+            if source_leaf != leaf {
+                candidates.extend(lookup_suffix_candidates(
+                    &format!("{owner}.{source_leaf}"),
+                    &[".", "::"],
+                ));
+            }
+        }
         let base_candidates = candidates.clone();
         for candidate in base_candidates {
             candidates.extend(csharp_nested_owner_short_name_candidates(&candidate));

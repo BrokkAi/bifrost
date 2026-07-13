@@ -2748,7 +2748,7 @@ namespace App {
 }
 
 #[test]
-fn csharp_type_lookup_preserves_same_fqn_generic_arity_candidates() {
+fn csharp_type_lookup_selects_same_fqn_candidate_by_generic_arity() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Models/Box.cs",
@@ -2770,6 +2770,7 @@ namespace App {
         }
     }
 }
+
 "#,
         )
         .build();
@@ -2784,11 +2785,69 @@ namespace App {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(result["status"], "resolved", "{value}");
     let definitions = result["types"][0]["definitions"]
         .as_array()
         .expect("definitions array");
-    assert_eq!(definitions.len(), 2, "{value}");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(definitions[0]["path"], "Models/GenericBox.cs", "{value}");
+}
+
+#[test]
+fn csharp_type_lookup_does_not_normalize_an_exact_arity_miss() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "N/GenericBox.cs",
+            "namespace N { public class Box<T> {} }\n",
+        )
+        .file(
+            "Imported/Box.cs",
+            "namespace Imported { public class Box {} }\n",
+        )
+        .file(
+            "N/UseBox.cs",
+            "using Imported;\nnamespace N { public class UseBox { public void Read(Box input) { input.ToString(); } } }\n",
+        )
+        .build();
+    let line =
+        "namespace N { public class UseBox { public void Read(Box input) { input.ToString(); } } }";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"N/UseBox.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "input.ToString")
+        ),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["types"][0]["fqn"], "Imported.Box",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_global_qualified_simple_type_bypasses_current_namespace() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Box.cs", "public class Box {}\n")
+        .file(
+            "N/Box.cs",
+            "namespace N { public class Box<T> {} }\n",
+        )
+        .file(
+            "N/UseBox.cs",
+            "namespace N { public class UseBox { public void Read(global::Box input) { input.ToString(); } } }\n",
+        )
+        .build();
+    let line = "namespace N { public class UseBox { public void Read(global::Box input) { input.ToString(); } } }";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"N/UseBox.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "input.ToString")
+        ),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(value["results"][0]["types"][0]["fqn"], "Box", "{value}");
 }
 
 #[test]
@@ -11544,7 +11603,7 @@ fn csharp_instance_member_receiver_resolves_from_enclosing_property_type() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "App.List$Node.Data",
+        result["definitions"][0]["fqn"], "App.List`1$Node`1.Data",
         "{value}"
     );
 }
@@ -11634,11 +11693,11 @@ fn csharp_var_initialized_from_instance_member_seeds_receiver_type() {
         assert_eq!(result["status"], "resolved", "{value}");
     }
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "App.List$Node.Next",
+        value["results"][0]["definitions"][0]["fqn"], "App.List`1$Node`1.Next",
         "{value}"
     );
     assert_eq!(
-        value["results"][1]["definitions"][0]["fqn"], "App.List$Node.Data",
+        value["results"][1]["definitions"][0]["fqn"], "App.List`1$Node`1.Data",
         "{value}"
     );
 }
@@ -11799,6 +11858,80 @@ fn csharp_explicit_constructor_call_resolves_to_constructor_definition() {
 }
 
 #[test]
+fn csharp_generic_constructor_coexists_with_same_named_nongeneric_type() {
+    let source = r#"namespace Lib {
+public class Response {}
+public class Error {}
+public class RestException {
+    public RestException(Response response) {}
+    public RestException(Response response, Error body) {}
+}
+public partial class RestException<T> {
+    public RestException(Response response, T body) {}
+}
+public partial class RestException<T> {
+    public T Body { get; }
+}
+}
+"#;
+    let consumer = r#"using Lib;
+namespace App {
+public class Runner {
+    public void Run(Response response, Error error) {
+        var failure = new RestException<Error>(response, error);
+        var body = failure.Body;
+    }
+}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Lib/RestException.cs", source)
+        .file(
+            "Other/RestException.cs",
+            "namespace Other { public class RestException<T> { public RestException(T body) {} } }\n",
+        )
+        .file("App/Runner.cs", consumer)
+        .build();
+    let start = consumer.find("RestException<Error>").expect("constructor");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("App/Runner.cs", consumer, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Lib.RestException`1.RestException",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["signature"], "(Response, T)",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "Lib/RestException.cs",
+        "{value}"
+    );
+
+    let body = consumer.find("failure.Body").expect("partial member") + "failure.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("App/Runner.cs", consumer, body),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Lib.RestException`1.Body",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -11836,6 +11969,102 @@ fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
         result["definitions"][1]["signature"], "(string, bool)",
         "{value}"
     );
+}
+
+#[test]
+fn csharp_generic_supertype_selects_arity_exact_base() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Types.cs",
+            "namespace Lib { public class Base { public void Pick(int value) {} } public class Base<T> { public void Pick(T value) {} } public class Child : Base<string> {} public class GlobalChild : global::Lib.Base<string> {} }\n",
+        )
+        .file(
+            "Other/AliasedChild.cs",
+            "using L = Lib;\nnamespace Other { public class AliasedChild : L::Base<string> {} }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            "using Lib; using Other;\nnamespace App { public class Controller { public void Handle(Child child, GlobalChild globalChild, AliasedChild aliasedChild) { child.Pick(\"value\"); globalChild.Pick(\"value\"); aliasedChild.Pick(\"value\"); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { public void Handle(Child child, GlobalChild globalChild, AliasedChild aliasedChild) { child.Pick(\"value\"); globalChild.Pick(\"value\"); aliasedChild.Pick(\"value\"); } } }";
+    for marker in ["child.Pick", "globalChild.Pick", "aliasedChild.Pick"] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+                column_of(line, marker) + marker.find("Pick").unwrap()
+            ),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().unwrap().len(),
+            1,
+            "{value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"], "Lib.Base`1.Pick",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn csharp_generic_object_initializer_and_new_receiver_keep_owner_arity() {
+    let source = r#"namespace Lib {
+public class Box {
+    public int Value { get; set; }
+    public int Read() => Value;
+}
+public class Box<T> {
+    public T Value { get; set; }
+    public T Read() => Value;
+}
+}
+"#;
+    let consumer = r#"using Lib;
+namespace App {
+public class Runner {
+    public void Run() {
+        var initialized = new Box<string> { Value = "text" };
+        var read = new Box<string>().Read();
+        var globalRead = new global::Lib.Box<string>().Read();
+    }
+}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Lib/Boxes.cs", source)
+        .file("App/Runner.cs", consumer)
+        .build();
+
+    for (marker, offset, expected) in [
+        ("Value =", 0, "Lib.Box`1.Value"),
+        (
+            "new Box<string>().Read",
+            "new Box<string>().".len(),
+            "Lib.Box`1.Read",
+        ),
+        (
+            "new global::Lib.Box<string>().Read",
+            "new global::Lib.Box<string>().".len(),
+            "Lib.Box`1.Read",
+        ),
+    ] {
+        let start = consumer.find(marker).expect("reference marker") + offset;
+        let value = lookup(
+            project.root(),
+            &location_reference("App/Runner.cs", consumer, start),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
 }
 
 #[test]

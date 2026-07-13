@@ -82,22 +82,31 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         imports: &[crate::analyzer::ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        if self.namespace_of_file(source_file) == self.namespace_of_file(target) {
+        let target_classes = self
+            .declarations(target)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .collect::<Vec<_>>();
+        let arity_sensitive = target_classes
+            .iter()
+            .any(|unit| unit.identifier().contains('`'));
+        if self.namespace_of_file(source_file) == self.namespace_of_file(target) && !arity_sensitive
+        {
             return true;
         }
-        let target_namespaces: HashSet<String> = self
-            .declarations(target)
-            .into_iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class)
+        let target_namespaces: HashSet<String> = target_classes
+            .iter()
             .map(|unit| unit.package_name().to_string())
             .collect();
-        let target_fq_names: HashSet<String> = self
-            .declarations(target)
-            .into_iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class)
+        let target_names: HashSet<String> = target_classes
+            .iter()
             .flat_map(|unit| {
                 let fq_name = unit.fq_name();
-                [fq_name.clone(), fq_name.replace('$', ".")]
+                [
+                    unit.identifier().to_string(),
+                    fq_name.clone(),
+                    fq_name.replace('$', "."),
+                ]
             })
             .collect();
         if self
@@ -106,7 +115,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             .is_some_and(|identifiers| {
                 identifiers
                     .iter()
-                    .any(|identifier| target_fq_names.contains(identifier))
+                    .any(|identifier| target_names.contains(identifier))
             })
         {
             return true;
@@ -251,22 +260,8 @@ pub(super) fn csharp_using_alias_from_node(
     let target_node = node.named_children(&mut cursor).find(|child| {
         child.start_byte() >= alias_node.end_byte() && child.id() != alias_node.id()
     })?;
-    let target = node_text(target_node, source).trim().to_string();
+    let target = super::csharp_type_node_identity(target_node, source);
     (!target.is_empty()).then_some((alias, target))
-}
-
-pub(super) fn normalize_csharp_type_name(raw_name: &str) -> String {
-    let without_nullable = raw_name.trim().trim_end_matches('?').trim();
-    let without_arrays = without_nullable
-        .trim_end_matches("[]")
-        .trim_end_matches('?')
-        .trim();
-    without_arrays
-        .split('<')
-        .next()
-        .unwrap_or(without_arrays)
-        .trim()
-        .to_string()
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

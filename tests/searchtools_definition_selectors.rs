@@ -977,7 +977,7 @@ fn csharp_generic_arity_selectors_resolve_indexed_source_names() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "DownloadClientFixtureBase.cs",
-            "namespace NzbDrone.Core.Test.Download;\nclass DownloadClientFixtureBase<T> { public void Verify(T value) {} public U Convert<U>(T value) { return default(U); } }\n",
+            "namespace NzbDrone.Core.Test.Download;\nclass DownloadClientFixtureBase { public void Verify(int value) {} }\nclass DownloadClientFixtureBase<T> { public void Verify(T value) {} public U Convert<U>(T value) { return default(U); } }\n",
         )
         .build();
 

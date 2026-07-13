@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use tree_sitter::{Node, Tree};
 
-use crate::analyzer::common::language_for_file;
+use crate::analyzer::common::{language_for_file, source_identifier_for_target};
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 
 pub(crate) struct DeclarationNameRangeContext {
     content: Arc<String>,
@@ -107,12 +107,7 @@ fn code_unit_declaration_name_range_for_range(
 /// static and instance members distinct. That suffix is not part of the
 /// declaration token in source, which is what this module selects.
 fn declaration_source_identifier(code_unit: &CodeUnit) -> &str {
-    let identifier = code_unit.identifier();
-    if language_for_file(code_unit.source()) == Language::TypeScript {
-        identifier.strip_suffix("$static").unwrap_or(identifier)
-    } else {
-        identifier
-    }
+    source_identifier_for_target(code_unit)
 }
 
 /// Find the node whose byte span exactly equals `range`. When several nested

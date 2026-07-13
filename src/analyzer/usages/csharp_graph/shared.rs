@@ -33,13 +33,17 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
-        let Some(spec) = TargetSpec::from_target(analyzer, target) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
-                "CSharpUsageGraphStrategy",
-            );
-        };
+        let mut specs = Vec::with_capacity(overloads.len());
+        for overload in overloads {
+            let Some(spec) = TargetSpec::from_target(analyzer, overload) else {
+                return GraphUsageOutcome::fallback_safe(
+                    overload.fq_name(),
+                    GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
+                    "CSharpUsageGraphStrategy",
+                );
+            };
+            specs.push(spec);
+        }
 
         let candidate_files = scan_scope.candidate_files();
         let mut files: HashSet<ProjectFile> = candidate_files
@@ -47,8 +51,10 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
             .filter(|file| language_for_file(file) == Language::CSharp)
             .cloned()
             .collect();
-        if scan_scope.allows(target.source()) {
-            files.insert(target.source().clone());
+        for overload in overloads {
+            if scan_scope.allows(overload.source()) {
+                files.insert(overload.source().clone());
+            }
         }
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
@@ -64,9 +70,11 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
             if scan_scope.is_cancelled() {
                 break;
             }
-            scan_file(self.csharp, analyzer, &file, &spec, &mut state);
-            if *state.limit_exceeded {
-                break;
+            for spec in &specs {
+                scan_file(self.csharp, analyzer, &file, spec, &mut state);
+                if *state.limit_exceeded {
+                    break;
+                }
             }
         }
 

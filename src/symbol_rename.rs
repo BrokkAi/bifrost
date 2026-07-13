@@ -3,7 +3,9 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::analyzer::common::{is_valid_rename_identifier, language_for_file};
+use crate::analyzer::common::{
+    is_valid_rename_identifier, language_for_file, source_identifier_for_target,
+};
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, byte_offset_for_character_column,
     resolve_definition_batch_with_source,
@@ -173,14 +175,27 @@ pub(crate) fn rename_symbol(
     let mut edits_by_file: HashMap<ProjectFile, Vec<EditCandidate>> = HashMap::new();
 
     for hit in hits {
+        let entry = cache.ensure(project, &hit.file)?;
+        let (start_byte, end_byte) =
+            if entry.body.get(hit.start_offset..hit.end_offset) == Some(old_name.as_str()) {
+                (hit.start_offset, hit.end_offset)
+            } else {
+                let slice = entry
+                    .body
+                    .get(hit.start_offset..hit.end_offset)
+                    .ok_or_else(|| RenameFailure {
+                        kind: "stale_location",
+                        message: "usage range no longer exists in source".to_string(),
+                    })?;
+                let offset = find_word(slice, &old_name).ok_or_else(|| RenameFailure {
+                    kind: "stale_location",
+                    message: format!("expected `{old_name}` inside resolved usage range"),
+                })?;
+                let start = hit.start_offset + offset;
+                (start, start + old_name.len())
+            };
         let edit = edit_for_byte_range(
-            project,
-            &mut cache,
-            &hit.file,
-            hit.start_offset,
-            hit.end_offset,
-            &old_name,
-            new_name,
+            project, &mut cache, &hit.file, start_byte, end_byte, &old_name, new_name,
         )?;
         edits_by_file.entry(hit.file).or_default().push(edit);
     }
@@ -358,7 +373,7 @@ fn resolve_rename_target(
         .into_iter()
         .next()
         .expect("definition count checked");
-    if target.identifier() != cursor.identifier {
+    if source_identifier_for_target(&target) != cursor.identifier {
         return Err(RenameFailure {
             kind: "not_found",
             message: "resolved definition identifier does not match selected token".to_string(),
@@ -374,7 +389,7 @@ fn declaration_target_at_span(
     let mut matches = analyzer
         .declarations(cursor.file)
         .into_iter()
-        .filter(|code_unit| code_unit.identifier() == cursor.identifier)
+        .filter(|code_unit| source_identifier_for_target(code_unit) == cursor.identifier)
         .filter(|code_unit| {
             analyzer.ranges(code_unit).iter().any(|range| {
                 identifier_selection_byte_range(code_unit, cursor.content, range)
@@ -525,7 +540,7 @@ fn identifier_selection_byte_range(
     fallback: &ByteRange,
 ) -> Option<ByteRange> {
     let slice = content.get(fallback.start_byte..fallback.end_byte)?;
-    let name = code_unit.identifier();
+    let name = source_identifier_for_target(code_unit);
     if name.is_empty() {
         return None;
     }

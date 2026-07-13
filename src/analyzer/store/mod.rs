@@ -624,37 +624,6 @@ impl AnalyzerStore {
         Ok(out)
     }
 
-    pub(crate) fn declaration_type_rows_by_package_simple_for_langs(
-        &self,
-        langs: &[String],
-        package: &str,
-        simple: &str,
-    ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let sql = format!(
-            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
-                    units.content_qualifier, units.signature, units.synthetic,
-                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup
-             FROM code_units AS units
-             JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-             WHERE units.lang = ?1 AND units.content_qualifier = ?2
-               AND units.simple_type_name = ?3 AND units.kind = 0
-               AND units.in_declarations = 1 AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY units.blob_oid, units.unit_key"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut out = Vec::new();
-        for lang in langs {
-            out.extend(collect_candidate_rows(stmt.query_map(
-                params![lang, package, simple],
-                candidate_row_from_row,
-            )?)?);
-        }
-        Ok(out)
-    }
-
     pub(crate) fn declaration_member_rows_for_owner_for_langs(
         &self,
         langs: &[String],

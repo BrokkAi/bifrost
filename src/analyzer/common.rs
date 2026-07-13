@@ -76,11 +76,7 @@ pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
             .map(|segment| segment.trim_end_matches('$'))
             .collect::<Vec<_>>()
             .join("."),
-        Language::CSharp => symbol
-            .split('.')
-            .map(|segment| segment.replace('$', "."))
-            .collect::<Vec<_>>()
-            .join("."),
+        Language::CSharp => crate::analyzer::csharp_normalize_full_name(symbol),
         Language::TypeScript => symbol.strip_suffix("$static").unwrap_or(symbol).to_string(),
         _ => symbol.to_string(),
     }
@@ -130,6 +126,15 @@ pub(crate) fn display_identifier_for_target(target: &CodeUnit) -> String {
         .next()
         .unwrap_or(&display_name)
         .to_string()
+}
+
+pub(crate) fn source_identifier_for_target(target: &CodeUnit) -> &str {
+    let identifier = target.identifier();
+    match language_for_target(target) {
+        Language::CSharp => crate::analyzer::csharp::strip_csharp_generic_arity(identifier),
+        Language::TypeScript => identifier.strip_suffix("$static").unwrap_or(identifier),
+        _ => identifier,
+    }
 }
 
 pub(crate) fn is_valid_rename_identifier(language: Language, name: &str) -> bool {

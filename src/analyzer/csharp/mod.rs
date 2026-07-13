@@ -9,7 +9,6 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::usages::visible_names::{FileImportContext, resolve_visible_type};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
     ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
@@ -17,11 +16,10 @@ use crate::analyzer::{
     UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::path_utils::rel_path_string;
 use crate::{CloneSmell, CloneSmellWeights};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use adapter::CSharpAdapter;
 use cache::CSharpMemoCaches;
@@ -121,14 +119,6 @@ impl CSharpAnalyzer {
     ) -> BTreeSet<CodeUnit> {
         self.inner
             .lookup_declarations_by_persisted_fqn(fqn, normalized)
-    }
-
-    pub(crate) fn type_candidates_in_package(
-        &self,
-        package: &str,
-        simple: &str,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_types_by_package_simple(package, simple)
     }
 
     pub(crate) fn member_candidates_for_owner(
@@ -280,26 +270,19 @@ impl CSharpAnalyzer {
         sorted.first().map(CodeUnit::fq_name)
     }
 
-    fn type_declaration_key(&self, unit: &CodeUnit) -> (String, usize) {
-        (
-            unit.fq_name(),
-            self.inner
-                .signatures(unit)
-                .first()
-                .map_or(0, |signature| csharp_type_parameter_count(signature)),
-        )
+    fn type_declaration_key(&self, unit: &CodeUnit) -> String {
+        unit.fq_name()
     }
 
     pub fn resolve_visible_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
-        let ctx = self.file_import_context(file);
-        resolve_visible_type(
-            self.definition_lookup_index(),
-            &ctx,
-            name,
-            &csharp_normalize_full_name,
-            &|_| true,
-        )
-        .cloned()
+        let candidates = self.visible_type_candidates(file, name);
+        (self.logical_type_count(&candidates) == 1)
+            .then(|| {
+                let mut candidates = candidates;
+                self.sort_type_candidates(&mut candidates);
+                candidates.into_iter().next()
+            })
+            .flatten()
     }
 
     fn visible_type_candidates_inner(
@@ -308,9 +291,27 @@ impl CSharpAnalyzer {
         name: &str,
         resolve_aliases: bool,
     ) -> Vec<CodeUnit> {
-        let normalized = normalize_csharp_type_fragment(name);
+        let mut normalized = normalize_csharp_type_fragment(name);
         if normalized.is_empty() {
             return Vec::new();
+        }
+        let mut global_qualified = false;
+        if let Some((alias, suffix)) = normalized.split_once("::") {
+            normalized = if alias == "global" {
+                global_qualified = true;
+                suffix.to_string()
+            } else if let Some(target) = self.using_aliases_of(file).get(alias) {
+                if suffix.is_empty() {
+                    target.clone()
+                } else {
+                    format!("{target}.{suffix}")
+                }
+            } else {
+                return Vec::new();
+            };
+        }
+        if global_qualified {
+            return self.type_candidates_by_fqn(&normalized);
         }
         if resolve_aliases
             && let Some(target) = self.using_aliases_of(file).get(&normalized)
@@ -319,52 +320,46 @@ impl CSharpAnalyzer {
             return self.visible_type_candidates_inner(file, target, false);
         }
 
-        let mut candidates = self.type_candidates_by_fqn(&normalized);
-        if !normalized.contains('.') {
-            let mut namespaces = self.using_namespaces_of(file);
-            let file_namespace = self.namespace_of_file(file);
-            if !file_namespace.is_empty() {
-                namespaces.push(file_namespace);
-            }
-            for namespace in namespaces {
-                candidates.extend(
-                    self.definition_lookup_index()
-                        .types_in_package(&namespace, &normalized)
-                        .iter()
-                        .cloned(),
-                );
+        if normalized.contains('.') {
+            return self.type_candidates_by_fqn(&normalized);
+        }
+
+        let mut namespace = self.namespace_of_file(file);
+        if !namespace.is_empty() {
+            let candidates = self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"));
+            if !candidates.is_empty() {
+                return candidates;
             }
         }
-        candidates
+
+        let mut visible = Vec::new();
+        for namespace in self.using_namespaces_of(file) {
+            visible.extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}")));
+        }
+
+        while let Some(separator) = namespace.rfind('.') {
+            namespace.truncate(separator);
+            visible.extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}")));
+        }
+
+        visible.extend(self.type_candidates_by_fqn(&normalized));
+        visible
     }
 
     fn type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let normalized = csharp_normalize_full_name(fqn);
         self.definition_lookup_index()
             .by_fqn(fqn)
             .iter()
-            .chain(
-                self.definition_lookup_index()
-                    .by_normalized_fqn(&normalized)
-                    .iter(),
-            )
             .filter(|unit| unit.is_class())
             .cloned()
             .collect()
-    }
-
-    fn file_import_context(&self, file: &ProjectFile) -> CSharpFileImportContext<'_> {
-        CSharpFileImportContext {
-            csharp: self,
-            package: self.namespace_of_file(file),
-            namespaces: self.using_namespaces_of(file),
-            aliases: self.using_aliases_of(file),
-        }
     }
 }
 
 pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
     let normalized = fq_name
+        .strip_prefix("global::")
+        .unwrap_or(fq_name)
         .replace(['$', '+'], ".")
         .split('.')
         .map(strip_csharp_generic_arity)
@@ -402,6 +397,98 @@ pub(crate) fn strip_csharp_generic_arity(segment: &str) -> &str {
         name
     } else {
         segment
+    }
+}
+
+pub(crate) fn csharp_source_identifier(unit: &CodeUnit) -> &str {
+    strip_csharp_generic_arity(unit.identifier())
+}
+
+pub(crate) fn csharp_source_name_segment(segment: &str) -> &str {
+    strip_csharp_generic_arity(segment)
+}
+
+pub(crate) fn csharp_type_node_identity(node: Node<'_>, source: &str) -> String {
+    let mut segments = Vec::new();
+    let mut stack = vec![node];
+    let mut alias_qualified = false;
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "qualified_name" | "alias_qualified_name" => {
+                alias_qualified |= current.kind() == "alias_qualified_name";
+                let qualifier = current
+                    .child_by_field_name("qualifier")
+                    .or_else(|| current.child_by_field_name("alias"))
+                    .or_else(|| current.named_child(0));
+                let name = current
+                    .child_by_field_name("name")
+                    .or_else(|| current.named_child(current.named_child_count().saturating_sub(1)));
+                if let Some(name) = name {
+                    stack.push(name);
+                }
+                if let Some(qualifier) = qualifier {
+                    stack.push(qualifier);
+                }
+            }
+            "generic_name" => {
+                let name = current
+                    .child_by_field_name("name")
+                    .or_else(|| current.named_child(0));
+                let type_arguments = (0..current.named_child_count())
+                    .filter_map(|index| current.named_child(index))
+                    .find(|child| child.kind() == "type_argument_list");
+                if let Some(name) = name {
+                    let source_name = source
+                        .get(name.start_byte()..name.end_byte())
+                        .unwrap_or("")
+                        .trim();
+                    let arity = type_arguments.map_or(0, |arguments| arguments.named_child_count());
+                    if !source_name.is_empty() {
+                        segments.push(if arity == 0 {
+                            source_name.to_string()
+                        } else {
+                            format!("{source_name}`{arity}")
+                        });
+                    }
+                }
+            }
+            "nullable_type"
+            | "array_type"
+            | "pointer_type"
+            | "type"
+            | "simple_base_type"
+            | "primary_constructor_base_type" => {
+                if let Some(inner) = current
+                    .child_by_field_name("type")
+                    .or_else(|| current.named_child(0))
+                {
+                    stack.push(inner);
+                }
+            }
+            "identifier" | "predefined_type" => {
+                let segment = source
+                    .get(current.start_byte()..current.end_byte())
+                    .unwrap_or("")
+                    .trim();
+                if !segment.is_empty() {
+                    segments.push(segment.to_string());
+                }
+            }
+            _ => {
+                let fallback = source
+                    .get(current.start_byte()..current.end_byte())
+                    .map(normalize_csharp_type_fragment)
+                    .unwrap_or_default();
+                if !fallback.is_empty() {
+                    segments.push(fallback);
+                }
+            }
+        }
+    }
+    if alias_qualified && segments.len() > 1 {
+        format!("{}::{}", segments[0], segments[1..].join("."))
+    } else {
+        segments.join(".")
     }
 }
 
@@ -513,111 +600,6 @@ fn count_top_level_comma_separated(text: &str) -> usize {
     }
 
     count
-}
-
-struct CSharpFileImportContext<'a> {
-    csharp: &'a CSharpAnalyzer,
-    package: String,
-    namespaces: Vec<String>,
-    aliases: HashMap<String, String>,
-}
-
-impl FileImportContext for CSharpFileImportContext<'_> {
-    fn imported_type_names(&self, simple: &str) -> Vec<String> {
-        let mut names = Vec::new();
-        if let Some(target) = self.aliases.get(simple)
-            && target != simple
-        {
-            names.push(target.clone());
-            if !target.contains('.') {
-                names.extend(
-                    self.namespaces
-                        .iter()
-                        .map(|namespace| format!("{namespace}.{target}")),
-                );
-                if !self.package.is_empty() {
-                    names.push(format!("{}.{target}", self.package));
-                }
-            }
-            return names;
-        }
-        if !simple.contains('.') {
-            names.extend(
-                self.namespaces
-                    .iter()
-                    .map(|namespace| format!("{namespace}.{simple}")),
-            );
-        }
-        names
-    }
-
-    fn package_of_file(&self) -> &str {
-        &self.package
-    }
-
-    fn select_unique<'a>(&self, candidates: Vec<&'a CodeUnit>) -> Option<&'a CodeUnit> {
-        let mut keyed = candidates
-            .into_iter()
-            .map(|unit| {
-                let key = self.csharp.type_declaration_key(unit);
-                let source = rel_path_string(unit.source());
-                (unit, key, source)
-            })
-            .collect::<Vec<_>>();
-        keyed.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
-        keyed.dedup_by(|left, right| left.1 == right.1);
-        (keyed.len() == 1).then(|| keyed[0].0)
-    }
-}
-
-fn csharp_type_parameter_count(signature: &str) -> usize {
-    let source = if signature.trim_end().ends_with('{') {
-        format!("{signature} }}")
-    } else {
-        signature.to_string()
-    };
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .is_err()
-    {
-        return 0;
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return 0;
-    };
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if matches!(
-            node.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "struct_declaration"
-                | "record_declaration"
-                | "record_struct_declaration"
-        ) {
-            return node
-                .child_by_field_name("type_parameters")
-                .or_else(|| first_named_child_of_kind(node, "type_parameter_list"))
-                .map_or(0, count_type_parameters);
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    0
-}
-
-fn count_type_parameters(node: Node<'_>) -> usize {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter(|child| child.kind() == "type_parameter")
-        .count()
-}
-
-fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
 }
 
 impl TestDetectionProvider for CSharpAnalyzer {}
