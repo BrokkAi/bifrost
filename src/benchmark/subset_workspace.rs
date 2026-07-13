@@ -1,4 +1,5 @@
 use crate::benchmark::BenchmarkRepoTarget;
+use crate::benchmark::artifact_path::sanitize_component;
 use crate::{FilesystemProject, Project};
 use std::collections::BTreeSet;
 use std::fs;
@@ -295,25 +296,6 @@ fn normalize_extension(extension: &str) -> String {
         .trim()
         .trim_start_matches('.')
         .to_ascii_lowercase()
-}
-
-fn sanitize_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let trimmed = sanitized.trim_matches('-');
-    if trimmed.is_empty() {
-        "repo".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 fn short_commit(commit: &str) -> String {

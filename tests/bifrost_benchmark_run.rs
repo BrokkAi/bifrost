@@ -111,6 +111,10 @@ type_hierarchy_queries = [
     assert_eq!(scenarios.len(), 11, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
+        assert!(
+            scenario.get("profile_artifacts").is_none(),
+            "profile-disabled reports must not churn: {report}"
+        );
     }
 
     let names = scenarios
@@ -128,6 +132,113 @@ type_hierarchy_queries = [
     assert!(names.contains(&"get_definition"), "report: {report}");
     assert!(names.contains(&"call_hierarchy"), "report: {report}");
     assert!(names.contains(&"type_hierarchy"), "report: {report}");
+}
+
+#[test]
+fn run_subcommand_profile_writes_iteration_traces_and_report_references() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo_root = temp.path().join("fixture-repo");
+    copy_dir_recursively(&fixture_root(), &repo_root).expect("copy fixture repo");
+    init_git_repo(&repo_root);
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["java"]
+required_scenarios = ["get_definition"]
+
+[[repos]]
+name = "fixture-java"
+url = "{}"
+commit = "{}"
+languages = ["java"]
+extensions = ["java"]
+scenarios = ["get_definition"]
+definition_queries = [
+  {{ path = "A.java", line = 8, column = 19, expected_status = "no_definition" }},
+]
+"#,
+            toml_basic_string(&repo_root.display().to_string()),
+            head_commit(&repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--profile")
+        .env(
+            "BIFROST_BENCHMARK_BIFROST_BIN",
+            env!("CARGO_BIN_EXE_bifrost"),
+        )
+        .output()
+        .expect("run profiled bifrost_benchmark");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_dir = manifest_dir.join("out");
+    let report_path = single_json_file(&output_dir);
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    let scenario = &report["repos"][0]["scenarios"][0];
+    let artifacts = scenario["profile_artifacts"]
+        .as_array()
+        .expect("profile artifact array");
+    assert_eq!(artifacts.len(), 2, "report: {report}");
+
+    let mut combined_traces = String::new();
+    for (index, artifact) in artifacts.iter().enumerate() {
+        let relative = artifact.as_str().expect("artifact path");
+        let components = Path::new(relative).components().collect::<Vec<_>>();
+        assert_eq!(components.len(), 3, "run-scoped artifact path: {relative}");
+        assert_eq!(components[0].as_os_str(), "profiles");
+        let trace = fs::read_to_string(output_dir.join(relative)).expect("read profile trace");
+        let expected_phase = if index == 0 { "warmup" } else { "measured" };
+        assert!(trace.contains("repository=fixture-java"), "trace: {trace}");
+        assert!(trace.contains("scenario=get_definition"), "trace: {trace}");
+        assert!(
+            trace.contains(&format!("phase={expected_phase}")),
+            "trace: {trace}"
+        );
+        assert!(trace.contains("iteration=1"), "trace: {trace}");
+        assert!(trace.contains("[bifrost-timing]"), "trace: {trace}");
+        combined_traces.push_str(&trace);
+    }
+    for expected in [
+        "SearchToolsService::snapshot_for_query",
+        "SearchToolsService::apply_watcher_delta",
+        "get_definition::resolve_definition_batch",
+        "language=Java",
+        "get_definition::language_dispatch",
+        "definition_lookup_index::enumerate_live_keys",
+        "AnalyzerStore::definition_lookup_rows_by_keys",
+        "definition_lookup_index::resolve_persisted_rows",
+        "definition_lookup_index::collect_dirty_units",
+        "definition_lookup_index::collect_nonpersisted_units",
+        "definition_lookup_index::build",
+        "build_count=1",
+    ] {
+        assert!(
+            combined_traces.contains(expected),
+            "profile traces missing `{expected}`:\n{combined_traces}"
+        );
+    }
 }
 
 #[test]

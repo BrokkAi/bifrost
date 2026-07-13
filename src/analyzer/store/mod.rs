@@ -856,6 +856,10 @@ impl AnalyzerStore {
         lang: &str,
         oids: &[Oid],
     ) -> Result<Vec<CandidateRow>> {
+        let _scope = crate::profiling::scope("AnalyzerStore::definition_lookup_rows_by_oids");
+        if crate::profiling::enabled() {
+            crate::profiling::note(format!("language={lang} oid_count={}", oids.len()));
+        }
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let mut out = Vec::new();
         for chunk in oids.chunks(900) {
@@ -887,6 +891,9 @@ impl AnalyzerStore {
                 candidate_row_from_row,
             )?)?);
         }
+        if crate::profiling::enabled() {
+            crate::profiling::note(format!("row_count={}", out.len()));
+        }
         Ok(out)
     }
 
@@ -894,6 +901,10 @@ impl AnalyzerStore {
         &self,
         entries: &[(Oid, String)],
     ) -> Result<Vec<CandidateRow>> {
+        let _scope = crate::profiling::scope("AnalyzerStore::definition_lookup_rows_by_keys");
+        if crate::profiling::enabled() {
+            crate::profiling::note(format!("key_count={}", entries.len()));
+        }
         let mut by_lang: HashMap<String, Vec<Oid>> = HashMap::default();
         for (oid, lang) in entries {
             by_lang.entry(lang.clone()).or_default().push(*oid);
@@ -903,6 +914,9 @@ impl AnalyzerStore {
             oids.sort();
             oids.dedup();
             out.extend(self.definition_lookup_candidate_rows_by_oids(&lang, &oids)?);
+        }
+        if crate::profiling::enabled() {
+            crate::profiling::note(format!("row_count={}", out.len()));
         }
         Ok(out)
     }

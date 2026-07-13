@@ -292,6 +292,10 @@ impl WorkspaceAnalyzer {
     }
 
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
+        let _scope = profiling::scope("WorkspaceAnalyzer::update");
+        if profiling::enabled() {
+            profiling::note(format!("changed_files={}", changed_files.len()));
+        }
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
             Self::Single(delegate) => Self::Single(Box::new(delegate.update(changed_files))),
@@ -300,6 +304,7 @@ impl WorkspaceAnalyzer {
     }
 
     pub fn update_all(&self) -> Self {
+        let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
             Self::Single(delegate) => Self::Single(Box::new(delegate.update_all())),

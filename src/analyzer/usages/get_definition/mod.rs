@@ -72,6 +72,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
+use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 pub(crate) use rust::{
     RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_is_type_definition,
@@ -221,6 +222,10 @@ pub(crate) fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
 ) -> Vec<DefinitionLookupOutcome> {
+    let _scope = profiling::scope("get_definition::resolve_definition_batch");
+    if profiling::enabled() {
+        profiling::note(format!("request_count={}", requests.len()));
+    }
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     requests
         .into_iter()
@@ -296,6 +301,10 @@ impl<'a> DefinitionBatchContext<'a> {
     }
 
     fn support(&self) -> &'a DefinitionLookupIndex {
+        let _scope = profiling::scope("get_definition::definition_lookup_index");
+        if profiling::enabled() {
+            profiling::note(format!("cached={}", self.support.get().is_some()));
+        }
         self.support
             .get_or_init(|| self.analyzer.definition_lookup_index())
     }
@@ -353,7 +362,11 @@ fn resolve_one(
     context: &mut DefinitionBatchContext<'_>,
     request: DefinitionLookupRequest,
 ) -> DefinitionLookupOutcome {
+    let _scope = profiling::scope("get_definition::resolve_one");
     let language = language_for_file(&request.file);
+    if profiling::enabled() {
+        profiling::note(format!("language={language:?}"));
+    }
     if matches!(language, Language::None) {
         return diagnostic_outcome(
             DefinitionLookupStatus::UnsupportedLanguage,
@@ -362,30 +375,36 @@ fn resolve_one(
         );
     }
 
-    let source = match context.source(&request.file) {
-        Ok(source) => source,
-        Err(message) => {
-            return diagnostic_outcome(
-                DefinitionLookupStatus::NotFound,
-                "file_read_failed",
-                message,
-            );
+    let source = {
+        let _scope = profiling::scope("get_definition::source");
+        match context.source(&request.file) {
+            Ok(source) => source,
+            Err(message) => {
+                return diagnostic_outcome(
+                    DefinitionLookupStatus::NotFound,
+                    "file_read_failed",
+                    message,
+                );
+            }
         }
     };
 
-    let line_starts = context.line_starts(&request.file, &source);
-    let site = match resolve_reference_site_with_line_starts(
-        &request.as_source_location(),
-        &source,
-        &line_starts,
-    ) {
-        Ok(site) => site,
-        Err(message) => {
-            return diagnostic_outcome(
-                DefinitionLookupStatus::InvalidLocation,
-                "invalid_location",
-                message,
-            );
+    let site = {
+        let _scope = profiling::scope("get_definition::reference_site");
+        let line_starts = context.line_starts(&request.file, &source);
+        match resolve_reference_site_with_line_starts(
+            &request.as_source_location(),
+            &source,
+            &line_starts,
+        ) {
+            Ok(site) => site,
+            Err(message) => {
+                return diagnostic_outcome(
+                    DefinitionLookupStatus::InvalidLocation,
+                    "invalid_location",
+                    message,
+                );
+            }
         }
     };
     let site = if matches!(language, Language::JavaScript | Language::TypeScript) {
@@ -394,7 +413,10 @@ fn resolve_one(
         site
     };
 
-    let tree = context.tree(&request.file, language, &source);
+    let tree = {
+        let _scope = profiling::scope("get_definition::parse_tree");
+        context.tree(&request.file, language, &source)
+    };
     if let Some(tree) = tree.as_ref()
         && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
     {
@@ -421,6 +443,7 @@ fn resolve_one(
             None => {}
         }
     }
+    let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
     let resolved = match language {
         Language::Rust => context.rust_support.as_ref().map_or_else(
             || no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable"),

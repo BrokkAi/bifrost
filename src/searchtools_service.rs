@@ -16,6 +16,7 @@ use crate::{
     },
     get_summaries_output::fit_get_summaries_output_to_budget,
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
+    profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, SymbolLookupParams, SymbolSourcesResult,
@@ -432,7 +433,10 @@ impl SearchToolsService {
             return self
                 .handle_get_symbol_sources(strip_legacy_kind_filter(arguments), render_options);
         }
-        let snapshot = self.snapshot_for_query()?;
+        let snapshot = {
+            let _scope = profiling::scope("SearchToolsService::snapshot_for_query");
+            self.snapshot_for_query()?
+        };
         match name {
             "search_symbols" => Self::decode_render_and_run(
                 &snapshot,
@@ -1187,13 +1191,27 @@ impl SearchToolsService {
     }
 
     fn apply_watcher_delta(session: &mut WorkspaceSession) {
+        let _scope = profiling::scope("SearchToolsService::apply_watcher_delta");
         let Some(watcher) = session.watcher.as_ref() else {
             return;
         };
 
-        let delta = watcher.take_changed_files();
+        let delta = {
+            let _scope = profiling::scope("SearchToolsService::take_changed_files");
+            watcher.take_changed_files()
+        };
+        if profiling::enabled() {
+            profiling::note(format!(
+                "watcher_delta files={} full_refresh={}",
+                delta.files.len(),
+                delta.requires_full_refresh
+            ));
+        }
         if delta.requires_full_refresh {
-            session.snapshot = Arc::new(session.snapshot.update_all());
+            session.snapshot = Arc::new({
+                let _scope = profiling::scope("SearchToolsService::snapshot_update_all");
+                session.snapshot.update_all()
+            });
             #[cfg(feature = "nlp")]
             if let Some(semantic) = &session.semantic {
                 semantic.request_full_build(session.snapshot.clone());
@@ -1213,7 +1231,13 @@ impl SearchToolsService {
         if changed_files.is_empty() {
             return;
         }
-        session.snapshot = Arc::new(session.snapshot.update(&changed_files));
+        if profiling::enabled() {
+            profiling::note(format!("snapshot_changed_files={}", changed_files.len()));
+        }
+        session.snapshot = Arc::new({
+            let _scope = profiling::scope("SearchToolsService::snapshot_update");
+            session.snapshot.update(&changed_files)
+        });
         #[cfg(feature = "nlp")]
         if let Some(semantic) = &session.semantic {
             semantic.request_update(session.snapshot.clone(), changed_files);

@@ -42,6 +42,8 @@ pub struct ScenarioReport {
     pub mean_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_artifacts: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +127,7 @@ impl ScenarioReport {
             warmup_durations_ms,
             measured_durations_ms,
             failure_message,
+            profile_artifacts: Vec::new(),
         }
     }
 }
