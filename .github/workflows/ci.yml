@@ -41,15 +41,7 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            can-test: true
             rustflags: ''
-            test-args: ''
-            cargo-flags: '--features nlp'
-          - target: aarch64-pc-windows-msvc
-            runner: windows-latest
-            can-test: false
-            rustflags: ''
-            test-args: ''
             cargo-flags: '--features nlp'
     steps:
       - uses: actions/checkout@v5
@@ -91,7 +83,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.96.0
-          components: clippy
           targets: ${{ matrix.target }}
 
       - name: Cache cargo + target
@@ -99,21 +90,26 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: cargo clippy
-        run: cargo clippy --all-targets ${{ matrix.cargo-flags }} --target ${{ matrix.target }} -- -D warnings
-
       - name: Install uv
-        if: matrix.can-test
         uses: astral-sh/setup-uv@v7
         with:
           python-version: '3.12'
 
-      - name: cargo test
-        if: matrix.can-test
-        run: cargo test --target ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}
+      - name: Reproduce Windows dead-code benchmark flake
+        shell: pwsh
+        run: |
+          1..10 | ForEach-Object {
+            Write-Host "Diagnostic iteration $_ of 10"
+            cargo test --target ${{ matrix.target }} ${{ matrix.cargo-flags }} --test bifrost_benchmark_run run_subcommand_executes_all_configured_scenarios_on_local_repo -- --exact
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
 
   python:
     name: python (${{ matrix.target }})
+    # Temporarily skip unrelated Python validation while reproducing PR #723's Windows Rust flake.
+    if: ${{ false }}
     needs: rust
     runs-on: ${{ matrix.runner }}
     env:
