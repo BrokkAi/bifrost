@@ -8154,6 +8154,251 @@ export function run(obj: any) {
 }
 
 #[test]
+fn typescript_unknown_global_members_do_not_guess_project_definitions() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/app.ts",
+            r#"
+export function run() {
+  console.error("boom");
+  return process.argv;
+}
+"#,
+        )
+        .file(
+            "mocks/globals.ts",
+            r#"
+export const console = {
+  error(message: string) {}
+};
+
+export const process = {
+  argv: ["--mock"]
+};
+"#,
+        )
+        .build();
+
+    for (line_number, line, member) in [
+        (3, "  console.error(\"boom\");", "error"),
+        (4, "  return process.argv;", "argv"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"src/app.ts","line":{line_number},"column":{}}}]}}"#,
+                column_of(line, member)
+            ),
+        );
+
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    }
+}
+
+#[test]
+fn typescript_cross_file_ambient_namespace_resolves_to_global_declaration() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "globals.d.ts",
+            r#"
+declare namespace ThirdPartyLib {
+  interface LibOptions {
+    enabled: boolean
+  }
+}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+export const options: ThirdPartyLib.LibOptions = { enabled: true }
+"#,
+        )
+        .build();
+
+    let line = "export const options: ThirdPartyLib.LibOptions = { enabled: true }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":2,"column":{}}}]}}"#,
+            column_of(line, "LibOptions")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ThirdPartyLib.LibOptions",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "globals.d.ts", "{value}");
+}
+
+#[test]
+fn typescript_cross_file_umd_namespace_resolves_to_global_declaration() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "globals.d.ts",
+            r#"
+export as namespace ThirdPartyLib;
+export = ThirdPartyLib;
+
+declare namespace ThirdPartyLib {
+  interface LibOptions {
+    enabled: boolean
+  }
+}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+let options: ThirdPartyLib.LibOptions;
+"#,
+        )
+        .build();
+
+    let line = "let options: ThirdPartyLib.LibOptions;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":2,"column":{}}}]}}"#,
+            column_of(line, "LibOptions")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ThirdPartyLib.LibOptions",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "globals.d.ts", "{value}");
+}
+
+#[test]
+fn typescript_cross_file_exported_namespace_requires_an_import() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "library.ts",
+            r#"
+export namespace ThirdPartyLib {
+  export interface LibOptions {
+    enabled: boolean
+  }
+}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+export const options: ThirdPartyLib.LibOptions = { enabled: true }
+"#,
+        )
+        .build();
+
+    let line = "export const options: ThirdPartyLib.LibOptions = { enabled: true }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":2,"column":{}}}]}}"#,
+            column_of(line, "LibOptions")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn typescript_this_member_uses_exact_enclosing_class_with_duplicate_names() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "z/current.ts",
+            r#"
+export class ErrorBoundary {
+  state = { failed: false };
+
+  render() {
+    return this.state.failed;
+  }
+}
+"#,
+        )
+        .file(
+            "a/other.ts",
+            r#"
+export class ErrorBoundary {
+  state = { failed: true };
+}
+"#,
+        )
+        .build();
+
+    let line = "    return this.state.failed;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"z/current.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "state")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "z/current.ts", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn typescript_this_member_does_not_use_same_named_class_from_another_file() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "z/current.ts",
+            r#"
+export class ErrorBoundary {
+  constructor() {
+    this.state = { failed: false };
+  }
+
+  render() {
+    return this.state.failed;
+  }
+}
+"#,
+        )
+        .file(
+            "a/other.ts",
+            r#"
+export class ErrorBoundary {
+  state = { failed: true };
+}
+"#,
+        )
+        .build();
+
+    let line = "    return this.state.failed;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"z/current.ts","line":8,"column":{}}}]}}"#,
+            column_of(line, "state")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn typescript_this_member_resolves_to_enclosing_class_method() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
