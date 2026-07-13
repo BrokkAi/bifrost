@@ -615,6 +615,68 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
 }
 
 #[test]
+fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(root_a.join("Alpha.java"), "class AlphaRoot {}\n").expect("write Alpha.java");
+    fs::write(root_b.join("Beta.java"), "class BetaRoot {}\n").expect("write Beta.java");
+
+    let mut server = LspServer::start_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    let response = server.request("bifrost/queryCode", json!({"query": "(class)"}));
+    assert!(
+        response["error"].is_null(),
+        "unexpected query response: {response}"
+    );
+    let text = response["result"]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected text result, got {response}"));
+    assert!(text.contains("AlphaRoot"), "expected first root in {text}");
+    assert!(text.contains("BetaRoot"), "expected second root in {text}");
+    let matches = response["result"]["matches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected structured match result, got {response}"));
+    assert_eq!(
+        matches.len(),
+        2,
+        "expected both workspace roots in {response}"
+    );
+    assert!(
+        matches.iter().all(|matched| {
+            matched["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.starts_with("file://"))
+                && matched["startLine"].as_u64().is_some()
+        }),
+        "expected navigable match locations in {response}"
+    );
+
+    let invalid = server.request("bifrost/queryCode", json!({"query": "(class"}));
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    assert!(
+        invalid["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Failed to parse RQL query")),
+        "expected RQL parse error, got {invalid}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_honors_configured_roots() {
     let temp = TempDir::new().expect("tempdir");
     let parent = temp.path().canonicalize().expect("canon temp");

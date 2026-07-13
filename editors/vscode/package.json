@@ -40,7 +40,8 @@
     "onLanguage:cpp",
     "onLanguage:csharp",
     "onLanguage:php",
-    "onLanguage:scala"
+    "onLanguage:scala",
+    "onLanguage:bifrost-rql"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -199,8 +200,50 @@
       {
         "command": "bifrost.showOutput",
         "title": "Bifrost: Show Output"
+      },
+      {
+        "command": "bifrost.runRqlQuery",
+        "title": "Bifrost: Run RQL Query",
+        "icon": "$(play)"
+      },
+      {
+        "command": "bifrost.openRqlQueryMatch",
+        "title": "Bifrost: Open RQL Query Match"
       }
-    ]
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "bifrost.queryResults",
+          "name": "Bifrost Query Results"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "bifrost.queryResults",
+        "contents": "Run an RQL query from a `.rql` editor to see its matches here."
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "bifrost.runRqlQuery",
+          "when": "false"
+        },
+        {
+          "command": "bifrost.openRqlQueryMatch",
+          "when": "false"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "bifrost.runRqlQuery",
+          "when": "resourceLangId == bifrost-rql",
+          "group": "navigation@1"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "node esbuild.mjs",

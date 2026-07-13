@@ -57,6 +57,7 @@ function assertScoped(tokens, text, scope) {
 
 test("registers Bifrost RQL as a distinct .rql language", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"));
+  assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql"));
   assert.deepEqual(manifest.contributes.languages, [
     {
       id: "bifrost-rql",
@@ -75,6 +76,28 @@ test("registers Bifrost RQL as a distinct .rql language", () => {
       scopeName,
       path: "./syntaxes/bifrost-rql.tmLanguage.json"
     }
+  ]);
+  assert.deepEqual(
+    manifest.contributes.commands.find((command) => command.command === "bifrost.runRqlQuery"),
+    {
+      command: "bifrost.runRqlQuery",
+      title: "Bifrost: Run RQL Query",
+      icon: "$(play)"
+    }
+  );
+  assert.deepEqual(manifest.contributes.menus["editor/title"], [
+    {
+      command: "bifrost.runRqlQuery",
+      when: "resourceLangId == bifrost-rql",
+      group: "navigation@1"
+    }
+  ]);
+  assert.deepEqual(manifest.contributes.menus.commandPalette, [
+    { command: "bifrost.runRqlQuery", when: "false" },
+    { command: "bifrost.openRqlQueryMatch", when: "false" }
+  ]);
+  assert.deepEqual(manifest.contributes.views.explorer, [
+    { id: "bifrost.queryResults", name: "Bifrost Query Results" }
   ]);
 });
 
