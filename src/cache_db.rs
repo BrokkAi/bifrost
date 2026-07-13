@@ -15,31 +15,15 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
-const BASELINE_TABLE_NAMES: &[&str] = &[
-    "cache_state",
-    "semantic_blobs",
-    "semantic_blob_summaries",
-    "semantic_blob_chunks",
-    "semantic_component_vectors",
-    "semantic_vectors",
-    "analysis_epochs",
-    "blobs",
-    "code_units",
-    "unit_ranges",
-    "unit_signatures",
-    "unit_signature_metadata",
-    "unit_supertypes",
-    "unit_children",
-    "ruby_method_dispatch_modes",
-    "scala_traits",
-    "import_statements",
-    "import_details",
-    "blob_meta",
-    "type_identifiers",
-];
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
     Lazy::new(|| Migrations::new(vec![M::up(CURRENT_BASELINE_SQL)]));
+static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
+    let conn = Connection::open_in_memory().expect("open baseline schema connection");
+    conn.execute_batch(CURRENT_BASELINE_SQL)
+        .expect("create baseline schema");
+    schema_object_definitions(&conn).expect("read baseline schema definitions")
+});
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
@@ -210,13 +194,13 @@ fn recreate_schema(conn: &mut Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "OFF")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     let result = (|| {
-        let table_names = user_table_names(conn)?;
+        let schema_objects = user_schema_objects(conn)?;
         let tx = conn
             .transaction()
             .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-        for table_name in table_names {
-            let quoted = format!("\"{}\"", table_name.replace('"', "\"\""));
-            tx.execute_batch(&format!("DROP TABLE {quoted};"))
+        for (object_type, name) in schema_objects {
+            let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+            tx.execute_batch(&format!("DROP {object_type} {quoted};"))
                 .map_err(|err| format!("cache DB SQLite error: {err}"))?;
         }
         tx.execute_batch("PRAGMA user_version = 0;")
@@ -240,19 +224,51 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-fn user_table_names(conn: &Connection) -> Result<Vec<String>> {
+fn user_schema_objects(conn: &Connection) -> Result<Vec<(String, String)>> {
     let mut statement = conn
         .prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            "SELECT type, name FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+               AND type IN ('view', 'trigger', 'table')
+             ORDER BY CASE type
+                 WHEN 'view' THEN 0
+                 WHEN 'trigger' THEN 1
+                 WHEN 'table' THEN 2
+                 ELSE 3
+             END, name",
         )
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     statement
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|err| format!("cache DB SQLite error: {err}"))?
-        .collect::<std::result::Result<Vec<String>, _>>()
+        .collect::<std::result::Result<Vec<(String, String)>, _>>()
         .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
+
+fn schema_object_definitions(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
+             ORDER BY type, name",
+        )
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    statement
+        .query_map([], |row| {
+            let sql: String = row.get(2)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                sql.chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect(),
+            ))
+        })
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?
+        .collect::<std::result::Result<Vec<(String, String, String)>, _>>()
+        .map_err(|err| format!("cache DB SQLite error: {err}"))
+}
+
 fn prepare_baseline_migration(conn: &mut Connection) -> Result<()> {
     let user_version = cache_migration_version(conn)?;
     if user_version < 0 {
@@ -264,8 +280,7 @@ fn prepare_baseline_migration(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
-    let table_names = user_table_names(conn)?;
-    if user_version == 0 && table_names.is_empty() {
+    if user_version == 0 && user_schema_objects(conn)?.is_empty() {
         return Ok(());
     }
 
@@ -288,12 +303,7 @@ fn baseline_schema_is_valid(conn: &Connection) -> Result<bool> {
     if !quick_check_is_ok(conn)? {
         return Ok(false);
     }
-    let table_names = user_table_names(conn)?;
-    if table_names.len() != BASELINE_TABLE_NAMES.len()
-        || BASELINE_TABLE_NAMES
-            .iter()
-            .any(|table| !table_names.iter().any(|name| name == table))
-    {
+    if schema_object_definitions(conn)? != *BASELINE_SCHEMA_OBJECTS {
         return Ok(false);
     }
     let versions = conn.query_row(
@@ -449,6 +459,58 @@ mod tests {
 
         assert_eq!(cache_migration_version(&conn).unwrap(), 1);
         assert!(!table_exists(&conn, "legacy_cache").unwrap());
+        assert!(baseline_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn pre_migration_cache_with_incomplete_table_shape_is_rebuilt() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.execute_batch(
+            "DROP TABLE blob_meta;
+             CREATE TABLE blob_meta(
+               blob_oid TEXT NOT NULL,
+               lang TEXT NOT NULL,
+               PRIMARY KEY(blob_oid, lang)
+             ) WITHOUT ROWID, STRICT;",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let has_content_package: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('blob_meta')
+                   WHERE name = 'content_package'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(has_content_package);
+        assert!(baseline_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn pre_migration_cache_with_unrecognized_view_is_rebuilt() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.execute_batch("CREATE VIEW legacy_view AS SELECT 1 AS value;")
+            .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let legacy_view_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'legacy_view'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert!(!legacy_view_exists);
         assert!(baseline_schema_is_valid(&conn).unwrap());
     }
 

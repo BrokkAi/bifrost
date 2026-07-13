@@ -25,23 +25,10 @@ pub(crate) struct GoWorkspacePathIndex {
 impl GoWorkspacePathIndex {
     pub(crate) fn build(project: &dyn Project) -> Self {
         let files = project.all_files().unwrap_or_default();
-        let mut module_roots = Vec::new();
+        let module_roots = go_module_roots_from_files(project, &files);
         let mut representative_by_directory: HashMap<PathBuf, ProjectFile> = HashMap::default();
         for file in files {
             if file
-                .rel_path()
-                .file_name()
-                .is_some_and(|name| name == "go.mod")
-            {
-                if let Ok(contents) = project.read_source(&file)
-                    && let Some(import_path) = go_module_path_from_source(&contents)
-                {
-                    module_roots.push(GoModuleRoot {
-                        import_path,
-                        workspace_dir: file.parent(),
-                    });
-                }
-            } else if file
                 .rel_path()
                 .extension()
                 .is_some_and(|extension| extension == "go")
@@ -56,13 +43,6 @@ impl GoWorkspacePathIndex {
                     .or_insert(file);
             }
         }
-        module_roots.sort_by(|left, right| {
-            right
-                .import_path
-                .len()
-                .cmp(&left.import_path.len())
-                .then_with(|| left.workspace_dir.cmp(&right.workspace_dir))
-        });
         Self {
             module_roots,
             representative_by_directory,
@@ -132,9 +112,15 @@ fn module_relative_import<'a>(module: &str, import_path: &'a str) -> Option<&'a 
 }
 
 pub(crate) fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {
-    project
-        .all_files()
-        .unwrap_or_default()
+    let files = project.all_files().unwrap_or_default();
+    go_module_roots_from_files(project, &files)
+}
+
+fn go_module_roots_from_files<'a>(
+    project: &dyn Project,
+    files: impl IntoIterator<Item = &'a ProjectFile>,
+) -> Vec<GoModuleRoot> {
+    let mut module_roots: Vec<_> = files
         .into_iter()
         .filter(|file| {
             file.rel_path()
@@ -142,14 +128,22 @@ pub(crate) fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {
                 .is_some_and(|name| name == "go.mod")
         })
         .filter_map(|manifest| {
-            let contents = project.read_source(&manifest).ok()?;
+            let contents = project.read_source(manifest).ok()?;
             let import_path = go_module_path_from_source(&contents)?;
             Some(GoModuleRoot {
                 import_path,
                 workspace_dir: manifest.parent(),
             })
         })
-        .collect()
+        .collect();
+    module_roots.sort_by(|left, right| {
+        right
+            .import_path
+            .len()
+            .cmp(&left.import_path.len())
+            .then_with(|| left.workspace_dir.cmp(&right.workspace_dir))
+    });
+    module_roots
 }
 
 /// Canonical Go package identity (import path) for `file`, given the
