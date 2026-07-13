@@ -33,7 +33,11 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 23:49Z) Completed the valid post-#704 C# N=1 rerun: all 1,000 target groups queried, zero candidate-scope-loss notes, 1,834 consistent, 40 unproven, 103 missing, and 8,023 inconclusive sites in 1,132.3 seconds.
 - [x] (2026-07-13 00:10Z) Filed #705 after a reduced observable-inventory regression proved exact mode called the full inventory before retaining one path; switched exact selection to safe project-relative point lookup and preserved full-workspace semantic resolution.
 - [x] (2026-07-13 00:26Z) Exact BillingBenefits production validation remained consistent and fell from 1,134.4 to 865.2 seconds while truthful eligibility counts changed from 126,829/1 to 1/1; the remaining startup cost is separate from the eliminated runner pass.
-- [ ] Push and close #705, then implement the independently reduced 34-site `using static` root fix across both inverse type roles and persisted candidate routing.
+- [x] (2026-07-13 00:31Z) Pushed `d8f073d7` through merged `master` and closed #705; preserved the unrelated Rust test edits across the concurrent upstream merge.
+- [x] (2026-07-13 00:37Z) Reproduced the 34-site `using static` boundary in the shared inline harness, filed #706, and added one shared AST predicate to inverse type scanning and persisted type-identifier routing with a C# epoch bump.
+- [x] (2026-07-13 00:54Z) Changed exact MachineLearningServices bytes `498..508` from missing to consistent with a covering `482..569` inverse hit after the required persisted C# rebuild; all 62 C# usage tests and affected all-feature clippy pass.
+- [x] (2026-07-13 00:58Z) Passed the complete `cargo test --features nlp,python` gate for #706.
+- [ ] Push and close #706, then rerun the full C# corpus and repartition the expected 69-site residual.
 
 ## Surprises & Discoveries
 
@@ -67,6 +71,8 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: `/tmp/csharp-exact-generic-type-705-fixed.jsonl` audited the same BillingBenefits bytes with the same two external partial targets and consistent covering hit in 865.2 seconds, down 269.2 seconds or 23.7%. It reports one eligible and one audited file because no repository-wide eligibility inventory was computed. The remaining elapsed time occurs while constructing/reconciling the full persisted analyzer and is a distinct optimization boundary.
 - Observation: `using static` needs one shared structural type-role rule at both scanning and candidate-routing layers.
   Evidence: Delegated isolated fixtures with three partial target declarations failed in authoritative inverse scanning until `using_directive` with an unnamed `static` child was recognized. Default routing still failed until the same role was added to persisted C# type-identifier collection. Ordinary namespace using, unrelated alias RHS, and unrelated same-terminal static imports remained negative. Changing persisted identifiers requires a C# analyzer epoch bump.
+- Observation: The shared `using static` role survives persisted production rebuilding and exact differential comparison.
+  Evidence: `/tmp/csharp-exact-using-static-706-fixed.jsonl` rebuilt the bumped C# epoch, audited only `ExportProxyCmdlet.cs`, and changed the forward-resolved `PsHelpers` import type to consistent with a proven full-directive hit at bytes `482..569`. The exact record reports one eligible, audited, sampled, resolved, queried, and consistent site in 831.1 seconds.
 
 ## Decision Log
 
@@ -158,3 +164,5 @@ Revision note (2026-07-12): Recorded delegated #704 reduction, negative coverage
 Revision note (2026-07-12): Recorded pushed/closed #704, its complete 1,000-target rerun, the 103-site residual partition, and the independently reviewed exact-mode inventory seam.
 
 Revision note (2026-07-13): Recorded #705 reduction/fix and production timing, plus the delegated `using static` root boundary across inverse scanning, persisted routing, and cache epoching.
+
+Revision note (2026-07-13): Recorded pushed/closed #705 and #706's shared-role implementation, cache epoch bump, focused validation, and exact persisted production proof.

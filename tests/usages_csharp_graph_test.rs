@@ -709,6 +709,105 @@ namespace Demo.Runtime {
 }
 
 #[test]
+fn usage_finder_csharp_finds_using_static_type_in_authoritative_and_default_scope() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Runtime/Extensions.First.cs",
+            "namespace Demo.Runtime { public static partial class Extensions { } }\n",
+        ),
+        (
+            "Runtime/Extensions.Second.cs",
+            "namespace Demo.Runtime { public static partial class Extensions { } }\n",
+        ),
+        (
+            "Runtime/Extensions.Third.cs",
+            "namespace Demo.Runtime { public static partial class Extensions { } }\n",
+        ),
+        (
+            "Other/Extensions.cs",
+            "namespace Other { public static class Extensions { } }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using static Demo.Runtime.Extensions;
+using Other;
+using Alias = Other.Extensions;
+using static Other.Extensions;
+
+namespace App {
+    public sealed class Consumer { }
+}
+"#,
+        ),
+    ]);
+
+    let targets: Vec<_> = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == "Demo.Runtime.Extensions"
+        })
+        .cloned()
+        .collect();
+    assert_eq!(targets.len(), 3, "expected all partial type declarations");
+    let consumer = project.file("App/Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let authoritative = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+    let authoritative_hits = authoritative
+        .result
+        .into_either()
+        .expect("authoritative using-static type query should resolve");
+
+    let source = consumer.read_to_string().expect("consumer source");
+    let positive_start = source
+        .find("Demo.Runtime.Extensions")
+        .expect("positive using-static type");
+    let positive_end = positive_start + "Demo.Runtime.Extensions".len();
+    assert!(
+        authoritative_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= positive_start
+                && positive_end <= hit.end_offset
+        }),
+        "using-static type should be a proven structural reference: {authoritative_hits:#?}"
+    );
+    for unrelated_start in source
+        .match_indices("Other.Extensions")
+        .map(|(index, _)| index)
+    {
+        let unrelated_end = unrelated_start + "Other.Extensions".len();
+        assert!(
+            authoritative_hits.iter().all(|hit| {
+                !(hit.start_offset <= unrelated_start && unrelated_end <= hit.end_offset)
+            }),
+            "unrelated alias/static imports must not match the target: {authoritative_hits:#?}"
+        );
+    }
+
+    let routed = UsageFinder::new().query(&analyzer, &targets, 1000, 1000);
+    assert!(
+        routed.candidate_files.contains(&consumer),
+        "persisted type identifiers must route the using-static consumer"
+    );
+    let routed_hits = routed
+        .result
+        .into_either()
+        .expect("default using-static type query should resolve");
+    assert!(
+        routed_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= positive_start
+                && positive_end <= hit.end_offset
+        }),
+        "default routing should preserve the using-static type hit: {routed_hits:#?}"
+    );
+}
+
+#[test]
 fn usage_finder_csharp_routes_global_using_references() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (

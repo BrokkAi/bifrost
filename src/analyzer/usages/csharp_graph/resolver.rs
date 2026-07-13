@@ -4,7 +4,8 @@ use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_normalize_full_name,
-    csharp_signature_arity, csharp_signature_return_type, resolve_analyzer,
+    csharp_signature_arity, csharp_signature_return_type, csharp_using_directive_is_static,
+    resolve_analyzer,
 };
 use tree_sitter::Node;
 
@@ -1002,6 +1003,9 @@ pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) ->
             return true;
         }
         if parent.kind() == "object_creation_expression" {
+            return true;
+        }
+        if csharp_using_directive_is_static(parent) {
             return true;
         }
         if matches!(

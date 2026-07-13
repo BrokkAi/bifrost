@@ -446,6 +446,9 @@ fn is_csharp_type_position_node(mut node: Node<'_>) -> bool {
         if parent.kind() == "object_creation_expression" {
             return true;
         }
+        if super::csharp_using_directive_is_static(parent) {
+            return true;
+        }
         if matches!(
             parent.kind(),
             "class_declaration"

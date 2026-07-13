@@ -29,6 +29,15 @@ use clones::{build_csharp_clone_candidate_data, refine_csharp_clone_similarity};
 use imports::{csharp_using_alias_from_import, csharp_using_namespace};
 use tests::detect_csharp_test_assertion_smells;
 
+pub(crate) fn csharp_using_directive_is_static(node: Node<'_>) -> bool {
+    if node.kind() != "using_directive" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "static")
+}
+
 #[derive(Clone)]
 pub struct CSharpAnalyzer {
     inner: TreeSitterAnalyzer<CSharpAdapter>,
