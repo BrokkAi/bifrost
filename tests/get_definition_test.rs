@@ -11593,6 +11593,48 @@ fn python_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn python_definition_batch_resolves_typed_imported_receivers() {
+    let source = "from service import Service\n\ndef handle(service: Service):\n    service.run()\n    service.stop()\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class Service:\n    def run(self):\n        pass\n\n    def stop(self):\n        pass\n",
+        )
+        .file("app.py", source)
+        .build();
+
+    let references = ["run", "stop"]
+        .into_iter()
+        .map(|needle| {
+            let start = source.rfind(needle).expect("receiver member in source");
+            let single: Value = serde_json::from_str(&location_reference("app.py", source, start))
+                .expect("single location reference");
+            single["references"][0].clone()
+        })
+        .collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({"references": references}).to_string(),
+    );
+
+    assert_eq!(
+        value["results"].as_array().map(Vec::len),
+        Some(2),
+        "{value}"
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "service.Service.run",
+        "{value}"
+    );
+    assert_eq!(value["results"][1]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][1]["definitions"][0]["fqn"], "service.Service.stop",
+        "{value}"
+    );
+}
+
+#[test]
 fn python_typed_receiver_inherited_method_resolves_to_base_definition() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

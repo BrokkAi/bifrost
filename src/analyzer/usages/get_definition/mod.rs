@@ -27,7 +27,9 @@ use crate::analyzer::usages::java_graph::java_signature_arity;
 use crate::analyzer::usages::js_ts_graph::{
     JsTsReceiverFactProvider, cached_jsts_index, compute_jsts_import_binder,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::local_inference::{
+    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine,
+};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::php_graph::{
     FileContext, php_node_text, php_qualified_candidate_text, resolve_php_constant,
@@ -227,9 +229,37 @@ pub(crate) fn resolve_definition_batch(
         profiling::note(format!("request_count={}", requests.len()));
     }
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    resolve_definition_requests(analyzer, &mut context, requests)
+}
+
+fn resolve_definition_requests(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    requests: Vec<DefinitionLookupRequest>,
+) -> Vec<DefinitionLookupOutcome> {
+    let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
+    for request in &requests {
+        if language_for_file(&request.file) == Language::Python {
+            *remaining_python_requests
+                .entry(request.file.clone())
+                .or_default() += 1;
+        }
+    }
+
     requests
         .into_iter()
-        .map(|request| resolve_one(analyzer, &mut context, request))
+        .map(|request| {
+            let is_python = language_for_file(&request.file) == Language::Python;
+            let file = request.file.clone();
+            let outcome = resolve_one(analyzer, context, request);
+            if is_python && let Some(remaining) = remaining_python_requests.get_mut(&file) {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    context.python_contexts.remove(&file);
+                }
+            }
+            outcome
+        })
         .collect()
 }
 
@@ -241,10 +271,7 @@ pub(crate) fn resolve_definition_batch_with_source(
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    requests
-        .into_iter()
-        .map(|request| resolve_one(analyzer, &mut context, request))
-        .collect()
+    resolve_definition_requests(analyzer, &mut context, requests)
 }
 
 pub(crate) fn resolve_call_reference_definition_with_source(
@@ -283,6 +310,9 @@ struct DefinitionBatchContext<'a> {
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
     scala_project_types: Option<Arc<ScalaProjectTypes>>,
+    python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
+    #[cfg(test)]
+    python_build_counters: Arc<python::PythonDefinitionBuildCounters>,
 }
 
 impl<'a> DefinitionBatchContext<'a> {
@@ -297,6 +327,9 @@ impl<'a> DefinitionBatchContext<'a> {
             line_starts: HashMap::default(),
             cpp_visibility: HashMap::default(),
             scala_project_types: None,
+            python_contexts: HashMap::default(),
+            #[cfg(test)]
+            python_build_counters: Arc::default(),
         }
     }
 
@@ -354,6 +387,42 @@ impl<'a> DefinitionBatchContext<'a> {
         self.scala_project_types
             .get_or_insert_with(|| scala.project_types())
             .clone()
+    }
+
+    fn python_context(
+        &mut self,
+        py: &PythonAnalyzer,
+        file: &ProjectFile,
+    ) -> Arc<python::PythonDefinitionContext> {
+        self.python_contexts
+            .entry(file.clone())
+            .or_insert_with(|| {
+                let _scope = crate::profiling::scope("get_definition::python::batch_context");
+                #[cfg(test)]
+                self.python_build_counters
+                    .context_builds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Arc::new(python::PythonDefinitionContext::build(
+                    py,
+                    self.analyzer,
+                    file,
+                    #[cfg(test)]
+                    Arc::clone(&self.python_build_counters),
+                ))
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn python_build_counts(&self) -> (usize, usize) {
+        (
+            self.python_build_counters
+                .context_builds
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.python_build_counters
+                .scope_fact_builds
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 }
 
@@ -514,7 +583,7 @@ fn resolve_one(
         ),
         Language::Python => python::resolve_python(
             analyzer,
-            context.support(),
+            context,
             &request.file,
             &source,
             tree.as_ref(),
@@ -759,4 +828,52 @@ fn sort_units(units: &mut [CodeUnit]) {
             .then_with(|| left.fq_name().cmp(&right.fq_name()))
             .then_with(|| left.signature().cmp(&right.signature()))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn python_batch_context_builds_file_and_scope_state_once() {
+        let source = "from service import Service\n\ndef handle(service: Service):\n    service.run()\n    service.stop()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "service.py",
+                    "class Service:\n    def run(self):\n        pass\n\n    def stop(self):\n        pass\n",
+                ),
+                ("app.py", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "app.py");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let requests = ["run", "stop"]
+            .into_iter()
+            .map(|needle| {
+                let start_byte = source.rfind(needle).expect("receiver member in source");
+                DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + needle.len()),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests);
+
+        assert!(outcomes.iter().all(|outcome| {
+            outcome.status == DefinitionLookupStatus::Resolved
+                && outcome.definitions[0]
+                    .fq_name()
+                    .starts_with("service.Service.")
+        }));
+        assert_eq!(context.python_build_counts(), (1, 1));
+        assert!(context.python_contexts.is_empty());
+    }
 }
