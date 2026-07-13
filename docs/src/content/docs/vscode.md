@@ -48,8 +48,9 @@ does not provide a more specific `.rql` icon.
 | `bifrost.roots` | `[]` | Workspace-relative or absolute directories to index instead of the full VS Code workspace. Empty means use VS Code workspace folders. |
 | `bifrost.exclude` | `[]` | Workspace-relative or absolute files or directories to exclude from Bifrost indexing and LSP lookups. |
 | `bifrost.formatterCommands` | `[]` | Ordered formatter command rules passed to Bifrost from user settings only. Rules run without a shell, receive document text on stdin, and write the formatted document to stdout. |
+| `bifrost.unrecognizedSymbolDiagnostics` | `false` | Enable experimental unrecognized-symbol and member diagnostics. |
 
-Changes to `bifrost.roots`, `bifrost.exclude`, and `bifrost.formatterCommands` apply to the running language server without a restart. Root and exclusion changes rebuild the workspace index; formatter changes affect subsequent formatting requests. Removing one of these settings sends an empty value so the previous runtime setting is cleared.
+Changes to `bifrost.roots`, `bifrost.exclude`, `bifrost.formatterCommands`, and `bifrost.unrecognizedSymbolDiagnostics` apply to the running language server without a restart. Root and exclusion changes rebuild the workspace index; formatter changes affect subsequent formatting requests. Removing one of these settings sends its default value so the previous runtime setting is cleared.
 
 Changes to process-launch settings still require a restart: `bifrost.launchMode`, `bifrost.serverPath`, `bifrost.debug`, `bifrost.slowRequestMs`, and `bifrost.extraArgs`. The extension prompts before restarting for those settings.
 

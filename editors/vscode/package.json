@@ -172,6 +172,11 @@
             },
             "additionalProperties": false
           }
+        },
+        "bifrost.unrecognizedSymbolDiagnostics": {
+          "type": "boolean",
+          "default": false,
+          "description": "Publish Bifrost unrecognized-symbol diagnostics. This experimental lint is disabled by default because it can report false positives."
         }
       }
     },

@@ -278,7 +278,8 @@ function currentBifrostRuntimeSettings(
     root,
     config.get<string[]>("roots") ?? [],
     config.get<string[]>("exclude") ?? [],
-    trustedFormatterCommands(config)
+    trustedFormatterCommands(config),
+    config.get<boolean>("unrecognizedSymbolDiagnostics") ?? false
   );
 }
 
