@@ -1546,6 +1546,69 @@ fn ts_interface_property_usages_include_typed_reads_and_contextual_return_keys()
 }
 
 #[test]
+fn ts_interface_property_usages_include_typed_iterable_and_receiver_destructuring_labels() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "api.ts",
+            "export interface SyncSourceEntry { source: string; }\nexport interface OtherEntry { source: string; }\n",
+        )
+        .file(
+            "app.ts",
+            "import { SyncSourceEntry, OtherEntry } from './api';\nfunction collect(entries: Array<SyncSourceEntry>) {\n  for (const { source } of entries) {\n    consume(source);\n  }\n}\nfunction collectRenamed(entries: SyncSourceEntry[]) {\n  for (const { source: sourceValue } of entries) {\n    consume(sourceValue);\n  }\n}\nfunction collectSet(entries: Set<SyncSourceEntry>) {\n  for (const { source: setSource } of entries) {\n    consume(setSource);\n  }\n}\nfunction collectIterable(entries: Iterable<SyncSourceEntry>) {\n  for (const { source: iterableSource } of entries) {\n    consume(iterableSource);\n  }\n}\nfunction direct(entry: SyncSourceEntry) {\n  const { source: directSource } = entry;\n  consume(directSource);\n}\nfunction forIn(entry: SyncSourceEntry) {\n  for (const { source } in entry) {\n    consume(source);\n  }\n}\nfunction unrelated(entries: OtherEntry[]) {\n  for (const { source } of entries) {\n    consume(source);\n  }\n}\ndeclare function consume(value: string): void;\n",
+        )
+        .build()
+    });
+
+    let source = find_ts_target(&analyzer, &project.file("api.ts"), |cu| {
+        cu.fq_name() == "SyncSourceEntry.source" && cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&source)),
+    );
+
+    let app_hits: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.file == project.file("app.ts"))
+        .collect();
+    assert_eq!(
+        5,
+        app_hits.len(),
+        "SyncSourceEntry.source hits: {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source }")),
+        "expected shorthand destructuring label, got {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source: sourceValue }")),
+        "expected renamed destructuring label, got {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source: directSource }")),
+        "expected typed receiver destructuring label, got {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source: setSource }")),
+        "expected Set element destructuring label, got {app_hits:?}"
+    );
+    assert!(
+        app_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("{ source: iterableSource }")),
+        "expected Iterable element destructuring label, got {app_hits:?}"
+    );
+}
+
+#[test]
 fn js_this_receiver_is_editor_only_member_usage() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(
