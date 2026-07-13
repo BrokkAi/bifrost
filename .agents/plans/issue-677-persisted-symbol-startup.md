@@ -41,6 +41,14 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-13) Restore bounded Scala wildcard-import resolution for top-level package members as well as object members; the complete LSP click-around regression now passes.
 - [x] (2026-07-13) Pass 436 definition tests, 35 persistence tests, 18 cache migration tests, all-target/all-feature clippy, formatting, and the complete `nlp,python` gate under the macOS CI linker configuration.
 - [x] (2026-07-13) Make asynchronous unified-cache GC snapshot eligible rows before its Git reachability walk, preventing an in-flight cold-build GC from deleting dirty/stale blobs written by a concurrent warm build; the 35-case persistence suite passes 20 consecutive stress runs.
+- [x] (2026-07-13) Run Brokk guided review over the complete branch diff; record two HIGH, seven MEDIUM, and two LOW findings covering projection durability, package-prefix boundedness, Scala resolution outcomes, Rust path safety, Ruby request-time parsing, batch caching, warm projection reconciliation, and duplicated forward fact walkers.
+- [ ] Make path-projection writes durable or retryable, refresh only changed/deleted projections after the initial backfill, and test write-failure recovery without a live-path scan fallback.
+- [ ] Replace package-prefix candidate hydration with a literal, indexed existence query that cannot interpret `%` or `_` as wildcards and stops after a live validated match.
+- [ ] Preserve Scala ambiguity and missing-import outcomes through every fallback tier; persist and resolve structured qualified supertype paths; share one iterative ancestry walker.
+- [ ] Share `AnalyzerDefinitionLookup` across an entire type batch and add multi-reference query-count coverage.
+- [ ] Bound Rust Cargo route resolution to the workspace while sharing manifest/dependency parsing between forward and inverse paths.
+- [ ] Persist Ruby mixin-kind facts so warm forward ancestry never reparses source, and share the fact extractor with inverse analysis.
+- [ ] Centralize path-projection row encoding/decoding, run focused regressions, then rerun formatting, clippy, persistence, definition, and full feature gates.
 
 ## Surprises & Discoveries
 
@@ -119,6 +127,18 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - Observation: The first dirty/stale Scala regressions were intermittently erased by an older analyzer's asynchronous GC, not by Scala resolution. GC computed reachability before the warm analyzer wrote its new blob, then swept the newly inserted row because the sweep enumerated rows after the reachability walk.
   Evidence: the 35-case persistence suite failed within three stress repetitions before the fix. GC now stores its eligible OID/language keys in disk-backed temporary tables before walking Git and sweeps only that snapshot; 20 consecutive suite repetitions pass.
 
+- Observation: Path-derived module projections are now correctness-critical, but both full sync and incremental replacement discard SQLite errors and keep no dirty overlay.
+  Evidence: `TreeSitterAnalyzer::sync_path_symbol_units` and `refresh_path_symbol_units` assign store results to `_`; exact forward module lookup consults only the projection table after dirty declaration unions.
+
+- Observation: The package-prefix predicate is neither literal nor bounded. SQLite uses the qualifier index only for `lang = ?`, while `LIKE ? || '%'` scans the language partition and treats `%` and `_` in package names as wildcards before hydrating all returned owners.
+  Evidence: `AnalyzerStore::declaration_rows_by_package_prefix_for_langs` materializes candidate rows, and `forward_fqn_prefix_exists` resolves the complete vector before checking `.any()`.
+
+- Observation: Scala's typed outcome is collapsed to `Option` before visible-type fallback, and its persisted "structured" supertype path is still an opaque dotted string reduced to the first segment.
+  Evidence: `ForwardScalaNameResolver::{resolve,resolve_singleton}` map `Ambiguous` and `MissingExplicitImport` to `None`; `scala_forward_simple_name("Outer.Base")` returns `Outer`, so same-package ancestry probes `app.Outer` instead of `app.Outer.Base`.
+
+- Observation: Warm Ruby forward mixin resolution reads and reparses the exact owner source because mixin relation kind is not persisted with raw supertypes; current build-progress parse counters cannot observe this request-time parser.
+  Evidence: `RubySemanticIndex::forward_owner_facts` calls `RubyAnalyzer::forward_mixin_specs`, which reads the source and calls `parse_ruby_tree` on every uncached owner.
+
 ## Decision Log
 
 - Decision: Reject immutable Arc-backed `DefinitionLookupIndex` shards.
@@ -193,9 +213,17 @@ Opening a warm persisted workspace must finish without reconstructing every decl
   Rationale: Each request already identifies the receiver owner or imported module. Hydrating that owner, reading its persisted signature/supertype facts, and following only its manifest/re-export edges preserves semantics while making unrelated source files unreachable from the request.
   Date/Author: 2026-07-13 / Codex
 
+- Decision: Treat projection persistence as part of the analyzer generation's correctness contract rather than a best-effort cache write.
+  Rationale: Once request-time live-path enumeration is removed, a missing path projection is a false negative, not merely a performance degradation. Failed projection writes must either fail/retry reconciliation or remain visible through a bounded dirty overlay.
+  Date/Author: 2026-07-13 / Codex
+
+- Decision: Persist semantic path/fact structure needed by forward resolution instead of reparsing its source spelling during a request.
+  Rationale: Qualified Scala owners and Ruby mixin kinds are already known at declaration-collection time. Persisting ordered Scala path segments and Ruby relation kinds gives forward and inverse consumers one fact source and eliminates delimiter parsing and request-time tree construction.
+  Date/Author: 2026-07-13 / Codex
+
 ## Outcomes & Retrospective
 
-The request-scoped forward query layer and typed Scala forward resolver are complete. A forward batch carries an explicit language scope and positive/negative owned-result caches; it does not expose new public `IAnalyzer` methods or fan out to unrelated delegates. JavaScript, TypeScript, and Python synthetic module identities live in OID-validated workspace-path projections, so exact module queries no longer enumerate all live paths and Python no longer constructs an eager workspace module map. Scala distinguishes class and singleton owners, treats a missing explicit import as terminal, persists structured supertype lookup paths, walks only candidate owner facts iteratively, and resolves wildcard imports through exact package-member candidates or bounded singleton children. The legacy index is explicitly named `GlobalUsageDefinitionIndex` and remains reachable only from global diagnostics and inverse usage analysis.
+The initial request-scoped forward query layer and typed Scala forward resolver passed the full local gates, but guided review showed that the completion claim was premature. Path projection writes can silently diverge from parsed blobs, package-prefix existence can scan and hydrate a language partition, Scala loses ambiguity and qualified-owner structure in fallback paths, type batches recreate their lookup session per reference, Rust follows unbounded Cargo paths, and Ruby reparses owner source for mixin facts. The milestones above remain open until those behaviors have direct regressions and the complete gates pass again.
 
 The final local gates pass: 436 definition tests, 35 persistence tests, 18 cache migration tests, the complete Scala LSP click-around regression, formatting, warning-as-error all-target/all-feature clippy, and the complete feature-enabled workspace suite. The persistence matrix covers every supported definition language and every type-enabled language, asserts zero warm parses, full declaration scans, global-index builds, Scala `ProjectTypes` builds, and request-time path scans, and keeps candidate hydration below a 32-file unrelated sentinel. The requested AWS rerun cannot be performed in this worktree because `/mnt/T9/repo-clones/aws__aws-sdk-go-v2` is not mounted; the prior schema-v9 artifacts remain the latest real-corpus evidence and this environmental limitation does not weaken the deterministic bounded-work regressions.
 
