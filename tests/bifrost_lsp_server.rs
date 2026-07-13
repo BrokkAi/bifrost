@@ -615,6 +615,68 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
 }
 
 #[test]
+fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(root_a.join("Alpha.java"), "class AlphaRoot {}\n").expect("write Alpha.java");
+    fs::write(root_b.join("Beta.java"), "class BetaRoot {}\n").expect("write Beta.java");
+
+    let mut server = LspServer::start_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    let response = server.request("bifrost/queryCode", json!({"query": "(class)"}));
+    assert!(
+        response["error"].is_null(),
+        "unexpected query response: {response}"
+    );
+    let text = response["result"]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected text result, got {response}"));
+    assert!(text.contains("AlphaRoot"), "expected first root in {text}");
+    assert!(text.contains("BetaRoot"), "expected second root in {text}");
+    let matches = response["result"]["matches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected structured match result, got {response}"));
+    assert_eq!(
+        matches.len(),
+        2,
+        "expected both workspace roots in {response}"
+    );
+    assert!(
+        matches.iter().all(|matched| {
+            matched["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.starts_with("file://"))
+                && matched["startLine"].as_u64().is_some()
+        }),
+        "expected navigable match locations in {response}"
+    );
+
+    let invalid = server.request("bifrost/queryCode", json!({"query": "(class"}));
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    assert!(
+        invalid["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Failed to parse RQL query")),
+        "expected RQL parse error, got {invalid}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_honors_configured_roots() {
     let temp = TempDir::new().expect("tempdir");
     let parent = temp.path().canonicalize().expect("canon temp");
@@ -6151,7 +6213,7 @@ fn bifrost_lsp_server_diagnostics_edge_cases() {
 }
 
 #[test]
-fn bifrost_lsp_server_go_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+fn bifrost_lsp_server_go_semantic_diagnostics_pull_suppresses_unrecognized_symbol_lints() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -6193,21 +6255,167 @@ func Run() {
     let items = response["result"]["items"]
         .as_array()
         .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(items.is_empty(), "expected no semantic lints: {response}");
+}
+
+#[test]
+fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
+
+    let mut server = LspServer::start(&temp_root);
+    let app_uri = uri_for(&temp_root.join("app.py"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let disabled_response = server.read_message();
     assert!(
-        items.iter().any(|item| item["source"] == "bifrost-go"
-            && item["code"] == "go_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("missingValue"))),
-        "expected missingValue semantic diagnostic: {response}"
+        disabled_response["result"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "unrecognized-symbol linting must be disabled by default: {disabled_response}"
     );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let initially_published = server.read_notification("textDocument/publishDiagnostics");
     assert!(
-        items.iter().any(|item| item["source"] == "bifrost-go"
-            && item["code"] == "go_unrecognized_package_member"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("Missing"))),
-        "expected store.Missing semantic diagnostic: {response}"
+        initially_published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "default-off diagnostics must publish an empty report: {initially_published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    let enabled_publish = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        enabled_publish["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["code"] == "python_unrecognized_symbol")
+            }),
+        "enabling the opt-in must refresh existing push diagnostics: {enabled_publish}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let enabled_response = server.read_message();
+    assert!(
+        enabled_response["result"]["items"]
+            .as_array()
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["source"] == "bifrost-python"
+                        && item["code"] == "python_unrecognized_symbol"
+                        && item["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("missing_value"))
+                })
+            }),
+        "the opt-in must publish the semantic lint: {enabled_response}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["code"] == "python_unrecognized_symbol")
+            }),
+        "the opt-in must apply to push diagnostics: {published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": false}}
+    }));
+    let cleared = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        cleared["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "disabling the opt-in must clear previously published lints: {cleared}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let re_disabled_response = server.read_message();
+    assert!(
+        re_disabled_response["result"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "disabling the opt-in must suppress the semantic lint again: {re_disabled_response}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    fs::write(temp_root.join("app.py"), "def run(\n    missing_value\n")
+        .expect("write malformed app.py");
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let parse_error = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        parse_error["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["source"] == "bifrost-tree-sitter")
+            }),
+        "expected a parse diagnostic before disabling the semantic lint: {parse_error}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": false}}
+    }));
+    let retained_parse_error = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        retained_parse_error["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["source"] == "bifrost-tree-sitter")
+            }),
+        "disabling the semantic lint must retain parser diagnostics: {retained_parse_error}"
     );
 }
 
@@ -6252,7 +6460,7 @@ fn bifrost_lsp_server_go_malformed_file_reports_parse_not_semantic_diagnostics()
 }
 
 #[test]
-fn bifrost_lsp_server_python_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+fn bifrost_lsp_server_python_semantic_diagnostics_pull_suppresses_unrecognized_symbol_lints() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -6277,14 +6485,7 @@ def run():
     let items = response["result"]["items"]
         .as_array()
         .unwrap_or_else(|| panic!("expected items array, got {response}"));
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-python"
-            && item["code"] == "python_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("missing_value"))),
-        "expected missing_value semantic diagnostic: {response}"
-    );
+    assert!(items.is_empty(), "expected no semantic lints: {response}");
 }
 
 #[test]
@@ -6320,7 +6521,7 @@ fn bifrost_lsp_server_python_semantic_diagnostics_malformed_file_reports_parse_n
 }
 
 #[test]
-fn bifrost_lsp_server_php_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+fn bifrost_lsp_server_php_semantic_diagnostics_pull_suppresses_unrecognized_symbol_lints() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::create_dir_all(temp_root.join("src")).expect("create src");
@@ -6355,22 +6556,7 @@ class Service {
     let items = response["result"]["items"]
         .as_array()
         .unwrap_or_else(|| panic!("expected items array, got {response}"));
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-php"
-            && item["code"] == "php_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("MissingType"))),
-        "expected MissingType PHP semantic diagnostic: {response}"
-    );
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-php"
-            && item["code"] == "php_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("missing_function"))),
-        "expected missing_function PHP semantic diagnostic: {response}"
-    );
+    assert!(items.is_empty(), "expected no semantic lints: {response}");
 }
 
 #[test]
@@ -6409,7 +6595,7 @@ fn bifrost_lsp_server_php_semantic_diagnostics_malformed_file_reports_parse_not_
 }
 
 #[test]
-fn bifrost_lsp_server_rust_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+fn bifrost_lsp_server_rust_semantic_diagnostics_pull_suppresses_unrecognized_symbol_lints() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::create_dir_all(temp_root.join("src")).expect("create src");
@@ -6436,22 +6622,7 @@ fn run(input: MissingType) {
     let items = response["result"]["items"]
         .as_array()
         .unwrap_or_else(|| panic!("expected items array, got {response}"));
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-rust"
-            && item["code"] == "rust_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("MissingType"))),
-        "expected MissingType Rust semantic diagnostic: {response}"
-    );
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-rust"
-            && item["code"] == "rust_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("missing_value"))),
-        "expected missing_value Rust semantic diagnostic: {response}"
-    );
+    assert!(items.is_empty(), "expected no semantic lints: {response}");
 }
 
 #[test]
@@ -6491,7 +6662,7 @@ fn bifrost_lsp_server_rust_semantic_diagnostics_malformed_file_reports_parse_not
 }
 
 #[test]
-fn bifrost_lsp_server_js_ts_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+fn bifrost_lsp_server_js_ts_semantic_diagnostics_pull_suppresses_unrecognized_symbol_lints() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -6520,14 +6691,8 @@ fn bifrost_lsp_server_js_ts_semantic_diagnostics_pull_reports_unrecognized_symbo
         .as_array()
         .unwrap_or_else(|| panic!("expected items array, got {js_response}"));
     assert!(
-        js_items
-            .iter()
-            .any(|item| item["source"] == "bifrost-javascript"
-                && item["code"] == "js_ts_unrecognized_symbol"
-                && item["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("missingValue"))),
-        "expected missingValue JavaScript semantic diagnostic: {js_response}"
+        js_items.is_empty(),
+        "expected no JavaScript semantic lints: {js_response}"
     );
 
     server.notify_value(json!({
@@ -6541,24 +6706,8 @@ fn bifrost_lsp_server_js_ts_semantic_diagnostics_pull_reports_unrecognized_symbo
         .as_array()
         .unwrap_or_else(|| panic!("expected items array, got {ts_response}"));
     assert!(
-        ts_items
-            .iter()
-            .any(|item| item["source"] == "bifrost-typescript"
-                && item["code"] == "js_ts_unrecognized_symbol"
-                && item["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("MissingType"))),
-        "expected MissingType TypeScript semantic diagnostic: {ts_response}"
-    );
-    assert!(
-        ts_items
-            .iter()
-            .any(|item| item["source"] == "bifrost-typescript"
-                && item["code"] == "js_ts_unrecognized_symbol"
-                && item["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("missingValue"))),
-        "expected missingValue TypeScript semantic diagnostic: {ts_response}"
+        ts_items.is_empty(),
+        "expected no TypeScript semantic lints: {ts_response}"
     );
 }
 
@@ -6866,7 +7015,7 @@ fn bifrost_lsp_server_did_save_publishes_diagnostics() {
 }
 
 #[test]
-fn bifrost_lsp_server_did_save_publishes_go_semantic_diagnostics() {
+fn bifrost_lsp_server_did_save_suppresses_go_semantic_diagnostics() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -6898,18 +7047,11 @@ fn bifrost_lsp_server_did_save_publishes_go_semantic_diagnostics() {
     let items = publish["params"]["diagnostics"]
         .as_array()
         .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-go"
-            && item["code"] == "go_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("missingValue"))),
-        "expected publishDiagnostics semantic Go item: {publish}"
-    );
+    assert!(items.is_empty(), "expected no semantic lints: {publish}");
 }
 
 #[test]
-fn bifrost_lsp_server_did_save_publishes_python_semantic_diagnostics() {
+fn bifrost_lsp_server_did_save_suppresses_python_semantic_diagnostics() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(temp_root.join("app.py"), "def run():\n    print(\"ok\")\n").expect("write fixture");
@@ -6929,18 +7071,11 @@ fn bifrost_lsp_server_did_save_publishes_python_semantic_diagnostics() {
     let items = publish["params"]["diagnostics"]
         .as_array()
         .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-python"
-            && item["code"] == "python_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("missing_value"))),
-        "expected publishDiagnostics semantic Python item: {publish}"
-    );
+    assert!(items.is_empty(), "expected no semantic lints: {publish}");
 }
 
 #[test]
-fn bifrost_lsp_server_did_save_publishes_php_semantic_diagnostics() {
+fn bifrost_lsp_server_did_save_suppresses_php_semantic_diagnostics() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -6967,18 +7102,11 @@ fn bifrost_lsp_server_did_save_publishes_php_semantic_diagnostics() {
     let items = publish["params"]["diagnostics"]
         .as_array()
         .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-php"
-            && item["code"] == "php_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("MissingType"))),
-        "expected publishDiagnostics semantic PHP item: {publish}"
-    );
+    assert!(items.is_empty(), "expected no semantic lints: {publish}");
 }
 
 #[test]
-fn bifrost_lsp_server_did_save_publishes_rust_semantic_diagnostics() {
+fn bifrost_lsp_server_did_save_suppresses_rust_semantic_diagnostics() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::create_dir_all(temp_root.join("src")).expect("create src");
@@ -7002,18 +7130,11 @@ fn bifrost_lsp_server_did_save_publishes_rust_semantic_diagnostics() {
     let items = publish["params"]["diagnostics"]
         .as_array()
         .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
-    assert!(
-        items.iter().any(|item| item["source"] == "bifrost-rust"
-            && item["code"] == "rust_unrecognized_symbol"
-            && item["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("missing_value"))),
-        "expected publishDiagnostics semantic Rust item: {publish}"
-    );
+    assert!(items.is_empty(), "expected no semantic lints: {publish}");
 }
 
 #[test]
-fn bifrost_lsp_server_did_save_publishes_js_ts_semantic_diagnostics() {
+fn bifrost_lsp_server_did_save_suppresses_js_ts_semantic_diagnostics() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(temp_root.join("app.ts"), "function run() { return 1; }\n").expect("write fixture");
@@ -7036,16 +7157,7 @@ fn bifrost_lsp_server_did_save_publishes_js_ts_semantic_diagnostics() {
     let items = publish["params"]["diagnostics"]
         .as_array()
         .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
-    assert!(
-        items
-            .iter()
-            .any(|item| item["source"] == "bifrost-typescript"
-                && item["code"] == "js_ts_unrecognized_symbol"
-                && item["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("MissingType"))),
-        "expected publishDiagnostics semantic TypeScript item: {publish}"
-    );
+    assert!(items.is_empty(), "expected no semantic lints: {publish}");
 }
 
 #[test]

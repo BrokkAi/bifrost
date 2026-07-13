@@ -37,10 +37,18 @@ import {
   releaseAssetFor,
   releaseTargetFor
 } from "./provisioning";
+import {
+  RqlQueryDocument,
+  RqlQueryMatch,
+  RqlQueryResponse,
+  runRqlQuery
+} from "./rql_query";
+import { RqlQueryResultsProvider } from "./rql_results";
 
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
+let rqlQueryResults: RqlQueryResultsProvider | undefined;
 let lastLaunchConfig: BifrostLaunchConfig | undefined;
 let startInFlight: Promise<void> | undefined;
 let extensionActive = false;
@@ -50,6 +58,14 @@ export function activate(context: vscode.ExtensionContext): void {
   extensionActive = true;
   outputChannel = vscode.window.createOutputChannel("Bifrost");
   context.subscriptions.push(outputChannel);
+  rqlQueryResults = new RqlQueryResultsProvider();
+  context.subscriptions.push(rqlQueryResults);
+  context.subscriptions.push(
+    vscode.window.createTreeView("bifrost.queryResults", {
+      treeDataProvider: rqlQueryResults,
+      showCollapseAll: true
+    })
+  );
 
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBarItem.text = "$(circle-slash) Bifrost";
@@ -63,6 +79,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bifrost.stopServer", stopClient),
     vscode.commands.registerCommand("bifrost.restartServer", () => restartClient(context)),
     vscode.commands.registerCommand("bifrost.showOutput", () => outputChannel?.show(true)),
+    vscode.commands.registerCommand("bifrost.runRqlQuery", (resource?: vscode.Uri) =>
+      runRqlQueryForEditor(resource)
+    ),
+    vscode.commands.registerCommand("bifrost.openRqlQueryMatch", (match: RqlQueryMatch) =>
+      openRqlQueryMatch(match)
+    ),
     vscode.commands.registerCommand("bifrost.copyMcpConfig", () => copyMcpConfig(context)),
     vscode.commands.registerCommand("bifrost.openMcpSetup", () => openMcpSetup(context))
   );
@@ -86,6 +108,50 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void startClient(context);
+}
+
+async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
+  const document = resource
+    ? await vscode.workspace.openTextDocument(resource)
+    : vscode.window.activeTextEditor?.document;
+  const queryDocument: RqlQueryDocument | undefined = document
+    ? {
+        languageId: document.languageId,
+        text: document.getText()
+      }
+    : undefined;
+  const currentClient = client;
+  const response = await runRqlQuery(queryDocument, {
+    isReady: () => currentClient?.state === State.Running,
+    sendRequest: (method, params) => currentClient!.sendRequest<RqlQueryResponse>(method, params),
+    showError: (message) => {
+      void vscode.window.showErrorMessage(message);
+    },
+    showWarning: (message) => {
+      void vscode.window.showWarningMessage(message);
+    }
+  });
+  if (!response || !rqlQueryResults) {
+    return;
+  }
+
+  rqlQueryResults.update(response);
+  await vscode.commands.executeCommand("bifrost.queryResults.focus");
+  if (response.matches.length === 0) {
+    void vscode.window.showInformationMessage("Bifrost RQL query returned no matches.");
+  }
+}
+
+async function openRqlQueryMatch(match: RqlQueryMatch): Promise<void> {
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(match.uri));
+  const editor = await vscode.window.showTextDocument(document, { preview: true });
+  const startLine = Math.min(Math.max(0, match.startLine - 1), document.lineCount - 1);
+  const endLine = Math.min(Math.max(startLine, match.endLine - 1), document.lineCount - 1);
+  const start = new vscode.Position(startLine, 0);
+  const end = document.lineAt(endLine).range.end;
+  const range = new vscode.Range(start, end);
+  editor.selection = new vscode.Selection(start, end);
+  editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
 }
 
 export function deactivate(): Thenable<void> | undefined {
@@ -278,7 +344,8 @@ function currentBifrostRuntimeSettings(
     root,
     config.get<string[]>("roots") ?? [],
     config.get<string[]>("exclude") ?? [],
-    trustedFormatterCommands(config)
+    trustedFormatterCommands(config),
+    config.get<boolean>("unrecognizedSymbolDiagnostics") ?? false
   );
 }
 

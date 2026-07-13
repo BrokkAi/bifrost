@@ -20,7 +20,8 @@ Clients can also pass Bifrost-specific `initializationOptions`:
 ```json
 {
   "roots": ["src", "tests"],
-  "exclude": ["target", "vendor/generated"]
+  "exclude": ["target", "vendor/generated"],
+  "unrecognizedSymbolDiagnostics": false
 }
 ```
 
@@ -36,15 +37,18 @@ Bifrost supports the LSP 3.18 [`workspace/didChangeConfiguration`](https://micro
     "bifrost": {
       "roots": ["src", "tests"],
       "exclude": ["target"],
-      "formatterCommands": []
+      "formatterCommands": [],
+      "unrecognizedSymbolDiagnostics": false
     }
   }
 }
 ```
 
-Each accepted runtime value is a full snapshot. It replaces the startup `initializationOptions` and the previous runtime value; omitted or empty `roots`, `exclude`, and `formatterCommands` fields therefore clear those settings. Unknown fields are ignored, while an invalid recognized field rejects the complete snapshot and leaves the last working configuration active.
+Each accepted runtime value is a full snapshot. It replaces the startup `initializationOptions` and the previous runtime value; omitted or empty `roots`, `exclude`, `formatterCommands`, and `unrecognizedSymbolDiagnostics` fields therefore reset those settings to their defaults. Unknown fields are ignored, while an invalid recognized field rejects the complete snapshot and leaves the last working configuration active.
 
 Changing only `formatterCommands` affects later formatting requests without rebuilding the analyzer. Changing `roots` or `exclude` rebuilds the workspace, preserves open editor buffers, cancels active formatter processes before swapping state, and clears published diagnostics for files that leave the workspace. Clearing `roots` restores the latest workspace folders reported by the editor.
+
+`unrecognizedSymbolDiagnostics` is an experimental opt-in lint. It is `false` by default because Bifrost's symbol resolver is not yet accurate enough to make those editor errors trustworthy. Set it to `true` to publish unrecognized symbol and member diagnostics; syntax diagnostics are always enabled.
 
 ## Protocol Surface
 

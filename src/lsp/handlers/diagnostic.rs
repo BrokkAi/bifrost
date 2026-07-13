@@ -26,8 +26,14 @@ pub fn handle(
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     params: &DocumentDiagnosticParams,
+    include_semantic_diagnostics: bool,
 ) -> DocumentDiagnosticReportResult {
-    let items = collect(workspace, project, &params.text_document.uri);
+    let items = collect(
+        workspace,
+        project,
+        &params.text_document.uri,
+        include_semantic_diagnostics,
+    );
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
             related_documents: None,
@@ -41,16 +47,22 @@ pub fn handle(
 
 /// Build the diagnostic items for a document URI. Shared between the pull-model
 /// `handle` and the push-model `publishDiagnostics` emitter so both paths
-/// surface the same parse errors. Returns an empty vec for unsupported
-/// languages, missing files, or URIs outside the project root.
-pub fn collect(workspace: &WorkspaceAnalyzer, project: &dyn Project, uri: &Uri) -> Vec<Diagnostic> {
-    build_report(workspace, project, uri).unwrap_or_default()
+/// surface the same configuration-gated diagnostics. Returns an empty vec for
+/// unsupported languages, missing files, or URIs outside the project root.
+pub fn collect(
+    workspace: &WorkspaceAnalyzer,
+    project: &dyn Project,
+    uri: &Uri,
+    include_semantic_diagnostics: bool,
+) -> Vec<Diagnostic> {
+    build_report(workspace, project, uri, include_semantic_diagnostics).unwrap_or_default()
 }
 
 fn build_report(
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     uri: &Uri,
+    include_semantic_diagnostics: bool,
 ) -> Option<Vec<Diagnostic>> {
     let project_file = project_file_for_uri(project, uri)?;
     let language = language_for_file(&project_file);
@@ -84,7 +96,7 @@ fn build_report(
         .into_iter()
         .map(|err| parse_error_to_diagnostic(err, &content, &line_starts))
         .collect();
-    if diagnostics.is_empty() {
+    if diagnostics.is_empty() && include_semantic_diagnostics {
         diagnostics.extend(
             workspace
                 .analyzer()

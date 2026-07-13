@@ -26,15 +26,21 @@ npm test
 
 Use the extension setting `bifrost.serverPath` when testing a locally built Bifrost binary.
 
-## RQL Highlighting
+## RQL Queries
 
 The extension automatically recognizes `.rql` files as **Bifrost RQL** and
-highlights RQL query structure, known forms, literals, and comments. It is a
-TextMate grammar only, so opening a query file does not start the Bifrost
-language server or validate the query. If another extension owns `.rql` in a
-workspace, use VS Code's language-mode picker to select **Bifrost RQL**.
-The Bifrost helmet is its default file icon when the active VS Code icon theme
-does not provide a more specific `.rql` icon.
+highlights RQL query structure, known forms, literals, and comments. When the
+Bifrost language server is ready, the Play button in the editor title executes
+the current query text, including unsaved edits. Results appear in the
+**Bifrost Query Results** Explorer view; select a match to open its source
+range.
+
+See [RQL in VS Code](/rql-vscode/) for an execution example, scope rules, and
+the results view. Opening a query file does not start the language server or
+wait for indexing. If another extension owns `.rql` in a workspace, use VS
+Code's language-mode picker to select **Bifrost RQL**. The Bifrost helmet is
+its default file icon when the active VS Code icon theme does not provide a
+more specific `.rql` icon.
 
 ## Extension Settings
 
@@ -48,8 +54,9 @@ does not provide a more specific `.rql` icon.
 | `bifrost.roots` | `[]` | Workspace-relative or absolute directories to index instead of the full VS Code workspace. Empty means use VS Code workspace folders. |
 | `bifrost.exclude` | `[]` | Workspace-relative or absolute files or directories to exclude from Bifrost indexing and LSP lookups. |
 | `bifrost.formatterCommands` | `[]` | Ordered formatter command rules passed to Bifrost from user settings only. Rules run without a shell, receive document text on stdin, and write the formatted document to stdout. |
+| `bifrost.unrecognizedSymbolDiagnostics` | `false` | Enable experimental unrecognized-symbol and member diagnostics. |
 
-Changes to `bifrost.roots`, `bifrost.exclude`, and `bifrost.formatterCommands` apply to the running language server without a restart. Root and exclusion changes rebuild the workspace index; formatter changes affect subsequent formatting requests. Removing one of these settings sends an empty value so the previous runtime setting is cleared.
+Changes to `bifrost.roots`, `bifrost.exclude`, `bifrost.formatterCommands`, and `bifrost.unrecognizedSymbolDiagnostics` apply to the running language server without a restart. Root and exclusion changes rebuild the workspace index; formatter changes affect subsequent formatting requests. Removing one of these settings sends its default value so the previous runtime setting is cleared.
 
 Changes to process-launch settings still require a restart: `bifrost.launchMode`, `bifrost.serverPath`, `bifrost.debug`, `bifrost.slowRequestMs`, and `bifrost.extraArgs`. The extension prompts before restarting for those settings.
 

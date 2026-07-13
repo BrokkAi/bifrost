@@ -35,6 +35,7 @@ use lsp_types::{
     WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
 };
 
+use crate::analyzer::structural::{CodeQuery, execute};
 use crate::analyzer::{
     AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
     OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
@@ -674,6 +675,7 @@ fn handle_request(
     let id_for_log = format!("{id:?}");
     let method = req.method.clone();
     let response = match req.method.as_str() {
+        RunRqlQuery::METHOD => handle_run_rql_query_request(req, &state.workspace),
         DocumentSymbolRequest::METHOD => {
             decode_and_run::<DocumentSymbolRequest, _>(req, |params| {
                 Ok(document_symbol::handle(
@@ -766,6 +768,7 @@ fn handle_request(
                     &state.workspace,
                     state.project(),
                     &params,
+                    state.runtime_configuration.unrecognized_symbol_diagnostics,
                 ))
             })
         }
@@ -835,6 +838,65 @@ fn handle_request(
         .sender
         .send(Message::Response(response))
         .map_err(|err| format!("Failed to send LSP response: {err}"))
+}
+
+fn handle_run_rql_query_request(req: Request, workspace: &WorkspaceAnalyzer) -> Response {
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let params = match req.extract::<RunRqlQueryParams>(RunRqlQuery::METHOD) {
+        Ok((_, params)) => params,
+        Err(ExtractError::JsonError { error, .. }) => {
+            return Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("Failed to decode params for {method}: {error}"),
+            );
+        }
+        Err(ExtractError::MethodMismatch(_)) => {
+            return Response::new_err(
+                id,
+                ErrorCode::MethodNotFound as i32,
+                format!("Method not implemented: {method}"),
+            );
+        }
+    };
+
+    let query = match CodeQuery::from_sexp(&params.query) {
+        Ok(query) => query,
+        Err(error) => {
+            return Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("Failed to parse RQL query: {error}"),
+            );
+        }
+    };
+    let query_result = execute(workspace.analyzer(), &query);
+    let workspace_root = workspace.analyzer().project().root();
+    let result = RunRqlQueryResult {
+        text: query_result.render_text(),
+        matches: query_result
+            .matches
+            .iter()
+            .map(|matched| RunRqlQueryMatch {
+                uri: path_to_uri_string(&workspace_root.join(&matched.path)),
+                path: matched.path.clone(),
+                kind: matched.kind.to_owned(),
+                start_line: matched.start_line,
+                end_line: matched.end_line,
+                text: matched.text.clone(),
+                enclosing_symbol: matched.enclosing_symbol.clone(),
+            })
+            .collect(),
+    };
+    match serde_json::to_value(result) {
+        Ok(value) => Response::new_ok(id, value),
+        Err(error) => Response::new_err(
+            id,
+            ErrorCode::InternalError as i32,
+            format!("Failed to serialize {method} result: {error}"),
+        ),
+    }
 }
 
 fn handle_references_request(
@@ -1423,15 +1485,16 @@ fn handle_notification(
 }
 
 /// Send a `textDocument/publishDiagnostics` notification with the current
-/// parse-error report for `uri`. We always send — even when the diagnostic
-/// list is empty — so clients clear stale diagnostics from a previous save.
+/// configuration-gated diagnostic report for `uri`. We always send — even
+/// when the diagnostic list is empty — so clients clear stale diagnostics.
 fn publish_diagnostics(
     connection: &Connection,
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     uri: &Uri,
+    include_semantic_diagnostics: bool,
 ) -> Result<(), String> {
-    let diagnostics = diagnostic::collect(workspace, project, uri);
+    let diagnostics = diagnostic::collect(workspace, project, uri, include_semantic_diagnostics);
     let params = PublishDiagnosticsParams {
         uri: uri.clone(),
         diagnostics,
@@ -1449,7 +1512,13 @@ fn publish_diagnostics_for_state(
     state: &mut ServerState,
     uri: &Uri,
 ) -> Result<(), String> {
-    publish_diagnostics(connection, &state.workspace, state.project(), uri)?;
+    publish_diagnostics(
+        connection,
+        &state.workspace,
+        state.project(),
+        uri,
+        state.runtime_configuration.unrecognized_symbol_diagnostics,
+    )?;
     state.remember_published_diagnostic_uri(uri);
     Ok(())
 }
@@ -1479,6 +1548,8 @@ fn apply_runtime_configuration_value(
             return Ok(());
         }
     };
+    let semantic_diagnostics_changed = state.runtime_configuration.unrecognized_symbol_diagnostics
+        != configuration.unrecognized_symbol_diagnostics;
     let stale_diagnostics = match state.apply_runtime_configuration(configuration) {
         Ok(stale) => stale,
         Err(err) => {
@@ -1488,6 +1559,11 @@ fn apply_runtime_configuration_value(
     };
     for uri in stale_diagnostics {
         publish_empty_diagnostics(connection, &uri)?;
+    }
+    if semantic_diagnostics_changed {
+        for uri in state.published_diagnostic_uris.clone() {
+            publish_diagnostics_for_state(connection, state, &uri)?;
+        }
     }
     Ok(())
 }
@@ -1548,6 +1624,7 @@ struct BifrostRuntimeConfiguration {
     configured_roots: Vec<WorkspaceRoot>,
     excluded_paths: Vec<PathBuf>,
     formatter_commands: Vec<formatting::FormatterCommandRule>,
+    unrecognized_symbol_diagnostics: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1578,6 +1655,8 @@ struct BifrostInitializationOptions {
     exclude: Vec<String>,
     #[serde(default)]
     formatter_commands: Vec<formatting::FormatterCommandRule>,
+    #[serde(default)]
+    unrecognized_symbol_diagnostics: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1600,6 +1679,41 @@ const REJECTED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
 const MAX_CONCURRENT_CANCELLABLE_REQUESTS: usize = 2;
 const MAX_CONCURRENT_FORMATTING_REQUESTS: usize = 2;
 const FORMATTER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Private request used by the VS Code RQL editor. The query source is sent
+/// directly so unsaved editor content runs against the live LSP snapshot.
+enum RunRqlQuery {}
+
+impl lsp_types::request::Request for RunRqlQuery {
+    type Params = RunRqlQueryParams;
+    type Result = RunRqlQueryResult;
+
+    const METHOD: &'static str = "bifrost/queryCode";
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RunRqlQueryParams {
+    query: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunRqlQueryResult {
+    text: String,
+    matches: Vec<RunRqlQueryMatch>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunRqlQueryMatch {
+    uri: String,
+    path: String,
+    kind: String,
+    start_line: usize,
+    end_line: usize,
+    text: String,
+    enclosing_symbol: Option<String>,
+}
 
 #[derive(Clone)]
 struct ConcurrencyLimiter {
@@ -2462,6 +2576,7 @@ fn collect_workspace_config(
         roots,
         exclude,
         formatter_commands,
+        unrecognized_symbol_diagnostics,
     } = bifrost_initialization_options(params);
     let configuration_base = fallback
         .canonicalize()
@@ -2502,6 +2617,7 @@ fn collect_workspace_config(
             configured_roots,
             excluded_paths,
             formatter_commands,
+            unrecognized_symbol_diagnostics,
         },
         configuration_protocol: RuntimeConfigurationProtocol {
             supports_pull,
@@ -2561,6 +2677,7 @@ fn bifrost_initialization_options(params: &InitializeParams) -> BifrostInitializ
             }),
             None => Vec::new(),
         },
+        unrecognized_symbol_diagnostics: optional_boolean(object, "unrecognizedSymbolDiagnostics"),
     }
 }
 
@@ -2585,6 +2702,8 @@ fn parse_runtime_configuration(
                 .map_err(|err| format!("formatterCommands is invalid: {err}"))?,
             None => Vec::new(),
         };
+    let unrecognized_symbol_diagnostics =
+        strict_optional_boolean(object, "unrecognizedSymbolDiagnostics")?;
     for (index, rule) in formatter_commands.iter().enumerate() {
         rule.validate()
             .map_err(|err| format!("formatterCommands[{index}] is invalid: {err}"))?;
@@ -2607,7 +2726,31 @@ fn parse_runtime_configuration(
         configured_roots,
         excluded_paths,
         formatter_commands,
+        unrecognized_symbol_diagnostics,
     })
+}
+
+fn optional_boolean(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    match object.get(key) {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => {
+            eprintln!("[bifrost-lsp] ignoring initializationOptions.{key} that is not a boolean");
+            false
+        }
+        None => false,
+    }
+}
+
+fn strict_optional_boolean(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<bool, String> {
+    match object.get(key) {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("{key} must be a boolean")),
+        None => Ok(false),
+    }
 }
 
 fn strict_optional_string_array(
@@ -2746,7 +2889,8 @@ mod tests {
         let settings = json!({
             "roots": ["source"],
             "exclude": ["target", "target"],
-            "formatterCommands": [{"include": ["*.rs"], "command": "rustfmt"}]
+            "formatterCommands": [{"include": ["*.rs"], "command": "rustfmt"}],
+            "unrecognizedSymbolDiagnostics": true
         });
 
         let direct = parse_runtime_configuration(&settings, &base).unwrap();
@@ -2756,6 +2900,7 @@ mod tests {
         assert_eq!(direct.configured_roots.len(), 1);
         assert_eq!(direct.excluded_paths, vec![base.join("target")]);
         assert_eq!(direct.formatter_commands.len(), 1);
+        assert!(direct.unrecognized_symbol_diagnostics);
     }
 
     #[test]
@@ -2769,6 +2914,7 @@ mod tests {
         assert!(configuration.configured_roots.is_empty());
         assert!(configuration.excluded_paths.is_empty());
         assert!(configuration.formatter_commands.is_empty());
+        assert!(!configuration.unrecognized_symbol_diagnostics);
     }
 
     #[test]
@@ -2786,6 +2932,11 @@ mod tests {
         )
         .expect_err("invalid formatter rule must reject the snapshot");
         assert!(formatter_error.contains("formatterCommands is invalid"));
+
+        let diagnostics_error =
+            parse_runtime_configuration(&json!({"unrecognizedSymbolDiagnostics": "yes"}), &base)
+                .expect_err("invalid diagnostics opt-in must reject the snapshot");
+        assert!(diagnostics_error.contains("unrecognizedSymbolDiagnostics must be a boolean"));
     }
 
     #[test]

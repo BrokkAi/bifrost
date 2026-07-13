@@ -188,7 +188,7 @@ fn get_definitions_by_location_descriptor() -> Value {
         "Resolve source reference sites back to workspace definition metadata from exact line/column locations. Use when line numbers are visible and you need usage-to-definition navigation without building the whole usage_graph.",
         location_references_schema(
             "Project-relative source file path containing the reference.",
-            None,
+            Some(crate::searchtools::DEFINITION_LOOKUP_MAX_REFERENCES),
         ),
     )
 }

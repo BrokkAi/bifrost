@@ -1396,6 +1396,48 @@ pub fn format_value() {}
 }
 
 #[test]
+fn rust_definition_lookup_ignores_other_language_normalized_fqn_collisions() {
+    let rust_source = "pub struct Widget;\n\nimpl Widget {\n    pub fn build() -> Self {\n        Self\n    }\n}\n";
+    let project = InlineTestProject::new()
+        .file("src/shared/mod.rs", rust_source)
+        .file(
+            "src/shared/Widget.scala",
+            "package shared\nobject Widget { def create(): Widget.type = this }\n",
+        )
+        .build();
+    let (reference_line_index, reference_line) = rust_source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.trim() == "Self")
+        .unwrap();
+
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "src/shared/mod.rs",
+                "line": reference_line_index + 1,
+                "column": column_of(reference_line, "Self")
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "shared.Widget", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/shared/mod.rs",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_grouped_use_prefix_resolves_to_module_declaration() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -3322,6 +3364,29 @@ fn type_lookup_rejects_oversized_batches() {
         .collect::<Vec<_>>()
         .join(",");
     let value = lookup_type(
+        project.root(),
+        &format!(r#"{{"references":[{references}]}}"#),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "invalid_location", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "too_many_references",
+        "{value}"
+    );
+}
+
+#[test]
+fn definition_lookup_rejects_oversized_batches() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub struct Widget;\n")
+        .build();
+
+    let references = (0..101)
+        .map(|_| r#"{"path":"lib.rs","line":1,"column":12}"#)
+        .collect::<Vec<_>>()
+        .join(",");
+    let value = lookup(
         project.root(),
         &format!(r#"{{"references":[{references}]}}"#),
     );
@@ -7411,6 +7476,72 @@ const options = { createConnection: run };
         let value = lookup(project.root(), &location_reference("app.ts", source, start));
         assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
     }
+}
+
+#[test]
+fn typescript_for_of_bindings_block_same_named_indexed_fields() {
+    let source = r#"
+class SortItem {
+  field = "indexed";
+  key = "indexed";
+  config = "indexed";
+  uid = "indexed";
+  source = "indexed";
+}
+
+function consume(...values: unknown[]) {}
+
+function render(entries: unknown[], fallback: string) {
+  for (const field of entries) {
+    consume(field);
+  }
+  for (const [key, config] of entries) {
+    consume("array", key, config);
+  }
+  for (const { key, config } of entries) {
+    consume("object", key, config);
+  }
+  for (const { uid, source: { config = fallback }, ...source } of entries) {
+    consume("nested", uid, config, source);
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", source)
+        .build();
+
+    for (marker, identifiers) in [
+        ("consume(field)", &["field"][..]),
+        ("consume(\"array\", key, config)", &["key", "config"][..]),
+        ("consume(\"object\", key, config)", &["key", "config"][..]),
+        (
+            "consume(\"nested\", uid, config, source)",
+            &["uid", "config", "source"][..],
+        ),
+    ] {
+        let line_start = source.find(marker).expect("loop-body marker");
+        for identifier in identifiers {
+            let start = line_start + marker.find(identifier).expect("identifier in marker");
+            let value = lookup(project.root(), &location_reference("app.ts", source, start));
+            let result = &value["results"][0];
+            assert_eq!(result["status"], "no_definition", "{value}");
+            assert!(result["definitions"].is_null(), "{value}");
+            assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+        }
+    }
+
+    let fallback = source
+        .find("config = fallback")
+        .expect("default initializer")
+        + "config = ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app.ts", source, fallback),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "fallback", "{value}");
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]

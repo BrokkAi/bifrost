@@ -422,17 +422,19 @@ test("builds complete runtime settings snapshots for initialization and pulls", 
     "/workspace",
     ["src", "  ", "/absolute/root"],
     ["target"],
-    [formatter]
+    [formatter],
+    true
   );
 
   assert.deepEqual(settings, {
     roots: [path.join("/workspace", "src"), "/absolute/root"],
     exclude: [path.join("/workspace", "target")],
-    formatterCommands: [formatter]
+    formatterCommands: [formatter],
+    unrecognizedSymbolDiagnostics: true
   });
   assert.deepEqual(
-    lifecycle.buildBifrostInitializationOptions("/workspace", [], [], []),
-    { roots: [], exclude: [], formatterCommands: [] }
+    lifecycle.buildBifrostInitializationOptions("/workspace", [], [], [], false),
+    { roots: [], exclude: [], formatterCommands: [], unrecognizedSymbolDiagnostics: false }
   );
 });
 

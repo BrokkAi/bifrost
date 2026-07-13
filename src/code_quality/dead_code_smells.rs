@@ -106,17 +106,15 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let resolved_file_count = resolved.files.len();
     let input_files: Vec<ProjectFile> = resolved.files.into_iter().take(input_file_cap).collect();
     let mut truncated = resolved.input_truncated || resolved_file_count > input_file_cap;
-    let selected_file_paths: HashSet<PathBuf> = input_files
-        .iter()
-        .map(|file| file.rel_path().to_path_buf())
-        .collect();
+    let selected_file_ids: HashSet<PathBuf> =
+        input_files.iter().map(canonical_file_identity).collect();
     let mut skipped: Vec<String> = Vec::new();
 
     let candidate_selection = dead_code_candidates(
         analyzer,
         &input_files,
         &params.fq_names,
-        &selected_file_paths,
+        &selected_file_ids,
         candidate_cap,
         &mut skipped,
     );
@@ -482,7 +480,7 @@ fn dead_code_candidates(
     analyzer: &dyn IAnalyzer,
     files: &[ProjectFile],
     fq_names: &[String],
-    selected_file_paths: &HashSet<PathBuf>,
+    selected_file_ids: &HashSet<PathBuf>,
     candidate_cap: usize,
     skipped: &mut Vec<String>,
 ) -> CandidateSelection {
@@ -504,8 +502,8 @@ fn dead_code_candidates(
             }
             let mut matched_any = false;
             for definition in definitions {
-                if !selected_file_paths.is_empty()
-                    && !selected_file_paths.contains(definition.source().rel_path())
+                if !selected_file_ids.is_empty()
+                    && !selected_file_ids.contains(&canonical_file_identity(definition.source()))
                 {
                     continue;
                 }
@@ -573,6 +571,34 @@ fn dead_code_candidates(
     CandidateSelection {
         candidates,
         truncated,
+    }
+}
+
+fn canonical_file_identity(file: &ProjectFile) -> PathBuf {
+    let path = file.abs_path();
+    path.canonicalize().unwrap_or(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_file_identity;
+    use crate::analyzer::ProjectFile;
+
+    #[test]
+    fn canonical_file_identity_ignores_equivalent_project_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested_root = temp.path().join("nested");
+        std::fs::create_dir(&nested_root).unwrap();
+        std::fs::write(nested_root.join("A.java"), "class A {}\n").unwrap();
+
+        let from_workspace_root = ProjectFile::new(temp.path(), "nested/A.java");
+        let from_nested_root = ProjectFile::new(&nested_root, "A.java");
+
+        assert_ne!(from_workspace_root.rel_path(), from_nested_root.rel_path(),);
+        assert_eq!(
+            canonical_file_identity(&from_workspace_root),
+            canonical_file_identity(&from_nested_root),
+        );
     }
 }
 
