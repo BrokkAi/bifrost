@@ -819,16 +819,15 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferen
         return;
     }
 
+    // A typed local needs receiver proof; keep imported namespace and static
+    // members on their cheap, exact paths below.
     if (object.kind() != "identifier" || locals.is_shadowed(object_text))
         && record_receiver_member(node, object, property, property_text, ctx)
     {
         return;
     }
 
-    if object.kind() != "identifier" {
-        return;
-    }
-    if object_text.is_empty() || locals.is_shadowed(object_text) {
+    if object.kind() != "identifier" || object_text.is_empty() || locals.is_shadowed(object_text) {
         return;
     }
 
@@ -878,12 +877,6 @@ fn handle_scoped_member(
         return;
     }
 
-    if object.kind() != "identifier"
-        && record_scoped_receiver_member(node, object, property, property_text, ctx)
-    {
-        return;
-    }
-
     if object.kind() == "identifier" {
         let object_text = slice(object, ctx.source);
         if object_text.is_empty() {
@@ -904,6 +897,10 @@ fn handle_scoped_member(
                 ctx.record(member, property);
             }
         }
+        return;
+    }
+
+    if record_scoped_receiver_member(node, object, property, property_text, ctx) {
         return;
     }
 

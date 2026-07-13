@@ -2115,40 +2115,75 @@ where
     }
 
     fn sql_definition_lookup_index(&self) -> Option<DefinitionLookupIndex> {
-        let snapshot = self.live_snapshot();
-        let mut blob_keys = Vec::new();
-        for file in snapshot.all_paths() {
-            let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
-                continue;
-            };
-            if crate::analyzer::common::language_for_file(&project_file) != self.adapter.language()
-            {
-                continue;
+        let _scope = profiling::scope("TreeSitterAnalyzer::sql_definition_lookup_index");
+        if profiling::enabled() {
+            profiling::note(format!("language={:?}", self.adapter.language()));
+        }
+        let blob_keys = {
+            let _scope = profiling::scope("definition_lookup_index::enumerate_live_keys");
+            let snapshot = self.live_snapshot();
+            let mut blob_keys = Vec::new();
+            for file in snapshot.all_paths() {
+                let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
+                    continue;
+                };
+                if crate::analyzer::common::language_for_file(&project_file)
+                    != self.adapter.language()
+                {
+                    continue;
+                }
+                let Some(oid) = snapshot.oid_for_path(file) else {
+                    continue;
+                };
+                blob_keys.push((
+                    oid,
+                    self.adapter.storage_language_key_for_file(&project_file),
+                ));
             }
-            let Some(oid) = snapshot.oid_for_path(file) else {
-                continue;
-            };
-            blob_keys.push((
-                oid,
-                self.adapter.storage_language_key_for_file(&project_file),
+            blob_keys.sort();
+            blob_keys.dedup();
+            if profiling::enabled() {
+                profiling::note(format!("live_blob_keys={}", blob_keys.len()));
+            }
+            blob_keys
+        };
+
+        let rows = {
+            let _scope = profiling::scope("definition_lookup_index::fetch_persisted_rows");
+            let rows = self
+                .store_context
+                .store
+                .definition_lookup_candidate_rows_by_keys(&blob_keys)
+                .ok()?;
+            if profiling::enabled() {
+                profiling::note(format!("persisted_rows={}", rows.len()));
+            }
+            rows
+        };
+        let mut units = {
+            let _scope = profiling::scope("definition_lookup_index::resolve_persisted_rows");
+            self.resolve_candidate_rows(rows)
+        };
+        units.retain(|unit| !unit.is_file_scope());
+        let dirty_units = {
+            let _scope = profiling::scope("definition_lookup_index::collect_dirty_units");
+            self.dirty_units_matching(true, |_| true)
+        };
+        let nonpersisted_units = {
+            let _scope = profiling::scope("definition_lookup_index::collect_nonpersisted_units");
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| !unit.is_file_scope())?
+        };
+        if profiling::enabled() {
+            profiling::note(format!(
+                "resolved_persisted_units={} dirty_units={} nonpersisted_units={}",
+                units.len(),
+                dirty_units.len(),
+                nonpersisted_units.len()
             ));
         }
-        blob_keys.sort();
-        blob_keys.dedup();
-
-        let rows = self
-            .store_context
-            .store
-            .definition_lookup_candidate_rows_by_keys(&blob_keys)
-            .ok()?;
-        let mut units = self.resolve_candidate_rows(rows);
-        units.retain(|unit| !unit.is_file_scope());
-        units.extend(self.dirty_units_matching(true, |_| true));
-        units.extend(
-            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-                !unit.is_file_scope()
-            })?,
-        );
+        units.extend(dirty_units);
+        units.extend(nonpersisted_units);
+        let _scope = profiling::scope("definition_lookup_index::build");
         Some(DefinitionLookupIndex::from_declarations(
             units.iter(),
             |fqn| self.adapter.normalize_full_name(fqn),
@@ -3243,8 +3278,17 @@ where
 
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
         self.definition_lookup_index.get_or_init(|| {
-            self.definition_lookup_index_build_count
-                .fetch_add(1, Ordering::Relaxed);
+            let _scope = profiling::scope("TreeSitterAnalyzer::definition_lookup_index_build");
+            let build_count = self
+                .definition_lookup_index_build_count
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if profiling::enabled() {
+                profiling::note(format!(
+                    "language={:?} build_count={build_count}",
+                    self.adapter.language()
+                ));
+            }
             self.sql_definition_lookup_index().unwrap_or_default()
         })
     }

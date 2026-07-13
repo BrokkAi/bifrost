@@ -21,6 +21,10 @@ const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bifrost-agents.md");
 
+pub(crate) const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
+pub(crate) const BENCHMARK_PROFILE_BOUNDARY_MARKER: &str =
+    "\n\u{1e}bifrost-benchmark-profile-boundary\u{1e}\n";
+
 pub const SEARCHTOOLS_INSTRUCTIONS: &str =
     "Analyzer-backed search tools for source code workspaces.";
 
@@ -191,6 +195,7 @@ fn dispatch_request(
     let response = match method {
         "initialize" => Ok(initialize_result(spec.instructions)),
         "ping" => Ok(json!({})),
+        BENCHMARK_PROFILE_BOUNDARY_METHOD => write_benchmark_profile_boundary(),
         "resources/list" => Ok(list_resources_result()),
         "resources/read" => handle_resource_read(params),
         "tools/list" => Ok(list_tools_result(spec)),
@@ -202,6 +207,20 @@ fn dispatch_request(
         Ok(result) => success_response(id, result),
         Err((code, message)) => error_response(id, code, message),
     }
+}
+
+fn write_benchmark_profile_boundary() -> Result<Value, (i64, String)> {
+    let mut stderr = io::stderr().lock();
+    stderr
+        .write_all(BENCHMARK_PROFILE_BOUNDARY_MARKER.as_bytes())
+        .and_then(|_| stderr.flush())
+        .map_err(|err| {
+            (
+                INTERNAL_ERROR,
+                format!("Failed to write benchmark profile boundary: {err}"),
+            )
+        })?;
+    Ok(json!({}))
 }
 
 fn handle_notification(method: &str, _params: Value) {

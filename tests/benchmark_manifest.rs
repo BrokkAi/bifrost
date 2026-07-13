@@ -245,3 +245,34 @@ scenarios = ["workspace_build"]
         "{validation}"
     );
 }
+
+#[test]
+fn manifest_validation_rejects_duplicate_repo_scenarios() {
+    let manifest = r#"
+warmup_iterations = 1
+measured_iterations = 1
+required_languages = ["java"]
+required_scenarios = ["workspace_build"]
+
+[[repos]]
+name = "gson"
+url = "https://github.com/google/gson"
+commit = "deadbeef"
+languages = ["java"]
+extensions = ["java"]
+scenarios = ["workspace_build", "workspace_build"]
+"#;
+
+    let err = BenchmarkManifest::from_toml_str(manifest).expect_err("manifest should fail");
+    let ManifestLoadError::Validation(validation) = err else {
+        panic!("expected validation error");
+    };
+
+    assert!(
+        validation
+            .messages()
+            .iter()
+            .any(|message| message.contains("duplicate scenario `workspace_build`")),
+        "{validation}"
+    );
+}
