@@ -18,6 +18,8 @@ pub fn prepare_repo(
         run_git_command(
             Command::new("git")
                 .arg("clone")
+                .args(["-c", "core.autocrlf=false"])
+                .arg("--no-checkout")
                 .arg("--filter=blob:none")
                 .arg(&target.url)
                 .arg(&checkout_path),

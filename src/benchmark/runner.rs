@@ -1059,16 +1059,16 @@ fn assert_scenario_result(
             for expected in &target.dead_code_expect_report_contains {
                 if !report.contains(expected) {
                     return Err(format!(
-                        "dead_code_smells report for `{}` did not contain expected text `{expected}`",
-                        target.name
+                        "dead_code_smells report for `{}` did not contain expected text `{expected}`\n\nActual report:\n{report}",
+                        target.name,
                     ));
                 }
             }
             for forbidden in &target.dead_code_expect_report_absent {
                 if report.contains(forbidden) {
                     return Err(format!(
-                        "dead_code_smells report for `{}` contained forbidden text `{forbidden}`",
-                        target.name
+                        "dead_code_smells report for `{}` contained forbidden text `{forbidden}`\n\nActual report:\n{report}",
+                        target.name,
                     ));
                 }
             }

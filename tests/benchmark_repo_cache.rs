@@ -40,6 +40,23 @@ fn prepare_repo_disables_autocrlf_for_deterministic_checkout_bytes() {
             .expect("autocrlf config"),
         "false"
     );
+    let checkout_bytes = fs::read(repo.workdir().expect("checkout workdir").join("lib.rs"))
+        .expect("read checked-out fixture");
+    assert_eq!(checkout_bytes, b"pub fn fixture() {}\n");
+
+    let head = repo
+        .head()
+        .expect("checkout head")
+        .peel_to_commit()
+        .unwrap();
+    let committed_oid = head
+        .tree()
+        .unwrap()
+        .get_path(Path::new("lib.rs"))
+        .unwrap()
+        .id();
+    let working_oid = git2::Oid::hash_object(git2::ObjectType::Blob, &checkout_bytes).unwrap();
+    assert_eq!(working_oid, committed_oid);
 }
 
 fn repo_target(source_root: &Path, commit: &str) -> BenchmarkRepoTarget {
