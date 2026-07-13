@@ -36,25 +36,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Temporary diagnostic matrix for the Windows dead_code_smells flake in PR #723.
+        # Restore the full platform matrix before merging.
         include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            can-test: true
-            rustflags: ''
-            test-args: '--jobs 1'
-            cargo-flags: '--features nlp'
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            can-test: true
-            rustflags: '-C target-feature=+fullfp16'
-            test-args: '--jobs 1'
-            cargo-flags: '--features nlp'
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            can-test: true
-            rustflags: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
-            test-args: ''
-            cargo-flags: '--features nlp'
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             can-test: true
@@ -67,12 +51,6 @@ jobs:
             rustflags: ''
             test-args: ''
             cargo-flags: '--features nlp'
-          - target: aarch64-linux-android
-            runner: ubuntu-latest
-            can-test: false
-            rustflags: ''
-            test-args: ''
-            cargo-flags: ''
     steps:
       - uses: actions/checkout@v5
 
@@ -143,16 +121,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Temporary diagnostic matrix for the Windows dead_code_smells flake in PR #723.
+        # Restore the full platform matrix before merging.
         include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            rustflags: ''
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            rustflags: ''
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            rustflags: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             rustflags: ''
