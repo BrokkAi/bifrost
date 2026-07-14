@@ -1,3 +1,6 @@
+#[path = "usage_graph.rs"]
+mod usage_graph;
+
 use brokk_bifrost::SearchToolsService;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -29,20 +32,35 @@ fn mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+/// Semantic expectations for a generated benchmark workspace.
+///
+/// These are deliberately not applied to `BIFROST_BENCH_REPO`, whose contents
+/// are chosen by the caller and therefore cannot have fixture-specific bounds.
+pub struct GeneratedFixtureExpectations {
+    pub minimum_nodes: usize,
+    pub minimum_edges: usize,
+    pub expected_edge_suffixes: (&'static str, &'static str),
+}
+
 /// Run the shared `usage_graph` peak-RSS benchmark harness.
 ///
 /// Point at a real checkout with `BIFROST_BENCH_REPO=/path/to/repo`; otherwise
 /// `generate_fixture` builds a synthetic workspace in a temp directory.
-pub fn run_usage_graph_peak_rss_benchmark(label: &str, generate_fixture: impl FnOnce(&Path)) {
-    let (root, _temp): (PathBuf, Option<TempDir>) = match std::env::var("BIFROST_BENCH_REPO") {
-        Ok(p) => (PathBuf::from(p), None),
-        Err(_) => {
-            let temp = TempDir::new().expect("temp dir");
-            let root = temp.path().to_path_buf();
-            generate_fixture(&root);
-            (root, Some(temp))
-        }
-    };
+pub fn run_usage_graph_peak_rss_benchmark(
+    label: &str,
+    generated_fixture_expectations: GeneratedFixtureExpectations,
+    generate_fixture: impl FnOnce(&Path),
+) {
+    let (root, _temp, is_generated_fixture): (PathBuf, Option<TempDir>, bool) =
+        match std::env::var("BIFROST_BENCH_REPO") {
+            Ok(p) => (PathBuf::from(p), None, false),
+            Err(_) => {
+                let temp = TempDir::new().expect("temp dir");
+                let root = temp.path().to_path_buf();
+                generate_fixture(&root);
+                (root, Some(temp), true)
+            }
+        };
     eprintln!("workspace: {}", root.display());
 
     let rss_start = peak_rss_bytes();
@@ -63,6 +81,24 @@ pub fn run_usage_graph_peak_rss_benchmark(label: &str, generate_fixture: impl Fn
         node_count > 0,
         "usage_graph should resolve nodes across the workspace"
     );
+    if is_generated_fixture {
+        assert!(
+            node_count >= generated_fixture_expectations.minimum_nodes,
+            "generated {label} fixture should resolve at least {} nodes, found {node_count}",
+            generated_fixture_expectations.minimum_nodes
+        );
+        assert!(
+            edge_count >= generated_fixture_expectations.minimum_edges,
+            "generated {label} fixture should resolve at least {} edges, found {edge_count}",
+            generated_fixture_expectations.minimum_edges
+        );
+        let (from_suffix, to_suffix) = generated_fixture_expectations.expected_edge_suffixes;
+        let has_expected_edge = usage_graph::find_edge(&graph, from_suffix, to_suffix).is_some();
+        assert!(
+            has_expected_edge,
+            "generated {label} fixture should contain a cross-file edge ending in {from_suffix} -> {to_suffix}; found {edge_count} edges"
+        );
+    }
 
     eprintln!("\n=== {label} usage_graph peak RSS ===");
     eprintln!("nodes: {node_count}, edges: {edge_count}");

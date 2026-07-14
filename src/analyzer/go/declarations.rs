@@ -50,17 +50,45 @@ pub(crate) fn determine_go_package_name(root: Node<'_>, source: &str) -> String 
     String::new()
 }
 
+/// Collect every import declaration from a Go source tree.
+///
+/// Both the persisted analyzer and whole-workspace usage graph need the same
+/// structured import facts. Keeping the AST extraction here prevents the graph
+/// index from having to reconstruct import aliases from source text later.
+pub(crate) fn collect_go_import_infos(root: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "import_declaration" {
+            collect_go_import_infos_from_declaration(child, source, &mut imports);
+        }
+    }
+    imports
+}
+
 fn visit_go_imports(
     node: Node<'_>,
     source: &str,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
+    let mut imports = Vec::new();
+    collect_go_import_infos_from_declaration(node, source, &mut imports);
+    for info in imports {
+        parsed.import_statements.push(info.raw_snippet.clone());
+        parsed.imports.push(info);
+    }
+}
+
+fn collect_go_import_infos_from_declaration(
+    node: Node<'_>,
+    source: &str,
+    imports: &mut Vec<ImportInfo>,
+) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "import_spec" {
             if let Some(info) = parse_go_import_spec(child, source) {
-                parsed.import_statements.push(info.raw_snippet.clone());
-                parsed.imports.push(info);
+                imports.push(info);
             }
             continue;
         }
@@ -70,8 +98,7 @@ fn visit_go_imports(
             if spec.kind() == "import_spec"
                 && let Some(info) = parse_go_import_spec(spec, source)
             {
-                parsed.import_statements.push(info.raw_snippet.clone());
-                parsed.imports.push(info);
+                imports.push(info);
             }
         }
     }
