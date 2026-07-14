@@ -130,21 +130,9 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Report ARM disk usage before tests
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          df -h .
-          du -sh target
-
       - name: cargo test
         if: matrix.can-test
         run: cargo test --target ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}
-
-      - name: Report ARM disk usage after tests
-        if: always() && matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          df -h .
-          du -sh target
 
   python:
     name: python (${{ matrix.target }})
