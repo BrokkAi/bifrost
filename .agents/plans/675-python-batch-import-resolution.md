@@ -47,6 +47,9 @@ resolution work.
   global index with `direct_children` on the already-resolved class. The focused
   batch regression now proves zero global-index builds and zero full declaration
   scans while factory-return coverage remains green.
+- [x] (2026-07-14) Read return types from the concrete callable's persisted ranges
+  and indexed file source. This avoids generic `get_source` re-resolving every
+  same-FQN function merely to inspect one already-selected declaration.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -119,6 +122,13 @@ resolution work.
   `global_usage_definition_index_build_count_for_test() == 0` and
   `full_declaration_scan_count_for_test() == 0`.
 
+- Observation: Once the global scan was removed, the warmed sample exposed
+  `IAnalyzer::get_source` as another broad operation: function source rendering
+  calls `definitions(fqn)` to combine overloads, which is unnecessary for return
+  inference on a concrete imported callable. Persisted declaration ranges plus the
+  indexed source provide the exact structured slice without a workspace lookup.
+  Evidence: `/private/tmp/bifrost-675-bounded-direct-children.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -177,6 +187,13 @@ resolution work.
   source-specific children are both more precise and bounded than an FQN lookup in a
   workspace-wide index. This preserves factory-return inference while removing the
   only global declaration scan in the definition-batch scope path.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Infer a concrete callable's Python return from its own persisted ranges
+  over `indexed_source`, trying ranges in source order.
+  Rationale: This preserves overload-aware behavior elsewhere in `get_source` while
+  keeping factory-return inference scoped to the declaration import resolution
+  already selected. It reuses analyzer structure and does not retain source or trees.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective

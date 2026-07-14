@@ -766,14 +766,19 @@ fn collect_imported_class_method_return_types(
 }
 
 fn callable_return_type_name(analyzer: &dyn IAnalyzer, callable: &CodeUnit) -> Option<String> {
-    let source = analyzer.get_source(callable, false)?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let function = first_function_definition(tree.root_node())?;
-    factory_return_type(function, &source)
+    let source = analyzer.indexed_source(callable.source())?;
+    let mut ranges = analyzer.ranges(callable);
+    ranges.sort_by_key(|range| range.start_byte);
+    ranges.into_iter().find_map(|range| {
+        let declaration_source = source.get(range.start_byte..range.end_byte)?;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .ok()?;
+        let tree = parser.parse(declaration_source, None)?;
+        let function = first_function_definition(tree.root_node())?;
+        factory_return_type(function, declaration_source)
+    })
 }
 
 fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
