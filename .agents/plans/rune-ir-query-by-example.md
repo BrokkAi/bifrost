@@ -18,7 +18,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 - [x] (2026-07-14 15:25Z) Documented Rune IR as the source-side representation matched by `CodeQuery`, documented both query-by-example surfaces, passed Astro content checks and the production build, and visually verified the rendered code-querying page in the in-app browser.
 - [x] (2026-07-14 12:14Z) Reviewed the complete branch diff, repaired truncation so every bounded Rune IR result remains a balanced S-expression, passed `cargo fmt --check`, 7 focused library tests, 15 REPL tests, the overlay LSP integration test, all 48 VS Code tests, and all-target/all-feature clippy with warnings denied. The full `nlp,python` test binary remains un-linkable in this local PyO3 environment as recorded below.
 - [x] (2026-07-14) Remediated guided-review findings in structural extraction and LSP: centralized the default grammar registry, preserved explicit/path-derived TSX grammar selection, rejected source above 256 KiB before parsing, removed unresolvable arena IDs from role forms, and passed 9 focused library tests plus the TSX-aware overlay LSP integration test.
-- [ ] Remediate guided-review findings in the REPL: make explicit-terminator capture independent of query delimiter validation and bound accumulated source input.
+- [x] (2026-07-14) Remediated guided-review findings in the REPL by sharing capture state with Reedline validation, making captured lines complete regardless of delimiters, and cancelling/resetting capture before it exceeds 256 KiB; all 17 REPL tests pass.
 - [ ] Remediate the duplicated VS Code source-language registry, run the focused validation matrix, and complete the post-fix review.
 
 ## Surprises & Discoveries
@@ -37,6 +37,8 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
   Evidence: `:ir tsx` on `function View() { return <div>{value}</div>; }` rendered only identifiers and generated an identifier starter, while `TypescriptAdapter::parser_language_for_file` deliberately selects the TSX grammar for `.tsx` files.
 - Observation: the interactive Reedline validator receives input before `ReplSession`, so session-local capture state cannot make malformed source lines complete.
   Evidence: an unclosed `(` keeps Reedline's query validator in multiline mode and prevents a later `:end` line from reaching `process_rune_ir_line`; capture state must be shared with validation or interactive capture must use a raw input path.
+- Observation: the sandbox PTY cannot complete Reedline's cursor-position handshake, so a direct interactive smoke cannot run in this environment.
+  Evidence: launching the real REPL under the available PTY failed with `The cursor position could not be read within a normal duration`; the regression is instead exercised through the same shared atomic capture flag, `ReplValidator`, and `ReplSession` used by the interactive path.
 
 ## Decision Log
 
@@ -174,3 +176,5 @@ Revision note (2026-07-14 12:14Z): Completed the final review and validation mil
 Revision note (2026-07-14): Reopened the plan after the merge-base guided review and added three remediation milestones covering all six confirmed findings, with the TSX and interactive-capture evidence that drives the revised design.
 
 Revision note (2026-07-14): Completed the structural/LSP remediation milestone with file-sensitive TSX parsing, a pre-parse input cap, self-contained roles, and focused Rust/LSP proof.
+
+Revision note (2026-07-14): Completed the REPL remediation milestone with capture-aware validation, bounded ingestion, reset behavior, and 17 passing binary tests; recorded the sandbox PTY limitation.

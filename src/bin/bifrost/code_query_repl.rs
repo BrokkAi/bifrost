@@ -16,6 +16,8 @@ use serde_json::Value;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const COMMANDS: &[MetadataEntry] = &[
     MetadataEntry::new(":help", "Show commands and S-expression examples."),
@@ -136,6 +138,7 @@ impl CtrlCQuitGuard {
 pub struct ReplSession {
     current_query: Option<Value>,
     rune_ir_capture: Option<RuneIrCapture>,
+    rune_ir_capture_mode: Arc<AtomicBool>,
     use_color: bool,
 }
 
@@ -150,9 +153,14 @@ impl ReplSession {
     }
 
     fn with_color(use_color: bool) -> Self {
+        Self::with_capture_mode(use_color, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_capture_mode(use_color: bool, rune_ir_capture_mode: Arc<AtomicBool>) -> Self {
         Self {
             current_query: None,
             rune_ir_capture: None,
+            rune_ir_capture_mode,
             use_color,
         }
     }
@@ -284,6 +292,7 @@ impl ReplSession {
             language,
             source: String::new(),
         });
+        self.rune_ir_capture_mode.store(true, Ordering::Relaxed);
         (
             ReplFlow::Continue,
             format!(
@@ -295,10 +304,28 @@ impl ReplSession {
 
     fn process_rune_ir_line(&mut self, line: &str) -> (ReplFlow, String) {
         if line.trim() != ":end" {
+            let input_limit = RuneIrLimits::default().max_input_bytes;
             let capture = self
                 .rune_ir_capture
                 .as_mut()
                 .expect("capture checked above");
+            let separator_bytes = usize::from(!capture.source.is_empty());
+            if capture
+                .source
+                .len()
+                .saturating_add(separator_bytes)
+                .saturating_add(line.len())
+                > input_limit
+            {
+                self.rune_ir_capture = None;
+                self.rune_ir_capture_mode.store(false, Ordering::Relaxed);
+                return (
+                    ReplFlow::Continue,
+                    format!(
+                        "error: Rune IR source exceeds the {input_limit}-byte input limit; capture cancelled"
+                    ),
+                );
+            }
             if !capture.source.is_empty() {
                 capture.source.push('\n');
             }
@@ -307,6 +334,7 @@ impl ReplSession {
         }
 
         let capture = self.rune_ir_capture.take().expect("capture checked above");
+        self.rune_ir_capture_mode.store(false, Ordering::Relaxed);
         let result = render_source_rune_ir(
             capture.language,
             &capture.source,
@@ -372,9 +400,10 @@ impl LazySearchService {
 }
 
 fn run_interactive(service: &mut LazySearchService) -> Result<(), String> {
-    let mut line_editor = configured_reedline();
+    let rune_ir_capture_mode = Arc::new(AtomicBool::new(false));
+    let mut line_editor = configured_reedline(Arc::clone(&rune_ir_capture_mode));
     let prompt = DefaultPrompt::default();
-    let mut session = ReplSession::with_color(should_colorize_repl());
+    let mut session = ReplSession::with_capture_mode(should_colorize_repl(), rune_ir_capture_mode);
     let mut ctrl_c_quit = CtrlCQuitGuard::default();
     println!("{}", welcome_text());
     loop {
@@ -474,7 +503,7 @@ fn accumulate_scripted_input(pending_query: &mut String, line: &str) -> Option<S
     }
 }
 
-fn configured_reedline() -> Reedline {
+fn configured_reedline(rune_ir_capture_mode: Arc<AtomicBool>) -> Reedline {
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
         KeyModifiers::NONE,
@@ -490,7 +519,9 @@ fn configured_reedline() -> Reedline {
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
         .with_highlighter(Box::new(ReplHighlighter))
-        .with_validator(Box::new(ReplValidator))
+        .with_validator(Box::new(ReplValidator {
+            rune_ir_capture_mode,
+        }))
         .with_hinter(Box::new(DefaultHinter::default()));
     if let Some(path) = prepare_history_path()
         && let Ok(history) = FileBackedHistory::with_file(1000, path)
@@ -1026,11 +1057,13 @@ fn completion_prefix(line: &str, pos: usize) -> (usize, &str) {
     (start, &line[start..pos])
 }
 
-struct ReplValidator;
+struct ReplValidator {
+    rune_ir_capture_mode: Arc<AtomicBool>,
+}
 
 impl Validator for ReplValidator {
     fn validate(&self, line: &str) -> ValidationResult {
-        if balanced_delimiters(line) {
+        if self.rune_ir_capture_mode.load(Ordering::Relaxed) || balanced_delimiters(line) {
             ValidationResult::Complete
         } else {
             ValidationResult::Incomplete
@@ -1200,6 +1233,49 @@ mod tests {
     }
 
     #[test]
+    fn rune_ir_capture_rejects_oversized_input_and_resets() {
+        let mut session = ReplSession::new();
+        session.process_line(":ir rust", None);
+        let oversized = "x".repeat(RuneIrLimits::default().max_input_bytes + 1);
+        let (_, output) = session.process_line(&oversized, None);
+
+        assert!(output.contains("input limit"), "{output}");
+        assert!(output.contains("capture cancelled"), "{output}");
+        assert!(!session.is_capturing_rune_ir());
+        assert!(!session.rune_ir_capture_mode.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rune_ir_capture_bypasses_query_delimiter_validation() {
+        let capture_mode = Arc::new(AtomicBool::new(false));
+        let validator = ReplValidator {
+            rune_ir_capture_mode: Arc::clone(&capture_mode),
+        };
+        let mut session = ReplSession::with_capture_mode(false, capture_mode);
+
+        assert!(matches!(
+            validator.validate("fn broken("),
+            ValidationResult::Incomplete
+        ));
+        session.process_line(":ir rust", None);
+        assert!(matches!(
+            validator.validate("fn broken("),
+            ValidationResult::Complete
+        ));
+        session.process_line("fn broken(", None);
+        assert!(matches!(
+            validator.validate(":end"),
+            ValidationResult::Complete
+        ));
+        let (_, output) = session.process_line(":end", None);
+        assert!(!session.is_capturing_rune_ir());
+        assert!(
+            !output.is_empty(),
+            "capture should finish with a result or actionable error"
+        );
+    }
+
+    #[test]
     fn code_query_repl_examples_all_parse() {
         for example in EXAMPLES {
             parse_query_input(example.query)
@@ -1238,7 +1314,9 @@ mod tests {
 
     #[test]
     fn code_query_repl_validator_accepts_multiline_until_balanced() {
-        let validator = ReplValidator;
+        let validator = ReplValidator {
+            rune_ir_capture_mode: Arc::new(AtomicBool::new(false)),
+        };
         assert!(matches!(
             validator.validate(r#"(call :callee (name "eval")"#),
             ValidationResult::Incomplete
