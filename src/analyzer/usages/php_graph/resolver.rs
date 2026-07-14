@@ -4,8 +4,9 @@ use crate::analyzer::{
     resolve_php_type,
 };
 use crate::cancellation::CancellationToken;
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
+use std::cell::RefCell;
 use tree_sitter::Node;
 
 pub(super) enum TargetKind {
@@ -74,6 +75,7 @@ impl TargetSpec {
 pub(super) struct PhpHierarchyIndex {
     owner_fq_name: Option<String>,
     owner_is_interface: bool,
+    subtype_matches: RefCell<HashMap<String, bool>>,
 }
 
 impl PhpHierarchyIndex {
@@ -85,15 +87,28 @@ impl PhpHierarchyIndex {
         Self {
             owner_fq_name: Some(owner_fq_name),
             owner_is_interface: php.is_interface(owner),
+            subtype_matches: RefCell::default(),
         }
     }
 
     fn is_subtype(&self, php: &PhpAnalyzer, receiver_fq_name: &str, owner: &str) -> bool {
-        self.owner_fq_name.as_deref() == Some(owner)
-            && php
-                .definitions(receiver_fq_name)
-                .filter(CodeUnit::is_class)
-                .any(|unit| class_is_subtype_of_owner(php, &unit, owner))
+        if self.owner_fq_name.as_deref() != Some(owner) {
+            return false;
+        }
+        // A usage scan visits the same receiver types at many call sites. Keep
+        // the scoped proof lazy, but perform each persisted definition lookup
+        // and ancestry walk at most once per query.
+        if let Some(result) = self.subtype_matches.borrow().get(receiver_fq_name) {
+            return *result;
+        }
+        let result = php
+            .definitions(receiver_fq_name)
+            .filter(CodeUnit::is_class)
+            .any(|unit| class_is_subtype_of_owner(php, &unit, owner));
+        self.subtype_matches
+            .borrow_mut()
+            .insert(receiver_fq_name.to_string(), result);
+        result
     }
 
     pub(super) fn overriding_methods(
