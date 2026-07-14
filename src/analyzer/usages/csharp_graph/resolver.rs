@@ -6,8 +6,8 @@ use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
     csharp_as_expression_type_operand, csharp_callable_arity, csharp_conditional_member_access,
     csharp_member_name, csharp_method_generic_arity, csharp_normalize_full_name,
-    csharp_signature_arity, csharp_signature_return_type, csharp_source_identifier,
-    csharp_type_node_identity, csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_signature_return_type, csharp_source_identifier, csharp_type_node_identity,
+    csharp_using_directive_is_global, csharp_using_directive_is_static,
     csharp_using_directive_namespace, csharp_using_directive_target, resolve_analyzer,
 };
 use crate::hash::HashSet;
@@ -75,10 +75,6 @@ impl TargetSpec {
     pub(super) fn accepts_explicit_generic_arity(&self, arity: Option<usize>) -> bool {
         arity.is_none_or(|arity| self.generic_arity == Some(arity))
     }
-}
-
-pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> usize {
-    csharp_signature_arity(signature)
 }
 
 pub(in crate::analyzer::usages) fn seed_visible_bindings_at(
@@ -502,7 +498,7 @@ fn type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Vec<Code
 
 pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
     csharp: &CSharpAnalyzer,
-    file: &ProjectFile,
+    _file: &ProjectFile,
     owner: &CodeUnit,
     member_name: &str,
 ) -> Option<String> {
@@ -512,8 +508,14 @@ pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
         .into_iter()
         .filter(|unit| unit.is_field() && unit.fq_name() == member_fqn)
         .filter_map(|unit| {
-            member_declared_type(csharp, &unit)
-                .and_then(|type_text| resolve_member_type_fq_name(csharp, file, owner, &type_text))
+            let declared_type = csharp
+                .signature_metadata(&unit)
+                .into_iter()
+                .find_map(|metadata| metadata.return_type_text().map(str::to_string))
+                .or_else(|| member_declared_type(csharp, &unit));
+            declared_type.as_deref().and_then(|type_text| {
+                resolve_member_type_fq_name(csharp, unit.source(), owner, type_text)
+            })
         })
         .next()
 }
@@ -541,29 +543,23 @@ pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
     .into_iter()
     .filter(|unit| unit.is_function())
     .filter_map(|unit| {
-        let facts = csharp.usage_facts_index().fact_for_declaration(&unit);
-        let callable_arity = facts
-            .and_then(|facts| facts.callable_arity)
-            .unwrap_or_else(|| {
-                CallableArity::exact(
-                    facts
-                        .and_then(|facts| facts.arity)
-                        .unwrap_or_else(|| signature_arity(unit.signature())),
-                )
-            });
+        let callable_arity = csharp_callable_arity(csharp, &unit);
         if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
             return None;
         }
-        let metadata = explicit_type_arguments.map(|_| csharp.signature_metadata(&unit));
-        if let Some(substituted) = metadata.as_deref().and_then(|metadata| {
-            substituted_method_type_parameter(metadata, explicit_type_arguments)
-        }) {
+        let metadata = csharp.signature_metadata(&unit);
+        if let Some(substituted) = (!metadata.is_empty())
+            .then_some(metadata.as_slice())
+            .and_then(|metadata| {
+                substituted_method_type_parameter(metadata, explicit_type_arguments)
+            })
+        {
             return Some(substituted);
         }
-        if let Some(return_type) = facts.and_then(|facts| facts.return_type_fqn.clone()) {
-            return Some(return_type);
-        }
-        let declared_type = method_return_type(csharp, &unit)?;
+        let declared_type = metadata
+            .iter()
+            .find_map(|metadata| metadata.return_type_text().map(str::to_string))
+            .or_else(|| method_return_type(csharp, &unit))?;
         let declaring_owner = csharp.parent_of(&unit).unwrap_or_else(|| owner.clone());
         resolve_member_type_fq_name(csharp, unit.source(), &declaring_owner, &declared_type)
     })
@@ -1421,7 +1417,7 @@ pub(super) fn nearest_member_candidates_for_owner(
     name: &str,
     explicit_generic_arity: Option<usize>,
 ) -> Vec<CodeUnit> {
-    let hierarchy = analyzer.type_hierarchy_provider();
+    let mut hierarchy = None;
     let mut seen = HashSet::default();
     let mut level = csharp.partial_type_parts(owner);
     if level.is_empty() {
@@ -1452,6 +1448,9 @@ pub(super) fn nearest_member_candidates_for_owner(
         members.dedup();
         if !members.is_empty() {
             return members;
+        }
+        if hierarchy.is_none() {
+            hierarchy = analyzer.type_hierarchy_provider();
         }
         let mut next_level = Vec::new();
         if let Some(hierarchy) = hierarchy {

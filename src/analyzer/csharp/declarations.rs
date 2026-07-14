@@ -1,6 +1,7 @@
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata,
+    csharp_type_node_identity,
 };
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -607,6 +608,7 @@ fn csharp_constructor_skeleton(node: Node<'_>, source: &str) -> String {
 fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
     let callable_arity = csharp_callable_arity(node);
     let type_parameters = csharp_method_type_parameters(node, source);
+    let return_type_text = csharp_return_type_text(node, source);
     let bare_return_type_parameter =
         csharp_bare_return_type_parameter(node, source, &type_parameters);
     let parameter_text = csharp_rendered_parameter_text(node, source);
@@ -614,6 +616,7 @@ fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
         return SignatureMetadata::new(signature, Vec::new())
             .with_callable_arity(callable_arity)
             .with_type_parameters(type_parameters)
+            .with_return_type_text(return_type_text)
             .with_bare_return_type_parameter(bare_return_type_parameter);
     };
     let parameters_end = parameters_start + parameter_text.len();
@@ -636,7 +639,15 @@ fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
     SignatureMetadata::new(signature, parameters)
         .with_callable_arity(callable_arity)
         .with_type_parameters(type_parameters)
+        .with_return_type_text(return_type_text)
         .with_bare_return_type_parameter(bare_return_type_parameter)
+}
+
+fn csharp_return_type_text(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("returns")
+        .or_else(|| node.child_by_field_name("return_type"))
+        .map(|return_type| csharp_type_node_identity(return_type, source))
+        .filter(|return_type| !return_type.is_empty())
 }
 
 fn csharp_bare_return_type_parameter(

@@ -306,6 +306,7 @@ pub(crate) fn resolve_call_reference_definition_with_source(
 }
 
 struct DefinitionBatchContext<'a> {
+    analyzer: &'a dyn IAnalyzer,
     bounded_support: AnalyzerDefinitionLookup<'a>,
     rust_support: Option<rust::AnalyzerRustDefinitionProvider<'a>>,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
@@ -320,6 +321,7 @@ struct DefinitionBatchContext<'a> {
 impl<'a> DefinitionBatchContext<'a> {
     fn new(analyzer: &'a dyn IAnalyzer, cache_rust_lookups: bool) -> Self {
         Self {
+            analyzer,
             bounded_support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             rust_support: resolve_analyzer::<RustAnalyzer>(analyzer)
                 .map(|rust| rust::AnalyzerRustDefinitionProvider::new(rust, cache_rust_lookups)),

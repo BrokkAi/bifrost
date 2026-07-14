@@ -729,7 +729,7 @@ fn jsts_exact_dotted_candidates(
 
 fn ts_exact_global_dotted_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     reference: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
@@ -1200,7 +1200,7 @@ fn jsts_member_candidates(
 
 fn jsts_file_scoped_member_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
     value_position: bool,
