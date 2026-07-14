@@ -21,6 +21,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
 use tree_sitter::{Node, Parser, Tree};
 
+type NamespacePackages = (HashMap<String, Vec<String>>, Vec<String>);
+
 pub(crate) struct ParsedFile {
     pub(super) source: Arc<String>,
     pub(super) tree: Tree,
@@ -235,7 +237,7 @@ pub(crate) struct GoEdgeIndex {
     type_units: Vec<CodeUnit>,
     direct_member_fqns: HashMap<String, HashMap<String, Vec<String>>>,
     embedded_field_type_fqns: HashMap<String, Vec<String>>,
-    namespace_packages_by_file: HashMap<ProjectFile, (HashMap<String, Vec<String>>, Vec<String>)>,
+    namespace_packages_by_file: HashMap<ProjectFile, NamespacePackages>,
 }
 
 impl GoEdgeIndex {
@@ -253,10 +255,7 @@ impl GoEdgeIndex {
 
     /// See [`GoProjectGraph::namespace_packages`]; resolves target package names
     /// from the tree-free per-file map instead of retained parse trees.
-    pub(super) fn namespace_packages(
-        &self,
-        file: &ProjectFile,
-    ) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    pub(super) fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
         self.namespace_packages_by_file
             .get(file)
             .cloned()
@@ -634,7 +633,7 @@ fn namespace_packages_from(
     dir_index: &ParentDirIndex,
     module_path: Option<&str>,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
-) -> (HashMap<String, Vec<String>>, Vec<String>) {
+) -> NamespacePackages {
     let imports = analyzer.import_info_of(file);
     namespace_packages_from_imports(&imports, dir_index, module_path, target_package_name)
 }
@@ -644,7 +643,7 @@ fn namespace_packages_from_imports(
     dir_index: &ParentDirIndex,
     module_path: Option<&str>,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
-) -> (HashMap<String, Vec<String>>, Vec<String>) {
+) -> NamespacePackages {
     let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
     let mut dot_imports: Vec<String> = Vec::new();
     for import in imports {
@@ -702,7 +701,7 @@ pub(crate) fn resolve_go_import_namespaces(
     analyzer: &GoAnalyzer,
     file: &ProjectFile,
     package_names: &HashMap<ProjectFile, String>,
-) -> (HashMap<String, Vec<String>>, Vec<String>) {
+) -> NamespacePackages {
     let dir_index = build_parent_dir_index(package_names.keys());
     let module_path = read_go_module_path(file.root());
     namespace_packages_from(
