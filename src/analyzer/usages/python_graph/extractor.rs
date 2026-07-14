@@ -163,6 +163,7 @@ pub(super) fn scan_files_for_seeds(
             source_str,
             tree_ref.root_node(),
         );
+        let scope_range_index = build_scope_range_index(analyzer, &scope_facts);
 
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
@@ -181,6 +182,7 @@ pub(super) fn scan_files_for_seeds(
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
             local_conflicts: &local_conflicts,
             scope_facts: &scope_facts,
+            scope_range_index: &scope_range_index,
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
@@ -234,8 +236,67 @@ pub(super) struct ScanCtx<'a> {
     member_best_effort_unique: bool,
     local_conflicts: &'a HashSet<String>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    scope_range_index: &'a [ScopeRangeEntry],
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
+}
+
+struct ScopeRangeEntry {
+    range: Range,
+    scope: CodeUnit,
+    prefix_max_end: usize,
+}
+
+fn build_scope_range_index(
+    analyzer: &dyn IAnalyzer,
+    scope_facts: &HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+) -> Vec<ScopeRangeEntry> {
+    let mut entries = scope_facts
+        .keys()
+        .flat_map(|scope| {
+            analyzer
+                .ranges(scope)
+                .into_iter()
+                .map(|range| ScopeRangeEntry {
+                    range,
+                    scope: scope.clone(),
+                    prefix_max_end: 0,
+                })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.range
+            .start_byte
+            .cmp(&right.range.start_byte)
+            .then_with(|| right.range.end_byte.cmp(&left.range.end_byte))
+            .then_with(|| left.scope.cmp(&right.scope))
+    });
+    let mut max_end = 0;
+    for entry in &mut entries {
+        max_end = max_end.max(entry.range.end_byte);
+        entry.prefix_max_end = max_end;
+    }
+    entries
+}
+
+fn indexed_scope_facts<'a>(
+    scope_range_index: &[ScopeRangeEntry],
+    scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    node: Node<'_>,
+) -> Option<&'a LocalBindingsSnapshot<String>> {
+    let mut cursor =
+        scope_range_index.partition_point(|entry| entry.range.start_byte <= node.start_byte());
+    while cursor > 0 {
+        cursor -= 1;
+        let entry = &scope_range_index[cursor];
+        if entry.prefix_max_end < node.end_byte() {
+            return None;
+        }
+        if entry.range.end_byte >= node.end_byte() {
+            return scope_facts.get(&entry.scope);
+        }
+    }
+    None
 }
 
 /// The per-function receiver-type facts enclosing `node`, if any. Shared by the
@@ -259,7 +320,7 @@ pub(in crate::analyzer::usages) fn enclosing_scope_facts<'a>(
 
 impl ScanCtx<'_> {
     fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&LocalBindingsSnapshot<String>> {
-        enclosing_scope_facts(self.analyzer, self.file, self.scope_facts, node)
+        indexed_scope_facts(self.scope_range_index, self.scope_facts, node)
     }
 
     fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {

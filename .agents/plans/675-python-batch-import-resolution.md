@@ -61,6 +61,9 @@ resolution work.
 - [x] (2026-07-14) Resolve Python base classes from the specific binder entry
   instead of resolving every import in the declaring file during inverse receiver
   hierarchy checks.
+- [x] (2026-07-14) Index the already-collected per-file scope-fact ranges for
+  inverse scanning instead of rediscovering the enclosing code unit for every AST
+  candidate.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -184,6 +187,13 @@ resolution work.
   already-fixed definition-batch context.
   Evidence: `/private/tmp/bifrost-675-full-acceptance-post-empty.sample.txt`.
 
+- Observation: The targeted hierarchy binder removed generic import resolution
+  from the scaled sample and reduced `resolve_base_class` to negligible work. The
+  next dominant stack was `binds_target -> enclosing_scope_facts ->
+  enclosing_code_unit`, even though `scan_files_for_seeds` had already built a map
+  of the relevant per-function facts for that file.
+  Evidence: `/private/tmp/bifrost-675-full-acceptance-binder.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -285,6 +295,15 @@ resolution work.
   resolution followed by the existing direct-definition fallback. Local and
   unresolved bases retain their prior fallbacks, while unrelated imports are never
   materialized.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Build a scan-local interval index from the persisted ranges of the
+  `CodeUnit`s already present in `scope_facts`.
+  Rationale: Candidate nodes only need to select one of those facts, not ask the
+  analyzer to search every declaration and reload its ranges. Sorting once by start
+  byte plus a prefix maximum end supports nested scopes and fast rejection outside
+  any function. The index stores only ranges and `CodeUnit`s for one file scan; it
+  retains no source or tree state.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective
