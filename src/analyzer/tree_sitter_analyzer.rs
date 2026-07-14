@@ -794,8 +794,8 @@ pub struct TreeSitterAnalyzer<A> {
     transient_file_states: Arc<Mutex<FileStateCache>>,
     source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
-    global_usage_definition_index: Arc<OnceLock<GlobalUsageDefinitionIndex>>,
-    usage_facts_index: Arc<OnceLock<UsageFactsIndex>>,
+    global_usage_definition_index: Arc<OnceLock<Arc<GlobalUsageDefinitionIndex>>>,
+    usage_facts_index: Arc<OnceLock<Arc<UsageFactsIndex>>>,
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
@@ -3336,13 +3336,36 @@ where
     /// map clone; used by per-query views that must outlive a borrow of the
     /// analyzer (e.g. Scala's `ProjectTypes` behind `Arc` caches).
     pub(crate) fn global_usage_definition_index_shared(&self) -> Arc<GlobalUsageDefinitionIndex> {
-        Arc::new(self.global_usage_definition_index().clone())
+        Arc::clone(self.global_usage_definition_index_handle())
     }
 
     /// Owned handle to the derived callable-facts index; see
     /// [`Self::global_usage_definition_index_shared`].
     pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
-        Arc::new(self.usage_facts_index().clone())
+        Arc::clone(self.usage_facts_index_handle())
+    }
+
+    fn global_usage_definition_index_handle(&self) -> &Arc<GlobalUsageDefinitionIndex> {
+        self.global_usage_definition_index.get_or_init(|| {
+            let _scope =
+                profiling::scope("TreeSitterAnalyzer::global_usage_definition_index_build");
+            let build_count = self
+                .global_usage_definition_index_build_count
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if profiling::enabled() {
+                profiling::note(format!(
+                    "language={:?} build_count={build_count}",
+                    self.adapter.language()
+                ));
+            }
+            Arc::new(self.sql_global_usage_definition_index().unwrap_or_default())
+        })
+    }
+
+    fn usage_facts_index_handle(&self) -> &Arc<UsageFactsIndex> {
+        self.usage_facts_index
+            .get_or_init(|| Arc::new(self.build_usage_facts_index()))
     }
 
     fn build_usage_facts_index(&self) -> UsageFactsIndex {
@@ -3624,21 +3647,7 @@ where
     }
 
     fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
-        self.global_usage_definition_index.get_or_init(|| {
-            let _scope =
-                profiling::scope("TreeSitterAnalyzer::global_usage_definition_index_build");
-            let build_count = self
-                .global_usage_definition_index_build_count
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            if profiling::enabled() {
-                profiling::note(format!(
-                    "language={:?} build_count={build_count}",
-                    self.adapter.language()
-                ));
-            }
-            self.sql_global_usage_definition_index().unwrap_or_default()
-        })
+        self.global_usage_definition_index_handle().as_ref()
     }
 
     fn reset_global_usage_definition_index_build_count_for_test(&self) {
@@ -3683,8 +3692,7 @@ where
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.usage_facts_index
-            .get_or_init(|| self.build_usage_facts_index())
+        self.usage_facts_index_handle().as_ref()
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -4605,6 +4613,59 @@ mod tests {
         );
         assert_eq!(analyzer.full_hydration_count_for_test(), 0);
         assert_eq!(analyzer.bulk_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn shared_usage_indices_reuse_generation_allocations_and_reset_on_update() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/demo/Service.java");
+        file.write("package demo; class Service { String before() { return \"before\"; } }\n")
+            .expect("java source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        analyzer.reset_global_usage_definition_index_build_count_for_test();
+
+        let first_definitions = analyzer.global_usage_definition_index_shared();
+        let first_facts = analyzer.usage_facts_index_shared();
+        let second_definitions = analyzer.global_usage_definition_index_shared();
+        let second_facts = analyzer.usage_facts_index_shared();
+        let cloned = analyzer.clone();
+        let cloned_definitions = cloned.global_usage_definition_index_shared();
+        let cloned_facts = cloned.usage_facts_index_shared();
+
+        assert!(Arc::ptr_eq(&first_definitions, &second_definitions));
+        assert!(Arc::ptr_eq(&first_facts, &second_facts));
+        assert!(Arc::ptr_eq(&first_definitions, &cloned_definitions));
+        assert!(Arc::ptr_eq(&first_facts, &cloned_facts));
+        assert_eq!(
+            analyzer.global_usage_definition_index_build_count_for_test(),
+            1
+        );
+        assert_eq!(first_definitions.fqn("demo.Service.before").len(), 1);
+        assert!(!first_facts.facts("demo.Service.before").is_empty());
+
+        file.write("package demo; class Service { String after() { return \"after\"; } }\n")
+            .expect("updated java source");
+        let updated = analyzer.update(&BTreeSet::from([file]));
+        let updated_definitions = updated.global_usage_definition_index_shared();
+        let updated_facts = updated.usage_facts_index_shared();
+
+        assert!(!Arc::ptr_eq(&first_definitions, &updated_definitions));
+        assert!(!Arc::ptr_eq(&first_facts, &updated_facts));
+        assert_eq!(
+            updated.global_usage_definition_index_build_count_for_test(),
+            1
+        );
+        assert_eq!(first_definitions.fqn("demo.Service.before").len(), 1);
+        assert!(first_definitions.fqn("demo.Service.after").is_empty());
+        assert!(!first_facts.facts("demo.Service.before").is_empty());
+        assert!(first_facts.facts("demo.Service.after").is_empty());
+        assert!(updated_definitions.fqn("demo.Service.before").is_empty());
+        assert_eq!(updated_definitions.fqn("demo.Service.after").len(), 1);
+        assert!(updated_facts.facts("demo.Service.before").is_empty());
+        assert!(!updated_facts.facts("demo.Service.after").is_empty());
     }
 
     #[test]
