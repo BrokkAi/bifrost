@@ -3,7 +3,8 @@
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, PatternField, QueryField, QueryStepField,
-    RqlForm, RqlFormClass, RqlProperty, StringPredicateField,
+    RqlForm, RqlFormClass, RqlProperty, StringPredicateField, reference_kind_from_label,
+    usage_proof_from_label, usage_surface_from_label,
 };
 use super::sexp::query_to_json;
 use super::syntax::{Expr, ExprKind, parse_rql};
@@ -635,6 +636,9 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
                 ),
             ),
         },
+        RqlForm::ReferencesOf | RqlForm::UsedBy | RqlForm::Uses => {
+            validate_reference_wrapper(form, args, query, analysis);
+        }
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -644,6 +648,137 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
         | RqlForm::NotKind => unreachable!("predicate cannot be a query wrapper"),
     }
     validate_rql_query(query, path, analysis);
+}
+
+fn validate_reference_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
+    let options = &args[..args.len().saturating_sub(1)];
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .map_or_else(|| query.range.clone(), |arg| arg.range.clone()),
+            "wrong-value-shape",
+            format!(
+                "{} expects option/value pairs followed by a query",
+                form.label()
+            ),
+        );
+        return;
+    }
+
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let key = &pair[0];
+        let value = &pair[1];
+        let Some(label) = key.as_symbol().and_then(|symbol| symbol.strip_prefix(':')) else {
+            analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                "reference traversal option names must be keywords",
+            );
+            continue;
+        };
+        let canonical = label.replace('-', "_");
+        if !seen.insert(canonical.clone()) {
+            analysis.error(
+                key.range.clone(),
+                "duplicate-property",
+                format!("duplicate reference traversal option '{label}'"),
+            );
+            continue;
+        }
+        match canonical.as_str() {
+            "reference_kinds" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":reference-kinds [kind ...]",
+                    QueryStepField::ReferenceKinds.description(),
+                );
+                validate_rql_reference_kinds(value, analysis);
+            }
+            "proof" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":proof proven | unproven",
+                    QueryStepField::Proof.description(),
+                );
+                validate_rql_reference_scalar(value, "proof", usage_proof_from_label, analysis);
+            }
+            "surface" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":surface external-usages | lsp-references",
+                    QueryStepField::Surface.description(),
+                );
+                validate_rql_reference_scalar(value, "surface", usage_surface_from_label, analysis);
+            }
+            _ => analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                "reference traversal accepts only :reference-kinds, :proof, and :surface",
+            ),
+        }
+    }
+}
+
+fn validate_rql_reference_kinds(value: &Expr, analysis: &mut Analysis) {
+    let ExprKind::Vector(items) = &value.kind else {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            "reference-kinds must be a non-empty vector",
+        );
+        return;
+    };
+    if items.is_empty() {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            "reference-kinds must be a non-empty vector",
+        );
+    }
+    for item in items {
+        let Some(label) = item.as_symbol().or_else(|| item.as_string()) else {
+            analysis.error(
+                item.range.clone(),
+                "wrong-value-shape",
+                "reference kind must be a symbol",
+            );
+            continue;
+        };
+        let canonical = label.replace('-', "_");
+        if reference_kind_from_label(&canonical).is_none() {
+            analysis.error(
+                item.range.clone(),
+                "invalid-reference-kind",
+                format!("unknown reference kind '{label}'"),
+            );
+        }
+    }
+}
+
+fn validate_rql_reference_scalar<T>(
+    value: &Expr,
+    name: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    analysis: &mut Analysis,
+) {
+    let Some(label) = value.as_symbol().or_else(|| value.as_string()) else {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            format!("{name} must be a symbol"),
+        );
+        return;
+    };
+    let canonical = label.replace('-', "_");
+    if parse(&canonical).is_none() {
+        analysis.error(
+            value.range.clone(),
+            "invalid-query-step-option",
+            format!("unknown reference traversal {name} '{label}'"),
+        );
+    }
 }
 
 fn validate_rql_pattern(expr: &Expr, path: &str, analysis: &mut Analysis) {
@@ -893,7 +1028,10 @@ fn validate_property_value(
         | super::schema::ValueShape::LanguageList
         | super::schema::ValueShape::PositiveInteger
         | super::schema::ValueShape::ResultDetail
+        | super::schema::ValueShape::ReferenceKindList
         | super::schema::ValueShape::SchemaVersion
+        | super::schema::ValueShape::UsageProof
+        | super::schema::ValueShape::UsageSurface
         | super::schema::ValueShape::TrueBoolean => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
@@ -1853,9 +1991,13 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
             .find(|(key, _)| key.get_ref() == "op")
             .and_then(|(_, child)| child.as_string());
         let hierarchy = matches!(op_label, Some("supertypes" | "subtypes"));
+        let reference_step = matches!(op_label, Some("references_of" | "used_by" | "uses"));
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
+        let mut seen_reference_kinds = false;
+        let mut seen_proof = false;
+        let mut seen_surface = false;
         let mut transitive_range = None;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
@@ -1909,10 +2051,80 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 continue;
             }
+            if field == Some(QueryStepField::ReferenceKinds) && reference_step {
+                analysis.add_help(
+                    key.range(),
+                    QueryStepField::ReferenceKinds.signature(),
+                    QueryStepField::ReferenceKinds.description(),
+                );
+                if seen_reference_kinds {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'reference_kinds'",
+                    );
+                }
+                seen_reference_kinds = true;
+                validate_json_reference_kinds(child, analysis);
+                continue;
+            }
+            if field == Some(QueryStepField::Proof) && reference_step {
+                analysis.add_help(
+                    key.range(),
+                    QueryStepField::Proof.signature(),
+                    QueryStepField::Proof.description(),
+                );
+                if seen_proof {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'proof'",
+                    );
+                }
+                seen_proof = true;
+                validate_json_reference_scalar(child, "proof", usage_proof_from_label, analysis);
+                continue;
+            }
+            if field == Some(QueryStepField::Surface) && reference_step {
+                analysis.add_help(
+                    key.range(),
+                    QueryStepField::Surface.signature(),
+                    QueryStepField::Surface.description(),
+                );
+                if seen_surface {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'surface'",
+                    );
+                }
+                seen_surface = true;
+                validate_json_reference_scalar(
+                    child,
+                    "surface",
+                    usage_surface_from_label,
+                    analysis,
+                );
+                continue;
+            }
             if field != Some(QueryStepField::Op) {
                 let candidates: Vec<_> = ALL_QUERY_STEP_FIELDS
                     .iter()
-                    .filter(|candidate| **candidate == QueryStepField::Op || hierarchy)
+                    .filter(|candidate| {
+                        **candidate == QueryStepField::Op
+                            || (hierarchy
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::Depth | QueryStepField::Transitive
+                                ))
+                            || (reference_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::ReferenceKinds
+                                        | QueryStepField::Proof
+                                        | QueryStepField::Surface
+                                ))
+                    })
                     .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))
                     .collect();
                 add_spelling_error(
@@ -1968,6 +2180,64 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 "depth and transitive are mutually exclusive",
             );
         }
+    }
+}
+
+fn validate_json_reference_kinds(value: &spanned::Value, analysis: &mut Analysis) {
+    let Some(values) = value.as_array() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "reference_kinds must be a non-empty array of strings",
+        );
+        return;
+    };
+    if values.is_empty() {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "reference_kinds must be a non-empty array of strings",
+        );
+    }
+    for item in values {
+        let Some(label) = item.as_string() else {
+            analysis.error(
+                item.range(),
+                "wrong-value-shape",
+                "reference kind must be a string",
+            );
+            continue;
+        };
+        if reference_kind_from_label(label).is_none() {
+            analysis.error(
+                item.range(),
+                "invalid-reference-kind",
+                format!("unknown reference kind '{label}'"),
+            );
+        }
+    }
+}
+
+fn validate_json_reference_scalar<T>(
+    value: &spanned::Value,
+    name: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    analysis: &mut Analysis,
+) {
+    let Some(label) = value.as_string() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            format!("{name} must be a string"),
+        );
+        return;
+    };
+    if parse(label).is_none() {
+        analysis.error(
+            value.range(),
+            "invalid-query-step-option",
+            format!("unknown reference traversal {name} '{label}'"),
+        );
     }
 }
 
@@ -2282,6 +2552,8 @@ mod tests {
             assert_eq!(&rql[help.range], token);
             assert!(!help.description.is_empty());
         }
+        let file_of_help = query_source_help_at(rql, rql.find("file-of").unwrap()).unwrap();
+        assert!(file_of_help.description.contains("reference site"));
         assert!(validate_query_source(rql).is_empty());
 
         let json = r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;
@@ -2291,6 +2563,13 @@ mod tests {
                 query_source_help_at(json, offset).unwrap_or_else(|| panic!("no help for {token}"));
             assert!(!help.description.is_empty());
         }
+        let file_of_help = query_source_help_at(json, json.find("file_of").unwrap()).unwrap();
+        assert!(file_of_help.description.contains("reference sites"));
+        assert!(
+            crate::analyzer::structural::query::schema::QueryStepOp::FileOf
+                .signature()
+                .contains("reference_site")
+        );
         assert!(validate_query_source(json).is_empty());
 
         let invalid =
@@ -2325,6 +2604,42 @@ mod tests {
             &conflicting[diagnostic.range.clone()] == "true"
                 && diagnostic.message.contains("mutually exclusive")
         }));
+    }
+
+    #[test]
+    fn reference_step_help_and_option_diagnostics_are_range_precise() {
+        let rql = "(references-of :surface external-usages :reference-kinds [field-write] :proof proven (enclosing-decl (class)))";
+        for token in ["references-of", ":surface", ":reference-kinds", ":proof"] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no reference traversal help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        for (source, token) in [
+            (
+                r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"references_of","reference_kinds":["field_guess"]}]}"#,
+                "\"field_guess\"",
+            ),
+            (
+                r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"used_by","proof":"maybe"}]}"#,
+                "\"maybe\"",
+            ),
+            (
+                r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"uses","surface":"all"}]}"#,
+                "\"all\"",
+            ),
+        ] {
+            let diagnostics = validate_query_source(source);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| &source[diagnostic.range.clone()] == token),
+                "{source}: {diagnostics:#?}"
+            );
+        }
     }
 
     #[test]

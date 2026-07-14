@@ -37,6 +37,399 @@ fn result_fq_names(value: &Value) -> Vec<String> {
 }
 
 #[test]
+fn java_reference_steps_preserve_exact_site_and_semantic_owner() {
+    let files = [
+        ("Target.java", "class Target { int status; }\n"),
+        (
+            "User.java",
+            "class User { int read(Target target) { return target.status; } }\n",
+        ),
+        (
+            "Unrelated.java",
+            "class Unrelated { int status; } class Other { int read(Unrelated value) { return value.status; } }\n",
+        ),
+    ];
+    let references = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "references_of", "proof": "proven" }
+            ],
+            "result_detail": "full"
+        }),
+    ));
+    assert_eq!(
+        references["results"].as_array().unwrap().len(),
+        1,
+        "{references}"
+    );
+    let site = &references["results"][0];
+    assert_eq!(site["result_type"], "reference_site", "{references}");
+    assert_eq!(site["path"], "User.java", "{references}");
+    assert_eq!(site["target"]["fq_name"], "Target.status", "{references}");
+    assert_eq!(
+        site["enclosing_declaration"]["fq_name"], "User.read",
+        "{references}"
+    );
+    assert_eq!(site["proof"], "proven", "{references}");
+    assert!(
+        site["provenance"][0]["steps"][2]["result"]["target_id"].is_string(),
+        "{references}"
+    );
+    assert!(
+        site["range"]["start_column"].as_u64().unwrap() > 0,
+        "{references}"
+    );
+
+    let used_by = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "used_by", "proof": "proven" }
+            ]
+        }),
+    ));
+    assert_eq!(result_fq_names(&used_by), vec!["User.read"], "{used_by}");
+    assert_eq!(
+        used_by["results"][0]["provenance"][0]["steps"][2]["via"]["result_type"], "reference_site",
+        "{used_by}"
+    );
+}
+
+#[test]
+fn java_uses_is_inverse_of_used_by_and_reference_file_composes() {
+    let files = [
+        ("Target.java", "class Target { int status; }\n"),
+        (
+            "User.java",
+            "class User { int read(Target target) { return target.status; } }\n",
+        ),
+    ];
+    let uses = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "method", "name": "read" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "uses" }
+            ]
+        }),
+    ));
+    assert!(
+        result_fq_names(&uses)
+            .iter()
+            .any(|name| name == "Target.status"),
+        "{uses}"
+    );
+    let status = uses["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["fq_name"] == "Target.status")
+        .expect("status dependency");
+    assert_eq!(
+        status["provenance"][0]["steps"][1]["via"]["target_fq_name"], "Target.status",
+        "{uses}"
+    );
+
+    let files_result = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "references_of" },
+                { "op": "file_of" }
+            ]
+        }),
+    ));
+    assert_eq!(
+        files_result["results"][0]["path"], "User.java",
+        "{files_result}"
+    );
+}
+
+#[test]
+fn java_reference_kind_filter_distinguishes_field_writes() {
+    let result = serialized(&run(
+        &[
+            ("Target.java", "class Target { int status; }\n"),
+            (
+                "User.java",
+                "class User { int update(Target target) { target.status = 1; return target.status; } }\n",
+            ),
+        ],
+        json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "references_of", "reference_kinds": ["field_write"] }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(
+        result["results"][0]["reference_kind"], "field_write",
+        "{result}"
+    );
+}
+
+#[test]
+fn java_reference_kinds_cover_type_constructor_static_super_and_inheritance() {
+    let files = [(
+        "Sample.java",
+        "class Base { static int FLAG; Base() {} void run() {} }\n\
+         class Child extends Base { void call() { super.run(); int x = Base.FLAG; Base value = new Base(); } }\n",
+    )];
+    let references_for = |target_kind: &str, target_name: &str, reference_kind: &str| {
+        serialized(&run(
+            &files,
+            json!({
+                "languages": ["java"],
+                "match": { "kind": target_kind, "name": target_name },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    {
+                        "op": "references_of",
+                        "reference_kinds": [reference_kind],
+                        "proof": "proven",
+                        "surface": "lsp_references"
+                    }
+                ]
+            }),
+        ))
+    };
+
+    for reference_kind in ["type_reference", "constructor_call", "inheritance"] {
+        let result = references_for("class", "Base", reference_kind);
+        assert!(
+            result["results"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "missing {reference_kind}: {result}"
+        );
+    }
+
+    let static_reference = serialized(&run(
+        &files,
+        json!({
+            "languages": ["java"],
+            "match": { "kind": "class", "name": "Base" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                {
+                    "op": "references_of",
+                    "reference_kinds": ["static_reference"],
+                    "proof": "proven",
+                    "surface": "lsp_references"
+                }
+            ]
+        }),
+    ));
+    assert!(
+        static_reference["results"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "{static_reference}"
+    );
+
+    let super_call = references_for("method", "run", "super_call");
+    assert!(
+        super_call["results"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "{super_call}"
+    );
+}
+
+#[test]
+fn reference_traversal_resolves_inbound_and_outbound_across_all_adapters() {
+    let cases = [
+        (
+            "python",
+            "sample.py",
+            "def target():\n    pass\n\ndef caller():\n    target()\n",
+        ),
+        (
+            "java",
+            "Sample.java",
+            "class Sample { static void target() {} static void caller() { target(); } }\n",
+        ),
+        (
+            "javascript",
+            "sample.js",
+            "function target() {}\nfunction caller() { target(); }\n",
+        ),
+        (
+            "typescript",
+            "sample.ts",
+            "function target(): void {}\nfunction caller(): void { target(); }\n",
+        ),
+        (
+            "go",
+            "sample.go",
+            "package sample\nfunc target() {}\nfunc caller() { target() }\n",
+        ),
+        (
+            "cpp",
+            "sample.cpp",
+            "void target() {}\nvoid caller() { target(); }\n",
+        ),
+        (
+            "rust",
+            "sample.rs",
+            "fn target() {}\nfn caller() { target(); }\n",
+        ),
+        (
+            "php",
+            "sample.php",
+            "<?php\nfunction target() {}\nfunction caller() { target(); }\n",
+        ),
+        (
+            "scala",
+            "Sample.scala",
+            "object Sample { def target(): Unit = (); def caller(): Unit = target() }\n",
+        ),
+        (
+            "csharp",
+            "Sample.cs",
+            "class Sample { static void target() {} static void caller() { target(); } }\n",
+        ),
+        (
+            "ruby",
+            "sample.rb",
+            "def target; end\ndef caller; target; end\n",
+        ),
+    ];
+
+    for (language, path, source) in cases {
+        let inbound = serialized(&run(
+            &[(path, source)],
+            json!({
+                "languages": [language],
+                "match": { "kind": "callable", "name": "target" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "references_of" }
+                ]
+            }),
+        ));
+        assert!(
+            inbound["results"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["target"]["fq_name"]
+                        .as_str()
+                        .is_some_and(|name| name.ends_with("target"))
+                })
+            }),
+            "missing inbound {language} reference: {inbound}"
+        );
+
+        let outbound = serialized(&run(
+            &[(path, source)],
+            json!({
+                "languages": [language],
+                "match": { "kind": "callable", "name": "caller" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "uses" }
+                ]
+            }),
+        ));
+        assert!(
+            result_fq_names(&outbound)
+                .iter()
+                .any(|name| name.ends_with("target")),
+            "missing outbound {language} reference: {outbound}"
+        );
+    }
+}
+
+#[test]
+fn reference_surface_and_proof_filters_preserve_existing_usage_semantics() {
+    let files = [(
+        "target.js",
+        "class Target { target() {} caller() { this.target(); } }\n",
+    )];
+    let query = |surface: &str, proof: &str| {
+        serialized(&run(
+            &files,
+            json!({
+                "match": { "kind": "class", "name": "Target" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "members" },
+                    {
+                        "op": "references_of",
+                        "surface": surface,
+                        "proof": proof
+                    }
+                ]
+            }),
+        ))
+    };
+    let external = query("external_usages", "proven");
+    assert!(
+        external["results"].as_array().unwrap().is_empty(),
+        "{external}"
+    );
+
+    let lsp = query("lsp_references", "proven");
+    assert_eq!(lsp["results"].as_array().unwrap().len(), 1, "{lsp}");
+    assert_eq!(lsp["results"][0]["usage_kind"], "self_receiver", "{lsp}");
+    assert_eq!(lsp["results"][0]["reference_kind"], "method_call", "{lsp}");
+
+    let unproven = query("lsp_references", "unproven");
+    assert!(
+        unproven["results"].as_array().unwrap().is_empty(),
+        "{unproven}"
+    );
+
+    let outbound = |surface: &str| {
+        serialized(&run(
+            &files,
+            json!({
+                "match": { "kind": "callable", "name": "caller" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    {
+                        "op": "uses",
+                        "surface": surface,
+                        "proof": "proven"
+                    }
+                ]
+            }),
+        ))
+    };
+    let external_outbound = outbound("external_usages");
+    assert!(
+        external_outbound["results"].as_array().unwrap().is_empty(),
+        "{external_outbound}"
+    );
+
+    let lsp_outbound = outbound("lsp_references");
+    assert_eq!(
+        result_fq_names(&lsp_outbound),
+        vec!["Target.target"],
+        "{lsp_outbound}"
+    );
+    assert_eq!(
+        lsp_outbound["results"][0]["provenance"][0]["steps"][1]["via"]["usage_kind"],
+        "self_receiver",
+        "{lsp_outbound}"
+    );
+}
+
+#[test]
 fn enclosing_decl_is_inclusive_and_excludes_file_scope() {
     let files = [(
         "app.py",
@@ -579,6 +972,86 @@ fn intermediate_budget_exhaustion_never_returns_wrong_terminal_type() {
             .filter(|diagnostic| diagnostic.message.contains("pipeline budget exhausted"))
             .count(),
         1,
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn reference_scans_charge_workspace_budgets_and_do_not_leak_intermediate_sites() {
+    let project = InlineTestProject::new()
+        .file(
+            "Sample.java",
+            "class Sample { static void target() {} static void caller() { target(); } }\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "callable", "name": "target" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "references_of" },
+            { "op": "file_of" }
+        ]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+
+    assert!(result.truncated, "{:?}", result.diagnostics);
+    assert!(
+        result.results.is_empty(),
+        "reference sites are not the declared file terminal domain"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("examining 0 references")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn inbound_reference_scan_admits_candidate_sources_before_graph_work() {
+    let target_source = "class Target { static void target() {} }\n";
+    let project = InlineTestProject::new()
+        .file("Target.java", target_source)
+        .file(
+            "User.java",
+            "class User { static void caller() { Target.target(); } }\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "where": ["Target.java"],
+        "match": { "kind": "callable", "name": "target" },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "references_of" }]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_source_bytes: target_source.len() + 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+
+    assert!(result.truncated, "{:?}", result.diagnostics);
+    assert!(result.results.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("source-byte budget truncated")),
         "{:?}",
         result.diagnostics
     );

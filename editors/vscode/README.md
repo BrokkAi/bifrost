@@ -104,6 +104,12 @@ bifrost --root <workspace-root> --lsp
 `--root` is the fallback root. VS Code still sends active workspace folders
 during LSP initialization, including multi-root workspaces.
 
+The extension also associates `.rune` files with **Bifrost Rune IR**. Running
+**Bifrost: Show Rune IR** from a supported source editor opens its preview in
+that language mode, with canonical normalized kinds, roles, metadata, spans,
+strings, and comments highlighted. The preview headings begin with `;`, so
+saved previews remain valid Rune IR documents.
+
 For large repositories, scope indexing before starting the server:
 
 ```json

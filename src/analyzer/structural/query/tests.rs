@@ -2,6 +2,7 @@ use super::*;
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::ALL_ROLES;
 use crate::analyzer::structural::{NormalizedKind, Role};
+use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use serde_json::{Value, json};
 
 fn parse(json: Value) -> Result<CodeQuery, QueryError> {
@@ -42,6 +43,67 @@ fn parses_the_issue_example_query() {
     let inside = query.inside.as_ref().expect("inside pattern");
     assert_eq!(inside.kinds, vec![NormalizedKind::Function]);
     assert_eq!(inside.capture.as_deref(), Some("enclosing_function"));
+}
+
+#[test]
+fn parses_and_canonicalizes_reference_traversal_filters() {
+    let query = parse_ok(json!({
+        "match": { "kind": "class", "name": "Target" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            {
+                "op": "references_of",
+                "reference_kinds": ["field_write", "method_call"],
+                "proof": "proven",
+                "surface": "lsp_references"
+            }
+        ]
+    }));
+    assert_eq!(
+        query.steps[1],
+        QueryStep::ReferencesOf(ReferenceTraversalFilter {
+            reference_kinds: vec![ReferenceKind::FieldWrite, ReferenceKind::MethodCall],
+            proof: Some(UsageProof::Proven),
+            surface: UsageHitSurface::LspReferences,
+        })
+    );
+    assert_eq!(
+        query.to_canonical_json()["steps"][1],
+        json!({
+            "op": "references_of",
+            "reference_kinds": ["field_write", "method_call"],
+            "proof": "proven",
+            "surface": "lsp_references"
+        })
+    );
+}
+
+#[test]
+fn reference_options_are_operation_specific_and_constrained() {
+    for (step, path) in [
+        (
+            json!({ "op": "file_of", "proof": "proven" }),
+            "steps[1].proof",
+        ),
+        (
+            json!({ "op": "uses", "reference_kinds": [] }),
+            "steps[1].reference_kinds",
+        ),
+        (
+            json!({ "op": "used_by", "proof": "maybe" }),
+            "steps[1].proof",
+        ),
+        (
+            json!({ "op": "references_of", "surface": "all" }),
+            "steps[1].surface",
+        ),
+    ] {
+        let error = error_of(json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [{ "op": "enclosing_decl" }, step]
+        }));
+        assert_eq!(error.path, path);
+    }
 }
 
 #[test]

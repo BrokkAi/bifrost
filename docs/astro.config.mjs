@@ -66,12 +66,14 @@ export default defineConfig({
               label: 'Rune Query Language',
               items: [
                 { label: 'Overview', slug: 'rune-query-language' },
+                { label: 'Rune IR', slug: 'rune-ir' },
                 { label: 'VS Code', slug: 'rql-vscode' },
                 {
                   label: 'Language Tutorials',
                   items: [
                     { label: 'Overview', slug: 'code-query-tutorials' },
                     { label: 'Import Traversal', slug: 'code-query-tutorials/import-traversal' },
+                    { label: 'Reference Traversal', slug: 'code-query-tutorials/reference-traversal' },
                     { label: 'Python', slug: 'code-query-tutorials/python' },
                     { label: 'Java', slug: 'code-query-tutorials/java' },
                     { label: 'JavaScript', slug: 'code-query-tutorials/javascript' },

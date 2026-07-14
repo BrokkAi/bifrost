@@ -38,12 +38,20 @@ import {
   releaseTargetFor
 } from "./provisioning";
 import {
+  queryResultRange,
   RqlQueryDocument,
   RqlQueryResponse,
   RqlQueryResultItem,
   runRqlQuery
 } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
+import {
+  RUNE_IR_LANGUAGE_ID,
+  RUNE_IR_SOURCE_LANGUAGE_IDS,
+  RuneIrRange,
+  RuneIrResponse,
+  showRuneIr
+} from "./rune_ir";
 import {
   RQL_QUERY_HOVER_METHOD,
   RqlValidationController,
@@ -98,6 +106,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bifrost.runRqlQuery", (resource?: vscode.Uri) =>
       runRqlQueryForEditor(resource)
     ),
+    vscode.commands.registerCommand("bifrost.showRuneIr", () => showRuneIrForEditor()),
     vscode.commands.registerCommand("bifrost.openRqlQueryResult", (result: RqlQueryResultItem) =>
       openRqlQueryResult(result)
     ),
@@ -159,6 +168,47 @@ export function activate(context: vscode.ExtensionContext): void {
   void startClient(context);
 }
 
+async function showRuneIrForEditor(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  const document = editor?.document;
+  const currentClient = client;
+  const selection = editor?.selection;
+  const selectedRange: RuneIrRange | undefined = selection && !selection.isEmpty
+    ? {
+        start: { line: selection.start.line, character: selection.start.character },
+        end: { line: selection.end.line, character: selection.end.character }
+      }
+    : undefined;
+  const position = selection
+    ? { line: selection.active.line, character: selection.active.character }
+    : undefined;
+  await showRuneIr(
+    document
+      ? { uri: document.uri.toString(), languageId: document.languageId }
+      : undefined,
+    selectedRange,
+    position,
+    {
+      isReady: () => currentClient?.state === State.Running,
+      sendRequest: (method, params) =>
+        currentClient!.sendRequest<RuneIrResponse>(method, params),
+      showError: (message) => {
+        void vscode.window.showErrorMessage(message);
+      },
+      showWarning: (message) => {
+        void vscode.window.showWarningMessage(message);
+      },
+      showDocument: async (text, languageId) => {
+        const result = await vscode.workspace.openTextDocument({
+          content: text,
+          language: languageId
+        });
+        await vscode.window.showTextDocument(result, { preview: true });
+      }
+    }
+  );
+}
+
 async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
   const document = resource
     ? await vscode.workspace.openTextDocument(resource)
@@ -194,6 +244,28 @@ async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
 async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
   const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(result.uri));
   const editor = await vscode.window.showTextDocument(document, { preview: true });
+  if (result.result_type === "reference_site") {
+    const resultRange = queryResultRange(result);
+    if (!resultRange) {
+      return;
+    }
+    const startLine = Math.min(Math.max(0, resultRange.start_line - 1), document.lineCount - 1);
+    const endLine = Math.min(Math.max(startLine, resultRange.end_line - 1), document.lineCount - 1);
+    const startColumn = Math.min(
+      Math.max(0, resultRange.start_column - 1),
+      document.lineAt(startLine).text.length
+    );
+    const endColumn = Math.min(
+      Math.max(0, resultRange.end_column - 1),
+      document.lineAt(endLine).text.length
+    );
+    const start = new vscode.Position(startLine, startColumn);
+    const end = new vscode.Position(endLine, endColumn);
+    const range = new vscode.Range(start, end);
+    editor.selection = new vscode.Selection(start, end);
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+    return;
+  }
   const resultStartLine = result.result_type === "file" ? 1 : result.start_line;
   const resultEndLine = result.result_type === "file" ? resultStartLine : result.end_line;
   const startLine = Math.min(Math.max(0, resultStartLine - 1), document.lineCount - 1);
@@ -294,20 +366,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [
-      { scheme: "file", language: "java" },
-      { scheme: "file", language: "javascript" },
-      { scheme: "file", language: "javascriptreact" },
-      { scheme: "file", language: "typescript" },
-      { scheme: "file", language: "typescriptreact" },
-      { scheme: "file", language: "rust" },
-      { scheme: "file", language: "go" },
-      { scheme: "file", language: "python" },
-      { scheme: "file", language: "c" },
-      { scheme: "file", language: "cpp" },
-      { scheme: "file", language: "csharp" },
-      { scheme: "file", language: "php" },
-      { scheme: "file", language: "scala" },
-      { scheme: "file", language: "ruby" },
+      ...RUNE_IR_SOURCE_LANGUAGE_IDS.map((language) => ({ scheme: "file", language })),
       { scheme: "file", language: RQL_LANGUAGE_ID }
     ],
     outputChannel,

@@ -4,7 +4,7 @@ use tree_sitter::Node;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReferenceCandidateRanges {
     Complete(Vec<Range>),
-    LimitExceeded { limit: usize },
+    LimitExceeded { limit: usize, ranges: Vec<Range> },
 }
 
 /// Collect grammar-derived terminal nodes that may denote source references.
@@ -17,7 +17,29 @@ pub(crate) fn reference_candidate_ranges(
     language: Language,
     limit: usize,
 ) -> ReferenceCandidateRanges {
-    collect_candidate_ranges(root, language, limit, CandidateFrontier::References)
+    collect_candidate_ranges(
+        root,
+        language,
+        limit,
+        CandidateFrontier::References,
+        &|| false,
+    )
+    .expect("non-cancellable collection cannot be cancelled")
+}
+
+pub(crate) fn reference_candidate_ranges_cancellable(
+    root: Node<'_>,
+    language: Language,
+    limit: usize,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Option<ReferenceCandidateRanges> {
+    collect_candidate_ranges(
+        root,
+        language,
+        limit,
+        CandidateFrontier::References,
+        is_cancelled,
+    )
 }
 
 /// Preserve the LSP's identifier-only token frontier. Semantic tokens resolve
@@ -28,7 +50,14 @@ pub(crate) fn semantic_token_candidate_ranges(
     language: Language,
     limit: usize,
 ) -> ReferenceCandidateRanges {
-    collect_candidate_ranges(root, language, limit, CandidateFrontier::SemanticTokens)
+    collect_candidate_ranges(
+        root,
+        language,
+        limit,
+        CandidateFrontier::SemanticTokens,
+        &|| false,
+    )
+    .expect("non-cancellable collection cannot be cancelled")
 }
 
 #[derive(Clone, Copy)]
@@ -42,10 +71,14 @@ fn collect_candidate_ranges(
     language: Language,
     limit: usize,
     frontier: CandidateFrontier,
-) -> ReferenceCandidateRanges {
+    is_cancelled: &dyn Fn() -> bool,
+) -> Option<ReferenceCandidateRanges> {
     let mut ranges = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if is_cancelled() {
+            return None;
+        }
         let compound = matches!(frontier, CandidateFrontier::References)
             && is_compound_reference_candidate(language, node.kind());
         let candidate = match frontier {
@@ -59,7 +92,9 @@ fn collect_candidate_ranges(
             && node.start_byte() < node.end_byte()
         {
             if ranges.len() == limit {
-                return ReferenceCandidateRanges::LimitExceeded { limit };
+                ranges.sort_unstable();
+                ranges.dedup();
+                return Some(ReferenceCandidateRanges::LimitExceeded { limit, ranges });
             }
             ranges.push(Range {
                 start_byte: node.start_byte(),
@@ -76,7 +111,7 @@ fn collect_candidate_ranges(
     }
     ranges.sort_unstable();
     ranges.dedup();
-    ReferenceCandidateRanges::Complete(ranges)
+    Some(ReferenceCandidateRanges::Complete(ranges))
 }
 
 fn is_semantic_token_identifier_node(language: Language, kind: &str) -> bool {

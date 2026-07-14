@@ -14,11 +14,9 @@ pub(crate) fn js_ts_tree_sitter_language_for_file(
     language: Language,
 ) -> Option<TreeSitterLanguage> {
     match language {
-        Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
-        Language::TypeScript if file.rel_path().extension().is_some_and(|ext| ext == "tsx") => {
-            Some(tree_sitter_typescript::LANGUAGE_TSX.into())
+        Language::JavaScript | Language::TypeScript => {
+            crate::analyzer::parser_language_for_path(language, file.rel_path())
         }
-        Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         _ => None,
     }
 }

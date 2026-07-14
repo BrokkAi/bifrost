@@ -139,9 +139,13 @@ pub(crate) fn walk_named_tree_preorder<'tree>(
 pub trait LanguageAdapter: Send + Sync + 'static {
     fn language(&self) -> Language;
     fn query_directory(&self) -> &'static str;
-    fn parser_language(&self) -> TsLanguage;
-    fn parser_language_for_file(&self, _file: &ProjectFile) -> TsLanguage {
-        self.parser_language()
+    fn parser_language(&self) -> TsLanguage {
+        crate::analyzer::parser_language_for(self.language())
+            .expect("analyzable language must have a registered parser grammar")
+    }
+    fn parser_language_for_file(&self, file: &ProjectFile) -> TsLanguage {
+        crate::analyzer::parser_language_for_path(self.language(), file.rel_path())
+            .expect("analyzable language must have a registered parser grammar")
     }
     fn storage_language_key_for_file(&self, _file: &ProjectFile) -> String {
         self.language().config_label().to_string()
@@ -251,7 +255,7 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// `Some` expose `query_code` support through
     /// [`crate::analyzer::structural::StructuralSearchProvider`].
     fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        None
+        crate::analyzer::structural_spec_for(self.language())
     }
 }
 

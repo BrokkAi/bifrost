@@ -1,20 +1,23 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, StringPredicate,
+    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLanguage,
+    RuneIrLimits, RuneIrSelection, StringPredicate, render_source_rune_ir,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
 use reedline::{
     ColumnarMenu, Completer, DefaultHinter, DefaultPrompt, Emacs, FileBackedHistory, Highlighter,
-    KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal,
-    Span as ReedlineSpan, StyledText, Suggestion, ValidationResult, Validator,
-    default_emacs_keybindings,
+    History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, MenuBuilder,
+    Reedline, ReedlineEvent, ReedlineMenu, SearchQuery, Signal, Span as ReedlineSpan, StyledText,
+    Suggestion, ValidationResult, Validator, default_emacs_keybindings,
 };
 use serde_json::Value;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const COMMANDS: &[MetadataEntry] = &[
     MetadataEntry::new(":help", "Show commands and S-expression examples."),
@@ -27,6 +30,10 @@ const COMMANDS: &[MetadataEntry] = &[
     MetadataEntry::new(":kinds", "List normalized structural kinds."),
     MetadataEntry::new(":roles", "List structural role fields."),
     MetadataEntry::new(":languages", "List language filter labels."),
+    MetadataEntry::new(
+        ":ir",
+        "Capture source through :end and print its Rune IR plus starter RQL.",
+    ),
     MetadataEntry::new(":json", "Print the current query as canonical JSON."),
     MetadataEntry::new(
         ":validate",
@@ -130,7 +137,15 @@ impl CtrlCQuitGuard {
 
 pub struct ReplSession {
     current_query: Option<Value>,
+    rune_ir_capture: Option<RuneIrCapture>,
+    rune_ir_capture_mode: Arc<AtomicBool>,
     use_color: bool,
+}
+
+struct RuneIrCapture {
+    language: RuneIrLanguage,
+    source: String,
+    has_lines: bool,
 }
 
 impl ReplSession {
@@ -139,8 +154,14 @@ impl ReplSession {
     }
 
     fn with_color(use_color: bool) -> Self {
+        Self::with_capture_mode(use_color, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_capture_mode(use_color: bool, rune_ir_capture_mode: Arc<AtomicBool>) -> Self {
         Self {
             current_query: None,
+            rune_ir_capture: None,
+            rune_ir_capture_mode,
             use_color,
         }
     }
@@ -150,6 +171,9 @@ impl ReplSession {
         line: &str,
         service: Option<&SearchToolsService>,
     ) -> (ReplFlow, String) {
+        if self.rune_ir_capture.is_some() {
+            return self.process_rune_ir_line(line);
+        }
         let line = line.trim();
         if line.is_empty() {
             return (ReplFlow::Continue, String::new());
@@ -207,6 +231,7 @@ impl ReplSession {
             ":kinds" => (ReplFlow::Continue, kinds_text()),
             ":roles" => (ReplFlow::Continue, roles_text()),
             ":languages" => (ReplFlow::Continue, languages_text()),
+            ":ir" => self.start_rune_ir_capture(rest.trim()),
             ":json" => match self.current_query.as_ref() {
                 Some(value) => (ReplFlow::Continue, canonical_json_text(value)),
                 None => (ReplFlow::Continue, "No current query.".to_string()),
@@ -246,6 +271,95 @@ impl ReplSession {
                 ),
             ),
         }
+    }
+
+    fn start_rune_ir_capture(&mut self, label: &str) -> (ReplFlow, String) {
+        if label.is_empty() {
+            return (
+                ReplFlow::Continue,
+                "usage: :ir <language>; finish source input with :end".to_string(),
+            );
+        }
+        let Some(language) = RuneIrLanguage::from_config_label(label) else {
+            return (
+                ReplFlow::Continue,
+                format!(
+                    "unsupported Rune IR language `{}`; use :languages to list supported labels",
+                    sanitize_terminal_text(label)
+                ),
+            );
+        };
+        self.rune_ir_capture = Some(RuneIrCapture {
+            language,
+            source: String::new(),
+            has_lines: false,
+        });
+        self.rune_ir_capture_mode.store(true, Ordering::Relaxed);
+        (
+            ReplFlow::Continue,
+            format!(
+                "Capturing {} source for Rune IR. Enter :end on its own line to render.",
+                language.config_label()
+            ),
+        )
+    }
+
+    fn process_rune_ir_line(&mut self, line: &str) -> (ReplFlow, String) {
+        if line.trim() != ":end" {
+            let input_limit = RuneIrLimits::default().max_input_bytes;
+            let capture = self
+                .rune_ir_capture
+                .as_mut()
+                .expect("capture checked above");
+            let separator_bytes = usize::from(capture.has_lines);
+            if capture
+                .source
+                .len()
+                .saturating_add(separator_bytes)
+                .saturating_add(line.len())
+                > input_limit
+            {
+                self.rune_ir_capture = None;
+                self.rune_ir_capture_mode.store(false, Ordering::Relaxed);
+                return (
+                    ReplFlow::Continue,
+                    format!(
+                        "error: Rune IR source exceeds the {input_limit}-byte input limit; capture cancelled"
+                    ),
+                );
+            }
+            if capture.has_lines {
+                capture.source.push('\n');
+            }
+            capture.source.push_str(line);
+            capture.has_lines = true;
+            return (ReplFlow::Continue, String::new());
+        }
+
+        let capture = self.rune_ir_capture.take().expect("capture checked above");
+        self.rune_ir_capture_mode.store(false, Ordering::Relaxed);
+        let result = render_source_rune_ir(
+            capture.language,
+            &capture.source,
+            RuneIrSelection::WholeSource,
+            RuneIrLimits::default(),
+        );
+        let output = match result {
+            Ok(rendered) => {
+                let rune_ir = sanitize_terminal_document(rendered.rune_ir.trim_end());
+                let starter_rql = sanitize_terminal_text(&rendered.starter_rql);
+                format!(
+                    "Rune IR ({}):\n{rune_ir}\nStarter RQL:\n{starter_rql}",
+                    capture.language.config_label()
+                )
+            }
+            Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
+        };
+        (ReplFlow::Continue, output)
+    }
+
+    fn is_capturing_rune_ir(&self) -> bool {
+        self.rune_ir_capture.is_some()
     }
 }
 
@@ -291,9 +405,10 @@ impl LazySearchService {
 }
 
 fn run_interactive(service: &mut LazySearchService) -> Result<(), String> {
-    let mut line_editor = configured_reedline();
+    let rune_ir_capture_mode = Arc::new(AtomicBool::new(false));
+    let mut line_editor = configured_reedline(Arc::clone(&rune_ir_capture_mode));
     let prompt = DefaultPrompt::default();
-    let mut session = ReplSession::with_color(should_colorize_repl());
+    let mut session = ReplSession::with_capture_mode(should_colorize_repl(), rune_ir_capture_mode);
     let mut ctrl_c_quit = CtrlCQuitGuard::default();
     println!("{}", welcome_text());
     loop {
@@ -330,6 +445,17 @@ fn run_scripted(service: &mut LazySearchService) -> Result<(), String> {
     let mut pending_query = String::new();
     for line in stdin.lock().lines() {
         let line = line.map_err(|err| format!("Failed to read REPL input: {err}"))?;
+        if session.is_capturing_rune_ir() {
+            let (flow, output) = process_line_with_lazy_service(&mut session, &line, service)?;
+            if !output.is_empty() {
+                writeln!(stdout, "{output}")
+                    .map_err(|err| format!("Failed to write output: {err}"))?;
+            }
+            if flow == ReplFlow::Quit {
+                break;
+            }
+            continue;
+        }
         let Some(input) = accumulate_scripted_input(&mut pending_query, &line) else {
             continue;
         };
@@ -359,7 +485,7 @@ fn process_line_with_lazy_service(
     line: &str,
     service: &mut LazySearchService,
 ) -> Result<(ReplFlow, String), String> {
-    if line.trim_start().starts_with(":run") {
+    if !session.is_capturing_rune_ir() && line.trim_start().starts_with(":run") {
         let service = service.get_or_init()?;
         Ok(session.process_line(line, Some(service)))
     } else {
@@ -382,7 +508,8 @@ fn accumulate_scripted_input(pending_query: &mut String, line: &str) -> Option<S
     }
 }
 
-fn configured_reedline() -> Reedline {
+fn configured_reedline(rune_ir_capture_mode: Arc<AtomicBool>) -> Reedline {
+    let history_capture_mode = Arc::clone(&rune_ir_capture_mode);
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
         KeyModifiers::NONE,
@@ -398,14 +525,79 @@ fn configured_reedline() -> Reedline {
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
         .with_highlighter(Box::new(ReplHighlighter))
-        .with_validator(Box::new(ReplValidator))
+        .with_validator(Box::new(ReplValidator {
+            rune_ir_capture_mode,
+        }))
         .with_hinter(Box::new(DefaultHinter::default()));
     if let Some(path) = prepare_history_path()
         && let Ok(history) = FileBackedHistory::with_file(1000, path)
     {
-        editor = editor.with_history(Box::new(history));
+        editor = editor.with_history(Box::new(CaptureFilteringHistory::new(
+            history,
+            history_capture_mode,
+        )));
     }
     editor
+}
+
+struct CaptureFilteringHistory {
+    inner: FileBackedHistory,
+    rune_ir_capture_mode: Arc<AtomicBool>,
+}
+
+impl CaptureFilteringHistory {
+    fn new(inner: FileBackedHistory, rune_ir_capture_mode: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            rune_ir_capture_mode,
+        }
+    }
+}
+
+impl History for CaptureFilteringHistory {
+    fn save(&mut self, mut item: HistoryItem) -> reedline::Result<HistoryItem> {
+        if self.rune_ir_capture_mode.load(Ordering::Relaxed) {
+            item.id = None;
+            return Ok(item);
+        }
+        self.inner.save(item)
+    }
+
+    fn load(&self, id: HistoryItemId) -> reedline::Result<HistoryItem> {
+        self.inner.load(id)
+    }
+
+    fn count(&self, query: SearchQuery) -> reedline::Result<i64> {
+        self.inner.count(query)
+    }
+
+    fn search(&self, query: SearchQuery) -> reedline::Result<Vec<HistoryItem>> {
+        self.inner.search(query)
+    }
+
+    fn update(
+        &mut self,
+        id: HistoryItemId,
+        updater: &dyn Fn(HistoryItem) -> HistoryItem,
+    ) -> reedline::Result<()> {
+        self.inner.update(id, updater)
+    }
+
+    fn clear(&mut self) -> reedline::Result<()> {
+        self.inner.clear()
+    }
+
+    fn delete(&mut self, id: HistoryItemId) -> reedline::Result<()> {
+        self.inner.delete(id)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.inner.sync()
+    }
+
+    fn session(&self) -> Option<HistorySessionId> {
+        self.inner.session()
+    }
 }
 
 fn history_path() -> Option<PathBuf> {
@@ -617,6 +809,19 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.language
                     ));
                 }
+                CodeQueryResultValue::ReferenceSite { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let target = sanitize_terminal_text(&value.target.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "reference:", use_color),
+                        paint(Style::new().bold(), &target, use_color),
+                        value.proof
+                    ));
+                }
             }
             if !result.provenance.is_empty() {
                 out.push_str(&format!(
@@ -709,19 +914,43 @@ fn render_code_query_match(out: &mut String, matched: &CodeQueryMatch, use_color
 fn sanitize_terminal_text(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
     for ch in text.chars() {
-        match ch {
-            '\n' => sanitized.push_str("\\n"),
-            '\r' => sanitized.push_str("\\r"),
-            '\t' => sanitized.push_str("\\t"),
-            '\u{1b}' => sanitized.push_str("\\x1b"),
-            '\u{07}' => sanitized.push_str("\\x07"),
-            ch if ch.is_control() => {
-                sanitized.push_str(&format!("\\u{{{:x}}}", ch as u32));
-            }
-            ch => sanitized.push(ch),
-        }
+        push_terminal_safe_char(&mut sanitized, ch, false);
     }
     sanitized
+}
+
+fn sanitize_terminal_document(text: &str) -> String {
+    let mut sanitized = String::with_capacity(text.len());
+    for ch in text.chars() {
+        push_terminal_safe_char(&mut sanitized, ch, true);
+    }
+    sanitized
+}
+
+fn push_terminal_safe_char(sanitized: &mut String, ch: char, preserve_newlines: bool) {
+    match ch {
+        '\n' if preserve_newlines => sanitized.push('\n'),
+        '\n' => sanitized.push_str("\\n"),
+        '\r' => sanitized.push_str("\\r"),
+        '\t' => sanitized.push_str("\\t"),
+        '\u{1b}' => sanitized.push_str("\\x1b"),
+        '\u{07}' => sanitized.push_str("\\x07"),
+        ch if ch.is_control() || is_unicode_directional_control(ch) => {
+            sanitized.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        }
+        ch => sanitized.push(ch),
+    }
+}
+
+fn is_unicode_directional_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn paint(style: Style, text: &str, use_color: bool) -> String {
@@ -747,6 +976,8 @@ fn help_text() -> String {
         "  :example <name>        Load a named example.".to_string(),
         "  :kinds | :roles        List query vocabulary.".to_string(),
         "  :languages             List language labels.".to_string(),
+        "  :ir <language>         Capture source through :end and print Rune IR plus starter RQL."
+            .to_string(),
         "  :json                  Print canonical JSON for the current query.".to_string(),
         "  :validate              Validate the current query.".to_string(),
         "  :run                   Execute the current query.".to_string(),
@@ -789,9 +1020,7 @@ fn roles_text() -> String {
 }
 
 fn languages_text() -> String {
-    Language::ANALYZABLE
-        .iter()
-        .map(|language| language.config_label())
+    RuneIrLanguage::config_labels()
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -840,6 +1069,9 @@ fn doc_text(name: &str) -> String {
             role.label(),
             role.signature()
         );
+    }
+    if normalized == "tsx" {
+        return "tsx — Rune IR parser label for TypeScript source containing JSX.".to_string();
     }
     if Language::ANALYZABLE
         .iter()
@@ -890,10 +1122,16 @@ impl ReplCompleter {
             value: format!(":{}", role.label()),
             description: role.description().to_string(),
         }));
-        entries.extend(Language::ANALYZABLE.iter().map(|language| CompletionEntry {
-            value: language.config_label().to_string(),
-            description: "language filter label".to_string(),
-        }));
+        entries.extend(
+            RuneIrLanguage::config_labels().map(|label| CompletionEntry {
+                value: label.to_string(),
+                description: if label == "tsx" {
+                    "Rune IR parser label for TypeScript source containing JSX".to_string()
+                } else {
+                    "language filter and Rune IR parser label".to_string()
+                },
+            }),
+        );
         entries.extend(EXAMPLES.iter().map(|example| CompletionEntry {
             value: example.name.to_string(),
             description: example.doc.to_string(),
@@ -932,11 +1170,13 @@ fn completion_prefix(line: &str, pos: usize) -> (usize, &str) {
     (start, &line[start..pos])
 }
 
-struct ReplValidator;
+struct ReplValidator {
+    rune_ir_capture_mode: Arc<AtomicBool>,
+}
 
 impl Validator for ReplValidator {
     fn validate(&self, line: &str) -> ValidationResult {
-        if balanced_delimiters(line) {
+        if self.rune_ir_capture_mode.load(Ordering::Relaxed) || balanced_delimiters(line) {
             ValidationResult::Complete
         } else {
             ValidationResult::Incomplete
@@ -1032,10 +1272,178 @@ mod tests {
     #[test]
     fn code_query_repl_exposes_doc_metadata() {
         assert!(doc_text(":run").contains("Run"));
+        assert!(doc_text(":ir").contains("Rune IR"));
         assert!(doc_text("call").contains("Match call"));
         assert!(doc_text("comments").contains("no block comments"));
         assert!(doc_text("callee").contains("call target"));
         assert!(doc_text("calls").contains("eval"));
+    }
+
+    #[test]
+    fn code_query_repl_renders_multiline_rune_ir_without_search_service() {
+        let mut session = ReplSession::new();
+        let (_, output) = session.process_line(":ir rust", None);
+        assert!(output.contains("Capturing rust source"), "{output}");
+        assert!(
+            session
+                .process_line("fn greet(name: &str) {", None)
+                .1
+                .is_empty()
+        );
+        assert!(
+            session
+                .process_line("    println!(\"{name}\");", None)
+                .1
+                .is_empty()
+        );
+        assert!(session.process_line("}", None).1.is_empty());
+
+        let (_, output) = session.process_line(":end", None);
+        assert!(output.contains("Rune IR (rust):"), "{output}");
+        assert!(output.contains("(function"), "{output}");
+        assert!(output.contains(":name \"greet\""), "{output}");
+        assert!(
+            output.contains("Starter RQL:\n(function :name \"greet\")"),
+            "{output}"
+        );
+        assert!(!output.contains("function_item"), "{output}");
+    }
+
+    #[test]
+    fn rune_ir_capture_preserves_leading_blank_lines_and_ranges() {
+        let mut session = ReplSession::new();
+        session.process_line(":ir rust", None);
+        session.process_line("", None);
+        session.process_line("fn f() {}", None);
+
+        let (_, output) = session.process_line(":end", None);
+        assert!(output.contains("(function :range (1 10)"), "{output}");
+    }
+
+    #[test]
+    fn rune_ir_terminal_output_escapes_directional_controls() {
+        let mut session = ReplSession::new();
+        session.process_line(":ir rust", None);
+        session.process_line("fn f() { let value = \"safe\u{202e}evil\"; }", None);
+
+        let (_, output) = session.process_line(":end", None);
+        assert!(!output.contains('\u{202e}'), "{output:?}");
+        assert!(output.contains("\\u{202e}"), "{output:?}");
+    }
+
+    #[test]
+    fn rune_ir_source_lines_are_excluded_from_history() {
+        let capture_mode = Arc::new(AtomicBool::new(false));
+        let inner = FileBackedHistory::new(10).unwrap();
+        let mut history = CaptureFilteringHistory::new(inner, Arc::clone(&capture_mode));
+        history
+            .save(HistoryItem::from_command_line(":ir rust"))
+            .unwrap();
+        capture_mode.store(true, Ordering::Relaxed);
+        history
+            .save(HistoryItem::from_command_line("let token = \"secret\";"))
+            .unwrap();
+
+        let entries = history
+            .search(SearchQuery::everything(
+                reedline::SearchDirection::Forward,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].command_line, ":ir rust");
+    }
+
+    #[test]
+    fn rune_ir_languages_include_tsx_parser_flavor() {
+        assert!(languages_text().lines().any(|label| label == "tsx"));
+        assert!(doc_text("tsx").contains("TypeScript source containing JSX"));
+        let mut completer = ReplCompleter::new();
+        assert!(
+            completer
+                .complete("tsx", 3)
+                .iter()
+                .any(|suggestion| suggestion.value == "tsx")
+        );
+    }
+
+    #[test]
+    fn code_query_repl_rune_ir_errors_are_actionable() {
+        let mut session = ReplSession::new();
+        let (_, output) = session.process_line(":ir", None);
+        assert!(output.contains("usage: :ir <language>"), "{output}");
+
+        let (_, output) = session.process_line(":ir brainfuck", None);
+        assert!(output.contains("unsupported Rune IR language"), "{output}");
+
+        session.process_line(":ir python", None);
+        let (_, output) = session.process_line(":end", None);
+        assert!(output.contains("source is empty"), "{output}");
+    }
+
+    #[test]
+    fn rune_ir_capture_treats_colon_commands_as_source_until_end() {
+        let mut session = ReplSession::new();
+        session.process_line(":ir python", None);
+        session.process_line(":run", None);
+        assert!(session.is_capturing_rune_ir());
+        let (_, output) = session.process_line(":end", None);
+        assert!(!output.contains("No search service"), "{output}");
+    }
+
+    #[test]
+    fn rune_ir_capture_does_not_initialize_lazy_search_service() {
+        let mut session = ReplSession::new();
+        let mut service = LazySearchService::new(PathBuf::from("unused"));
+        process_line_with_lazy_service(&mut session, ":ir rust", &mut service).unwrap();
+        process_line_with_lazy_service(&mut session, "fn demo() {}", &mut service).unwrap();
+        let (_, output) =
+            process_line_with_lazy_service(&mut session, ":end", &mut service).unwrap();
+        assert!(output.contains("Rune IR (rust):"), "{output}");
+        assert!(service.service.is_none());
+    }
+
+    #[test]
+    fn rune_ir_capture_rejects_oversized_input_and_resets() {
+        let mut session = ReplSession::new();
+        session.process_line(":ir rust", None);
+        let oversized = "x".repeat(RuneIrLimits::default().max_input_bytes + 1);
+        let (_, output) = session.process_line(&oversized, None);
+
+        assert!(output.contains("input limit"), "{output}");
+        assert!(output.contains("capture cancelled"), "{output}");
+        assert!(!session.is_capturing_rune_ir());
+        assert!(!session.rune_ir_capture_mode.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rune_ir_capture_bypasses_query_delimiter_validation() {
+        let capture_mode = Arc::new(AtomicBool::new(false));
+        let validator = ReplValidator {
+            rune_ir_capture_mode: Arc::clone(&capture_mode),
+        };
+        let mut session = ReplSession::with_capture_mode(false, capture_mode);
+
+        assert!(matches!(
+            validator.validate("fn broken("),
+            ValidationResult::Incomplete
+        ));
+        session.process_line(":ir rust", None);
+        assert!(matches!(
+            validator.validate("fn broken("),
+            ValidationResult::Complete
+        ));
+        session.process_line("fn broken(", None);
+        assert!(matches!(
+            validator.validate(":end"),
+            ValidationResult::Complete
+        ));
+        let (_, output) = session.process_line(":end", None);
+        assert!(!session.is_capturing_rune_ir());
+        assert!(
+            !output.is_empty(),
+            "capture should finish with a result or actionable error"
+        );
     }
 
     #[test]
@@ -1077,7 +1485,9 @@ mod tests {
 
     #[test]
     fn code_query_repl_validator_accepts_multiline_until_balanced() {
-        let validator = ReplValidator;
+        let validator = ReplValidator {
+            rune_ir_capture_mode: Arc::new(AtomicBool::new(false)),
+        };
         assert!(matches!(
             validator.validate(r#"(call :callee (name "eval")"#),
             ValidationResult::Incomplete

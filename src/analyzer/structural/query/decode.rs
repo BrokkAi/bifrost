@@ -3,10 +3,11 @@ use super::ir::{
     MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
     MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS,
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
-    QueryStep, SCHEMA_VERSION, StringPredicate, validate_query_steps,
+    QueryStep, ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate, validate_query_steps,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
+    reference_kind_from_label, usage_proof_from_label, usage_surface_from_label,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
@@ -281,11 +282,27 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             )
         })?;
         let hierarchy = matches!(step, QueryStep::Supertypes(_) | QueryStep::Subtypes(_));
+        let reference = matches!(
+            step,
+            QueryStep::ReferencesOf(_) | QueryStep::UsedBy(_) | QueryStep::Uses(_)
+        );
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
                 Some(QueryStepField::Depth | QueryStepField::Transitive) if hierarchy => {}
-                Some(QueryStepField::Depth | QueryStepField::Transitive) | None => {
+                Some(
+                    QueryStepField::ReferenceKinds
+                    | QueryStepField::Proof
+                    | QueryStepField::Surface,
+                ) if reference => {}
+                Some(
+                    QueryStepField::Depth
+                    | QueryStepField::Transitive
+                    | QueryStepField::ReferenceKinds
+                    | QueryStepField::Proof
+                    | QueryStepField::Surface,
+                )
+                | None => {
                     return Err(QueryError::new(
                         child_path(&entry_path, key),
                         "unknown field in query step object",
@@ -334,6 +351,74 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 QueryStep::Supertypes(_) => QueryStep::Supertypes(traversal),
                 QueryStep::Subtypes(_) => QueryStep::Subtypes(traversal),
                 _ => unreachable!("hierarchy step filtered above"),
+            };
+        } else if reference {
+            let reference_kinds = match object.get("reference_kinds") {
+                Some(value) => {
+                    let values = value.as_array().ok_or_else(|| {
+                        QueryError::new(
+                            child_path(&entry_path, "reference_kinds"),
+                            "expected an array of reference-kind strings",
+                        )
+                    })?;
+                    if values.is_empty() {
+                        return Err(QueryError::new(
+                            child_path(&entry_path, "reference_kinds"),
+                            "reference_kinds must not be empty",
+                        ));
+                    }
+                    let mut kinds = Vec::with_capacity(values.len());
+                    for (kind_index, value) in values.iter().enumerate() {
+                        let path =
+                            index_path(&child_path(&entry_path, "reference_kinds"), kind_index);
+                        let label = value.as_str().ok_or_else(|| {
+                            QueryError::new(&path, "expected a reference-kind string")
+                        })?;
+                        let kind = reference_kind_from_label(label).ok_or_else(|| {
+                            QueryError::new(&path, format!("unknown reference kind {label:?}"))
+                        })?;
+                        if !kinds.contains(&kind) {
+                            kinds.push(kind);
+                        }
+                    }
+                    kinds
+                }
+                None => Vec::new(),
+            };
+            let proof = object
+                .get("proof")
+                .map(|value| {
+                    let path = child_path(&entry_path, "proof");
+                    let label = value
+                        .as_str()
+                        .ok_or_else(|| QueryError::new(&path, "expected proven or unproven"))?;
+                    usage_proof_from_label(label)
+                        .ok_or_else(|| QueryError::new(&path, "expected proven or unproven"))
+                })
+                .transpose()?;
+            let surface = object
+                .get("surface")
+                .map(|value| {
+                    let path = child_path(&entry_path, "surface");
+                    let label = value.as_str().ok_or_else(|| {
+                        QueryError::new(&path, "expected external_usages or lsp_references")
+                    })?;
+                    usage_surface_from_label(label).ok_or_else(|| {
+                        QueryError::new(&path, "expected external_usages or lsp_references")
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let filter = ReferenceTraversalFilter {
+                reference_kinds,
+                proof,
+                surface,
+            };
+            step = match step {
+                QueryStep::ReferencesOf(_) => QueryStep::ReferencesOf(filter),
+                QueryStep::UsedBy(_) => QueryStep::UsedBy(filter),
+                QueryStep::Uses(_) => QueryStep::Uses(filter),
+                _ => unreachable!("reference step filtered above"),
             };
         }
         steps.push(step);

@@ -3,13 +3,11 @@ use lsp_types::{
     DocumentDiagnosticReportResult, FullDocumentDiagnosticReport, NumberOrString,
     RelatedFullDocumentDiagnosticReport, Uri,
 };
-use tree_sitter::{Language as TsLanguage, Parser};
+use tree_sitter::Parser;
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
-use crate::analyzer::{
-    Language, ParseError, ParseErrorKind, Project, SemanticDiagnostic, WorkspaceAnalyzer,
-};
+use crate::analyzer::{ParseError, ParseErrorKind, Project, SemanticDiagnostic, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::project_file_for_uri;
 use crate::text_utils::compute_line_starts;
@@ -66,7 +64,7 @@ fn build_report(
 ) -> Option<Vec<Diagnostic>> {
     let project_file = project_file_for_uri(project, uri)?;
     let language = language_for_file(&project_file);
-    let ts_language = ts_language_for(language)?;
+    let ts_language = crate::analyzer::parser_language_for(language)?;
 
     // The cached byte offsets and `content` come from independent reads, but
     // they describe the same snapshot: `server.rs` always calls
@@ -152,21 +150,4 @@ fn semantic_diagnostic_to_lsp(
         tags: None,
         data: None,
     }
-}
-
-fn ts_language_for(language: Language) -> Option<TsLanguage> {
-    Some(match language {
-        Language::Java => tree_sitter_java::LANGUAGE.into(),
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
-        Language::Scala => tree_sitter_scala::LANGUAGE.into(),
-        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-        Language::None => return None,
-    })
 }

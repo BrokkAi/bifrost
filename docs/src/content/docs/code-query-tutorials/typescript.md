@@ -5,6 +5,8 @@ description: Query TypeScript declarations, callable refinements, decorators, an
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+
 TypeScript shares JavaScript's structural adapter and adds interface, enum, abstract-class, type-alias, type-identifier, decorator, and TSX grammar shapes.
 
 ## Fixtures

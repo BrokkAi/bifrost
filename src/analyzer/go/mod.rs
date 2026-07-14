@@ -5,7 +5,7 @@ pub(crate) mod diagnostics;
 mod hierarchy;
 mod imports;
 pub(crate) mod packages;
-mod structural;
+pub(crate) mod structural;
 mod tests;
 
 use crate::analyzer::common::language_for_file as file_language;

@@ -42,7 +42,10 @@ use lsp_types::{
 use crate::analyzer::structural::query::{
     QuerySourceEdit, query_source_help_at, validate_query_source,
 };
-use crate::analyzer::structural::{CodeQuery, CodeQueryResultItem, CodeQueryResultValue, execute};
+use crate::analyzer::structural::search::execute_with_cancellation;
+use crate::analyzer::structural::{
+    CodeQuery, CodeQueryExecutionLimits, CodeQueryResult, CodeQueryResultItem, CodeQueryResultValue,
+};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, BuildProgressEvent, BuildProgressPhase, FilesystemProject,
     MultiRootProject, OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
@@ -58,7 +61,7 @@ use crate::lsp::handlers::util::{
 };
 use crate::lsp::handlers::{
     call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
-    folding_range, formatting, hover, references, rename, semantic_tokens, signature_help,
+    folding_range, formatting, hover, references, rename, rune_ir, semantic_tokens, signature_help,
     type_definition, type_hierarchy, workspace_symbol,
 };
 use crate::lsp::progress::work_done_progress_message;
@@ -680,19 +683,24 @@ fn handle_request(
     if req.method == References::METHOD {
         return handle_references_request(connection, state, req);
     }
+    if req.method == RunRqlQuery::METHOD {
+        return handle_run_rql_query_request(connection, state, req);
+    }
 
     let id = req.id.clone();
     let id_for_log = format!("{id:?}");
     let method = req.method.clone();
     let _query_scope = AnalyzerQueryScope::new(state.workspace.analyzer());
     let response = match req.method.as_str() {
-        RunRqlQuery::METHOD => handle_run_rql_query_request(req, &state.workspace),
         ValidateQuery::METHOD => {
             decode_and_run::<ValidateQuery, _>(req, |params| Ok(validate_query_request(params)))
         }
         QueryHover::METHOD => {
             decode_and_run::<QueryHover, _>(req, |params| Ok(query_hover_request(params)))
         }
+        RuneIrRequest::METHOD => decode_and_run::<RuneIrRequest, _>(req, |params| {
+            rune_ir::handle(&state.workspace, state.project(), params)
+        }),
         CodeActionRequest::METHOD => decode_and_run::<CodeActionRequest, _>(req, |params| {
             Ok(Some(rql_code_actions(state, params)))
         }),
@@ -860,41 +868,174 @@ fn handle_request(
         .map_err(|err| format!("Failed to send LSP response: {err}"))
 }
 
-fn handle_run_rql_query_request(req: Request, workspace: &WorkspaceAnalyzer) -> Response {
+fn handle_run_rql_query_request(
+    connection: &Connection,
+    state: &ServerState,
+    req: Request,
+) -> Result<(), String> {
     let id = req.id.clone();
     let method = req.method.clone();
     let params = match req.extract::<RunRqlQueryParams>(RunRqlQuery::METHOD) {
         Ok((_, params)) => params,
         Err(ExtractError::JsonError { error, .. }) => {
-            return Response::new_err(
+            let response = Response::new_err(
                 id,
                 ErrorCode::InvalidParams as i32,
                 format!("Failed to decode params for {method}: {error}"),
             );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
         }
         Err(ExtractError::MethodMismatch(_)) => {
-            return Response::new_err(
+            let response = Response::new_err(
                 id,
                 ErrorCode::MethodNotFound as i32,
                 format!("Method not implemented: {method}"),
             );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
         }
     };
 
     let query = match CodeQuery::from_source(&params.query) {
         Ok(query) => query,
         Err(error) => {
-            return Response::new_err(
+            let response = Response::new_err(
                 id,
                 ErrorCode::InvalidParams as i32,
                 format!("Failed to parse query source: {error}"),
             );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
         }
     };
-    let query_result = execute(workspace.analyzer(), &query);
+
+    let Some(slot) = state.request_jobs.try_acquire() else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::ServerCancelled as i32,
+            "too many concurrent cancellable requests".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+    let Some(active_request) = state.active_request_ids.try_reserve(id.clone()) else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+    let cancellation = CancellationToken::default();
+    if !state.request_jobs.reserve(id.clone(), cancellation.clone()) {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    }
+
+    let worker_cancellation = cancellation.clone();
+    let project = Arc::new(state.overlay.snapshot());
+    let workspace = state
+        .workspace
+        .clone_with_project(Arc::clone(&project) as Arc<dyn Project>);
+    let sender = connection.sender.clone();
+    let progress_sender = sender.clone();
+    let worker_id = id.clone();
+    let worker_method = method.clone();
+    let context = RequestContext::new(
+        worker_cancellation.clone(),
+        None,
+        "Running code query",
+        "Traversing references",
+        Arc::new(move |message| {
+            progress_sender
+                .send(message)
+                .map_err(|err| format!("Failed to send LSP progress: {err}"))
+        }),
+    );
+    let handle = match thread::Builder::new()
+        .name("bifrost-lsp-query-code".to_string())
+        .spawn(move || {
+            let _query_scope = AnalyzerQueryScope::new(workspace.analyzer());
+            context.begin();
+            let response = finish_cancellable_request(
+                &worker_id,
+                &worker_method,
+                &context,
+                &worker_cancellation,
+                "query request cancelled by client",
+                "Query ready",
+                || {
+                    let result = execute_with_cancellation(
+                        workspace.analyzer(),
+                        &query,
+                        CodeQueryExecutionLimits::default(),
+                        &worker_cancellation,
+                    );
+                    if worker_cancellation.is_cancelled() {
+                        return Err(RequestCancelled);
+                    }
+                    Ok(run_rql_query_result(&workspace, result))
+                },
+            );
+            if let Some(error) = response.error.as_ref() {
+                eprintln!(
+                    "[bifrost-lsp] request error method={} id={:?} code={} message={}",
+                    worker_method, worker_id, error.code, error.message
+                );
+            }
+            if let Err(err) = sender.send(Message::Response(response)) {
+                eprintln!(
+                    "[bifrost-lsp] failed to send query response method={} id={:?}: {err}",
+                    worker_method, worker_id
+                );
+            }
+            drop(active_request);
+            drop(slot);
+        }) {
+        Ok(handle) => handle,
+        Err(err) => {
+            state.request_jobs.remove(&id);
+            let response = Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                format!("Failed to start query worker: {err}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|send_err| format!("Failed to send LSP response: {send_err}"));
+        }
+    };
+    state.request_jobs.start(&id, handle);
+    Ok(())
+}
+
+fn run_rql_query_result(
+    workspace: &WorkspaceAnalyzer,
+    query_result: CodeQueryResult,
+) -> RunRqlQueryResult {
     let workspace_root = workspace.analyzer().project().root();
     let text = query_result.render_text();
-    let result = RunRqlQueryResult {
+    RunRqlQueryResult {
         text,
         results: query_result
             .results
@@ -904,6 +1045,7 @@ fn handle_run_rql_query_request(req: Request, workspace: &WorkspaceAnalyzer) -> 
                     CodeQueryResultValue::StructuralMatch { value } => &value.path,
                     CodeQueryResultValue::Declaration { value } => &value.path,
                     CodeQueryResultValue::File { value } => &value.path,
+                    CodeQueryResultValue::ReferenceSite { value } => &value.path,
                 };
                 RunRqlQueryResultItem {
                     uri: path_to_uri_string(&workspace_root.join(path)),
@@ -911,14 +1053,6 @@ fn handle_run_rql_query_request(req: Request, workspace: &WorkspaceAnalyzer) -> 
                 }
             })
             .collect(),
-    };
-    match serde_json::to_value(result) {
-        Ok(value) => Response::new_ok(id, value),
-        Err(error) => Response::new_err(
-            id,
-            ErrorCode::InternalError as i32,
-            format!("Failed to serialize {method} result: {error}"),
-        ),
     }
 }
 
@@ -1016,11 +1150,13 @@ fn handle_references_request(
         .spawn(move || {
             let _query_scope = AnalyzerQueryScope::new(workspace.analyzer());
             context.begin();
-            let response = finish_reference_request(
+            let response = finish_cancellable_request(
                 &worker_id,
                 &worker_method,
                 &context,
                 &worker_cancellation,
+                "reference request cancelled by client",
+                "References ready",
                 || references::handle(&workspace, project.as_ref(), &params, &context),
             );
             if let Some(error) = response.error.as_ref() {
@@ -1056,11 +1192,13 @@ fn handle_references_request(
     Ok(())
 }
 
-fn finish_reference_request<T: serde::Serialize>(
+fn finish_cancellable_request<T: serde::Serialize>(
     id: &RequestId,
     method: &str,
     context: &RequestContext,
     cancellation: &CancellationToken,
+    cancellation_message: &str,
+    success_message: &str,
     run: impl FnOnce() -> Result<T, RequestCancelled>,
 ) -> Response {
     match panic::catch_unwind(panic::AssertUnwindSafe(run)) {
@@ -1078,7 +1216,7 @@ fn finish_reference_request<T: serde::Serialize>(
                 Response::new_err(
                     id.clone(),
                     ErrorCode::RequestCanceled as i32,
-                    "reference request cancelled by client".to_string(),
+                    cancellation_message.to_string(),
                 )
             }
             Ok(_) if cancellation.is_cancelled() => {
@@ -1086,12 +1224,12 @@ fn finish_reference_request<T: serde::Serialize>(
                 Response::new_err(
                     id.clone(),
                     ErrorCode::RequestCanceled as i32,
-                    "reference request cancelled by client".to_string(),
+                    cancellation_message.to_string(),
                 )
             }
             Ok(result) => match serde_json::to_value(result) {
                 Ok(value) => {
-                    context.end("References ready");
+                    context.end(success_message);
                     Response::new_ok(id.clone(), value)
                 }
                 Err(err) => {
@@ -1761,6 +1899,17 @@ impl lsp_types::request::Request for QueryHover {
     type Result = Option<Hover>;
 
     const METHOD: &'static str = "bifrost/queryHover";
+}
+
+/// Inspect the matcher-visible Rune IR for the smallest indexed declaration
+/// enclosing a cursor or selection in the current overlay.
+enum RuneIrRequest {}
+
+impl lsp_types::request::Request for RuneIrRequest {
+    type Params = rune_ir::RuneIrParams;
+    type Result = rune_ir::RuneIrResponse;
+
+    const METHOD: &'static str = "bifrost/runeIr";
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -3364,11 +3513,13 @@ mod tests {
         );
         context.begin();
 
-        let response = finish_reference_request::<serde_json::Value>(
+        let response = finish_cancellable_request::<serde_json::Value>(
             &RequestId::from(9),
             References::METHOD,
             &context,
             &cancellation,
+            "reference request cancelled by client",
+            "References ready",
             || panic!("injected reference failure"),
         );
 
@@ -3385,6 +3536,35 @@ mod tests {
         assert_eq!(end.params["token"], json!("panic-progress"));
         assert_eq!(end.params["value"]["kind"], json!("end"));
         assert_eq!(end.params["value"]["message"], json!("Failed"));
+    }
+
+    #[test]
+    fn cancelled_query_worker_returns_request_cancelled_without_result() {
+        let cancellation = CancellationToken::default();
+        let context = RequestContext::new(
+            cancellation.clone(),
+            None,
+            "Running code query",
+            "Traversing references",
+            Arc::new(|_| Ok(())),
+        );
+        cancellation.cancel();
+
+        let response = finish_cancellable_request(
+            &RequestId::from(10),
+            RunRqlQuery::METHOD,
+            &context,
+            &cancellation,
+            "query request cancelled by client",
+            "Query ready",
+            || Ok(json!({ "results": ["partial"] })),
+        );
+
+        assert!(response.result.is_none());
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::RequestCanceled as i32)
+        );
     }
 
     #[test]

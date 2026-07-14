@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from bifrost_searchtools import (
     CodeQueryFile,
     CodeQueryMatch,
+    CodeQueryReferenceSite,
     CodeQueryResult,
     SearchToolsClient,
     SearchToolsError,
@@ -205,6 +206,95 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIsInstance(files.results[0], CodeQueryFile)
         self.assertEqual(files.results[0].path, "A.java")
         self.assertEqual(len(files.results[0].provenance), 1)
+
+    def test_query_code_parses_reference_sites_and_via_provenance(self) -> None:
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "reference_site",
+                        "path": "User.java",
+                        "language": "java",
+                        "range": {
+                            "start_line": 3,
+                            "start_column": 12,
+                            "end_line": 3,
+                            "end_column": 18,
+                        },
+                        "target": {
+                            "path": "Target.java",
+                            "language": "java",
+                            "kind": "field",
+                            "fq_name": "Target.status",
+                            "start_line": 1,
+                            "end_line": 1,
+                        },
+                        "enclosing_declaration": {
+                            "path": "User.java",
+                            "language": "java",
+                            "kind": "function",
+                            "fq_name": "User.read",
+                            "start_line": 2,
+                            "end_line": 4,
+                        },
+                        "usage_kind": "reference",
+                        "proof": "proven",
+                        "reference_kind": "field_read",
+                        "provenance": [
+                            {
+                                "seed": {
+                                    "result_type": "structural_match",
+                                    "path": "Target.java",
+                                    "kind": "class",
+                                    "start_line": 1,
+                                    "end_line": 1,
+                                },
+                                "steps": [
+                                    {
+                                        "op": "used_by",
+                                        "result": {
+                                            "result_type": "declaration",
+                                            "path": "User.java",
+                                            "kind": "function",
+                                            "fq_name": "User.read",
+                                            "start_line": 2,
+                                            "end_line": 4,
+                                        },
+                                        "via": {
+                                            "result_type": "reference_site",
+                                            "path": "User.java",
+                                            "range": {
+                                                "start_line": 3,
+                                                "start_column": 12,
+                                                "end_line": 3,
+                                                "end_column": 18,
+                                            },
+                                            "target_fq_name": "Target.status",
+                                            "target_id": "Target.java:field:Target.status:0-11",
+                                            "proof": "proven",
+                                            "reference_kind": "field_read",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                "truncated": False,
+            }
+        )
+        site = result.results[0]
+        self.assertIsInstance(site, CodeQueryReferenceSite)
+        self.assertEqual(site.target.fq_name, "Target.status")
+        self.assertEqual(site.enclosing_declaration.fq_name, "User.read")
+        self.assertEqual(
+            site.provenance[0].steps[0].via.target_fq_name,
+            "Target.status",
+        )
+        self.assertEqual(
+            site.provenance[0].steps[0].via.target_id,
+            "Target.java:field:Target.status:0-11",
+        )
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

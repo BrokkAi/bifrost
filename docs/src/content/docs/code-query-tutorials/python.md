@@ -5,6 +5,8 @@ description: Query Python calls, decorators, assignments, keyword arguments, and
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+
 Python exposes calls, receiver/member access, positional and keyword arguments, imports, assignments, decorated declarations, callable refinements, literals, and control-flow nodes through the normalized model. These examples deliberately include two `client.post(...)` calls so the narrowing query has something real to exclude.
 
 ## Fixture

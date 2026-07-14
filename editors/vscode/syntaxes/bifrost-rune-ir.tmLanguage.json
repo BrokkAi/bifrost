@@ -1,0 +1,39 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Bifrost Rune IR",
+  "scopeName": "source.bifrost-rune-ir",
+  "patterns": [
+    {
+      "name": "comment.line.semicolon.bifrost-rune-ir",
+      "match": ";.*$"
+    },
+    {
+      "name": "string.quoted.double.bifrost-rune-ir",
+      "match": "\\\"(?:\\\\.|[^\\\"\\\\])*\\\""
+    },
+    {
+      "name": "punctuation.section.brackets.bifrost-rune-ir",
+      "match": "[()]"
+    },
+    {
+      "name": "variable.other.property.bifrost-rune-ir",
+      "match": ":(?:keyword|name|range|span|text)\\b"
+    },
+    {
+      "name": "entity.name.type.kind.bifrost-rune-ir",
+      "match": "\\b(?:declaration|callable|function|method|constructor|lambda|class|import|call|assignment|field_access|identifier|literal|string_literal|numeric_literal|boolean_literal|null_literal|return|throw|catch|if|loop|decorator)\\b"
+    },
+    {
+      "name": "variable.parameter.role.bifrost-rune-ir",
+      "match": "\\b(?:callee|receiver|args|kwargs|left|right|module|decorators|object|field)\\b"
+    },
+    {
+      "name": "invalid.deprecated.truncated.bifrost-rune-ir",
+      "match": "\\btruncated\\b"
+    },
+    {
+      "name": "constant.numeric.integer.decimal.bifrost-rune-ir",
+      "match": "\\b[0-9]+\\b"
+    }
+  ]
+}

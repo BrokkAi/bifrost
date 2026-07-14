@@ -1,6 +1,6 @@
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
-use tree_sitter::{Language as TsLanguage, Tree};
+use tree_sitter::Tree;
 
 use super::declarations::parse_scala_file;
 use super::tests::scala_contains_tests;
@@ -21,16 +21,8 @@ impl LanguageAdapter for ScalaAdapter {
         "resources/treesitter/scala"
     }
 
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_scala::LANGUAGE.into()
-    }
-
     fn file_extension(&self) -> &'static str {
         "scala"
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::SCALA_STRUCTURAL_SPEC)
     }
 
     fn normalize_full_name(&self, fq_name: &str) -> String {

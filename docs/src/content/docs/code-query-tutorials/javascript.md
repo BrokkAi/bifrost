@@ -5,6 +5,8 @@ description: Query JavaScript member calls, arrows, class expressions, field acc
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+
 JavaScript normalizes functions, methods, constructors, arrows, class declarations and expressions, calls and `new`, imports, assignments, and member access. It does not invent keyword arguments for a language that has none.
 
 ## Fixture

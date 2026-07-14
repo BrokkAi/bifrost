@@ -26,6 +26,11 @@ npm test
 
 Use the extension setting `bifrost.serverPath` when testing a locally built Bifrost binary.
 
+The extension associates [`.rune` files](/rune-ir/) with **Bifrost Rune IR**
+and uses that language mode for **Bifrost: Show Rune IR** previews. Canonical
+kinds, roles, metadata, spans, strings, and `;` comments receive syntax
+highlighting.
+
 ## RQL Queries
 
 The extension automatically recognizes `.rql` files as **Bifrost RQL** and

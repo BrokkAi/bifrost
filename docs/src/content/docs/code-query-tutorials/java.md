@@ -5,6 +5,8 @@ description: Query Java member calls, constructors, annotations, exceptions, and
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+
 Java normalizes methods, constructors, annotations, object creation, member calls, imports, assignments, exceptions, and control flow. The fixture includes two `post` receivers so receiver filtering proves a real exclusion.
 
 ## Fixture

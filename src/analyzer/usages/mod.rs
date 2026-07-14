@@ -58,7 +58,7 @@ pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
     ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceGraphResult,
     ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageAnalysisDiagnostic, UsageHit,
-    UsageHitKind, UsageHitSurface,
+    UsageHitKind, UsageHitSurface, UsageProof,
 };
 pub use php_graph::PhpUsageGraphStrategy;
 pub use python_graph::PythonExportUsageGraphStrategy;

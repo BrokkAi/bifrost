@@ -4,7 +4,7 @@ use super::*;
 use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cognitive_complexity;
 use std::sync::LazyLock;
-use tree_sitter::{Language as TsLanguage, Tree};
+use tree_sitter::Tree;
 
 /// Tree-sitter node-kind mapping used by the cognitive-complexity scorer for
 /// Ruby. Node names are from the tree-sitter-ruby grammar.
@@ -35,16 +35,8 @@ impl LanguageAdapter for RubyAdapter {
         "resources/treesitter/ruby"
     }
 
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_ruby::LANGUAGE.into()
-    }
-
     fn file_extension(&self) -> &'static str {
         "rb"
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::RUBY_STRUCTURAL_SPEC)
     }
 
     fn contains_tests(

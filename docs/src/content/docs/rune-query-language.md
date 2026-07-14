@@ -27,6 +27,8 @@ For source-first examples across every structural adapter, see the [language tut
 
 Use `:json` in the REPL to inspect the canonical JSON generated for the current RQL query.
 
+Use `:ir <language>` for the opposite direction: paste source code through a line containing only `:end`, then inspect the [Rune IR](/rune-ir/) produced by that language's real structural adapter and copy the generated starter RQL. Use the `tsx` language label for TypeScript snippets containing JSX. Rune IR is the normalized source-side representation matched by `CodeQuery`; it is not RQL's query-side IR.
+
 ## Complete Example
 
 This query finds calls to `eval` inside a function, captures the first positional argument, limits the search to Python source files, and requests full ranges:
@@ -112,9 +114,12 @@ Pipeline wrappers transform the result domain. Inner wrappers execute first:
 (supertypes :depth 2 (enclosing-decl (class :name "Service")))
 (subtypes :transitive true (enclosing-decl (class :name "BaseService")))
 (owner (members (enclosing-decl (class :name "Service"))))
+(references-of :proof proven (members (enclosing-decl (class :name "Service"))))
+(used-by :reference-kinds [field-write] (members (enclosing-decl (class :name "Service"))))
+(uses :surface lsp-references (enclosing-decl (method :name "handle")))
 ```
 
-The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. `members` returns direct declarations and `owner` recovers their exact declaring type. `:json` renders every wrapper as an ordered `steps` array.
+The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference options may appear in any order before the nested query; see [Reference Traversal](/code-query-tutorials/reference-traversal/) for kinds, proof tiers, surfaces, exact ownership, and `via` provenance. `:json` renders every wrapper as an ordered `steps` array.
 
 Only declarations indexed by the active workspace analyzer can appear. A visible usage of library code does not imply that the library declaration itself is indexed or queryable.
 
@@ -127,6 +132,7 @@ RQL is not yet a stable external API. It is intended to make interactive explora
 - `:examples` lists named examples.
 - `:example <name>` loads a named example.
 - `:kinds`, `:roles`, and `:languages` list the current vocabulary.
+- `:ir <language>` captures source through `:end` and prints Rune IR plus starter RQL without indexing a workspace.
 - `:validate` validates the current query without running it.
 - `:json` prints canonical JSON for the current query.
 - `:run` executes the current query.

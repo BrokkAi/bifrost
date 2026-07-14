@@ -7,7 +7,7 @@ mod exceptions;
 mod external;
 mod hierarchy;
 mod imports;
-mod structural;
+pub(crate) mod structural;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};

@@ -1,5 +1,5 @@
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
-use tree_sitter::{Language as TsLanguage, Tree};
+use tree_sitter::Tree;
 
 use super::declarations::parse_go_file;
 use super::packages::canonical_go_package_name;
@@ -15,10 +15,6 @@ impl LanguageAdapter for GoAdapter {
 
     fn query_directory(&self) -> &'static str {
         "resources/treesitter/go"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_go::LANGUAGE.into()
     }
 
     fn file_extension(&self) -> &'static str {
@@ -73,9 +69,5 @@ impl LanguageAdapter for GoAdapter {
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_go_file(file, source, tree)
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::GO_STRUCTURAL_SPEC)
     }
 }

@@ -44,7 +44,7 @@ use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Clone, Default)]
 pub struct JavascriptAdapter;
@@ -56,10 +56,6 @@ impl LanguageAdapter for JavascriptAdapter {
 
     fn query_directory(&self) -> &'static str {
         "resources/treesitter/javascript"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_javascript::LANGUAGE.into()
     }
 
     fn file_extension(&self) -> &'static str {
@@ -196,10 +192,6 @@ impl LanguageAdapter for JavascriptAdapter {
         }
 
         parsed
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&crate::analyzer::js_ts::structural::JAVASCRIPT_STRUCTURAL_SPEC)
     }
 }
 

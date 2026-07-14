@@ -58,18 +58,6 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         "resources/treesitter/typescript"
     }
 
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-    }
-
-    fn parser_language_for_file(&self, file: &ProjectFile) -> TsLanguage {
-        crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file(
-            file,
-            Language::TypeScript,
-        )
-        .unwrap_or_else(|| self.parser_language())
-    }
-
     fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
         if file.rel_path().extension().is_some_and(|ext| ext == "tsx") {
             "typescript:tsx".to_string()
@@ -235,10 +223,6 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         }
 
         parsed
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&crate::analyzer::js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC)
     }
 }
 

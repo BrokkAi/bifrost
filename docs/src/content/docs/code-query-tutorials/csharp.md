@@ -5,6 +5,8 @@ description: Query C# null-conditional calls, named arguments, attributes, and u
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+
 C# exposes object creation, null-conditional access, named arguments, attributes, constructors, properties, and using aliases through normalized structural facts. Alias bindings are represented by their visible alias, not by the terminal name of the target type.
 
 ## Fixture

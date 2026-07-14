@@ -7,12 +7,27 @@
 //! diagnostics.
 
 use super::facts::{FileFacts, Span};
-use super::kinds::Role;
+use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
-use super::query::{CodeQuery, CodeQueryResultDetail, HierarchyTraversal, QueryStep};
+use super::query::schema::{reference_kind_label, usage_proof_label};
+use super::query::{
+    CodeQuery, CodeQueryResultDetail, HierarchyTraversal, QueryStep, ReferenceTraversalFilter,
+};
+use crate::analyzer::reference_candidates::{
+    ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
+};
 use crate::analyzer::structural::capabilities::QueryFeature;
+use crate::analyzer::usages::get_definition::{
+    DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
+    resolve_definition_batch_with_source, resolve_definition_batch_with_source_and_cancellation,
+};
+use crate::analyzer::usages::{
+    ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind,
+    UsageProof,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
@@ -63,6 +78,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: CodeQueryFile,
     },
+    ReferenceSite {
+        #[serde(flatten)]
+        value: Box<CodeQueryReferenceSite>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +128,20 @@ pub struct CodeQueryFile {
     pub language: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryReferenceSite {
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub target: CodeQueryDeclaration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_declaration: Option<CodeQueryDeclaration>,
+    pub usage_kind: &'static str,
+    pub proof: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_kind: Option<&'static str>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CodeQueryProvenance {
     pub seed: CodeQueryResultRef,
@@ -119,6 +152,8 @@ pub struct CodeQueryProvenance {
 pub struct CodeQueryProvenanceStep {
     pub op: &'static str,
     pub result: CodeQueryResultRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<CodeQueryResultRef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,6 +183,18 @@ pub enum CodeQueryResultRef {
     File {
         path: String,
     },
+    ReferenceSite {
+        path: String,
+        range: CodeQueryRange,
+        target_fq_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage_kind: Option<&'static str>,
+        proof: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference_kind: Option<&'static str>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,7 +208,7 @@ pub struct CodeQueryCapture {
     pub kind: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct CodeQueryRange {
     pub start_line: usize,
     pub start_column: usize,
@@ -191,6 +238,17 @@ struct SeedMatch {
 struct DeclarationValue {
     unit: CodeUnit,
     range: Range,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReferenceSiteValue {
+    file: ProjectFile,
+    range: Range,
+    target: DeclarationValue,
+    enclosing: Option<DeclarationValue>,
+    usage_kind: UsageHitKind,
+    proof: UsageProof,
+    reference_kind: Option<ReferenceKind>,
 }
 
 #[derive(Default)]
@@ -296,6 +354,7 @@ fn primary_range_key(range: &Range) -> (usize, usize, usize, usize) {
 struct PipelineExpansion {
     value: PipelineValue,
     trace_values: Vec<PipelineTraceValue>,
+    via: Option<ReferenceSiteValue>,
     budgeted: bool,
 }
 
@@ -304,6 +363,7 @@ enum PipelineValue {
     StructuralMatch(Arc<SeedMatch>),
     Declaration(DeclarationValue),
     File(ProjectFile),
+    ReferenceSite(ReferenceSiteValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -311,6 +371,7 @@ enum PipelineKey {
     StructuralMatch(ProjectFile, u32),
     Declaration(DeclarationValue),
     File(ProjectFile),
+    ReferenceSite(ReferenceSiteValue),
 }
 
 impl PipelineValue {
@@ -321,6 +382,7 @@ impl PipelineValue {
             }
             Self::Declaration(declaration) => PipelineKey::Declaration(declaration.clone()),
             Self::File(file) => PipelineKey::File(file.clone()),
+            Self::ReferenceSite(site) => PipelineKey::ReferenceSite(site.clone()),
         }
     }
 }
@@ -335,12 +397,21 @@ struct PipelineTrace {
 struct PipelineTraceStep {
     op: QueryStep,
     value: PipelineTraceValue,
+    via: Option<ReferenceSiteValue>,
 }
 
 #[derive(Debug, Clone)]
 enum PipelineTraceValue {
     Declaration(DeclarationValue),
     File(ProjectFile),
+    ReferenceSite(ReferenceSiteValue),
+}
+
+#[derive(Default)]
+struct ReferenceTraversalCache {
+    inbound: HashMap<CodeUnit, Vec<ReferenceHit>>,
+    outbound: HashMap<ProjectFile, Vec<ReferenceHit>>,
+    reported_inbound: HashSet<CodeUnit>,
 }
 
 #[derive(Debug)]
@@ -462,6 +533,7 @@ struct CodeQueryExecutionBudget {
     scanned_files: usize,
     scanned_source_bytes: usize,
     fact_nodes: usize,
+    examined_references: usize,
     pipeline_rows: usize,
     provenance_steps: usize,
 }
@@ -472,6 +544,27 @@ pub fn execute_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
+    execute_internal(analyzer, query, limits, None)
+}
+
+pub(crate) fn execute_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: &CancellationToken,
+) -> CodeQueryResult {
+    execute_internal(analyzer, query, limits, Some(cancellation))
+}
+
+fn execute_internal(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> CodeQueryResult {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_query_result();
+    }
     if let Err(error) = query.validate_steps() {
         return CodeQueryResult {
             results: Vec::new(),
@@ -494,6 +587,9 @@ pub fn execute_with_limits(
     let mut diagnostics = Vec::new();
     let mut scoped_languages = BTreeSet::new();
     for file in analyzer.analyzed_files() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         let language = crate::analyzer::common::language_for_file(&file);
         let requested = query.languages.is_empty() || query.languages.contains(&language);
         if requested && file_matches_globs(&file, query) {
@@ -509,6 +605,9 @@ pub fn execute_with_limits(
     )> = Vec::new();
 
     for provider in providers {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         let language = provider.structural_language();
         supported.insert(language);
         let mut files = provider.structural_files();
@@ -577,6 +676,9 @@ pub fn execute_with_limits(
     let mut budget_exhausted = false;
     let mut pipeline_budget_diagnostic_emitted = false;
     for (_path, language, provider, file) in candidates {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         let Some(source) = provider.structural_source(&file) else {
             continue;
         };
@@ -624,6 +726,9 @@ pub fn execute_with_limits(
     }
 
     if !pipeline_query {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         let truncated = match_truncated || budget_exhausted;
         if should_report_broad_query(&plan, query, &budget, truncated) {
             push_broad_query_diagnostic(&mut diagnostics, &budget);
@@ -680,10 +785,14 @@ pub fn execute_with_limits(
     budget.pipeline_rows = rows.len();
 
     let mut indexed_declarations = None;
+    let mut reference_cache = ReferenceTraversalCache::default();
 
     let mut import_graph = None;
     let mut import_graph_budget_diagnostic_emitted = false;
     for (step_index, step) in query.steps.iter().enumerate() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         if !rows.is_empty()
             && indexed_declarations.is_none()
             && matches!(
@@ -692,6 +801,9 @@ pub fn execute_with_limits(
                     | QueryStep::Subtypes(_)
                     | QueryStep::Members
                     | QueryStep::Owner
+                    | QueryStep::ReferencesOf(_)
+                    | QueryStep::UsedBy(_)
+                    | QueryStep::Uses(_)
             )
         {
             indexed_declarations = Some(IndexedDeclarations::default());
@@ -710,7 +822,9 @@ pub fn execute_with_limits(
                     .iter()
                     .filter_map(|row| match &row.value {
                         PipelineValue::File(file) => Some(file.clone()),
-                        PipelineValue::StructuralMatch(_) | PipelineValue::Declaration(_) => None,
+                        PipelineValue::StructuralMatch(_)
+                        | PipelineValue::Declaration(_)
+                        | PipelineValue::ReferenceSite(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -737,14 +851,27 @@ pub fn execute_with_limits(
             rows,
             import_graph.as_ref(),
             indexed_declarations.as_mut(),
+            &mut reference_cache,
             &mut budget,
-            limits.max_pipeline_rows,
+            limits,
+            if step_index + 1 == query.steps.len() {
+                query.limit.saturating_add(1)
+            } else {
+                limits.max_pipeline_rows
+            },
+            cancellation,
             &mut diagnostics,
         );
         rows = next;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         if exhausted {
             budget_exhausted = true;
-            if !pipeline_budget_diagnostic_emitted {
+            if (budget.pipeline_rows >= limits.max_pipeline_rows
+                || budget.provenance_steps >= limits.max_pipeline_rows)
+                && !pipeline_budget_diagnostic_emitted
+            {
                 push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
             }
             if step_index + 1 < query.steps.len() {
@@ -767,6 +894,9 @@ pub fn execute_with_limits(
         push_broad_query_diagnostic(&mut diagnostics, &budget);
     }
     let mut render_cache = PipelineRenderCache::default();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_query_result();
+    }
     let results = rows
         .into_iter()
         .map(|row| render_pipeline_item(analyzer, row, query.result_detail, &mut render_cache))
@@ -775,6 +905,17 @@ pub fn execute_with_limits(
         results,
         truncated,
         diagnostics,
+    }
+}
+
+fn cancelled_query_result() -> CodeQueryResult {
+    CodeQueryResult {
+        results: Vec::new(),
+        truncated: true,
+        diagnostics: vec![CodeQueryDiagnostic {
+            language: "workspace",
+            message: "query_code cancelled; no partial results were retained".to_string(),
+        }],
     }
 }
 
@@ -890,10 +1031,14 @@ fn apply_pipeline_step(
     rows: Vec<PipelineRow>,
     import_graph: Option<&DirectImportGraph>,
     indexed_declarations: Option<&mut IndexedDeclarations>,
+    reference_cache: &mut ReferenceTraversalCache,
     budget: &mut CodeQueryExecutionBudget,
-    max_pipeline_rows: usize,
+    limits: CodeQueryExecutionLimits,
+    max_step_outputs: usize,
+    cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<PipelineRow>, bool) {
+    let max_pipeline_rows = limits.max_pipeline_rows;
     let mut output = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut unsupported_languages = BTreeSet::new();
@@ -904,6 +1049,9 @@ fn apply_pipeline_step(
 
     let mut indexed_declarations = indexed_declarations;
     'rows: for row in rows {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (Vec::new(), true);
+        }
         let mut row_exhausted = false;
         let expansions = match (&row.value, step) {
             (PipelineValue::StructuralMatch(seed), QueryStep::EnclosingDecl) => {
@@ -920,6 +1068,9 @@ fn apply_pipeline_step(
                 vec![pipeline_expansion(PipelineValue::File(
                     declaration.unit.source().clone(),
                 ))]
+            }
+            (PipelineValue::ReferenceSite(site), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(site.file.clone()))]
             }
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
@@ -1022,6 +1173,48 @@ fn apply_pipeline_step(
                     None => Vec::new(),
                 }
             }
+            (
+                PipelineValue::Declaration(declaration),
+                QueryStep::ReferencesOf(filter) | QueryStep::UsedBy(filter),
+            ) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let (expansions, reference_exhausted) = inbound_reference_expansions(
+                    analyzer,
+                    declaration,
+                    step,
+                    filter,
+                    indexed,
+                    reference_cache,
+                    budget,
+                    limits,
+                    diagnostics,
+                    max_pipeline_rows.saturating_sub(budget.pipeline_rows),
+                    cancellation,
+                );
+                row_exhausted = reference_exhausted;
+                expansions
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::Uses(filter)) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let (expansions, reference_exhausted) = outbound_reference_expansions(
+                    analyzer,
+                    declaration,
+                    filter,
+                    indexed,
+                    reference_cache,
+                    budget,
+                    limits,
+                    max_step_outputs,
+                    cancellation,
+                    diagnostics,
+                );
+                row_exhausted = reference_exhausted;
+                expansions
+            }
             _ => unreachable!("query step domains are validated before execution"),
         };
 
@@ -1044,6 +1237,7 @@ fn apply_pipeline_step(
                             PipelineTraceStep {
                                 op: step.clone(),
                                 value,
+                                via: expansion.via.clone(),
                             }
                         }));
                     trace
@@ -1103,6 +1297,7 @@ fn pipeline_expansion(value: PipelineValue) -> PipelineExpansion {
     PipelineExpansion {
         value,
         trace_values: vec![trace_value],
+        via: None,
         budgeted: false,
     }
 }
@@ -1111,8 +1306,732 @@ fn budgeted_declaration_expansion(declaration: DeclarationValue) -> PipelineExpa
     PipelineExpansion {
         value: PipelineValue::Declaration(declaration.clone()),
         trace_values: vec![PipelineTraceValue::Declaration(declaration)],
+        via: None,
         budgeted: true,
     }
+}
+
+fn reference_expansion(value: PipelineValue, site: ReferenceSiteValue) -> PipelineExpansion {
+    let trace_value =
+        pipeline_trace_value(&value).expect("reference steps produce a semantic value");
+    PipelineExpansion {
+        value,
+        trace_values: vec![trace_value],
+        via: Some(site),
+        budgeted: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inbound_reference_expansions(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    step: &QueryStep,
+    filter: &ReferenceTraversalFilter,
+    indexed: &mut IndexedDeclarations,
+    cache: &mut ReferenceTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    max_hits: usize,
+    cancellation: Option<&CancellationToken>,
+) -> (Vec<PipelineExpansion>, bool) {
+    let mut exhausted = false;
+    if !cache.inbound.contains_key(&declaration.unit) {
+        let remaining_files = limits
+            .max_scanned_files
+            .saturating_sub(budget.scanned_files);
+        if remaining_files == 0 {
+            push_budget_diagnostic(diagnostics, budget);
+            return (Vec::new(), true);
+        }
+        let remaining_source_bytes = limits
+            .max_scanned_source_bytes
+            .saturating_sub(budget.scanned_source_bytes);
+        if remaining_source_bytes == 0 {
+            push_budget_diagnostic(diagnostics, budget);
+            return (Vec::new(), true);
+        }
+        let mut finder = UsageFinder::new();
+        if let Some(cancellation) = cancellation {
+            finder = finder.with_cancellation(cancellation.clone());
+        }
+        let query = finder.query_with_source_budget(
+            analyzer,
+            std::slice::from_ref(&declaration.unit),
+            MAX_SCANNED_FILES.min(remaining_files),
+            max_hits.max(1),
+            remaining_source_bytes,
+        );
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (Vec::new(), true);
+        }
+        let examined_references = fuzzy_result_examination_count(&query.result);
+        if charge_reference_scan(
+            budget,
+            limits,
+            query.candidate_files.len(),
+            query.scanned_source_bytes,
+            examined_references,
+        ) {
+            push_budget_diagnostic(diagnostics, budget);
+            cache.inbound.insert(declaration.unit.clone(), Vec::new());
+            return (Vec::new(), true);
+        }
+        let mut hits = Vec::new();
+        let report = cache.reported_inbound.insert(declaration.unit.clone());
+        if report && query.source_bytes_truncated {
+            exhausted = true;
+            diagnostics.push(CodeQueryDiagnostic {
+                language: crate::analyzer::common::language_for_file(declaration.unit.source())
+                    .config_label(),
+                message: format!(
+                    "references_of source-byte budget truncated candidate files for {}",
+                    declaration.unit.fq_name()
+                ),
+            });
+        } else if report && query.candidate_files_truncated {
+            exhausted = true;
+            diagnostics.push(CodeQueryDiagnostic {
+                language: crate::analyzer::common::language_for_file(declaration.unit.source())
+                    .config_label(),
+                message: format!(
+                    "references_of candidate files were truncated for {}",
+                    declaration.unit.fq_name()
+                ),
+            });
+        }
+        match query.result {
+            FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+            } => {
+                hits.extend(hits_by_overload.into_values().flatten().map(|hit| {
+                    reference_hit_for_target(
+                        analyzer,
+                        hit,
+                        declaration.unit.clone(),
+                        UsageProof::Proven,
+                    )
+                }));
+                hits.extend(unproven_by_overload.into_values().flatten().map(|hit| {
+                    reference_hit_for_target(
+                        analyzer,
+                        hit,
+                        declaration.unit.clone(),
+                        UsageProof::Unproven,
+                    )
+                }));
+                if report {
+                    let omitted = unproven_total_by_overload
+                        .values()
+                        .sum::<usize>()
+                        .saturating_sub(
+                            hits.iter()
+                                .filter(|hit| hit.proof == UsageProof::Unproven)
+                                .count(),
+                        );
+                    if omitted > 0 {
+                        diagnostics.push(CodeQueryDiagnostic {
+                            language: crate::analyzer::common::language_for_file(
+                                declaration.unit.source(),
+                            )
+                            .config_label(),
+                            message: format!(
+                                "references_of omitted {omitted} unproven reference candidates for {}",
+                                declaration.unit.fq_name()
+                            ),
+                        });
+                    }
+                }
+            }
+            FuzzyResult::Ambiguous {
+                hits_by_overload, ..
+            } => {
+                hits.extend(hits_by_overload.into_values().flatten().map(|hit| {
+                    reference_hit_for_target(
+                        analyzer,
+                        hit,
+                        declaration.unit.clone(),
+                        UsageProof::Unproven,
+                    )
+                }));
+                if report {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        language: crate::analyzer::common::language_for_file(
+                            declaration.unit.source(),
+                        )
+                        .config_label(),
+                        message: format!(
+                            "references_of emitted ambiguous candidates for {} as unproven",
+                            declaration.unit.fq_name()
+                        ),
+                    });
+                }
+            }
+            FuzzyResult::TooManyCallsites {
+                total_callsites,
+                limit,
+                ..
+            } => {
+                exhausted = true;
+                if report {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        language: crate::analyzer::common::language_for_file(
+                            declaration.unit.source(),
+                        )
+                        .config_label(),
+                        message: format!(
+                            "references_of found {total_callsites} call sites for {}, exceeding limit {limit}",
+                            declaration.unit.fq_name()
+                        ),
+                    });
+                }
+            }
+            FuzzyResult::Failure { reason, .. } => {
+                if report {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        language: crate::analyzer::common::language_for_file(
+                            declaration.unit.source(),
+                        )
+                        .config_label(),
+                        message: format!(
+                            "references_of does not support {}: {reason}",
+                            declaration.unit.fq_name()
+                        ),
+                    });
+                }
+            }
+        }
+        cache.inbound.insert(declaration.unit.clone(), hits);
+    }
+
+    let mut sites = cache
+        .inbound
+        .get(&declaration.unit)
+        .into_iter()
+        .flatten()
+        .filter(|hit| reference_hit_matches(hit, filter))
+        .filter_map(|hit| reference_site_value(analyzer, hit, declaration.clone(), indexed))
+        .collect::<Vec<_>>();
+    sort_reference_sites(&mut sites);
+    sites.dedup();
+    let expansions = sites
+        .into_iter()
+        .filter_map(|site| match step {
+            QueryStep::ReferencesOf(_) => Some(reference_expansion(
+                PipelineValue::ReferenceSite(site.clone()),
+                site,
+            )),
+            QueryStep::UsedBy(_) => site
+                .enclosing
+                .clone()
+                .map(|enclosing| reference_expansion(PipelineValue::Declaration(enclosing), site)),
+            _ => unreachable!("inbound helper is only used by inbound reference steps"),
+        })
+        .collect::<Vec<_>>();
+    (expansions, exhausted)
+}
+
+fn fuzzy_result_examination_count(result: &FuzzyResult) -> usize {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            hits_by_overload.values().map(BTreeSet::len).sum::<usize>()
+                + unproven_total_by_overload.values().sum::<usize>()
+        }
+        FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => hits_by_overload.values().map(BTreeSet::len).sum(),
+        FuzzyResult::TooManyCallsites {
+            total_callsites, ..
+        } => *total_callsites,
+        FuzzyResult::Failure { .. } => 0,
+    }
+}
+
+fn charge_reference_scan(
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    scanned_files: usize,
+    scanned_source_bytes: usize,
+    examined_references: usize,
+) -> bool {
+    budget.scanned_files = budget.scanned_files.saturating_add(scanned_files);
+    budget.scanned_source_bytes = budget
+        .scanned_source_bytes
+        .saturating_add(scanned_source_bytes);
+    budget.examined_references = budget
+        .examined_references
+        .saturating_add(examined_references);
+    budget.scanned_files > limits.max_scanned_files
+        || budget.scanned_source_bytes > limits.max_scanned_source_bytes
+        || budget.fact_nodes.saturating_add(budget.examined_references) > limits.max_fact_nodes
+}
+
+fn reference_hit_for_target(
+    analyzer: &dyn IAnalyzer,
+    hit: crate::analyzer::usages::UsageHit,
+    target: CodeUnit,
+    proof: UsageProof,
+) -> ReferenceHit {
+    let kind = hit.reference_kind.or_else(|| {
+        classify_reference_kind(
+            analyzer,
+            &hit.file,
+            hit.start_offset,
+            hit.end_offset,
+            &target,
+        )
+    });
+    ReferenceHit {
+        file: hit.file,
+        range: Range {
+            start_byte: hit.start_offset,
+            end_byte: hit.end_offset,
+            start_line: hit.line,
+            end_line: hit.line,
+        },
+        enclosing_unit: hit.enclosing,
+        kind,
+        resolved: target,
+        confidence: (hit.confidence.clamp(0.0, 1.0) * 1_000_000.0) as u32,
+        usage_kind: hit.kind,
+        proof,
+    }
+}
+
+fn reference_hits_for_target(
+    analyzer: &dyn IAnalyzer,
+    result: FuzzyResult,
+    target: &CodeUnit,
+) -> Vec<ReferenceHit> {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } => hits_by_overload
+            .into_values()
+            .flatten()
+            .map(|hit| reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Proven))
+            .chain(unproven_by_overload.into_values().flatten().map(|hit| {
+                reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Unproven)
+            }))
+            .collect(),
+        FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => hits_by_overload
+            .into_values()
+            .flatten()
+            .map(|hit| {
+                reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Unproven)
+            })
+            .collect(),
+        FuzzyResult::Failure { .. } | FuzzyResult::TooManyCallsites { .. } => Vec::new(),
+    }
+}
+
+fn reference_hit_matches(hit: &ReferenceHit, filter: &ReferenceTraversalFilter) -> bool {
+    hit.usage_kind.included_in(filter.surface)
+        && filter.proof.is_none_or(|proof| proof == hit.proof)
+        && (filter.reference_kinds.is_empty()
+            || hit
+                .kind
+                .is_some_and(|kind| filter.reference_kinds.contains(&kind)))
+}
+
+fn reference_site_value(
+    analyzer: &dyn IAnalyzer,
+    hit: &ReferenceHit,
+    target: DeclarationValue,
+    indexed: &mut IndexedDeclarations,
+) -> Option<ReferenceSiteValue> {
+    let enclosing = indexed.get(analyzer, &hit.enclosing_unit);
+    Some(ReferenceSiteValue {
+        file: hit.file.clone(),
+        range: hit.range,
+        target,
+        enclosing,
+        usage_kind: hit.usage_kind,
+        proof: hit.proof,
+        reference_kind: hit.kind,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn outbound_reference_expansions(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    filter: &ReferenceTraversalFilter,
+    indexed: &mut IndexedDeclarations,
+    cache: &mut ReferenceTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    max_step_outputs: usize,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> (Vec<PipelineExpansion>, bool) {
+    let mut exhausted = false;
+    if !cache.outbound.contains_key(declaration.unit.source()) {
+        let (hits, scan_exhausted) = scan_outbound_reference_hits(
+            analyzer,
+            declaration.unit.source(),
+            budget,
+            limits,
+            max_step_outputs,
+            cancellation,
+            diagnostics,
+        );
+        exhausted = scan_exhausted;
+        cache
+            .outbound
+            .insert(declaration.unit.source().clone(), hits);
+    }
+    let mut sites = cache
+        .outbound
+        .get(declaration.unit.source())
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit.enclosing_unit == declaration.unit)
+        .filter(|hit| reference_hit_matches(hit, filter))
+        .filter_map(|hit| {
+            let target = indexed.get(analyzer, &hit.resolved)?;
+            reference_site_value(analyzer, hit, target, indexed)
+        })
+        .collect::<Vec<_>>();
+    sort_reference_sites(&mut sites);
+    sites.dedup();
+    let expansions = sites
+        .into_iter()
+        .map(|site| reference_expansion(PipelineValue::Declaration(site.target.clone()), site))
+        .collect();
+    (expansions, exhausted)
+}
+
+fn scan_outbound_reference_hits(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    max_step_outputs: usize,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> (Vec<ReferenceHit>, bool) {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return (Vec::new(), true);
+    }
+    let language = crate::analyzer::common::language_for_file(file);
+    let Some(source) = analyzer.indexed_source(file) else {
+        return (Vec::new(), false);
+    };
+    let remaining_source_bytes = limits
+        .max_scanned_source_bytes
+        .saturating_sub(budget.scanned_source_bytes);
+    if budget.scanned_files >= limits.max_scanned_files || source.len() > remaining_source_bytes {
+        push_budget_diagnostic(diagnostics, budget);
+        return (Vec::new(), true);
+    }
+    budget.scanned_files += 1;
+    budget.scanned_source_bytes += source.len();
+    let source = Arc::new(source);
+    let Some(tree) = parse_tree_for_language(file, language, &source) else {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!("uses does not support parsing {}", rel_path_string(file)),
+        });
+        return (Vec::new(), false);
+    };
+    const MAX_OUTBOUND_SITES_PER_FILE: usize = 50_000;
+    let remaining_reference_budget = limits
+        .max_fact_nodes
+        .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references));
+    if remaining_reference_budget == 0 {
+        push_budget_diagnostic(diagnostics, budget);
+        return (Vec::new(), true);
+    }
+    let retained_work_budget = max_step_outputs.saturating_mul(64).max(256);
+    let candidate_limit = MAX_OUTBOUND_SITES_PER_FILE
+        .min(remaining_reference_budget)
+        .min(retained_work_budget);
+    let candidate_ranges = match cancellation {
+        Some(cancellation) => reference_candidate_ranges_cancellable(
+            tree.root_node(),
+            language,
+            candidate_limit,
+            &|| cancellation.is_cancelled(),
+        ),
+        None => Some(reference_candidate_ranges(
+            tree.root_node(),
+            language,
+            candidate_limit,
+        )),
+    };
+    let Some(candidate_ranges) = candidate_ranges else {
+        return (Vec::new(), true);
+    };
+    let (ranges, mut exhausted) = match candidate_ranges {
+        ReferenceCandidateRanges::Complete(ranges) => (ranges, false),
+        ReferenceCandidateRanges::LimitExceeded { ranges, .. } => (ranges, true),
+    };
+    budget.examined_references = budget.examined_references.saturating_add(ranges.len());
+    if exhausted {
+        if candidate_limit == remaining_reference_budget {
+            push_budget_diagnostic(diagnostics, budget);
+        } else {
+            diagnostics.push(CodeQueryDiagnostic {
+                language: language.config_label(),
+                message: format!(
+                    "uses returned a bounded partial scan of {} after reaching the structured reference-candidate limit of {candidate_limit}",
+                    rel_path_string(file)
+                ),
+            });
+        }
+    }
+    if candidate_limit == 0 {
+        exhausted = true;
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!(
+                "uses has no reference-candidate capacity for {}",
+                rel_path_string(file)
+            ),
+        });
+    }
+    let requests = ranges
+        .into_iter()
+        .map(|range| DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(range.start_byte),
+            end_byte: Some(range.end_byte),
+        })
+        .collect();
+    let outcomes = match cancellation {
+        Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
+            analyzer,
+            requests,
+            file.clone(),
+            Arc::clone(&source),
+            cancellation,
+        ),
+        None => resolve_definition_batch_with_source(
+            analyzer,
+            requests,
+            file.clone(),
+            Arc::clone(&source),
+        ),
+    };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return (Vec::new(), true);
+    }
+    let mut candidates_by_target: BTreeMap<CodeUnit, BTreeSet<(usize, usize)>> = BTreeMap::new();
+    let mut ambiguous = 0usize;
+    for outcome in outcomes {
+        match outcome.status {
+            DefinitionLookupStatus::Resolved => {}
+            DefinitionLookupStatus::Ambiguous => {
+                ambiguous += 1;
+            }
+            _ => continue,
+        }
+        let Some(reference) = outcome.reference else {
+            continue;
+        };
+        for resolved in outcome.definitions {
+            candidates_by_target
+                .entry(resolved)
+                .or_default()
+                .insert((reference.focus_start_byte, reference.focus_end_byte));
+        }
+    }
+
+    let mut candidate_files = HashSet::default();
+    candidate_files.insert(file.clone());
+    let provider = ExplicitCandidateProvider::new(Arc::new(candidate_files));
+    let mut hits = Vec::new();
+    let mut omitted = 0usize;
+    for (target, candidate_ranges) in candidates_by_target {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (Vec::new(), true);
+        }
+        let mut finder = UsageFinder::new();
+        if let Some(cancellation) = cancellation {
+            finder = finder.with_cancellation(cancellation.clone());
+        }
+        let result = finder.query_with_provider(
+            analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            candidate_ranges.len().max(1),
+        );
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (Vec::new(), true);
+        }
+        let target_hits = reference_hits_for_target(analyzer, result.result, &target);
+        let before = hits.len();
+        hits.extend(target_hits.into_iter().filter(|hit| {
+            hit.file == *file
+                && candidate_ranges.contains(&(hit.range.start_byte, hit.range.end_byte))
+        }));
+        omitted += candidate_ranges.len().saturating_sub(hits.len() - before);
+    }
+    if ambiguous > 0 {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!(
+                "uses emitted {ambiguous} ambiguous reference site{} in {} as unproven",
+                if ambiguous == 1 { "" } else { "s" },
+                rel_path_string(file)
+            ),
+        });
+    }
+    if omitted > 0 {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!(
+                "uses omitted {omitted} candidate reference site{} in {} because the structured usage analyzer did not confirm the exact edge",
+                if omitted == 1 { "" } else { "s" },
+                rel_path_string(file)
+            ),
+        });
+    }
+    (hits, exhausted)
+}
+
+fn sort_reference_sites(sites: &mut [ReferenceSiteValue]) {
+    sites.sort_by(|left, right| {
+        rel_path_string(&left.file)
+            .cmp(&rel_path_string(&right.file))
+            .then_with(|| primary_range_key(&left.range).cmp(&primary_range_key(&right.range)))
+            .then_with(|| left.target.unit.cmp(&right.target.unit))
+            .then_with(|| {
+                left.enclosing
+                    .as_ref()
+                    .map(|value| &value.unit)
+                    .cmp(&right.enclosing.as_ref().map(|value| &value.unit))
+            })
+            .then_with(|| {
+                left.usage_kind
+                    .wire_label()
+                    .cmp(right.usage_kind.wire_label())
+            })
+            .then_with(|| usage_proof_label(left.proof).cmp(usage_proof_label(right.proof)))
+            .then_with(|| {
+                left.reference_kind
+                    .map(reference_kind_label)
+                    .cmp(&right.reference_kind.map(reference_kind_label))
+            })
+    });
+}
+
+fn classify_reference_kind(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    start_byte: usize,
+    end_byte: usize,
+    target: &CodeUnit,
+) -> Option<ReferenceKind> {
+    let language = crate::analyzer::common::language_for_file(file);
+    let facts = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)?
+        .structural_facts(file)?;
+    let covers = |span: Span| span.start_byte <= start_byte && end_byte <= span.end_byte;
+    let mut candidates = facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.name.is_some_and(covers)
+                && matches!(
+                    node.kind,
+                    NormalizedKind::Call | NormalizedKind::FieldAccess
+                )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, node)| {
+        (
+            usize::from(node.kind != NormalizedKind::Call),
+            node.range.end_byte - node.range.start_byte,
+        )
+    });
+    if let Some((id, node)) = candidates.first().copied() {
+        let receiver_role = if node.kind == NormalizedKind::FieldAccess {
+            Role::Object
+        } else {
+            Role::Receiver
+        };
+        let receiver = node
+            .role_targets(receiver_role)
+            .next()
+            .map(|role| role.span.text(facts.source()).trim());
+        if receiver.is_some_and(|text| matches!(text, "super" | "base")) {
+            return Some(ReferenceKind::SuperCall);
+        }
+        let static_receiver = analyzer
+            .parent_of(target)
+            .filter(|owner| owner.is_class())
+            .is_some_and(|owner| receiver == Some(owner.short_name()));
+        if static_receiver {
+            return Some(ReferenceKind::StaticReference);
+        }
+        if node.kind == NormalizedKind::Call {
+            return Some(
+                if target.is_class() || target.kind().display_lowercase() == "constructor" {
+                    ReferenceKind::ConstructorCall
+                } else {
+                    ReferenceKind::MethodCall
+                },
+            );
+        }
+        let mut parent = Some(id as u32);
+        while let Some(current) = parent {
+            let fact = facts.node(current);
+            if fact.kind == NormalizedKind::Assignment {
+                return Some(
+                    if fact.role_targets(Role::Left).any(|role| covers(role.span)) {
+                        ReferenceKind::FieldWrite
+                    } else {
+                        ReferenceKind::FieldRead
+                    },
+                );
+            }
+            parent = fact.parent;
+        }
+        return Some(ReferenceKind::FieldRead);
+    }
+    if target.is_class() {
+        let nearest = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.range.start_byte <= start_byte && end_byte <= node.range.end_byte
+            })
+            .min_by_key(|(_, node)| node.range.end_byte - node.range.start_byte)
+            .map(|(id, _)| id as u32);
+        let mut current = nearest;
+        while let Some(id) = current {
+            let node = facts.node(id);
+            if node.kind.satisfies(NormalizedKind::Declaration) {
+                if node.kind == NormalizedKind::Class && node.name.is_none_or(|name| !covers(name))
+                {
+                    return Some(ReferenceKind::Inheritance);
+                }
+                break;
+            }
+            current = node.parent;
+        }
+    }
+    target.is_class().then_some(ReferenceKind::TypeReference)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1202,6 +2121,7 @@ fn expand_hierarchy(
             expansions.push(PipelineExpansion {
                 value: PipelineValue::Declaration(value),
                 trace_values: hierarchy_trace_values(&paths, path_tail, next_depth),
+                via: None,
                 budgeted: true,
             });
 
@@ -1348,6 +2268,7 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
             Some(PipelineTraceValue::Declaration(declaration.clone()))
         }
         PipelineValue::File(file) => Some(PipelineTraceValue::File(file.clone())),
+        PipelineValue::ReferenceSite(site) => Some(PipelineTraceValue::ReferenceSite(site.clone())),
     }
 }
 
@@ -1408,6 +2329,9 @@ fn render_pipeline_item(
         PipelineValue::File(file) => CodeQueryResultValue::File {
             value: render_file(&file),
         },
+        PipelineValue::ReferenceSite(site) => CodeQueryResultValue::ReferenceSite {
+            value: Box::new(render_reference_site(analyzer, &site, detail, cache)),
+        },
     };
     CodeQueryResultItem {
         value,
@@ -1434,7 +2358,17 @@ fn render_provenance(
                         render_declaration_ref(analyzer, declaration, detail, cache)
                     }
                     PipelineTraceValue::File(file) => render_file_ref(file),
+                    PipelineTraceValue::ReferenceSite(site) => {
+                        render_reference_site_ref(analyzer, site, detail, cache)
+                    }
                 },
+                via: matches!(step.op, QueryStep::UsedBy(_) | QueryStep::Uses(_))
+                    .then(|| {
+                        step.via
+                            .as_ref()
+                            .map(|site| render_reference_site_ref(analyzer, site, detail, cache))
+                    })
+                    .flatten(),
             })
             .collect(),
     }
@@ -1483,6 +2417,34 @@ fn render_file_ref(file: &ProjectFile) -> CodeQueryResultRef {
     }
 }
 
+fn render_reference_site_ref(
+    analyzer: &dyn IAnalyzer,
+    site: &ReferenceSiteValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let target_path = rel_path_string(site.target.unit.source());
+    let target_fq_name = site.target.unit.fq_name();
+    let target_kind = site.target.unit.kind().display_lowercase();
+    CodeQueryResultRef::ReferenceSite {
+        path: rel_path_string(&site.file),
+        range: render_reference_range(analyzer, site, cache),
+        target_id: (!detail.is_compact()).then(|| {
+            declaration_id(
+                &target_path,
+                target_kind,
+                &target_fq_name,
+                site.target.range,
+            )
+        }),
+        target_fq_name,
+        usage_kind: (site.usage_kind != UsageHitKind::Reference)
+            .then(|| site.usage_kind.wire_label()),
+        proof: usage_proof_label(site.proof),
+        reference_kind: site.reference_kind.map(reference_kind_label),
+    }
+}
+
 fn render_declaration(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
@@ -1519,6 +2481,50 @@ fn render_file(file: &ProjectFile) -> CodeQueryFile {
         path: rel_path_string(file),
         language: crate::analyzer::common::language_for_file(file).config_label(),
     }
+}
+
+fn render_reference_site(
+    analyzer: &dyn IAnalyzer,
+    site: &ReferenceSiteValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReferenceSite {
+    CodeQueryReferenceSite {
+        path: rel_path_string(&site.file),
+        language: crate::analyzer::common::language_for_file(&site.file).config_label(),
+        range: render_reference_range(analyzer, site, cache),
+        target: render_declaration(analyzer, &site.target, detail, cache),
+        enclosing_declaration: site
+            .enclosing
+            .as_ref()
+            .map(|declaration| render_declaration(analyzer, declaration, detail, cache)),
+        usage_kind: site.usage_kind.wire_label(),
+        proof: usage_proof_label(site.proof),
+        reference_kind: site.reference_kind.map(reference_kind_label),
+    }
+}
+
+fn render_reference_range(
+    analyzer: &dyn IAnalyzer,
+    site: &ReferenceSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryRange {
+    cache
+        .coordinates_for(&site.file, || analyzer.indexed_source(&site.file))
+        .map(|coordinates| {
+            range_for_offsets(
+                &coordinates.source,
+                &coordinates.line_starts,
+                site.range.start_byte,
+                site.range.end_byte,
+            )
+        })
+        .unwrap_or(CodeQueryRange {
+            start_line: site.range.start_line,
+            start_column: 1,
+            end_line: site.range.end_line,
+            end_column: 1,
+        })
 }
 
 fn declaration_id(path: &str, kind: &str, fq_name: &str, range: Range) -> String {
@@ -1561,8 +2567,11 @@ fn push_budget_diagnostic(
     diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "query_code execution budget exhausted after scanning {} files, {} bytes, and {} facts; refine the query with where, languages, kind/name anchors, or a narrower pattern",
-            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+            "query_code execution budget exhausted after scanning {} files, {} bytes, {} facts, and examining {} references; refine the query with where, languages, kind/name anchors, or a narrower pattern",
+            budget.scanned_files,
+            budget.scanned_source_bytes,
+            budget.fact_nodes,
+            budget.examined_references
         ),
     });
 }
@@ -1601,8 +2610,11 @@ fn push_truncation_diagnostic(
     diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "query_code returned the first {limit} results after scanning {} files, {} bytes, and {} facts; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
-            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+            "query_code returned the first {limit} results after scanning {} files, {} bytes, {} facts, and examining {} references; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+            budget.scanned_files,
+            budget.scanned_source_bytes,
+            budget.fact_nodes,
+            budget.examined_references
         ),
     });
 }
@@ -1626,8 +2638,11 @@ fn push_broad_query_diagnostic(
     diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "broad unanchored query_code query scanned {} files, {} bytes, and {} facts; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",
-            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+            "broad unanchored query_code query scanned {} files, {} bytes, {} facts, and examined {} references; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",
+            budget.scanned_files,
+            budget.scanned_source_bytes,
+            budget.fact_nodes,
+            budget.examined_references
         ),
     });
 }
@@ -1742,9 +2757,9 @@ impl CodeQueryResult {
             .iter()
             .filter_map(|result| match &result.value {
                 CodeQueryResultValue::StructuralMatch { value } => Some(value),
-                CodeQueryResultValue::Declaration { .. } | CodeQueryResultValue::File { .. } => {
-                    None
-                }
+                CodeQueryResultValue::Declaration { .. }
+                | CodeQueryResultValue::File { .. }
+                | CodeQueryResultValue::ReferenceSite { .. } => None,
             })
             .collect()
     }
@@ -1800,6 +2815,17 @@ impl CodeQueryResult {
                     }
                     CodeQueryResultValue::File { value } => {
                         out.push_str(&format!("{} [file; {}]\n", value.path, value.language));
+                    }
+                    CodeQueryResultValue::ReferenceSite { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [reference; {}; {}] -> {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.usage_kind,
+                            value.proof,
+                            value.target.fq_name
+                        ));
                     }
                 }
                 if !result.provenance.is_empty() {

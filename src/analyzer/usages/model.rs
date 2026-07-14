@@ -38,10 +38,11 @@ pub enum UsageProof {
     Unproven,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UsageHitSurface {
     /// Agent/search/relevance/call-graph surfaces that should count only external
     /// references from other semantic contexts.
+    #[default]
     ExternalUsages,
     /// Editor find-references surface that should show every source occurrence that
     /// points at the symbol, including import bindings and self/this receiver calls.
@@ -49,6 +50,15 @@ pub enum UsageHitSurface {
 }
 
 impl UsageHitKind {
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            UsageHitKind::Reference => "reference",
+            UsageHitKind::Import => "import",
+            UsageHitKind::SelfReceiver => "self_receiver",
+            UsageHitKind::OverrideDeclaration => "override_declaration",
+        }
+    }
+
     pub fn included_in(self, surface: UsageHitSurface) -> bool {
         match surface {
             UsageHitSurface::ExternalUsages => {
@@ -81,6 +91,9 @@ pub struct UsageHit {
     pub snippet: String,
     pub kind: UsageHitKind,
     pub proof: UsageProof,
+    /// Structured source-reference classification when the analyzer can
+    /// determine it without guessing from source text.
+    pub reference_kind: Option<ReferenceKind>,
 }
 
 impl UsageHit {
@@ -103,6 +116,7 @@ impl UsageHit {
             snippet: snippet.into(),
             kind: UsageHitKind::Reference,
             proof: UsageProof::Proven,
+            reference_kind: None,
         }
     }
 
@@ -140,7 +154,13 @@ impl UsageHit {
             snippet: self.snippet.clone(),
             kind: self.kind,
             proof: self.proof,
+            reference_kind: self.reference_kind,
         }
+    }
+
+    pub fn with_reference_kind(mut self, kind: ReferenceKind) -> Self {
+        self.reference_kind = Some(kind);
+        self
     }
 }
 
@@ -183,9 +203,11 @@ pub struct ReferenceHit {
     pub file: ProjectFile,
     pub range: Range,
     pub enclosing_unit: CodeUnit,
-    pub kind: ReferenceKind,
+    pub kind: Option<ReferenceKind>,
     pub resolved: CodeUnit,
     pub confidence: u32,
+    pub usage_kind: UsageHitKind,
+    pub proof: UsageProof,
 }
 
 impl ReferenceHit {

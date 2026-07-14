@@ -1,4 +1,5 @@
 use super::ir::{CodeQuery, HierarchyTraversal, Pattern, QueryStep, StringPredicate};
+use super::schema::{reference_kind_label, usage_proof_label, usage_surface_label};
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Value, json};
 
@@ -73,6 +74,29 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ImportersOf
         | QueryStep::Members
         | QueryStep::Owner => {}
+        QueryStep::ReferencesOf(filter) | QueryStep::UsedBy(filter) | QueryStep::Uses(filter) => {
+            if !filter.reference_kinds.is_empty() {
+                object.insert(
+                    "reference_kinds".to_string(),
+                    Value::Array(
+                        filter
+                            .reference_kinds
+                            .iter()
+                            .map(|kind| json!(reference_kind_label(*kind)))
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(proof) = filter.proof {
+                object.insert("proof".to_string(), json!(usage_proof_label(proof)));
+            }
+            if filter.surface != Default::default() {
+                object.insert(
+                    "surface".to_string(),
+                    json!(usage_surface_label(filter.surface)),
+                );
+            }
+        }
     }
     Value::Object(object)
 }

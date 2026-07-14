@@ -5,6 +5,8 @@ description: Query Rust calls, assignments, imports, closures, and method receiv
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+
 Rust maps turbofish calls, method receivers, grouped `use` declarations, closures, signed literals, and compound assignments into the normalized `query_code` model. The fixture includes both production code and a closure so containment and exclusion remain observable.
 
 ## Fixture

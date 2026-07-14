@@ -72,6 +72,7 @@ use crate::analyzer::{
     cpp_include_paths, cpp_node_text, csharp_callable_arity, resolve_analyzer,
     resolve_include_targets,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::profiling;
@@ -233,13 +234,14 @@ pub(crate) fn resolve_definition_batch(
         profiling::note(format!("request_count={}", requests.len()));
     }
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
-    resolve_definition_requests(analyzer, &mut context, requests)
+    resolve_definition_requests(analyzer, &mut context, requests, None)
 }
 
 fn resolve_definition_requests(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
     requests: Vec<DefinitionLookupRequest>,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<DefinitionLookupOutcome> {
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
     for request in &requests {
@@ -252,6 +254,7 @@ fn resolve_definition_requests(
 
     requests
         .into_iter()
+        .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
         .map(|request| {
             let is_python = language_for_file(&request.file) == Language::Python;
             let file = request.file.clone();
@@ -275,7 +278,19 @@ pub(crate) fn resolve_definition_batch_with_source(
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests)
+    resolve_definition_requests(analyzer, &mut context, requests, None)
+}
+
+pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<String>,
+    cancellation: &CancellationToken,
+) -> Vec<DefinitionLookupOutcome> {
+    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    context.sources.insert(file, Ok(source));
+    resolve_definition_requests(analyzer, &mut context, requests, Some(cancellation))
 }
 
 pub(crate) fn resolve_call_reference_definition_with_source(
@@ -856,7 +871,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved

@@ -1,4 +1,6 @@
-use crate::analyzer::structural::query::schema::ALL_QUERY_STEP_OPS;
+use crate::analyzer::structural::query::schema::{
+    ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, reference_kind_label,
+};
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
     MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
@@ -36,7 +38,7 @@ fn query_step_input_variants() -> Vec<Value> {
     let plain = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
-        .filter(|op| !op.allows_hierarchy_options())
+        .filter(|op| !op.allows_hierarchy_options() && !op.allows_reference_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let hierarchy = ALL_QUERY_STEP_OPS
@@ -44,6 +46,17 @@ fn query_step_input_variants() -> Vec<Value> {
         .copied()
         .filter(|op| op.allows_hierarchy_options())
         .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let references = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_reference_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let reference_kinds = ALL_REFERENCE_KINDS
+        .iter()
+        .copied()
+        .map(reference_kind_label)
         .collect::<Vec<_>>();
     vec![
         json!({
@@ -76,6 +89,22 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op", "transitive"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": references },
+                "reference_kinds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": reference_kinds }
+                },
+                "proof": { "type": "string", "enum": ["proven", "unproven"] },
+                "surface": { "type": "string", "enum": ["external_usages", "lsp_references"] }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
     ]
 }
 
@@ -99,7 +128,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, or file results with provenance. It does not traverse call graphs or perform control-flow or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Pipeline example: {{\"match\":{{\"kind\":\"class\",\"name\":\"Service\"}},\"steps\":[{{\"op\":\"enclosing_decl\"}},{{\"op\":\"subtypes\",\"transitive\":true}},{{\"op\":\"members\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
+        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Reference steps preserve exact indexed targets and sites; they may filter reference_kinds, proof, and the external_usages or lsp_references surface. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, or reference_site results with provenance. It does not perform points-to, control-flow, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Pipeline example: {{\"match\":{{\"kind\":\"class\",\"name\":\"Service\"}},\"steps\":[{{\"op\":\"enclosing_decl\"}},{{\"op\":\"members\"}},{{\"op\":\"uses\",\"proof\":\"proven\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     vec![
