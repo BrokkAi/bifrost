@@ -130,10 +130,13 @@ impl PythonAnalyzer {
     }
 
     fn resolve_module_code_unit(&self, module_fq: &str) -> Option<CodeUnit> {
+        if let Some(units) = self.inner.forward_path_module_fqn(module_fq) {
+            return units.into_iter().find(|code_unit| code_unit.is_module());
+        }
         self.inner
             .forward_definition_fqn(module_fq)
             .into_iter()
-            .find(|code_unit| code_unit.is_module())
+            .find(CodeUnit::is_module)
     }
 
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {

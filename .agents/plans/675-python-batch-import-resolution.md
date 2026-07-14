@@ -53,6 +53,8 @@ resolution work.
 - [x] (2026-07-14) Route exact Python path-symbol lookups through the existing
   `(lang, exact_fqn)` index, with a query-plan regression that prevents SQLite
   from reverting to a primary-key scan.
+- [x] (2026-07-14) Resolve Python module-existence checks directly from path-backed
+  module units instead of hydrating broad same-short-name definition candidates.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -141,6 +143,14 @@ resolution work.
   Evidence: `/private/tmp/bifrost-675-bounded-callable-source.sample.txt` and
   `/private/tmp/bifrost-675-bounded-callable-source-later.sample.txt`.
 
+- Observation: The indexed path-symbol smoke reduced
+  `path_symbol_rows_by_fqn_for_langs` to a negligible fraction of the sample, but
+  `PythonAnalyzer::export_index_of` still spent most of its time in
+  `record_reexport_event`. Its module-existence check called full FQN definition
+  lookup, hydrating every declaration with the same short name and recomputing
+  `python_module_name` before eventually consulting path-backed module units.
+  Evidence: `/private/tmp/bifrost-675-indexed-path-module.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -217,6 +227,15 @@ resolution work.
   changing their import-details and normalization semantics. The explicit index is
   necessary because SQLite chose the primary key even for the simplified predicate
   in an empty in-memory store.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Make Python's internal `resolve_module_code_unit` use the path-module
+  projection as the complete result whenever that store query succeeds, falling
+  back to full definition resolution only on store-query failure.
+  Rationale: Python module declarations are synthetic path-backed units, including
+  dirty files. Both a hit and a miss are therefore answered by the structured
+  module projection; broad short-name candidate hydration cannot add a valid module
+  result and made export-index construction scale with unrelated declarations.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective

@@ -3140,6 +3140,11 @@ where
             .unwrap_or_default()
     }
 
+    pub(crate) fn forward_path_module_fqn(&self, fq_name: &str) -> Option<Vec<CodeUnit>> {
+        let normalized = self.adapter.normalize_full_name(fq_name);
+        self.sql_path_symbol_units(fq_name, &normalized)
+    }
+
     pub(crate) fn forward_file_identifier(
         &self,
         file: &ProjectFile,
