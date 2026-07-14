@@ -14,7 +14,7 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 - [x] (2026-07-14 15:00Z) Inspected the typed query IR/executor, schema-driven JSON/RQL help, result/provenance models, usage finder, targeted resolvers, inverted edge builders, clients, editor, and executable cookbook harness.
 - [x] (2026-07-14 15:00Z) Created this implementation ExecPlan and fixed the public syntax, domains, result shape, exact-user semantics, language scope, and documentation shape.
 - [x] (2026-07-14 17:10Z) Milestone 1: implemented the public reference-step IR, operation-specific schema, JSON/RQL parsing, `reference_site` result domain, provenance `via`, MCP/TextMate vocabulary, CLI/LSP routing, and Python consumer models.
-- [ ] Milestone 2: expose analyzer-owned structured inbound/outbound reference hits and implement `references_of`, `used_by`, and `uses` across all eleven usage adapters without changing existing usage surfaces. The shared all-language resolver path and Java vertical slice are complete; adapter matrix coverage and failure/cancellation hardening remain.
+- [x] (2026-07-14 19:05Z) Milestone 2: implemented cached exact inbound/outbound traversal across all eleven adapters, structured proof/surface/kind filtering, deterministic site identity and provenance, bounded partial-result semantics, reference-scan budget accounting, and focused cross-language/classification/failure tests without changing the legacy usage graph.
 - [ ] Milestone 3: add the executable cross-language reference-traversal cookbook and update public documentation.
 - [ ] Milestone 4: run focused and complete validation, review the full diff, fix findings, and record the final outcome.
 
@@ -34,6 +34,12 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 
 - Observation: The requested all-feature focused test command currently fails to link the Python extension on this macOS environment because the linker cannot resolve Python symbols. Featureless focused Rust tests link and run successfully, while `cargo check --features nlp,python` succeeds.
   Evidence: `cargo test --features nlp,python --test code_query_pipelines` reached the dylib link and failed on `_Py*` symbols; the same pipeline tests without features pass.
+
+- Observation: Java field access records its structured qualifier under `Role::Object`, while method calls use `Role::Receiver`.
+  Evidence: the normalized Java extractor attaches `field_access.object` as `Role::Object`; using the operation-appropriate role makes `Base.FLAG` classify as `static_reference` without parsing source text.
+
+- Observation: Reference traversal performs analyzer work beyond the structural seed scan and therefore must consume the same workspace limits even when its results deduplicate to few rows.
+  Evidence: inbound candidate sets now charge files/source bytes and resolved candidates; outbound per-file scans charge files/source bytes/named leaves once at cache fill. A focused intermediate-domain test proves exhaustion returns no `reference_site` rows from a file-terminal query.
 
 ## Decision Log
 
@@ -67,7 +73,7 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 
 ## Outcomes & Retrospective
 
-Milestone 1 is implemented. JSON and RQL now canonicalize configured reference steps; reference sites serialize exact ranges, targets, optional exact enclosing declarations, proof, usage surface kind, and optional classification. Declaration-returning steps retain the exact site under `via`. Java integration tests demonstrate inbound references, inverse `uses`/`used_by`, `file_of` composition, and field-write filtering. The schema and full-feature library compile; broader adapter/documentation coverage remains before completion.
+Milestones 1 and 2 are implemented. JSON and RQL canonicalize configured reference steps; reference sites serialize exact ranges, targets, optional exact enclosing declarations, proof, usage surface kind, and optional classification. Declaration-returning steps retain the exact site under `via`. The pipeline resolves exact inbound and outbound edges across Python, Java, JavaScript, TypeScript, Go, C/C++, Rust, PHP, Scala, C#, and Ruby. Focused Java cases prove all eight reference kinds, inverse `uses`/`used_by`, `file_of` composition, surfaces, proof tiers, and same-name-owner isolation. Reference scans are cached and charged to existing workspace/pipeline budgets; legacy `usage_graph` construction remains unchanged. Documentation and final full-suite validation remain.
 
 ## Context and Orientation
 
@@ -148,3 +154,5 @@ The public IR adds conceptually:
 `CodeQueryResultValue` and `CodeQueryResultRef` gain `ReferenceSite`. `CodeQueryProvenanceStep` gains an optional `via: CodeQueryResultRef`. No new external dependency is required.
 
 Revision note (2026-07-14): Created the implementation-ready ExecPlan from issue #717, the accepted plan, current issue-715/716 implementation, usage-analysis architecture, and cookbook harness.
+
+Revision note (2026-07-14): Recorded the completed public-contract and all-adapter traversal milestones, the structured outbound-resolver decision, classification details, budget behavior, and the macOS Python-linker limitation discovered during focused validation.

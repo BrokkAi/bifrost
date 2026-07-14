@@ -523,6 +523,7 @@ struct CodeQueryExecutionBudget {
     scanned_files: usize,
     scanned_source_bytes: usize,
     fact_nodes: usize,
+    examined_references: usize,
     pipeline_rows: usize,
     provenance_steps: usize,
 }
@@ -806,13 +807,15 @@ pub fn execute_with_limits(
             indexed_declarations.as_mut(),
             &mut reference_cache,
             &mut budget,
-            limits.max_pipeline_rows,
+            limits,
             &mut diagnostics,
         );
         rows = next;
         if exhausted {
             budget_exhausted = true;
-            if !pipeline_budget_diagnostic_emitted {
+            if budget.pipeline_rows >= limits.max_pipeline_rows
+                && !pipeline_budget_diagnostic_emitted
+            {
                 push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
             }
             if step_index + 1 < query.steps.len() {
@@ -960,9 +963,10 @@ fn apply_pipeline_step(
     indexed_declarations: Option<&mut IndexedDeclarations>,
     reference_cache: &mut ReferenceTraversalCache,
     budget: &mut CodeQueryExecutionBudget,
-    max_pipeline_rows: usize,
+    limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<PipelineRow>, bool) {
+    let max_pipeline_rows = limits.max_pipeline_rows;
     let mut output = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut unsupported_languages = BTreeSet::new();
@@ -1101,29 +1105,37 @@ fn apply_pipeline_step(
                 let indexed = indexed_declarations
                     .as_deref_mut()
                     .expect("semantic declaration index exists");
-                inbound_reference_expansions(
+                let (expansions, reference_exhausted) = inbound_reference_expansions(
                     analyzer,
                     declaration,
                     step,
                     filter,
                     indexed,
                     reference_cache,
+                    budget,
+                    limits,
                     diagnostics,
                     max_pipeline_rows.saturating_sub(budget.pipeline_rows),
-                )
+                );
+                row_exhausted = reference_exhausted;
+                expansions
             }
             (PipelineValue::Declaration(declaration), QueryStep::Uses(filter)) => {
                 let indexed = indexed_declarations
                     .as_deref_mut()
                     .expect("semantic declaration index exists");
-                outbound_reference_expansions(
+                let (expansions, reference_exhausted) = outbound_reference_expansions(
                     analyzer,
                     declaration,
                     filter,
                     indexed,
                     reference_cache,
+                    budget,
+                    limits,
                     diagnostics,
-                )
+                );
+                row_exhausted = reference_exhausted;
+                expansions
             }
             _ => unreachable!("query step domains are validated before execution"),
         };
@@ -1240,19 +1252,48 @@ fn inbound_reference_expansions(
     filter: &ReferenceTraversalFilter,
     indexed: &mut IndexedDeclarations,
     cache: &mut ReferenceTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     max_hits: usize,
-) -> Vec<PipelineExpansion> {
+) -> (Vec<PipelineExpansion>, bool) {
+    let mut exhausted = false;
     if !cache.inbound.contains_key(&declaration.unit) {
+        let remaining_files = limits
+            .max_scanned_files
+            .saturating_sub(budget.scanned_files);
+        if remaining_files == 0 {
+            push_budget_diagnostic(diagnostics, budget);
+            return (Vec::new(), true);
+        }
         let query = UsageFinder::new().query(
             analyzer,
             std::slice::from_ref(&declaration.unit),
-            MAX_SCANNED_FILES,
+            MAX_SCANNED_FILES.min(remaining_files),
             max_hits.max(1),
         );
+        let scanned_source_bytes = query
+            .candidate_files
+            .iter()
+            .filter_map(|file| analyzer.indexed_source(file))
+            .map(|source| source.len())
+            .sum();
+        let examined_references = fuzzy_result_examination_count(&query.result);
+        if charge_reference_scan(
+            budget,
+            limits,
+            query.candidate_files.len(),
+            scanned_source_bytes,
+            examined_references,
+        ) {
+            push_budget_diagnostic(diagnostics, budget);
+            cache.inbound.insert(declaration.unit.clone(), Vec::new());
+            return (Vec::new(), true);
+        }
         let mut hits = Vec::new();
         let report = cache.reported_inbound.insert(declaration.unit.clone());
         if report && query.candidate_files_truncated {
+            exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
                 language: crate::analyzer::common::language_for_file(declaration.unit.source())
                     .config_label(),
@@ -1336,6 +1377,7 @@ fn inbound_reference_expansions(
                 limit,
                 ..
             } => {
+                exhausted = true;
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
                         language: crate::analyzer::common::language_for_file(
@@ -1377,7 +1419,7 @@ fn inbound_reference_expansions(
         .collect::<Vec<_>>();
     sort_reference_sites(&mut sites);
     sites.dedup();
-    sites
+    let expansions = sites
         .into_iter()
         .filter_map(|site| match step {
             QueryStep::ReferencesOf(_) => Some(reference_expansion(
@@ -1390,7 +1432,47 @@ fn inbound_reference_expansions(
                 .map(|enclosing| reference_expansion(PipelineValue::Declaration(enclosing), site)),
             _ => unreachable!("inbound helper is only used by inbound reference steps"),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    (expansions, exhausted)
+}
+
+fn fuzzy_result_examination_count(result: &FuzzyResult) -> usize {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            hits_by_overload.values().map(BTreeSet::len).sum::<usize>()
+                + unproven_total_by_overload.values().sum::<usize>()
+        }
+        FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => hits_by_overload.values().map(BTreeSet::len).sum(),
+        FuzzyResult::TooManyCallsites {
+            total_callsites, ..
+        } => *total_callsites,
+        FuzzyResult::Failure { .. } => 0,
+    }
+}
+
+fn charge_reference_scan(
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    scanned_files: usize,
+    scanned_source_bytes: usize,
+    examined_references: usize,
+) -> bool {
+    budget.scanned_files = budget.scanned_files.saturating_add(scanned_files);
+    budget.scanned_source_bytes = budget
+        .scanned_source_bytes
+        .saturating_add(scanned_source_bytes);
+    budget.examined_references = budget
+        .examined_references
+        .saturating_add(examined_references);
+    budget.scanned_files > limits.max_scanned_files
+        || budget.scanned_source_bytes > limits.max_scanned_source_bytes
+        || budget.fact_nodes.saturating_add(budget.examined_references) > limits.max_fact_nodes
 }
 
 fn reference_hit_for_target(
@@ -1458,10 +1540,20 @@ fn outbound_reference_expansions(
     filter: &ReferenceTraversalFilter,
     indexed: &mut IndexedDeclarations,
     cache: &mut ReferenceTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> Vec<PipelineExpansion> {
+) -> (Vec<PipelineExpansion>, bool) {
+    let mut exhausted = false;
     if !cache.outbound.contains_key(declaration.unit.source()) {
-        let hits = scan_outbound_reference_hits(analyzer, declaration.unit.source(), diagnostics);
+        let (hits, scan_exhausted) = scan_outbound_reference_hits(
+            analyzer,
+            declaration.unit.source(),
+            budget,
+            limits,
+            diagnostics,
+        );
+        exhausted = scan_exhausted;
         cache
             .outbound
             .insert(declaration.unit.source().clone(), hits);
@@ -1480,20 +1572,23 @@ fn outbound_reference_expansions(
         .collect::<Vec<_>>();
     sort_reference_sites(&mut sites);
     sites.dedup();
-    sites
+    let expansions = sites
         .into_iter()
         .map(|site| reference_expansion(PipelineValue::Declaration(site.target.clone()), site))
-        .collect()
+        .collect();
+    (expansions, exhausted)
 }
 
 fn scan_outbound_reference_hits(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> Vec<ReferenceHit> {
+) -> (Vec<ReferenceHit>, bool) {
     let language = crate::analyzer::common::language_for_file(file);
     let Ok(source) = file.read_to_string() else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let source = Arc::new(source);
     let Some(tree) = parse_tree_for_language(file, language, &source) else {
@@ -1501,7 +1596,7 @@ fn scan_outbound_reference_hits(
             language: language.config_label(),
             message: format!("uses does not support parsing {}", rel_path_string(file)),
         });
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let mut nodes = Vec::new();
     let mut stack = vec![tree.root_node()];
@@ -1515,7 +1610,14 @@ fn scan_outbound_reference_hits(
         }
     }
     const MAX_OUTBOUND_SITES_PER_FILE: usize = 50_000;
+    let examined_references = nodes.len();
+    if charge_reference_scan(budget, limits, 1, source.len(), examined_references) {
+        push_budget_diagnostic(diagnostics, budget);
+        return (Vec::new(), true);
+    }
+    let mut exhausted = false;
     if nodes.len() > MAX_OUTBOUND_SITES_PER_FILE {
+        exhausted = true;
         diagnostics.push(CodeQueryDiagnostic {
             language: language.config_label(),
             message: format!(
@@ -1599,7 +1701,7 @@ fn scan_outbound_reference_hits(
             ),
         });
     }
-    hits
+    (hits, exhausted)
 }
 
 fn sort_reference_sites(sites: &mut [ReferenceSiteValue]) {
@@ -1645,6 +1747,25 @@ fn classify_reference_kind(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, node)| node.range.end_byte - node.range.start_byte);
     if let Some((id, node)) = candidates.first().copied() {
+        let receiver_role = if node.kind == NormalizedKind::FieldAccess {
+            Role::Object
+        } else {
+            Role::Receiver
+        };
+        let receiver = node
+            .role_targets(receiver_role)
+            .next()
+            .map(|role| role.span.text(facts.source()).trim());
+        if receiver.is_some_and(|text| matches!(text, "super" | "base")) {
+            return Some(ReferenceKind::SuperCall);
+        }
+        let static_receiver = analyzer
+            .parent_of(target)
+            .filter(|owner| owner.is_class())
+            .is_some_and(|owner| receiver == Some(owner.short_name()));
+        if static_receiver {
+            return Some(ReferenceKind::StaticReference);
+        }
         if node.kind == NormalizedKind::Call {
             return Some(
                 if target.is_class() || target.kind().display_lowercase() == "constructor" {
@@ -1669,6 +1790,29 @@ fn classify_reference_kind(
             parent = fact.parent;
         }
         return Some(ReferenceKind::FieldRead);
+    }
+    if target.is_class() {
+        let nearest = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.range.start_byte <= start_byte && end_byte <= node.range.end_byte
+            })
+            .min_by_key(|(_, node)| node.range.end_byte - node.range.start_byte)
+            .map(|(id, _)| id as u32);
+        let mut current = nearest;
+        while let Some(id) = current {
+            let node = facts.node(id);
+            if node.kind.satisfies(NormalizedKind::Declaration) {
+                if node.kind == NormalizedKind::Class && node.name.is_none_or(|name| !covers(name))
+                {
+                    return Some(ReferenceKind::Inheritance);
+                }
+                break;
+            }
+            current = node.parent;
+        }
     }
     target.is_class().then_some(ReferenceKind::TypeReference)
 }
@@ -2221,8 +2365,11 @@ fn push_budget_diagnostic(
     diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "query_code execution budget exhausted after scanning {} files, {} bytes, and {} facts; refine the query with where, languages, kind/name anchors, or a narrower pattern",
-            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+            "query_code execution budget exhausted after scanning {} files, {} bytes, {} facts, and examining {} references; refine the query with where, languages, kind/name anchors, or a narrower pattern",
+            budget.scanned_files,
+            budget.scanned_source_bytes,
+            budget.fact_nodes,
+            budget.examined_references
         ),
     });
 }
@@ -2261,8 +2408,11 @@ fn push_truncation_diagnostic(
     diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "query_code returned the first {limit} results after scanning {} files, {} bytes, and {} facts; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
-            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+            "query_code returned the first {limit} results after scanning {} files, {} bytes, {} facts, and examining {} references; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+            budget.scanned_files,
+            budget.scanned_source_bytes,
+            budget.fact_nodes,
+            budget.examined_references
         ),
     });
 }
@@ -2286,8 +2436,11 @@ fn push_broad_query_diagnostic(
     diagnostics.push(CodeQueryDiagnostic {
         language: "workspace",
         message: format!(
-            "broad unanchored query_code query scanned {} files, {} bytes, and {} facts; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",
-            budget.scanned_files, budget.scanned_source_bytes, budget.fact_nodes
+            "broad unanchored query_code query scanned {} files, {} bytes, {} facts, and examined {} references; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",
+            budget.scanned_files,
+            budget.scanned_source_bytes,
+            budget.fact_nodes,
+            budget.examined_references
         ),
     });
 }

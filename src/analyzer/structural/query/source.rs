@@ -2598,6 +2598,42 @@ mod tests {
     }
 
     #[test]
+    fn reference_step_help_and_option_diagnostics_are_range_precise() {
+        let rql = "(references-of :surface external-usages :reference-kinds [field-write] :proof proven (enclosing-decl (class)))";
+        for token in ["references-of", ":surface", ":reference-kinds", ":proof"] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no reference traversal help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        for (source, token) in [
+            (
+                r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"references_of","reference_kinds":["field_guess"]}]}"#,
+                "\"field_guess\"",
+            ),
+            (
+                r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"used_by","proof":"maybe"}]}"#,
+                "\"maybe\"",
+            ),
+            (
+                r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"uses","surface":"all"}]}"#,
+                "\"all\"",
+            ),
+        ] {
+            let diagnostics = validate_query_source(source);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| &source[diagnostic.range.clone()] == token),
+                "{source}: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn byte_ranges_preserve_utf8_boundaries() {
         let source = "(call :unknown-λ 1)";
         let diagnostic = validate_query_source(source).pop().expect("diagnostic");

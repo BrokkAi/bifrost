@@ -125,3 +125,16 @@ test("highlights registered underscore predicate aliases", async () => {
   assertScoped(tokens, "not_has", "support.function.predicate.bifrost-rql");
   assertScoped(tokens, "not_kind", "support.function.predicate.bifrost-rql");
 });
+
+test("highlights reference traversal forms and options", async () => {
+  const tokens = tokenize(
+    await grammar(),
+    "(references-of :reference-kinds [field-write] :proof proven :surface external-usages (class :name \"Target\")) (used-by (class)) (uses (method))"
+  );
+  assertScoped(tokens, "references-of", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":reference-kinds", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, ":proof", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, ":surface", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, "used-by", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "uses", "support.function.wrapper.bifrost-rql");
+});
