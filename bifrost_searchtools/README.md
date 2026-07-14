@@ -62,7 +62,7 @@ exposes:
 | Method | Purpose |
 | --- | --- |
 | `search_symbols(patterns, *, include_tests=False, limit=20)` | Find symbols by name pattern. |
-| `query_code(pattern, *, inside=None, not_inside=None, where=None, languages=None, steps=None, limit=None, result_detail=None, schema_version=None)` | Query normalized code structure and apply typed declaration/import steps. |
+| `query_code(pattern, *, inside=None, not_inside=None, where=None, languages=None, steps=None, limit=None, result_detail=None, schema_version=None)` | Query normalized code structure and apply typed declaration, hierarchy, ownership, and import steps. |
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
@@ -116,9 +116,13 @@ passed through `options` (keys map 1:1 to the Rust tool arguments).
 
 `query_code` is the version-2 typed query surface. Omit `schema_version` for v2
 or pass `schema_version=2` explicitly. The structural `pattern` can be followed
-by ordered `steps` using `enclosing_decl`, `file_of`, `imports_of`, and
-`importers_of`. Import operations traverse one direct project-local edge per
-step. Results are tagged as structural matches, declarations, or files.
+by ordered `steps` using `enclosing_decl`, `file_of`, `imports_of`,
+`importers_of`, `supertypes`, `subtypes`, `members`, and `owner`. Import
+operations traverse one direct project-local edge per step. Hierarchy operations
+are direct by default and accept a positive `depth` or `transitive: true`.
+Declaration results are limited to declarations indexed by the workspace
+analyzer, so references into an unindexed library do not manufacture library
+declarations. Results are tagged as structural matches, declarations, or files.
 Compact output retains minimal pipeline provenance. Pass `result_detail="full"`
 when follow-up tooling needs deterministic IDs and precise ranges.
 
@@ -144,7 +148,7 @@ is the canonical reference:
 | Receiver and callee | `callee.name` and `receiver.name` are derived from AST fields and terminal names, not type resolution. Chained calls stay syntactic. |
 | Decorators and annotations | Decorators/annotations are exposed through the `decorators` role. Full detail reports `node_range`, `decorator_ranges`, and `decorated_range`. |
 | Positional arguments | `args` patterns match positional arguments in order as a subsequence; v2 does not require exact positions or arity. |
-| Typed pipelines | `enclosing_decl` and `file_of` preserve exact indexed identities; import steps follow direct workspace file edges and may be repeated. |
+| Typed pipelines | Declaration, hierarchy, and ownership steps preserve exact indexed identities; import steps follow direct workspace file edges and may be repeated. |
 | Unsupported capabilities | Queries against unsupported normalized kinds or roles return diagnostics instead of silently pretending the language can answer them. |
 
 ## Semantic search

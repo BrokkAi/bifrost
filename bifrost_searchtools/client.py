@@ -196,7 +196,10 @@ class SearchToolsClient:
 
         Version 2 starts with normalized syntactic structure and optionally
         applies typed semantic ``steps`` such as ``enclosing_decl``, ``file_of``,
-        ``imports_of``, and ``importers_of``. ``pattern`` is sent as the tool's
+        ``imports_of``, ``supertypes``, ``subtypes``, ``members``, and ``owner``.
+        Hierarchy steps are direct by default and accept a positive ``depth`` or
+        ``transitive=True``. Declaration results are limited to declarations
+        indexed by the workspace analyzer. ``pattern`` is sent as the tool's
         ``match`` object. ``where`` accepts project-relative globs or absolute
         in-workspace paths/globs. ``result_detail="full"`` adds stable IDs and
         precise ranges; compact mode retains minimal pipeline provenance.

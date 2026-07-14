@@ -22,6 +22,8 @@ bifrost --query-file queries/audit.rql
 bifrost --root /path/to/project --query-file queries/audit.json
 ```
 
+For example, a saved hierarchy query can use `(members (subtypes :transitive true (enclosing-decl (class :name "Service"))))`, or the equivalent JSON steps `enclosing_decl`, transitive `subtypes`, then `members`.
+
 `--query-file` accepts `.rql` and `.json` files only. The default workspace root is the current directory; query-file paths must stay inside that workspace, including after symlinks are resolved. The file contains the complete query, so it cannot be combined with `--tool`, `--args`, or `--sources`.
 
 For the available tool families and tool names, see [MCP Server](../mcp/). For a single tool's description and parameters, ask the CLI directly:

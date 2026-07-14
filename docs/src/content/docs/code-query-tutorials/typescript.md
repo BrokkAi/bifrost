@@ -3,7 +3,7 @@ title: TypeScript
 description: Query TypeScript declarations, callable refinements, decorators, and TSX with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 TypeScript shares JavaScript's structural adapter and adds interface, enum, abstract-class, type-alias, type-identifier, decorator, and TSX grammar shapes.
 
@@ -204,3 +204,166 @@ The TypeScript language filter includes `.tsx`; `where` narrows this call to the
 ## Precision Boundary
 
 Interfaces, enums, and abstract classes intentionally share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; version 2 has no separate public `interface` kind.
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:typescript/hierarchy.ts -->
+```typescript
+class QueryRoot {
+  rootMember(): void {}
+}
+
+class QueryLeaf extends QueryRoot {
+  leafMember(): void {}
+}
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes :transitive true (enclosing-decl (language typescript (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["typescript"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","transitive":true}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 3,
+      "fq_name": "QueryRoot",
+      "kind": "class",
+      "language": "typescript",
+      "path": "typescript/hierarchy.ts",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 7,
+            "kind": "class",
+            "path": "typescript/hierarchy.ts",
+            "result_type": "structural_match",
+            "start_line": 5
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "typescript/hierarchy.ts",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "typescript/hierarchy.ts",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryRoot {",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes (enclosing-decl (language typescript (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["typescript"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes"},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 7,
+      "fq_name": "QueryLeaf",
+      "kind": "class",
+      "language": "typescript",
+      "path": "typescript/hierarchy.ts",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 3,
+            "kind": "class",
+            "path": "typescript/hierarchy.ts",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "typescript/hierarchy.ts",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "typescript/hierarchy.ts",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 6,
+                "fq_name": "QueryLeaf.leafMember",
+                "kind": "function",
+                "path": "typescript/hierarchy.ts",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "typescript/hierarchy.ts",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryLeaf extends QueryRoot {",
+      "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```

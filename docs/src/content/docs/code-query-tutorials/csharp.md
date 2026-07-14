@@ -3,7 +3,7 @@ title: C#
 description: Query C# null-conditional calls, named arguments, attributes, and using aliases with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 C# exposes object creation, null-conditional access, named arguments, attributes, constructors, properties, and using aliases through normalized structural facts. Alias bindings are represented by their visible alias, not by the terminal name of the target type.
 
@@ -187,3 +187,166 @@ Attributes are decorators on the class. An alias import matches `WriterAlias`, b
 ```
 
 Uninitialized declarations such as `empty` are intentionally not assignments. Querying `assignment` with that left name is a useful exact-zero check when auditing initialization patterns.
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:csharp/QueryHierarchy.cs -->
+```csharp
+class QueryRoot {
+    public void RootMember() {}
+}
+
+class QueryLeaf : QueryRoot {
+    public void LeafMember() {}
+}
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes :depth 2 (enclosing-decl (language csharp (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["csharp"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","depth":2}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 3,
+      "fq_name": "QueryRoot",
+      "kind": "class",
+      "language": "csharp",
+      "path": "csharp/QueryHierarchy.cs",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 7,
+            "kind": "class",
+            "path": "csharp/QueryHierarchy.cs",
+            "result_type": "structural_match",
+            "start_line": 5
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "csharp/QueryHierarchy.cs",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "csharp/QueryHierarchy.cs",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryRoot {",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes :transitive true (enclosing-decl (language csharp (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["csharp"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes","transitive":true},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 7,
+      "fq_name": "QueryLeaf",
+      "kind": "class",
+      "language": "csharp",
+      "path": "csharp/QueryHierarchy.cs",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 3,
+            "kind": "class",
+            "path": "csharp/QueryHierarchy.cs",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "csharp/QueryHierarchy.cs",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "csharp/QueryHierarchy.cs",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 6,
+                "fq_name": "QueryLeaf.LeafMember",
+                "kind": "function",
+                "path": "csharp/QueryHierarchy.cs",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "csharp/QueryHierarchy.cs",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryLeaf : QueryRoot {",
+      "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```

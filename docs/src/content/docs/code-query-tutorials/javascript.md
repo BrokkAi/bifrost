@@ -3,7 +3,7 @@ title: JavaScript
 description: Query JavaScript member calls, arrows, class expressions, field access, and new expressions with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 JavaScript normalizes functions, methods, constructors, arrows, class declarations and expressions, calls and `new`, imports, assignments, and member access. It does not invent keyword arguments for a language that has none.
 
@@ -212,3 +212,166 @@ Anonymous class expressions are queryable as `class`, but the assignment binding
 ## Precision Boundary
 
 `service` is matched as source structure, not resolved to the imported binding. Follow a structural result with symbol/usage tools when identity matters.
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:javascript/hierarchy.js -->
+```javascript
+class QueryRoot {
+  rootMember() {}
+}
+
+class QueryLeaf extends QueryRoot {
+  leafMember() {}
+}
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes (enclosing-decl (language javascript (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["javascript"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes"}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 3,
+      "fq_name": "QueryRoot",
+      "kind": "class",
+      "language": "javascript",
+      "path": "javascript/hierarchy.js",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 7,
+            "kind": "class",
+            "path": "javascript/hierarchy.js",
+            "result_type": "structural_match",
+            "start_line": 5
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "javascript/hierarchy.js",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "javascript/hierarchy.js",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryRoot {",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes :depth 2 (enclosing-decl (language javascript (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["javascript"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes","depth":2},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 7,
+      "fq_name": "QueryLeaf",
+      "kind": "class",
+      "language": "javascript",
+      "path": "javascript/hierarchy.js",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 3,
+            "kind": "class",
+            "path": "javascript/hierarchy.js",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "javascript/hierarchy.js",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "javascript/hierarchy.js",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 6,
+                "fq_name": "QueryLeaf.leafMember",
+                "kind": "function",
+                "path": "javascript/hierarchy.js",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "javascript/hierarchy.js",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryLeaf extends QueryRoot {",
+      "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```

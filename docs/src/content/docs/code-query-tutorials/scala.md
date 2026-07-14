@@ -3,7 +3,7 @@ title: Scala
 description: Query Scala named and block arguments, annotations, imports, and assignments with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 Scala has several call shapes that look like assignments in source. The normalized adapter keeps named arguments in `kwargs`, while real `val`/`var` declarations remain `assignment` facts. It also exposes block arguments as structured descendants.
 
@@ -195,6 +195,169 @@ Grouped imports expose their imported selector or alias through `module`; path p
       "path": "scala/App.scala",
       "start_line": 4,
       "text": "import scala.collection.mutable.{ListBuffer, Map as MutableMap}"
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:scala/QueryHierarchy.scala -->
+```scala
+class QueryRoot {
+  def rootMember(): Unit = ()
+}
+
+class QueryLeaf extends QueryRoot {
+  def leafMember(): Unit = ()
+}
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes :transitive true (enclosing-decl (language scala (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["scala"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","transitive":true}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 3,
+      "fq_name": "QueryRoot",
+      "kind": "class",
+      "language": "scala",
+      "path": "scala/QueryHierarchy.scala",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 7,
+            "kind": "class",
+            "path": "scala/QueryHierarchy.scala",
+            "result_type": "structural_match",
+            "start_line": 5
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "scala/QueryHierarchy.scala",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "scala/QueryHierarchy.scala",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryRoot {",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes (enclosing-decl (language scala (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["scala"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes"},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 7,
+      "fq_name": "QueryLeaf",
+      "kind": "class",
+      "language": "scala",
+      "path": "scala/QueryHierarchy.scala",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 3,
+            "kind": "class",
+            "path": "scala/QueryHierarchy.scala",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "scala/QueryHierarchy.scala",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "scala/QueryHierarchy.scala",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 6,
+                "fq_name": "QueryLeaf.leafMember",
+                "kind": "function",
+                "path": "scala/QueryHierarchy.scala",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "scala/QueryHierarchy.scala",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryLeaf {",
+      "start_line": 5
     }
   ],
   "truncated": false

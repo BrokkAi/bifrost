@@ -5,7 +5,9 @@ description: Learn query_code through executable, per-language structural matchi
 
 These tutorials start from recognizable source code and show the same query in [Rune Query Language](/rune-query-language/) and canonical [JSON `CodeQuery`](/code-query-json/). Their fixtures, queries, and complete expected results are executed by Bifrost's integration tests.
 
-Each page builds from a broad structural query to narrower filters and exclusions. [Import Traversal](./import-traversal/) shows version 2's typed enclosing-declaration and direct import-file steps across every adapter with structured import-file analysis. The examples do not claim arbitrary type resolution, call-graph traversal, or data-flow reasoning.
+Each page builds from a broad structural query to narrower filters and exclusions. [Import Traversal](./import-traversal/) shows version 2's typed enclosing-declaration and direct import-file steps across every adapter with structured import-file analysis. Every language cookbook also executes `supertypes`, `subtypes`, `members`, and `owner`, with bounded and transitive hierarchy examples distributed across the suite. The examples do not claim arbitrary type resolution, call-graph traversal, or data-flow reasoning.
+
+Hierarchy recipes return only declarations indexed by the fixture's analyzer. Real projects may expose usages of library types whose declarations are not indexed; those library declarations remain outside the query result until library indexing can be targeted explicitly.
 
 All language pages below are marked with the date of their last successful end-to-end verification.
 
