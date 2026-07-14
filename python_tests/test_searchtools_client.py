@@ -270,6 +270,7 @@ class SearchToolsClientTest(unittest.TestCase):
                                                 "end_column": 18,
                                             },
                                             "target_fq_name": "Target.status",
+                                            "target_id": "Target.java:field:Target.status:0-11",
                                             "proof": "proven",
                                             "reference_kind": "field_read",
                                         },
@@ -289,6 +290,10 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertEqual(
             site.provenance[0].steps[0].via.target_fq_name,
             "Target.status",
+        )
+        self.assertEqual(
+            site.provenance[0].steps[0].via.target_id,
+            "Target.java:field:Target.status:0-11",
         )
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:

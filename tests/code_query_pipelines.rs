@@ -76,6 +76,10 @@ fn java_reference_steps_preserve_exact_site_and_semantic_owner() {
     );
     assert_eq!(site["proof"], "proven", "{references}");
     assert!(
+        site["provenance"][0]["steps"][2]["result"]["target_id"].is_string(),
+        "{references}"
+    );
+    assert!(
         site["range"]["start_column"].as_u64().unwrap() > 0,
         "{references}"
     );

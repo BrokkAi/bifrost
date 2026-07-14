@@ -201,6 +201,7 @@ class CodeQueryResultRef:
     node_range: CodeQueryRange | None = None
     range: CodeQueryRange | None = None
     target_fq_name: str | None = None
+    target_id: str | None = None
     proof: str | None = None
     reference_kind: str | None = None
 
@@ -221,6 +222,7 @@ class CodeQueryResultRef:
             if "range" in data
             else None,
             target_fq_name=data.get("target_fq_name"),
+            target_id=data.get("target_id"),
             proof=data.get("proof"),
             reference_kind=data.get("reference_kind"),
         )

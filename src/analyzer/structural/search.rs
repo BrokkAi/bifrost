@@ -74,7 +74,7 @@ pub enum CodeQueryResultValue {
     },
     ReferenceSite {
         #[serde(flatten)]
-        value: CodeQueryReferenceSite,
+        value: Box<CodeQueryReferenceSite>,
     },
 }
 
@@ -181,6 +181,8 @@ pub enum CodeQueryResultRef {
         path: String,
         range: CodeQueryRange,
         target_fq_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
         proof: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         reference_kind: Option<&'static str>,
@@ -813,7 +815,8 @@ pub fn execute_with_limits(
         rows = next;
         if exhausted {
             budget_exhausted = true;
-            if budget.pipeline_rows >= limits.max_pipeline_rows
+            if (budget.pipeline_rows >= limits.max_pipeline_rows
+                || budget.provenance_steps >= limits.max_pipeline_rows)
                 && !pipeline_budget_diagnostic_emitted
             {
                 push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
@@ -1534,6 +1537,7 @@ fn reference_site_value(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn outbound_reference_expansions(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
@@ -1587,7 +1591,7 @@ fn scan_outbound_reference_hits(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<ReferenceHit>, bool) {
     let language = crate::analyzer::common::language_for_file(file);
-    let Ok(source) = file.read_to_string() else {
+    let Some(source) = analyzer.indexed_source(file) else {
         return (Vec::new(), false);
     };
     let source = Arc::new(source);
@@ -1715,6 +1719,13 @@ fn sort_reference_sites(sites: &mut [ReferenceSiteValue]) {
                     .as_ref()
                     .map(|value| &value.unit)
                     .cmp(&right.enclosing.as_ref().map(|value| &value.unit))
+            })
+            .then_with(|| usage_kind_label(left.usage_kind).cmp(usage_kind_label(right.usage_kind)))
+            .then_with(|| usage_proof_label(left.proof).cmp(usage_proof_label(right.proof)))
+            .then_with(|| {
+                left.reference_kind
+                    .map(reference_kind_label)
+                    .cmp(&right.reference_kind.map(reference_kind_label))
             })
     });
 }
@@ -2118,7 +2129,7 @@ fn render_pipeline_item(
             value: render_file(&file),
         },
         PipelineValue::ReferenceSite(site) => CodeQueryResultValue::ReferenceSite {
-            value: render_reference_site(analyzer, &site, detail, cache),
+            value: Box::new(render_reference_site(analyzer, &site, detail, cache)),
         },
     };
     CodeQueryResultItem {
@@ -2147,14 +2158,14 @@ fn render_provenance(
                     }
                     PipelineTraceValue::File(file) => render_file_ref(file),
                     PipelineTraceValue::ReferenceSite(site) => {
-                        render_reference_site_ref(analyzer, site, cache)
+                        render_reference_site_ref(analyzer, site, detail, cache)
                     }
                 },
                 via: matches!(step.op, QueryStep::UsedBy(_) | QueryStep::Uses(_))
                     .then(|| {
                         step.via
                             .as_ref()
-                            .map(|site| render_reference_site_ref(analyzer, site, cache))
+                            .map(|site| render_reference_site_ref(analyzer, site, detail, cache))
                     })
                     .flatten(),
             })
@@ -2208,12 +2219,24 @@ fn render_file_ref(file: &ProjectFile) -> CodeQueryResultRef {
 fn render_reference_site_ref(
     analyzer: &dyn IAnalyzer,
     site: &ReferenceSiteValue,
+    detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
+    let target_path = rel_path_string(site.target.unit.source());
+    let target_fq_name = site.target.unit.fq_name();
+    let target_kind = site.target.unit.kind().display_lowercase();
     CodeQueryResultRef::ReferenceSite {
         path: rel_path_string(&site.file),
         range: render_reference_range(analyzer, site, cache),
-        target_fq_name: site.target.unit.fq_name(),
+        target_id: (!detail.is_compact()).then(|| {
+            declaration_id(
+                &target_path,
+                target_kind,
+                &target_fq_name,
+                site.target.range,
+            )
+        }),
+        target_fq_name,
         proof: usage_proof_label(site.proof),
         reference_kind: site.reference_kind.map(reference_kind_label),
     }
@@ -2279,12 +2302,12 @@ fn render_reference_site(
 }
 
 fn render_reference_range(
-    _analyzer: &dyn IAnalyzer,
+    analyzer: &dyn IAnalyzer,
     site: &ReferenceSiteValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryRange {
     cache
-        .coordinates_for(&site.file, || site.file.read_to_string().ok())
+        .coordinates_for(&site.file, || analyzer.indexed_source(&site.file))
         .map(|coordinates| {
             range_for_offsets(
                 &coordinates.source,

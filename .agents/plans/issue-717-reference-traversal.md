@@ -16,7 +16,7 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 - [x] (2026-07-14 17:10Z) Milestone 1: implemented the public reference-step IR, operation-specific schema, JSON/RQL parsing, `reference_site` result domain, provenance `via`, MCP/TextMate vocabulary, CLI/LSP routing, and Python consumer models.
 - [x] (2026-07-14 19:05Z) Milestone 2: implemented cached exact inbound/outbound traversal across all eleven adapters, structured proof/surface/kind filtering, deterministic site identity and provenance, bounded partial-result semantics, reference-scan budget accounting, and focused cross-language/classification/failure tests without changing the legacy usage graph.
 - [x] (2026-07-14 19:45Z) Milestone 3: added and rendered the executable Reference Traversal cookbook, seven exact JSON/RQL/expected-result recipes, all-adapter support matrix and language links, Python consumer coverage, generated agent-skill guidance, and public schema/CLI/MCP documentation.
-- [ ] Milestone 4: run focused and complete validation, review the full diff, fix findings, and record the final outcome.
+- [x] (2026-07-14 20:35Z) Milestone 4: reviewed the complete diff, fixed indexed-overlay range rendering and full-provenance target identity, passed all-feature clippy and focused/public-consumer gates, and ran the broad NLP suite with its single sandbox-only sidecar failure passing outside the sandbox. The combined `nlp,python` Rust test binary remains un-linkable on this macOS extension-module configuration; the Python wheel suite passes separately.
 
 ## Surprises & Discoveries
 
@@ -46,6 +46,15 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 
 - Observation: Member calls produce both a normalized call and a nested field-access fact, so choosing the smallest containing fact first misclassified `this.target()` as a field read.
   Evidence: preferring a covering `Call` fact before `FieldAccess` preserves the structured receiver/surface semantics and makes the executable LSP-surface recipe report `method_call`.
+
+- Observation: This machine has matching-version Rustup and Homebrew Cargo/Clippy binaries, but their compiler metadata is not interchangeable even though both report Rust 1.96.0.
+  Evidence: the default `cargo clippy` resolved Homebrew `cargo-clippy` after Rustup Cargo compiled dependencies and produced E0514 errors. Pinning `PATH` to `/Users/dave/.cargo/bin` and using a fresh target made `cargo clippy --all-targets --all-features -- -D warnings` pass.
+
+- Observation: Outbound source reads and final range rendering must use the analyzer snapshot, not `ProjectFile::read_to_string`.
+  Evidence: final review found those two disk reads; both now use `IAnalyzer::indexed_source`, preserving open-document overlays and the same source generation used for structured resolution.
+
+- Observation: The featureful NLP suite's sidecar timeout test fails inside the filesystem sandbox because its `uv` child cannot read the existing cache, not because of the feature.
+  Evidence: the broad `--features nlp` library run passed 779 tests before that one failure, and the exact failed test passed when rerun outside the sandbox. The separate Python wheel suite passed all 39 tests.
 
 ## Decision Log
 
@@ -79,7 +88,9 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 
 ## Outcomes & Retrospective
 
-Milestones 1 through 3 are implemented. JSON and RQL canonicalize configured reference steps; reference sites serialize exact ranges, targets, optional exact enclosing declarations, proof, usage surface kind, and optional classification. Declaration-returning steps retain the exact site under `via`. The pipeline resolves exact inbound and outbound edges across Python, Java, JavaScript, TypeScript, Go, C/C++, Rust, PHP, Scala, C#, and Ruby. Focused Java cases prove all eight reference kinds, inverse `uses`/`used_by`, `file_of` composition, surfaces, proof tiers, and same-name-owner isolation. Reference scans are cached and charged to existing workspace/pipeline budgets; legacy `usage_graph` construction remains unchanged. The executable cookbook now proves seven complete reference/import compositions, public consumer and generated-skill documentation is current, Python/editor/docs checks pass, and a fresh browser render has been inspected. Final full Rust validation and diff review remain.
+Issue #717 is implemented across the schema-v2 typed pipeline, all eleven existing analyzers, public result/provenance models, CLI/LSP/Python consumers, editor grammar, installed agent skills, and published documentation. JSON and RQL canonicalize configured reference steps; exact sites retain target and smallest semantic owner identity, proof/surface/kind classification, deterministic deduplication, and up to sixteen provenance paths. `used_by` and `uses` retain the proving site under `via`, including a stable exact target ID in full-detail results. Cached analyzer-snapshot scans are charged to query limits and cannot leak an intermediate domain after truncation.
+
+The executable cookbook proves seven full recipes and the cross-language integration test proves exact inbound and outbound traversal for Python, Java, JavaScript, TypeScript, Go, C/C++, Rust, PHP, Scala, C#, and Ruby. All-feature clippy, focused Rust suites, 39 Python tests, 46 VS Code tests, Astro check/build, formatting, and diff checks pass; a fresh rendered preview was inspected. The macOS environment cannot link the combined Rust `python` feature test binary because this crate is configured as an extension module with unresolved `_Py*` symbols, but the same Python feature builds and passes through the wheel test gate. The broad NLP suite's sole sandbox-caused sidecar failure passed outside the sandbox.
 
 ## Context and Orientation
 

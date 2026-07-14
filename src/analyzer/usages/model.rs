@@ -38,20 +38,15 @@ pub enum UsageProof {
     Unproven,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UsageHitSurface {
     /// Agent/search/relevance/call-graph surfaces that should count only external
     /// references from other semantic contexts.
+    #[default]
     ExternalUsages,
     /// Editor find-references surface that should show every source occurrence that
     /// points at the symbol, including import bindings and self/this receiver calls.
     LspReferences,
-}
-
-impl Default for UsageHitSurface {
-    fn default() -> Self {
-        Self::ExternalUsages
-    }
 }
 
 impl UsageHitKind {

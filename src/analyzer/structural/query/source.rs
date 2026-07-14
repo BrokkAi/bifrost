@@ -652,7 +652,7 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
 
 fn validate_reference_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
     let options = &args[..args.len().saturating_sub(1)];
-    if options.len() % 2 != 0 {
+    if !options.len().is_multiple_of(2) {
         analysis.error(
             options
                 .last()
