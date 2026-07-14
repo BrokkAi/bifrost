@@ -20,7 +20,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 - [x] (2026-07-14) Remediated guided-review findings in structural extraction and LSP: centralized the default grammar registry, preserved explicit/path-derived TSX grammar selection, rejected source above 256 KiB before parsing, removed unresolvable arena IDs from role forms, and passed 9 focused library tests plus the TSX-aware overlay LSP integration test.
 - [x] (2026-07-14) Remediated guided-review findings in the REPL by sharing capture state with Reedline validation, making captured lines complete regardless of delimiters, and cancelling/resetting capture before it exceeds 256 KiB; all 17 REPL tests pass.
 - [x] (2026-07-14) Remediated the duplicated VS Code runtime source-language registry by deriving both client selection and Rune IR validation from one exported list; added manifest consistency coverage and passed all 49 extension tests.
-- [ ] Update user-facing limit/TSX documentation, run the complete post-fix validation matrix and full merge-base review, then close the guided-review queue.
+- [x] (2026-07-14) Documented explicit TSX selection and the 256 KiB pre-parse/capture bound, reran the complete post-fix validation matrix, reviewed the full merge-base diff, and closed all six guided-review findings. All compiled default-feature Rust test binaries passed; the final rustdoc phase passed in an isolated rustup target after the shared target exposed a Homebrew/rustup metadata collision. All-target/all-feature clippy, 49 extension tests, Astro checks, and the production docs build pass.
 
 ## Surprises & Discoveries
 
@@ -64,7 +64,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 
 ## Outcomes & Retrospective
 
-The issue is implemented end to end under the public name Rune IR. Callers can render bounded, balanced Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer; the REPL exposes that path through `:ir <language>` without initializing its lazy workspace service; the private LSP request returns identical Rune IR from unsaved overlay content with indexed declaration selection and UTF-16 ranges; and VS Code displays the opaque server response from a source-editor command. The documentation builds cleanly and its rendered preview presents the architecture and workflows correctly. Formatting, focused Rust/LSP tests, extension tests, and all-target/all-feature clippy pass. The only unavailable gate is the full `nlp,python` test link in this machine's existing PyO3 environment; its undefined Python symbols are unrelated to Rune IR.
+The issue is implemented end to end under the public name Rune IR. Callers can render bounded, balanced Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer; explicit and file-derived TSX parsing preserves JSX; input is rejected before parsing or unbounded capture beyond 256 KiB; role forms no longer leak arena-local identifiers; and malformed captured source reliably reaches `:end`. The private LSP request returns identical Rune IR from unsaved overlay content with indexed declaration selection and UTF-16 ranges, while VS Code displays the opaque server response and derives its runtime language checks from one registry. The documentation builds cleanly and its rendered preview presents the architecture and workflows correctly. Formatting, focused Rust/LSP tests, all compiled default-feature Rust test binaries, isolated rustdoc tests, all 49 extension tests, Astro checks/build, and all-target/all-feature clippy pass. The only unavailable gate is the full `nlp,python` test link in this machine's existing PyO3 environment; its undefined Python symbols are unrelated to Rune IR.
 
 ## Context and Orientation
 
@@ -181,3 +181,5 @@ Revision note (2026-07-14): Completed the structural/LSP remediation milestone w
 Revision note (2026-07-14): Completed the REPL remediation milestone with capture-aware validation, bounded ingestion, reset behavior, and 17 passing binary tests; recorded the sandbox PTY limitation.
 
 Revision note (2026-07-14): Completed the editor registry remediation milestone by centralizing the runtime language IDs and adding a test that holds both declarative manifest contexts to that registry.
+
+Revision note (2026-07-14): Closed the guided-review remediation after documenting TSX and input bounds, passing the complete practical validation matrix, isolating the rustdoc toolchain collision, and reviewing the final merge-base diff.

@@ -52,9 +52,11 @@ fn greet(name: &str) {
 :end
 ```
 
-This path parses the supplied source through the real Rust structural adapter and does not initialize a workspace index. The starter uses the selected top-level node's canonical kind and exact name when available, and Bifrost validates it through the same `CodeQuery` frontend used for normal RQL. The complete Rune IR may contain several containment children and role edges that one starter `Pattern` cannot express.
+This path parses the supplied source through the real Rust structural adapter and does not initialize a workspace index. Use `:ir tsx` for TypeScript snippets containing JSX; `:ir typescript` uses the ordinary `.ts` grammar. The starter uses the selected top-level node's canonical kind and exact name when available, and Bifrost validates it through the same `CodeQuery` frontend used for normal RQL. The complete Rune IR may contain several containment children and role edges that one starter `Pattern` cannot express.
 
-In VS Code, place the cursor or a selection inside an indexed declaration and run **Bifrost: Show Rune IR** from the editor context menu or command palette. The server reads the current unsaved overlay, selects the smallest enclosing indexed code unit, and returns Rune IR plus starter RQL. The extension displays that server-rendered result without maintaining its own structural vocabulary.
+In VS Code, place the cursor or a selection inside an indexed declaration and run **Bifrost: Show Rune IR** from the editor context menu or command palette. The server reads the current unsaved overlay, preserves file-specific parser variants such as TSX, selects the smallest enclosing indexed code unit, and returns Rune IR plus starter RQL. The extension displays that server-rendered result without maintaining its own structural vocabulary.
+
+Rune IR accepts at most 256 KiB of source per request or REPL capture. Oversized input is rejected before structural parsing so query-by-example cannot monopolize the language server or grow an unbounded REPL buffer.
 
 ## Version 2 Typed Pipelines
 
