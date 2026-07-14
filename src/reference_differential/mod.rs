@@ -454,7 +454,7 @@ fn collect_sampled_sites(
         let ranges =
             match reference_candidate_ranges(root, language, config.max_candidates_per_file) {
                 ReferenceCandidateRanges::Complete(ranges) => ranges,
-                ReferenceCandidateRanges::LimitExceeded { limit } => {
+                ReferenceCandidateRanges::LimitExceeded { limit, .. } => {
                     summary.candidate_limit_exceeded_files += 1;
                     summary.candidate_limit_excluded_candidates_lower_bound = summary
                         .candidate_limit_excluded_candidates_lower_bound
@@ -914,7 +914,7 @@ fn inverse_hit_evidence(hit: &UsageHit, record: &ReferenceDifferentialSite) -> I
         start_byte: hit.start_offset,
         end_byte: hit.end_offset,
         line: hit.line + 1,
-        kind: usage_hit_kind(hit.kind).to_string(),
+        kind: hit.kind.wire_label().to_string(),
         exact_range: hit.start_offset == record.start_byte && hit.end_offset == record.end_byte,
         snippet: hit.snippet.clone(),
     }
@@ -981,15 +981,6 @@ fn code_unit_kind(kind: CodeUnitType) -> &'static str {
         CodeUnitType::Module => "module",
         CodeUnitType::Macro => "macro",
         CodeUnitType::FileScope => "file_scope",
-    }
-}
-
-fn usage_hit_kind(kind: UsageHitKind) -> &'static str {
-    match kind {
-        UsageHitKind::Reference => "reference",
-        UsageHitKind::Import => "import",
-        UsageHitKind::SelfReceiver => "self_receiver",
-        UsageHitKind::OverrideDeclaration => "override_declaration",
     }
 }
 

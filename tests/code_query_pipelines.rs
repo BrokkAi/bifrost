@@ -393,6 +393,40 @@ fn reference_surface_and_proof_filters_preserve_existing_usage_semantics() {
         unproven["results"].as_array().unwrap().is_empty(),
         "{unproven}"
     );
+
+    let outbound = |surface: &str| {
+        serialized(&run(
+            &files,
+            json!({
+                "match": { "kind": "callable", "name": "caller" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    {
+                        "op": "uses",
+                        "surface": surface,
+                        "proof": "proven"
+                    }
+                ]
+            }),
+        ))
+    };
+    let external_outbound = outbound("external_usages");
+    assert!(
+        external_outbound["results"].as_array().unwrap().is_empty(),
+        "{external_outbound}"
+    );
+
+    let lsp_outbound = outbound("lsp_references");
+    assert_eq!(
+        result_fq_names(&lsp_outbound),
+        vec!["Target.target"],
+        "{lsp_outbound}"
+    );
+    assert_eq!(
+        lsp_outbound["results"][0]["provenance"][0]["steps"][1]["via"]["usage_kind"],
+        "self_receiver",
+        "{lsp_outbound}"
+    );
 }
 
 #[test]
@@ -980,6 +1014,44 @@ fn reference_scans_charge_workspace_budgets_and_do_not_leak_intermediate_sites()
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("examining 0 references")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn inbound_reference_scan_admits_candidate_sources_before_graph_work() {
+    let target_source = "class Target { static void target() {} }\n";
+    let project = InlineTestProject::new()
+        .file("Target.java", target_source)
+        .file(
+            "User.java",
+            "class User { static void caller() { Target.target(); } }\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "where": ["Target.java"],
+        "match": { "kind": "callable", "name": "target" },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "references_of" }]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_source_bytes: target_source.len() + 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+
+    assert!(result.truncated, "{:?}", result.diagnostics);
+    assert!(result.results.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("source-byte budget truncated")),
         "{:?}",
         result.diagnostics
     );

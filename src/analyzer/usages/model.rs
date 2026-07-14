@@ -50,6 +50,15 @@ pub enum UsageHitSurface {
 }
 
 impl UsageHitKind {
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            UsageHitKind::Reference => "reference",
+            UsageHitKind::Import => "import",
+            UsageHitKind::SelfReceiver => "self_receiver",
+            UsageHitKind::OverrideDeclaration => "override_declaration",
+        }
+    }
+
     pub fn included_in(self, surface: UsageHitSurface) -> bool {
         match surface {
             UsageHitSurface::ExternalUsages => {

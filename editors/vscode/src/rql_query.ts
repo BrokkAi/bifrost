@@ -13,6 +13,13 @@ interface RqlQueryResultBase {
   provenance_truncated?: boolean;
 }
 
+export interface RqlResultRange {
+  start_line: number;
+  start_column: number;
+  end_line: number;
+  end_column: number;
+}
+
 export interface RqlStructuralMatchResult extends RqlQueryResultBase {
   result_type: "structural_match";
   kind: string;
@@ -33,6 +40,20 @@ export interface RqlDeclarationResult extends RqlQueryResultBase {
   signature?: string;
 }
 
+export interface RqlReferenceSiteResult extends RqlQueryResultBase {
+  result_type: "reference_site";
+  language: string;
+  range: RqlResultRange;
+  target: Omit<RqlDeclarationResult, "result_type" | "uri" | "provenance" | "provenance_truncated">;
+  enclosing_declaration?: Omit<
+    RqlDeclarationResult,
+    "result_type" | "uri" | "provenance" | "provenance_truncated"
+  >;
+  usage_kind: string;
+  proof: string;
+  reference_kind?: string;
+}
+
 export interface RqlFileResult extends RqlQueryResultBase {
   result_type: "file";
   language: string;
@@ -41,7 +62,8 @@ export interface RqlFileResult extends RqlQueryResultBase {
 export type RqlQueryResultItem =
   | RqlStructuralMatchResult
   | RqlDeclarationResult
-  | RqlFileResult;
+  | RqlFileResult
+  | RqlReferenceSiteResult;
 
 export interface RqlQueryResponse {
   text: string;
@@ -105,4 +127,82 @@ export function groupRqlQueryResults(results: readonly RqlQueryResultItem[]): Rq
     }
   }
   return [...files.values()];
+}
+
+export function queryResultLabel(result: RqlQueryResultItem): string {
+  switch (result.result_type) {
+    case "structural_match":
+      return result.text;
+    case "declaration":
+      return result.fq_name;
+    case "file":
+      return result.path;
+    case "reference_site":
+      return result.target.fq_name;
+  }
+}
+
+export function queryResultDescription(result: RqlQueryResultItem): string {
+  switch (result.result_type) {
+    case "file":
+      return `file · ${result.language}`;
+    case "reference_site":
+      return `${result.reference_kind ?? "reference"} · ${result.range.start_line}:${result.range.start_column}`;
+    case "structural_match":
+    case "declaration":
+      return `${result.kind} · ${result.start_line}-${result.end_line}`;
+  }
+}
+
+export function queryResultTooltip(result: RqlQueryResultItem): string {
+  switch (result.result_type) {
+    case "structural_match":
+      return (
+        `**${result.kind}** at ${result.path}:${result.start_line}-${result.end_line}` +
+        (result.enclosing_symbol ? `\n\nInside \`${result.enclosing_symbol}\`` : "")
+      );
+    case "declaration":
+      return (
+        `**${result.kind}** at ${result.path}:${result.start_line}-${result.end_line}` +
+        (result.signature ? `\n\n\`${result.signature}\`` : "")
+      );
+    case "file":
+      return `**file** at ${result.path}\n\nLanguage: ${result.language}`;
+    case "reference_site":
+      return (
+        `**${result.reference_kind ?? "reference"}** to \`${result.target.fq_name}\` at ` +
+        `${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n${result.usage_kind} · ${result.proof}`
+      );
+  }
+}
+
+export function queryResultIcon(result: RqlQueryResultItem): string {
+  switch (result.result_type) {
+    case "structural_match":
+      return "symbol-method";
+    case "declaration":
+      return "symbol-class";
+    case "file":
+      return "file-code";
+    case "reference_site":
+      return "references";
+  }
+}
+
+export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | undefined {
+  switch (result.result_type) {
+    case "file":
+      return undefined;
+    case "reference_site":
+      return result.range;
+    case "structural_match":
+    case "declaration":
+      return {
+        start_line: result.start_line,
+        start_column: 1,
+        end_line: result.end_line,
+        end_column: 1
+      };
+  }
 }

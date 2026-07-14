@@ -1,5 +1,7 @@
 use crate::analyzer::common::{is_unparseable_source, language_for_file};
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
+#[cfg(test)]
+use crate::analyzer::reference_candidates::reference_candidate_ranges;
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, semantic_token_candidate_ranges,
 };
@@ -562,16 +564,40 @@ mod tests {
         source.push_str("} }\n");
         let tree = parse_tree_for_language(&file, Language::Java, &source).expect("parse Java");
 
-        assert_eq!(
-            semantic_token_candidate_ranges(
-                tree.root_node(),
-                Language::Java,
-                MAX_SEMANTIC_TOKEN_CANDIDATES
-            ),
-            ReferenceCandidateRanges::LimitExceeded {
-                limit: MAX_SEMANTIC_TOKEN_CANDIDATES
-            }
+        let collected = semantic_token_candidate_ranges(
+            tree.root_node(),
+            Language::Java,
+            MAX_SEMANTIC_TOKEN_CANDIDATES,
         );
+        assert!(matches!(
+            collected,
+            ReferenceCandidateRanges::LimitExceeded { limit, ranges }
+                if limit == MAX_SEMANTIC_TOKEN_CANDIDATES
+                    && ranges.len() == MAX_SEMANTIC_TOKEN_CANDIDATES
+        ));
+    }
+
+    #[test]
+    fn reference_candidates_exclude_non_reference_literals() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = crate::analyzer::ProjectFile::new(&root, PathBuf::from("Values.java"));
+        let source = "class Values { void target() {} void caller() { 123; \"text\"; target(); } }";
+        let tree = parse_tree_for_language(&file, Language::Java, source).expect("parse Java");
+        let ReferenceCandidateRanges::Complete(ranges) = reference_candidate_ranges(
+            tree.root_node(),
+            Language::Java,
+            MAX_SEMANTIC_TOKEN_CANDIDATES,
+        ) else {
+            panic!("small structured candidate set must be complete");
+        };
+        let candidate_text = ranges
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<Vec<_>>();
+        assert!(!candidate_text.contains(&"123"));
+        assert!(!candidate_text.contains(&"\"text\""));
+        assert!(candidate_text.contains(&"target"));
     }
 
     #[test]

@@ -10,21 +10,27 @@ use super::facts::{FileFacts, Span};
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
+use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CodeQuery, CodeQueryResultDetail, HierarchyTraversal, QueryStep, ReferenceTraversalFilter,
+};
+use crate::analyzer::reference_candidates::{
+    ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
 };
 use crate::analyzer::structural::capabilities::QueryFeature;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
-    resolve_definition_batch_with_source,
+    resolve_definition_batch_with_source, resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::usages::{
-    FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind, UsageProof,
+    ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind,
+    UsageProof,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset, line_column_for_offset};
+use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -183,6 +189,8 @@ pub enum CodeQueryResultRef {
         target_fq_name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage_kind: Option<&'static str>,
         proof: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         reference_kind: Option<&'static str>,
@@ -536,6 +544,27 @@ pub fn execute_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
+    execute_internal(analyzer, query, limits, None)
+}
+
+pub(crate) fn execute_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: &CancellationToken,
+) -> CodeQueryResult {
+    execute_internal(analyzer, query, limits, Some(cancellation))
+}
+
+fn execute_internal(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> CodeQueryResult {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_query_result();
+    }
     if let Err(error) = query.validate_steps() {
         return CodeQueryResult {
             results: Vec::new(),
@@ -558,6 +587,9 @@ pub fn execute_with_limits(
     let mut diagnostics = Vec::new();
     let mut scoped_languages = BTreeSet::new();
     for file in analyzer.analyzed_files() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         let language = crate::analyzer::common::language_for_file(&file);
         let requested = query.languages.is_empty() || query.languages.contains(&language);
         if requested && file_matches_globs(&file, query) {
@@ -573,6 +605,9 @@ pub fn execute_with_limits(
     )> = Vec::new();
 
     for provider in providers {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         let language = provider.structural_language();
         supported.insert(language);
         let mut files = provider.structural_files();
@@ -641,6 +676,9 @@ pub fn execute_with_limits(
     let mut budget_exhausted = false;
     let mut pipeline_budget_diagnostic_emitted = false;
     for (_path, language, provider, file) in candidates {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         let Some(source) = provider.structural_source(&file) else {
             continue;
         };
@@ -688,6 +726,9 @@ pub fn execute_with_limits(
     }
 
     if !pipeline_query {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         let truncated = match_truncated || budget_exhausted;
         if should_report_broad_query(&plan, query, &budget, truncated) {
             push_broad_query_diagnostic(&mut diagnostics, &budget);
@@ -749,6 +790,9 @@ pub fn execute_with_limits(
     let mut import_graph = None;
     let mut import_graph_budget_diagnostic_emitted = false;
     for (step_index, step) in query.steps.iter().enumerate() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         if !rows.is_empty()
             && indexed_declarations.is_none()
             && matches!(
@@ -810,9 +854,18 @@ pub fn execute_with_limits(
             &mut reference_cache,
             &mut budget,
             limits,
+            if step_index + 1 == query.steps.len() {
+                query.limit.saturating_add(1)
+            } else {
+                limits.max_pipeline_rows
+            },
+            cancellation,
             &mut diagnostics,
         );
         rows = next;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_query_result();
+        }
         if exhausted {
             budget_exhausted = true;
             if (budget.pipeline_rows >= limits.max_pipeline_rows
@@ -841,6 +894,9 @@ pub fn execute_with_limits(
         push_broad_query_diagnostic(&mut diagnostics, &budget);
     }
     let mut render_cache = PipelineRenderCache::default();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_query_result();
+    }
     let results = rows
         .into_iter()
         .map(|row| render_pipeline_item(analyzer, row, query.result_detail, &mut render_cache))
@@ -849,6 +905,17 @@ pub fn execute_with_limits(
         results,
         truncated,
         diagnostics,
+    }
+}
+
+fn cancelled_query_result() -> CodeQueryResult {
+    CodeQueryResult {
+        results: Vec::new(),
+        truncated: true,
+        diagnostics: vec![CodeQueryDiagnostic {
+            language: "workspace",
+            message: "query_code cancelled; no partial results were retained".to_string(),
+        }],
     }
 }
 
@@ -967,6 +1034,8 @@ fn apply_pipeline_step(
     reference_cache: &mut ReferenceTraversalCache,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
+    max_step_outputs: usize,
+    cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<PipelineRow>, bool) {
     let max_pipeline_rows = limits.max_pipeline_rows;
@@ -980,6 +1049,9 @@ fn apply_pipeline_step(
 
     let mut indexed_declarations = indexed_declarations;
     'rows: for row in rows {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (Vec::new(), true);
+        }
         let mut row_exhausted = false;
         let expansions = match (&row.value, step) {
             (PipelineValue::StructuralMatch(seed), QueryStep::EnclosingDecl) => {
@@ -1119,6 +1191,7 @@ fn apply_pipeline_step(
                     limits,
                     diagnostics,
                     max_pipeline_rows.saturating_sub(budget.pipeline_rows),
+                    cancellation,
                 );
                 row_exhausted = reference_exhausted;
                 expansions
@@ -1135,6 +1208,8 @@ fn apply_pipeline_step(
                     reference_cache,
                     budget,
                     limits,
+                    max_step_outputs,
+                    cancellation,
                     diagnostics,
                 );
                 row_exhausted = reference_exhausted;
@@ -1259,6 +1334,7 @@ fn inbound_reference_expansions(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     max_hits: usize,
+    cancellation: Option<&CancellationToken>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let mut exhausted = false;
     if !cache.inbound.contains_key(&declaration.unit) {
@@ -1269,24 +1345,33 @@ fn inbound_reference_expansions(
             push_budget_diagnostic(diagnostics, budget);
             return (Vec::new(), true);
         }
-        let query = UsageFinder::new().query(
+        let remaining_source_bytes = limits
+            .max_scanned_source_bytes
+            .saturating_sub(budget.scanned_source_bytes);
+        if remaining_source_bytes == 0 {
+            push_budget_diagnostic(diagnostics, budget);
+            return (Vec::new(), true);
+        }
+        let mut finder = UsageFinder::new();
+        if let Some(cancellation) = cancellation {
+            finder = finder.with_cancellation(cancellation.clone());
+        }
+        let query = finder.query_with_source_budget(
             analyzer,
             std::slice::from_ref(&declaration.unit),
             MAX_SCANNED_FILES.min(remaining_files),
             max_hits.max(1),
+            remaining_source_bytes,
         );
-        let scanned_source_bytes = query
-            .candidate_files
-            .iter()
-            .filter_map(|file| analyzer.indexed_source(file))
-            .map(|source| source.len())
-            .sum();
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (Vec::new(), true);
+        }
         let examined_references = fuzzy_result_examination_count(&query.result);
         if charge_reference_scan(
             budget,
             limits,
             query.candidate_files.len(),
-            scanned_source_bytes,
+            query.scanned_source_bytes,
             examined_references,
         ) {
             push_budget_diagnostic(diagnostics, budget);
@@ -1295,7 +1380,17 @@ fn inbound_reference_expansions(
         }
         let mut hits = Vec::new();
         let report = cache.reported_inbound.insert(declaration.unit.clone());
-        if report && query.candidate_files_truncated {
+        if report && query.source_bytes_truncated {
+            exhausted = true;
+            diagnostics.push(CodeQueryDiagnostic {
+                language: crate::analyzer::common::language_for_file(declaration.unit.source())
+                    .config_label(),
+                message: format!(
+                    "references_of source-byte budget truncated candidate files for {}",
+                    declaration.unit.fq_name()
+                ),
+            });
+        } else if report && query.candidate_files_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
                 language: crate::analyzer::common::language_for_file(declaration.unit.source())
@@ -1510,6 +1605,37 @@ fn reference_hit_for_target(
     }
 }
 
+fn reference_hits_for_target(
+    analyzer: &dyn IAnalyzer,
+    result: FuzzyResult,
+    target: &CodeUnit,
+) -> Vec<ReferenceHit> {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } => hits_by_overload
+            .into_values()
+            .flatten()
+            .map(|hit| reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Proven))
+            .chain(unproven_by_overload.into_values().flatten().map(|hit| {
+                reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Unproven)
+            }))
+            .collect(),
+        FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => hits_by_overload
+            .into_values()
+            .flatten()
+            .map(|hit| {
+                reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Unproven)
+            })
+            .collect(),
+        FuzzyResult::Failure { .. } | FuzzyResult::TooManyCallsites { .. } => Vec::new(),
+    }
+}
+
 fn reference_hit_matches(hit: &ReferenceHit, filter: &ReferenceTraversalFilter) -> bool {
     hit.usage_kind.included_in(filter.surface)
         && filter.proof.is_none_or(|proof| proof == hit.proof)
@@ -1546,6 +1672,8 @@ fn outbound_reference_expansions(
     cache: &mut ReferenceTraversalCache,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
+    max_step_outputs: usize,
+    cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let mut exhausted = false;
@@ -1555,6 +1683,8 @@ fn outbound_reference_expansions(
             declaration.unit.source(),
             budget,
             limits,
+            max_step_outputs,
+            cancellation,
             diagnostics,
         );
         exhausted = scan_exhausted;
@@ -1588,12 +1718,26 @@ fn scan_outbound_reference_hits(
     file: &ProjectFile,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
+    max_step_outputs: usize,
+    cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<ReferenceHit>, bool) {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return (Vec::new(), true);
+    }
     let language = crate::analyzer::common::language_for_file(file);
     let Some(source) = analyzer.indexed_source(file) else {
         return (Vec::new(), false);
     };
+    let remaining_source_bytes = limits
+        .max_scanned_source_bytes
+        .saturating_sub(budget.scanned_source_bytes);
+    if budget.scanned_files >= limits.max_scanned_files || source.len() > remaining_source_bytes {
+        push_budget_diagnostic(diagnostics, budget);
+        return (Vec::new(), true);
+    }
+    budget.scanned_files += 1;
+    budget.scanned_source_bytes += source.len();
     let source = Arc::new(source);
     let Some(tree) = parse_tree_for_language(file, language, &source) else {
         diagnostics.push(CodeQueryDiagnostic {
@@ -1602,98 +1746,141 @@ fn scan_outbound_reference_hits(
         });
         return (Vec::new(), false);
     };
-    let mut nodes = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        if children.is_empty() && node.is_named() && node.start_byte() < node.end_byte() {
-            nodes.push((node.start_byte(), node.end_byte()));
-        } else {
-            stack.extend(children.into_iter().rev());
-        }
-    }
     const MAX_OUTBOUND_SITES_PER_FILE: usize = 50_000;
-    let examined_references = nodes.len();
-    if charge_reference_scan(budget, limits, 1, source.len(), examined_references) {
+    let remaining_reference_budget = limits
+        .max_fact_nodes
+        .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references));
+    if remaining_reference_budget == 0 {
         push_budget_diagnostic(diagnostics, budget);
         return (Vec::new(), true);
     }
-    let mut exhausted = false;
-    if nodes.len() > MAX_OUTBOUND_SITES_PER_FILE {
+    let retained_work_budget = max_step_outputs.saturating_mul(64).max(256);
+    let candidate_limit = MAX_OUTBOUND_SITES_PER_FILE
+        .min(remaining_reference_budget)
+        .min(retained_work_budget);
+    let candidate_ranges = match cancellation {
+        Some(cancellation) => reference_candidate_ranges_cancellable(
+            tree.root_node(),
+            language,
+            candidate_limit,
+            &|| cancellation.is_cancelled(),
+        ),
+        None => Some(reference_candidate_ranges(
+            tree.root_node(),
+            language,
+            candidate_limit,
+        )),
+    };
+    let Some(candidate_ranges) = candidate_ranges else {
+        return (Vec::new(), true);
+    };
+    let (ranges, mut exhausted) = match candidate_ranges {
+        ReferenceCandidateRanges::Complete(ranges) => (ranges, false),
+        ReferenceCandidateRanges::LimitExceeded { ranges, .. } => (ranges, true),
+    };
+    budget.examined_references = budget.examined_references.saturating_add(ranges.len());
+    if exhausted {
+        if candidate_limit == remaining_reference_budget {
+            push_budget_diagnostic(diagnostics, budget);
+        } else {
+            diagnostics.push(CodeQueryDiagnostic {
+                language: language.config_label(),
+                message: format!(
+                    "uses returned a bounded partial scan of {} after reaching the structured reference-candidate limit of {candidate_limit}",
+                    rel_path_string(file)
+                ),
+            });
+        }
+    }
+    if candidate_limit == 0 {
         exhausted = true;
         diagnostics.push(CodeQueryDiagnostic {
             language: language.config_label(),
             message: format!(
-                "uses omitted {} candidate reference sites in {} after reaching the per-file limit of {MAX_OUTBOUND_SITES_PER_FILE}",
-                nodes.len() - MAX_OUTBOUND_SITES_PER_FILE,
+                "uses has no reference-candidate capacity for {}",
                 rel_path_string(file)
             ),
         });
-        nodes.truncate(MAX_OUTBOUND_SITES_PER_FILE);
     }
-    let requests = nodes
+    let requests = ranges
         .into_iter()
-        .map(|(start_byte, end_byte)| DefinitionLookupRequest {
+        .map(|range| DefinitionLookupRequest {
             file: file.clone(),
             line: None,
             column: None,
-            start_byte: Some(start_byte),
-            end_byte: Some(end_byte),
+            start_byte: Some(range.start_byte),
+            end_byte: Some(range.end_byte),
         })
         .collect();
-    let outcomes =
-        resolve_definition_batch_with_source(analyzer, requests, file.clone(), Arc::clone(&source));
-    let line_starts = compute_line_starts(&source);
-    let mut hits = Vec::new();
+    let outcomes = match cancellation {
+        Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
+            analyzer,
+            requests,
+            file.clone(),
+            Arc::clone(&source),
+            cancellation,
+        ),
+        None => resolve_definition_batch_with_source(
+            analyzer,
+            requests,
+            file.clone(),
+            Arc::clone(&source),
+        ),
+    };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return (Vec::new(), true);
+    }
+    let mut candidates_by_target: BTreeMap<CodeUnit, BTreeSet<(usize, usize)>> = BTreeMap::new();
     let mut ambiguous = 0usize;
     for outcome in outcomes {
-        let proof = match outcome.status {
-            DefinitionLookupStatus::Resolved => UsageProof::Proven,
+        match outcome.status {
+            DefinitionLookupStatus::Resolved => {}
             DefinitionLookupStatus::Ambiguous => {
                 ambiguous += 1;
-                UsageProof::Unproven
             }
             _ => continue,
-        };
+        }
         let Some(reference) = outcome.reference else {
             continue;
         };
-        let range = Range {
-            start_byte: reference.focus_start_byte,
-            end_byte: reference.focus_end_byte,
-            start_line: find_line_index_for_offset(&line_starts, reference.focus_start_byte) + 1,
-            end_line: find_line_index_for_offset(
-                &line_starts,
-                reference.focus_end_byte.saturating_sub(1),
-            ) + 1,
-        };
-        let Some(enclosing_unit) = analyzer.enclosing_code_unit(file, &range) else {
-            continue;
-        };
-        hits.extend(outcome.definitions.into_iter().map(|resolved| {
-            let kind = classify_reference_kind(
-                analyzer,
-                file,
-                range.start_byte,
-                range.end_byte,
-                &resolved,
-            );
-            ReferenceHit {
-                file: file.clone(),
-                range,
-                enclosing_unit: enclosing_unit.clone(),
-                kind,
-                resolved,
-                confidence: if proof == UsageProof::Proven {
-                    1_000_000
-                } else {
-                    500_000
-                },
-                usage_kind: UsageHitKind::Reference,
-                proof,
-            }
+        for resolved in outcome.definitions {
+            candidates_by_target
+                .entry(resolved)
+                .or_default()
+                .insert((reference.focus_start_byte, reference.focus_end_byte));
+        }
+    }
+
+    let mut candidate_files = HashSet::default();
+    candidate_files.insert(file.clone());
+    let provider = ExplicitCandidateProvider::new(Arc::new(candidate_files));
+    let mut hits = Vec::new();
+    let mut omitted = 0usize;
+    for (target, candidate_ranges) in candidates_by_target {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (Vec::new(), true);
+        }
+        let mut finder = UsageFinder::new();
+        if let Some(cancellation) = cancellation {
+            finder = finder.with_cancellation(cancellation.clone());
+        }
+        let result = finder.query_with_provider(
+            analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            candidate_ranges.len().max(1),
+        );
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (Vec::new(), true);
+        }
+        let target_hits = reference_hits_for_target(analyzer, result.result, &target);
+        let before = hits.len();
+        hits.extend(target_hits.into_iter().filter(|hit| {
+            hit.file == *file
+                && candidate_ranges.contains(&(hit.range.start_byte, hit.range.end_byte))
         }));
+        omitted += candidate_ranges.len().saturating_sub(hits.len() - before);
     }
     if ambiguous > 0 {
         diagnostics.push(CodeQueryDiagnostic {
@@ -1701,6 +1888,16 @@ fn scan_outbound_reference_hits(
             message: format!(
                 "uses emitted {ambiguous} ambiguous reference site{} in {} as unproven",
                 if ambiguous == 1 { "" } else { "s" },
+                rel_path_string(file)
+            ),
+        });
+    }
+    if omitted > 0 {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!(
+                "uses omitted {omitted} candidate reference site{} in {} because the structured usage analyzer did not confirm the exact edge",
+                if omitted == 1 { "" } else { "s" },
                 rel_path_string(file)
             ),
         });
@@ -1720,7 +1917,11 @@ fn sort_reference_sites(sites: &mut [ReferenceSiteValue]) {
                     .map(|value| &value.unit)
                     .cmp(&right.enclosing.as_ref().map(|value| &value.unit))
             })
-            .then_with(|| usage_kind_label(left.usage_kind).cmp(usage_kind_label(right.usage_kind)))
+            .then_with(|| {
+                left.usage_kind
+                    .wire_label()
+                    .cmp(right.usage_kind.wire_label())
+            })
             .then_with(|| usage_proof_label(left.proof).cmp(usage_proof_label(right.proof)))
             .then_with(|| {
                 left.reference_kind
@@ -2237,6 +2438,8 @@ fn render_reference_site_ref(
             )
         }),
         target_fq_name,
+        usage_kind: (site.usage_kind != UsageHitKind::Reference)
+            .then(|| site.usage_kind.wire_label()),
         proof: usage_proof_label(site.proof),
         reference_kind: site.reference_kind.map(reference_kind_label),
     }
@@ -2295,7 +2498,7 @@ fn render_reference_site(
             .enclosing
             .as_ref()
             .map(|declaration| render_declaration(analyzer, declaration, detail, cache)),
-        usage_kind: usage_kind_label(site.usage_kind),
+        usage_kind: site.usage_kind.wire_label(),
         proof: usage_proof_label(site.proof),
         reference_kind: site.reference_kind.map(reference_kind_label),
     }
@@ -2322,35 +2525,6 @@ fn render_reference_range(
             end_line: site.range.end_line,
             end_column: 1,
         })
-}
-
-fn usage_kind_label(kind: UsageHitKind) -> &'static str {
-    match kind {
-        UsageHitKind::Reference => "reference",
-        UsageHitKind::Import => "import",
-        UsageHitKind::SelfReceiver => "self_receiver",
-        UsageHitKind::OverrideDeclaration => "override_declaration",
-    }
-}
-
-fn usage_proof_label(proof: UsageProof) -> &'static str {
-    match proof {
-        UsageProof::Proven => "proven",
-        UsageProof::Unproven => "unproven",
-    }
-}
-
-fn reference_kind_label(kind: ReferenceKind) -> &'static str {
-    match kind {
-        ReferenceKind::MethodCall => "method_call",
-        ReferenceKind::ConstructorCall => "constructor_call",
-        ReferenceKind::FieldRead => "field_read",
-        ReferenceKind::FieldWrite => "field_write",
-        ReferenceKind::TypeReference => "type_reference",
-        ReferenceKind::StaticReference => "static_reference",
-        ReferenceKind::SuperCall => "super_call",
-        ReferenceKind::Inheritance => "inheritance",
-    }
 }
 
 fn declaration_id(path: &str, kind: &str, fq_name: &str, range: Range) -> String {

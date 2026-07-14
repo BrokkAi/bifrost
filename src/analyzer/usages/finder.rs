@@ -28,6 +28,8 @@ pub const DEFAULT_MAX_USAGES: usize = 1000;
 pub struct QueryResult {
     pub candidate_files: HashSet<ProjectFile>,
     pub candidate_files_truncated: bool,
+    pub source_bytes_truncated: bool,
+    pub scanned_source_bytes: usize,
     pub candidate_files_sample: Option<CandidateFilesSample>,
     pub result: FuzzyResult,
     pub graph_failure: Option<crate::analyzer::usages::model::UsageAnalysisDiagnostic>,
@@ -90,7 +92,27 @@ impl UsageFinder {
         max_files: usize,
         max_usages: usize,
     ) -> QueryResult {
-        self.query_with_provider(analyzer, overloads, None, max_files, max_usages)
+        self.query_with_provider_and_source_budget(
+            analyzer, overloads, None, max_files, max_usages, None,
+        )
+    }
+
+    pub(crate) fn query_with_source_budget(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        max_files: usize,
+        max_usages: usize,
+        max_source_bytes: usize,
+    ) -> QueryResult {
+        self.query_with_provider_and_source_budget(
+            analyzer,
+            overloads,
+            None,
+            max_files,
+            max_usages,
+            Some(max_source_bytes),
+        )
     }
 
     pub fn query_with_provider(
@@ -101,11 +123,32 @@ impl UsageFinder {
         max_files: usize,
         max_usages: usize,
     ) -> QueryResult {
+        self.query_with_provider_and_source_budget(
+            analyzer,
+            overloads,
+            explicit_provider,
+            max_files,
+            max_usages,
+            None,
+        )
+    }
+
+    fn query_with_provider_and_source_budget(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        explicit_provider: Option<&dyn CandidateFileProvider>,
+        max_files: usize,
+        max_usages: usize,
+        max_source_bytes: Option<usize>,
+    ) -> QueryResult {
         let _query_scope = AnalyzerQueryScope::new(analyzer);
         if overloads.is_empty() || self.cancellation.is_cancelled() {
             return QueryResult {
                 candidate_files: HashSet::default(),
                 candidate_files_truncated: false,
+                source_bytes_truncated: false,
+                scanned_source_bytes: 0,
                 candidate_files_sample: None,
                 result: FuzzyResult::empty_success(),
                 graph_failure: None,
@@ -138,14 +181,21 @@ impl UsageFinder {
             return cancelled_query_result();
         }
 
-        let candidate_files_truncated = candidates.len() > max_files;
-        let all_candidates = candidate_files_truncated.then(|| candidates.clone());
-        if candidate_files_truncated {
+        let all_candidates = candidates.clone();
+        if candidates.len() > max_files {
             candidates = truncate_candidates(candidates, &protected_candidates, max_files);
         }
-        let candidate_files_sample = all_candidates
-            .as_ref()
-            .map(|all_candidates| candidate_files_sample(all_candidates, &candidates));
+        let (admitted, scanned_source_bytes, source_bytes_truncated) =
+            admit_candidates_by_source_bytes(
+                analyzer,
+                candidates,
+                &protected_candidates,
+                max_source_bytes,
+            );
+        candidates = admitted;
+        let candidate_files_truncated = candidates.len() < all_candidates.len();
+        let candidate_files_sample =
+            candidate_files_truncated.then(|| candidate_files_sample(&all_candidates, &candidates));
 
         let mut graph_failure = None;
         let scan_scope = UsageScanScope::with_cancellation(
@@ -183,6 +233,8 @@ impl UsageFinder {
         QueryResult {
             candidate_files: candidates,
             candidate_files_truncated,
+            source_bytes_truncated,
+            scanned_source_bytes,
             candidate_files_sample,
             result,
             graph_failure,
@@ -213,10 +265,39 @@ fn cancelled_query_result() -> QueryResult {
     QueryResult {
         candidate_files: HashSet::default(),
         candidate_files_truncated: false,
+        source_bytes_truncated: false,
+        scanned_source_bytes: 0,
         candidate_files_sample: None,
         result: FuzzyResult::empty_success(),
         graph_failure: None,
     }
+}
+
+fn admit_candidates_by_source_bytes(
+    analyzer: &dyn IAnalyzer,
+    candidates: HashSet<ProjectFile>,
+    protected_candidates: &HashSet<ProjectFile>,
+    max_source_bytes: Option<usize>,
+) -> (HashSet<ProjectFile>, usize, bool) {
+    let Some(max_source_bytes) = max_source_bytes else {
+        return (candidates, 0, false);
+    };
+
+    let mut ordered = candidates.iter().cloned().collect::<Vec<_>>();
+    ordered.sort_by_key(|file| (!protected_candidates.contains(file), file.clone()));
+    let mut admitted = HashSet::default();
+    let mut scanned_source_bytes = 0usize;
+    for file in ordered {
+        let Some(source_bytes) = analyzer.indexed_source(&file).map(|source| source.len()) else {
+            continue;
+        };
+        if scanned_source_bytes.saturating_add(source_bytes) <= max_source_bytes {
+            scanned_source_bytes += source_bytes;
+            admitted.insert(file);
+        }
+    }
+    let truncated = admitted.len() < candidates.len();
+    (admitted, scanned_source_bytes, truncated)
 }
 
 impl Default for UsageFinder {

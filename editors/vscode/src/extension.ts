@@ -38,6 +38,7 @@ import {
   releaseTargetFor
 } from "./provisioning";
 import {
+  queryResultRange,
   RqlQueryDocument,
   RqlQueryResponse,
   RqlQueryResultItem,
@@ -194,6 +195,28 @@ async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
 async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
   const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(result.uri));
   const editor = await vscode.window.showTextDocument(document, { preview: true });
+  if (result.result_type === "reference_site") {
+    const resultRange = queryResultRange(result);
+    if (!resultRange) {
+      return;
+    }
+    const startLine = Math.min(Math.max(0, resultRange.start_line - 1), document.lineCount - 1);
+    const endLine = Math.min(Math.max(startLine, resultRange.end_line - 1), document.lineCount - 1);
+    const startColumn = Math.min(
+      Math.max(0, resultRange.start_column - 1),
+      document.lineAt(startLine).text.length
+    );
+    const endColumn = Math.min(
+      Math.max(0, resultRange.end_column - 1),
+      document.lineAt(endLine).text.length
+    );
+    const start = new vscode.Position(startLine, startColumn);
+    const end = new vscode.Position(endLine, endColumn);
+    const range = new vscode.Range(start, end);
+    editor.selection = new vscode.Selection(start, end);
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+    return;
+  }
   const resultStartLine = result.result_type === "file" ? 1 : result.start_line;
   const resultEndLine = result.result_type === "file" ? resultStartLine : result.end_line;
   const startLine = Math.min(Math.max(0, resultStartLine - 1), document.lineCount - 1);

@@ -1,6 +1,10 @@
 import * as vscode from "vscode";
 import {
   groupRqlQueryResults,
+  queryResultDescription,
+  queryResultIcon,
+  queryResultLabel,
+  queryResultTooltip,
   RqlQueryFileGroup,
   RqlQueryResultItem,
   RqlQueryResult
@@ -52,61 +56,15 @@ class RqlQueryFileItem extends vscode.TreeItem {
 
 class RqlQueryValueItem extends vscode.TreeItem {
   constructor(readonly result: RqlQueryResultItem) {
-    super(compactText(resultLabel(result)), vscode.TreeItemCollapsibleState.None);
-    this.description = resultDescription(result);
-    this.tooltip = new vscode.MarkdownString(resultTooltip(result));
-    this.iconPath = new vscode.ThemeIcon(resultIcon(result));
+    super(compactText(queryResultLabel(result)), vscode.TreeItemCollapsibleState.None);
+    this.description = queryResultDescription(result);
+    this.tooltip = new vscode.MarkdownString(queryResultTooltip(result));
+    this.iconPath = new vscode.ThemeIcon(queryResultIcon(result));
     this.command = {
       command: "bifrost.openRqlQueryResult",
       title: "Open Bifrost Query Result",
       arguments: [result]
     };
-  }
-}
-
-function resultLabel(result: RqlQueryResultItem): string {
-  switch (result.result_type) {
-    case "structural_match":
-      return result.text;
-    case "declaration":
-      return result.fq_name;
-    case "file":
-      return result.path;
-  }
-}
-
-function resultDescription(result: RqlQueryResultItem): string {
-  if (result.result_type === "file") {
-    return `file · ${result.language}`;
-  }
-  return `${result.kind} · ${result.start_line}-${result.end_line}`;
-}
-
-function resultTooltip(result: RqlQueryResultItem): string {
-  switch (result.result_type) {
-    case "structural_match":
-      return (
-        `**${result.kind}** at ${result.path}:${result.start_line}-${result.end_line}` +
-        (result.enclosing_symbol ? `\n\nInside \`${result.enclosing_symbol}\`` : "")
-      );
-    case "declaration":
-      return (
-        `**${result.kind}** at ${result.path}:${result.start_line}-${result.end_line}` +
-        (result.signature ? `\n\n\`${result.signature}\`` : "")
-      );
-    case "file":
-      return `**file** at ${result.path}\n\nLanguage: ${result.language}`;
-  }
-}
-
-function resultIcon(result: RqlQueryResultItem): string {
-  switch (result.result_type) {
-    case "structural_match":
-      return "symbol-method";
-    case "declaration":
-      return "symbol-class";
-    case "file":
-      return "file-code";
   }
 }
 

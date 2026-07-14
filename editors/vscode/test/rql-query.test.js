@@ -5,6 +5,11 @@ const {
   RQL_LANGUAGE_ID,
   RUN_RQL_QUERY_METHOD,
   groupRqlQueryResults,
+  queryResultDescription,
+  queryResultIcon,
+  queryResultLabel,
+  queryResultRange,
+  queryResultTooltip,
   runRqlQuery
 } = require("../out-test/rql_query.js");
 
@@ -138,4 +143,36 @@ test("groups mixed typed results by path while preserving result order", () => {
       ["b.rs", ["file"]]
     ]
   );
+});
+
+test("renders and navigates an exact reference-site result", () => {
+  const reference = {
+    uri: "file:///workspace/src/user.ts",
+    path: "src/user.ts",
+    result_type: "reference_site",
+    language: "typescript",
+    range: {
+      start_line: 7,
+      start_column: 14,
+      end_line: 7,
+      end_column: 20
+    },
+    target: {
+      path: "src/target.ts",
+      language: "typescript",
+      kind: "function",
+      fq_name: "Target.status",
+      start_line: 2,
+      end_line: 2
+    },
+    usage_kind: "reference",
+    proof: "proven",
+    reference_kind: "field_read"
+  };
+
+  assert.equal(queryResultLabel(reference), "Target.status");
+  assert.equal(queryResultDescription(reference), "field_read · 7:14");
+  assert.equal(queryResultIcon(reference), "references");
+  assert.match(queryResultTooltip(reference), /Target\.status/);
+  assert.deepEqual(queryResultRange(reference), reference.range);
 });

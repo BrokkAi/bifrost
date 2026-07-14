@@ -2552,6 +2552,8 @@ mod tests {
             assert_eq!(&rql[help.range], token);
             assert!(!help.description.is_empty());
         }
+        let file_of_help = query_source_help_at(rql, rql.find("file-of").unwrap()).unwrap();
+        assert!(file_of_help.description.contains("reference site"));
         assert!(validate_query_source(rql).is_empty());
 
         let json = r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;
@@ -2561,6 +2563,13 @@ mod tests {
                 query_source_help_at(json, offset).unwrap_or_else(|| panic!("no help for {token}"));
             assert!(!help.description.is_empty());
         }
+        let file_of_help = query_source_help_at(json, json.find("file_of").unwrap()).unwrap();
+        assert!(file_of_help.description.contains("reference sites"));
+        assert!(
+            crate::analyzer::structural::query::schema::QueryStepOp::FileOf
+                .signature()
+                .contains("reference_site")
+        );
         assert!(validate_query_source(json).is_empty());
 
         let invalid =
