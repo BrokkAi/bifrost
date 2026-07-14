@@ -3,7 +3,7 @@ use crate::analyzer::semantic_diagnostics::{contains_node, node_range, node_text
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::usages::{ImportBinder, ImportKind};
 use crate::analyzer::{
-    DefinitionLookupIndex, IAnalyzer, ProjectFile, Range, RustAnalyzer, SemanticDiagnostic,
+    GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, Range, RustAnalyzer, SemanticDiagnostic,
     resolve_analyzer,
 };
 use crate::hash::HashSet;
@@ -58,7 +58,7 @@ pub(crate) fn collect_rust_semantic_diagnostics(
     let visible_uses = collect_rust_use_bindings(root, source);
     let mut collector = RustDiagnosticCollector {
         rust,
-        support: analyzer.definition_lookup_index(),
+        support: analyzer.global_usage_definition_index(),
         file,
         source,
         line_starts: &line_starts,
@@ -72,7 +72,7 @@ pub(crate) fn collect_rust_semantic_diagnostics(
 
 struct RustDiagnosticCollector<'a, 'tree> {
     rust: &'a RustAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a GlobalUsageDefinitionIndex,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],

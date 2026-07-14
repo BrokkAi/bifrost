@@ -20,7 +20,7 @@ pub(super) fn resolve_cpp(
         return no_definition("cpp_parse_failed", "C++ source could not be parsed");
     };
     let visibility = context.cpp_visibility(cpp, analyzer, file);
-    let support = context.support();
+    let support = context.bounded_support();
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -82,6 +82,7 @@ pub(super) fn resolve_cpp(
             }
             if let Some(owner) = cpp_enclosing_class(
                 ctx.analyzer,
+                ctx.support,
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
@@ -159,7 +160,7 @@ enum CppReferenceNode<'tree> {
 #[derive(Clone, Copy)]
 struct CppLookupCtx<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     visibility: &'a CppVisibilityIndex,
     source: &'a str,
@@ -244,7 +245,7 @@ fn cpp_is_type_declaration_name(node: Node<'_>) -> bool {
 
 fn resolve_cpp_type(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     visibility: &CppVisibilityIndex,
     source: &str,
@@ -326,7 +327,7 @@ fn cpp_type_definition_candidates(
     analyzer: &dyn IAnalyzer,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
     let mut seen = HashSet::default();
@@ -486,6 +487,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             }
             if let Some(owner) = cpp_enclosing_class(
                 ctx.analyzer,
+                ctx.support,
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
@@ -673,7 +675,7 @@ fn cpp_visible_name_candidates(
     analyzer: &dyn IAnalyzer,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     raw_name: &str,
     kind: Option<CppTargetKind>,
     lexical_namespace: Option<&str>,
@@ -747,7 +749,7 @@ fn cpp_visible_name_candidates(
 
 fn cpp_unit_matches_kind(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     unit: &CodeUnit,
     kind: CppTargetKind,
 ) -> bool {
@@ -772,7 +774,7 @@ fn cpp_qualified_identifier_is_declaration_name(node: Node<'_>) -> bool {
         })
 }
 
-fn cpp_parent_is_class(support: &DefinitionLookupIndex, unit: &CodeUnit) -> bool {
+fn cpp_parent_is_class(support: &dyn BoundedDefinitionLookup, unit: &CodeUnit) -> bool {
     let fqn = unit.fq_name();
     let Some((parent_fqn, _)) = fqn.rsplit_once('.') else {
         return false;
@@ -785,7 +787,7 @@ fn cpp_parent_is_class(support: &DefinitionLookupIndex, unit: &CodeUnit) -> bool
 
 fn cpp_is_unqualified_field(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     unit: &CodeUnit,
 ) -> bool {
     if !unit.short_name().contains('.') {
@@ -876,7 +878,7 @@ where
 }
 
 fn cpp_direct_member_candidates(
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     owners: &[CodeUnit],
     member: &str,
 ) -> Vec<CodeUnit> {
@@ -1134,7 +1136,7 @@ fn cpp_pointer_expression_delta(node: Node<'_>) -> Option<i32> {
 
 fn cpp_call_argument_types(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1155,7 +1157,7 @@ fn cpp_call_argument_types(
 
 fn cpp_expression_type(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1213,7 +1215,7 @@ fn cpp_expression_type(
 
 fn cpp_field_expression_type(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1319,6 +1321,7 @@ fn cpp_receiver_type_units(
         }
         "this" => cpp_enclosing_class(
             ctx.analyzer,
+            ctx.support,
             ctx.visibility,
             ctx.file,
             ctx.source,
@@ -1365,7 +1368,7 @@ fn cpp_receiver_type_units(
 #[allow(clippy::too_many_arguments)]
 fn cpp_field_receiver_type_units(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1419,6 +1422,7 @@ fn cpp_field_expression_uses_arrow(field: Node<'_>, source: &str) -> bool {
 
 fn cpp_enclosing_class(
     analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1426,7 +1430,7 @@ fn cpp_enclosing_class(
     byte: usize,
 ) -> Option<CodeUnit> {
     if let Some(fqn) = ClassRangeIndex::build(analyzer, file).enclosing(byte) {
-        return analyzer.definitions(fqn).next();
+        return support.fqn(fqn).into_iter().next();
     }
     if let Some(owner) = cpp_out_of_line_function_owner(visibility, file, source, root, byte) {
         return Some(owner);
@@ -1443,7 +1447,10 @@ fn cpp_enclosing_class(
     let enclosing = analyzer.enclosing_code_unit(file, &range)?;
     let enclosing_fqn = enclosing.fq_name();
     let owner_fqn = enclosing_fqn.rsplit_once('.')?.0;
-    analyzer.definitions(owner_fqn).find(|unit| unit.is_class())
+    support
+        .fqn(owner_fqn)
+        .into_iter()
+        .find(|unit| unit.is_class())
 }
 
 fn cpp_out_of_line_function_owner(
@@ -1496,7 +1503,7 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
 #[allow(clippy::too_many_arguments)]
 fn cpp_enclosing_member_field_type(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1504,7 +1511,15 @@ fn cpp_enclosing_member_field_type(
     node: Node<'_>,
     name: &str,
 ) -> Option<CppType> {
-    let owner = cpp_enclosing_class(analyzer, visibility, file, source, root, node.start_byte())?;
+    let owner = cpp_enclosing_class(
+        analyzer,
+        support,
+        visibility,
+        file,
+        source,
+        root,
+        node.start_byte(),
+    )?;
     let ctx = CppLookupCtx {
         analyzer,
         support,
@@ -1625,7 +1640,7 @@ fn cpp_seed_active_path(
 
 fn cpp_seed_typed_binding(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1773,7 +1788,7 @@ fn cpp_seed_variable_declaration(
 
 fn cpp_seed_recovered_statement_declaration(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -2125,7 +2140,7 @@ fn cpp_builtin_type_text(text: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn cpp_seed_binding(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -2460,7 +2475,7 @@ fn cpp_alias_target_text(signature: &str) -> Option<String> {
 
 fn cpp_infer_type_from_value(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -2488,7 +2503,7 @@ fn cpp_infer_type_from_value(
 
 fn cpp_call_return_type(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,

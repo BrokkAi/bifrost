@@ -3,9 +3,8 @@ use crate::analyzer::usages::get_definition::{RustTypeLookupCache, parse_tree_fo
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
 };
-use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{AnalyzerDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::sync::Arc;
@@ -84,21 +83,19 @@ pub(crate) fn resolve_type_batch(
 }
 
 struct TypeBatchContext<'a> {
-    support: &'a DefinitionLookupIndex,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     rust_cache: RustTypeLookupCache,
-    scala_project_types: Option<Arc<ScalaProjectTypes>>,
+    support: AnalyzerDefinitionLookup<'a>,
 }
 
 impl<'a> TypeBatchContext<'a> {
     fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self {
-            support: analyzer.definition_lookup_index(),
             sources: HashMap::default(),
             trees: HashMap::default(),
             rust_cache: RustTypeLookupCache::default(),
-            scala_project_types: None,
+            support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
         }
     }
 
@@ -119,20 +116,11 @@ impl<'a> TypeBatchContext<'a> {
             .or_insert_with(|| parse_tree_for_type_lookup(file, language, source))
             .clone()
     }
-
-    fn scala_project_types(
-        &mut self,
-        scala: &crate::analyzer::ScalaAnalyzer,
-    ) -> Arc<ScalaProjectTypes> {
-        self.scala_project_types
-            .get_or_insert_with(|| scala.project_types())
-            .clone()
-    }
 }
 
-fn resolve_one(
-    analyzer: &dyn IAnalyzer,
-    context: &mut TypeBatchContext<'_>,
+fn resolve_one<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    context: &mut TypeBatchContext<'a>,
     request: TypeLookupRequest,
 ) -> TypeLookupOutcome {
     let file = request.file.clone();
@@ -187,16 +175,29 @@ fn resolve_one(
             csharp::resolve_csharp_type(analyzer, &file, &source, tree.as_ref(), &site)
         }
         Language::Go => go::resolve_go_type(analyzer, &file, &source, tree.as_ref(), &site),
-        Language::Java => java::resolve_java_type(analyzer, &file, &source, tree.as_ref(), &site),
-        Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts_type(
-            analyzer,
-            context.support,
-            &file,
-            language,
-            &source,
-            tree.as_ref(),
-            &site,
-        ),
+        Language::Java => {
+            context.support.set_language(language);
+            java::resolve_java_type(
+                analyzer,
+                &context.support,
+                &file,
+                &source,
+                tree.as_ref(),
+                &site,
+            )
+        }
+        Language::JavaScript | Language::TypeScript => {
+            context.support.set_language(language);
+            js_ts::resolve_js_ts_type(
+                analyzer,
+                &context.support,
+                &file,
+                language,
+                &source,
+                tree.as_ref(),
+                &site,
+            )
+        }
         Language::Rust => rust::resolve_rust_type(
             analyzer,
             &file,
@@ -206,7 +207,15 @@ fn resolve_one(
             &mut context.rust_cache,
         ),
         Language::Scala => {
-            scala::resolve_scala_type(analyzer, context, &file, &source, tree.as_ref(), &site)
+            context.support.set_language(language);
+            scala::resolve_scala_type(
+                analyzer,
+                &context.support,
+                &file,
+                &source,
+                tree.as_ref(),
+                &site,
+            )
         }
         _ => unreachable!("unsupported language handled above"),
     };

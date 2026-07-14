@@ -47,6 +47,8 @@ pub struct CppAnalyzer {
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
 }
 
+crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
+
 impl CppAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
@@ -146,12 +148,6 @@ impl CppAnalyzer {
             .map(|token| token.trim_matches(':').to_string())
             .collect()
     }
-
-    pub(crate) fn definition_lookup_index_shared(
-        &self,
-    ) -> Arc<crate::analyzer::DefinitionLookupIndex> {
-        self.inner.definition_lookup_index_shared()
-    }
 }
 
 impl IAnalyzer for CppAnalyzer {
@@ -202,8 +198,34 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
-        self.inner.definition_lookup_index()
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+        self.inner.global_usage_definition_index()
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {

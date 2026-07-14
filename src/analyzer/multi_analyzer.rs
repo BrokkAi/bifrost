@@ -1,7 +1,7 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
-    DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
+    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
     ScalaAnalyzer, SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata,
@@ -195,16 +195,16 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
 #[derive(Clone, Default)]
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
-    definition_lookup_index: Arc<OnceLock<DefinitionLookupIndex>>,
-    definition_lookup_index_build_count: Arc<AtomicUsize>,
+    global_usage_definition_index: Arc<OnceLock<GlobalUsageDefinitionIndex>>,
+    global_usage_definition_index_build_count: Arc<AtomicUsize>,
 }
 
 impl MultiAnalyzer {
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
         Self {
             delegates,
-            definition_lookup_index: Arc::new(OnceLock::new()),
-            definition_lookup_index_build_count: Arc::new(AtomicUsize::new(0)),
+            global_usage_definition_index: Arc::new(OnceLock::new()),
+            global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -228,8 +228,8 @@ impl MultiAnalyzer {
                     (*language, delegate.clone_with_project(Arc::clone(&project)))
                 })
                 .collect(),
-            definition_lookup_index: Arc::new(OnceLock::new()),
-            definition_lookup_index_build_count: Arc::new(AtomicUsize::new(0)),
+            global_usage_definition_index: Arc::new(OnceLock::new()),
+            global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -463,11 +463,11 @@ impl IAnalyzer for MultiAnalyzer {
         Box::new(matches.into_iter())
     }
 
-    fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
-        self.definition_lookup_index.get_or_init(|| {
-            self.definition_lookup_index_build_count
+    fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
+        self.global_usage_definition_index.get_or_init(|| {
+            self.global_usage_definition_index_build_count
                 .fetch_add(1, Ordering::Relaxed);
-            DefinitionLookupIndex::from_declarations(
+            GlobalUsageDefinitionIndex::from_declarations(
                 self.delegates
                     .values()
                     .flat_map(|delegate| delegate.analyzer().all_declarations()),
@@ -477,18 +477,18 @@ impl IAnalyzer for MultiAnalyzer {
         })
     }
 
-    fn reset_definition_lookup_index_build_count_for_test(&self) {
-        self.definition_lookup_index_build_count
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.global_usage_definition_index_build_count
             .store(0, Ordering::Relaxed);
         for delegate in self.delegates.values() {
             delegate
                 .analyzer()
-                .reset_definition_lookup_index_build_count_for_test();
+                .reset_global_usage_definition_index_build_count_for_test();
         }
     }
 
-    fn definition_lookup_index_build_count_for_test(&self) -> usize {
-        self.definition_lookup_index_build_count
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.global_usage_definition_index_build_count
             .load(Ordering::Relaxed)
             + self
                 .delegates
@@ -496,7 +496,7 @@ impl IAnalyzer for MultiAnalyzer {
                 .map(|delegate| {
                     delegate
                         .analyzer()
-                        .definition_lookup_index_build_count_for_test()
+                        .global_usage_definition_index_build_count_for_test()
                 })
                 .sum::<usize>()
     }
@@ -513,6 +513,77 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegates
             .values()
             .map(|delegate| delegate.analyzer().full_declaration_scan_count_for_test())
+            .sum()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .reset_candidate_hydration_count_for_test();
+        }
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| delegate.analyzer().candidate_hydration_count_for_test())
+            .sum()
+    }
+
+    fn full_candidate_hydration_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .full_candidate_hydration_count_for_test()
+            })
+            .sum()
+    }
+
+    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .bulk_candidate_hydration_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .reset_workspace_path_scan_count_for_test();
+        }
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| delegate.analyzer().workspace_path_scan_count_for_test())
+            .sum()
+    }
+
+    fn reset_scala_project_types_build_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .reset_scala_project_types_build_count_for_test();
+        }
+    }
+
+    fn scala_project_types_build_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .scala_project_types_build_count_for_test()
+            })
             .sum()
     }
 
@@ -893,16 +964,22 @@ mod tests {
         let snapshot = analyzer.clone_with_project(project);
 
         assert!(!Arc::ptr_eq(
-            &analyzer.definition_lookup_index,
-            &snapshot.definition_lookup_index
+            &analyzer.global_usage_definition_index,
+            &snapshot.global_usage_definition_index
         ));
         assert!(!Arc::ptr_eq(
-            &analyzer.definition_lookup_index_build_count,
-            &snapshot.definition_lookup_index_build_count
+            &analyzer.global_usage_definition_index_build_count,
+            &snapshot.global_usage_definition_index_build_count
         ));
 
-        snapshot.definition_lookup_index();
-        assert_eq!(snapshot.definition_lookup_index_build_count_for_test(), 1);
-        assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+        snapshot.global_usage_definition_index();
+        assert_eq!(
+            snapshot.global_usage_definition_index_build_count_for_test(),
+            1
+        );
+        assert_eq!(
+            analyzer.global_usage_definition_index_build_count_for_test(),
+            0
+        );
     }
 }

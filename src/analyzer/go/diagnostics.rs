@@ -5,7 +5,7 @@ use crate::analyzer::semantic_diagnostics::{
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::usages::go_graph::resolve_go_import_namespaces;
 use crate::analyzer::{
-    DefinitionLookupIndex, GoAnalyzer, IAnalyzer, ProjectFile, Range, SemanticDiagnostic,
+    GlobalUsageDefinitionIndex, GoAnalyzer, IAnalyzer, ProjectFile, Range, SemanticDiagnostic,
     resolve_analyzer,
 };
 use crate::hash::HashMap;
@@ -56,7 +56,7 @@ pub(crate) fn collect_go_semantic_diagnostics(
         return Vec::new();
     }
 
-    let support = analyzer.definition_lookup_index();
+    let support = analyzer.global_usage_definition_index();
     let line_starts = compute_line_starts(source);
     let imports = GoImportNamespaces::new(go, file);
     let package_name = declared_package_name(tree.root_node(), source)
@@ -81,7 +81,7 @@ fn parse_go_tree(source: &str) -> Option<Tree> {
 }
 
 struct GoDiagnosticCollector<'a> {
-    support: &'a DefinitionLookupIndex,
+    support: &'a GlobalUsageDefinitionIndex,
     source: &'a str,
     line_starts: &'a [usize],
     package_name: String,
@@ -391,7 +391,7 @@ impl GoImportNamespaces {
         }
     }
 
-    fn has_dot_member(&self, name: &str, support: &DefinitionLookupIndex) -> bool {
+    fn has_dot_member(&self, name: &str, support: &GlobalUsageDefinitionIndex) -> bool {
         self.dot_packages.iter().any(|package| {
             !support.fqn(&format!("{package}.{name}")).is_empty()
                 || !support

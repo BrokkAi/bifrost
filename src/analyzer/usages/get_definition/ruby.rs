@@ -1,9 +1,10 @@
 use super::*;
+use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::ruby::{RubyFieldScope, ruby_field_short_name};
 
 pub(super) fn resolve_ruby(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -220,7 +221,7 @@ fn ruby_autoload_symbol_outcome(
 
 fn ruby_field_outcome(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     semantic: &RubySemanticIndex<'_>,
     context: &RubyLookupContext,
     node: Node<'_>,
@@ -238,7 +239,11 @@ fn ruby_field_outcome(
 
     let owners: Vec<String> = match scope {
         RubyFieldScope::ClassVariable => std::iter::once(owner.clone())
-            .chain(semantic.ancestor_lookup_order(&owner))
+            .chain(semantic.forward_ancestor_lookup_order(
+                support,
+                &context.visible_files.iter().cloned().collect::<Vec<_>>(),
+                &owner,
+            ))
             .collect(),
         RubyFieldScope::Instance | RubyFieldScope::SingletonClass => vec![owner],
     };
@@ -300,7 +305,7 @@ fn ruby_is_indexed_field_declaration_site(
 }
 
 fn ruby_method_outcome(
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     semantic: &RubySemanticIndex<'_>,
     visible_files: &HashSet<ProjectFile>,
     context: &RubyLookupContext,

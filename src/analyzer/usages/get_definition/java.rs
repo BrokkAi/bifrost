@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{AnalyzerDefinitionLookup, BoundedDefinitionLookup};
 
 pub(crate) enum JavaTypeLookupResolution {
     Type {
@@ -23,7 +24,7 @@ pub(crate) fn java_type_lookup_resolution(
 
 pub(super) fn resolve_java(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -271,7 +272,7 @@ fn is_java_declaration_or_import_name(node: Node<'_>) -> bool {
 fn resolve_java_type_reference(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -304,7 +305,7 @@ fn resolve_java_type_reference(
 
 fn resolve_java_method_invocation(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -347,7 +348,7 @@ fn resolve_java_method_invocation(
 fn resolve_java_method_reference(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -412,7 +413,7 @@ fn resolve_java_method_reference(
 fn resolve_java_constructor_call(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -438,7 +439,7 @@ fn resolve_java_constructor_call(
 }
 
 fn java_constructor_outcome(
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     owner: CodeUnit,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
@@ -543,7 +544,7 @@ fn java_field_access_is_simple_focused_qualifier(
 
 fn resolve_java_field_access(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -568,7 +569,7 @@ fn resolve_java_field_access(
 fn resolve_java_bare_identifier(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -659,10 +660,11 @@ fn java_receiver_type_for_java(
                 object.start_byte(),
             )
             .or_else(|| {
+                let support = AnalyzerDefinitionLookup::new(analyzer, Language::Java);
                 java_lambda_parameter_type_before(
                     analyzer,
                     java,
-                    analyzer.definition_lookup_index(),
+                    &support,
                     file,
                     source,
                     root,
@@ -679,9 +681,9 @@ fn java_receiver_type_for_java(
         // A method-call receiver (`getABC().i`) is typed by the called method's
         // declared return type.
         "method_invocation" => {
-            let support = analyzer.definition_lookup_index();
+            let support = AnalyzerDefinitionLookup::new(analyzer, Language::Java);
             let outcome =
-                resolve_java_method_invocation(analyzer, support, file, source, root, object);
+                resolve_java_method_invocation(analyzer, &support, file, source, root, object);
             let method_unit = outcome.definitions.into_iter().next()?;
             java_method_return_type_unit(analyzer, java, file, source, root, &method_unit)
         }
@@ -1002,7 +1004,7 @@ fn java_seed_inline_typed_binding(
 fn java_lambda_parameter_type_before(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1032,7 +1034,7 @@ fn java_lambda_parameter_type_before(
 fn java_lambda_parameter_type_text_before(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1163,7 +1165,7 @@ fn java_ancestor_method_invocation(mut node: Node<'_>) -> Option<Node<'_>> {
 fn java_collection_element_type_text(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1211,7 +1213,7 @@ fn java_collection_element_type_text(
 fn java_expression_type_text(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1512,7 +1514,7 @@ fn collect_java_identifier_binding_before(
 
 fn java_member_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     owner_fqn: &str,
     member: &str,
     allow_generated_accessors: bool,
@@ -1577,7 +1579,7 @@ struct JavaAccessorProperty {
 
 pub(crate) fn java_lombok_accessor_field_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     owner: &CodeUnit,
     member: &str,
 ) -> Vec<CodeUnit> {
@@ -1783,7 +1785,7 @@ fn java_lombok_annotation_generates_accessor(name: &str, kind: JavaAccessorKind)
 
 fn java_static_import_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -1831,7 +1833,7 @@ fn java_static_import_candidates(
 
 fn java_import_boundary_for_type(
     java: &JavaAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     name: &str,
 ) -> bool {
@@ -1872,11 +1874,11 @@ fn java_static_import_path(import: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-fn java_workspace_fqn_exists(support: &DefinitionLookupIndex, fqn: &str) -> bool {
+fn java_workspace_fqn_exists(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
     support.fqn_exists(fqn)
 }
 
-fn java_workspace_package_exists(support: &DefinitionLookupIndex, package: &str) -> bool {
+fn java_workspace_package_exists(support: &dyn BoundedDefinitionLookup, package: &str) -> bool {
     support.package_exists(package) || support.fqn_prefix_exists(package)
 }
 

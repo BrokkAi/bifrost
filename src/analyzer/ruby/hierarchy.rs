@@ -53,8 +53,7 @@ impl TypeHierarchyProvider for RubyAnalyzer {
         }
 
         let ancestors: Vec<_> = self
-            .inner
-            .raw_supertypes_of(code_unit)
+            .forward_superclass_targets(code_unit)
             .iter()
             .filter_map(|raw| self.resolve_supertype(raw))
             .collect();

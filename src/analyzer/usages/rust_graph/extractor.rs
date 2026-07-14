@@ -16,8 +16,8 @@ use crate::analyzer::usages::rust_graph::resolver::{
 };
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
-    CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer,
-    RustReferenceContext, TypeHierarchyProvider,
+    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile,
+    RustAnalyzer, RustReferenceContext, TypeHierarchyProvider,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -137,7 +137,7 @@ pub(super) fn scan_files_for_target(
 ) -> BTreeSet<UsageHit> {
     let target_short = target.identifier().to_string();
     let target_fqn = target.fq_name();
-    let support = analyzer.definition_lookup_index();
+    let support = analyzer.global_usage_definition_index();
     let parser_language = tree_sitter_rust::LANGUAGE.into();
     let hits = Mutex::new(BTreeSet::new());
     let files_vec: Vec<_> = files.into_iter().collect();
@@ -231,7 +231,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) rust: &'a RustAnalyzer,
     pub(super) refs: &'a RustReferenceContext,
-    support: &'a DefinitionLookupIndex,
+    support: &'a GlobalUsageDefinitionIndex,
     target: &'a CodeUnit,
     pub(super) target_fqn: &'a str,
     pub(super) target_is_class: bool,
@@ -425,7 +425,7 @@ pub(super) fn scan_files_for_member_target(
     let unproven_hits = Mutex::new(BTreeSet::new());
     let constructor_returns = self_like_constructor_returns(rust, &owner);
     let self_like_constructors = self_like_constructor_seeds(rust, &owner, &constructor_returns);
-    let support = analyzer.definition_lookup_index();
+    let support = analyzer.global_usage_definition_index();
 
     files.par_iter().for_each(|file| {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -559,7 +559,7 @@ pub(super) struct RustMemberScanResult {
 struct MemberScanCtx<'a> {
     analyzer: &'a dyn IAnalyzer,
     rust: &'a RustAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a GlobalUsageDefinitionIndex,
     refs: &'a RustReferenceContext,
     file: &'a ProjectFile,
     source: &'a str,
@@ -1512,7 +1512,7 @@ fn resolved_owner_receiver_names(
     source: &str,
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &GlobalUsageDefinitionIndex,
     file: &ProjectFile,
     owner: &CodeUnit,
 ) -> Vec<String> {

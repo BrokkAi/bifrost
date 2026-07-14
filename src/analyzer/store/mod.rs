@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use git2::Oid;
 use growable_bloom_filter::GrowableBloom;
 use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, params, params_from_iter};
+use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
@@ -148,6 +149,91 @@ pub struct CandidateRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PathSymbolRow {
+    pub(crate) rel_path: String,
+    pub(crate) blob_oid: Oid,
+    pub(crate) kind: CodeUnitType,
+    pub(crate) package_name: String,
+    pub(crate) short_name: String,
+    pub(crate) exact_fqn: String,
+    pub(crate) normalized_fqn: String,
+}
+
+fn decode_path_symbol_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<PathSymbolRow> {
+    let oid_text: String = row.get(offset + 1)?;
+    let blob_oid = Oid::from_str(&oid_text).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 1,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })?;
+    let kind_raw: i64 = row.get(offset + 2)?;
+    let kind = code_unit_kind_from_i64(kind_raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 2,
+            rusqlite::types::Type::Integer,
+            Box::new(err),
+        )
+    })?;
+    Ok(PathSymbolRow {
+        rel_path: row.get(offset)?,
+        blob_oid,
+        kind,
+        package_name: row.get(offset + 3)?,
+        short_name: row.get(offset + 4)?,
+        exact_fqn: row.get(offset + 5)?,
+        normalized_fqn: row.get(offset + 6)?,
+    })
+}
+
+fn path_symbol_fingerprint(rows: &[PathSymbolRow]) -> String {
+    let mut ordered = rows.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.rel_path
+            .cmp(&right.rel_path)
+            .then_with(|| left.exact_fqn.cmp(&right.exact_fqn))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    let mut digest = Sha256::new();
+    for row in ordered {
+        for value in [
+            row.rel_path.as_bytes(),
+            row.blob_oid.as_bytes(),
+            row.package_name.as_bytes(),
+            row.short_name.as_bytes(),
+            row.exact_fqn.as_bytes(),
+            row.normalized_fqn.as_bytes(),
+        ] {
+            digest.update(value.len().to_le_bytes());
+            digest.update(value);
+        }
+        digest.update([code_unit_kind_to_i64(row.kind) as u8]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn insert_path_symbol_row(
+    statement: &mut rusqlite::Statement<'_>,
+    lang: &str,
+    row: &PathSymbolRow,
+) -> rusqlite::Result<usize> {
+    statement.execute(params![
+        lang,
+        row.rel_path,
+        row.blob_oid.to_string(),
+        code_unit_kind_to_i64(row.kind),
+        row.package_name,
+        row.short_name,
+        row.exact_fqn,
+        row.normalized_fqn,
+    ])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchCandidateRow {
     pub candidate: CandidateRow,
     pub primary_range: Option<Range>,
@@ -164,6 +250,130 @@ pub struct UsageFactRow {
 }
 
 impl AnalyzerStore {
+    pub(crate) fn sync_path_symbol_units(&self, lang: &str, rows: &[PathSymbolRow]) -> Result<()> {
+        let fingerprint = path_symbol_fingerprint(rows);
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        let existing_fingerprint = tx
+            .query_row(
+                "SELECT fingerprint FROM path_symbol_snapshots WHERE lang = ?1",
+                params![lang],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            tx.commit()?;
+            return Ok(());
+        }
+        let existing = {
+            let mut stmt = tx.prepare(
+                "SELECT rel_path, blob_oid, kind, package_name, short_name,
+                        exact_fqn, normalized_fqn
+                 FROM path_symbol_units WHERE lang = ?1",
+            )?;
+            let mapped = stmt.query_map(params![lang], |row| decode_path_symbol_row(row, 0))?;
+            mapped
+                .map(|row| row.map(|row| (row.rel_path.clone(), row)))
+                .collect::<std::result::Result<HashMap<_, _>, _>>()?
+        };
+        let wanted: HashMap<_, _> = rows
+            .iter()
+            .cloned()
+            .map(|row| (row.rel_path.clone(), row))
+            .collect();
+
+        let mut delete =
+            tx.prepare("DELETE FROM path_symbol_units WHERE lang = ?1 AND rel_path = ?2")?;
+        for (rel_path, row) in &existing {
+            if wanted.get(rel_path) != Some(row) {
+                delete.execute(params![lang, rel_path])?;
+            }
+        }
+        drop(delete);
+
+        let mut insert = tx.prepare(
+            "INSERT OR REPLACE INTO path_symbol_units(
+               lang, rel_path, blob_oid, kind, package_name, short_name,
+               exact_fqn, normalized_fqn
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for (rel_path, row) in &wanted {
+            if existing.get(rel_path) == Some(row) {
+                continue;
+            }
+            insert_path_symbol_row(&mut insert, lang, row)?;
+        }
+        drop(insert);
+        tx.execute(
+            "INSERT INTO path_symbol_snapshots(lang, fingerprint) VALUES(?1, ?2)
+             ON CONFLICT(lang) DO UPDATE SET fingerprint = excluded.fingerprint",
+            params![lang, fingerprint],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn path_symbol_rows_by_fqn_for_langs(
+        &self,
+        langs: &[String],
+        exact_fqn: &str,
+        normalized_fqn: &str,
+    ) -> Result<Vec<(String, PathSymbolRow)>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut out = Vec::new();
+        let sql = "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
+                    exact_fqn, normalized_fqn
+             FROM path_symbol_units AS units
+             WHERE lang = ?1 AND (exact_fqn = ?2 OR normalized_fqn = ?3)
+               AND (
+                 lang NOT IN ('javascript', 'typescript:ts', 'typescript:tsx')
+                 OR EXISTS(
+                   SELECT 1 FROM import_details AS imports
+                   WHERE imports.blob_oid = units.blob_oid AND imports.lang = units.lang
+                 )
+               )
+             ORDER BY rel_path, exact_fqn";
+        for lang in langs {
+            let mut stmt = conn.prepare(sql)?;
+            let mapped = stmt.query_map(params![lang, exact_fqn, normalized_fqn], |row| {
+                Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
+            })?;
+            out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn replace_path_symbol_unit(
+        &self,
+        storage_langs: &[String],
+        rel_path: &str,
+        replacement: Option<(&str, &PathSymbolRow)>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        for lang in storage_langs {
+            tx.execute(
+                "DELETE FROM path_symbol_units WHERE lang = ?1 AND rel_path = ?2",
+                params![lang, rel_path],
+            )?;
+            tx.execute(
+                "DELETE FROM path_symbol_snapshots WHERE lang = ?1",
+                params![lang],
+            )?;
+        }
+        if let Some((lang, row)) = replacement {
+            let mut insert = tx.prepare(
+                "INSERT INTO path_symbol_units(
+                   lang, rel_path, blob_oid, kind, package_name, short_name,
+                   exact_fqn, normalized_fqn
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            insert_path_symbol_row(&mut insert, lang, row)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn open_for_workspace(workspace_root: &Path) -> Result<Self> {
         if gitblob::discover(workspace_root).is_some() {
             Self::open_persistent(&analyzer_db_path(workspace_root))
@@ -554,6 +764,28 @@ impl AnalyzerStore {
         )
     }
 
+    /// Returns declaration-lookup candidates for a known short name.
+    ///
+    /// Some languages publish structured synthetic declarations (for example,
+    /// JavaScript property assignments) only to the definition lookup set.
+    /// Forward resolvers still need those rows, but must obtain them through a
+    /// name-bounded query instead of loading every lookup unit in the
+    /// workspace.
+    pub(crate) fn definition_lookup_candidate_rows_by_short_name_for_langs(
+        &self,
+        langs: &[String],
+        short_name: &str,
+    ) -> Result<Vec<CandidateRow>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let sql = definition_lookup_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
+        candidate_rows_for_languages(
+            &conn,
+            langs.iter().map(String::as_str),
+            &sql,
+            &[&short_name],
+        )
+    }
+
     pub fn declaration_candidate_rows_by_identifier_for_langs(
         &self,
         langs: &[String],
@@ -629,6 +861,65 @@ impl AnalyzerStore {
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let sql = declaration_candidate_sql("units.lang = ?1 AND units.content_qualifier = ?2");
         candidate_rows_for_languages(&conn, langs.iter().map(String::as_str), &sql, &[&package])
+    }
+
+    /// One literal, index-ordered page of candidate rows whose persisted
+    /// content qualifier is exactly `package` or is nested beneath it.
+    ///
+    /// The caller must still resolve rows against the live snapshot because
+    /// some adapters derive the hydrated package identity from the live path.
+    /// Paging lets that validation stop at the first live match without
+    /// materializing the complete package subtree.
+    pub(crate) fn declaration_rows_by_package_prefix_page(
+        &self,
+        lang: &str,
+        package: &str,
+        after: Option<(&str, Oid, i64)>,
+        limit: usize,
+    ) -> Result<Vec<CandidateRow>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let nested = format!("{package}.");
+        // '/' is the immediate ASCII successor of '.', so the half-open range
+        // ["pkg.", "pkg/") contains exactly strings with the literal "pkg."
+        // prefix. Unlike LIKE, '%' and '_' in a legal package name remain data.
+        let upper = format!("{package}/");
+        let cursor_predicate = if after.is_some() {
+            "AND (units.content_qualifier, units.blob_oid, units.unit_key) > (?5, ?6, ?7)"
+        } else {
+            ""
+        };
+        let predicate = format!(
+            "units.lang = ?1
+             AND (units.content_qualifier = ?2
+                  OR (units.content_qualifier >= ?3 AND units.content_qualifier < ?4))
+             {cursor_predicate}"
+        );
+        let sql = declaration_candidate_sql_with_order(
+            &predicate,
+            "units.content_qualifier, units.blob_oid, units.unit_key",
+        );
+        let sql = format!("{sql} LIMIT ?{}", if after.is_some() { 8 } else { 5 });
+        let mut statement = conn.prepare(&sql)?;
+        let mapped = match after {
+            Some((after_qualifier, after_oid, after_unit_key)) => statement.query_map(
+                params![
+                    lang,
+                    package,
+                    nested,
+                    upper,
+                    after_qualifier,
+                    after_oid.to_string(),
+                    after_unit_key,
+                    limit as i64,
+                ],
+                candidate_row_from_row,
+            )?,
+            None => statement.query_map(
+                params![lang, package, nested, upper, limit as i64],
+                candidate_row_from_row,
+            )?,
+        };
+        collect_candidate_rows(mapped)
     }
 
     pub fn declaration_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<CandidateRow>> {
@@ -1055,16 +1346,50 @@ impl AnalyzerStore {
 }
 
 fn declaration_candidate_sql(predicate: &str) -> String {
-    candidate_rows_sql(
+    declaration_candidate_sql_with_order(predicate, "units.blob_oid, units.unit_key")
+}
+
+fn declaration_candidate_sql_with_order(predicate: &str, order_by: &str) -> String {
+    candidate_rows_sql_with_membership(
         "units",
         "FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
         predicate,
+        "units.in_declarations = 1",
+        order_by,
+    )
+}
+
+fn definition_lookup_candidate_sql(predicate: &str) -> String {
+    candidate_rows_sql_with_membership(
+        "units",
+        "FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+        predicate,
+        "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+        "units.blob_oid, units.unit_key",
     )
 }
 
 fn candidate_rows_sql(candidate_alias: &str, from_clause: &str, predicate: &str) -> String {
+    candidate_rows_sql_with_membership(
+        candidate_alias,
+        from_clause,
+        predicate,
+        &format!("{candidate_alias}.in_declarations = 1"),
+        &format!("{candidate_alias}.blob_oid, {candidate_alias}.unit_key"),
+    )
+}
+
+fn candidate_rows_sql_with_membership(
+    candidate_alias: &str,
+    from_clause: &str,
+    predicate: &str,
+    membership: &str,
+    order_by: &str,
+) -> String {
     format!(
         "SELECT {candidate_alias}.blob_oid, {candidate_alias}.lang, {candidate_alias}.unit_key,
                 {candidate_alias}.kind, {candidate_alias}.short_name,
@@ -1073,9 +1398,9 @@ fn candidate_rows_sql(candidate_alias: &str, from_clause: &str, predicate: &str)
                 {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
                 {candidate_alias}.in_definition_lookup
          {from_clause}
-         WHERE {predicate} AND {candidate_alias}.in_declarations = 1
+         WHERE {predicate} AND {membership}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY {candidate_alias}.blob_oid, {candidate_alias}.unit_key"
+         ORDER BY {order_by}"
     )
 }
 
@@ -1191,8 +1516,14 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     let signature_count = insert_unit_signatures(tx, &oid, lang, &unit_keys, &state.signatures)?;
     let signature_metadata_count =
         insert_unit_signature_metadata(tx, &oid, lang, &unit_keys, &state.signature_metadata)?;
-    let supertype_count =
-        insert_unit_supertypes(tx, &oid, lang, &unit_keys, &state.raw_supertypes)?;
+    let supertype_count = insert_unit_supertypes(
+        tx,
+        &oid,
+        lang,
+        &unit_keys,
+        &state.raw_supertypes,
+        &state.supertype_lookup_paths,
+    )?;
     let child_count = insert_unit_children(tx, &oid, lang, &unit_keys, &state.children)?;
     let ruby_dispatch_count = insert_ruby_method_dispatch_modes(
         tx,
@@ -1388,11 +1719,12 @@ fn insert_unit_supertypes(
     lang: &str,
     unit_keys: &HashMap<CodeUnit, i64>,
     supertypes: &HashMap<CodeUnit, Vec<String>>,
+    lookup_paths: &HashMap<CodeUnit, Vec<String>>,
 ) -> Result<usize> {
     let mut stmt = tx.prepare(
         "INSERT OR IGNORE INTO unit_supertypes(
-           blob_oid, lang, unit_key, ordinal, raw
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+           blob_oid, lang, unit_key, ordinal, raw, lookup_path
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     let mut count = 0;
     for (unit, entries) in supertypes {
@@ -1400,7 +1732,19 @@ fn insert_unit_supertypes(
             continue;
         };
         for (ordinal, raw) in entries.iter().enumerate() {
-            stmt.execute(params![oid, lang, unit_key, usize_to_i64(ordinal)?, raw])?;
+            let lookup_path = lookup_paths
+                .get(unit)
+                .and_then(|paths| paths.get(ordinal))
+                .map(String::as_str)
+                .unwrap_or("");
+            stmt.execute(params![
+                oid,
+                lang,
+                unit_key,
+                usize_to_i64(ordinal)?,
+                raw,
+                lookup_path
+            ])?;
             count += 1;
         }
     }
@@ -1688,6 +2032,8 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
 
     let children = read_children(conn, &oid, lang, &by_key)?;
     let raw_supertypes = read_unit_string_vec(conn, &oid, lang, "unit_supertypes", "raw", &by_key)?;
+    let supertype_lookup_paths =
+        read_unit_string_vec(conn, &oid, lang, "unit_supertypes", "lookup_path", &by_key)?;
     let ruby_method_dispatch_modes = read_ruby_method_dispatch_modes(conn, &oid, lang, &by_key)?;
     let scala_traits = read_scala_traits(conn, &oid, lang, &by_key)?;
     let import_statements = read_import_statements(conn, &oid, lang)?;
@@ -1722,6 +2068,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         import_statements,
         imports,
         raw_supertypes,
+        supertype_lookup_paths,
         type_identifiers: meta.type_identifiers,
         signatures,
         signature_metadata,
@@ -1803,6 +2150,8 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
     let unit_rows_by_oid = read_unit_rows_bulk(conn, lang, &oids)?;
     let children_by_oid = read_children_bulk(conn, lang, &oids)?;
     let supertypes_by_oid = read_unit_string_vec_bulk(conn, lang, "unit_supertypes", "raw", &oids)?;
+    let supertype_lookup_paths_by_oid =
+        read_unit_string_vec_bulk(conn, lang, "unit_supertypes", "lookup_path", &oids)?;
     let signatures_by_oid =
         read_unit_string_vec_bulk(conn, lang, "unit_signatures", "text", &oids)?;
     let signature_metadata_by_oid = read_signature_metadata_bulk(conn, lang, &oids)?;
@@ -1884,6 +2233,8 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             .cloned()
             .unwrap_or_default();
         let raw_supertypes = unit_string_map_for_file(supertypes_by_oid.get(&oid_text), &by_key);
+        let supertype_lookup_paths =
+            unit_string_map_for_file(supertype_lookup_paths_by_oid.get(&oid_text), &by_key);
         let signatures = unit_string_map_for_file(signatures_by_oid.get(&oid_text), &by_key);
         let signature_metadata =
             signature_metadata_map_for_file(signature_metadata_by_oid.get(&oid_text), &by_key)?;
@@ -1916,6 +2267,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             import_statements,
             imports,
             raw_supertypes,
+            supertype_lookup_paths,
             type_identifiers: meta.type_identifiers.clone(),
             signatures,
             signature_metadata,
@@ -3209,6 +3561,80 @@ mod tests {
     }
 
     #[test]
+    fn package_prefix_pages_are_literal_and_cursor_bounded() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let adapter = JavaAdapter;
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        for (path, source) in [
+            ("src/a_b/One.java", "package a_b; class One {}\n"),
+            (
+                "src/a_b/child/Two.java",
+                "package a_b.child; class Two {}\n",
+            ),
+            ("src/aXb/Other.java", "package aXb; class Other {}\n"),
+        ] {
+            let file = write_file(root, path, source);
+            let oid = oid_for(source.as_bytes());
+            store
+                .write_parsed_blob(oid, "java", &adapter, &parse_state(&adapter, &file))
+                .unwrap();
+        }
+
+        let first = store
+            .declaration_rows_by_package_prefix_page("java", "a_b", None, 1)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            first[0].content_qualifier.as_str(),
+            "a_b" | "a_b.child"
+        ));
+        let cursor = (
+            first[0].content_qualifier.as_str(),
+            first[0].blob_oid,
+            first[0].unit_key,
+        );
+        let second = store
+            .declaration_rows_by_package_prefix_page("java", "a_b", Some(cursor), 16)
+            .unwrap();
+        let qualifiers = first
+            .iter()
+            .chain(&second)
+            .map(|row| row.content_qualifier.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            qualifiers,
+            ["a_b", "a_b.child"].into_iter().collect::<HashSet<_>>()
+        );
+        assert!(!qualifiers.contains("aXb"));
+    }
+
+    #[test]
+    fn unchanged_path_symbol_snapshot_skips_table_reconciliation() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let row = PathSymbolRow {
+            rel_path: "pkg/model.py".to_string(),
+            blob_oid: oid_for(b"class Model:\n    pass\n"),
+            kind: CodeUnitType::Module,
+            package_name: "pkg".to_string(),
+            short_name: "model".to_string(),
+            exact_fqn: "pkg.model".to_string(),
+            normalized_fqn: "pkg.model".to_string(),
+        };
+
+        store
+            .sync_path_symbol_units("python", std::slice::from_ref(&row))
+            .unwrap();
+        let changes_after_cold_sync = store.conn.lock().expect("store mutex").total_changes();
+        store
+            .sync_path_symbol_units("python", std::slice::from_ref(&row))
+            .unwrap();
+        let changes_after_warm_sync = store.conn.lock().expect("store mutex").total_changes();
+
+        assert_eq!(changes_after_warm_sync, changes_after_cold_sync);
+    }
+
+    #[test]
     fn summary_projection_matches_required_file_state_rows_and_rejects_missing_ranges() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
@@ -3943,6 +4369,7 @@ mod tests {
             import_statements: parsed.import_statements,
             imports: parsed.imports,
             raw_supertypes: parsed.raw_supertypes,
+            supertype_lookup_paths: parsed.supertype_lookup_paths,
             type_identifiers: parsed.type_identifiers,
             signatures: parsed.signatures,
             signature_metadata: parsed.signature_metadata,
@@ -3972,6 +4399,10 @@ mod tests {
         assert_eq!(
             non_empty_string_vec_entries(&actual.raw_supertypes),
             non_empty_string_vec_entries(&expected.raw_supertypes)
+        );
+        assert_eq!(
+            non_empty_string_vec_entries(&actual.supertype_lookup_paths),
+            non_empty_string_vec_entries(&expected.supertype_lookup_paths)
         );
         assert_eq!(actual.type_identifiers, expected.type_identifiers);
         assert_eq!(actual.signatures, expected.signatures);

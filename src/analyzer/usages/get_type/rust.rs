@@ -1,12 +1,14 @@
 use super::{TypeLookupOutcome, candidates_outcome, no_type, type_reference_outcome};
 use crate::analyzer::usages::get_definition::{
-    RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_is_type_definition,
+    AnalyzerRustDefinitionProvider, RustTypeLookupCache,
+    rust_expression_type_definition_fqn_cached, rust_is_type_definition,
     rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, smallest_named_node_covering,
 };
-use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::analyzer::usages::rust_graph::RustDefinitionProvider;
+use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, resolve_analyzer};
 use tree_sitter::{Node, Tree};
 
 pub(super) fn resolve_rust_type(
@@ -28,11 +30,14 @@ pub(super) fn resolve_rust_type(
             "no Rust syntax node at reference location",
         );
     };
-    let support = analyzer.definition_lookup_index();
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return no_type("rust_analyzer_unavailable", "Rust analyzer is unavailable");
+    };
+    let support = AnalyzerRustDefinitionProvider::new(rust, true);
     if rust_is_type_reference_position(node) {
         let Some(fqn) = rust_resolve_type_node_fqn(
             analyzer,
-            support,
+            &support,
             file,
             source,
             node,
@@ -63,7 +68,7 @@ pub(super) fn resolve_rust_type(
     let expression = rust_type_lookup_expression(node);
     let Some(fqn) = rust_expression_type_definition_fqn_cached(
         analyzer,
-        support,
+        &support,
         file,
         source,
         tree.root_node(),

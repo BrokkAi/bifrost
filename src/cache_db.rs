@@ -14,15 +14,35 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
+#[cfg(test)]
+const CURRENT_MIGRATION_VERSION: i64 = 3;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
-static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
-    Lazy::new(|| Migrations::new(vec![M::up(CURRENT_BASELINE_SQL)]));
+const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
+const FORWARD_FACTS_SQL: &str = include_str!("../migrations/cache/0003-forward-facts.sql");
+static CACHE_MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
+    Migrations::new(vec![
+        M::up(CURRENT_BASELINE_SQL),
+        M::up(PATH_SYMBOL_UNITS_SQL),
+        M::up(FORWARD_FACTS_SQL),
+    ])
+});
 static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open baseline schema connection");
     conn.execute_batch(CURRENT_BASELINE_SQL)
         .expect("create baseline schema");
     schema_object_definitions(&conn).expect("read baseline schema definitions")
+});
+#[cfg(test)]
+static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
+    let conn = Connection::open_in_memory().expect("open current schema connection");
+    conn.execute_batch(CURRENT_BASELINE_SQL)
+        .expect("create baseline schema");
+    conn.execute_batch(PATH_SYMBOL_UNITS_SQL)
+        .expect("apply path symbol migration");
+    conn.execute_batch(FORWARD_FACTS_SQL)
+        .expect("apply forward facts migration");
+    schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 
@@ -315,6 +335,23 @@ fn baseline_schema_is_valid(conn: &Connection) -> Result<bool> {
     Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
 }
 
+#[cfg(test)]
+fn current_schema_is_valid(conn: &Connection) -> Result<bool> {
+    if !quick_check_is_ok(conn)? {
+        return Ok(false);
+    }
+    if schema_object_definitions(conn)? != *CURRENT_SCHEMA_OBJECTS {
+        return Ok(false);
+    }
+    let versions = conn.query_row(
+        "SELECT schema_version, semantic_schema_version, analyzer_schema_version
+         FROM cache_state WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
+}
+
 fn quick_check_is_ok(conn: &Connection) -> Result<bool> {
     let result: String = conn
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
@@ -385,7 +422,12 @@ mod tests {
     }
 
     fn future_migrations(sql: &'static str) -> Migrations<'static> {
-        Migrations::new(vec![M::up(CURRENT_BASELINE_SQL), M::up(sql)])
+        Migrations::new(vec![
+            M::up(CURRENT_BASELINE_SQL),
+            M::up(PATH_SYMBOL_UNITS_SQL),
+            M::up(FORWARD_FACTS_SQL),
+            M::up(sql),
+        ])
     }
 
     fn create_legacy_cache(path: &Path) {
@@ -404,12 +446,15 @@ mod tests {
     fn fresh_cache_applies_baseline_migration() {
         let conn = open_in_memory_cache();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
-        assert!(baseline_schema_is_valid(&conn).unwrap());
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
-    fn current_pre_migration_cache_is_adopted_without_dropping_rows() {
+    fn current_pre_migration_cache_preserves_semantic_rows_and_invalidates_analyzer_rows() {
         let mut conn = create_current_baseline_without_migration();
         conn.execute(
             "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
@@ -430,9 +475,12 @@ mod tests {
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert_eq!(semantic_count, 1);
-        assert_eq!(analyzer_count, 1);
+        assert_eq!(analyzer_count, 0);
     }
 
     #[test]
@@ -444,9 +492,12 @@ mod tests {
 
         migrate(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert!(!table_exists(&conn, "legacy_cache").unwrap());
-        assert!(baseline_schema_is_valid(&conn).unwrap());
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -457,9 +508,12 @@ mod tests {
 
         migrate(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert!(!table_exists(&conn, "legacy_cache").unwrap());
-        assert!(baseline_schema_is_valid(&conn).unwrap());
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -487,9 +541,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert!(has_content_package);
-        assert!(baseline_schema_is_valid(&conn).unwrap());
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -509,9 +566,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert!(!legacy_view_exists);
-        assert!(baseline_schema_is_valid(&conn).unwrap());
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -525,8 +585,11 @@ mod tests {
 
         migrate(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
-        assert!(baseline_schema_is_valid(&conn).unwrap());
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -545,7 +608,7 @@ mod tests {
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 2);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
         assert_eq!(analyzer_count, 1);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
@@ -560,7 +623,10 @@ mod tests {
 
         assert!(migrations.to_latest(&mut conn).is_err());
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert!(!table_exists(&conn, "migration_probe").unwrap());
     }
 
@@ -582,13 +648,16 @@ mod tests {
             future_migrations("CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;");
 
         assert!(migrations.to_latest(&mut conn).is_err());
-        assert_eq!(cache_migration_version(&conn).unwrap(), 1);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert!(!table_exists(&conn, "migration_probe").unwrap());
 
         writer.rollback().unwrap();
         migrations.to_latest(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 2);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
 
@@ -600,7 +669,7 @@ mod tests {
             ["2222222222222222222222222222222222222222"],
         )
         .unwrap();
-        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
 
         let err = migrate(&mut conn).unwrap_err();
 
@@ -611,7 +680,7 @@ mod tests {
             err.contains("DatabaseTooFarAhead"),
             "unexpected error: {err}"
         );
-        assert_eq!(cache_migration_version(&conn).unwrap(), 2);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
         assert_eq!(analyzer_count, 1);
     }
 
@@ -649,7 +718,10 @@ mod tests {
 
         let connection = open_unified_connection(&unified).unwrap();
 
-        assert_eq!(cache_migration_version(&connection).unwrap(), 1);
+        assert_eq!(
+            cache_migration_version(&connection).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert!(legacy.exists());
     }
 

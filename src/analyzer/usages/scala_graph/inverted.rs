@@ -36,7 +36,7 @@ use crate::analyzer::usages::inverted_edges::{
     build_file_declarations_from_state, first_precise, parse_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{CodeUnit, DefinitionLookupIndex, UsageFactsIndex};
+use crate::analyzer::{CodeUnit, GlobalUsageDefinitionIndex, UsageFactsIndex};
 use crate::analyzer::{
     IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
 };
@@ -52,7 +52,7 @@ type OverrideTargetEntries = Arc<Vec<String>>;
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
 pub(crate) struct ProjectTypes {
-    index: Arc<DefinitionLookupIndex>,
+    index: Arc<GlobalUsageDefinitionIndex>,
     facts: Arc<UsageFactsIndex>,
     direct_ancestors_by_owner: Option<HashMap<String, Vec<CodeUnit>>>,
     scala_trait_fqns: Option<HashSet<String>>,
@@ -64,7 +64,7 @@ pub(crate) struct ProjectTypes {
 
 impl ProjectTypes {
     pub(crate) fn build(scala: &ScalaAnalyzer) -> Self {
-        let index = scala.definition_lookup_index_shared();
+        let index = scala.global_usage_definition_index_shared();
         Self {
             index,
             facts: scala.usage_facts_index_shared(),
@@ -93,7 +93,7 @@ impl ProjectTypes {
                 }
             }
         }
-        let index = Arc::new(DefinitionLookupIndex::from_declarations(
+        let index = Arc::new(GlobalUsageDefinitionIndex::from_declarations(
             declarations.iter(),
             scala_normalize_full_name,
             scala_simple_type_name,

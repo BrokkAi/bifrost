@@ -2,11 +2,11 @@ use super::{
     TypeLookupDiagnostic, TypeLookupOutcome, candidates_outcome_with_target_kind, no_type,
 };
 use crate::analyzer::usages::get_definition::{
-    GoTypeLookupResolutionKind, go_type_lookup_resolution,
+    GoDefinitionProvider, GoTypeLookupResolutionKind, go_type_lookup_resolution,
 };
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile, resolve_analyzer};
 use tree_sitter::Tree;
 
 pub(super) fn resolve_go_type(
@@ -19,9 +19,12 @@ pub(super) fn resolve_go_type(
     let Some(tree) = tree else {
         return no_type("go_parse_failed", "Go source could not be parsed");
     };
-    let support = analyzer.definition_lookup_index();
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return no_type("go_analyzer_unavailable", "Go analyzer is unavailable");
+    };
+    let support = crate::analyzer::usages::get_definition::AnalyzerGoDefinitionProvider::new(go);
     let Some(resolution) =
-        go_type_lookup_resolution(analyzer, support, file, source, tree.root_node(), site)
+        go_type_lookup_resolution(analyzer, &support, file, source, tree.root_node(), site)
     else {
         return no_type(
             "go_no_supported_type",

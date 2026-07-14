@@ -27,7 +27,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::{
-    DefinitionLookupIndex, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
+    GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -44,7 +44,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = rust.get_analyzed_files().into_iter().collect();
-    let support = analyzer.definition_lookup_index();
+    let support = analyzer.global_usage_definition_index();
     let language = tree_sitter_rust::LANGUAGE.into();
     build_edges(&files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
@@ -74,7 +74,7 @@ where
 
 struct RustScan<'a, 'b> {
     rust: &'a RustAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a GlobalUsageDefinitionIndex,
     file: &'a ProjectFile,
     source: &'a str,
     refs: Arc<RustReferenceContext>,

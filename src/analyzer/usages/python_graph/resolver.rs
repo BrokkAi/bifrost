@@ -144,7 +144,7 @@ fn resolve_indexed_receiver_type(
     file: &ProjectFile,
     raw_type: &str,
 ) -> Option<CodeUnit> {
-    let index = analyzer.definition_lookup_index();
+    let index = analyzer.global_usage_definition_index();
     module_fqn_for_file(analyzer, file)
         .into_iter()
         .flat_map(|module| index.types_in_package(&module, raw_type).iter())

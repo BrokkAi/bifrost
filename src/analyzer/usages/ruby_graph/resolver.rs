@@ -1,4 +1,5 @@
 use crate::analyzer::ruby::{RubyFieldScope, extract_name_path};
+use crate::analyzer::type_relations::TypeRelationKind;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer, RubyMethodDispatchMode, RubySemanticFacts,
     resolve_analyzer,
@@ -121,9 +122,18 @@ pub(crate) struct ReceiverType {
 pub(crate) struct RubySemanticIndex<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) ruby: &'a RubyAnalyzer,
-    facts: &'a RubySemanticFacts,
+    facts: Option<&'a RubySemanticFacts>,
     target: Option<CodeUnit>,
+    forward_owner_facts: RefCell<HashMap<String, RubyForwardOwnerFacts>>,
     pub(super) factory_return_cache: RefCell<HashMap<FactoryInferenceKey, Option<String>>>,
+}
+
+#[derive(Clone, Default)]
+struct RubyForwardOwnerFacts {
+    ancestors: Vec<String>,
+    included: Vec<String>,
+    prepended: Vec<String>,
+    extended: Vec<String>,
 }
 
 impl<'a> RubySemanticIndex<'a> {
@@ -147,8 +157,9 @@ impl<'a> RubySemanticIndex<'a> {
         Self {
             analyzer,
             ruby,
-            facts: ruby.semantic_facts(),
+            facts: target.as_ref().map(|_| ruby.semantic_facts()),
             target,
+            forward_owner_facts: RefCell::new(HashMap::default()),
             factory_return_cache: RefCell::new(HashMap::default()),
         }
     }
@@ -231,7 +242,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     pub(crate) fn resolve_method_candidates(
         &self,
-        support: &crate::analyzer::DefinitionLookupIndex,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
         visible_files: &HashSet<ProjectFile>,
         receiver: &ReceiverType,
         member: &str,
@@ -256,14 +267,27 @@ impl<'a> RubySemanticIndex<'a> {
                 self.resolve_top_level_method_candidates(support, &visible_files, member)
             }
             ReceiverMode::Instance => {
-                for owner in self.receiver_owner_lookup_order(&receiver.owner_fq_name) {
+                for owner in self.forward_receiver_owner_lookup_order(
+                    support,
+                    &visible_files,
+                    &receiver.owner_fq_name,
+                ) {
                     let mut prepended = Vec::new();
-                    self.push_mixin_methods(
-                        &owner,
-                        &self.facts.mixin_prepended_owners,
-                        &mut push_owner,
-                        &mut prepended,
-                    );
+                    for mixin in self
+                        .mixin_owners(
+                            support,
+                            &visible_files,
+                            &owner,
+                            TypeRelationKind::MixinPrepend,
+                        )
+                        .into_iter()
+                        .rev()
+                    {
+                        push_owner(&mixin, RubyMethodLookupMode::InstanceMethod, &mut prepended);
+                        if !prepended.is_empty() {
+                            break;
+                        }
+                    }
                     if !prepended.is_empty() {
                         return prepended;
                     }
@@ -275,12 +299,21 @@ impl<'a> RubySemanticIndex<'a> {
                     }
 
                     let mut included = Vec::new();
-                    self.push_mixin_methods(
-                        &owner,
-                        &self.facts.mixin_included_owners,
-                        &mut push_owner,
-                        &mut included,
-                    );
+                    for mixin in self
+                        .mixin_owners(
+                            support,
+                            &visible_files,
+                            &owner,
+                            TypeRelationKind::MixinInclude,
+                        )
+                        .into_iter()
+                        .rev()
+                    {
+                        push_owner(&mixin, RubyMethodLookupMode::InstanceMethod, &mut included);
+                        if !included.is_empty() {
+                            break;
+                        }
+                    }
                     if !included.is_empty() {
                         return included;
                     }
@@ -288,7 +321,11 @@ impl<'a> RubySemanticIndex<'a> {
                 Vec::new()
             }
             ReceiverMode::Class => {
-                for owner in self.receiver_owner_lookup_order(&receiver.owner_fq_name) {
+                for owner in self.forward_receiver_owner_lookup_order(
+                    support,
+                    &visible_files,
+                    &receiver.owner_fq_name,
+                ) {
                     let mut direct = Vec::new();
                     push_owner(&owner, RubyMethodLookupMode::SingletonMethod, &mut direct);
                     if !direct.is_empty() {
@@ -296,12 +333,21 @@ impl<'a> RubySemanticIndex<'a> {
                     }
 
                     let mut extended = Vec::new();
-                    self.push_mixin_methods(
-                        &owner,
-                        &self.facts.mixin_class_owners,
-                        &mut push_owner,
-                        &mut extended,
-                    );
+                    for mixin in self
+                        .mixin_owners(
+                            support,
+                            &visible_files,
+                            &owner,
+                            TypeRelationKind::MixinExtend,
+                        )
+                        .into_iter()
+                        .rev()
+                    {
+                        push_owner(&mixin, RubyMethodLookupMode::InstanceMethod, &mut extended);
+                        if !extended.is_empty() {
+                            break;
+                        }
+                    }
                     if !extended.is_empty() {
                         return extended;
                     }
@@ -313,7 +359,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     pub(crate) fn resolve_bare_method_candidates(
         &self,
-        support: &crate::analyzer::DefinitionLookupIndex,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
         visible_files: &HashSet<ProjectFile>,
         receiver: &ReceiverType,
         member: &str,
@@ -328,7 +374,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     fn resolve_top_level_method_candidates(
         &self,
-        support: &crate::analyzer::DefinitionLookupIndex,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         member: &str,
     ) -> Vec<CodeUnit> {
@@ -348,34 +394,38 @@ impl<'a> RubySemanticIndex<'a> {
             .collect()
     }
 
-    fn push_mixin_methods(
+    fn mixin_owners(
         &self,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
         owner: &str,
-        index: &HashMap<String, Vec<String>>,
-        push_owner: &mut impl FnMut(&str, RubyMethodLookupMode, &mut Vec<CodeUnit>),
-        out: &mut Vec<CodeUnit>,
-    ) {
-        if let Some(mixins) = index.get(owner) {
-            for mixin in mixins.iter().rev() {
-                push_owner(mixin, RubyMethodLookupMode::InstanceMethod, out);
-                if !out.is_empty() {
-                    break;
-                }
-            }
+        kind: TypeRelationKind,
+    ) -> Vec<String> {
+        if let Some(facts) = self.facts {
+            let index = match kind {
+                TypeRelationKind::MixinInclude => &facts.mixin_included_owners,
+                TypeRelationKind::MixinPrepend => &facts.mixin_prepended_owners,
+                TypeRelationKind::MixinExtend => &facts.mixin_class_owners,
+                _ => return Vec::new(),
+            };
+            return index.get(owner).cloned().unwrap_or_default();
+        }
+        let facts = self.forward_owner_facts(support, visible_files, owner);
+        match kind {
+            TypeRelationKind::MixinInclude => facts.included,
+            TypeRelationKind::MixinPrepend => facts.prepended,
+            TypeRelationKind::MixinExtend => facts.extended,
+            _ => Vec::new(),
         }
     }
 
-    fn receiver_owner_lookup_order(&self, owner: &str) -> Vec<String> {
-        let mut out = vec![owner.to_string()];
-        out.extend(self.ancestor_lookup_order(owner));
-        out
-    }
-
     pub(crate) fn ancestor_lookup_order(&self, owner: &str) -> Vec<String> {
+        let Some(facts) = self.facts else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         let mut visited = HashSet::default();
-        let mut stack: Vec<String> = self
-            .facts
+        let mut stack: Vec<String> = facts
             .ancestors
             .get(owner)
             .map(|items| items.iter().cloned().collect())
@@ -385,11 +435,143 @@ impl<'a> RubySemanticIndex<'a> {
                 continue;
             }
             out.push(candidate.clone());
-            if let Some(next) = self.facts.ancestors.get(&candidate) {
+            if let Some(next) = facts.ancestors.get(&candidate) {
                 stack.extend(next.iter().cloned());
             }
         }
         out
+    }
+
+    pub(crate) fn forward_ancestor_lookup_order(
+        &self,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        owner: &str,
+    ) -> Vec<String> {
+        if self.facts.is_some() {
+            return self.ancestor_lookup_order(owner);
+        }
+        let mut out = Vec::new();
+        let mut visited = HashSet::default();
+        let mut stack = self
+            .forward_owner_facts(support, visible_files, owner)
+            .ancestors;
+        stack.reverse();
+        while let Some(candidate) = stack.pop() {
+            if !visited.insert(candidate.clone()) {
+                continue;
+            }
+            out.push(candidate.clone());
+            let mut next = self
+                .forward_owner_facts(support, visible_files, &candidate)
+                .ancestors;
+            next.reverse();
+            stack.extend(next);
+        }
+        out
+    }
+
+    fn forward_receiver_owner_lookup_order(
+        &self,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        owner: &str,
+    ) -> Vec<String> {
+        let mut owners = vec![owner.to_string()];
+        owners.extend(self.forward_ancestor_lookup_order(support, visible_files, owner));
+        owners
+    }
+
+    fn forward_owner_facts(
+        &self,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        owner: &str,
+    ) -> RubyForwardOwnerFacts {
+        if let Some(cached) = self.forward_owner_facts.borrow().get(owner) {
+            return cached.clone();
+        }
+        let Some(owner_unit) = support.fqn(owner).into_iter().find(|unit| {
+            (unit.is_class() || unit.is_module())
+                && unit.fq_name() == owner
+                && visible_files.contains(unit.source())
+        }) else {
+            self.forward_owner_facts
+                .borrow_mut()
+                .insert(owner.to_string(), RubyForwardOwnerFacts::default());
+            return RubyForwardOwnerFacts::default();
+        };
+
+        let specs = self.ruby.forward_mixin_specs(&owner_unit);
+        let mixin_names: HashSet<String> =
+            specs.iter().map(|spec| spec.raw_target.clone()).collect();
+        let mut facts = RubyForwardOwnerFacts::default();
+        for spec in specs {
+            let Some(target) =
+                self.resolve_forward_owner_name(support, visible_files, owner, &spec.raw_target)
+            else {
+                continue;
+            };
+            match spec.kind {
+                TypeRelationKind::MixinInclude => facts.included.push(target),
+                TypeRelationKind::MixinPrepend => facts.prepended.push(target),
+                TypeRelationKind::MixinExtend => facts.extended.push(target),
+                _ => {}
+            }
+        }
+        for raw in self.ruby.forward_raw_supertypes(&owner_unit) {
+            if mixin_names.contains(&raw) {
+                continue;
+            }
+            if let Some(target) =
+                self.resolve_forward_owner_name(support, visible_files, owner, &raw)
+            {
+                facts.ancestors.push(target);
+            }
+        }
+        facts.ancestors.dedup();
+        facts.included.dedup();
+        facts.prepended.dedup();
+        facts.extended.dedup();
+        self.forward_owner_facts
+            .borrow_mut()
+            .insert(owner.to_string(), facts.clone());
+        facts
+    }
+
+    fn resolve_forward_owner_name(
+        &self,
+        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        lexical_owner: &str,
+        raw: &str,
+    ) -> Option<String> {
+        let mut candidate_names = vec![raw.to_string()];
+        let mut prefix = lexical_owner;
+        while let Some((parent, _)) = prefix.rsplit_once('$') {
+            candidate_names.push(format!("{parent}${raw}"));
+            prefix = parent;
+        }
+        for candidate in candidate_names {
+            let mut matches = support.fqn(&candidate);
+            matches.retain(|unit| {
+                (unit.is_class() || unit.is_module()) && visible_files.contains(unit.source())
+            });
+            matches.sort();
+            matches.dedup();
+            if matches.len() == 1 {
+                return Some(matches.remove(0).fq_name());
+            }
+        }
+
+        let identifier = raw.rsplit('$').next().unwrap_or(raw);
+        let mut matches = support.file_identifier_in_files(visible_files, identifier);
+        matches.retain(|unit| {
+            (unit.is_class() || unit.is_module()) && unit.identifier() == identifier
+        });
+        matches.sort();
+        matches.dedup();
+        (matches.len() == 1).then(|| matches.remove(0).fq_name())
     }
 }
 

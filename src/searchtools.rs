@@ -2550,7 +2550,7 @@ fn java_generated_accessor_source_blocks(
         .flat_map(|owner| {
             java_lombok_accessor_field_candidates(
                 analyzer,
-                analyzer.definition_lookup_index(),
+                analyzer.global_usage_definition_index(),
                 owner,
                 &member,
             )
@@ -7370,7 +7370,7 @@ fn resolve_directory_target(analyzer: &dyn IAnalyzer, target: &str) -> Vec<Proje
     // filesystem directory. Filesystem matches win first, so workspace-relative paths
     // never collide with import paths.
     analyzer
-        .definition_lookup_index()
+        .global_usage_definition_index()
         .package_files_with_prefix(normalized)
 }
 

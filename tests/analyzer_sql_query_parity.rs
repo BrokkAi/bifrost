@@ -262,7 +262,7 @@ fn non_git_live_map_makes_store_only_file_visible_to_workspace_queries() {
 }
 
 #[test]
-fn definition_lookup_index_includes_store_only_live_units() {
+fn global_usage_definition_index_includes_store_only_live_units() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("tracked.py", "class Tracked:\n    pass\n")
         .build();
@@ -272,7 +272,7 @@ fn definition_lookup_index_includes_store_only_live_units() {
     analyzer
         .write_live_file_to_store_for_test(&file)
         .expect("store-only blob write");
-    let support = analyzer.definition_lookup_index();
+    let support = analyzer.global_usage_definition_index();
     assert!(
         support
             .fqn_for_test("store_only.StoreOnly")

@@ -45,6 +45,8 @@ pub struct JavaAnalyzer {
     external_index: Arc<std::sync::OnceLock<JavaExternalDeclarationIndex>>,
 }
 
+crate::analyzer::impl_forward_query_provider!(JavaAnalyzer);
+
 impl JavaAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
@@ -182,7 +184,7 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        self.resolve_type_name(file, raw_name)
+        self.resolve_forward_type_name(file, raw_name)
     }
 
     pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
@@ -272,8 +274,34 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
-        self.inner.definition_lookup_index()
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+        self.inner.global_usage_definition_index()
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {

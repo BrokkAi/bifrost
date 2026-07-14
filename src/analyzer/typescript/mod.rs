@@ -261,6 +261,8 @@ pub struct TypescriptAnalyzer {
     alias_resolver: Arc<AliasResolver>,
 }
 
+crate::analyzer::impl_forward_query_provider!(TypescriptAnalyzer);
+
 impl TypescriptAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
@@ -650,8 +652,42 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
-        self.inner.definition_lookup_index()
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        self.inner.reset_workspace_path_scan_count_for_test();
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.inner.workspace_path_scan_count_for_test()
+    }
+
+    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+        self.inner.global_usage_definition_index()
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {

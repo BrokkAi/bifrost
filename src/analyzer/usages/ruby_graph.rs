@@ -124,7 +124,7 @@ impl RubyUsageGraphStrategy {
             let mut scan = RubyFileScan {
                 analyzer,
                 semantic: &semantic,
-                support: analyzer.definition_lookup_index(),
+                support: analyzer.global_usage_definition_index(),
                 file,
                 source: &source,
                 line_starts: &line_starts,

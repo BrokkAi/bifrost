@@ -1,4 +1,6 @@
-use crate::analyzer::{CallableArity, CodeUnit, DefinitionLookupIndex, IAnalyzer, LanguageAdapter};
+use crate::analyzer::{
+    CallableArity, CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, LanguageAdapter,
+};
 use crate::hash::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,7 +70,7 @@ impl UsageFactsIndex {
     ) -> UsageFactsIndex {
         let declarations: Vec<_> = analyzer.all_declarations().collect();
         Self::build_from_declarations(
-            analyzer.definition_lookup_index(),
+            analyzer.global_usage_definition_index(),
             declarations.iter(),
             |unit| {
                 analyzer
@@ -83,7 +85,7 @@ impl UsageFactsIndex {
     }
 
     pub(crate) fn build_from_declarations<'a>(
-        definitions: &DefinitionLookupIndex,
+        definitions: &GlobalUsageDefinitionIndex,
         declarations: impl IntoIterator<Item = &'a CodeUnit>,
         signature_of: impl Fn(&CodeUnit) -> Option<String>,
         metadata_of: impl Fn(&CodeUnit) -> Option<crate::analyzer::SignatureMetadata>,
@@ -202,7 +204,7 @@ fn insert_callable_return_type(
 fn return_type_fqn(
     return_type: &str,
     package_name: &str,
-    definitions: &DefinitionLookupIndex,
+    definitions: &GlobalUsageDefinitionIndex,
     extract: &dyn SignatureFactsExtractor,
 ) -> Option<String> {
     let base = return_type
@@ -289,7 +291,7 @@ mod tests {
                 Some("arity:1 -> Other"),
             ),
         ];
-        let definitions = DefinitionLookupIndex::from_declarations(
+        let definitions = GlobalUsageDefinitionIndex::from_declarations(
             &declarations,
             |fqn| fqn.replace("$.", ".").trim_end_matches('$').to_string(),
             |unit| unit.identifier().trim_end_matches('$').to_string(),
@@ -324,7 +326,7 @@ mod tests {
                 Some("arity:0 -> Other"),
             ),
         ];
-        let definitions = DefinitionLookupIndex::from_declarations(
+        let definitions = GlobalUsageDefinitionIndex::from_declarations(
             &declarations,
             |fqn| fqn.replace("$.", ".").trim_end_matches('$').to_string(),
             |unit| unit.identifier().trim_end_matches('$').to_string(),

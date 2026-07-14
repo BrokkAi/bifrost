@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::BoundedDefinitionLookup;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -37,8 +38,8 @@ pub(super) fn resolve_python(
         );
     }
 
-    let support = context.support();
     let ctx = context.python_context(py, file);
+    let support = context.bounded_support();
     let reference = python_reference_node(node);
     match reference {
         Some(PythonReferenceNode::Attribute { object, attribute }) => {
@@ -244,7 +245,7 @@ impl PythonDefinitionContext {
     fn receiver_type_for_object(
         &self,
         py: &PythonAnalyzer,
-        support: &DefinitionLookupIndex,
+        support: &dyn BoundedDefinitionLookup,
         object: &str,
     ) -> Option<CodeUnit> {
         if let Some(fqn) = self.named.get(object) {
@@ -354,7 +355,7 @@ fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
 
 fn python_fqn_outcome(
     py: &PythonAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     fqn: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
@@ -379,7 +380,7 @@ fn python_fqn_outcome(
 
 fn python_class_for_fqn(
     py: &PythonAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Option<CodeUnit> {
     support
@@ -391,7 +392,7 @@ fn python_class_for_fqn(
 
 fn python_member_outcome(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     receiver_type: CodeUnit,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -427,14 +428,14 @@ fn python_member_outcome(
     }
 }
 
-fn python_crosses_unindexed_boundary(support: &DefinitionLookupIndex, fqn: &str) -> bool {
+fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
     let Some((module, _)) = fqn.rsplit_once('.') else {
         return !python_workspace_module_exists(support, "");
     };
     !python_workspace_module_exists(support, module)
 }
 
-fn python_workspace_module_exists(support: &DefinitionLookupIndex, module: &str) -> bool {
+fn python_workspace_module_exists(support: &dyn BoundedDefinitionLookup, module: &str) -> bool {
     support.package_exists(module) || support.fqn_exists(module)
 }
 
@@ -442,7 +443,7 @@ fn python_workspace_module_exists(support: &DefinitionLookupIndex, module: &str)
 fn python_receiver_type_unit(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     context: &PythonDefinitionContext,
     file: &ProjectFile,
     source: &str,
@@ -496,7 +497,7 @@ fn python_receiver_type_unit(
 fn python_call_result_type(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     context: &PythonDefinitionContext,
     file: &ProjectFile,
     source: &str,
@@ -518,7 +519,7 @@ fn python_call_result_type(
 fn python_resolve_callable(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn BoundedDefinitionLookup,
     context: &PythonDefinitionContext,
     file: &ProjectFile,
     source: &str,

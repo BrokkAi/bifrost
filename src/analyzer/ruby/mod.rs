@@ -57,6 +57,8 @@ pub struct RubyAnalyzer {
     types_by_identifier: Arc<OnceLock<HashMap<String, Vec<CodeUnit>>>>,
 }
 
+crate::analyzer::impl_forward_query_provider!(RubyAnalyzer);
+
 impl RubyAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
@@ -129,6 +131,10 @@ impl RubyAnalyzer {
         self.inner
             .ruby_method_dispatch_mode(unit)
             .unwrap_or(RubyMethodDispatchMode::Instance)
+    }
+
+    pub(crate) fn forward_raw_supertypes(&self, unit: &CodeUnit) -> Vec<String> {
+        self.forward_superclass_targets(unit)
     }
 }
 
@@ -228,8 +234,34 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
-        self.inner.definition_lookup_index()
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+        self.inner.global_usage_definition_index()
     }
 
     fn structural_search_providers(

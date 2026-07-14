@@ -3,8 +3,8 @@ use crate::analyzer::semantic_diagnostics::{
 };
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::{
-    DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer, Range,
-    SemanticDiagnostic, resolve_analyzer,
+    GlobalUsageDefinitionIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer,
+    Range, SemanticDiagnostic, resolve_analyzer,
 };
 use crate::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
@@ -60,7 +60,7 @@ pub(crate) fn collect_python_semantic_diagnostics(
         return Vec::new();
     }
 
-    let support = analyzer.definition_lookup_index();
+    let support = analyzer.global_usage_definition_index();
     let line_starts = compute_line_starts(source);
     let module_name = super::python_module_name(file);
     let mut collector = PythonDiagnosticCollector {
@@ -88,7 +88,7 @@ fn parse_python_tree(source: &str) -> Option<Tree> {
 struct PythonDiagnosticCollector<'a> {
     py: &'a PythonAnalyzer,
     analyzer: &'a dyn IAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a GlobalUsageDefinitionIndex,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],

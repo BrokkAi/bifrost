@@ -8,7 +8,7 @@ mod config;
 mod cpp;
 mod csharp;
 pub(crate) mod declaration_range;
-mod definition_lookup_index;
+mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
 mod java;
@@ -60,13 +60,16 @@ pub(crate) use csharp::{
     CSharpMemberName, csharp_as_expression_type_operand, csharp_attribute_name_node,
     csharp_attribute_terminal_name, csharp_attribute_type_names, csharp_callable_arity,
     csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
-    csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
-    csharp_source_identifier, csharp_source_name_segment, csharp_type_node_identity,
-    csharp_unqualified_invocation_for_name, csharp_using_directive_is_global,
-    csharp_using_directive_is_static, csharp_using_directive_namespace,
-    csharp_using_directive_target,
+    csharp_normalize_full_name, csharp_signature_return_type, csharp_source_identifier,
+    csharp_source_name_segment, csharp_type_node_identity, csharp_unqualified_invocation_for_name,
+    csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_using_directive_namespace, csharp_using_directive_target,
 };
-pub use definition_lookup_index::DefinitionLookupIndex;
+pub use global_usage_definition_index::GlobalUsageDefinitionIndex;
+pub(crate) use global_usage_definition_index::{
+    AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
+    impl_forward_query_provider,
+};
 pub use go::GoAnalyzer;
 pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,

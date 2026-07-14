@@ -2,7 +2,7 @@ use crate::analyzer::semantic_diagnostics::{node_range, node_text};
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::usages::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
-    DefinitionLookupIndex, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, Range,
+    GlobalUsageDefinitionIndex, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, Range,
     SemanticDiagnostic, resolve_analyzer, resolve_php_constant, resolve_php_function,
     resolve_php_type,
 };
@@ -60,7 +60,7 @@ pub(crate) fn collect_php_semantic_diagnostics(
         return Vec::new();
     }
 
-    let support = analyzer.definition_lookup_index();
+    let support = analyzer.global_usage_definition_index();
     let line_starts = compute_line_starts(source);
     let ctx = php.file_context_from_source(file, source);
     let mut collector = PhpDiagnosticCollector {
@@ -88,7 +88,7 @@ fn parse_php_tree(source: &str) -> Option<Tree> {
 struct PhpDiagnosticCollector<'a> {
     php: &'a PhpAnalyzer,
     analyzer: &'a dyn IAnalyzer,
-    support: &'a DefinitionLookupIndex,
+    support: &'a GlobalUsageDefinitionIndex,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],

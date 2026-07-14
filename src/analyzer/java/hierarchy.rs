@@ -12,7 +12,7 @@ impl TypeHierarchyProvider for JavaAnalyzer {
             .inner
             .raw_supertypes_of(code_unit)
             .iter()
-            .filter_map(|raw_name| self.resolve_type_name(code_unit.source(), raw_name))
+            .filter_map(|raw_name| self.resolve_forward_type_name(code_unit.source(), raw_name))
             .collect();
         self.memo_caches
             .direct_ancestors
