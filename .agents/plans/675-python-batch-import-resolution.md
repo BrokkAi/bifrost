@@ -25,7 +25,8 @@ resolution work.
   Python batch tests.
 - [x] (2026-07-14) Rebase the checkpoint onto merged PR #750 and rerun the focused
   Python batch and integration tests.
-- [ ] Run clippy and the complete `nlp,python` suite.
+- [x] (2026-07-14) Run clippy and the complete `nlp,python` suite with one
+  Homebrew Python 3.14 toolchain; both gates pass.
 - [x] (2026-07-14) Complete the warmed Python differential smoke after addressing
   the remaining candidate-lookup hotspot; retain the JSONL evidence.
 - [x] (2026-07-14) Reject a resolver-local content-qualifier cache after profiling:
@@ -66,10 +67,11 @@ resolution work.
   candidate.
 - [x] (2026-07-14) Build scan-local scope inputs from the parsed file source and
   persisted declaration ranges instead of generic overload-aware `get_source`.
-- [ ] Bulk-hydrate the one-time Python usage index and parse source only for
-  files whose local declarations collide with named reexports.
-- [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
-  disk preflight permits, then record the result and close #675 only if it completes.
+- [x] (2026-07-14) Bulk-hydrate the one-time Python usage index and parse source
+  only for files whose local declarations collide with named reexports.
+- [x] (2026-07-14) Complete the full 1,000-file / 10,000-site / 1,000-target
+  acceptance record after a 228 GiB disk preflight. The final record completed
+  in 132.3 seconds with a report identical to the 174.1-second pre-batch run.
 
 ## Surprises & Discoveries
 
@@ -208,13 +210,26 @@ resolution work.
   sampled warm-up almost entirely building `PythonUsageIndex`: `export_index_of`
   reparsed every file and fetched each persisted file state independently.
   Evidence: `/private/tmp/bifrost-675-full-acceptance-scope-source.sample.txt` and
-  `.agents/docs/reference-differential/675-python-full-acceptance.jsonl`.
+  `/private/tmp/bifrost-675-full-acceptance-before-batched.jsonl`.
 
 - Observation: Source-omitting bulk hydration does not synthesize path-derived
   module `CodeUnit`s. The first batched run therefore changed 175 module targets
   from `missing` to inconclusive `export graph produced no seeds`, despite
   identical forward results.
-  Evidence: `.agents/docs/reference-differential/675-python-full-acceptance-batched.jsonl`.
+  Evidence: `/private/tmp/bifrost-675-full-acceptance-batched-missing-module.jsonl`.
+
+- Observation: Restoring the module seed produced a 132.3-second completed full
+  record, 24 percent faster than the 174.1-second pre-batch record. Their
+  normalized `.report` values have the identical SHA-256
+  `b2fce2ff39fc227379989fbd674892aad571f126495527d2cae899a8b2806ae3`.
+  Evidence: `.agents/docs/reference-differential/675-python-full-acceptance.jsonl`.
+
+- Observation: Local all-feature validation required a consistent Rust and Python
+  environment. The Rustup `cargo`, `rustc`, `cargo-clippy`, and `clippy-driver` were
+  pinned together; PyO3 used Homebrew Python 3.14 plus its framework library; and
+  `/usr/sbin` remained on `PATH` so the temp-storage regressions could call `lsof`.
+  With that environment, clippy with warnings denied and the complete
+  `cargo test --features nlp,python` suite both passed.
 
 ## Decision Log
 
@@ -364,13 +379,25 @@ binder's exact named import map, then same-file classes, and only then takes the
 unchanged shared graph-resolver fallback. The context remains removed after its last
 request, so no cache survives the batch-file lifecycle.
 
-The full validation and acceptance benchmark remains pending. The receiver path is
-covered for direct imports, explicit facade reexports, and imported class factory
-methods. Focused counters prove it no longer builds `MultiAnalyzer`'s global index or
-scans every declaration. The completed warmed corpus smoke confirms the bounded path
-finishes without generic import binding or broad definition hydration dominating typed
-receiver resolution, so the full limits may now be started after the required disk
-preflight.
+The receiver path is covered for direct imports, explicit facade reexports, imported
+class factory methods, per-file cache isolation, and bounded-cache overflow. Focused
+counters prove direct named imports avoid the generic resolver and the context is
+released after its final request. The completed warmed smoke and full acceptance
+record confirm generic import binding no longer dominates typed receiver resolution.
+
+The final full record audited 1,000 of 36,100 eligible files, sampled 10,000 sites,
+queried all 685 distinct resolved targets, and completed in 132.3 seconds with 927
+consistent, 8,854 inconclusive, and 219 missing classifications. Its report is byte-
+equivalent after canonical JSON normalization to the 174.1-second pre-batch result,
+while the sampled one-time usage-index parse is gone and peak footprint remained
+bounded at 574.6 MiB.
+
+Final validation passed `cargo fmt`,
+`cargo clippy --all-targets --all-features -- -D warnings`, all focused Python
+definition and usage tests, and the complete `cargo test --features nlp,python`
+suite. The NLP-sidecar timeout test needed access to the existing host `uv` cache;
+the first temp-storage attempt was also rerun after restoring `/usr/sbin` to `PATH`,
+which made `lsof` available as expected.
 
 ## Context and Orientation
 
