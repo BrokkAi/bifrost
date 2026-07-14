@@ -34,6 +34,12 @@ resolution work.
 - [x] (2026-07-14) Reject a longest-module-prefix path-symbol selector after a
   warmed smoke: its non-indexable prefix query dominated the sampled work, so
   the implementation was reverted.
+- [x] (2026-07-14) Reject an exact-FQN path-symbol projection: it preserved
+  correctness but the corpus still reached re-export traversal, so the added
+  SQLite lookup did not replace the generic receiver resolver and was reverted.
+- [x] (2026-07-14) Follow explicit named re-export chains through existing import
+  binders before the generic export resolver, with regression coverage that keeps
+  the generic receiver fallback at zero.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -76,6 +82,16 @@ resolution work.
   smoke.
   Evidence: `/private/tmp/bifrost-675-path-narrowing.sample.txt`.
 
+- Observation: Even after an exact-FQN query was made indexable, the corpus sample
+  still spent its receiver resolution in `resolve_import_bindings` and
+  `PythonAnalyzer::export_index_of`. Direct named imports commonly target facade
+  modules that explicitly re-export the class, so resolving only the first
+  `module.Type` FQN does not reach the leaf declaration. The path projection was
+  reverted. A bounded walk over binder-derived `ImportKind::Named` edges reaches
+  direct reexports without reading or parsing intermediate source; star exports and
+  ambiguous shapes continue to use the established resolver.
+  Evidence: `/private/tmp/bifrost-675-exact-indexed.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -113,6 +129,14 @@ resolution work.
   already-structured lookup key.
   Date/Author: 2026-07-14 / Codex
 
+- Decision: Resolve only explicit named Python reexports before requesting the
+  generic export resolver.
+  Rationale: Import binders already encode the path and imported local name for
+  this unambiguous shape. Following those structured edges resolves facade modules
+  without constructing export indexes; wildcard, namespace, and missing bindings
+  retain the existing comprehensive behavior.
+  Date/Author: 2026-07-14 / Codex
+
 ## Outcomes & Retrospective
 
 The implementation is complete and the new focused behavior is covered. A
@@ -122,12 +146,11 @@ binder's exact named import map, then same-file classes, and only then takes the
 unchanged shared graph-resolver fallback. The context remains removed after its last
 request, so no cache survives the batch-file lifecycle.
 
-The full validation and acceptance benchmark remain blocked. Disk was reclaimed to
-244 GiB before the renewed smoke and held above 200 GiB, so capacity is no longer the
-gate. Instead, the new sample proves that a distinct Python module-name / SQL
-candidate-lookup path remains hot. A cache attempt confirmed that candidate rows are
-mostly from distinct files. Do not close #675 or start the full limits until Python
-definition candidates can be narrowed by path-derived FQN before row hydration.
+The full validation and acceptance benchmark remains pending. The direct named import
+path is covered, including an explicit facade re-export, but only a completed warmed
+smoke can establish whether the remaining generic resolver work is now below the
+typed receiver path. Do not close #675 or start the full limits before that record
+exists.
 
 ## Context and Orientation
 

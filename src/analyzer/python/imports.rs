@@ -97,6 +97,58 @@ impl PythonAnalyzer {
         self.resolve_exported_name_from_module(module, name)
     }
 
+    /// Resolve an unambiguous chain of explicit named reexports without
+    /// constructing export indexes for each intermediate module. Star exports,
+    /// shadowing, and every other ambiguous shape remain with the complete
+    /// export resolver below.
+    pub(crate) fn resolve_direct_named_exported_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let Some((module, name)) = fqn.rsplit_once('.') else {
+            return Vec::new();
+        };
+        let mut results = Vec::new();
+        let mut queue = VecDeque::from([(module.to_string(), name.to_string())]);
+        let mut visited = HashSet::default();
+
+        while let Some((module, export_name)) = queue.pop_front() {
+            if !visited.insert((module.clone(), export_name.clone())) {
+                continue;
+            }
+            let Some(module_unit) = self.resolve_module_code_unit(&module) else {
+                continue;
+            };
+            let file = module_unit.source();
+            let local = self
+                .inner
+                .top_level_declarations(file)
+                .into_iter()
+                .filter(|unit| unit.identifier() == export_name)
+                .collect::<Vec<_>>();
+            if !local.is_empty() {
+                results.extend(local);
+                continue;
+            }
+            let binder = self.import_binder_of(file);
+            let Some(binding) = binder.bindings.get(&export_name) else {
+                continue;
+            };
+            if binding.kind != ImportKind::Named {
+                continue;
+            }
+            let Some(imported_name) = binding.imported_name.as_ref() else {
+                continue;
+            };
+            queue.push_back((binding.module_specifier.clone(), imported_name.clone()));
+        }
+
+        results.sort_by(|left, right| {
+            left.source()
+                .cmp(right.source())
+                .then_with(|| left.fq_name().cmp(&right.fq_name()))
+        });
+        results.dedup();
+        results
+    }
+
     fn resolve_exported_name_from_module(&self, module: &str, name: &str) -> Vec<CodeUnit> {
         let Some(module_unit) = self.resolve_module_code_unit(module) else {
             return Vec::new();

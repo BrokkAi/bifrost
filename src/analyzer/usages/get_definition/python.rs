@@ -481,6 +481,7 @@ fn python_class_for_fqn(
     support
         .fqn(fqn)
         .into_iter()
+        .chain(py.resolve_direct_named_exported_fqn(fqn))
         .chain(py.resolve_exported_fqn(fqn))
         .find(|unit| unit.is_class())
 }

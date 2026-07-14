@@ -893,6 +893,44 @@ mod tests {
     }
 
     #[test]
+    fn python_batch_context_resolves_explicit_reexports_without_generic_imports() {
+        let source =
+            "from facade import Service\n\ndef handle(service: Service):\n    service.run()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "service.py",
+                    "class Service:\n    def run(self):\n        pass\n",
+                ),
+                ("facade.py", "from service import Service\n"),
+                ("app.py", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "app.py");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let start_byte = source.rfind("run").expect("receiver member in source");
+
+        let outcomes = resolve_definition_requests(
+            analyzer,
+            &mut context,
+            vec![DefinitionLookupRequest {
+                file,
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + "run".len()),
+            }],
+        );
+
+        assert_eq!(outcomes[0].status, DefinitionLookupStatus::Resolved);
+        assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
+        assert_eq!(context.python_build_counts(), (1, 1, 1, 0));
+        assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
     fn python_batch_context_keeps_receiver_types_isolated_by_file() {
         let source_a =
             "from service_a import Service\n\ndef handle(service: Service):\n    service.run()\n";
