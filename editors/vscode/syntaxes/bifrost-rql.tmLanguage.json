@@ -42,15 +42,15 @@
     },
     {
       "name": "variable.parameter.role.bifrost-rql",
-      "match": ":(?:args|callee|capture|decorators|depth|field|has|kwargs|left|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|proof|receiver|reference-kinds|right|surface|text/regex|transitive)(?=$|[\\s()\\[\\]])"
+      "match": ":(?:args|callee|capture|decorators|depth|field|has|kwargs|left|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|parameter-(?:index|name)|proof|receiver|reference-kinds|right|surface|text/regex|transitive)(?=$|[\\s()\\[\\]])"
+    },
+    {
+      "name": "support.function.wrapper.bifrost-rql",
+      "match": "\\b(?:call-input|call-sites-from|call-sites-to|callees|callers|enclosing-decl|file-of|importers-of|imports-of|inside|language|languages|limit|members|not-inside|owner|references-of|result-detail|subtypes|supertypes|used-by|uses|where)\\b"
     },
     {
       "name": "entity.name.type.kind.bifrost-rql",
       "match": "\\b(?:assignment|boolean_literal|call|callable|catch|class|constructor|declaration|decorator|field_access|function|identifier|if|import|lambda|literal|loop|method|null_literal|numeric_literal|return|string_literal|throw)\\b"
-    },
-    {
-      "name": "support.function.wrapper.bifrost-rql",
-      "match": "\\b(?:enclosing-decl|file-of|importers-of|imports-of|inside|language|languages|limit|members|not-inside|owner|references-of|result-detail|subtypes|supertypes|used-by|uses|where)\\b"
     },
     {
       "name": "support.function.predicate.bifrost-rql",

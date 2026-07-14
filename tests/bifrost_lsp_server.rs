@@ -5834,6 +5834,35 @@ fn bifrost_lsp_server_call_hierarchy_finds_java_incoming_and_outgoing_calls() {
 }
 
 #[test]
+fn bifrost_lsp_server_call_hierarchy_finds_ruby_bare_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("calls.rb");
+    let source = "def target; end\ndef caller; target; end\n";
+    fs::write(&file_path, source).expect("write Ruby call hierarchy fixture");
+
+    let mut server = LspServer::start(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "def t");
+    let target = prepare_call_hierarchy(&mut server, &file_uri, line, character);
+    assert_eq!(target["name"], "target", "prepared target: {target}");
+
+    let incoming =
+        call_hierarchy_relation(&mut server, "callHierarchy/incomingCalls", target.clone());
+    assert_eq!(incoming.len(), 1, "incoming calls: {incoming:#?}");
+    assert_eq!(incoming[0]["from"]["name"], "caller", "{incoming:#?}");
+    assert_call_range(&incoming[0]["fromRanges"], 1, 12, 18);
+
+    let (line, character) = position_after(source, "def c");
+    let caller = prepare_call_hierarchy(&mut server, &file_uri, line, character);
+    let outgoing = call_hierarchy_relation(&mut server, "callHierarchy/outgoingCalls", caller);
+    assert!(
+        outgoing.iter().any(|call| call["to"]["name"] == "target"),
+        "outgoing calls should include target: {outgoing:#?}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_call_hierarchy_prepare_filters_java_cursor_contexts() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

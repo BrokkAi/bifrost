@@ -639,6 +639,10 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
         RqlForm::ReferencesOf | RqlForm::UsedBy | RqlForm::Uses => {
             validate_reference_wrapper(form, args, query, analysis);
         }
+        RqlForm::Callers | RqlForm::Callees | RqlForm::CallSitesTo | RqlForm::CallSitesFrom => {
+            validate_call_wrapper(form, args, query, analysis)
+        }
+        RqlForm::CallInput => validate_call_input_wrapper(args, query, analysis),
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -648,6 +652,128 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
         | RqlForm::NotKind => unreachable!("predicate cannot be a query wrapper"),
     }
     validate_rql_query(query, path, analysis);
+}
+
+fn validate_call_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
+    let options = &args[..args.len().saturating_sub(1)];
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .map_or_else(|| query.range.clone(), |arg| arg.range.clone()),
+            "wrong-value-shape",
+            format!(
+                "{} expects option/value pairs followed by a query",
+                form.label()
+            ),
+        );
+        return;
+    }
+    let permits_depth = matches!(form, RqlForm::Callers | RqlForm::Callees);
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let Some(key) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "call traversal option names must be symbols",
+            );
+            continue;
+        };
+        if !seen.insert(key) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate call traversal option {key}"),
+            );
+        }
+        match key {
+            ":depth" if permits_depth => {
+                analysis.add_help(
+                    pair[0].range.clone(),
+                    ":depth positive-integer",
+                    QueryStepField::Depth.description(),
+                );
+                if !matches!(pair[1].kind, ExprKind::Number(number) if number > 0) {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        "call traversal depth must be a positive integer",
+                    );
+                }
+            }
+            ":proof" => {
+                analysis.add_help(
+                    pair[0].range.clone(),
+                    ":proof proven|unproven",
+                    QueryStepField::Proof.description(),
+                );
+                validate_rql_reference_scalar(&pair[1], "proof", usage_proof_from_label, analysis);
+            }
+            _ => analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                if permits_depth {
+                    "call traversal accepts only :depth and :proof"
+                } else {
+                    "call-site traversal accepts only :proof"
+                },
+            ),
+        }
+    }
+}
+
+fn validate_call_input_wrapper(args: &[Expr], query: &Expr, analysis: &mut Analysis) {
+    if args.len() != 3 {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "call-input expects one selector option followed by a query",
+        );
+        return;
+    }
+    let Some(key) = args[0].as_symbol() else {
+        analysis.error(
+            args[0].range.clone(),
+            "unknown-property",
+            "call-input selector must be a symbol",
+        );
+        return;
+    };
+    match key {
+        ":receiver" => {
+            if args[1].as_symbol() != Some("true") {
+                analysis.error(
+                    args[1].range.clone(),
+                    "wrong-value-shape",
+                    "receiver selector must be true",
+                );
+            }
+        }
+        ":parameter-index" => {
+            if !matches!(args[1].kind, ExprKind::Number(_)) {
+                analysis.error(
+                    args[1].range.clone(),
+                    "wrong-value-shape",
+                    "parameter index must be a non-negative integer",
+                );
+            }
+        }
+        ":parameter-name" => {
+            if !matches!(args[1].kind, ExprKind::String(_) | ExprKind::Symbol(_)) {
+                analysis.error(
+                    args[1].range.clone(),
+                    "wrong-value-shape",
+                    "parameter name must be a string or symbol",
+                );
+            }
+        }
+        _ => analysis.error(
+            args[0].range.clone(),
+            "unknown-property",
+            "call-input requires :receiver, :parameter-index, or :parameter-name",
+        ),
+    }
 }
 
 fn validate_reference_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
@@ -1027,6 +1153,7 @@ fn validate_property_value(
         | super::schema::ValueShape::RegexPredicate
         | super::schema::ValueShape::LanguageList
         | super::schema::ValueShape::PositiveInteger
+        | super::schema::ValueShape::NonNegativeInteger
         | super::schema::ValueShape::ResultDetail
         | super::schema::ValueShape::ReferenceKindList
         | super::schema::ValueShape::SchemaVersion
@@ -1992,18 +2119,24 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
             .and_then(|(_, child)| child.as_string());
         let hierarchy = matches!(op_label, Some("supertypes" | "subtypes"));
         let reference_step = matches!(op_label, Some("references_of" | "used_by" | "uses"));
+        let call_step = matches!(op_label, Some("callers" | "callees"));
+        let call_site_step = matches!(op_label, Some("call_sites_to" | "call_sites_from"));
+        let call_input_step = op_label == Some("call_input");
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
         let mut seen_reference_kinds = false;
         let mut seen_proof = false;
         let mut seen_surface = false;
+        let mut seen_receiver = false;
+        let mut seen_parameter_index = false;
+        let mut seen_parameter_name = false;
         let mut transitive_range = None;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
             analysis.path(&child_path, child.range());
             let field = QueryStepField::from_label(key.get_ref());
-            if field == Some(QueryStepField::Depth) && hierarchy {
+            if field == Some(QueryStepField::Depth) && (hierarchy || call_step) {
                 analysis.add_help(
                     key.range(),
                     QueryStepField::Depth.signature(),
@@ -2022,7 +2155,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                     analysis.error(
                         child.range(),
                         "wrong-value-shape",
-                        "hierarchy depth must be a positive integer",
+                        "traversal depth must be a positive integer",
                     );
                 }
                 continue;
@@ -2068,7 +2201,9 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 validate_json_reference_kinds(child, analysis);
                 continue;
             }
-            if field == Some(QueryStepField::Proof) && reference_step {
+            if field == Some(QueryStepField::Proof)
+                && (reference_step || call_step || call_site_step)
+            {
                 analysis.add_help(
                     key.range(),
                     QueryStepField::Proof.signature(),
@@ -2083,6 +2218,55 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 seen_proof = true;
                 validate_json_reference_scalar(child, "proof", usage_proof_from_label, analysis);
+                continue;
+            }
+            if field == Some(QueryStepField::Receiver) && call_input_step {
+                if seen_receiver {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'receiver'",
+                    );
+                }
+                seen_receiver = true;
+                if spanned_to_json(child) != Value::Bool(true) {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        "receiver must be true when present",
+                    );
+                }
+                continue;
+            }
+            if field == Some(QueryStepField::ParameterIndex) && call_input_step {
+                if seen_parameter_index {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'parameter_index'",
+                    );
+                }
+                seen_parameter_index = true;
+                if !matches!(spanned_to_json(child), Value::Number(number) if number.as_u64().is_some())
+                {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        "parameter_index must be a non-negative integer",
+                    );
+                }
+                continue;
+            }
+            if field == Some(QueryStepField::ParameterName) && call_input_step {
+                if seen_parameter_name {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'parameter_name'",
+                    );
+                }
+                seen_parameter_name = true;
+                require_json_string(child, analysis);
                 continue;
             }
             if field == Some(QueryStepField::Surface) && reference_step {
@@ -2123,6 +2307,19 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                     QueryStepField::ReferenceKinds
                                         | QueryStepField::Proof
                                         | QueryStepField::Surface
+                                ))
+                            || (call_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::Depth | QueryStepField::Proof
+                                ))
+                            || (call_site_step && **candidate == QueryStepField::Proof)
+                            || (call_input_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::Receiver
+                                        | QueryStepField::ParameterIndex
+                                        | QueryStepField::ParameterName
                                 ))
                     })
                     .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))
@@ -2178,6 +2375,18 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 transitive_range.expect("seen transitive has a value range"),
                 "invalid-query-step",
                 "depth and transitive are mutually exclusive",
+            );
+        }
+        if call_input_step
+            && usize::from(seen_receiver)
+                + usize::from(seen_parameter_index)
+                + usize::from(seen_parameter_name)
+                != 1
+        {
+            analysis.error(
+                step.range(),
+                "invalid-query-step",
+                "call_input requires exactly one of receiver, parameter_index, or parameter_name",
             );
         }
     }

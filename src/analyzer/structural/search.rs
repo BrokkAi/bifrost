@@ -12,17 +12,19 @@ use super::matcher::FactMatch;
 use super::planner::QueryPlan;
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
-    CodeQuery, CodeQueryResultDetail, HierarchyTraversal, QueryStep, ReferenceTraversalFilter,
+    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
+    CodeQueryResultDetail, HierarchyTraversal, QueryStep, ReferenceTraversalFilter,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
 };
 use crate::analyzer::structural::capabilities::QueryFeature;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
+    CallSyntaxKind, DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
     resolve_definition_batch_with_source, resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::usages::{
+    CallRelationResult, CallRelationService, CallSite, DEFAULT_MAX_FILES,
     ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind,
     UsageProof,
 };
@@ -81,6 +83,14 @@ pub enum CodeQueryResultValue {
     ReferenceSite {
         #[serde(flatten)]
         value: Box<CodeQueryReferenceSite>,
+    },
+    CallSite {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallSite>,
+    },
+    ExpressionSite {
+        #[serde(flatten)]
+        value: Box<CodeQueryExpressionSite>,
     },
 }
 
@@ -142,6 +152,55 @@ pub struct CodeQueryReferenceSite {
     pub reference_kind: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallSite {
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub callee_range: CodeQueryRange,
+    pub caller: CodeQueryDeclaration,
+    pub callee: CodeQueryDeclaration,
+    pub call_kind: &'static str,
+    pub proof: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<CodeQueryRange>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<CodeQueryCallArgument>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallArgument {
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formal_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formal_name: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub variadic: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub spread: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryExpressionSite {
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub text: String,
+    pub input_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_name: Option<String>,
+    pub caller_fq_name: String,
+    pub callee_fq_name: String,
+    pub call_range: CodeQueryRange,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CodeQueryProvenance {
     pub seed: CodeQueryResultRef,
@@ -194,6 +253,22 @@ pub enum CodeQueryResultRef {
         proof: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         reference_kind: Option<&'static str>,
+    },
+    CallSite {
+        path: String,
+        range: CodeQueryRange,
+        caller_fq_name: String,
+        callee_fq_name: String,
+        proof: &'static str,
+    },
+    ExpressionSite {
+        path: String,
+        range: CodeQueryRange,
+        input_kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameter_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameter_name: Option<String>,
     },
 }
 
@@ -249,6 +324,22 @@ struct ReferenceSiteValue {
     usage_kind: UsageHitKind,
     proof: UsageProof,
     reference_kind: Option<ReferenceKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CallSiteValue(CallSite);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ExpressionInput {
+    Receiver,
+    Parameter { index: usize, name: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExpressionSiteValue {
+    call_site: CallSiteValue,
+    range: Range,
+    input: ExpressionInput,
 }
 
 #[derive(Default)]
@@ -353,8 +444,7 @@ fn primary_range_key(range: &Range) -> (usize, usize, usize, usize) {
 
 struct PipelineExpansion {
     value: PipelineValue,
-    trace_values: Vec<PipelineTraceValue>,
-    via: Option<ReferenceSiteValue>,
+    trace: Vec<(PipelineTraceValue, Option<PipelineVia>)>,
     budgeted: bool,
 }
 
@@ -364,6 +454,8 @@ enum PipelineValue {
     Declaration(DeclarationValue),
     File(ProjectFile),
     ReferenceSite(ReferenceSiteValue),
+    CallSite(CallSiteValue),
+    ExpressionSite(ExpressionSiteValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -372,6 +464,8 @@ enum PipelineKey {
     Declaration(DeclarationValue),
     File(ProjectFile),
     ReferenceSite(ReferenceSiteValue),
+    CallSite(CallSiteValue),
+    ExpressionSite(ExpressionSiteValue),
 }
 
 impl PipelineValue {
@@ -383,6 +477,8 @@ impl PipelineValue {
             Self::Declaration(declaration) => PipelineKey::Declaration(declaration.clone()),
             Self::File(file) => PipelineKey::File(file.clone()),
             Self::ReferenceSite(site) => PipelineKey::ReferenceSite(site.clone()),
+            Self::CallSite(site) => PipelineKey::CallSite(site.clone()),
+            Self::ExpressionSite(site) => PipelineKey::ExpressionSite(site.clone()),
         }
     }
 }
@@ -397,7 +493,7 @@ struct PipelineTrace {
 struct PipelineTraceStep {
     op: QueryStep,
     value: PipelineTraceValue,
-    via: Option<ReferenceSiteValue>,
+    via: Option<PipelineVia>,
 }
 
 #[derive(Debug, Clone)]
@@ -405,6 +501,14 @@ enum PipelineTraceValue {
     Declaration(DeclarationValue),
     File(ProjectFile),
     ReferenceSite(ReferenceSiteValue),
+    CallSite(CallSiteValue),
+    ExpressionSite(ExpressionSiteValue),
+}
+
+#[derive(Debug, Clone)]
+enum PipelineVia {
+    ReferenceSite(ReferenceSiteValue),
+    CallSite(CallSiteValue),
 }
 
 #[derive(Default)]
@@ -412,6 +516,14 @@ struct ReferenceTraversalCache {
     inbound: HashMap<CodeUnit, Vec<ReferenceHit>>,
     outbound: HashMap<ProjectFile, Vec<ReferenceHit>>,
     reported_inbound: HashSet<CodeUnit>,
+}
+
+#[derive(Default)]
+struct CallTraversalCache {
+    incoming: HashMap<CodeUnit, CallRelationResult>,
+    outgoing: HashMap<CodeUnit, CallRelationResult>,
+    reported_incoming: HashSet<CodeUnit>,
+    reported_outgoing: HashSet<CodeUnit>,
 }
 
 #[derive(Debug)]
@@ -786,6 +898,7 @@ fn execute_internal(
 
     let mut indexed_declarations = None;
     let mut reference_cache = ReferenceTraversalCache::default();
+    let mut call_cache = CallTraversalCache::default();
 
     let mut import_graph = None;
     let mut import_graph_budget_diagnostic_emitted = false;
@@ -804,6 +917,10 @@ fn execute_internal(
                     | QueryStep::ReferencesOf(_)
                     | QueryStep::UsedBy(_)
                     | QueryStep::Uses(_)
+                    | QueryStep::Callers(_)
+                    | QueryStep::Callees(_)
+                    | QueryStep::CallSitesTo(_)
+                    | QueryStep::CallSitesFrom(_)
             )
         {
             indexed_declarations = Some(IndexedDeclarations::default());
@@ -824,7 +941,9 @@ fn execute_internal(
                         PipelineValue::File(file) => Some(file.clone()),
                         PipelineValue::StructuralMatch(_)
                         | PipelineValue::Declaration(_)
-                        | PipelineValue::ReferenceSite(_) => None,
+                        | PipelineValue::ReferenceSite(_)
+                        | PipelineValue::CallSite(_)
+                        | PipelineValue::ExpressionSite(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -852,6 +971,7 @@ fn execute_internal(
             import_graph.as_ref(),
             indexed_declarations.as_mut(),
             &mut reference_cache,
+            &mut call_cache,
             &mut budget,
             limits,
             if step_index + 1 == query.steps.len() {
@@ -1032,6 +1152,7 @@ fn apply_pipeline_step(
     import_graph: Option<&DirectImportGraph>,
     indexed_declarations: Option<&mut IndexedDeclarations>,
     reference_cache: &mut ReferenceTraversalCache,
+    call_cache: &mut CallTraversalCache,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     max_step_outputs: usize,
@@ -1072,6 +1193,12 @@ fn apply_pipeline_step(
             (PipelineValue::ReferenceSite(site), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(site.file.clone()))]
             }
+            (PipelineValue::CallSite(site), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(site.0.file.clone()))]
+            }
+            (PipelineValue::ExpressionSite(site), QueryStep::FileOf) => vec![pipeline_expansion(
+                PipelineValue::File(site.call_site.0.file.clone()),
+            )],
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
                 if graph.unsupported.contains(file) {
@@ -1215,6 +1342,45 @@ fn apply_pipeline_step(
                 row_exhausted = reference_exhausted;
                 expansions
             }
+            (
+                PipelineValue::Declaration(declaration),
+                QueryStep::Callers(filter) | QueryStep::Callees(filter),
+            ) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let (expansions, call_exhausted) = call_declaration_expansions(
+                    analyzer,
+                    declaration,
+                    step,
+                    filter,
+                    indexed,
+                    call_cache,
+                    max_step_outputs,
+                    diagnostics,
+                );
+                row_exhausted = call_exhausted;
+                expansions
+            }
+            (
+                PipelineValue::Declaration(declaration),
+                QueryStep::CallSitesTo(filter) | QueryStep::CallSitesFrom(filter),
+            ) => {
+                let (expansions, call_exhausted) = call_site_expansions(
+                    analyzer,
+                    declaration,
+                    step,
+                    filter,
+                    call_cache,
+                    max_step_outputs,
+                    diagnostics,
+                );
+                row_exhausted = call_exhausted;
+                expansions
+            }
+            (PipelineValue::CallSite(site), QueryStep::CallInput(selector)) => {
+                call_input_expansions(site, selector)
+            }
             _ => unreachable!("query step domains are validated before execution"),
         };
 
@@ -1233,11 +1399,11 @@ fn apply_pipeline_step(
                 .map(|mut trace| {
                     trace
                         .steps
-                        .extend(expansion.trace_values.iter().cloned().map(|value| {
+                        .extend(expansion.trace.iter().cloned().map(|(value, via)| {
                             PipelineTraceStep {
                                 op: step.clone(),
                                 value,
-                                via: expansion.via.clone(),
+                                via,
                             }
                         }));
                     trace
@@ -1296,8 +1462,7 @@ fn pipeline_expansion(value: PipelineValue) -> PipelineExpansion {
         pipeline_trace_value(&value).expect("every semantic query step produces a semantic value");
     PipelineExpansion {
         value,
-        trace_values: vec![trace_value],
-        via: None,
+        trace: vec![(trace_value, None)],
         budgeted: false,
     }
 }
@@ -1305,8 +1470,7 @@ fn pipeline_expansion(value: PipelineValue) -> PipelineExpansion {
 fn budgeted_declaration_expansion(declaration: DeclarationValue) -> PipelineExpansion {
     PipelineExpansion {
         value: PipelineValue::Declaration(declaration.clone()),
-        trace_values: vec![PipelineTraceValue::Declaration(declaration)],
-        via: None,
+        trace: vec![(PipelineTraceValue::Declaration(declaration), None)],
         budgeted: true,
     }
 }
@@ -1316,10 +1480,215 @@ fn reference_expansion(value: PipelineValue, site: ReferenceSiteValue) -> Pipeli
         pipeline_trace_value(&value).expect("reference steps produce a semantic value");
     PipelineExpansion {
         value,
-        trace_values: vec![trace_value],
-        via: Some(site),
+        trace: vec![(trace_value, Some(PipelineVia::ReferenceSite(site)))],
         budgeted: false,
     }
+}
+
+#[derive(Clone)]
+struct CallTraversalWork {
+    unit: CodeUnit,
+    depth: usize,
+    trace: Vec<(DeclarationValue, CallSiteValue)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_declaration_expansions(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    step: &QueryStep,
+    filter: &CallTraversalFilter,
+    indexed: &mut IndexedDeclarations,
+    cache: &mut CallTraversalCache,
+    max_outputs: usize,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> (Vec<PipelineExpansion>, bool) {
+    let incoming = matches!(step, QueryStep::Callers(_));
+    let mut queue = VecDeque::from([CallTraversalWork {
+        unit: declaration.unit.clone(),
+        depth: 0,
+        trace: Vec::new(),
+    }]);
+    let mut queued = HashSet::default();
+    queued.insert(declaration.unit.clone());
+    let mut expansions = Vec::new();
+    let mut exhausted = false;
+    while let Some(work) = queue.pop_front() {
+        let result = cached_call_relation(
+            analyzer,
+            &work.unit,
+            incoming,
+            max_outputs.max(1),
+            cache,
+            diagnostics,
+        );
+        exhausted |= result.truncated;
+        for site in result
+            .sites
+            .into_iter()
+            .filter(|site| filter.proof.is_none_or(|proof| proof == site.proof))
+        {
+            if expansions.len() >= max_outputs {
+                return (expansions, true);
+            }
+            let next_unit = if incoming {
+                site.caller.clone()
+            } else {
+                site.callee.clone()
+            };
+            let Some(next) = indexed.get(analyzer, &next_unit) else {
+                continue;
+            };
+            let call_site = CallSiteValue(site);
+            let mut trace = work.trace.clone();
+            trace.push((next.clone(), call_site.clone()));
+            expansions.push(PipelineExpansion {
+                value: PipelineValue::Declaration(next),
+                trace: trace
+                    .iter()
+                    .cloned()
+                    .map(|(value, via)| {
+                        (
+                            PipelineTraceValue::Declaration(value),
+                            Some(PipelineVia::CallSite(via)),
+                        )
+                    })
+                    .collect(),
+                budgeted: false,
+            });
+            let next_depth = work.depth + 1;
+            if next_depth < filter.depth.get() && queued.insert(next_unit.clone()) {
+                queue.push_back(CallTraversalWork {
+                    unit: next_unit,
+                    depth: next_depth,
+                    trace,
+                });
+            }
+        }
+    }
+    (expansions, exhausted)
+}
+
+fn call_site_expansions(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    step: &QueryStep,
+    filter: &CallSiteTraversalFilter,
+    cache: &mut CallTraversalCache,
+    max_outputs: usize,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> (Vec<PipelineExpansion>, bool) {
+    let incoming = matches!(step, QueryStep::CallSitesTo(_));
+    let result = cached_call_relation(
+        analyzer,
+        &declaration.unit,
+        incoming,
+        max_outputs.max(1),
+        cache,
+        diagnostics,
+    );
+    let truncated = result.truncated;
+    let expansions = result
+        .sites
+        .into_iter()
+        .filter(|site| filter.proof.is_none_or(|proof| proof == site.proof))
+        .take(max_outputs)
+        .map(|site| pipeline_expansion(PipelineValue::CallSite(CallSiteValue(site))))
+        .collect();
+    (expansions, truncated)
+}
+
+fn cached_call_relation(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    incoming: bool,
+    max_sites: usize,
+    cache: &mut CallTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> CallRelationResult {
+    let results = if incoming {
+        &mut cache.incoming
+    } else {
+        &mut cache.outgoing
+    };
+    let result = results
+        .entry(unit.clone())
+        .or_insert_with(|| {
+            if incoming {
+                CallRelationService::incoming(analyzer, unit, DEFAULT_MAX_FILES, max_sites)
+            } else {
+                CallRelationService::outgoing(analyzer, unit, max_sites)
+            }
+        })
+        .clone();
+    let reported = if incoming {
+        &mut cache.reported_incoming
+    } else {
+        &mut cache.reported_outgoing
+    };
+    if reported.insert(unit.clone()) {
+        let language = crate::analyzer::common::language_for_file(unit.source()).config_label();
+        diagnostics.extend(
+            result
+                .diagnostics
+                .iter()
+                .cloned()
+                .map(|message| CodeQueryDiagnostic { language, message }),
+        );
+    }
+    result
+}
+
+fn call_input_expansions(
+    site: &CallSiteValue,
+    selector: &CallInputSelector,
+) -> Vec<PipelineExpansion> {
+    let expressions = match selector {
+        CallInputSelector::Receiver => site
+            .0
+            .receiver
+            .map(|range| ExpressionSiteValue {
+                call_site: site.clone(),
+                range,
+                input: ExpressionInput::Receiver,
+            })
+            .into_iter()
+            .collect::<Vec<_>>(),
+        CallInputSelector::ParameterIndex(index) => site
+            .0
+            .arguments
+            .iter()
+            .filter(|argument| argument.formal_index == Some(*index))
+            .map(|argument| ExpressionSiteValue {
+                call_site: site.clone(),
+                range: argument.range,
+                input: ExpressionInput::Parameter {
+                    index: *index,
+                    name: argument.formal_name.clone(),
+                },
+            })
+            .collect(),
+        CallInputSelector::ParameterName(name) => site
+            .0
+            .arguments
+            .iter()
+            .filter(|argument| argument.formal_name.as_deref() == Some(name))
+            .filter_map(|argument| {
+                Some(ExpressionSiteValue {
+                    call_site: site.clone(),
+                    range: argument.range,
+                    input: ExpressionInput::Parameter {
+                        index: argument.formal_index?,
+                        name: argument.formal_name.clone(),
+                    },
+                })
+            })
+            .collect(),
+    };
+    expressions
+        .into_iter()
+        .map(|expression| pipeline_expansion(PipelineValue::ExpressionSite(expression)))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2120,8 +2489,10 @@ fn expand_hierarchy(
             });
             expansions.push(PipelineExpansion {
                 value: PipelineValue::Declaration(value),
-                trace_values: hierarchy_trace_values(&paths, path_tail, next_depth),
-                via: None,
+                trace: hierarchy_trace_values(&paths, path_tail, next_depth)
+                    .into_iter()
+                    .map(|value| (value, None))
+                    .collect(),
                 budgeted: true,
             });
 
@@ -2269,6 +2640,10 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::File(file) => Some(PipelineTraceValue::File(file.clone())),
         PipelineValue::ReferenceSite(site) => Some(PipelineTraceValue::ReferenceSite(site.clone())),
+        PipelineValue::CallSite(site) => Some(PipelineTraceValue::CallSite(site.clone())),
+        PipelineValue::ExpressionSite(site) => {
+            Some(PipelineTraceValue::ExpressionSite(site.clone()))
+        }
     }
 }
 
@@ -2332,6 +2707,12 @@ fn render_pipeline_item(
         PipelineValue::ReferenceSite(site) => CodeQueryResultValue::ReferenceSite {
             value: Box::new(render_reference_site(analyzer, &site, detail, cache)),
         },
+        PipelineValue::CallSite(site) => CodeQueryResultValue::CallSite {
+            value: Box::new(render_call_site(analyzer, &site, detail, cache)),
+        },
+        PipelineValue::ExpressionSite(site) => CodeQueryResultValue::ExpressionSite {
+            value: Box::new(render_expression_site(analyzer, &site, cache)),
+        },
     };
     CodeQueryResultItem {
         value,
@@ -2361,14 +2742,19 @@ fn render_provenance(
                     PipelineTraceValue::ReferenceSite(site) => {
                         render_reference_site_ref(analyzer, site, detail, cache)
                     }
+                    PipelineTraceValue::CallSite(site) => {
+                        render_call_site_ref(analyzer, site, cache)
+                    }
+                    PipelineTraceValue::ExpressionSite(site) => {
+                        render_expression_site_ref(analyzer, site, cache)
+                    }
                 },
-                via: matches!(step.op, QueryStep::UsedBy(_) | QueryStep::Uses(_))
-                    .then(|| {
-                        step.via
-                            .as_ref()
-                            .map(|site| render_reference_site_ref(analyzer, site, detail, cache))
-                    })
-                    .flatten(),
+                via: step.via.as_ref().map(|via| match via {
+                    PipelineVia::ReferenceSite(site) => {
+                        render_reference_site_ref(analyzer, site, detail, cache)
+                    }
+                    PipelineVia::CallSite(site) => render_call_site_ref(analyzer, site, cache),
+                }),
             })
             .collect(),
     }
@@ -2445,6 +2831,35 @@ fn render_reference_site_ref(
     }
 }
 
+fn render_call_site_ref(
+    analyzer: &dyn IAnalyzer,
+    site: &CallSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    CodeQueryResultRef::CallSite {
+        path: rel_path_string(&site.0.file),
+        range: render_source_range(analyzer, &site.0.file, &site.0.range, cache),
+        caller_fq_name: site.0.caller.fq_name(),
+        callee_fq_name: site.0.callee.fq_name(),
+        proof: usage_proof_label(site.0.proof),
+    }
+}
+
+fn render_expression_site_ref(
+    analyzer: &dyn IAnalyzer,
+    site: &ExpressionSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let (input_kind, parameter_index, parameter_name) = expression_input_parts(&site.input);
+    CodeQueryResultRef::ExpressionSite {
+        path: rel_path_string(&site.call_site.0.file),
+        range: render_source_range(analyzer, &site.call_site.0.file, &site.range, cache),
+        input_kind,
+        parameter_index,
+        parameter_name,
+    }
+}
+
 fn render_declaration(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
@@ -2504,25 +2919,136 @@ fn render_reference_site(
     }
 }
 
+fn render_call_site(
+    analyzer: &dyn IAnalyzer,
+    site: &CallSiteValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallSite {
+    let caller = declaration_value_for_unit(analyzer, &site.0.caller, site.0.range);
+    let callee = declaration_value_for_unit(analyzer, &site.0.callee, site.0.callee_range);
+    CodeQueryCallSite {
+        path: rel_path_string(&site.0.file),
+        language: crate::analyzer::common::language_for_file(&site.0.file).config_label(),
+        range: render_source_range(analyzer, &site.0.file, &site.0.range, cache),
+        callee_range: render_source_range(analyzer, &site.0.file, &site.0.callee_range, cache),
+        caller: render_declaration(analyzer, &caller, detail, cache),
+        callee: render_declaration(analyzer, &callee, detail, cache),
+        call_kind: call_syntax_kind_label(site.0.kind),
+        proof: usage_proof_label(site.0.proof),
+        receiver: site
+            .0
+            .receiver
+            .as_ref()
+            .map(|range| render_source_range(analyzer, &site.0.file, range, cache)),
+        arguments: site
+            .0
+            .arguments
+            .iter()
+            .map(|argument| CodeQueryCallArgument {
+                range: render_source_range(analyzer, &site.0.file, &argument.range, cache),
+                name: argument.name.clone(),
+                position: argument.position,
+                formal_index: argument.formal_index,
+                formal_name: argument.formal_name.clone(),
+                variadic: argument.variadic,
+                spread: argument.spread,
+            })
+            .collect(),
+    }
+}
+
+fn render_expression_site(
+    analyzer: &dyn IAnalyzer,
+    site: &ExpressionSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryExpressionSite {
+    let file = &site.call_site.0.file;
+    let text = cache
+        .coordinates_for(file, || analyzer.indexed_source(file))
+        .and_then(|coordinates| {
+            coordinates
+                .source
+                .get(site.range.start_byte..site.range.end_byte)
+        })
+        .map(snippet)
+        .unwrap_or_default();
+    let (input_kind, parameter_index, parameter_name) = expression_input_parts(&site.input);
+    CodeQueryExpressionSite {
+        path: rel_path_string(file),
+        language: crate::analyzer::common::language_for_file(file).config_label(),
+        range: render_source_range(analyzer, file, &site.range, cache),
+        text,
+        input_kind,
+        parameter_index,
+        parameter_name,
+        caller_fq_name: site.call_site.0.caller.fq_name(),
+        callee_fq_name: site.call_site.0.callee.fq_name(),
+        call_range: render_source_range(analyzer, file, &site.call_site.0.range, cache),
+    }
+}
+
+fn expression_input_parts(
+    input: &ExpressionInput,
+) -> (&'static str, Option<usize>, Option<String>) {
+    match input {
+        ExpressionInput::Receiver => ("receiver", None, None),
+        ExpressionInput::Parameter { index, name } => ("parameter", Some(*index), name.clone()),
+    }
+}
+
+fn declaration_value_for_unit(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    fallback: Range,
+) -> DeclarationValue {
+    DeclarationValue {
+        unit: unit.clone(),
+        range: analyzer
+            .ranges_of(unit)
+            .into_iter()
+            .min_by_key(primary_range_key)
+            .unwrap_or(fallback),
+    }
+}
+
+fn call_syntax_kind_label(kind: CallSyntaxKind) -> &'static str {
+    match kind {
+        CallSyntaxKind::Function => "function",
+        CallSyntaxKind::Method => "method",
+        CallSyntaxKind::Constructor => "constructor",
+        CallSyntaxKind::Super => "super",
+    }
+}
+
 fn render_reference_range(
     analyzer: &dyn IAnalyzer,
     site: &ReferenceSiteValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryRange {
+    render_source_range(analyzer, &site.file, &site.range, cache)
+}
+
+fn render_source_range(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    range: &Range,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryRange {
     cache
-        .coordinates_for(&site.file, || analyzer.indexed_source(&site.file))
+        .coordinates_for(file, || analyzer.indexed_source(file))
         .map(|coordinates| {
             range_for_offsets(
                 &coordinates.source,
                 &coordinates.line_starts,
-                site.range.start_byte,
-                site.range.end_byte,
+                range.start_byte,
+                range.end_byte,
             )
         })
         .unwrap_or(CodeQueryRange {
-            start_line: site.range.start_line,
+            start_line: range.start_line,
             start_column: 1,
-            end_line: site.range.end_line,
+            end_line: range.end_line,
             end_column: 1,
         })
 }
@@ -2759,7 +3285,9 @@ impl CodeQueryResult {
                 CodeQueryResultValue::StructuralMatch { value } => Some(value),
                 CodeQueryResultValue::Declaration { .. }
                 | CodeQueryResultValue::File { .. }
-                | CodeQueryResultValue::ReferenceSite { .. } => None,
+                | CodeQueryResultValue::ReferenceSite { .. }
+                | CodeQueryResultValue::CallSite { .. }
+                | CodeQueryResultValue::ExpressionSite { .. } => None,
             })
             .collect()
     }
@@ -2825,6 +3353,29 @@ impl CodeQueryResult {
                             value.usage_kind,
                             value.proof,
                             value.target.fq_name
+                        ));
+                    }
+                    CodeQueryResultValue::CallSite { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [call; {}; {}] {} -> {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.call_kind,
+                            value.proof,
+                            value.caller.fq_name,
+                            value.callee.fq_name
+                        ));
+                    }
+                    CodeQueryResultValue::ExpressionSite { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [call input; {}] `{}` -> {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.input_kind,
+                            value.text,
+                            value.callee_fq_name
                         ));
                     }
                 }

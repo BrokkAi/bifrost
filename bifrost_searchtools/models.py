@@ -204,6 +204,11 @@ class CodeQueryResultRef:
     target_id: str | None = None
     proof: str | None = None
     reference_kind: str | None = None
+    caller_fq_name: str | None = None
+    callee_fq_name: str | None = None
+    input_kind: str | None = None
+    parameter_index: int | None = None
+    parameter_name: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryResultRef:
@@ -225,6 +230,13 @@ class CodeQueryResultRef:
             target_id=data.get("target_id"),
             proof=data.get("proof"),
             reference_kind=data.get("reference_kind"),
+            caller_fq_name=data.get("caller_fq_name"),
+            callee_fq_name=data.get("callee_fq_name"),
+            input_kind=data.get("input_kind"),
+            parameter_index=int(data["parameter_index"])
+            if "parameter_index" in data
+            else None,
+            parameter_name=data.get("parameter_name"),
         )
 
 
@@ -426,8 +438,124 @@ class CodeQueryReferenceSite:
         )
 
 
+@dataclass(frozen=True)
+class CodeQueryCallArgument:
+    range: CodeQueryRange
+    name: str | None = None
+    position: int | None = None
+    formal_index: int | None = None
+    formal_name: str | None = None
+    variadic: bool = False
+    spread: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallArgument:
+        return cls(
+            range=CodeQueryRange.from_dict(data["range"]),
+            name=data.get("name"),
+            position=int(data["position"]) if "position" in data else None,
+            formal_index=int(data["formal_index"])
+            if "formal_index" in data
+            else None,
+            formal_name=data.get("formal_name"),
+            variadic=bool(data.get("variadic", False)),
+            spread=bool(data.get("spread", False)),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryCallSite:
+    path: str
+    language: str
+    range: CodeQueryRange
+    callee_range: CodeQueryRange
+    caller: CodeQueryDeclaration
+    callee: CodeQueryDeclaration
+    call_kind: str
+    proof: str
+    receiver: CodeQueryRange | None = None
+    arguments: list[CodeQueryCallArgument] = field(default_factory=list)
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallSite:
+        return cls(
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            callee_range=CodeQueryRange.from_dict(data["callee_range"]),
+            caller=CodeQueryDeclaration.from_dict(data["caller"]),
+            callee=CodeQueryDeclaration.from_dict(data["callee"]),
+            call_kind=data["call_kind"],
+            proof=data["proof"],
+            receiver=CodeQueryRange.from_dict(data["receiver"])
+            if "receiver" in data
+            else None,
+            arguments=[
+                CodeQueryCallArgument.from_dict(item)
+                for item in data.get("arguments", [])
+            ],
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[call; {self.call_kind}; {self.proof}] "
+            f"{self.caller.fq_name} -> {self.callee.fq_name}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryExpressionSite:
+    path: str
+    language: str
+    range: CodeQueryRange
+    text: str
+    input_kind: str
+    caller_fq_name: str
+    callee_fq_name: str
+    call_range: CodeQueryRange
+    parameter_index: int | None = None
+    parameter_name: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryExpressionSite:
+        return cls(
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            text=data["text"],
+            input_kind=data["input_kind"],
+            caller_fq_name=data["caller_fq_name"],
+            callee_fq_name=data["callee_fq_name"],
+            call_range=CodeQueryRange.from_dict(data["call_range"]),
+            parameter_index=int(data["parameter_index"])
+            if "parameter_index" in data
+            else None,
+            parameter_name=data.get("parameter_name"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[call input; {self.input_kind}] `{self.text}` -> {self.callee_fq_name}"
+        )
+
+
 CodeQueryResultItem = (
-    CodeQueryMatch | CodeQueryDeclaration | CodeQueryFile | CodeQueryReferenceSite
+    CodeQueryMatch
+    | CodeQueryDeclaration
+    | CodeQueryFile
+    | CodeQueryReferenceSite
+    | CodeQueryCallSite
+    | CodeQueryExpressionSite
 )
 
 
@@ -441,6 +569,10 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryFile.from_dict(data)
     if result_type == "reference_site":
         return CodeQueryReferenceSite.from_dict(data)
+    if result_type == "call_site":
+        return CodeQueryCallSite.from_dict(data)
+    if result_type == "expression_site":
+        return CodeQueryExpressionSite.from_dict(data)
     raise ValueError(f"unknown code query result_type: {result_type!r}")
 
 

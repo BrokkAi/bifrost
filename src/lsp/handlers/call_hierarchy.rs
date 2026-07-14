@@ -7,18 +7,15 @@ use lsp_types::{
     Position, Range as LspRange, Uri,
 };
 
-use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, call_reference_ranges,
-    is_call_reference_range_in_tree, parse_tree_for_language,
-    resolve_call_reference_definition_with_source, resolve_definition_batch_with_source,
+    DefinitionLookupRequest, DefinitionLookupStatus, resolve_call_reference_definition_with_source,
 };
-use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
+use crate::analyzer::usages::{
+    CallRelationService, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageProof,
+};
 use crate::analyzer::{
-    AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range,
-    WorkspaceAnalyzer,
+    AnalyzerQueryScope, CodeUnit, IAnalyzer, Project, ProjectFile, Range, WorkspaceAnalyzer,
 };
-use crate::hash::HashMap;
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
@@ -27,9 +24,6 @@ use crate::lsp::handlers::hierarchy_support::{
     cursor_byte_range, hierarchy_item_data, resolve_hierarchy_item_code_unit,
 };
 use crate::lsp::handlers::util::{FileContentCache, read_document_for_uri};
-use crate::text_utils::compute_line_starts;
-
-const MAX_OUTGOING_CANDIDATES: usize = DEFAULT_MAX_USAGES;
 
 pub fn prepare(
     workspace: &WorkspaceAnalyzer,
@@ -144,36 +138,22 @@ pub fn incoming_calls(
     let _query_scope = AnalyzerQueryScope::new(analyzer);
     let target = resolve_item_code_unit(analyzer, project, &params.item)?;
 
-    let hits = UsageFinder::new()
-        .find_usages(
-            analyzer,
-            std::slice::from_ref(&target),
-            DEFAULT_MAX_FILES,
-            DEFAULT_MAX_USAGES,
-        )
-        .all_hits();
+    let relation =
+        CallRelationService::incoming(analyzer, &target, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
 
     let mut grouped: BTreeMap<String, (CodeUnit, Vec<LspRange>)> = BTreeMap::new();
     let mut content_cache = FileContentCache::default();
-    let mut call_reference_cache = CallReferenceRangeCache::default();
-    for hit in hits {
-        let caller = nearest_call_hierarchy_unit(analyzer, hit.enclosing.clone())
-            .or_else(|| caller_for_hit(analyzer, &hit));
-        let Some(caller) = caller else {
-            continue;
-        };
-        if same_symbol(&caller, &target) {
+    for site in relation.sites {
+        if site.proof != UsageProof::Proven {
             continue;
         }
-        if !call_reference_cache.is_call_usage_hit(project, &hit, &mut content_cache) {
-            continue;
-        }
-        let Some(range) = usage_hit_range(project, &hit, &mut content_cache) else {
+        let Some(range) = source_range(project, &site.file, &site.callee_range, &mut content_cache)
+        else {
             continue;
         };
         grouped
-            .entry(unit_key(&caller))
-            .or_insert_with(|| (caller, Vec::new()))
+            .entry(unit_key(&site.caller))
+            .or_insert_with(|| (site.caller, Vec::new()))
             .1
             .push(range);
     }
@@ -204,67 +184,23 @@ pub fn outgoing_calls(
     if !is_call_hierarchy_unit(&caller) {
         return Some(Vec::new());
     }
-    if language_for_file(caller.source()) == Language::Ruby {
-        // Ruby outgoing call hierarchy depends on Ruby get_definition support;
-        // keep this explicit until https://github.com/BrokkAi/bifrost/issues/266 lands.
-        return Some(Vec::new());
-    }
-
-    let source = Arc::new(project.read_source(caller.source()).ok()?);
-    let line_starts = compute_line_starts(&source);
-    let caller_range = analyzer.ranges(&caller).iter().min().copied()?;
-    let candidates = call_reference_ranges(
-        caller.source(),
-        &source,
-        &caller_range,
-        MAX_OUTGOING_CANDIDATES,
-    );
-    if candidates.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let requests: Vec<_> = candidates
-        .iter()
-        .take(MAX_OUTGOING_CANDIDATES)
-        .map(|node_range| DefinitionLookupRequest {
-            file: caller.source().clone(),
-            line: None,
-            column: None,
-            start_byte: Some(node_range.start_byte),
-            end_byte: Some(node_range.end_byte),
-        })
-        .collect();
-    let outcomes = resolve_definition_batch_with_source(
-        analyzer,
-        requests,
-        caller.source().clone(),
-        Arc::clone(&source),
-    );
+    let relation = CallRelationService::outgoing(analyzer, &caller, DEFAULT_MAX_USAGES);
 
     let mut grouped: BTreeMap<String, (CodeUnit, Vec<LspRange>)> = BTreeMap::new();
     let mut content_cache = FileContentCache::default();
-    for (node_range, outcome) in candidates
-        .into_iter()
-        .take(MAX_OUTGOING_CANDIDATES)
-        .zip(outcomes)
-    {
-        if outcome.status != DefinitionLookupStatus::Resolved {
+    for site in relation.sites {
+        if site.proof != UsageProof::Proven {
             continue;
         }
-        for definition in outcome.definitions {
-            let Some(callee) = nearest_call_hierarchy_unit(analyzer, definition) else {
-                continue;
-            };
-            if same_symbol(&caller, &callee) {
-                continue;
-            }
-            let lsp_range = byte_range_to_lsp_range(&source, &line_starts, &node_range);
-            grouped
-                .entry(unit_key(&callee))
-                .or_insert_with(|| (callee, Vec::new()))
-                .1
-                .push(lsp_range);
-        }
+        let Some(range) = source_range(project, &site.file, &site.callee_range, &mut content_cache)
+        else {
+            continue;
+        };
+        grouped
+            .entry(unit_key(&site.callee))
+            .or_insert_with(|| (site.callee, Vec::new()))
+            .1
+            .push(range);
     }
 
     Some(
@@ -295,55 +231,18 @@ fn is_call_hierarchy_unit(unit: &CodeUnit) -> bool {
     (unit.is_class() || unit.is_callable()) && !unit.is_synthetic()
 }
 
-fn caller_for_hit(analyzer: &dyn IAnalyzer, hit: &UsageHit) -> Option<CodeUnit> {
-    analyzer
-        .enclosing_code_unit_for_lines(&hit.file, hit.line, hit.line)
-        .and_then(|unit| nearest_call_hierarchy_unit(analyzer, unit))
-}
-
-fn usage_hit_range(
+fn source_range(
     project: &dyn Project,
-    hit: &UsageHit,
+    file: &ProjectFile,
+    range: &Range,
     cache: &mut FileContentCache,
 ) -> Option<LspRange> {
-    let entry = cache.read_project(project, &hit.file)?;
-    let range = Range {
-        start_byte: hit.start_offset,
-        end_byte: hit.end_offset,
-        start_line: hit.line,
-        end_line: hit.line,
-    };
+    let entry = cache.read_project(project, file)?;
     Some(byte_range_to_lsp_range(
         &entry.body,
         &entry.line_starts,
-        &range,
+        range,
     ))
-}
-
-#[derive(Default)]
-struct CallReferenceRangeCache {
-    trees: HashMap<ProjectFile, Option<tree_sitter::Tree>>,
-}
-
-impl CallReferenceRangeCache {
-    fn is_call_usage_hit(
-        &mut self,
-        project: &dyn Project,
-        hit: &UsageHit,
-        cache: &mut FileContentCache,
-    ) -> bool {
-        let Some(entry) = cache.read_project(project, &hit.file) else {
-            return false;
-        };
-        let language = language_for_file(&hit.file);
-        let tree = self
-            .trees
-            .entry(hit.file.clone())
-            .or_insert_with(|| parse_tree_for_language(&hit.file, language, &entry.body));
-        tree.as_ref().is_some_and(|tree| {
-            is_call_reference_range_in_tree(tree, language, hit.start_offset, hit.end_offset)
-        })
-    }
 }
 
 fn call_hierarchy_item(
@@ -388,13 +287,6 @@ fn unit_key(unit: &CodeUnit) -> String {
         unit.kind(),
         unit.signature().unwrap_or("")
     )
-}
-
-fn same_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
-    left.source() == right.source()
-        && left.fq_name() == right.fq_name()
-        && left.kind() == right.kind()
-        && left.signature() == right.signature()
 }
 
 fn compare_lsp_range(left: &LspRange, right: &LspRange) -> std::cmp::Ordering {

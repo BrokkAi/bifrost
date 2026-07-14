@@ -822,6 +822,34 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.proof
                     ));
                 }
+                CodeQueryResultValue::CallSite { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let caller = sanitize_terminal_text(&value.caller.fq_name);
+                    let callee = sanitize_terminal_text(&value.callee.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} -> {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "call:", use_color),
+                        paint(Style::new().bold(), &caller, use_color),
+                        paint(Style::new().bold(), &callee, use_color),
+                        value.proof
+                    ));
+                }
+                CodeQueryResultValue::ExpressionSite { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let text = sanitize_terminal_text(&value.text);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "call input:", use_color),
+                        text,
+                        value.input_kind
+                    ));
+                }
             }
             if !result.provenance.is_empty() {
                 out.push_str(&format!(

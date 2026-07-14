@@ -1,4 +1,6 @@
-use super::ir::{CodeQuery, HierarchyTraversal, Pattern, QueryStep, StringPredicate};
+use super::ir::{
+    CallInputSelector, CodeQuery, HierarchyTraversal, Pattern, QueryStep, StringPredicate,
+};
 use super::schema::{reference_kind_label, usage_proof_label, usage_surface_label};
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Value, json};
@@ -97,6 +99,30 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 );
             }
         }
+        QueryStep::Callers(filter) | QueryStep::Callees(filter) => {
+            if filter.depth.get() != 1 {
+                object.insert("depth".to_string(), json!(filter.depth.get()));
+            }
+            if let Some(proof) = filter.proof {
+                object.insert("proof".to_string(), json!(usage_proof_label(proof)));
+            }
+        }
+        QueryStep::CallSitesTo(filter) | QueryStep::CallSitesFrom(filter) => {
+            if let Some(proof) = filter.proof {
+                object.insert("proof".to_string(), json!(usage_proof_label(proof)));
+            }
+        }
+        QueryStep::CallInput(selector) => match selector {
+            CallInputSelector::Receiver => {
+                object.insert("receiver".to_string(), Value::Bool(true));
+            }
+            CallInputSelector::ParameterIndex(index) => {
+                object.insert("parameter_index".to_string(), json!(index));
+            }
+            CallInputSelector::ParameterName(name) => {
+                object.insert("parameter_name".to_string(), json!(name));
+            }
+        },
     }
     Value::Object(object)
 }

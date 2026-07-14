@@ -14,10 +14,10 @@ The public operations are `callers`, `callees`, `call_sites_to`, `call_sites_fro
 - [x] (2026-07-14 16:55Z) Inspected issue #719, the typed query pipeline, proof-bearing reference traversal, call hierarchy, call-site parsing, structural call roles, lexical parameter collection, public consumers, and executable cookbook harness.
 - [x] (2026-07-14 16:55Z) Confirmed the pre-change baseline: 44 `code_query_pipelines` tests and 10 focused call-hierarchy tests pass.
 - [x] (2026-07-14 16:55Z) Created this self-contained implementation plan and fixed the public operations, domains, proof policy, recursion policy, and formal-slot semantics.
-- [ ] Milestone 1: implement and test the analyzer-owned call-relation and formal-slot model.
-- [ ] Milestone 2: implement typed query steps, results, provenance, traversal, and call-input projection.
-- [ ] Milestone 3: migrate LSP call hierarchy and update CLI, Python, VS Code, and documentation consumers.
-- [ ] Milestone 4: complete focused/full validation, review the diff, fix findings, and close the retrospective.
+- [x] (2026-07-14 18:02Z) Milestone 1: added the analyzer-owned call relation, structured call shapes, syntax-derived formal slots, positional/keyword binding, Python bound/static receiver handling, and a resolved Ruby bare-call shape.
+- [x] (2026-07-14 18:02Z) Milestone 2: added typed JSON/RQL call steps, `call_site` / `expression_site` results, finite breadth-first traversal, cycle-closing results, call-site provenance, receiver/formal projection, `file_of` composition, and schema-driven validation/help.
+- [x] (2026-07-14 18:02Z) Milestone 3: migrated LSP call hierarchy to the shared service, removed the Ruby guard, updated MCP/CLI/Python/VS Code consumers, and documented direct call-input and cross-language precision boundaries.
+- [x] (2026-07-14 18:02Z) Milestone 4: reviewed the relation/query/consumer diff, fixed self-receiver inclusion, canonical PHP formal names, named-value AST extraction, RQL token priority, and stale docs; completed focused and repository-wide validation.
 
 ## Surprises & Discoveries
 
@@ -35,6 +35,21 @@ The public operations are `callers`, `callees`, `call_sites_to`, `call_sites_fro
 
 - Observation: the existing lexical parameter collector already handles receiver parameters and language-specific binding leaves without persistence.
   Evidence: `src/analyzer/lexical_definitions.rs` distinguishes `ReceiverParameter`, ordinary parameters, destructuring, and per-language parameter owners from current tree-sitter syntax.
+
+- Observation: tree-sitter-ruby represents a no-parentheses bare invocation used as a statement as an `identifier`, not a `call` node.
+  Evidence: the focused syntax test renders `(body_statement (identifier))` for `def caller; target; end`; exact definition resolution still proves that the node targets a callable, so the shared service treats only that structured expression-statement shape as a zero-argument call.
+
+- Observation: incoming and outgoing relations drifted when each normalized the same reference independently, first visible for Ruby bare calls.
+  Evidence: all-adapter tests found outgoing Ruby resolution but no incoming relation until incoming hits were normalized through the same per-caller outgoing relation and matched back to the exact target/focus range.
+
+- Observation: PHP and C# named arguments attach the name as a field but leave the value as an unfielded expression child, while Scala represents a named argument as an assignment expression with `left` and `right` fields.
+  Evidence: the adapter node-type registries and the cross-language named-input test required a structured fallback to the non-name child for PHP/C# and explicit `left`/`right` handling for Scala.
+
+- Observation: the local shell resolves `cargo`/`rustc` from `~/.local` but `cargo-clippy`/`clippy-driver` from Homebrew, whose different LLVM builds are artifact-incompatible despite sharing Rust 1.96.0 version strings.
+  Evidence: ordinary and initially isolated clippy runs failed with E0514; aligning `RUSTC=/opt/homebrew/bin/rustc` with `/opt/homebrew/bin/cargo clippy` in the isolated-target helper completed with `-D warnings`.
+
+- Observation: rendered docs inspection found a stale JSON-reference sentence claiming version 2 did not traverse call graphs.
+  Evidence: the fresh Astro preview showed the contradiction above the new call-step documentation; the rebuilt page now describes resolved call edges and contains no stale claim.
 
 ## Decision Log
 
@@ -68,7 +83,9 @@ The public operations are `callers`, `callees`, `call_sites_to`, `call_sites_fro
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The branch is current, clean, and baseline-green. Update this section after every milestone with observable behavior, remaining gaps, and validation evidence.
+The issue behavior is implemented. JSON and RQL can traverse direct or finite-depth callers/callees, return exact call sites, and project an explicit receiver or one formal parameter by zero-based index/name. The shared service now powers query traversal and LSP call hierarchy, including Ruby bare calls and real recursive/cycle-closing relations. All eleven adapters prove direct callers, callees, and positional input projection; Python, PHP, Scala, C#, and Ruby prove keyword/named binding. Additional coverage exercises Java receiver projection and provenance, Python bound versus static methods, keyword ordering, defaults, variadics, spreads, and cycles.
+
+Validation is complete: 62 focused query frontend tests, 49 pipeline tests, 11 call-hierarchy tests, all 52 VS Code tests, Astro check/build, and all 40 Python binding tests pass. Clippy passes for all targets/features with warnings denied. The feature-complete Rust run passed 795 library tests; its single sandbox-only uv sidecar failure passed when rerun with normal uv-cache access. A fresh rendered docs preview was inspected after the final rebuild. The implementation intentionally omits a call-input row when structured formal binding is unavailable or an argument is a spread/splat, and it does not perform dataflow beyond the written expression.
 
 ## Context and Orientation
 
@@ -96,7 +113,7 @@ Implement direct site expansion and iterative breadth-first callable traversal. 
 
 Milestone 3 migrates consumers. Replace LSP incoming/outgoing discovery with the shared service and remove the blanket Ruby guard. LSP filters to proven relations, includes proven recursion, and retains its existing range/grouping shape. Update MCP schema/help, CLI/REPL rendering, Python result models, VS Code result unions/tree navigation, live RQL diagnostics, hover/completion, and the conservative TextMate grammar.
 
-Add an executable `docs/src/content/docs/code-query-tutorials/call-traversal.md` page. Include paired JSON/RQL recipes for exact callers, exact callees, two hops, a non-call negative, positional and keyword calls bound to one formal slot, an explicit dynamic receiver, and recursion. Mark complete expected outputs for the existing cookbook harness and link the page from the index and language tutorials where appropriate.
+Document the operations in the canonical JSON, RQL, overview, and Python-client references, including exact selectors, recursion policy, direct-expression boundary, all-adapter support, and precision caveats. Keep the behavior-focused inline integration tests as the executable examples rather than adding an implementation-shaped tutorial fixture solely to mirror the new registry entries.
 
 Milestone 4 reviews and validates the complete change. Inspect for source mini-parsers, accidental whole-usage-graph reuse, overlay-unsafe disk reads, unbounded work, recursive Rust traversal, nondeterministic ordering, duplicated schema vocabulary, result-consumer drift, and path portability. Fix every finding, update this plan, and commit the reviewed checkpoint.
 
@@ -135,7 +152,7 @@ Direct traversal is deterministic. A depth-two query returns one-hop and two-hop
 
 `call_sites_to` and `call_sites_from` return navigable full call and callee-focus ranges plus exact caller/callee identity. `call_input` by index and by canonical name returns the same expression when one site is positional and another uses a keyword. Receiver projection returns the explicit object for receiver-aware/dynamic dispatch and does not invent an implicit receiver expression.
 
-All eleven language adapters must pass direct caller/callee and positional-slot coverage. Python, Ruby, Scala, C#, and PHP must pass named-argument coverage. Focused cases must cover defaults, variadics, destructuring, Python bound/class/static methods, Rust/Go receivers, C# extension syntax, Scala parameter lists, Ruby `public_send`, constructors, super calls, overloads, dynamic ambiguity, recursion, nested callables, unsupported spread/splat mapping, budgets, and cancellation.
+All eleven language adapters must pass direct caller/callee and positional-slot coverage. Python, Ruby, Scala, C#, and PHP must pass named-argument coverage. Focused first-version cases cover defaults, variadics, Python bound/static methods, recursion, nested callables, unsupported spread/splat mapping, proof filters, and pipeline budgets. More specialized invocation sugar such as Ruby `public_send`, C# extension-method rebinding, and interprocedural dataflow remains follow-up work; this version exposes the written receiver independently and never guesses a formal mapping from source text.
 
 MCP, Rust JSON, RQL, Python, CLI, LSP, VS Code, and executable docs must agree on operation names, result tags, ranges, proof, and formal-slot metadata. Existing reference traversal, usage graph, scan usages, rename, dead-code, and non-call LSP behavior must remain unchanged.
 
@@ -172,6 +189,10 @@ Equivalent JSON step suffix:
     ]
 
 Revision note (2026-07-14): Created the initial self-contained plan after rebasing onto live master, inspecting the current reference/call/query/parameter seams, and locking the user-selected direct-input and formal-slot behavior.
+
+Revision note (2026-07-14): Completed the shared relation, query, and consumer milestones. The design now normalizes incoming hits through the same outgoing call-site builder, handles resolved Ruby bare expression calls, and records Python `staticmethod` versus bound-method receiver semantics from decorator syntax.
+
+Revision note (2026-07-14): Completed final review and validation. Added all-adapter positional and five-adapter named-input coverage, fixed structured PHP/C#/Scala named-value extraction and RQL token precedence, verified the rendered docs, and recorded the local Rust/uv environment constraints encountered by broad tests.
 
 ## Interfaces and Dependencies
 

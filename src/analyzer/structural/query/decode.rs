@@ -1,9 +1,10 @@
 use super::ir::{
-    CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, HierarchyTraversal, MAX_CAPTURE_LENGTH,
-    MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS,
-    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
-    QueryStep, ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate, validate_query_steps,
+    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
+    CodeQueryResultDetail, DEFAULT_LIMIT, HierarchyTraversal, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
+    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep,
+    ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate, validate_query_steps,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
@@ -286,10 +287,23 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step,
             QueryStep::ReferencesOf(_) | QueryStep::UsedBy(_) | QueryStep::Uses(_)
         );
+        let call = matches!(step, QueryStep::Callers(_) | QueryStep::Callees(_));
+        let call_site = matches!(
+            step,
+            QueryStep::CallSitesTo(_) | QueryStep::CallSitesFrom(_)
+        );
+        let call_input = matches!(step, QueryStep::CallInput(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
                 Some(QueryStepField::Depth | QueryStepField::Transitive) if hierarchy => {}
+                Some(QueryStepField::Depth | QueryStepField::Proof) if call => {}
+                Some(QueryStepField::Proof) if call_site => {}
+                Some(
+                    QueryStepField::Receiver
+                    | QueryStepField::ParameterIndex
+                    | QueryStepField::ParameterName,
+                ) if call_input => {}
                 Some(
                     QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
@@ -300,7 +314,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Transitive
                     | QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
-                    | QueryStepField::Surface,
+                    | QueryStepField::Surface
+                    | QueryStepField::Receiver
+                    | QueryStepField::ParameterIndex
+                    | QueryStepField::ParameterName,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -420,11 +437,98 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 QueryStep::Uses(_) => QueryStep::Uses(filter),
                 _ => unreachable!("reference step filtered above"),
             };
+        } else if call {
+            let depth = object
+                .get("depth")
+                .map(|value| {
+                    let path = child_path(&entry_path, "depth");
+                    value
+                        .as_u64()
+                        .and_then(|raw| usize::try_from(raw).ok())
+                        .and_then(NonZeroUsize::new)
+                        .ok_or_else(|| QueryError::new(path, "expected a positive integer"))
+                })
+                .transpose()?
+                .unwrap_or(NonZeroUsize::MIN);
+            let proof = decode_optional_proof(object.get("proof"), &entry_path)?;
+            let filter = CallTraversalFilter { depth, proof };
+            step = match step {
+                QueryStep::Callers(_) => QueryStep::Callers(filter),
+                QueryStep::Callees(_) => QueryStep::Callees(filter),
+                _ => unreachable!("call step filtered above"),
+            };
+        } else if call_site {
+            let filter = CallSiteTraversalFilter {
+                proof: decode_optional_proof(object.get("proof"), &entry_path)?,
+            };
+            step = match step {
+                QueryStep::CallSitesTo(_) => QueryStep::CallSitesTo(filter),
+                QueryStep::CallSitesFrom(_) => QueryStep::CallSitesFrom(filter),
+                _ => unreachable!("call-site step filtered above"),
+            };
+        } else if call_input {
+            let selector_count = ["receiver", "parameter_index", "parameter_name"]
+                .into_iter()
+                .filter(|field| object.contains_key(*field))
+                .count();
+            if selector_count != 1 {
+                return Err(QueryError::new(
+                    &entry_path,
+                    "call_input requires exactly one of receiver, parameter_index, or parameter_name",
+                ));
+            }
+            let selector = if let Some(value) = object.get("receiver") {
+                if value.as_bool() != Some(true) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "receiver"),
+                        "receiver must be true when present",
+                    ));
+                }
+                CallInputSelector::Receiver
+            } else if let Some(value) = object.get("parameter_index") {
+                let path = child_path(&entry_path, "parameter_index");
+                let index = value
+                    .as_u64()
+                    .and_then(|raw| usize::try_from(raw).ok())
+                    .ok_or_else(|| QueryError::new(path, "expected a non-negative integer"))?;
+                CallInputSelector::ParameterIndex(index)
+            } else {
+                let path = child_path(&entry_path, "parameter_name");
+                let name = object["parameter_name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty() && name.len() <= MAX_KWARG_NAME_LENGTH)
+                    .ok_or_else(|| {
+                        QueryError::new(
+                            path,
+                            format!(
+                                "expected a non-empty string of at most {MAX_KWARG_NAME_LENGTH} bytes"
+                            ),
+                        )
+                    })?;
+                CallInputSelector::ParameterName(name.to_owned())
+            };
+            step = QueryStep::CallInput(selector);
         }
         steps.push(step);
     }
     validate_query_steps(&steps)?;
     Ok(steps)
+}
+
+fn decode_optional_proof(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<Option<crate::analyzer::usages::UsageProof>, QueryError> {
+    value
+        .map(|value| {
+            let path = child_path(path, "proof");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&path, "expected proven or unproven"))?;
+            usage_proof_from_label(label)
+                .ok_or_else(|| QueryError::new(path, "expected proven or unproven"))
+        })
+        .transpose()
 }
 
 fn decode_result_detail(value: &Value, path: &str) -> Result<CodeQueryResultDetail, QueryError> {

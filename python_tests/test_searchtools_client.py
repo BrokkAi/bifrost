@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bifrost_searchtools import (
+    CodeQueryCallSite,
+    CodeQueryExpressionSite,
     CodeQueryFile,
     CodeQueryMatch,
     CodeQueryReferenceSite,
@@ -295,6 +297,65 @@ class SearchToolsClientTest(unittest.TestCase):
             site.provenance[0].steps[0].via.target_id,
             "Target.java:field:Target.status:0-11",
         )
+
+    def test_query_code_parses_call_and_expression_sites(self) -> None:
+        declaration = lambda fq_name: {
+            "path": "sample.py",
+            "language": "python",
+            "kind": "function",
+            "fq_name": fq_name,
+            "start_line": 1,
+            "end_line": 2,
+        }
+        source_range = {
+            "start_line": 4,
+            "start_column": 4,
+            "end_line": 4,
+            "end_column": 19,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "call_site",
+                        "path": "sample.py",
+                        "language": "python",
+                        "range": source_range,
+                        "callee_range": source_range,
+                        "caller": declaration("sample.caller"),
+                        "callee": declaration("sample.target"),
+                        "call_kind": "function_call",
+                        "proof": "proven",
+                        "arguments": [
+                            {
+                                "range": source_range,
+                                "position": 0,
+                                "formal_index": 0,
+                                "formal_name": "payload",
+                            }
+                        ],
+                    },
+                    {
+                        "result_type": "expression_site",
+                        "path": "sample.py",
+                        "language": "python",
+                        "range": source_range,
+                        "text": '"value"',
+                        "input_kind": "parameter",
+                        "caller_fq_name": "sample.caller",
+                        "callee_fq_name": "sample.target",
+                        "call_range": source_range,
+                        "parameter_index": 0,
+                        "parameter_name": "payload",
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+        self.assertIsInstance(result.results[0], CodeQueryCallSite)
+        self.assertEqual(result.results[0].arguments[0].formal_name, "payload")
+        self.assertIsInstance(result.results[1], CodeQueryExpressionSite)
+        self.assertEqual(result.results[1].text, '"value"')
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

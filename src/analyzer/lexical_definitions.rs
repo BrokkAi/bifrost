@@ -31,6 +31,148 @@ struct ParameterBinding<'tree> {
     kind: DeclarationKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FormalParameterSlot {
+    pub(crate) names: Vec<String>,
+    pub(crate) declaration_range: Range,
+    pub(crate) receiver: bool,
+    pub(crate) variadic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct FormalParameterLayout {
+    pub(crate) slots: Vec<FormalParameterSlot>,
+    pub(crate) receiver_bound_first: bool,
+}
+
+/// Return the formal parameter slots owned by the callable at
+/// `declaration_range`. The result is syntax-derived so it remains correct for
+/// overlays and does not require parameter declarations to be persisted as
+/// workspace symbols.
+pub(crate) fn formal_parameter_slots(
+    language: Language,
+    root: Node<'_>,
+    source: &str,
+    declaration_range: &Range,
+) -> FormalParameterLayout {
+    let Some(owner) = parameter_owner_for_range(language, root, declaration_range) else {
+        return FormalParameterLayout::default();
+    };
+    let receiver_bound_first = language == Language::Python
+        && !python_has_staticmethod_decorator(owner, source, declaration_range);
+    let lambda = is_lambda_owner(language, owner.kind());
+    let (ordinary_roots, receiver_roots) = parameter_roots(language, owner);
+    let mut bindings = ordinary_roots
+        .into_iter()
+        .map(|root| (root, None))
+        .chain(
+            receiver_roots
+                .into_iter()
+                .map(|root| (root, Some(DeclarationKind::ReceiverParameter))),
+        )
+        .flat_map(|(root, forced_kind)| parameter_bindings(language, root, lambda, forced_kind))
+        .collect::<Vec<_>>();
+    bindings.sort_by_key(|binding| {
+        (
+            binding.declaration.start_byte(),
+            binding.name.start_byte(),
+            binding.name.end_byte(),
+        )
+    });
+
+    let mut slots: Vec<FormalParameterSlot> = Vec::new();
+    for binding in bindings {
+        let Some(name) = source.get(binding.name.byte_range()) else {
+            continue;
+        };
+        let receiver = binding.kind == DeclarationKind::ReceiverParameter;
+        let declaration_range = node_range(binding.declaration);
+        let variadic = is_variadic_parameter(language, binding.declaration.kind());
+        let can_share_slot = language != Language::Go;
+        if can_share_slot
+            && let Some(slot) = slots.last_mut()
+            && slot.declaration_range.start_byte == declaration_range.start_byte
+            && slot.declaration_range.end_byte == declaration_range.end_byte
+            && slot.receiver == receiver
+        {
+            if !slot.names.iter().any(|candidate| candidate == name) {
+                slot.names.push(name.to_owned());
+            }
+            slot.variadic |= variadic;
+            continue;
+        }
+        slots.push(FormalParameterSlot {
+            names: vec![name.to_owned()],
+            declaration_range,
+            receiver,
+            variadic,
+        });
+    }
+
+    FormalParameterLayout {
+        slots,
+        receiver_bound_first,
+    }
+}
+
+fn python_has_staticmethod_decorator(
+    owner: Node<'_>,
+    source: &str,
+    declaration_range: &Range,
+) -> bool {
+    let Some(decorated) = owner.parent().filter(|parent| {
+        parent.kind() == "decorated_definition"
+            && parent.start_byte() >= declaration_range.start_byte
+            && parent.end_byte() <= declaration_range.end_byte
+    }) else {
+        return false;
+    };
+    let mut stack = Vec::new();
+    let mut cursor = decorated.walk();
+    stack.extend(
+        decorated
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "decorator"),
+    );
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && source.get(node.byte_range()) == Some("staticmethod") {
+            return true;
+        }
+        push_named_children(node, &mut stack);
+    }
+    false
+}
+
+fn parameter_owner_for_range<'tree>(
+    language: Language,
+    root: Node<'tree>,
+    declaration_range: &Range,
+) -> Option<Node<'tree>> {
+    let mut best: Option<(usize, Node<'tree>)> = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= declaration_range.start_byte
+            || node.start_byte() >= declaration_range.end_byte
+        {
+            continue;
+        }
+        if is_parameter_owner(language, node.kind())
+            && node.start_byte() >= declaration_range.start_byte
+            && node.end_byte() <= declaration_range.end_byte
+        {
+            let distance = node
+                .start_byte()
+                .abs_diff(declaration_range.start_byte)
+                .saturating_add(node.end_byte().abs_diff(declaration_range.end_byte));
+            if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                best = Some((distance, node));
+            }
+        }
+        push_named_children(node, &mut stack);
+    }
+    best.map(|(_, owner)| owner)
+}
+
 /// Resolve `identifier` at the supplied byte range to the nearest lexical
 /// parameter binding.  `None` means that the structured syntax did not prove a
 /// lexical answer, so callers should continue with ordinary indexed lookup.
@@ -136,6 +278,33 @@ fn matching_parameter<'tree>(
     identifier: &str,
 ) -> Option<ParameterBinding<'tree>> {
     let lambda = is_lambda_owner(language, owner.kind());
+    let (ordinary_roots, receiver_roots) = parameter_roots(language, owner);
+
+    // Scala lambda parameters are repeated fields and can be naked identifiers
+    // or a bindings node; the field walk above captures both.
+    let mut best = None;
+    for (root, forced_kind) in ordinary_roots.into_iter().map(|root| (root, None)).chain(
+        receiver_roots
+            .into_iter()
+            .map(|root| (root, Some(DeclarationKind::ReceiverParameter))),
+    ) {
+        for binding in parameter_bindings(language, root, lambda, forced_kind) {
+            if identifier_matches(language, binding.name, source, identifier) {
+                best = Some(binding);
+                break;
+            }
+        }
+        if best.is_some() {
+            break;
+        }
+    }
+    best
+}
+
+fn parameter_roots<'tree>(
+    language: Language,
+    owner: Node<'tree>,
+) -> (Vec<Node<'tree>>, Vec<Node<'tree>>) {
     let mut ordinary_roots = Vec::new();
     push_field_children(owner, "parameters", &mut ordinary_roots);
     push_field_children(owner, "parameter", &mut ordinary_roots);
@@ -170,26 +339,20 @@ fn matching_parameter<'tree>(
             push_named_children(node, &mut stack);
         }
     }
+    (ordinary_roots, receiver_roots)
+}
 
-    // Scala lambda parameters are repeated fields and can be naked identifiers
-    // or a bindings node; the field walk above captures both.
-    let mut best = None;
-    for (root, forced_kind) in ordinary_roots.into_iter().map(|root| (root, None)).chain(
-        receiver_roots
-            .into_iter()
-            .map(|root| (root, Some(DeclarationKind::ReceiverParameter))),
-    ) {
-        for binding in parameter_bindings(language, root, lambda, forced_kind) {
-            if identifier_matches(language, binding.name, source, identifier) {
-                best = Some(binding);
-                break;
-            }
-        }
-        if best.is_some() {
-            break;
-        }
+fn is_variadic_parameter(language: Language, kind: &str) -> bool {
+    match language {
+        Language::Java => kind == "spread_parameter",
+        Language::Go => kind == "variadic_parameter_declaration",
+        Language::JavaScript | Language::TypeScript => kind == "rest_pattern",
+        Language::Python => matches!(kind, "list_splat_pattern" | "dictionary_splat_pattern"),
+        Language::Rust => kind == "variadic_parameter",
+        Language::Php => kind == "variadic_parameter",
+        Language::Ruby => matches!(kind, "splat_parameter" | "hash_splat_parameter"),
+        Language::Cpp | Language::Scala | Language::CSharp | Language::None => false,
     }
-    best
 }
 
 fn parameter_bindings(
