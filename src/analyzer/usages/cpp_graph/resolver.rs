@@ -1525,6 +1525,158 @@ pub(in crate::analyzer::usages) fn is_declarator_node(node: Node<'_>) -> bool {
     )
 }
 
+/// Aggregate-owner proof for a structurally recognized designated initializer.
+pub(in crate::analyzer::usages) enum DesignatedInitializerOwner {
+    Resolved(CodeUnit),
+    Unresolved,
+}
+
+/// Recognize a designated-initializer field and, when possible, resolve its
+/// aggregate owner.
+///
+/// Covers both the grammar's ordinary `field_designator` shape and the exact
+/// recovery used for `.field = value` after a preprocessor-split array
+/// initializer. Nested aggregate levels are deliberately left unresolved unless
+/// the single outer level is the containing array initializer: resolving those
+/// would require following the enclosing field's declared type. `None` means the
+/// node is not a designator at all; an unresolved designator remains classified so
+/// callers cannot fall through to unrelated global/member heuristics.
+pub(in crate::analyzer::usages) fn designated_initializer_owner(
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<DesignatedInitializerOwner> {
+    if let Some(designator) = node
+        .parent()
+        .filter(|parent| parent.kind() == "field_designator")
+    {
+        let pair = designator.parent()?;
+        if pair.kind() != "initializer_pair"
+            || pair.child_by_field_name("designator") != Some(designator)
+        {
+            return None;
+        }
+        let initializer = pair.parent()?;
+        if initializer.kind() != "initializer_list" {
+            return None;
+        }
+        return Some(classified_designated_owner(initializer_list_owner(
+            visibility,
+            file,
+            source,
+            initializer,
+        )));
+    }
+
+    let init_declarator = node.parent()?;
+    if init_declarator.child_by_field_name("declarator") != Some(node)
+        || !crate::analyzer::cpp::structural::is_recovered_designator_init_declarator(
+            init_declarator,
+        )
+    {
+        return None;
+    }
+    Some(classified_designated_owner(declaration_owner(
+        visibility,
+        file,
+        source,
+        init_declarator.parent()?,
+    )))
+}
+
+fn classified_designated_owner(owner: Option<CodeUnit>) -> DesignatedInitializerOwner {
+    owner.map_or(
+        DesignatedInitializerOwner::Unresolved,
+        DesignatedInitializerOwner::Resolved,
+    )
+}
+
+fn initializer_list_owner(
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    initializer: Node<'_>,
+) -> Option<CodeUnit> {
+    let mut current = initializer;
+    let mut outer_initializer_lists = 0usize;
+    loop {
+        let parent = current.parent()?;
+        match parent.kind() {
+            "initializer_pair" => return None,
+            "initializer_list" => {
+                outer_initializer_lists += 1;
+                if outer_initializer_lists > 1 {
+                    return None;
+                }
+                current = parent;
+            }
+            "init_declarator" if parent.child_by_field_name("value") == Some(current) => {
+                let declaration = parent.parent()?;
+                if outer_initializer_lists == 1
+                    && !parent
+                        .child_by_field_name("declarator")
+                        .is_some_and(contains_array_declarator)
+                {
+                    return None;
+                }
+                return declaration_owner(visibility, file, source, declaration);
+            }
+            "compound_literal_expression"
+                if parent.child_by_field_name("value") == Some(current)
+                    && outer_initializer_lists == 0 =>
+            {
+                let type_node = parent.child_by_field_name("type")?;
+                return resolve_designated_owner_type(visibility, file, source, type_node);
+            }
+            "ERROR" => current = parent,
+            _ => return None,
+        }
+    }
+}
+
+fn declaration_owner(
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    declaration: Node<'_>,
+) -> Option<CodeUnit> {
+    if !matches!(declaration.kind(), "declaration" | "field_declaration") {
+        return None;
+    }
+    let type_node = declaration
+        .child_by_field_name("type")
+        .or_else(|| first_type_child(declaration))?;
+    resolve_designated_owner_type(visibility, file, source, type_node)
+}
+
+fn resolve_designated_owner_type(
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+) -> Option<CodeUnit> {
+    let type_name = normalize_type_text(node_text(type_node, source));
+    visibility
+        .resolve_type(file, &type_name)
+        .filter(CodeUnit::is_class)
+}
+
+fn contains_array_declarator(declarator: Node<'_>) -> bool {
+    let mut stack = vec![declarator];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "array_declarator" {
+            return true;
+        }
+        if matches!(node.kind(), "initializer_list" | "compound_statement") {
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
 pub(super) fn recovered_macro_function_return_type(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "namespace_identifier" {
         return None;

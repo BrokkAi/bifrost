@@ -23,10 +23,10 @@
 //! receiver shapes the forward C++ scan proves.
 
 use super::resolver::{
-    TargetKind, VisibilityIndex, constructor_style_local_declaration, extract_variable_name,
-    first_type_child, infer_cpp_initializer_type, is_declaration_name, is_declarator_node,
-    normalize_type_text, out_of_line_member_definition_owner, recovered_macro_function_return_type,
-    type_owner_of,
+    DesignatedInitializerOwner, TargetKind, VisibilityIndex, constructor_style_local_declaration,
+    designated_initializer_owner, extract_variable_name, first_type_child,
+    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, normalize_type_text,
+    out_of_line_member_definition_owner, recovered_macro_function_return_type, type_owner_of,
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -141,6 +141,26 @@ fn record_reference(
     ctx: &mut CppScan<'_, '_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
+    if matches!(node.kind(), "identifier" | "field_identifier")
+        && let Some(designator_owner) =
+            designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node)
+    {
+        let name = node_text(node, ctx.source);
+        match designator_owner {
+            DesignatedInitializerOwner::Resolved(owner) => {
+                if let Some(field) = ctx
+                    .visibility
+                    .visible_members_for_owner_name(ctx.file, &owner, name)
+                    .into_iter()
+                    .find(|unit| unit.is_field())
+                {
+                    ctx.record(field.fq_name(), node);
+                }
+            }
+            DesignatedInitializerOwner::Unresolved => ctx.record_unproven(name, node),
+        }
+        return;
+    }
     match node.kind() {
         "namespace_identifier" if recovered_macro_function_return_type(node).is_some() => {
             if let Some(unit) = ctx.resolve_type(node_text(node, ctx.source)) {

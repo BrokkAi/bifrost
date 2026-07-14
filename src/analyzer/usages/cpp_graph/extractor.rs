@@ -950,6 +950,11 @@ fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node
 }
 
 fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if matches!(node.kind(), "identifier" | "field_identifier")
+        && designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node).is_some()
+    {
+        return;
+    }
     if !matches!(
         node.kind(),
         "identifier" | "field_identifier" | "qualified_identifier"
@@ -1080,6 +1085,28 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_hit(field, ctx);
         } else if !receiver_has_known_non_target(node, ctx) {
             push_unproven_hit(field, ctx);
+        }
+        return;
+    }
+
+    if matches!(node.kind(), "identifier" | "field_identifier")
+        && name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
+        && let Some(designator_owner) =
+            designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node)
+    {
+        *ctx.raw_match_count += 1;
+        match designator_owner {
+            DesignatedInitializerOwner::Resolved(owner)
+                if ctx
+                    .spec
+                    .owner
+                    .as_ref()
+                    .is_some_and(|target_owner| same_visible_symbol(&owner, target_owner)) =>
+            {
+                push_hit(node, ctx);
+            }
+            DesignatedInitializerOwner::Unresolved => push_unproven_hit(node, ctx),
+            DesignatedInitializerOwner::Resolved(_) => {}
         }
         return;
     }

@@ -54,6 +54,41 @@ const CPP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("do_statement", NormalizedKind::Loop),
 ];
 
+/// Whether tree-sitter recovered `.field = value` as a declaration child pair:
+/// an `ERROR` containing only the anonymous dot immediately followed by an
+/// `init_declarator` whose declarator is a real identifier.
+///
+/// This is intentionally narrower than rejecting declarators below `ERROR` in
+/// general: macro-decorated declarations and ordinary comma-separated initialized
+/// declarations also use recovery nodes and remain real declarations.
+pub(crate) fn is_recovered_designator_init_declarator(node: Node<'_>) -> bool {
+    if node.kind() != "init_declarator" {
+        return false;
+    }
+    let Some(identifier) = node.child_by_field_name("declarator") else {
+        return false;
+    };
+    if identifier.kind() != "identifier" || identifier.is_missing() {
+        return false;
+    }
+    let Some(previous) = node.prev_named_sibling() else {
+        return false;
+    };
+    if previous.kind() != "ERROR"
+        || previous.named_child_count() != 0
+        || previous.child_count() != 1
+        || previous.end_byte() != node.start_byte()
+    {
+        return false;
+    }
+    previous.child(0).is_some_and(|child| {
+        child.kind() == "."
+            && !child.is_named()
+            && child.start_byte() == previous.start_byte()
+            && child.end_byte() == previous.end_byte()
+    })
+}
+
 fn last_named_field_child<'tree>(node: Node<'tree>, field: &str) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
     node.children_by_field_name(field, &mut cursor)

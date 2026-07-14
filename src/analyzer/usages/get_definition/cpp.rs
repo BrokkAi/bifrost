@@ -63,6 +63,29 @@ pub(super) fn resolve_cpp(
         Some(CppReferenceNode::Call(call)) => resolve_cpp_call(ctx, call),
         Some(CppReferenceNode::Field(field)) => resolve_cpp_field(ctx, field, None, None),
         Some(CppReferenceNode::Identifier(identifier)) => {
+            if let Some(designator_owner) =
+                cpp_designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, identifier)
+            {
+                let member = cpp_node_text(identifier, ctx.source);
+                let CppDesignatedInitializerOwner::Resolved(owner) = designator_owner else {
+                    return no_definition(
+                        "unresolved_designated_initializer_owner",
+                        format!("aggregate owner for designated field `{member}` is unresolved"),
+                    );
+                };
+                let candidates = cpp_member_candidates(ctx, vec![owner], member, None, None)
+                    .into_iter()
+                    .filter(CodeUnit::is_field)
+                    .collect::<Vec<_>>();
+                return if candidates.is_empty() {
+                    no_definition(
+                        "no_indexed_definition",
+                        format!("`{member}` did not resolve to an indexed C++ field"),
+                    )
+                } else {
+                    candidates_outcome(candidates)
+                };
+            }
             if cpp_is_declaration_name(node) {
                 return no_definition(
                     "declaration_or_import_site",

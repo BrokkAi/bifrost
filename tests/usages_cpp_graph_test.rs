@@ -1834,6 +1834,413 @@ choose(void) { return 0; }
 }
 
 #[test]
+fn authoritative_cpp_usage_owns_designated_initializer_fields() {
+    // Reduced from arch/powerpc/kernel/cputable.c. The branch transitions are
+    // significant: tree-sitter recovers the second cpu_features as an
+    // init_declarator below ERROR rather than as a field_designator.
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "cpu_spec.h",
+            r#"struct cpu_spec {
+    int pvr_mask;
+    int cpu_features;
+};
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "cpu_spec.h"
+#define __initdata
+#define DECLARE static
+
+DECLARE int first = 1, second = 2;
+
+static struct cpu_spec __initdata cpu_specs[] = {
+#ifdef CONFIG_PPC_BOOK3S_64
+    {   /* default match */
+        .pvr_mask = 0x00000000,
+        .pvr_value = 0x00000000,
+        .cpu_name = "POWER4 (compatible)",
+        .other_features = CPU_FTRS_COMPATIBLE,
+        .cpu_user_features = COMMON_USER_PPC64,
+        .mmu_features = MMU_FTRS_DEFAULT_HPTE_ARCH_V2,
+        .icache_bsize = 128,
+        .dcache_bsize = 128,
+        .num_pmcs = 6,
+        .pmc_type = PPC_PMC_IBM,
+        .platform = "power4",
+    }
+#endif /* CONFIG_PPC_BOOK3S_64 */
+
+#ifdef CONFIG_PPC32
+#if CLASSIC_PPC
+    {   /* 601 */
+        .pvr_mask = 0xffff0000,
+        .pvr_value = 0x00010000,
+        .cpu_name = "601",
+        .other_features = CPU_FTRS_PPC601,
+        .cpu_user_features = COMMON_USER | PPC_FEATURE_601_INSTR |
+            PPC_FEATURE_UNIFIED_CACHE | PPC_FEATURE_NO_TB,
+        .mmu_features = MMU_FTR_HPTE_TABLE,
+        .icache_bsize = 32,
+        .dcache_bsize = 32,
+        .machine_check = machine_check_generic,
+        .platform = "ppc601",
+    },
+#endif /* CLASSIC_PPC */
+#ifdef CONFIG_8xx
+    {   /* 8xx */
+        .pvr_mask = 0xffff0000,
+        .pvr_value = 0x00500000,
+        .cpu_name = "8xx",
+        .other_features = CPU_FTRS_8XX,
+        .cpu_user_features = PPC_FEATURE_32 | PPC_FEATURE_HAS_MMU,
+        .mmu_features = MMU_FTR_TYPE_8xx,
+        .icache_bsize = 16,
+        .dcache_bsize = 16,
+        .platform = "ppc823",
+    },
+#endif /* CONFIG_8xx */
+#ifdef CONFIG_40x
+    {   /* 403GC */
+        .pvr_mask = 0xffffff00,
+        .pvr_value = 0x00200200,
+        .cpu_name = "403GC",
+        .other_features = CPU_FTRS_40X,
+        .cpu_user_features = PPC_FEATURE_32 | PPC_FEATURE_HAS_MMU,
+        .mmu_features = MMU_FTR_TYPE_40x,
+        .icache_bsize = 16,
+        .dcache_bsize = 16,
+        .machine_check = machine_check_4xx,
+        .platform = "ppc403",
+    },
+    {   /* APM8018X */
+        .pvr_mask = 0xffff0000,
+        .pvr_value = 0x7ff11432,
+        .cpu_name = "APM8018X",
+        .other_features = CPU_FTRS_40X,
+        .cpu_user_features = PPC_FEATURE_32 |
+            PPC_FEATURE_HAS_MMU | PPC_FEATURE_HAS_4xxMAC,
+        .mmu_features = MMU_FTR_TYPE_40x,
+        .icache_bsize = 32,
+        .dcache_bsize = 32,
+        .machine_check = machine_check_4xx,
+        .platform = "ppc405",
+    },
+    {   /* default match */
+        .pvr_mask = 0x00000000,
+        .pvr_value = 0x00000000,
+        .cpu_name = "(generic 40x PPC)",
+        .cpu_features = CPU_FTRS_40X,
+        .cpu_user_features = PPC_FEATURE_32 |
+            PPC_FEATURE_HAS_MMU | PPC_FEATURE_HAS_4xxMAC,
+        .mmu_features = MMU_FTR_TYPE_40x,
+        .icache_bsize = 32,
+        .dcache_bsize = 32,
+        .machine_check = machine_check_4xx,
+        .platform = "ppc405",
+    }
+
+#endif /* CONFIG_40x */
+#ifdef CONFIG_44x
+    {
+        .pvr_mask = 0xf0000fff,
+        .pvr_value = 0x40000850,
+        .cpu_name = "440GR Rev. A",
+        .cpu_features = CPU_FTRS_44X,
+        .cpu_user_features = COMMON_USER_BOOKE,
+        .mmu_features = MMU_FTR_TYPE_44x,
+        .icache_bsize = 32,
+        .dcache_bsize = 32,
+        .machine_check = machine_check_4xx,
+
+int ordinary = 0;
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.fq_name() == "cpu_spec.cpu_features"
+    });
+    let consumer = project.file("consumer.c");
+    let source = consumer.read_to_string().expect("consumer source");
+    let token = "cpu_features";
+    let starts = source
+        .match_indices(token)
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    assert_eq!(2, starts.len(), "test fixture designated initializer count");
+
+    for start in &starts {
+        let line_start = source[..*start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..*start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..*start].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.c".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        let result = &forward.results[0];
+        assert_eq!("resolved", result.status, "{result:#?}");
+        assert_eq!(
+            vec![Some("cpu_spec.cpu_features")],
+            result
+                .definitions
+                .iter()
+                .map(|definition| definition.fqn.as_deref())
+                .collect::<Vec<_>>(),
+            "designated field must resolve only through its cpu_spec owner: {result:#?}"
+        );
+    }
+
+    let declarations = analyzer.get_declarations(&consumer);
+    for name in ["first", "second", "cpu_specs", "ordinary"] {
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_field() && unit.identifier() == name),
+            "ordinary global {name} should remain indexed: {declarations:#?}"
+        );
+    }
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "cpu_features"),
+        "designators must not create a bare pseudo-global: {declarations:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative designated-initializer success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("cpu_features should have a proven-hit bucket");
+    for start in starts {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= start
+                    && start + token.len() <= hit.end_offset
+            }),
+            "designated cpu_features at {start} should be proven: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_usage_owns_structured_designator_forms() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "types.h",
+            r#"struct cpu_spec { int cpu_features; };
+struct wrapper { struct cpu_spec inner; };
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "types.h"
+void consume(struct cpu_spec value);
+int cpu_features = 99;
+
+void configure(void) {
+    struct cpu_spec direct = { .cpu_features = 1 };
+    struct cpu_spec array[] = { { .cpu_features = 2 } };
+    consume((struct cpu_spec) { .cpu_features = 3 });
+    struct wrapper nested = { .inner = { .cpu_features = 4 } };
+}
+"#,
+        ),
+        (
+            "recovered_only.c",
+            r#"#include "types.h"
+static struct cpu_spec .cpu_features = 1;
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.fq_name() == "cpu_spec.cpu_features"
+    });
+    let consumer = project.file("consumer.c");
+    let recovered_only = project.file("recovered_only.c");
+    assert!(
+        analyzer
+            .get_declarations(&recovered_only)
+            .iter()
+            .all(|unit| unit.identifier() != "cpu_features"),
+        "a declaration containing only a recovered designator must not persist it"
+    );
+    let source = consumer.read_to_string().expect("consumer source");
+    let token = "cpu_features";
+    let all_starts = source
+        .match_indices(token)
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    assert_eq!(5, all_starts.len(), "test fixture cpu_features count");
+    let starts = all_starts[1..].to_vec();
+
+    for (index, start) in starts.iter().enumerate() {
+        let line_start = source[..*start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..*start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..*start].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.c".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        let result = &forward.results[0];
+        if index < 3 {
+            assert_eq!("resolved", result.status, "{result:#?}");
+            assert_eq!(
+                vec![Some("cpu_spec.cpu_features")],
+                result
+                    .definitions
+                    .iter()
+                    .map(|definition| definition.fqn.as_deref())
+                    .collect::<Vec<_>>(),
+                "direct designator must resolve through its cpu_spec owner: {result:#?}"
+            );
+        } else {
+            assert_eq!("no_definition", result.status, "{result:#?}");
+            assert!(
+                result.definitions.is_empty(),
+                "unresolved nested aggregate must not fall through to the same-named global: {result:#?}"
+            );
+        }
+    }
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative designated-initializer success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("cpu_features should have a proven-hit bucket");
+    for start in &starts[..3] {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= *start
+                    && *start + token.len() <= hit.end_offset
+            }),
+            "direct designator at {start} should be proven: {hits:#?}"
+        );
+    }
+    assert!(
+        hits.iter().all(|hit| {
+            !(hit.file == consumer
+                && hit.start_offset <= starts[3]
+                && starts[3] + token.len() <= hit.end_offset)
+        }),
+        "unresolved nested aggregate designator must not be proven: {hits:#?}"
+    );
+    let unproven = unproven_by_overload
+        .get(&target)
+        .expect("unresolved nested designator should remain reviewable");
+    assert!(
+        unproven.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= starts[3]
+                && starts[3] + token.len() <= hit.end_offset
+        }),
+        "unresolved nested aggregate designator should be unproven: {unproven:#?}"
+    );
+
+    let global_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.source() == &consumer
+            && unit.fq_name() == "cpu_features"
+    });
+    let global_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&global_target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = global_query.result
+    else {
+        panic!(
+            "expected authoritative global-field success, got {:#?}",
+            global_query.result
+        );
+    };
+    assert!(
+        hits_by_overload
+            .get(&global_target)
+            .into_iter()
+            .flatten()
+            .all(|hit| starts.iter().all(|start| {
+                !(hit.file == consumer
+                    && hit.start_offset <= *start
+                    && *start + token.len() <= hit.end_offset)
+            })),
+        "structured designators must not fall through to a same-named global"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_rejects_ambiguous_and_cyclic_typedef_type_references() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (

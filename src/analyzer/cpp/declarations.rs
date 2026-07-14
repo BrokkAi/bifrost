@@ -698,6 +698,10 @@ impl<'a> CppVisitor<'a> {
                 }
                 continue;
             }
+            if super::structural::is_recovered_designator_init_declarator(child) {
+                handled_declarator = true;
+                continue;
+            }
             if let Some(kind) = classify_declarator(child) {
                 handled_declarator = true;
                 match kind {
