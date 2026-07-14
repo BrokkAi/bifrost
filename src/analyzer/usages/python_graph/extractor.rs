@@ -752,11 +752,7 @@ fn collect_imported_class_method_return_types(
     class_unit: &CodeUnit,
     factory_return_types: &mut HashMap<String, String>,
 ) {
-    let owner_fqn = class_unit.fq_name();
-    for member in analyzer
-        .global_usage_definition_index()
-        .fqn_direct_children(&owner_fqn)
-    {
+    for member in analyzer.direct_children(class_unit) {
         if !member.is_function() {
             continue;
         }

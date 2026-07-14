@@ -865,6 +865,8 @@ mod tests {
         );
         let file = ProjectFile::new(fixture.project_root(), "app.py");
         let analyzer = fixture.analyzer.analyzer();
+        analyzer.reset_global_usage_definition_index_build_count_for_test();
+        analyzer.reset_full_declaration_scan_count_for_test();
         let mut context = DefinitionBatchContext::new(analyzer, true);
         let requests = ["run", "stop"]
             .into_iter()
@@ -889,6 +891,11 @@ mod tests {
                     .starts_with("service.Service.")
         }));
         assert_eq!(context.python_build_counts(), (1, 1, 1, 0));
+        assert_eq!(
+            analyzer.global_usage_definition_index_build_count_for_test(),
+            0
+        );
+        assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
         assert!(context.python_contexts.is_empty());
     }
 

@@ -43,6 +43,10 @@ resolution work.
 - [x] (2026-07-14) Short-circuit scope-fact import resolution after direct
   definitions or explicit reexports, so it does not eagerly construct Python export
   indexes for every named import.
+- [x] (2026-07-14) Replace imported-class method discovery through the workspace
+  global index with `direct_children` on the already-resolved class. The focused
+  batch regression now proves zero global-index builds and zero full declaration
+  scans while factory-return coverage remains green.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -106,6 +110,15 @@ resolution work.
   `/private/tmp/bifrost-675-short-circuit.sample.txt`, and
   `/private/tmp/bifrost-675-short-circuit-later.sample.txt`.
 
+- Observation: The remaining global declaration hydration came from
+  `collect_imported_class_method_return_types`, even though that function already
+  receives the concrete imported class `CodeUnit`. `IAnalyzer::direct_children`
+  delegates to the class's owning analyzer and file, providing the same direct
+  methods without materializing unrelated declarations.
+  Evidence: `python_batch_context_builds_file_and_scope_state_once` asserts both
+  `global_usage_definition_index_build_count_for_test() == 0` and
+  `full_declaration_scan_count_for_test() == 0`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -158,6 +171,14 @@ resolution work.
   parse and index construction cost for ordinary named imports.
   Date/Author: 2026-07-14 / Codex
 
+- Decision: Discover imported class factory methods through
+  `analyzer.direct_children(class_unit)`.
+  Rationale: Import resolution has already selected a concrete declaration, so its
+  source-specific children are both more precise and bounded than an FQN lookup in a
+  workspace-wide index. This preserves factory-return inference while removing the
+  only global declaration scan in the definition-batch scope path.
+  Date/Author: 2026-07-14 / Codex
+
 ## Outcomes & Retrospective
 
 The implementation is complete and the new focused behavior is covered. A
@@ -168,10 +189,10 @@ unchanged shared graph-resolver fallback. The context remains removed after its 
 request, so no cache survives the batch-file lifecycle.
 
 The full validation and acceptance benchmark remains pending. The receiver path is
-now covered for direct imports and explicit facade reexports, and the sampled generic
-export work is no longer dominant. The current blocker is one-time global declaration
-hydration in `MultiAnalyzer`, so do not close #675 or start the full limits before a
-separate bounded approach to that workspace-wide setup produces a completed record.
+covered for direct imports, explicit facade reexports, and imported class factory
+methods. Focused counters prove it no longer builds `MultiAnalyzer`'s global index or
+scans every declaration; the next warmed smoke must confirm that result on the corpus
+before the full limits are started.
 
 ## Context and Orientation
 
