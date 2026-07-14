@@ -214,6 +214,10 @@
       {
         "command": "bifrost.openRqlQueryResult",
         "title": "Bifrost: Open RQL Query Result"
+      },
+      {
+        "command": "bifrost.showRuneIr",
+        "title": "Bifrost: Show Rune IR"
       }
     ],
     "views": {
@@ -239,6 +243,10 @@
         {
           "command": "bifrost.openRqlQueryResult",
           "when": "false"
+        },
+        {
+          "command": "bifrost.showRuneIr",
+          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby"
         }
       ],
       "editor/title": [
@@ -246,6 +254,13 @@
           "command": "bifrost.runRqlQuery",
           "when": "resourceLangId == bifrost-rql",
           "group": "navigation@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "bifrost.showRuneIr",
+          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby",
+          "group": "navigation@10"
         }
       ]
     }

@@ -57,6 +57,7 @@ function assertScoped(tokens, text, scope) {
 
 test("registers Bifrost RQL as a distinct .rql language", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"));
+  const runeIrSourceContext = "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby";
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql"));
   assert.deepEqual(manifest.contributes.languages, [
     {
@@ -85,6 +86,13 @@ test("registers Bifrost RQL as a distinct .rql language", () => {
       icon: "$(play)"
     }
   );
+  assert.deepEqual(
+    manifest.contributes.commands.find((command) => command.command === "bifrost.showRuneIr"),
+    {
+      command: "bifrost.showRuneIr",
+      title: "Bifrost: Show Rune IR"
+    }
+  );
   assert.deepEqual(manifest.contributes.menus["editor/title"], [
     {
       command: "bifrost.runRqlQuery",
@@ -94,7 +102,15 @@ test("registers Bifrost RQL as a distinct .rql language", () => {
   ]);
   assert.deepEqual(manifest.contributes.menus.commandPalette, [
     { command: "bifrost.runRqlQuery", when: "false" },
-    { command: "bifrost.openRqlQueryResult", when: "false" }
+    { command: "bifrost.openRqlQueryResult", when: "false" },
+    { command: "bifrost.showRuneIr", when: runeIrSourceContext }
+  ]);
+  assert.deepEqual(manifest.contributes.menus["editor/context"], [
+    {
+      command: "bifrost.showRuneIr",
+      when: runeIrSourceContext,
+      group: "navigation@10"
+    }
   ]);
   assert.deepEqual(manifest.contributes.views.explorer, [
     { id: "bifrost.queryResults", name: "Bifrost Query Results" }

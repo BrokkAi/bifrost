@@ -14,7 +14,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 - [x] (2026-07-14 14:05Z) Implemented and tested a bounded, deterministic Rune IR renderer and starter-RQL generator over the existing `FileFacts` arena; 5 focused library tests pass for Rust, Python, TypeScript, selection, escaping, parseable starters, errors, and all four limits.
 - [x] (2026-07-14 14:25Z) Added the index-free multiline `:ir <language>` REPL workflow with explicit `:end`, actionable input errors, colon-preserving source capture, lazy-service isolation, help/completion metadata, 15 passing binary tests, and a successful real scripted Rust smoke run.
 - [x] (2026-07-14 14:50Z) Added `bifrost/runeIr` with overlay-aware source reads, exclusive cursor/range params, smallest-enclosing indexed `CodeUnit` selection, primary-range Rune IR roots, UTF-16 response ranges, opaque display text, unit coverage, and a passing end-to-end Rust/TypeScript LSP test.
-- [ ] Add the VS Code source-editor command that displays the server-rendered output without interpreting Rune IR in TypeScript.
+- [x] (2026-07-14 15:05Z) Added **Bifrost: Show Rune IR** for supported source editors, using selection-or-cursor request params and opening the server-provided display text verbatim; TypeScript and manifest tests pass as part of all 48 VS Code tests.
 - [ ] Document Rune IR as the source-side representation matched by `CodeQuery`, run focused tests, `cargo fmt`, full feature tests where practical, and clippy with warnings denied.
 
 ## Surprises & Discoveries
@@ -42,7 +42,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 
 ## Outcomes & Retrospective
 
-The first three implementation milestones are complete. Callers can render bounded Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer; the REPL exposes that path through `:ir <language>` without initializing its lazy workspace service; and the private LSP request returns identical Rune IR from unsaved overlay content with indexed declaration selection and UTF-16 ranges. The editor command, documentation, and final gates remain.
+All implementation surfaces are complete. Callers can render bounded Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer; the REPL exposes that path through `:ir <language>` without initializing its lazy workspace service; the private LSP request returns identical Rune IR from unsaved overlay content with indexed declaration selection and UTF-16 ranges; and VS Code displays the opaque server response from a source-editor command. Documentation and final gates remain.
 
 ## Context and Orientation
 
@@ -145,3 +145,5 @@ Revision note (2026-07-14 14:05Z): Marked the shared renderer milestone complete
 Revision note (2026-07-14 14:25Z): Marked the REPL milestone complete after focused tests and a real piped `bifrost --repl` smoke run proved index-free rendering.
 
 Revision note (2026-07-14 14:50Z): Marked the LSP milestone complete after unit tests and an end-to-end overlay test proved direct-render parity, UTF-16 correctness, and class/field/constructor/method selection.
+
+Revision note (2026-07-14 15:05Z): Marked the VS Code milestone complete after lint, bundle compilation, and all 48 extension tests passed, including verbatim display and manifest context coverage.

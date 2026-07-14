@@ -44,6 +44,7 @@ import {
   runRqlQuery
 } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
+import { RuneIrRange, RuneIrResponse, showRuneIr } from "./rune_ir";
 import {
   RQL_QUERY_HOVER_METHOD,
   RqlValidationController,
@@ -98,6 +99,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bifrost.runRqlQuery", (resource?: vscode.Uri) =>
       runRqlQueryForEditor(resource)
     ),
+    vscode.commands.registerCommand("bifrost.showRuneIr", () => showRuneIrForEditor()),
     vscode.commands.registerCommand("bifrost.openRqlQueryResult", (result: RqlQueryResultItem) =>
       openRqlQueryResult(result)
     ),
@@ -157,6 +159,47 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void startClient(context);
+}
+
+async function showRuneIrForEditor(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  const document = editor?.document;
+  const currentClient = client;
+  const selection = editor?.selection;
+  const selectedRange: RuneIrRange | undefined = selection && !selection.isEmpty
+    ? {
+        start: { line: selection.start.line, character: selection.start.character },
+        end: { line: selection.end.line, character: selection.end.character }
+      }
+    : undefined;
+  const position = selection
+    ? { line: selection.active.line, character: selection.active.character }
+    : undefined;
+  await showRuneIr(
+    document
+      ? { uri: document.uri.toString(), languageId: document.languageId }
+      : undefined,
+    selectedRange,
+    position,
+    {
+      isReady: () => currentClient?.state === State.Running,
+      sendRequest: (method, params) =>
+        currentClient!.sendRequest<RuneIrResponse>(method, params),
+      showError: (message) => {
+        void vscode.window.showErrorMessage(message);
+      },
+      showWarning: (message) => {
+        void vscode.window.showWarningMessage(message);
+      },
+      showDocument: async (text) => {
+        const result = await vscode.workspace.openTextDocument({
+          content: text,
+          language: "plaintext"
+        });
+        await vscode.window.showTextDocument(result, { preview: true });
+      }
+    }
+  );
 }
 
 async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
