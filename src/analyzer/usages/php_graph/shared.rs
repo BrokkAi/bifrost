@@ -29,6 +29,7 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let _scope = crate::profiling::scope("php_graph::find_usages");
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
@@ -40,21 +41,27 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
             );
         };
 
-        let candidate_files = scan_scope.candidate_files();
-        let mut files: HashSet<ProjectFile> = candidate_files
-            .iter()
-            .filter(|file| language_for_file(file) == Language::Php)
-            .cloned()
-            .collect();
+        let mut files: HashSet<ProjectFile> = {
+            let _scope = crate::profiling::scope("php_graph::candidate_files");
+            scan_scope
+                .candidate_files()
+                .iter()
+                .filter(|file| language_for_file(file) == Language::Php)
+                .cloned()
+                .collect()
+        };
         if scan_scope.allows(target.source()) {
             files.insert(target.source().clone());
         }
 
-        let hierarchy = matches!(
-            spec.kind,
-            TargetKind::Constructor | TargetKind::Method | TargetKind::Field
-        )
-        .then(|| PhpHierarchyIndex::for_target_owner(self.php, &spec));
+        let hierarchy = {
+            let _scope = crate::profiling::scope("php_graph::target_hierarchy");
+            matches!(
+                spec.kind,
+                TargetKind::Constructor | TargetKind::Method | TargetKind::Field
+            )
+            .then(|| PhpHierarchyIndex::for_target_owner(self.php, &spec))
+        };
         let empty_hierarchy = PhpHierarchyIndex::default();
         let hierarchy = hierarchy.as_ref().unwrap_or(&empty_hierarchy);
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
@@ -70,7 +77,10 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
             if scan_scope.is_cancelled() {
                 break;
             }
-            scan_file(self.php, analyzer, &file, &spec, hierarchy, &mut hits);
+            {
+                let _scope = crate::profiling::scope("php_graph::scan_file");
+                scan_file(self.php, analyzer, &file, &spec, hierarchy, &mut hits);
+            }
             if hits.len() > max_usages {
                 return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                     short_name: target.short_name().to_string(),

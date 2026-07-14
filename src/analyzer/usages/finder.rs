@@ -101,6 +101,7 @@ impl UsageFinder {
         max_files: usize,
         max_usages: usize,
     ) -> QueryResult {
+        let _scope = crate::profiling::scope("usages::UsageFinder::query_with_provider");
         let _query_scope = AnalyzerQueryScope::new(analyzer);
         if overloads.is_empty() || self.cancellation.is_cancelled() {
             return QueryResult {
@@ -113,9 +114,14 @@ impl UsageFinder {
         }
 
         let target = &overloads[0];
-        let mut candidates: HashSet<ProjectFile> = match explicit_provider {
-            Some(provider) => provider.find_candidates(target, analyzer),
-            None => find_default_candidates_with_cancellation(target, analyzer, &self.cancellation),
+        let mut candidates: HashSet<ProjectFile> = {
+            let _scope = crate::profiling::scope("usages::UsageFinder::candidate_discovery");
+            match explicit_provider {
+                Some(provider) => provider.find_candidates(target, analyzer),
+                None => {
+                    find_default_candidates_with_cancellation(target, analyzer, &self.cancellation)
+                }
+            }
         };
         if self.cancellation.is_cancelled() {
             return cancelled_query_result();
@@ -123,11 +129,18 @@ impl UsageFinder {
         let mut protected_candidates = candidates.clone();
 
         if explicit_provider.is_none() {
-            add_php_composer_candidates(target, analyzer, &mut candidates);
+            {
+                let _scope =
+                    crate::profiling::scope("usages::UsageFinder::php_composer_candidates");
+                add_php_composer_candidates(target, analyzer, &mut candidates);
+            }
             if self.cancellation.is_cancelled() {
                 return cancelled_query_result();
             }
-            add_php_import_alias_candidates(target, analyzer, &mut candidates);
+            {
+                let _scope = crate::profiling::scope("usages::UsageFinder::php_alias_candidates");
+                add_php_import_alias_candidates(target, analyzer, &mut candidates);
+            }
         }
 
         if let Some(filter) = self.file_filter.as_ref() {
@@ -153,13 +166,16 @@ impl UsageFinder {
             self.authoritative_scope,
             &self.cancellation,
         );
-        let result = match graph_find_usages(
-            language_for_target(target),
-            analyzer,
-            overloads,
-            &scan_scope,
-            max_usages,
-        ) {
+        let result = match {
+            let _scope = crate::profiling::scope("usages::UsageFinder::graph_find_usages");
+            graph_find_usages(
+                language_for_target(target),
+                analyzer,
+                overloads,
+                &scan_scope,
+                max_usages,
+            )
+        } {
             GraphUsageOutcome::Resolved(result) => result,
             GraphUsageOutcome::FallbackSafe(diagnostic) => {
                 graph_failure = Some(diagnostic.clone());
