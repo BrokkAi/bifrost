@@ -783,7 +783,7 @@ fn spawn_formatter_once(command: &FormatterCommand) -> std::io::Result<Formatter
 
     #[cfg(windows)]
     {
-        return FormatterProcess::spawn_windows(builder);
+        FormatterProcess::spawn_windows(builder)
     }
 
     #[cfg(not(windows))]
