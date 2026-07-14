@@ -22,6 +22,20 @@ fn serialized(result: &CodeQueryResult) -> Value {
     serde_json::to_value(result).expect("query result should serialize")
 }
 
+fn result_fq_names(value: &Value) -> Vec<String> {
+    value["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|result| {
+            result["fq_name"]
+                .as_str()
+                .expect("declaration fq_name")
+                .to_string()
+        })
+        .collect()
+}
+
 #[test]
 fn enclosing_decl_is_inclusive_and_excludes_file_scope() {
     let files = [(
@@ -568,6 +582,284 @@ fn intermediate_budget_exhaustion_never_returns_wrong_terminal_type() {
         "{:?}",
         result.diagnostics
     );
+}
+
+#[test]
+fn hierarchy_steps_are_direct_by_default_and_depth_is_a_bounded_closure() {
+    let files = [(
+        "hierarchy.py",
+        "class Root:\n    pass\n\nclass Left(Root):\n    pass\n\nclass Right(Root):\n    pass\n\nclass Leaf(Left, Right):\n    pass\n",
+    )];
+
+    let direct = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Leaf" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }]
+        }),
+    ));
+    assert_eq!(
+        result_fq_names(&direct),
+        vec!["hierarchy.Left", "hierarchy.Right"]
+    );
+
+    let bounded = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Leaf" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "supertypes", "depth": 2 }
+            ]
+        }),
+    ));
+    assert_eq!(
+        result_fq_names(&bounded),
+        vec!["hierarchy.Left", "hierarchy.Right", "hierarchy.Root"]
+    );
+    let root = bounded["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["fq_name"] == "hierarchy.Root")
+        .unwrap();
+    assert_eq!(root["provenance"].as_array().unwrap().len(), 2, "{bounded}");
+    assert!(
+        root["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|trace| trace["steps"].as_array().unwrap().len() == 3),
+        "enclosing_decl plus two hierarchy edges should be visible: {bounded}"
+    );
+
+    let descendants = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Root" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "subtypes", "transitive": true }
+            ]
+        }),
+    ));
+    assert_eq!(
+        result_fq_names(&descendants),
+        vec!["hierarchy.Left", "hierarchy.Right", "hierarchy.Leaf"]
+    );
+}
+
+#[test]
+fn members_and_owner_preserve_overload_identity_and_round_trip() {
+    let files = [(
+        "Service.java",
+        "class Service {\n  int value;\n  int run(int input) { return input; }\n  String run(String input) { return input; }\n  class Nested {}\n}\n",
+    )];
+    let members = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Service" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "members" }]
+        }),
+    ));
+    let results = members["results"].as_array().unwrap();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result["fq_name"] == "Service.run")
+            .count(),
+        2,
+        "{members}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result["fq_name"] == "Service.value"),
+        "{members}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result["fq_name"] == "Service.Nested"),
+        "{members}"
+    );
+
+    let owner = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Service" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "owner" }
+            ]
+        }),
+    ));
+    assert_eq!(result_fq_names(&owner), vec!["Service"]);
+    assert!(owner["results"][0]["provenance"].as_array().unwrap().len() >= 4);
+}
+
+#[test]
+fn ruby_modules_are_type_owners_for_members_and_owner() {
+    let result = serialized(&run(
+        &[("tools.rb", "module Tools\n  def run\n  end\nend\n")],
+        json!({
+            "match": { "kind": "class", "name": "Tools" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "owner" }
+            ]
+        }),
+    ));
+    assert_eq!(result_fq_names(&result), vec!["Tools"]);
+    assert_eq!(result["results"][0]["kind"], "module", "{result}");
+}
+
+#[test]
+fn invalid_semantic_inputs_are_diagnostic_but_supported_leaves_are_not() {
+    let files = [(
+        "app.py",
+        "def helper():\n    pass\n\nclass Leaf:\n    pass\n",
+    )];
+    let invalid = run(
+        &files,
+        json!({
+            "match": { "kind": "function", "name": "helper" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "members" }]
+        }),
+    );
+    assert!(invalid.results.is_empty());
+    assert!(
+        invalid
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("not a type declaration")),
+        "{:?}",
+        invalid.diagnostics
+    );
+
+    let invalid_hierarchy = run(
+        &files,
+        json!({
+            "match": { "kind": "function", "name": "helper" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }]
+        }),
+    );
+    assert!(invalid_hierarchy.results.is_empty());
+    assert!(
+        invalid_hierarchy
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("not a supported type declaration")),
+        "{:?}",
+        invalid_hierarchy.diagnostics
+    );
+
+    let leaf = run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Leaf" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }]
+        }),
+    );
+    assert!(leaf.results.is_empty());
+    assert!(leaf.diagnostics.is_empty(), "{:?}", leaf.diagnostics);
+}
+
+#[test]
+fn hierarchy_preserves_module_scoped_identity_and_cycles_do_not_return_the_seed() {
+    let exact = serialized(&run(
+        &[
+            ("p1/Base.java", "package p1; public class Base {}\n"),
+            ("p2/Base.java", "package p2; public class Base {}\n"),
+            (
+                "p1/Child.java",
+                "package p1; public class Child extends Base {}\n",
+            ),
+        ],
+        json!({
+            "match": { "kind": "class", "name": "Child" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }]
+        }),
+    ));
+    assert_eq!(result_fq_names(&exact), vec!["p1.Base"]);
+
+    let cyclic = serialized(&run(
+        &[("cycle.py", "class A(B):\n    pass\nclass B(A):\n    pass\n")],
+        json!({
+            "match": { "kind": "class", "name": "A" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "supertypes", "transitive": true }
+            ]
+        }),
+    ));
+    assert_eq!(result_fq_names(&cyclic), vec!["cycle.B"]);
+}
+
+#[test]
+fn hierarchy_does_not_manufacture_unindexed_library_declarations() {
+    let result = run(
+        &[("app.py", "class Local(ExternalLibraryType):\n    pass\n")],
+        json!({
+            "match": { "kind": "class", "name": "Local" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }]
+        }),
+    );
+    assert!(result.results.is_empty());
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn hierarchy_budget_is_terminally_partial_but_not_intermediately_mistyped() {
+    let project = InlineTestProject::new()
+        .file(
+            "hierarchy.py",
+            "class Root:\n    pass\nclass Left(Root):\n    pass\nclass Right(Root):\n    pass\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let terminal = CodeQuery::from_json(&json!({
+        "match": { "kind": "class", "name": "Root" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "subtypes", "transitive": true }
+        ]
+    }))
+    .unwrap();
+    let terminal = execute_with_limits(
+        workspace.analyzer(),
+        &terminal,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(terminal.truncated);
+    assert_eq!(terminal.results.len(), 1);
+
+    let intermediate = CodeQuery::from_json(&json!({
+        "match": { "kind": "class", "name": "Root" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "subtypes", "transitive": true },
+            { "op": "members" }
+        ]
+    }))
+    .unwrap();
+    let intermediate = execute_with_limits(
+        workspace.analyzer(),
+        &intermediate,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(intermediate.truncated);
+    assert!(intermediate.results.is_empty());
 }
 
 #[test]

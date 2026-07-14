@@ -13,7 +13,7 @@ The feature is observable through JSON and RQL queries, exact tagged declaration
 - [x] (2026-07-14 07:56Z) Rebased the clean issue branch onto current `origin/master` and inspected the existing typed-pipeline, schema, execution, and documentation seams.
 - [x] (2026-07-14 07:56Z) Created this self-contained ExecPlan with the agreed public syntax and milestones.
 - [x] (2026-07-14 08:15Z) Milestone 1: added the configured public query IR, JSON/RQL syntax, declarative step-field registry, schema/help/MCP/grammar surfaces, CLI example, and parser/editor tests.
-- [ ] Milestone 2: implement budgeted exact hierarchy/member execution, diagnostics, provenance, and focused integration tests.
+- [x] (2026-07-14 08:40Z) Milestone 2: implemented budgeted exact hierarchy/member execution, diagnostics, provenance, and focused integration tests.
 - [ ] Milestone 3: add executable examples for all four operations to all eleven language cookbooks and update public reference documentation.
 - [ ] Milestone 4: run the complete Rust and docs validation bundle, review the full diff, fix findings, and record the outcome.
 
@@ -24,6 +24,9 @@ The feature is observable through JSON and RQL queries, exact tagged declaration
 
 - Observation: configured hierarchy steps make `QueryStep` non-`Copy`, while the existing executor and provenance structs currently copy each step by value.
   Evidence: `src/analyzer/structural/query/ir.rs` defines only four fieldless variants and `src/analyzer/structural/search.rs` iterates with `for (step_index, &step)`.
+
+- Observation: invoking clippy against the shared target directory selects Homebrew's clippy driver while existing artifacts came from rustup's identically labelled 1.96 compiler, producing incompatible-crate errors despite matching release labels.
+  Evidence: `which -a` reports `/opt/homebrew/bin/cargo-clippy` and `/opt/homebrew/bin/clippy-driver` ahead of rustup's binaries; focused tests pass, and final clippy validation must put the rustup toolchain first in `PATH` and use an isolated target directory.
 
 ## Decision Log
 
@@ -49,9 +52,9 @@ The feature is observable through JSON and RQL queries, exact tagged declaration
 
 ## Outcomes & Retrospective
 
-Implementation has not started beyond repository orientation and this plan. Update this section after each milestone and at completion.
-
 Milestone 1 now provides the complete public syntax without execution semantics. JSON and RQL canonicalize named hierarchy options identically, invalid configurations point to their exact fields, and the declarative registries drive help for the new forms and fields.
+
+Milestone 2 projects semantic results through the analyzer's bulk indexed-declaration/range API and traverses hierarchy relations iteratively under the existing pipeline budget. Exact identity survives same-name declarations and overloads; path-local cycle guards retain diamond provenance; invalid input shapes are aggregated by operation and language while legitimate leaves and unindexed external declarations remain silent. The 28 focused pipeline tests and the existing Go, Rust, Ruby, and multi-analyzer hierarchy suites pass.
 
 ## Context and Orientation
 
@@ -132,3 +135,5 @@ The serialized JSON step objects are exactly `{ "op": "supertypes" }`, `{ "op": 
 Revision note (2026-07-14 07:56Z): Created the initial implementation-ready plan from issue #716, the approved implementation plan, and current repository structure.
 
 Revision note (2026-07-14 08:15Z): Marked the public-syntax milestone complete after adding configured IR, shared schema metadata, MCP/editor/CLI surfaces, and passing 53 focused query parser/source tests plus the MCP schema test.
+
+Revision note (2026-07-14 08:40Z): Marked execution milestone complete after reviewing exact projection, replacing per-declaration range lookups with the bulk primary-range API, and passing focused pipeline and hierarchy-provider suites.

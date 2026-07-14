@@ -196,8 +196,8 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit>;
 
-    fn supports_type_hierarchy(&self, _code_unit: &CodeUnit) -> bool {
-        true
+    fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
+        code_unit.is_class()
     }
 
     fn get_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {

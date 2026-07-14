@@ -289,7 +289,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
-            .is_some()
+            .is_some_and(|provider| provider.supports_type_hierarchy(code_unit))
     }
 
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {

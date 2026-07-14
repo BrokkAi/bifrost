@@ -47,6 +47,10 @@ impl RubyAnalyzer {
 }
 
 impl TypeHierarchyProvider for RubyAnalyzer {
+    fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
+        code_unit.is_class() || code_unit.is_module()
+    }
+
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
             return (*cached).clone();
