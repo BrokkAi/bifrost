@@ -729,11 +729,14 @@ fn object_initializer_label_owner_resolution(
             LabelOwnerResolution::MatchesTarget
         }
         crate::analyzer::usages::local_inference::SymbolResolution::Unknown
-            if resolves_to_target(
-                ctx.csharp,
+            if resolves_to_target_at(
                 ctx.file,
+                &ctx.class_ranges,
                 &reference_type_text(type_node, ctx.source),
+                type_node,
+                ctx.source,
                 &ctx.spec.owner,
+                ctx.csharp,
             ) =>
         {
             LabelOwnerResolution::MatchesTarget

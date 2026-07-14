@@ -4737,6 +4737,87 @@ public sealed class Dto {
 }
 
 #[test]
+fn csharp_graph_object_initializer_label_matches_logical_partial_type() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/HttpPipeline.cs",
+            r#"namespace Example;
+public partial class HttpPipeline {
+    public object Terminal { get; set; } = new object();
+}
+"#,
+        ),
+        (
+            "src/ISendAsync.cs",
+            r#"namespace Example;
+public partial class HttpPipeline {
+    private object pipeline = new object();
+    public HttpPipeline Clone() => new HttpPipeline { pipeline = this.pipeline };
+}
+"#,
+        ),
+    ]);
+
+    let pipeline = member_field(&analyzer, "Example.HttpPipeline", "pipeline");
+    let hits = graph_hits(&analyzer, &pipeline);
+    let source = project.file("src/ISendAsync.cs").read_to_string().unwrap();
+    let initializer_start = source
+        .find("pipeline = this.pipeline")
+        .expect("initializer assignment");
+    let receiver_start = initializer_start + "pipeline = this.".len();
+
+    for expected_start in [initializer_start, receiver_start] {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == project.file("src/ISendAsync.cs")
+                    && hit.start_offset <= expected_start
+                    && expected_start + "pipeline".len() <= hit.end_offset
+            }),
+            "both initializer-label and ordinary field references should resolve across physical parts of the same logical partial type: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn csharp_graph_partial_type_name_does_not_beat_pascal_case_value_receiver() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/A.cs",
+            r#"namespace Example;
+public partial class HttpPipeline {}
+"#,
+        ),
+        (
+            "src/B.cs",
+            r#"namespace Example;
+public partial class HttpPipeline {
+    public void Run() {}
+}
+"#,
+        ),
+        (
+            "src/Consumer.cs",
+            r#"namespace Example;
+public sealed class Other {
+    public void Run() {}
+}
+public sealed class Consumer {
+    public void Invoke(Other HttpPipeline) { HttpPipeline.Run(); }
+}
+"#,
+        ),
+    ]);
+
+    let target = member_function(&analyzer, "Example.HttpPipeline", "Run");
+    let hits = graph_hits(&analyzer, &target);
+
+    assert!(
+        hits.is_empty(),
+        "a value binding must beat a same-spelled visible partial type: {hits:#?}"
+    );
+}
+
+#[test]
 fn csharp_definition_resolves_object_initializer_label_to_property() {
     let (project, _analyzer) = csharp_analyzer_with_files(&[(
         "src/Service.cs",
