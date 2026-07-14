@@ -1819,6 +1819,115 @@ CycleA cyclic_value;
 }
 
 #[test]
+fn authoritative_cpp_usage_accepts_variadic_calls_above_fixed_minimum() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("trace.h", "void trace(const char *fmt, ...);\n"),
+        (
+            "consumer.c",
+            r#"#include "trace.h"
+
+void run(void) {
+    trace("value=%d", 1);
+    trace("pair=%d,%d", 1, 2);
+    trace();
+}
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "trace"
+            && slash_path(unit.source()) == "trace.h"
+    });
+    let consumer = project.file("consumer.c");
+    let source = consumer.read_to_string().expect("consumer source");
+    let trace_starts = source
+        .match_indices("trace(")
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    assert_eq!(3, trace_starts.len(), "test fixture call count");
+
+    let valid_start = trace_starts[0];
+    let line_start = source[..valid_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source[..valid_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..valid_start].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.c".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let forward_result = &forward.results[0];
+    assert_eq!("resolved", forward_result.status, "{forward_result:#?}");
+    assert!(
+        forward_result
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("trace")),
+        "forward lookup should resolve the variadic header declaration: {forward_result:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative variadic C++ success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("trace should have a proven-hit bucket");
+    assert_eq!(
+        2,
+        hits.len(),
+        "only calls meeting the fixed minimum should be proven; target={target:#?}, hits={hits:#?}"
+    );
+    for valid_start in &trace_starts[..2] {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= *valid_start
+                    && *valid_start + "trace".len() <= hit.end_offset
+            }),
+            "valid variadic call at {valid_start} should be proven: {hits:#?}"
+        );
+    }
+    let invalid_start = trace_starts[2];
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != consumer
+                || invalid_start < hit.start_offset
+                || hit.end_offset < invalid_start + "trace".len()
+        }),
+        "zero-argument call below the fixed minimum must not be proven: {hits:#?}"
+    );
+}
+
+#[test]
 fn cpp_graph_rejects_unrelated_same_name_without_include_visibility() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         ("target.h", "struct Target { void run(); };\n"),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{ParameterMetadata, SignatureMetadata};
+use crate::analyzer::{CallableArity, ParameterMetadata, SignatureMetadata};
 use regex::Regex;
 use tree_sitter::Node;
 
@@ -1579,12 +1579,15 @@ fn enclosing_cpp_declaration_node(mut node: Node<'_>) -> Option<Node<'_>> {
 fn cpp_parameter_signature(parameters_node: Node<'_>, source: &str) -> String {
     let mut params = Vec::new();
     let mut cursor = parameters_node.walk();
-    for child in parameters_node.named_children(&mut cursor) {
+    for child in parameters_node.children(&mut cursor) {
         match child.kind() {
             "parameter_declaration" | "optional_parameter_declaration" => {
                 params.push(cpp_parameter_type(child, source));
             }
-            "variadic_parameter" => params.push("...".to_string()),
+            "variadic_parameter_declaration" => {
+                params.push(cpp_parameter_type(child, source));
+            }
+            "variadic_parameter" | "..." => params.push("...".to_string()),
             _ => {}
         }
     }
@@ -1604,13 +1607,14 @@ fn cpp_signature_metadata(
     let Some(parameters_node) = function_declarator.child_by_field_name("parameters") else {
         return SignatureMetadata::new(signature, Vec::new());
     };
+    let callable_arity = cpp_callable_arity(parameters_node, source);
     let parameter_text = normalize_cpp_whitespace(node_text(parameters_node, source));
     let search_from = cpp_signature_search_start(&signature, function_declarator, source);
     let Some(relative_start) = signature
         .get(search_from..)
         .and_then(|suffix| suffix.find(&parameter_text))
     else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return SignatureMetadata::new(signature, Vec::new()).with_callable_arity(callable_arity);
     };
     let parameters_start = search_from + relative_start;
     let parameters_end = parameters_start + parameter_text.len();
@@ -1630,13 +1634,41 @@ fn cpp_signature_metadata(
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
+    SignatureMetadata::new(signature, parameters).with_callable_arity(callable_arity)
+}
+
+fn cpp_callable_arity(parameters_node: Node<'_>, source: &str) -> CallableArity {
+    let mut required = 0;
+    let mut total = 0;
+    let mut repeated = false;
+    let mut cursor = parameters_node.walk();
+    for child in parameters_node.children(&mut cursor) {
+        match child.kind() {
+            "parameter_declaration" => {
+                if child.child_by_field_name("declarator").is_none()
+                    && child
+                        .child_by_field_name("type")
+                        .is_some_and(|type_node| node_text(type_node, source).trim() == "void")
+                {
+                    continue;
+                }
+                required += 1;
+                total += 1;
+            }
+            "optional_parameter_declaration" => total += 1,
+            "variadic_parameter" | "variadic_parameter_declaration" | "..." => {
+                repeated = true;
+            }
+            _ => {}
+        }
+    }
+    CallableArity::new(required, total, repeated)
 }
 
 fn cpp_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
     let mut labels = Vec::new();
     let mut cursor = parameters_node.walk();
-    for child in parameters_node.named_children(&mut cursor) {
+    for child in parameters_node.children(&mut cursor) {
         match child.kind() {
             "parameter_declaration" | "optional_parameter_declaration" => {
                 if let Some(name_node) = child
@@ -1648,7 +1680,9 @@ fn cpp_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
                     labels.push(child);
                 }
             }
-            "variadic_parameter" => labels.push(child),
+            "variadic_parameter" | "variadic_parameter_declaration" | "..." => {
+                labels.push(child);
+            }
             _ => {}
         }
     }

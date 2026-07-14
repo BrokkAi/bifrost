@@ -865,6 +865,64 @@ fn cpp_signature_metadata_labels_unnamed_pointer_parameters() {
 }
 
 #[test]
+fn cpp_signature_metadata_records_optional_and_variadic_callable_arity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "callables.hpp",
+            r#"
+            void trace(const char *fmt, ...);
+            void optional(int required, int value = 0);
+            template<typename... Args>
+            void pack(int required, Args... rest);
+            "#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("callables.hpp"));
+
+    for name in ["trace", "pack"] {
+        let function = declarations
+            .iter()
+            .find(|unit| unit.is_function() && base_function_name(unit) == name)
+            .unwrap_or_else(|| panic!("missing declaration for {name}: {declarations:#?}"));
+        assert!(
+            function
+                .signature()
+                .is_some_and(|signature| signature.contains("...")),
+            "variadic marker missing from {name} signature: {function:#?}"
+        );
+    }
+
+    let arity_for = |name: &str| {
+        let function = declarations
+            .iter()
+            .find(|unit| unit.is_function() && base_function_name(unit) == name)
+            .unwrap_or_else(|| panic!("missing declaration for {name}: {declarations:#?}"));
+        analyzer
+            .signature_metadata(function)
+            .into_iter()
+            .find_map(|metadata| metadata.callable_arity())
+            .unwrap_or_else(|| panic!("missing callable arity for {}", function.fq_name()))
+    };
+
+    let trace = arity_for("trace");
+    assert!(!trace.accepts(0));
+    assert!(trace.accepts(1));
+    assert!(trace.accepts(3));
+
+    let optional = arity_for("optional");
+    assert!(!optional.accepts(0));
+    assert!(optional.accepts(1));
+    assert!(optional.accepts(2));
+    assert!(!optional.accepts(3));
+
+    let pack = arity_for("pack");
+    assert!(!pack.accepts(0));
+    assert!(pack.accepts(1));
+    assert!(pack.accepts(3));
+}
+
+#[test]
 fn cpp_signature_metadata_anchors_multi_declarator_parameters() {
     let project = inline_cpp_project(&[(
         "multi.hpp",

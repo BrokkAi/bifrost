@@ -5,7 +5,7 @@ use crate::analyzer::usages::cpp_call_match::{
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
+    CallableArity, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
     cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
     resolve_include_targets_with_index,
 };
@@ -33,7 +33,7 @@ pub(super) struct TargetSpec {
     pub(super) member_name: String,
     pub(super) owner_fq_name: Option<String>,
     pub(super) owner_cpp_name: Option<String>,
-    pub(super) method_arity: Option<usize>,
+    pub(super) callable_arity: Option<CallableArity>,
     pub(super) param_types: Option<Vec<String>>,
 }
 
@@ -91,7 +91,7 @@ impl TargetSpec {
                 kind,
                 owner,
                 target.identifier().to_string(),
-                Some(signature_arity(target.signature())),
+                Some(cpp_callable_arity(analyzer, target)),
                 target.signature().and_then(cpp_signature_param_types),
             ));
         }
@@ -104,7 +104,7 @@ impl TargetSpec {
         kind: TargetKind,
         owner: Option<CodeUnit>,
         member_name: String,
-        method_arity: Option<usize>,
+        callable_arity: Option<CallableArity>,
         param_types: Option<Vec<String>>,
     ) -> Self {
         let owner_fq_name = owner.as_ref().map(CodeUnit::fq_name);
@@ -116,7 +116,7 @@ impl TargetSpec {
             member_name,
             owner_fq_name,
             owner_cpp_name,
-            method_arity,
+            callable_arity,
             param_types,
         }
     }
@@ -533,8 +533,7 @@ impl VisibilityIndex {
         for function in
             self.named_candidates_for_normalized(file, &normalized, TargetKind::FreeFunction)
         {
-            let signature = cpp_function_signature_text(analyzer, function)?;
-            if signature_arity(Some(&signature)) == arity {
+            if cpp_callable_arity(analyzer, function).accepts(arity) {
                 candidates.push(function.clone());
             }
         }
@@ -848,7 +847,7 @@ fn resolve_static_method_call_return_binding(
     let candidates = visibility
         .visible_members_for_owner_name(file, &owner, member_name)
         .into_iter()
-        .filter(|unit| unit.is_function() && signature_arity(unit.signature()) == arity)
+        .filter(|unit| unit.is_function() && cpp_callable_arity(analyzer, unit).accepts(arity))
         .cloned()
         .collect::<Vec<_>>();
     unanimous_return_binding(analyzer, visibility, file, &candidates)
@@ -879,7 +878,9 @@ fn resolve_field_method_call_return_binding(
             visibility
                 .visible_members_for_owner_name(file, &owner, member_name)
                 .into_iter()
-                .filter(|unit| unit.is_function() && signature_arity(unit.signature()) == arity)
+                .filter(|unit| {
+                    unit.is_function() && cpp_callable_arity(analyzer, unit).accepts(arity)
+                })
                 .cloned(),
         );
     }
@@ -1102,6 +1103,14 @@ pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> u
         return 0;
     }
     cpp_split_top_level_commas(inner).count()
+}
+
+pub(super) fn cpp_callable_arity(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> CallableArity {
+    analyzer
+        .signature_metadata(unit)
+        .into_iter()
+        .find_map(|metadata| metadata.callable_arity())
+        .unwrap_or_else(|| CallableArity::exact(signature_arity(unit.signature())))
 }
 
 pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {

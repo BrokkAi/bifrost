@@ -439,8 +439,8 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if field_initializer_constructs_target(node, ctx, owner)
             && ctx
                 .spec
-                .method_arity
-                .is_none_or(|expected| call_arity(node) == expected)
+                .callable_arity
+                .is_none_or(|expected| expected.accepts(call_arity(node)))
         {
             push_hit(node, ctx);
         }
@@ -451,8 +451,8 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             && declaration_mentions_type(node, ctx, owner)
             && ctx
                 .spec
-                .method_arity
-                .is_none_or(|expected| declaration_constructor_arity(node, ctx) == expected)
+                .callable_arity
+                .is_none_or(|expected| expected.accepts(declaration_constructor_arity(node, ctx)))
         {
             push_hit(node, ctx);
         }
@@ -466,8 +466,8 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.method_arity
-        && call_arity(node) != expected
+    if let Some(expected) = ctx.spec.callable_arity
+        && !expected.accepts(call_arity(node))
     {
         return;
     }
@@ -504,8 +504,8 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.method_arity
-        && call_arity(node) != expected
+    if let Some(expected) = ctx.spec.callable_arity
+        && !expected.accepts(call_arity(node))
     {
         return;
     }
@@ -539,9 +539,8 @@ fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) 
     let mut candidates = ctx
         .visibility
         .named_candidates(ctx.file, text, TargetKind::FreeFunction);
-    if let Some(expected) = ctx.spec.method_arity {
-        candidates.retain(|unit| signature_arity(unit.signature()) == expected);
-    }
+    let arity = call_arity(call);
+    candidates.retain(|unit| cpp_callable_arity(ctx.analyzer, unit).accepts(arity));
     if candidates.is_empty()
         || !candidates
             .iter()
@@ -715,8 +714,8 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         *ctx.raw_match_count += 1;
-        if let Some(expected) = ctx.spec.method_arity
-            && call_arity(node) != expected
+        if let Some(expected) = ctx.spec.callable_arity
+            && !expected.accepts(call_arity(node))
         {
             return;
         }
@@ -742,8 +741,8 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.method_arity
-        && call_arity(node) != expected
+    if let Some(expected) = ctx.spec.callable_arity
+        && !expected.accepts(call_arity(node))
     {
         return;
     }
@@ -779,9 +778,8 @@ fn method_call_may_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .filter(|unit| unit.is_function())
         .cloned()
         .collect::<Vec<_>>();
-    if let Some(expected) = ctx.spec.method_arity {
-        candidates.retain(|unit| signature_arity(unit.signature()) == expected);
-    }
+    let arity = call_arity(call);
+    candidates.retain(|unit| cpp_callable_arity(ctx.analyzer, unit).accepts(arity));
     if candidates.is_empty()
         || !candidates
             .iter()
@@ -901,10 +899,10 @@ fn callable_declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
 
 fn function_definition_signature_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let definition = node_text(node, ctx.source);
-    let Some(expected) = ctx.spec.method_arity else {
+    let Some(expected) = ctx.spec.callable_arity else {
         return true;
     };
-    if signature_arity(Some(definition)) != expected {
+    if !expected.accepts(signature_arity(Some(definition))) {
         return false;
     }
     let Some(target_signature) = ctx.spec.target.signature() else {
