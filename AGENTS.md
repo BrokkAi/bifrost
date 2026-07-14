@@ -75,7 +75,9 @@ artifacts are deliberately needed after the command; retained targets are marked
 
 Use `scripts/cleanup-bifrost-tmp.sh` to inspect stale Bifrost temporary directories. It is a dry run by default; review
 its candidates before rerunning with `--apply`. The command skips young directories, live helper PIDs, open directories,
-symlinks, and intentionally retained targets.
+symlinks, and intentionally retained targets. Apply mode automatically removes only directories carrying the helper's
+managed-target marker. Historical manually named `bifrost-*` directories remain report-only unless you explicitly add
+`--include-unmanaged` after reviewing them.
 
 For `bifrost_reference_differential`, use `--cache-mode ephemeral` for one-off smoke runs that should not write
 `.brokk/bifrost_cache.db`. Keep the default `--cache-mode persisted` for deliberately warmed or resumable corpus

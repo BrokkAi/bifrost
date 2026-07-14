@@ -17,6 +17,9 @@ The behavior is observable without a large build: run the isolated-target helper
 - [x] (2026-07-14T11:48Z) Added explicit persisted and ephemeral reference-differential cache modes, preserving persisted mode as the default.
 - [x] (2026-07-14T11:48Z) Updated `AGENTS.md` with the commands and the smoke-versus-campaign cache policy.
 - [x] (2026-07-14T11:53Z) Ran shell syntax checks, formatting, 11 focused integration tests, strict all-feature Clippy in a clean pinned-toolchain target, a manual helper smoke, and the final safety diff review.
+- [x] (2026-07-14T12:30Z) Ran the requested five-perspective guided review against `origin/master` and queued all seven deduplicated findings.
+- [x] (2026-07-14T12:45Z) Hardened managed-directory provenance, ownership/inode revalidation, quarantine deletion, process-group shutdown, Linux timestamp probing, age bounds, and deletion-error reporting; removed duplicated root policy and CLI fixtures.
+- [x] (2026-07-14T13:02Z) Re-ran 16 focused tests, strict all-feature Clippy, shell syntax and diff checks, then obtained post-fix security and operational APPROVE verdicts with no remaining high- or medium-severity findings.
 
 ## Surprises & Discoveries
 
@@ -30,6 +33,10 @@ The behavior is observable without a large build: run the isolated-target helper
   Evidence: the available tool inventory exposed the GitHub connector but no `search_symbols`, `get_summaries`, or `get_symbol_sources` tool, so repository exploration used narrow `rg` and source reads instead.
 - Observation: the ordinary strict Clippy command selected Homebrew Rust against Rustup-built shared artifacts and failed with `E0514`, even though both compilers report version 1.96.0.
   Evidence: the first run reported incompatible metadata for 30 dependencies. Pinning `PATH` to `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` and running Clippy through `scripts/with-isolated-cargo-target.sh` passed in 1 minute 29 seconds, after which the helper removed `/private/tmp/bifrost-cargo-target.jCvDMA`.
+- Observation: a failed BSD-style `stat -f '%m'` probe can still emit GNU filesystem-status output before the GNU fallback runs.
+  Evidence: GNU `gstat` returned status 1 but printed a filesystem report followed by the fallback epoch, producing a nonnumeric multiline timestamp. The shared helper now captures and validates each dialect separately and tries GNU first.
+- Observation: macOS `lsof +D` can print a matching open directory while returning status 1.
+  Evidence: the open-directory regression showed the holder process in `lsof` output but the original status-only check treated the directory as inactive. Cleanup now requests field output and treats any nonempty result as active before interpreting status.
 
 ## Decision Log
 
@@ -45,12 +52,21 @@ The behavior is observable without a large build: run the isolated-target helper
 - Decision: update `AGENTS.md` rather than rewrite historical ExecPlan evidence.
   Rationale: old plans record commands that were actually run. New repository-wide guidance prevents recurrence while preserving the accuracy of those living records.
   Date/Author: 2026-07-14 / Codex.
+- Decision: automatic apply requires an exact `bifrost-cargo-target.*` name, a versioned managed marker matching the basename/current UID, and current-UID ownership; historical unmarked directories require `--include-unmanaged`.
+  Rationale: prefix, age, and one activity snapshot do not prove that a directory belongs to this helper. The explicit legacy option retains recovery capability without making unrelated Bifrost worktrees automatic deletion targets.
+  Date/Author: 2026-07-14 / guided-review fix batch.
+- Decision: apply mode records device/inode/owner, revalidates immediately before moving the candidate to a same-root quarantine name, verifies the moved inode, checks activity again, then deletes.
+  Rationale: moving and revalidating the checked inode closes the pathname-replacement window and prevents a newly substituted active directory from being passed to `rm -rf`.
+  Date/Author: 2026-07-14 / guided-review fix batch.
+- Decision: the isolated command runs in its own process group, and interruption signals the group with a bounded grace period followed by `KILL`; ordinary completion also terminates surviving descendants before cleanup.
+  Rationale: direct-child supervision is insufficient for Cargo/rustc/linker trees and can either delete live output or hang forever on a signal-ignoring child.
+  Date/Author: 2026-07-14 / guided-review fix batch.
 
 ## Outcomes & Retrospective
 
-Completed on 2026-07-14. The isolated helper removes its target on success, failure, and `TERM`, records both the helper and direct-child PIDs for stale-cleanup protection, and can retain a marked target explicitly. Cleanup is dry-run by default and the focused tests prove its path, age, PID, open-directory, retained-marker, and symlink exclusions. The differential CLI defaults to persisted behavior and offers an ephemeral in-memory mode that leaves `.brokk/bifrost_cache.db` absent. `AGENTS.md` makes these commands and the cache policy the repository-wide default for future validation.
+Completed initially on 2026-07-14, then reopened for the requested guided-review fix batch. The isolated helper now supervises the complete command process group rather than only one PID, bounds interruption, and retains rather than deleting if the group cannot be stopped. Cleanup is dry-run by default, automatically applies only to helper-managed/current-UID targets, atomically quarantines the validated inode, and requires explicit opt-in for historical unmarked directories. The differential CLI still defaults to persisted behavior and offers an ephemeral in-memory mode that leaves `.brokk/bifrost_cache.db` absent. All seven guided-review findings were applied and verified; the post-fix security and operational reviews both returned APPROVE with no remaining high- or medium-severity findings.
 
-Validation passed: `bash -n` for both scripts; `cargo fmt --check`; `cargo test --test temp_storage_scripts --test bifrost_reference_differential_cli` with 11 tests passed; a manual clean-on-exit smoke; `git diff --check`; and `cargo clippy --all-targets --all-features -- -D warnings` through the isolated helper with a pinned Rustup toolchain. The final review strengthened the active marker to include the child PID as well as the helper PID, covering a helper killed before it can clean up while Cargo remains alive.
+Validation passed: `bash -n` for all three scripts; `cargo fmt --check`; `cargo test --test temp_storage_scripts --test bifrost_reference_differential_cli` with 16 tests passed; a manual clean-on-exit smoke; `git diff --check`; and `cargo clippy --all-targets --all-features -- -D warnings` through the isolated helper with a pinned Rustup toolchain. The final review strengthened the active marker to include the child PID as well as the helper PID, covering a helper killed before it can clean up while Cargo remains alive, and separately verified the process-tree and deletion-safety regressions.
 
 ## Context and Orientation
 
@@ -64,9 +80,9 @@ Cargo places compiled dependencies and other build artifacts in `target/`, or in
 
 ## Plan of Work
 
-First add `scripts/with-isolated-cargo-target.sh`. It will reject an empty command, create a `bifrost-cargo-target.XXXXXX` directory with `mktemp`, write its shell PID and direct-child PID to `.bifrost-active-pid`, export `CARGO_TARGET_DIR`, and run the requested command. An exit trap removes the exact created directory. Signal traps forward interruption to the direct child, wait for it, and then exit through the same cleanup path. `BIFROST_KEEP_TARGET=1` replaces deletion with a `.bifrost-keep` marker after removing the active marker.
+First add `scripts/with-isolated-cargo-target.sh`. It rejects an empty command, creates a `bifrost-cargo-target.XXXXXX` directory with `mktemp`, writes a versioned ownership marker plus shell/direct-child PIDs, exports `CARGO_TARGET_DIR`, and runs the requested command in a dedicated process group. Exit removes the exact target only after the process group is gone. Signal traps stop the group with bounded escalation before using the same cleanup path. `BIFROST_KEEP_TARGET=1` replaces deletion with a keep marker after removing the active marker.
 
-Next add `scripts/cleanup-bifrost-tmp.sh`. It will accept `--apply`, `--older-than-hours N`, and a testable `--tmp-root PATH`; default age is 24 hours and the default root is `BIFROST_TMP_ROOT` when set, `/private/tmp` when available, and `${TMPDIR:-/tmp}` otherwise. It will enumerate only direct directories whose basenames start `bifrost-`, never follow symlinks, skip `.bifrost-keep`, skip a live PID from `.bifrost-active-pid`, skip directories newer than the threshold, and skip any candidate for which `lsof +D` reports activity. Apply mode will also skip all candidates if `lsof` is unavailable, because inactivity would not be provable. Dry-run mode reports what would be removed without mutating anything.
+Next add `scripts/cleanup-bifrost-tmp.sh`. It accepts `--apply`, `--include-unmanaged`, `--older-than-hours N`, and a testable `--tmp-root PATH`; default age is 24 hours and root selection lives in `scripts/lib/bifrost-tmp.sh`. It enumerates only direct `bifrost-*` directories, never follows symlinks, and skips retained, live, young, foreign-owned, or open candidates. Automatic apply requires helper provenance. Apply revalidates identity, quarantines by same-root rename, revalidates and rechecks activity, and only then deletes. Failed deletion is reported nonzero and remaining data is restored when possible.
 
 Then extend the reference-differential parser with a small `CacheMode` enum. The default and `persisted` value call `WorkspaceAnalyzer::build_persisted`; `ephemeral` calls `WorkspaceAnalyzer::build`. The choice is operational and does not change differential sampling or the completion fingerprint. Help text will state which mode suits smoke versus resumable runs. Add a CLI test proving ephemeral mode completes and leaves no `.brokk/bifrost_cache.db`; retain the existing default-path coverage and assert that it still creates the persisted cache.
 
@@ -127,10 +143,14 @@ The implementation adds two executable shell scripts, one Rust integration test 
 
 `scripts/with-isolated-cargo-target.sh COMMAND [ARG ...]` must export a unique `CARGO_TARGET_DIR` to the command and support `BIFROST_KEEP_TARGET=1` and `BIFROST_TMP_ROOT=PATH`.
 
-`scripts/cleanup-bifrost-tmp.sh [--apply] [--older-than-hours N] [--tmp-root PATH]` must be dry-run by default. It depends only on POSIX-oriented shell utilities available on macOS and Linux plus `lsof` for apply-time activity proof.
+`scripts/cleanup-bifrost-tmp.sh [--apply] [--include-unmanaged] [--older-than-hours N] [--tmp-root PATH]` must be dry-run by default. It depends only on shell utilities available on macOS and Linux plus `lsof` for apply-time activity proof. `scripts/lib/bifrost-tmp.sh` owns shared root selection and portable stat helpers.
 
 In `src/bin/bifrost_reference_differential.rs`, define a private `CacheMode` with `Persisted` and `Ephemeral`, parse it from `--cache-mode`, and pass it to `run_engine`. No library API changes are needed.
 
 Plan created on 2026-07-14 for issue #745. It records the conservative cleanup boundary and preserves persisted differential behavior by default.
 
 Plan updated on 2026-07-14 after implementation and review to record completed behavior, validation evidence, the mixed-toolchain discovery, and the child-PID safety hardening.
+
+Plan updated again on 2026-07-14 after guided review to record seven queued findings, the provenance/process-group redesign, and the post-fix validation still required.
+
+Plan finalized on 2026-07-14 after all seven findings were fixed, 16 focused tests and strict Clippy passed, and the post-fix security and operational reviewers approved the result.

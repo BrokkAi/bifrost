@@ -79,36 +79,8 @@ fn corpus_exact_repo_and_language_filters_override_size_ranking() {
 
 #[test]
 fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let repo_root = temp.path().join("tiny__rust");
-    fs::create_dir_all(&repo_root).expect("repo root");
-    fs::write(
-        repo_root.join("lib.rs"),
-        "pub fn target() {}\npub fn caller() { target(); }\n",
-    )
-    .expect("rust source");
-    init_repo(&repo_root);
-    let output_path = temp.path().join("report.jsonl");
-
-    let run = || {
-        Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
-            .arg("run-repo")
-            .arg("--root")
-            .arg(&repo_root)
-            .arg("--language")
-            .arg("rust")
-            .arg("--output")
-            .arg(&output_path)
-            .arg("--max-files")
-            .arg("10")
-            .arg("--max-sites")
-            .arg("10")
-            .arg("--max-targets")
-            .arg("10")
-            .output()
-            .expect("run repository differential")
-    };
-    let output = run();
+    let fixture = TinyRepoFixture::new("tiny__rust");
+    let output = fixture.run(&[]);
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
@@ -116,7 +88,7 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let report_text = fs::read_to_string(&output_path).expect("read JSONL report");
+    let report_text = fs::read_to_string(&fixture.output).expect("read JSONL report");
     let lines = report_text.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1, "{report_text}");
     let record: serde_json::Value = serde_json::from_str(lines[0]).expect("parse record");
@@ -127,9 +99,9 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
     assert!(record["bifrost_version"].is_string(), "{record}");
     assert!(record["bifrost_head"].is_string(), "{record}");
     assert!(record["report"]["summary"].is_object(), "{record}");
-    assert!(repo_root.join(".brokk/bifrost_cache.db").is_file());
+    assert!(fixture.root.join(".brokk/bifrost_cache.db").is_file());
 
-    let resumed = run();
+    let resumed = fixture.run(&[]);
     assert!(
         resumed.status.success(),
         "stderr:\n{}",
@@ -141,7 +113,7 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
         String::from_utf8_lossy(&resumed.stderr)
     );
     assert_eq!(
-        fs::read_to_string(&output_path)
+        fs::read_to_string(&fixture.output)
             .expect("read resumed report")
             .lines()
             .count(),
@@ -151,43 +123,16 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
 
 #[test]
 fn run_repo_ephemeral_cache_does_not_create_persisted_database() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let repo_root = temp.path().join("tiny__rust_ephemeral");
-    fs::create_dir_all(&repo_root).expect("repo root");
-    fs::write(
-        repo_root.join("lib.rs"),
-        "pub fn target() {}\npub fn caller() { target(); }\n",
-    )
-    .expect("rust source");
-    init_repo(&repo_root);
-    let output_path = temp.path().join("ephemeral-report.jsonl");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
-        .arg("run-repo")
-        .arg("--root")
-        .arg(&repo_root)
-        .arg("--language")
-        .arg("rust")
-        .arg("--output")
-        .arg(&output_path)
-        .arg("--cache-mode")
-        .arg("ephemeral")
-        .arg("--max-files")
-        .arg("10")
-        .arg("--max-sites")
-        .arg("10")
-        .arg("--max-targets")
-        .arg("10")
-        .output()
-        .expect("run ephemeral repository differential");
+    let fixture = TinyRepoFixture::new("tiny__rust_ephemeral");
+    let output = fixture.run(&["--cache-mode", "ephemeral"]);
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output_path.is_file());
-    assert!(!repo_root.join(".brokk/bifrost_cache.db").exists());
+    assert!(fixture.output.is_file());
+    assert!(!fixture.root.join(".brokk/bifrost_cache.db").exists());
 }
 
 #[test]
@@ -211,6 +156,54 @@ fn invalid_cache_mode_is_rejected() {
         String::from_utf8_lossy(&output.stderr)
             .contains("--cache-mode expects `persisted` or `ephemeral`")
     );
+}
+
+struct TinyRepoFixture {
+    _temp: TempDir,
+    root: std::path::PathBuf,
+    output: std::path::PathBuf,
+}
+
+impl TinyRepoFixture {
+    fn new(slug: &str) -> Self {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join(slug);
+        fs::create_dir_all(&root).expect("repo root");
+        fs::write(
+            root.join("lib.rs"),
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .expect("rust source");
+        init_repo(&root);
+        let output = temp.path().join("report.jsonl");
+        Self {
+            _temp: temp,
+            root,
+            output,
+        }
+    }
+
+    fn run(&self, extra_args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
+            .arg("run-repo")
+            .arg("--root")
+            .arg(&self.root)
+            .arg("--language")
+            .arg("rust")
+            .arg("--output")
+            .arg(&self.output)
+            .args([
+                "--max-files",
+                "10",
+                "--max-sites",
+                "10",
+                "--max-targets",
+                "10",
+            ])
+            .args(extra_args)
+            .output()
+            .expect("run repository differential")
+    }
 }
 
 struct CorpusFixture {
