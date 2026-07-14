@@ -241,6 +241,7 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-typescript",
  "walkdir",
+ "windows-sys 0.61.2",
  "xee-xpath",
  "xot",
  "zip",

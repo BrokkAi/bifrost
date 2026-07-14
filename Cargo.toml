@@ -110,6 +110,17 @@ tempfile = "3.23.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows: formatter processes are born suspended, assigned to a Job Object,
+# then resumed so descendants cannot escape cancellation or timeout cleanup.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 # Full debuginfo made every dev test binary ~600 MB, so target/ grew by
 # terabytes; line tables keep file/line backtraces at a fraction of the size.
 # Bump back to `debug = true` locally when a real debugger session is needed.
