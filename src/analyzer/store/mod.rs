@@ -103,6 +103,16 @@ AND EXISTS (
     AND active_blob.generation = COALESCE(active_epoch.generation, 0)
 )";
 
+const EXACT_PATH_SYMBOL_FQN_SQL: &str =
+    "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
+           exact_fqn, normalized_fqn
+    FROM path_symbol_units INDEXED BY idx_path_symbol_units_lang_exact_fqn
+    WHERE lang = ?1 AND exact_fqn = ?2
+      AND generation = COALESCE(
+        (SELECT generation FROM analysis_epochs WHERE lang = ?1), 0
+      )
+    ORDER BY rel_path, exact_fqn";
+
 const PARSED_BLOB_INTEGRITY_CONDITION: &str = "
 meta.is_complete = 1
 AND EXISTS (
@@ -411,11 +421,19 @@ impl AnalyzerStore {
              ORDER BY rel_path, exact_fqn"
         );
         for lang in langs {
-            let mut stmt = tx.prepare(&sql)?;
-            let mapped = stmt.query_map(params![lang, exact_fqn, normalized_fqn], |row| {
-                Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
-            })?;
-            out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
+            if lang == "python" && exact_fqn == normalized_fqn {
+                let mut stmt = tx.prepare(EXACT_PATH_SYMBOL_FQN_SQL)?;
+                let mapped = stmt.query_map(params![lang, exact_fqn], |row| {
+                    Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
+                })?;
+                out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
+            } else {
+                let mut stmt = tx.prepare(&sql)?;
+                let mapped = stmt.query_map(params![lang, exact_fqn, normalized_fqn], |row| {
+                    Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
+                })?;
+                out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
+            }
         }
         tx.commit()?;
         Ok(out)
@@ -5137,6 +5155,28 @@ mod tests {
         let changes_after_warm_sync = store.conn.lock().expect("store mutex").total_changes();
 
         assert_eq!(changes_after_warm_sync, changes_after_cold_sync);
+    }
+
+    #[test]
+    fn python_exact_path_symbol_lookup_uses_fqn_index() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {EXACT_PATH_SYMBOL_FQN_SQL}"))
+            .unwrap();
+        let plan = stmt
+            .query_map(params!["python", "pkg.service"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_path_symbol_units_lang_exact_fqn")),
+            "expected exact Python lookup to use the FQN index, got {plan:?}"
+        );
     }
 
     #[test]

@@ -50,6 +50,9 @@ resolution work.
 - [x] (2026-07-14) Read return types from the concrete callable's persisted ranges
   and indexed file source. This avoids generic `get_source` re-resolving every
   same-FQN function merely to inspect one already-selected declaration.
+- [x] (2026-07-14) Route exact Python path-symbol lookups through the existing
+  `(lang, exact_fqn)` index, with a query-plan regression that prevents SQLite
+  from reverting to a primary-key scan.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -129,6 +132,15 @@ resolution work.
   indexed source provide the exact structured slice without a workspace lookup.
   Evidence: `/private/tmp/bifrost-675-bounded-direct-children.sample.txt`.
 
+- Observation: After callable source lookup became local, both early and late
+  samples no longer contained global declaration hydration or generic `get_source`.
+  The remaining repeated work was exact module resolution through
+  `path_symbol_rows_by_fqn_for_langs`; its combined exact/normalized predicate and
+  SQL ordering selected the `path_symbol_units` primary key by language rather than
+  the exact-FQN index.
+  Evidence: `/private/tmp/bifrost-675-bounded-callable-source.sample.txt` and
+  `/private/tmp/bifrost-675-bounded-callable-source-later.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -194,6 +206,17 @@ resolution work.
   Rationale: This preserves overload-aware behavior elsewhere in `get_source` while
   keeping factory-return inference scoped to the declaration import resolution
   already selected. It reuses analyzer structure and does not retain source or trees.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Specialize only Python path-symbol queries whose exact and normalized
+  names are identical, and explicitly select
+  `idx_path_symbol_units_lang_exact_fqn` for that query.
+  Rationale: Python module names normalize to themselves, so the exact predicate
+  preserves the lookup result while avoiding a language-wide scan. Keeping the
+  generic query for JavaScript, TypeScript, and differing normalized names avoids
+  changing their import-details and normalization semantics. The explicit index is
+  necessary because SQLite chose the primary key even for the simplified predicate
+  in an empty in-memory store.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective
