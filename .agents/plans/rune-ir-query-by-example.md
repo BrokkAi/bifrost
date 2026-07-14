@@ -19,7 +19,8 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 - [x] (2026-07-14 12:14Z) Reviewed the complete branch diff, repaired truncation so every bounded Rune IR result remains a balanced S-expression, passed `cargo fmt --check`, 7 focused library tests, 15 REPL tests, the overlay LSP integration test, all 48 VS Code tests, and all-target/all-feature clippy with warnings denied. The full `nlp,python` test binary remains un-linkable in this local PyO3 environment as recorded below.
 - [x] (2026-07-14) Remediated guided-review findings in structural extraction and LSP: centralized the default grammar registry, preserved explicit/path-derived TSX grammar selection, rejected source above 256 KiB before parsing, removed unresolvable arena IDs from role forms, and passed 9 focused library tests plus the TSX-aware overlay LSP integration test.
 - [x] (2026-07-14) Remediated guided-review findings in the REPL by sharing capture state with Reedline validation, making captured lines complete regardless of delimiters, and cancelling/resetting capture before it exceeds 256 KiB; all 17 REPL tests pass.
-- [ ] Remediate the duplicated VS Code source-language registry, run the focused validation matrix, and complete the post-fix review.
+- [x] (2026-07-14) Remediated the duplicated VS Code runtime source-language registry by deriving both client selection and Rune IR validation from one exported list; added manifest consistency coverage and passed all 49 extension tests.
+- [ ] Update user-facing limit/TSX documentation, run the complete post-fix validation matrix and full merge-base review, then close the guided-review queue.
 
 ## Surprises & Discoveries
 
@@ -178,3 +179,5 @@ Revision note (2026-07-14): Reopened the plan after the merge-base guided review
 Revision note (2026-07-14): Completed the structural/LSP remediation milestone with file-sensitive TSX parsing, a pre-parse input cap, self-contained roles, and focused Rust/LSP proof.
 
 Revision note (2026-07-14): Completed the REPL remediation milestone with capture-aware validation, bounded ingestion, reset behavior, and 17 passing binary tests; recorded the sandbox PTY limitation.
+
+Revision note (2026-07-14): Completed the editor registry remediation milestone by centralizing the runtime language IDs and adding a test that holds both declarative manifest contexts to that registry.

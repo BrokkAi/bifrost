@@ -1,11 +1,18 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
   RUNE_IR_METHOD,
+  RUNE_IR_SOURCE_LANGUAGE_IDS,
   isRuneIrSourceLanguage,
   showRuneIr
 } = require("../out-test/rune_ir.js");
+
+function languagesFromWhenClause(value) {
+  return [...value.matchAll(/resourceLangId == ([a-z]+)/g)].map((match) => match[1]);
+}
 
 function runner(overrides = {}) {
   const messages = { errors: [], warnings: [], documents: [] };
@@ -124,4 +131,19 @@ test("showRuneIr reports unsupported, not-ready, and request failures", async ()
   );
   assert.match(failed.messages.errors[0], /no declaration here/);
   assert.deepEqual(failed.messages.documents, []);
+});
+
+test("Rune IR manifest contexts match the runtime source-language registry", () => {
+  const manifest = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8")
+  );
+  const palette = manifest.contributes.menus.commandPalette.find(
+    (entry) => entry.command === "bifrost.showRuneIr"
+  );
+  const editorContext = manifest.contributes.menus["editor/context"].find(
+    (entry) => entry.command === "bifrost.showRuneIr"
+  );
+
+  assert.deepEqual(languagesFromWhenClause(palette.when), [...RUNE_IR_SOURCE_LANGUAGE_IDS]);
+  assert.deepEqual(languagesFromWhenClause(editorContext.when), [...RUNE_IR_SOURCE_LANGUAGE_IDS]);
 });

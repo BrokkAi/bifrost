@@ -39,7 +39,7 @@ export interface RuneIrRunner {
   showDocument(text: string): Promise<void>;
 }
 
-const SUPPORTED_SOURCE_LANGUAGES = new Set([
+export const RUNE_IR_SOURCE_LANGUAGE_IDS = [
   "java",
   "javascript",
   "javascriptreact",
@@ -54,7 +54,9 @@ const SUPPORTED_SOURCE_LANGUAGES = new Set([
   "php",
   "scala",
   "ruby"
-]);
+] as const;
+
+const SUPPORTED_SOURCE_LANGUAGES = new Set<string>(RUNE_IR_SOURCE_LANGUAGE_IDS);
 
 export function isRuneIrSourceLanguage(languageId: string): boolean {
   return SUPPORTED_SOURCE_LANGUAGES.has(languageId);

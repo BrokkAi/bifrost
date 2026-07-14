@@ -44,7 +44,12 @@ import {
   runRqlQuery
 } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
-import { RuneIrRange, RuneIrResponse, showRuneIr } from "./rune_ir";
+import {
+  RUNE_IR_SOURCE_LANGUAGE_IDS,
+  RuneIrRange,
+  RuneIrResponse,
+  showRuneIr
+} from "./rune_ir";
 import {
   RQL_QUERY_HOVER_METHOD,
   RqlValidationController,
@@ -337,20 +342,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [
-      { scheme: "file", language: "java" },
-      { scheme: "file", language: "javascript" },
-      { scheme: "file", language: "javascriptreact" },
-      { scheme: "file", language: "typescript" },
-      { scheme: "file", language: "typescriptreact" },
-      { scheme: "file", language: "rust" },
-      { scheme: "file", language: "go" },
-      { scheme: "file", language: "python" },
-      { scheme: "file", language: "c" },
-      { scheme: "file", language: "cpp" },
-      { scheme: "file", language: "csharp" },
-      { scheme: "file", language: "php" },
-      { scheme: "file", language: "scala" },
-      { scheme: "file", language: "ruby" },
+      ...RUNE_IR_SOURCE_LANGUAGE_IDS.map((language) => ({ scheme: "file", language })),
       { scheme: "file", language: RQL_LANGUAGE_ID }
     ],
     outputChannel,
