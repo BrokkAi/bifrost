@@ -1575,6 +1575,92 @@ int read_value(Root *root) {
 }
 
 #[test]
+fn authoritative_cpp_usage_follows_separate_typedef_direct_member_receiver() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "model.h",
+            r#"struct Owner { int value; };
+typedef struct Owner OwnerAlias;
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "model.h"
+
+int read(OwnerAlias *p) {
+    return p->value;
+}
+"#,
+        ),
+    ]);
+
+    let target = field_definition_with_owner(&analyzer, "Owner", "value");
+    let consumer = project.file("consumer.c");
+    let source = consumer.read_to_string().expect("consumer source");
+    let terminal_start = source.rfind("value").expect("terminal member");
+    let line_start = source[..terminal_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source[..terminal_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..terminal_start].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.c".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let forward_result = &forward.results[0];
+    assert_eq!("resolved", forward_result.status, "{forward_result:#?}");
+    assert!(
+        forward_result
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("Owner.value")),
+        "forward lookup should resolve the exact Owner.value declaration: {forward_result:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative separate-typedef C++ success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("Owner.value should have a proven-hit bucket");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= terminal_start
+                && terminal_start + "value".len() <= hit.end_offset
+        }),
+        "direct member receiver through a separate typedef should be proven: {hits:#?}"
+    );
+}
+
+#[test]
 fn cpp_graph_rejects_unrelated_same_name_without_include_visibility() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         ("target.h", "struct Target { void run(); };\n"),

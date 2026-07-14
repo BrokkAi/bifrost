@@ -1265,18 +1265,17 @@ fn receiver_type_units_with_budget(
         }
     };
 
+    base_units = canonical_receiver_units(base_units, ctx);
+    if base_units.is_empty() {
+        return Vec::new();
+    }
+
     while let Some(member_name) = member_chain.pop() {
         let mut next_units = Vec::new();
         for owner in &base_units {
-            let Some(owner) = ctx
-                .visibility
-                .canonical_type_unit(ctx.analyzer, ctx.file, owner)
-            else {
-                continue;
-            };
             for field in ctx
                 .visibility
-                .visible_members_for_owner_name(ctx.file, &owner, member_name)
+                .visible_members_for_owner_name(ctx.file, owner, member_name)
                 .into_iter()
                 .filter(|unit| unit.is_field())
             {
@@ -1303,6 +1302,20 @@ fn receiver_type_units_with_budget(
         }
     }
     base_units
+}
+
+fn canonical_receiver_units(units: Vec<CodeUnit>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
+    let mut canonical = Vec::with_capacity(units.len());
+    for unit in units {
+        let Some(unit) = ctx
+            .visibility
+            .canonical_type_unit(ctx.analyzer, ctx.file, &unit)
+        else {
+            return Vec::new();
+        };
+        canonical.push(unit);
+    }
+    unanimous_receiver_units(canonical)
 }
 
 fn receiver_units_from_declared_fields(fields: Vec<&CodeUnit>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
