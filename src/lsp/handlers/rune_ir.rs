@@ -72,7 +72,7 @@ pub(crate) fn handle(
     let code_unit_name = display_identifier_for_target(&code_unit);
     let source_range = byte_range_to_lsp_range(&source, &line_starts, &code_unit_range);
     let display_text = format!(
-        "Rune IR for {} ({})\n\n{}\nStarter RQL:\n{}\n",
+        "; Rune IR for {} ({})\n\n{}\n; Starter RQL\n{}\n",
         code_unit_name,
         language.config_label(),
         rendered.rune_ir.trim_end(),

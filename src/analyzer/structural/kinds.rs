@@ -244,6 +244,44 @@ impl Role {
 mod tests {
     use super::*;
 
+    fn rune_ir_grammar_match(scope: &str) -> String {
+        let grammar: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../editors/vscode/syntaxes/bifrost-rune-ir.tmLanguage.json"
+        ))
+        .expect("Rune IR TextMate grammar should be valid JSON");
+        grammar["patterns"]
+            .as_array()
+            .expect("Rune IR grammar should declare patterns")
+            .iter()
+            .find(|pattern| pattern["name"] == scope)
+            .and_then(|pattern| pattern["match"].as_str())
+            .expect("Rune IR grammar should declare the requested scope")
+            .to_string()
+    }
+
+    #[test]
+    fn rune_ir_textmate_vocabulary_matches_canonical_registries() {
+        let kinds = ALL_KINDS
+            .iter()
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>()
+            .join("|");
+        let roles = ALL_ROLES
+            .iter()
+            .map(|role| role.label())
+            .collect::<Vec<_>>()
+            .join("|");
+
+        assert_eq!(
+            rune_ir_grammar_match("entity.name.type.kind.bifrost-rune-ir"),
+            format!(r"\b(?:{kinds})\b")
+        );
+        assert_eq!(
+            rune_ir_grammar_match("variable.parameter.role.bifrost-rune-ir"),
+            format!(r"\b(?:{roles})\b")
+        );
+    }
+
     #[test]
     fn serde_labels_round_trip_and_match_label() {
         for &kind in ALL_KINDS {

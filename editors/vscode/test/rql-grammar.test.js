@@ -59,11 +59,22 @@ test("registers Bifrost RQL as a distinct .rql language", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"));
   const runeIrSourceContext = "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby";
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql"));
+  assert.ok(!manifest.activationEvents.includes("onLanguage:bifrost-rune-ir"));
   assert.deepEqual(manifest.contributes.languages, [
     {
       id: "bifrost-rql",
       aliases: ["Bifrost RQL", "bifrost-rql"],
       extensions: [".rql"],
+      configuration: "./language-configuration.json",
+      icon: {
+        light: "./icons/bifrost-rql.png",
+        dark: "./icons/bifrost-rql.png"
+      }
+    },
+    {
+      id: "bifrost-rune-ir",
+      aliases: ["Bifrost Rune IR", "bifrost-rune-ir"],
+      extensions: [".rune"],
       configuration: "./language-configuration.json",
       icon: {
         light: "./icons/bifrost-rql.png",
@@ -76,6 +87,11 @@ test("registers Bifrost RQL as a distinct .rql language", () => {
       language: "bifrost-rql",
       scopeName,
       path: "./syntaxes/bifrost-rql.tmLanguage.json"
+    },
+    {
+      language: "bifrost-rune-ir",
+      scopeName: "source.bifrost-rune-ir",
+      path: "./syntaxes/bifrost-rune-ir.tmLanguage.json"
     }
   ]);
   assert.deepEqual(

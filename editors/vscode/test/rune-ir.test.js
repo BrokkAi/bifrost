@@ -4,6 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  RUNE_IR_LANGUAGE_ID,
   RUNE_IR_METHOD,
   RUNE_IR_SOURCE_LANGUAGE_IDS,
   isRuneIrSourceLanguage,
@@ -33,7 +34,7 @@ function runner(overrides = {}) {
       }),
       showError: (message) => messages.errors.push(message),
       showWarning: (message) => messages.warnings.push(message),
-      showDocument: async (text) => messages.documents.push(text),
+      showDocument: async (text, languageId) => messages.documents.push({ text, languageId }),
       ...overrides
     }
   };
@@ -70,7 +71,12 @@ test("showRuneIr sends a cursor request and displays server text verbatim", asyn
     position: { line: 1, character: 4 }
   });
   assert.equal(result.codeUnit, "demo");
-  assert.deepEqual(state.messages.documents, ["exact server-rendered document\n"]);
+  assert.deepEqual(state.messages.documents, [
+    {
+      text: "exact server-rendered document\n",
+      languageId: RUNE_IR_LANGUAGE_ID
+    }
+  ]);
 });
 
 test("showRuneIr sends a non-empty selection instead of a cursor", async () => {

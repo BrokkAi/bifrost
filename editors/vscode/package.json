@@ -60,6 +60,21 @@
           "light": "./icons/bifrost-rql.png",
           "dark": "./icons/bifrost-rql.png"
         }
+      },
+      {
+        "id": "bifrost-rune-ir",
+        "aliases": [
+          "Bifrost Rune IR",
+          "bifrost-rune-ir"
+        ],
+        "extensions": [
+          ".rune"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/bifrost-rql.png",
+          "dark": "./icons/bifrost-rql.png"
+        }
       }
     ],
     "grammars": [
@@ -67,6 +82,11 @@
         "language": "bifrost-rql",
         "scopeName": "source.bifrost-rql",
         "path": "./syntaxes/bifrost-rql.tmLanguage.json"
+      },
+      {
+        "language": "bifrost-rune-ir",
+        "scopeName": "source.bifrost-rune-ir",
+        "path": "./syntaxes/bifrost-rune-ir.tmLanguage.json"
       }
     ],
     "configuration": {

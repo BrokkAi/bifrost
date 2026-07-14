@@ -801,7 +801,7 @@ fn bifrost_lsp_server_renders_rune_ir_from_unsaved_overlay_and_indexed_code_unit
     assert_eq!(
         response["result"]["displayText"],
         format!(
-            "Rune IR for fresh_name (rust)\n\n{}\nStarter RQL:\n{}\n",
+            "; Rune IR for fresh_name (rust)\n\n{}\n; Starter RQL\n{}\n",
             direct.rune_ir.trim_end(),
             direct.starter_rql
         )

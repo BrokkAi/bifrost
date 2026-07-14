@@ -45,6 +45,7 @@ import {
 } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
 import {
+  RUNE_IR_LANGUAGE_ID,
   RUNE_IR_SOURCE_LANGUAGE_IDS,
   RuneIrRange,
   RuneIrResponse,
@@ -196,10 +197,10 @@ async function showRuneIrForEditor(): Promise<void> {
       showWarning: (message) => {
         void vscode.window.showWarningMessage(message);
       },
-      showDocument: async (text) => {
+      showDocument: async (text, languageId) => {
         const result = await vscode.workspace.openTextDocument({
           content: text,
-          language: "plaintext"
+          language: languageId
         });
         await vscode.window.showTextDocument(result, { preview: true });
       }

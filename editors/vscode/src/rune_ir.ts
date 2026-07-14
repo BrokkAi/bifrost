@@ -1,4 +1,5 @@
 export const RUNE_IR_METHOD = "bifrost/runeIr";
+export const RUNE_IR_LANGUAGE_ID = "bifrost-rune-ir";
 
 export interface RuneIrPosition {
   line: number;
@@ -36,7 +37,7 @@ export interface RuneIrRunner {
   ): Promise<RuneIrResponse>;
   showError(message: string): void;
   showWarning(message: string): void;
-  showDocument(text: string): Promise<void>;
+  showDocument(text: string, languageId: string): Promise<void>;
 }
 
 export const RUNE_IR_SOURCE_LANGUAGE_IDS = [
@@ -92,7 +93,7 @@ export async function showRuneIr(
       );
       return undefined;
     }
-    await runner.showDocument(response.displayText);
+    await runner.showDocument(response.displayText, RUNE_IR_LANGUAGE_ID);
     return response;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
