@@ -124,7 +124,7 @@ pub(super) fn resolve_csharp(
             csharp_type_outcome(csharp, definitions, file, &reference)
         }
         Some(CSharpReferenceNode::Constructor(creation)) => {
-            resolve_csharp_constructor(csharp, definitions, file, source, creation)
+            resolve_csharp_constructor(analyzer, csharp, definitions, file, source, creation)
         }
         Some(CSharpReferenceNode::Member { receiver, name }) => {
             let Some((member, explicit_generic_arity)) = csharp_member_name_parts(name, source)
@@ -906,6 +906,7 @@ fn csharp_member_name_parts<'a>(
 }
 
 fn resolve_csharp_constructor(
+    analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
@@ -919,6 +920,18 @@ fn resolve_csharp_constructor(
         return no_definition("no_reference_text", "C# constructor call has no type");
     };
     let reference = csharp_reference_type_text(type_node, source);
+    // A nested type declared by a sibling partial declaration is visible
+    // through its enclosing partial type. Keep this lookup within classes:
+    // walking out to a namespace would resolve an ordinary constructor call to
+    // its owner type before the constructor-overload lookup below runs.
+    if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
+        analyzer,
+        file,
+        &reference,
+        type_node.start_byte(),
+    ) {
+        return candidates_outcome(vec![unit]);
+    }
     if csharp.using_aliases_of(file).contains_key(&reference) {
         return csharp_type_outcome(csharp, definitions, file, &reference);
     }
@@ -1763,6 +1776,29 @@ fn csharp_enclosing_class(
             return Some(current);
         }
         current = analyzer.parent_of(&current)?;
+    }
+}
+
+fn resolve_csharp_nested_type_in_enclosing_classes(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    let mut enclosing = csharp_enclosing_class(analyzer, file, byte)?;
+    loop {
+        let child_fqn = format!("{}.{}", enclosing.fq_name(), name);
+        if let Some(child) = analyzer.definitions(&child_fqn).find(CodeUnit::is_class) {
+            return Some(child);
+        }
+        let parent = analyzer.parent_of(&enclosing)?;
+        if !parent.is_class() {
+            return None;
+        }
+        enclosing = parent;
     }
 }
 

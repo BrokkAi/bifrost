@@ -1,7 +1,10 @@
 mod common;
 
-use brokk_bifrost::Language;
-use common::{InlineTestProject, call_search_tool_json};
+use brokk_bifrost::{Language, SearchToolsService};
+use common::{
+    CSHARP_NESTED_PARTIAL_MAPPER, InlineTestProject, call_search_tool_json,
+    csharp_nested_partial_cacheinfo_project,
+};
 use serde_json::{Value, json};
 
 fn lookup(root: &std::path::Path, args: &str) -> Value {
@@ -13311,6 +13314,30 @@ fn csharp_explicit_constructor_call_resolves_to_constructor_definition() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "Lib.Service.Service",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_partial_nested_constructor_resolves_after_persisted_startup() {
+    let project = csharp_nested_partial_cacheinfo_project().build();
+    let service = SearchToolsService::new_manual_for_project(project.project_dyn())
+        .expect("build persisted C# search tools service");
+    let constructor = CSHARP_NESTED_PARTIAL_MAPPER
+        .find("new CacheInfo")
+        .expect("nested constructor call")
+        + "new ".len();
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_location",
+            &location_reference("Mapper.cs", CSHARP_NESTED_PARTIAL_MAPPER, constructor),
+        )
+        .expect("resolve nested constructor type");
+    let value: Value = serde_json::from_str(&payload).expect("valid get_definition response");
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Dapper.SqlMapper$CacheInfo",
         "{value}"
     );
 }
