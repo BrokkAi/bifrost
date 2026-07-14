@@ -1661,6 +1661,164 @@ int read(OwnerAlias *p) {
 }
 
 #[test]
+fn authoritative_cpp_usage_follows_canonical_typedef_type_references() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "model.h",
+            r#"typedef struct Canonical { int value; } CanonicalAlias;
+typedef CanonicalAlias CanonicalArray[1];
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "model.h"
+
+CanonicalAlias direct_value;
+CanonicalArray array_value;
+"#,
+        ),
+    ]);
+
+    let target = class_definition(&analyzer, "Canonical");
+    let consumer = project.file("consumer.c");
+    let source = consumer.read_to_string().expect("consumer source");
+    let token_starts = ["CanonicalAlias", "CanonicalArray"].map(|token| {
+        let start = source.find(token).expect("consumer type token");
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.c".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        let forward_result = &forward.results[0];
+        assert_eq!(
+            "resolved", forward_result.status,
+            "forward lookup should resolve {token}: {forward_result:#?}"
+        );
+        assert!(
+            forward_result
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some("Canonical")),
+            "forward lookup should canonicalize {token} to Canonical: {forward_result:#?}"
+        );
+        (token, start)
+    });
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative canonical-typedef C++ success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("Canonical should have a proven-hit bucket");
+    for (token, start) in token_starts {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= start
+                    && start + token.len() <= hit.end_offset
+            }),
+            "canonical type reference through {token} should be proven: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_usage_rejects_ambiguous_and_cyclic_typedef_type_references() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "canonical.h",
+            r#"typedef struct Canonical { int value; } CanonicalAlias;
+"#,
+        ),
+        (
+            "left.h",
+            r#"#include "canonical.h"
+typedef CanonicalAlias SharedAlias;
+"#,
+        ),
+        (
+            "right.h",
+            r#"typedef struct Other { int value; } OtherAlias;
+typedef OtherAlias SharedAlias;
+"#,
+        ),
+        (
+            "cycle.h",
+            r#"typedef CycleB CycleA;
+typedef CycleA CycleB;
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "left.h"
+#include "right.h"
+#include "cycle.h"
+
+SharedAlias ambiguous_value;
+CycleA cyclic_value;
+"#,
+        ),
+    ]);
+
+    let target = class_definition(&analyzer, "Canonical");
+    let consumer = project.file("consumer.c");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative ambiguous/cyclic typedef C++ success, got {:#?}",
+            query.result
+        );
+    };
+    assert!(
+        hits_by_overload
+            .get(&target)
+            .is_some_and(|hits| hits.is_empty()),
+        "ambiguous and cyclic typedef references must remain unproven: {hits_by_overload:#?}"
+    );
+}
+
+#[test]
 fn cpp_graph_rejects_unrelated_same_name_without_include_visibility() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         ("target.h", "struct Target { void run(); };\n"),

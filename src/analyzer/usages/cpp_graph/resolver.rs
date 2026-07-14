@@ -368,19 +368,37 @@ impl VisibilityIndex {
 
     pub(super) fn resolves_to_type(
         &self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         raw_name: &str,
         target: &CodeUnit,
     ) -> bool {
-        let Some(resolved) = self.resolve_type(file, raw_name) else {
-            return self.parser_alias_resolves_to_type(file, raw_name, target);
+        let Some(normalized) = normalize_reference_name(raw_name) else {
+            return false;
         };
-        same_symbol(&resolved, target)
-            || same_visible_symbol(&resolved, target)
-            || self
-                .alias_target(&resolved)
-                .is_some_and(|alias_target| same_visible_symbol(&alias_target, target))
-            || self.parser_alias_resolves_to_type(file, raw_name, target)
+        let candidates = self.type_candidates(file, &normalized);
+        if candidates.is_empty() {
+            return self.parser_alias_resolves_to_type(file, raw_name, target);
+        }
+        let mut canonical_candidates = Vec::new();
+        for candidate in candidates {
+            let Some(canonical) = self.canonical_type_unit(analyzer, file, candidate) else {
+                return false;
+            };
+            if !canonical_candidates
+                .iter()
+                .any(|existing| same_visible_symbol(existing, &canonical))
+            {
+                canonical_candidates.push(canonical);
+                if canonical_candidates.len() > 1 {
+                    return false;
+                }
+            }
+        }
+        let Some(canonical) = canonical_candidates.pop() else {
+            return false;
+        };
+        same_symbol(&canonical, target) || same_visible_symbol(&canonical, target)
     }
 
     pub(super) fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
@@ -1330,13 +1348,17 @@ fn field_declaration_type_matches(
     owner: &CodeUnit,
 ) -> bool {
     ctx.visibility
-        .resolves_to_type(ctx.file, declaration, owner)
+        .resolves_to_type(ctx.analyzer, ctx.file, declaration, owner)
         || field_type_prefix(declaration, unit.identifier()).is_some_and(|type_text| {
             let normalized = normalize_field_type_text(type_text);
-            ctx.visibility.resolves_to_type(ctx.file, type_text, owner)
-                || ctx
-                    .visibility
-                    .resolves_to_type(ctx.file, normalized.as_str(), owner)
+            ctx.visibility
+                .resolves_to_type(ctx.analyzer, ctx.file, type_text, owner)
+                || ctx.visibility.resolves_to_type(
+                    ctx.analyzer,
+                    ctx.file,
+                    normalized.as_str(),
+                    owner,
+                )
         })
 }
 
@@ -1393,8 +1415,12 @@ pub(super) fn declaration_mentions_type(
     let Some(type_node) = node.child_by_field_name("type") else {
         return false;
     };
-    ctx.visibility
-        .resolves_to_type(ctx.file, node_text(type_node, ctx.source), owner)
+    ctx.visibility.resolves_to_type(
+        ctx.analyzer,
+        ctx.file,
+        node_text(type_node, ctx.source),
+        owner,
+    )
 }
 
 pub(super) fn declaration_is_object_construction_candidate(

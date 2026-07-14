@@ -323,14 +323,14 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !name_mentions(text, &ctx.spec.member_name)
         && !ctx
             .visibility
-            .resolves_to_type(ctx.file, text, &ctx.spec.target)
+            .resolves_to_type(ctx.analyzer, ctx.file, text, &ctx.spec.target)
     {
         return;
     }
     *ctx.raw_match_count += 1;
     if ctx
         .visibility
-        .resolves_to_type(ctx.file, text, &ctx.spec.target)
+        .resolves_to_type(ctx.analyzer, ctx.file, text, &ctx.spec.target)
     {
         push_hit(hit_node, ctx);
     } else if let Some(scope) = static_qualifier_type_scope(node, ctx) {
@@ -357,7 +357,7 @@ fn static_qualifier_type_scope<'tree>(node: Node<'tree>, ctx: &ScanCtx<'_>) -> O
             let text = qualified_scope_text(scope, ctx.source);
             if ctx
                 .visibility
-                .resolves_to_type(ctx.file, &text, &ctx.spec.target)
+                .resolves_to_type(ctx.analyzer, ctx.file, &text, &ctx.spec.target)
             {
                 return Some(scope);
             }
@@ -471,7 +471,10 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    if ctx.visibility.resolves_to_type(ctx.file, text, owner) {
+    if ctx
+        .visibility
+        .resolves_to_type(ctx.analyzer, ctx.file, text, owner)
+    {
         push_hit(type_node, ctx);
     } else {
         push_unproven_hit(type_node, ctx);
