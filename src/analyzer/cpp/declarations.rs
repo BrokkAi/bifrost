@@ -698,11 +698,46 @@ impl<'a> CppVisitor<'a> {
                 }
                 continue;
             }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children_by_field_name("declarator", &mut cursor) {
             if super::structural::is_recovered_designator_init_declarator(child) {
                 handled_declarator = true;
                 continue;
             }
             if let Some(kind) = classify_declarator(child) {
+                handled_declarator = true;
+                match kind {
+                    DeclaratorKind::Function(function_declarator) => {
+                        handled_function = true;
+                        self.visit_function_declaration(node, function_declarator, scope);
+                    }
+                    DeclaratorKind::Variable(variable_declarator) => {
+                        self.visit_variable_declaration(
+                            node,
+                            variable_declarator,
+                            scope,
+                            in_class_body,
+                        );
+                    }
+                }
+            }
+        }
+
+        if !handled_declarator {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if super::structural::is_recovered_designator_init_declarator(child) {
+                    handled_declarator = true;
+                    continue;
+                }
+                if !is_unfielded_declarator_candidate(child) {
+                    continue;
+                }
+                let Some(kind) = classify_declarator(child) else {
+                    continue;
+                };
                 handled_declarator = true;
                 match kind {
                     DeclaratorKind::Function(function_declarator) => {
@@ -1182,6 +1217,23 @@ fn classify_declarator(node: Node<'_>) -> Option<DeclaratorKind<'_>> {
             .or_else(|| last_named_child(node))
             .and_then(classify_declarator),
     }
+}
+
+fn is_unfielded_declarator_candidate(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_declarator"
+            | "init_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "parenthesized_declarator"
+            | "array_declarator"
+            | "attributed_declarator"
+            | "template_function"
+            | "identifier"
+            | "field_identifier"
+            | "qualified_identifier"
+    )
 }
 
 fn has_direct_cpp_declarator(node: Node<'_>) -> bool {

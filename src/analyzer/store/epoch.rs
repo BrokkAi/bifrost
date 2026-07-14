@@ -295,7 +295,7 @@ lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07"
 );
 // JS/TS salts bumped: anonymous `export default` expressions/declarations now
 // emit a synthetic `default` code unit, changing each file's persisted unit set.

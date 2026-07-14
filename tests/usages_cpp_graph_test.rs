@@ -2241,6 +2241,111 @@ static struct cpu_spec .cpu_features = 1;
 }
 
 #[test]
+fn cpp_macro_decorated_pointer_field_keeps_only_real_field_identity() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "port.h",
+            r#"struct Reg {};
+#define __iomem
+
+struct Port {
+    struct Reg __iomem *ip_serial_regs;
+};
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "port.h"
+
+struct Reg *registers(struct Port *port) {
+    return port->ip_serial_regs;
+}
+"#,
+        ),
+    ]);
+
+    let header = project.file("port.h");
+    let header_source = header.read_to_string().expect("header source");
+    let macro_token = "__iomem";
+    let macro_start = header_source
+        .rfind(macro_token)
+        .expect("declaration macro token");
+    let macro_line_start = header_source[..macro_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let macro_line = header_source[..macro_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let macro_column = header_source[macro_line_start..macro_start].chars().count() + 1;
+    let macro_forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "port.h".to_string(),
+                line: Some(macro_line),
+                column: Some(macro_column),
+            }],
+        },
+    );
+    assert_eq!(
+        "no_definition", macro_forward.results[0].status,
+        "declaration macro must not be a field reference: {:#?}",
+        macro_forward.results[0]
+    );
+
+    let declarations = analyzer.get_declarations(&header);
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.is_field() && unit.fq_name() == "Port.ip_serial_regs"),
+        "real pointer field should remain indexed: {declarations:#?}"
+    );
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "Port.__iomem"),
+        "macro decoration must not create a pseudo-field: {declarations:#?}"
+    );
+
+    let consumer = project.file("consumer.c");
+    let consumer_source = consumer.read_to_string().expect("consumer source");
+    let use_token = "ip_serial_regs";
+    let use_start = consumer_source.rfind(use_token).expect("pointer field use");
+    let use_line_start = consumer_source[..use_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let use_line = consumer_source[..use_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let use_column = consumer_source[use_line_start..use_start].chars().count() + 1;
+    let use_forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.c".to_string(),
+                line: Some(use_line),
+                column: Some(use_column),
+            }],
+        },
+    );
+    let use_result = &use_forward.results[0];
+    assert_eq!("resolved", use_result.status, "{use_result:#?}");
+    assert_eq!(
+        vec![Some("Port.ip_serial_regs")],
+        use_result
+            .definitions
+            .iter()
+            .map(|definition| definition.fqn.as_deref())
+            .collect::<Vec<_>>(),
+        "pointer field use must resolve only to Port.ip_serial_regs: {use_result:#?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_rejects_ambiguous_and_cyclic_typedef_type_references() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
