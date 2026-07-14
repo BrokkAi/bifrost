@@ -16,7 +16,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 - [x] (2026-07-14 14:50Z) Added `bifrost/runeIr` with overlay-aware source reads, exclusive cursor/range params, smallest-enclosing indexed `CodeUnit` selection, primary-range Rune IR roots, UTF-16 response ranges, opaque display text, unit coverage, and a passing end-to-end Rust/TypeScript LSP test.
 - [x] (2026-07-14 15:05Z) Added **Bifrost: Show Rune IR** for supported source editors, using selection-or-cursor request params and opening the server-provided display text verbatim; TypeScript and manifest tests pass as part of all 48 VS Code tests.
 - [x] (2026-07-14 15:25Z) Documented Rune IR as the source-side representation matched by `CodeQuery`, documented both query-by-example surfaces, passed Astro content checks and the production build, and visually verified the rendered code-querying page in the in-app browser.
-- [ ] Run final focused tests, `cargo fmt`, full feature tests where practical, and isolated-target clippy with warnings denied; review the complete branch diff.
+- [x] (2026-07-14 12:14Z) Reviewed the complete branch diff, repaired truncation so every bounded Rune IR result remains a balanced S-expression, passed `cargo fmt --check`, 7 focused library tests, 15 REPL tests, the overlay LSP integration test, all 48 VS Code tests, and all-target/all-feature clippy with warnings denied. The full `nlp,python` test binary remains un-linkable in this local PyO3 environment as recorded below.
 
 ## Surprises & Discoveries
 
@@ -27,7 +27,9 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 - Observation: The local all-feature Rust link gate cannot resolve PyO3 symbols on this macOS environment.
   Evidence: `cargo test rune_ir --features nlp,python` compiled the Rune IR code, then failed while linking `libbrokk_bifrost.dylib` with undefined `_Py*` symbols. `cargo test --lib rune_ir` avoids the unrelated optional Python bridge while still parsing Python through the always-available tree-sitter adapter and passes all 5 tests.
 - Observation: `cargo clippy` and `cargo test` are selecting incompatible local Rust compiler identities while sharing `target/` artifacts, even though both report Rust 1.96.0.
-  Evidence: after the focused tests passed, `cargo clippy --lib -- -D warnings` rejected 27 dependency metadata files with E0514 and advised rebuilding them. A later isolated-target clippy run is required; deleting the shared target directory is unnecessary and would discard useful user build artifacts.
+  Evidence: after the focused tests passed, the first clippy attempts rejected dependency metadata with E0514. `type -a cargo-clippy` showed Homebrew's subcommand before rustup's even though `cargo` itself came from rustup. Running with `/Users/dave/.cargo/bin` first on `PATH` and a fresh target directory passed `cargo clippy --all-targets --all-features -- -D warnings`; deleting the shared target directory was unnecessary.
+- Observation: a truncation marker alone was not enough to preserve Rune IR's S-expression contract when a node or depth limit interrupted nested output.
+  Evidence: the complete-diff review showed open node forms could remain unclosed. The renderer now reserves space for compact closing parentheses, and every bounded-dimension test verifies balanced parentheses while respecting the byte limit.
 
 ## Decision Log
 
@@ -43,7 +45,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 
 ## Outcomes & Retrospective
 
-All implementation and documentation surfaces are complete. Callers can render bounded Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer; the REPL exposes that path through `:ir <language>` without initializing its lazy workspace service; the private LSP request returns identical Rune IR from unsaved overlay content with indexed declaration selection and UTF-16 ranges; and VS Code displays the opaque server response from a source-editor command. The documentation builds cleanly and its rendered preview presents the architecture and workflows correctly. Final Rust gates and the complete-diff review remain.
+The issue is implemented end to end under the public name Rune IR. Callers can render bounded, balanced Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer; the REPL exposes that path through `:ir <language>` without initializing its lazy workspace service; the private LSP request returns identical Rune IR from unsaved overlay content with indexed declaration selection and UTF-16 ranges; and VS Code displays the opaque server response from a source-editor command. The documentation builds cleanly and its rendered preview presents the architecture and workflows correctly. Formatting, focused Rust/LSP tests, extension tests, and all-target/all-feature clippy pass. The only unavailable gate is the full `nlp,python` test link in this machine's existing PyO3 environment; its undefined Python symbols are unrelated to Rune IR.
 
 ## Context and Orientation
 
@@ -150,3 +152,5 @@ Revision note (2026-07-14 14:50Z): Marked the LSP milestone complete after unit 
 Revision note (2026-07-14 15:05Z): Marked the VS Code milestone complete after lint, bundle compilation, and all 48 extension tests passed, including verbatim display and manifest context coverage.
 
 Revision note (2026-07-14 15:25Z): Marked documentation complete after Astro checks, production build, and an in-app rendered-page inspection; separated final repository gates into their own remaining milestone.
+
+Revision note (2026-07-14 12:14Z): Completed the final review and validation milestone, recorded the rustup/Homebrew clippy collision and workaround, and strengthened bounded rendering so truncation always leaves balanced S-expressions.

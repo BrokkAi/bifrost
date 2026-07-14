@@ -227,6 +227,7 @@ struct Renderer<'a> {
     rendered_nodes: usize,
     copied_source_bytes: usize,
     truncated: Option<&'static str>,
+    open_nodes: usize,
     children: Vec<Vec<u32>>,
 }
 
@@ -245,6 +246,7 @@ impl<'a> Renderer<'a> {
             rendered_nodes: 0,
             copied_source_bytes: 0,
             truncated: None,
+            open_nodes: 0,
             children,
         }
     }
@@ -262,7 +264,9 @@ impl<'a> Renderer<'a> {
             match event {
                 Event::Open(id, depth) => self.open_node(id, depth, &mut stack),
                 Event::Close(depth) => {
-                    self.push_line(depth, ")");
+                    if self.push_line(depth, ")") {
+                        self.open_nodes -= 1;
+                    }
                 }
             }
         }
@@ -300,6 +304,7 @@ impl<'a> Renderer<'a> {
         if !self.push_line(depth, &line) {
             return;
         }
+        self.open_nodes += 1;
         for role in &node.roles {
             let mut role_line = format!(
                 "({} :span ({} {})",
@@ -351,11 +356,16 @@ impl<'a> Renderer<'a> {
 
     fn push_line(&mut self, depth: usize, line: &str) -> bool {
         let needed = depth.saturating_mul(2) + line.len() + 1;
+        // Preserve enough space for a truncation form and compact closing
+        // parentheses for every node that would remain open after this line.
+        let opens_node = line.starts_with('(') && !line.ends_with(')');
+        let prospective_open_nodes = self.open_nodes + usize::from(opens_node);
+        let reserve = TRUNCATION_RESERVE.saturating_add(prospective_open_nodes);
         if self
             .output
             .len()
             .saturating_add(needed)
-            .saturating_add(TRUNCATION_RESERVE)
+            .saturating_add(reserve)
             > self.limits.max_output_bytes
         {
             self.truncated = Some("output byte limit reached");
@@ -369,26 +379,21 @@ impl<'a> Renderer<'a> {
 
     fn append_truncation(&mut self, reason: &str) {
         let marker = format!("(truncated {})\n", quoted(reason));
-        debug_assert!(marker.len() <= self.limits.max_output_bytes);
-        let available = self.limits.max_output_bytes - marker.len();
-        if self.output.len() > available {
-            let end = floor_char_boundary(&self.output, available);
-            self.output.truncate(end);
-        }
+        debug_assert!(
+            self.output.len() + marker.len() + self.open_nodes < self.limits.max_output_bytes
+        );
         self.output.push_str(&marker);
+        self.output
+            .extend(std::iter::repeat_n(')', self.open_nodes));
+        if self.open_nodes > 0 {
+            self.output.push('\n');
+        }
+        self.open_nodes = 0;
     }
 }
 
 fn quoted(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
-}
-
-fn floor_char_boundary(value: &str, mut index: usize) -> usize {
-    index = index.min(value.len());
-    while !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 #[cfg(test)]
@@ -479,7 +484,38 @@ mod tests {
             assert!(rendered.truncated, "limits: {limits:?}");
             assert!(rendered.rune_ir.contains("truncated"), "limits: {limits:?}");
             assert!(rendered.rune_ir.len() <= limits.max_output_bytes);
+            assert_balanced_sexpr(&rendered.rune_ir);
         }
+    }
+
+    fn assert_balanced_sexpr(value: &str) {
+        let mut depth = 0usize;
+        let mut quoted = false;
+        let mut escaped = false;
+        for byte in value.bytes() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => quoted = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("unexpected closing parenthesis")
+                }
+                _ => {}
+            }
+        }
+        assert!(!quoted, "unterminated string in {value:?}");
+        assert_eq!(depth, 0, "unclosed form in {value:?}");
     }
 
     #[test]
