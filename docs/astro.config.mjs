@@ -66,6 +66,7 @@ export default defineConfig({
               label: 'Rune Query Language',
               items: [
                 { label: 'Overview', slug: 'rune-query-language' },
+                { label: 'Rune IR', slug: 'rune-ir' },
                 { label: 'VS Code', slug: 'rql-vscode' },
                 {
                   label: 'Language Tutorials',

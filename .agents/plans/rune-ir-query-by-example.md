@@ -22,6 +22,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 - [x] (2026-07-14) Remediated the duplicated VS Code runtime source-language registry by deriving both client selection and Rune IR validation from one exported list; added manifest consistency coverage and passed all 49 extension tests.
 - [x] (2026-07-14) Documented explicit TSX selection and the 256 KiB pre-parse/capture bound, reran the complete post-fix validation matrix, reviewed the full merge-base diff, and closed all six guided-review findings. All compiled default-feature Rust test binaries passed; the final rustdoc phase passed in an isolated rustup target after the shared target exposed a Homebrew/rustup metadata collision. All-target/all-feature clippy, 49 extension tests, Astro checks, and the production docs build pass.
 - [x] (2026-07-14) Registered `.rune` as Bifrost Rune IR, added canonical kind/role highlighting locked to the Rust registries, rendered LSP preview headings as `;` comments, and opened previews in the Rune IR language mode without making saved `.rune` files start the language server. The registry test, overlay LSP test, all 50 extension tests, Astro checks/build, formatting, and all-target/all-feature clippy pass.
+- [x] (2026-07-14) Added a dedicated Rune IR page under Rune Query Language, moved the complete language-adapter mapping out of the general querying overview, documented `.rune` structure and non-executable semantics with renderer-verified offsets, and linked the related RQL, VS Code, tutorial, and overview pages. Astro checks and the 39-page production build pass; the rendered page, sidebar placement, document example, overview links, and browser console were verified in the in-app browser.
 
 ## Surprises & Discoveries
 
@@ -188,3 +189,7 @@ Revision note (2026-07-14): Closed the guided-review remediation after documenti
 Revision note (2026-07-14): Reopened the editor surface to make Rune IR a first-class `.rune` language and use it for highlighted preview documents.
 
 Revision note (2026-07-14): Completed the `.rune` milestone with passive file association, comment-safe preview text, registry-locked TextMate vocabulary, and green Rust, extension, docs, formatting, and clippy gates.
+
+Revision note (2026-07-14): Reopened documentation to give Rune IR and `.rune` files a dedicated page and move adapter internals out of the general querying overview.
+
+Revision note (2026-07-14): Completed the dedicated Rune IR documentation milestone after build and rendered-browser verification of its navigation, layout, example, and cross-links.
