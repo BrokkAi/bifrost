@@ -458,6 +458,10 @@ fn python_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
+    let candidates = py.resolve_direct_named_exported_fqn(fqn);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
     let candidates = py.resolve_exported_fqn(fqn);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);

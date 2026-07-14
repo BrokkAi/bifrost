@@ -714,10 +714,13 @@ fn collect_imported_factory_return_types(
             continue;
         };
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        let units: Vec<CodeUnit> = analyzer
-            .definitions(&fqn)
-            .chain(py.resolve_exported_fqn(&fqn))
-            .collect();
+        let mut units = analyzer.definitions(&fqn).collect::<Vec<_>>();
+        if units.is_empty() {
+            units = py.resolve_direct_named_exported_fqn(&fqn);
+        }
+        if units.is_empty() {
+            units = py.resolve_exported_fqn(&fqn);
+        }
         for unit in units {
             if unit.is_function() {
                 if let Some(return_type) = callable_return_type_name(analyzer, &unit) {
