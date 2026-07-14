@@ -1856,6 +1856,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
+        let mut transitive_range = None;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
             analysis.path(&child_path, child.range());
@@ -1898,6 +1899,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                     );
                 }
                 seen_transitive = true;
+                transitive_range = Some(child.range());
                 if spanned_to_json(child) != Value::Bool(true) {
                     analysis.error(
                         child.range(),
@@ -1968,7 +1970,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         }
         if seen_depth && seen_transitive {
             analysis.error(
-                step.range(),
+                transitive_range.expect("seen transitive has a value range"),
                 "invalid-query-step",
                 "depth and transitive are mutually exclusive",
             );
@@ -2322,6 +2324,13 @@ mod tests {
         assert!(diagnostics.iter().any(|diagnostic| {
             &invalid[diagnostic.range.clone()] == "0"
                 && diagnostic.message.contains("positive integer")
+        }));
+
+        let conflicting = r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","depth":2,"transitive":true}]}"#;
+        let diagnostics = validate_query_source(conflicting);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            &conflicting[diagnostic.range.clone()] == "true"
+                && diagnostic.message.contains("mutually exclusive")
         }));
     }
 

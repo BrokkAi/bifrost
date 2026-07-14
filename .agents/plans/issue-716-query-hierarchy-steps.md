@@ -15,7 +15,7 @@ The feature is observable through JSON and RQL queries, exact tagged declaration
 - [x] (2026-07-14 08:15Z) Milestone 1: added the configured public query IR, JSON/RQL syntax, declarative step-field registry, schema/help/MCP/grammar surfaces, CLI example, and parser/editor tests.
 - [x] (2026-07-14 08:40Z) Milestone 2: implemented budgeted exact hierarchy/member execution, diagnostics, provenance, and focused integration tests.
 - [x] (2026-07-14 10:30Z) Milestone 3: added executable examples for all four operations to all eleven language cookbooks and updated public reference documentation.
-- [ ] Milestone 4: run the complete Rust and docs validation bundle, review the full diff, fix findings, and record the outcome.
+- [x] (2026-07-14 10:45Z) Milestone 4: ran the Rust and docs validation bundle, reviewed the full diff, tightened public help and validation ranges, added mixed-input coverage, and recorded the outcome.
 
 ## Surprises & Discoveries
 
@@ -30,6 +30,12 @@ The feature is observable through JSON and RQL queries, exact tagged declaration
 
 - Observation: the in-app browser runtime could not initialize for the rendered-preview pass because its bootstrap attempted to redefine Node's `process` property.
   Evidence: both fresh initialization attempts failed with `Cannot redefine property: process`; the Astro check/build still passed, and generated HTML was inspected for the new navigation heading, examples, and precision-boundary text.
+
+- Observation: macOS tests that link the Python feature require the same dynamic-lookup linker flags used by CI, and the sandbox cannot access uv's user cache for the sidecar smoke test.
+  Evidence: the feature-focused and clippy gates passed with `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`; the complete suite progressed after an elevated rerun allowed the existing uv cache.
+
+- Observation: the elevated complete-suite run suffered a single `SIGKILL` in `lsp_server_drop_cleanup_exits_cleanly_after_initialize` after 178 sibling LSP tests passed.
+  Evidence: rerunning that exact test with the same features and linker flags passed 1/1, indicating resource pressure in the fully parallel integration run rather than a reproducible test failure.
 
 ## Decision Log
 
@@ -60,6 +66,8 @@ Milestone 1 now provides the complete public syntax without execution semantics.
 Milestone 2 projects semantic results through the analyzer's bulk indexed-declaration/range API and traverses hierarchy relations iteratively under the existing pipeline budget. Exact identity survives same-name declarations and overloads; path-local cycle guards retain diamond provenance; invalid input shapes are aggregated by operation and language while legitimate leaves and unindexed external declarations remain silent. The 28 focused pipeline tests and the existing Go, Rust, Ruby, and multi-analyzer hierarchy suites pass.
 
 Milestone 3 adds two executable hierarchy/ownership recipes to every language cookbook, including exact declaration results and per-edge provenance. Bounded and transitive options are distributed across the languages, and a coverage assertion now prevents any cookbook from omitting one of the four operations. The overview, JSON/RQL references, CLI, MCP/Python client documentation, and package README explain direct/bounded/transitive semantics and the indexed-declarations-only precision boundary. Rust docs tests, Astro check, Astro build, and generated-HTML inspection pass.
+
+Milestone 4's review synchronized the MCP description with the literal public operation names, narrowed the JSON depth/transitive conflict diagnostic to the `transitive` value, and added a mixed valid/invalid input regression proving that valid hierarchy rows survive an aggregated shape diagnostic. Formatting, the 71-test focused feature gate, all-target/all-feature clippy, Astro check, and Astro build pass. The complete feature suite was also exercised: its sandbox-only uv cache failure was cleared by rerunning with normal host cache access, then one highly parallel LSP test process was killed after 178 sibling tests passed; the exact failed test passed immediately in isolation. No compatibility shim, textual resolver fallback, duplicate schema vocabulary, or unrelated file change remains in the branch diff.
 
 ## Context and Orientation
 
@@ -144,3 +152,5 @@ Revision note (2026-07-14 08:15Z): Marked the public-syntax milestone complete a
 Revision note (2026-07-14 08:40Z): Marked execution milestone complete after reviewing exact projection, replacing per-declaration range lookups with the bulk primary-range API, and passing focused pipeline and hierarchy-provider suites.
 
 Revision note (2026-07-14 10:30Z): Marked the documentation milestone complete after executing all JSON/RQL cookbook recipes, recording exact provenance-bearing outputs, updating public references and clients, and validating the rendered static site.
+
+Revision note (2026-07-14 10:45Z): Completed final review and validation, including precise conflict ranges, synchronized MCP operation help, mixed-input execution coverage, and documentation of the one non-reproducible parallel-suite `SIGKILL`.

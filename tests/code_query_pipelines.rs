@@ -770,6 +770,36 @@ fn invalid_semantic_inputs_are_diagnostic_but_supported_leaves_are_not() {
 }
 
 #[test]
+fn mixed_valid_and_invalid_hierarchy_inputs_keep_valid_rows() {
+    let result = serialized(&run(
+        &[(
+            "mixed.py",
+            "class Root:\n    pass\n\nclass Child(Root):\n    pass\n\ndef helper():\n    pass\n",
+        )],
+        json!({
+            "match": {
+                "kind": "declaration",
+                "name": { "regex": "^(Child|helper)$" }
+            },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }]
+        }),
+    ));
+    assert_eq!(result_fq_names(&result), vec!["mixed.Root"]);
+    assert_eq!(
+        result["diagnostics"].as_array().unwrap().len(),
+        1,
+        "{result}"
+    );
+    assert!(
+        result["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("omitted 1 input"),
+        "{result}"
+    );
+}
+
+#[test]
 fn hierarchy_preserves_module_scoped_identity_and_cycles_do_not_return_the_seed() {
     let exact = serialized(&run(
         &[
