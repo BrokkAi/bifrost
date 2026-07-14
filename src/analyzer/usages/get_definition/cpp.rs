@@ -1257,28 +1257,12 @@ fn cpp_field_declared_type(
     file: &ProjectFile,
     field: &CodeUnit,
 ) -> Option<CppType> {
-    let declaration_text = field
-        .signature()
-        .map(str::to_string)
-        .or_else(|| analyzer.get_source(field, false))?;
-    let declaration = declaration_text
-        .split('=')
-        .next()
-        .unwrap_or(&declaration_text)
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    let name_at = declaration.rfind(field.identifier())?;
-    let type_text = declaration[..name_at].trim();
-    if type_text.is_empty() {
-        return None;
-    }
-    let indirection = cpp_type_text_pointer_depth(type_text);
+    let (type_text, indirection) = cpp_field_declared_type_text(analyzer, visibility, field)?;
     Some(CppType::from_text(
         analyzer,
         visibility,
         file,
-        type_text,
+        &type_text,
         indirection,
     ))
 }

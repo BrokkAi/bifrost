@@ -1216,6 +1216,365 @@ int read_pointer_cluster_size() {
 }
 
 #[test]
+fn authoritative_cpp_usage_finds_terminal_fields_through_nested_member_chains() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "model.h",
+            r#"struct Leaf { int value; };
+struct Mid {
+    Leaf leaf;
+    Leaf* leaf_ptr;
+    Leaf leaves[2];
+};
+struct Root {
+    Mid mid;
+    Mid* mid_ptr;
+    int read_member_values() const;
+};
+extern Root* root;
+extern Root by_value;
+namespace ns { extern Root* qualified_root; }
+
+struct WrongLeaf { int value; };
+struct WrongMid {
+    WrongLeaf leaf;
+    WrongLeaf* leaf_ptr;
+};
+struct WrongRoot {
+    WrongMid mid;
+    WrongMid* mid_ptr;
+};
+extern WrongRoot* wrong;
+namespace wrong_ns { extern WrongRoot* qualified_root; }
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "model.h"
+
+int read_values() {
+    return root->mid.leaf.value
+        + root->mid.leaf_ptr->value
+        + root->mid_ptr->leaf.value
+        + by_value.mid.leaf.value
+        + (root->mid).leaf.value
+        + root->mid.leaves[0].value;
+}
+
+int Root::read_member_values() const {
+    return this->mid.leaf.value
+        + (*this).mid_ptr->leaf.value
+        + mid.leaf.value;
+}
+
+int read_qualified_value() {
+    return ns::qualified_root->mid.leaf.value;
+}
+
+int read_wrong_value() {
+    return wrong->mid.leaf.value;
+}
+
+int read_shadowed_value(WrongRoot* root) {
+    return root->mid.leaf.value;
+}
+
+int read_wrong_qualified_value() {
+    return wrong_ns::qualified_root->mid.leaf.value;
+}
+"#,
+        ),
+    ]);
+
+    let target = field_definition_with_owner(&analyzer, "Leaf", "value");
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let mut terminal_starts = source
+        .match_indices(".value")
+        .map(|(start, _)| start + 1)
+        .chain(source.match_indices("->value").map(|(start, _)| start + 2))
+        .collect::<Vec<_>>();
+    terminal_starts.sort_unstable();
+    assert_eq!(13, terminal_starts.len(), "test fixture terminal count");
+    let positive_starts = &terminal_starts[..10];
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative nested C++ field success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("Leaf.value should have a proven-hit bucket");
+    assert_eq!(
+        positive_starts.len(),
+        hits.len(),
+        "only terminals reached through Leaf should be proven: {hits:#?}"
+    );
+    for terminal_start in positive_starts {
+        let terminal_end = terminal_start + "value".len();
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= *terminal_start
+                    && terminal_end <= hit.end_offset
+            }),
+            "nested Leaf.value terminal at {terminal_start} should be proven: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_usage_does_not_choose_an_ambiguous_short_field_type() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "model.h",
+            r#"namespace alpha { struct Leaf { int value; }; }
+namespace beta { struct Leaf { int value; }; }
+struct Root { Leaf leaf; };
+extern Root root;
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "model.h"
+
+int read_value() {
+    return root.leaf.value;
+}
+"#,
+        ),
+    ]);
+
+    let alpha = definition_by(&analyzer, |unit| unit.fq_name() == "alpha.Leaf.value");
+    let beta = definition_by(&analyzer, |unit| unit.fq_name() == "beta.Leaf.value");
+    let consumer = project.file("consumer.cpp");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+
+    for target in [alpha, beta] {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            );
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = query.result
+        else {
+            panic!(
+                "expected authoritative ambiguous-type C++ success, got {:#?}",
+                query.result
+            );
+        };
+        assert!(
+            hits_by_overload
+                .get(&target)
+                .is_some_and(|hits| hits.is_empty()),
+            "ambiguous short field type must not be assigned to either declaration: {hits_by_overload:#?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_usage_does_not_reinterpret_untyped_global_as_same_named_type() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "model.h",
+            r#"struct Leaf { int value; };
+struct root { Leaf leaf; };
+extern MissingType root;
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "model.h"
+
+int read_value() {
+    return root.leaf.value;
+}
+"#,
+        ),
+    ]);
+
+    let target = field_definition_with_owner(&analyzer, "Leaf", "value");
+    let consumer = project.file("consumer.cpp");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative unresolved-global C++ success, got {:#?}",
+            query.result
+        );
+    };
+    assert!(
+        hits_by_overload
+            .get(&target)
+            .is_some_and(|hits| hits.is_empty()),
+        "an unresolved global variable must not be reinterpreted as its same-named type: {hits_by_overload:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_follows_inline_tagged_typedef_member_chain() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "model.h",
+            r#"typedef struct stats_tag {
+    int omcast;
+} stats_alias;
+
+typedef struct entry_tag {
+    stats_alias stats;
+} entry_alias;
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "model.h"
+
+int read_value(entry_alias *new_vals) {
+    return new_vals->stats.omcast;
+}
+"#,
+        ),
+    ]);
+
+    let target = field_definition_with_owner(&analyzer, "stats_tag", "omcast");
+    let consumer = project.file("consumer.c");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative tagged-typedef C++ success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("stats_tag.omcast should have a proven-hit bucket");
+    let terminal_start = consumer
+        .read_to_string()
+        .expect("consumer source")
+        .rfind("omcast")
+        .expect("terminal member");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= terminal_start
+                && terminal_start + "omcast".len() <= hit.end_offset
+        }),
+        "nested member through inline tagged typedefs should be proven: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_follows_same_name_inline_tagged_typedef_chain() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "model.h",
+            r#"typedef struct Leaf {
+    int value;
+} Leaf;
+
+typedef struct Root {
+    Leaf leaf;
+} Root;
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "model.h"
+
+int read_value(Root *root) {
+    return root->leaf.value;
+}
+"#,
+        ),
+    ]);
+
+    let target = field_definition_with_owner(&analyzer, "Leaf", "value");
+    let consumer = project.file("consumer.c");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative same-name tagged-typedef C++ success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("Leaf.value should have a proven-hit bucket");
+    let terminal_start = consumer
+        .read_to_string()
+        .expect("consumer source")
+        .rfind("value")
+        .expect("terminal member");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= terminal_start
+                && terminal_start + "value".len() <= hit.end_offset
+        }),
+        "same-name inline tagged typedef chain should be proven: {hits:#?}"
+    );
+}
+
+#[test]
 fn cpp_graph_rejects_unrelated_same_name_without_include_visibility() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         ("target.h", "struct Target { void run(); };\n"),

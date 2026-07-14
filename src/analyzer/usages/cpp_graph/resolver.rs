@@ -13,7 +13,7 @@ use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::hash::Hash;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -168,6 +168,14 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     alias_source_files: HashSet<ProjectFile>,
     aliases_by_file: OnceLock<HashMap<ProjectFile, Vec<CppAlias>>>,
+    field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
+    structured_alias_targets: Mutex<HashMap<CodeUnit, Option<String>>>,
+}
+
+#[derive(Clone)]
+struct DeclaredFieldTypeFact {
+    type_text: String,
+    indirection: i32,
 }
 
 struct CppAlias {
@@ -230,6 +238,8 @@ impl VisibilityIndex {
             visible_by_identifier,
             alias_source_files: files,
             aliases_by_file: OnceLock::new(),
+            field_type_facts: Mutex::new(HashMap::default()),
+            structured_alias_targets: Mutex::new(HashMap::default()),
         }
     }
 
@@ -291,6 +301,71 @@ impl VisibilityIndex {
         self.resolve_type(visible_from, raw_name)
     }
 
+    fn resolve_unique_canonical_type_for_declaration(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        let mut declaration = declaration.clone();
+        let mut raw_name = raw_name.to_string();
+        let mut seen_aliases = HashSet::default();
+        loop {
+            let resolved =
+                self.resolve_unique_type_for_declaration(visible_from, &declaration, &raw_name)?;
+            if let Some(target) = self.structured_alias_target(analyzer, &resolved) {
+                if !seen_aliases.insert(resolved.clone()) {
+                    return None;
+                }
+                raw_name = target;
+                declaration = resolved;
+                continue;
+            }
+            return resolved.is_class().then_some(resolved);
+        }
+    }
+
+    pub(super) fn canonical_type_unit(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        unit: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        let mut current = unit.clone();
+        let mut seen_aliases = HashSet::default();
+        loop {
+            let Some(target) = self.structured_alias_target(analyzer, &current) else {
+                return current.is_class().then_some(current);
+            };
+            if !seen_aliases.insert(current.clone()) {
+                return None;
+            }
+            current = self.resolve_unique_type_for_declaration(visible_from, &current, &target)?;
+        }
+    }
+
+    fn resolve_unique_type_for_declaration(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        let normalized = normalize_reference_name(raw_name)?;
+        if !normalized.contains("::")
+            && let Some(namespace) = cpp_namespace_for(declaration)
+        {
+            for prefix in namespace_prefixes(&namespace) {
+                let qualified = format!("{prefix}::{normalized}");
+                let candidates = self.type_candidates(visible_from, &qualified);
+                if !candidates.is_empty() {
+                    return unique_logical_type_candidate(candidates);
+                }
+            }
+        }
+        unique_logical_type_candidate(self.type_candidates(visible_from, &normalized))
+    }
+
     pub(super) fn resolves_to_type(
         &self,
         file: &ProjectFile,
@@ -309,18 +384,7 @@ impl VisibilityIndex {
     }
 
     pub(super) fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
-        let signature = alias.signature()?;
-        let raw_target = signature
-            .strip_prefix("using ")
-            .and_then(|rest| rest.split_once('=').map(|(_, rhs)| rhs))
-            .or_else(|| {
-                signature
-                    .strip_prefix("typedef ")
-                    .and_then(|rest| rest.rsplit_once(' ').map(|(lhs, _)| lhs))
-            })?
-            .trim()
-            .trim_end_matches(';')
-            .trim();
+        let raw_target = type_alias_target_text(alias)?;
         let resolved = self.resolve_type_for_declaration(alias.source(), alias, raw_target)?;
         match resolved.kind() {
             CodeUnitType::Class => Some(resolved),
@@ -489,15 +553,53 @@ impl VisibilityIndex {
         owner: &CodeUnit,
         name: &str,
     ) -> Vec<&'b CodeUnit> {
-        self.visible_units(file)
+        self.visible_identifier_candidates(file, name)
             .filter(|unit| {
-                unit.identifier() == name
-                    && unit
-                        .fq_name()
-                        .rsplit_once('.')
-                        .is_some_and(|(parent, _)| parent == owner.fq_name())
+                unit.fq_name()
+                    .rsplit_once('.')
+                    .is_some_and(|(parent, _)| parent == owner.fq_name())
             })
             .collect()
+    }
+
+    fn field_declared_type_fact(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        field: &CodeUnit,
+    ) -> Option<DeclaredFieldTypeFact> {
+        if let Some(cached) = self
+            .field_type_facts
+            .lock()
+            .expect("C++ field type fact cache poisoned")
+            .get(field)
+            .cloned()
+        {
+            return cached;
+        }
+        let decoded = decode_field_declared_type_fact(analyzer, field);
+        self.field_type_facts
+            .lock()
+            .expect("C++ field type fact cache poisoned")
+            .insert(field.clone(), decoded.clone());
+        decoded
+    }
+
+    fn structured_alias_target(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
+        if let Some(cached) = self
+            .structured_alias_targets
+            .lock()
+            .expect("C++ structured alias target cache poisoned")
+            .get(unit)
+            .cloned()
+        {
+            return cached;
+        }
+        let decoded = decode_structured_alias_target(analyzer, unit);
+        self.structured_alias_targets
+            .lock()
+            .expect("C++ structured alias target cache poisoned")
+            .insert(unit.clone(), decoded.clone());
+        decoded
     }
 
     fn type_candidates<'b>(&'b self, file: &ProjectFile, normalized: &str) -> Vec<&'b CodeUnit> {
@@ -1035,6 +1137,192 @@ fn field_declares_type(unit: &CodeUnit, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> 
             })
 }
 
+pub(super) fn field_declared_binding(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    visible_from: &ProjectFile,
+    field: &CodeUnit,
+) -> Option<CppScanBinding> {
+    let fact = visibility.field_declared_type_fact(analyzer, field)?;
+    let normalized = normalize_field_type_text(&fact.type_text);
+    let resolved = visibility.resolve_unique_canonical_type_for_declaration(
+        analyzer,
+        visible_from,
+        field,
+        &normalized,
+    );
+    Some(CppScanBinding::from_type_name(
+        normalized,
+        resolved,
+        fact.indirection,
+    ))
+}
+
+fn type_alias_target_text(alias: &CodeUnit) -> Option<&str> {
+    alias
+        .signature()?
+        .strip_prefix("using ")
+        .and_then(|rest| rest.split_once('=').map(|(_, rhs)| rhs))
+        .or_else(|| {
+            alias
+                .signature()?
+                .strip_prefix("typedef ")
+                .and_then(|rest| rest.rsplit_once(' ').map(|(lhs, _)| lhs))
+        })
+        .map(str::trim)
+        .map(|target| target.trim_end_matches(';').trim())
+}
+
+fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit> {
+    let first = candidates.first()?;
+    candidates
+        .iter()
+        .all(|candidate| candidate.kind() == first.kind() && candidate.fq_name() == first.fq_name())
+        .then(|| (*first).clone())
+}
+
+pub(in crate::analyzer::usages) fn field_declared_type_text(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    field: &CodeUnit,
+) -> Option<(String, i32)> {
+    let fact = visibility.field_declared_type_fact(analyzer, field)?;
+    Some((fact.type_text, fact.indirection))
+}
+
+fn decode_field_declared_type_fact(
+    analyzer: &dyn IAnalyzer,
+    field: &CodeUnit,
+) -> Option<DeclaredFieldTypeFact> {
+    let declaration = analyzer.get_source(field, false)?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(&declaration, None)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "declaration" | "field_declaration")
+            && let Some(type_node) = node
+                .child_by_field_name("type")
+                .or_else(|| first_type_child(node))
+            && let Some(indirection) =
+                declared_name_indirection(node, type_node, field.identifier(), &declaration)
+        {
+            return Some(DeclaredFieldTypeFact {
+                type_text: node_text(type_node, &declaration).to_string(),
+                indirection,
+            });
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+fn decode_structured_alias_target(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
+    let declaration = analyzer.get_source(unit, false)?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(&declaration, None)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let type_node = match node.kind() {
+            "type_definition" => {
+                if node
+                    .parent()
+                    .is_none_or(|parent| parent.kind() != "translation_unit")
+                {
+                    let mut cursor = node.walk();
+                    stack.extend(node.named_children(&mut cursor));
+                    continue;
+                }
+                let mut declarator_cursor = node.walk();
+                let declares_unit = node
+                    .children_by_field_name("declarator", &mut declarator_cursor)
+                    .any(|declarator| {
+                        extract_typedef_declarator_name(declarator, &declaration)
+                            .is_some_and(|name| name == unit.identifier())
+                    });
+                declares_unit.then(|| node.child_by_field_name("type"))??
+            }
+            "alias_declaration" => {
+                if node
+                    .parent()
+                    .is_none_or(|parent| parent.kind() != "translation_unit")
+                {
+                    let mut cursor = node.walk();
+                    stack.extend(node.named_children(&mut cursor));
+                    continue;
+                }
+                let name = node.child_by_field_name("name")?;
+                (node_text(name, &declaration) == unit.identifier())
+                    .then(|| node.child_by_field_name("type"))??
+            }
+            _ => {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+                continue;
+            }
+        };
+        return structured_alias_type_name(type_node, &declaration);
+    }
+    None
+}
+
+fn structured_alias_type_name(mut type_node: Node<'_>, source: &str) -> Option<String> {
+    while type_node.kind() == "type_descriptor" {
+        type_node = type_node.child_by_field_name("type")?;
+    }
+    if matches!(
+        type_node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+    ) {
+        let name = type_node.child_by_field_name("name")?;
+        return Some(node_text(name, source).to_string());
+    }
+    let normalized = normalize_type_text(node_text(type_node, source));
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn declared_name_indirection(
+    declaration: Node<'_>,
+    type_node: Node<'_>,
+    field_name: &str,
+    source: &str,
+) -> Option<i32> {
+    let mut stack = Vec::new();
+    let mut cursor = declaration.walk();
+    stack.extend(
+        declaration
+            .named_children(&mut cursor)
+            .filter(|child| !same_node(*child, type_node)),
+    );
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "identifier" | "field_identifier")
+            && node_text(node, source) == field_name
+        {
+            let mut indirection = 0;
+            let mut current = node.parent();
+            while let Some(parent) = current {
+                if same_node(parent, declaration) {
+                    return Some(indirection);
+                }
+                if parent.kind() == "pointer_declarator" {
+                    indirection += 1;
+                }
+                current = parent.parent();
+            }
+            return None;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
 fn field_declaration_type_matches(
     declaration: &str,
     unit: &CodeUnit,
@@ -1070,7 +1358,8 @@ fn field_type_prefix<'a>(declaration: &'a str, field_name: &str) -> Option<&'a s
 }
 
 fn normalize_field_type_text(type_text: &str) -> String {
-    const FIELD_SPECIFIERS: [&str; 7] = [
+    const FIELD_SPECIFIERS: [&str; 8] = [
+        "extern ",
         "static ",
         "mutable ",
         "constexpr ",

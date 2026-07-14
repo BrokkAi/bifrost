@@ -239,15 +239,37 @@ fn seed_binding_from_type_or_value(
     }
 }
 
+const MAX_RECEIVER_CALL_RESOLUTION_DEPTH: usize = 32;
+
 fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CppScanBinding> {
+    infer_type_from_value_with_budget(node, ctx, MAX_RECEIVER_CALL_RESOLUTION_DEPTH)
+}
+
+fn infer_type_from_value_with_budget(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    remaining_call_depth: usize,
+) -> Option<CppScanBinding> {
     match node.kind() {
+        "new_expression" | "call_expression" if remaining_call_depth == 0 => {
+            infer_cpp_initializer_binding(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                node,
+                None,
+            )
+        }
         "new_expression" | "call_expression" => infer_cpp_initializer_binding(
             ctx.analyzer,
             ctx.visibility,
             ctx.file,
             ctx.source,
             node,
-            Some(&|receiver, source| receiver_type_units(receiver, source, ctx)),
+            Some(&|receiver, source| {
+                receiver_type_units_with_budget(receiver, source, ctx, remaining_call_depth - 1)
+            }),
         ),
         "initializer_list" => None,
         "identifier" => {
@@ -1122,35 +1144,203 @@ fn owner_is_unscoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
 }
 
 fn receiver_type_units(node: Node<'_>, source: &str, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
-    match node.kind() {
-        "identifier" => ctx
-            .bindings
-            .resolve_symbol(node_text(node, source))
-            .as_precise()
-            .into_iter()
-            .flatten()
-            .filter_map(|binding| binding.unit.clone())
-            .collect(),
-        "pointer_expression" | "parenthesized_expression" => node
-            .child_by_field_name("argument")
-            .or_else(|| node.named_child(0))
-            .map(|inner| receiver_type_units(inner, source, ctx))
-            .unwrap_or_default(),
-        "call_expression" | "new_expression" => infer_type_from_value(node, ctx)
-            .and_then(|binding| binding.unit)
-            .into_iter()
-            .collect(),
-        "field_expression" => node
-            .child_by_field_name("argument")
-            .or_else(|| node.child_by_field_name("object"))
-            .map(|receiver| receiver_type_units(receiver, source, ctx))
-            .unwrap_or_default(),
-        _ => ctx
-            .visibility
-            .resolve_type(ctx.file, node_text(node, source))
-            .into_iter()
-            .collect(),
+    receiver_type_units_with_budget(node, source, ctx, MAX_RECEIVER_CALL_RESOLUTION_DEPTH)
+}
+
+fn receiver_type_units_with_budget(
+    node: Node<'_>,
+    source: &str,
+    ctx: &ScanCtx<'_>,
+    remaining_call_depth: usize,
+) -> Vec<CodeUnit> {
+    let mut current = node;
+    let mut member_chain = Vec::new();
+    let mut base_units = loop {
+        match current.kind() {
+            "field_expression" => {
+                let Some(member) = current.child_by_field_name("field") else {
+                    return Vec::new();
+                };
+                let Some(receiver) = current
+                    .child_by_field_name("argument")
+                    .or_else(|| current.child_by_field_name("object"))
+                    .or_else(|| current.named_child(0))
+                else {
+                    return Vec::new();
+                };
+                member_chain.push(node_text(member, source));
+                current = receiver;
+            }
+            "pointer_expression" | "parenthesized_expression" | "subscript_expression" => {
+                let Some(inner) = current
+                    .child_by_field_name("argument")
+                    .or_else(|| current.named_child(0))
+                else {
+                    return Vec::new();
+                };
+                current = inner;
+            }
+            "identifier" => {
+                let name = node_text(current, source);
+                let local = ctx.bindings.resolve_symbol(name);
+                if let Some(bindings) = local.as_precise() {
+                    break unanimous_receiver_units(
+                        bindings
+                            .iter()
+                            .filter_map(|binding| binding.unit.clone())
+                            .collect(),
+                    );
+                }
+                if ctx.bindings.is_shadowed(name) {
+                    return Vec::new();
+                }
+                if let Some(owner) = enclosing_context(current, ctx).owner {
+                    let implicit_fields = ctx
+                        .visibility
+                        .visible_members_for_owner_name(ctx.file, &owner, name)
+                        .into_iter()
+                        .filter(|unit| unit.is_field())
+                        .collect::<Vec<_>>();
+                    if !implicit_fields.is_empty() {
+                        break receiver_units_from_declared_fields(implicit_fields, ctx);
+                    }
+                }
+                let global_fields = ctx
+                    .visibility
+                    .visible_identifier_candidates(ctx.file, name)
+                    .filter(|unit| {
+                        has_persisted_global_field_identity(unit) && unit.identifier() == name
+                    })
+                    .collect::<Vec<_>>();
+                if global_fields.is_empty() {
+                    break ctx
+                        .visibility
+                        .resolve_type(ctx.file, name)
+                        .into_iter()
+                        .collect();
+                }
+                if let Some(first) = global_fields.first()
+                    && global_fields
+                        .iter()
+                        .skip(1)
+                        .any(|field| !same_visible_symbol(first, field))
+                {
+                    return Vec::new();
+                }
+                break receiver_units_from_declared_fields(global_fields, ctx);
+            }
+            "call_expression" | "new_expression" => {
+                break infer_type_from_value_with_budget(current, ctx, remaining_call_depth)
+                    .and_then(|binding| binding.unit)
+                    .into_iter()
+                    .collect();
+            }
+            "this" => {
+                break enclosing_context(current, ctx).owner.into_iter().collect();
+            }
+            "qualified_identifier" | "scoped_identifier" => {
+                let reference = node_text(current, source);
+                let fields = ctx
+                    .visibility
+                    .named_candidates(ctx.file, reference, TargetKind::GlobalField)
+                    .into_iter()
+                    .filter(has_persisted_global_field_identity)
+                    .collect::<Vec<_>>();
+                if fields.is_empty() {
+                    break ctx
+                        .visibility
+                        .resolve_type(ctx.file, reference)
+                        .into_iter()
+                        .collect();
+                }
+                break receiver_units_from_declared_fields(fields.iter().collect(), ctx);
+            }
+            _ => {
+                break ctx
+                    .visibility
+                    .resolve_type(ctx.file, node_text(current, source))
+                    .into_iter()
+                    .collect();
+            }
+        }
+    };
+
+    while let Some(member_name) = member_chain.pop() {
+        let mut next_units = Vec::new();
+        for owner in &base_units {
+            let Some(owner) = ctx
+                .visibility
+                .canonical_type_unit(ctx.analyzer, ctx.file, owner)
+            else {
+                continue;
+            };
+            for field in ctx
+                .visibility
+                .visible_members_for_owner_name(ctx.file, &owner, member_name)
+                .into_iter()
+                .filter(|unit| unit.is_field())
+            {
+                let Some(unit) =
+                    field_declared_binding(ctx.analyzer, ctx.visibility, ctx.file, field)
+                        .and_then(|binding| binding.unit)
+                else {
+                    continue;
+                };
+                if !next_units
+                    .iter()
+                    .any(|existing| same_visible_symbol(existing, &unit))
+                {
+                    next_units.push(unit);
+                }
+            }
+        }
+        if next_units.is_empty() {
+            return Vec::new();
+        }
+        base_units = unanimous_receiver_units(next_units);
+        if base_units.is_empty() {
+            return Vec::new();
+        }
     }
+    base_units
+}
+
+fn receiver_units_from_declared_fields(fields: Vec<&CodeUnit>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
+    let Some(first) = fields.first() else {
+        return Vec::new();
+    };
+    if fields
+        .iter()
+        .skip(1)
+        .any(|field| !same_visible_symbol(first, field))
+    {
+        return Vec::new();
+    }
+    unanimous_receiver_units(
+        fields
+            .into_iter()
+            .filter_map(|field| {
+                field_declared_binding(ctx.analyzer, ctx.visibility, ctx.file, field)
+                    .and_then(|binding| binding.unit)
+            })
+            .collect(),
+    )
+}
+
+fn unanimous_receiver_units(units: Vec<CodeUnit>) -> Vec<CodeUnit> {
+    let mut unique = Vec::new();
+    for unit in units {
+        if !unique
+            .iter()
+            .any(|existing| same_visible_symbol(existing, &unit))
+        {
+            unique.push(unit);
+            if unique.len() > 1 {
+                return Vec::new();
+            }
+        }
+    }
+    unique
 }
 
 fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -1161,7 +1351,12 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         "field_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"))
-            .is_some_and(|receiver| receiver_matches_target(receiver, ctx)),
+            .is_some_and(|receiver| {
+                receiver_is_self_like(receiver) && same_owner_context(receiver, ctx)
+                    || receiver_type_units(receiver, ctx.source, ctx)
+                        .iter()
+                        .any(|target| same_symbol(target, owner))
+            }),
         "call_expression" => node
             .child_by_field_name("function")
             .is_some_and(|function| receiver_matches_target(function, ctx)),
@@ -1191,20 +1386,36 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 fn receiver_is_self_like(node: Node<'_>) -> bool {
-    match node.kind() {
-        "this" => true,
-        "field_expression" => node
-            .child_by_field_name("argument")
-            .or_else(|| node.child_by_field_name("object"))
-            .is_some_and(receiver_is_self_like),
-        "call_expression" => node
-            .child_by_field_name("function")
-            .is_some_and(receiver_is_self_like),
-        "pointer_expression" | "parenthesized_expression" => node
-            .child_by_field_name("argument")
-            .or_else(|| node.named_child(0))
-            .is_some_and(receiver_is_self_like),
-        _ => false,
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "this" => return true,
+            "field_expression" => {
+                let Some(receiver) = current
+                    .child_by_field_name("argument")
+                    .or_else(|| current.child_by_field_name("object"))
+                else {
+                    return false;
+                };
+                current = receiver;
+            }
+            "call_expression" => {
+                let Some(function) = current.child_by_field_name("function") else {
+                    return false;
+                };
+                current = function;
+            }
+            "pointer_expression" | "parenthesized_expression" => {
+                let Some(inner) = current
+                    .child_by_field_name("argument")
+                    .or_else(|| current.named_child(0))
+                else {
+                    return false;
+                };
+                current = inner;
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -1216,7 +1427,13 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         "field_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"))
-            .is_some_and(|receiver| receiver_has_known_non_target(receiver, ctx)),
+            .is_some_and(|receiver| {
+                let units = receiver_type_units(receiver, ctx.source, ctx);
+                !units.is_empty()
+                    && units
+                        .iter()
+                        .all(|target| !same_visible_symbol(target, owner))
+            }),
         "call_expression" => node
             .child_by_field_name("function")
             .is_some_and(|function| receiver_has_known_non_target(function, ctx)),
