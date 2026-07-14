@@ -122,13 +122,30 @@ pub use typescript::TypescriptAnalyzer;
 pub(crate) use usage_facts::UsageFactsIndex;
 pub use workspace::{EmptyAnalyzer, WorkspaceAnalyzer};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParserFlavor {
+    Default,
+    TypeScriptTsx,
+}
+
 /// Resolve the default parser grammar registered for a language.
 pub(crate) fn parser_language_for(language: Language) -> Option<tree_sitter::Language> {
+    parser_language_for_flavor(language, ParserFlavor::Default)
+}
+
+/// Resolve a parser grammar from the canonical language registry.
+pub(crate) fn parser_language_for_flavor(
+    language: Language,
+    flavor: ParserFlavor,
+) -> Option<tree_sitter::Language> {
     Some(match language {
         Language::Java => tree_sitter_java::LANGUAGE.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript if flavor == ParserFlavor::TypeScriptTsx => {
+            tree_sitter_typescript::LANGUAGE_TSX.into()
+        }
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
@@ -138,6 +155,24 @@ pub(crate) fn parser_language_for(language: Language) -> Option<tree_sitter::Lan
         Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
         Language::None => return None,
     })
+}
+
+/// Resolve the parser grammar used by the indexed analyzer for a specific path.
+pub(crate) fn parser_language_for_path(
+    language: Language,
+    path: &std::path::Path,
+) -> Option<tree_sitter::Language> {
+    parser_language_for_flavor(language, parser_flavor_for_path(language, path))
+}
+
+pub(crate) fn parser_flavor_for_path(language: Language, path: &std::path::Path) -> ParserFlavor {
+    if language == Language::TypeScript
+        && path.extension().is_some_and(|extension| extension == "tsx")
+    {
+        ParserFlavor::TypeScriptTsx
+    } else {
+        ParserFlavor::Default
+    }
 }
 
 /// Resolve the normalized structural adapter registered for a language

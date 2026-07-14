@@ -853,6 +853,12 @@ fn bifrost_lsp_server_renders_rune_ir_from_unsaved_overlay_and_indexed_code_unit
     assert!(response["error"].is_null(), "{response}");
     assert_eq!(response["result"]["codeUnit"], "View", "{response}");
     assert!(
+        response["result"]["displayText"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("; Rune IR for View (tsx)")),
+        "{response}"
+    );
+    assert!(
         response["result"]["runeIr"]
             .as_str()
             .is_some_and(|text| text.starts_with("(function") && text.contains(":name \"View\"")),

@@ -1,5 +1,5 @@
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 use super::declarations::{parse_php_file, php_declared_type_node};
 use super::tests::php_contains_tests;
@@ -14,10 +14,6 @@ impl LanguageAdapter for PhpAdapter {
 
     fn query_directory(&self) -> &'static str {
         "resources/treesitter/php"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_php::LANGUAGE_PHP.into()
     }
 
     fn file_extension(&self) -> &'static str {
@@ -57,10 +53,6 @@ impl LanguageAdapter for PhpAdapter {
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_php_file(file, source, tree)
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::PHP_STRUCTURAL_SPEC)
     }
 }
 

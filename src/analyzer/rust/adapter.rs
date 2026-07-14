@@ -1,7 +1,7 @@
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use std::sync::LazyLock;
-use tree_sitter::{Language as TsLanguage, Tree};
+use tree_sitter::Tree;
 
 use super::declarations::{parse_rust_file, rust_package_name};
 use super::tests::rust_source_contains_tests;
@@ -31,10 +31,6 @@ impl LanguageAdapter for RustAdapter {
 
     fn query_directory(&self) -> &'static str {
         "resources/treesitter/rust"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_rust::LANGUAGE.into()
     }
 
     fn file_extension(&self) -> &'static str {
@@ -93,9 +89,5 @@ impl LanguageAdapter for RustAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&RUST_COGNITIVE_CONFIG)
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::RUST_STRUCTURAL_SPEC)
     }
 }

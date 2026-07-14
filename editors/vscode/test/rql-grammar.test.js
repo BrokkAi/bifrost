@@ -2,57 +2,19 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
-const { loadWASM, OnigScanner, OnigString } = require("vscode-oniguruma");
-const { INITIAL, Registry, parseRawGrammar } = require("vscode-textmate");
+const {
+  assertScoped,
+  loadTextMateGrammar,
+  tokenizeGrammar
+} = require("./textmate-test-utils");
 
 const extensionRoot = path.resolve(__dirname, "..");
 const grammarPath = path.join(extensionRoot, "syntaxes", "bifrost-rql.tmLanguage.json");
 const fixturePath = path.join(__dirname, "fixtures", "rql", "highlighting.rql");
 const scopeName = "source.bifrost-rql";
 
-let onigLib;
-
 async function grammar() {
-  if (!onigLib) {
-    const wasm = fs.readFileSync(require.resolve("vscode-oniguruma/release/onig.wasm"));
-    await loadWASM(wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength));
-    onigLib = Promise.resolve({
-      createOnigScanner(patterns) {
-        return new OnigScanner(patterns);
-      },
-      createOnigString(value) {
-        return new OnigString(value);
-      }
-    });
-  }
-
-  const registry = new Registry({
-    onigLib,
-    loadGrammar(requestedScope) {
-      if (requestedScope !== scopeName) {
-        return null;
-      }
-      return parseRawGrammar(fs.readFileSync(grammarPath, "utf8"), grammarPath);
-    }
-  });
-  return registry.loadGrammar(scopeName);
-}
-
-function tokenize(grammar, source) {
-  let ruleStack = INITIAL;
-  return source.split(/\r?\n/).flatMap((line) => {
-    const result = grammar.tokenizeLine(line, ruleStack);
-    ruleStack = result.ruleStack;
-    return result.tokens.map((token) => ({
-      text: line.slice(token.startIndex, token.endIndex),
-      scopes: token.scopes
-    }));
-  });
-}
-
-function assertScoped(tokens, text, scope) {
-  const token = tokens.find((candidate) => candidate.text === text && candidate.scopes.includes(scope));
-  assert.ok(token, `expected ${JSON.stringify(text)} to have ${scope}`);
+  return loadTextMateGrammar(grammarPath, scopeName);
 }
 
 test("registers Bifrost RQL as a distinct .rql language", () => {
@@ -134,7 +96,7 @@ test("registers Bifrost RQL as a distinct .rql language", () => {
 });
 
 test("tokenizes nested RQL structure, literals, and incomplete input", async () => {
-  const tokens = tokenize(await grammar(), fs.readFileSync(fixturePath, "utf8"));
+  const tokens = tokenizeGrammar(await grammar(), fs.readFileSync(fixturePath, "utf8"));
 
   assertScoped(tokens, "; A complete nested query and deliberately incomplete trailing input.", "comment.line.semicolon.bifrost-rql");
   assertScoped(tokens, "(", "punctuation.section.brackets.bifrost-rql");
@@ -153,7 +115,7 @@ test("tokenizes nested RQL structure, literals, and incomplete input", async () 
 });
 
 test("highlights registered underscore predicate aliases", async () => {
-  const tokens = tokenize(await grammar(), "(not_has (call)) (not_kind class)");
+  const tokens = tokenizeGrammar(await grammar(), "(not_has (call)) (not_kind class)");
   assertScoped(tokens, "not_has", "support.function.predicate.bifrost-rql");
   assertScoped(tokens, "not_kind", "support.function.predicate.bifrost-rql");
 });

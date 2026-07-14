@@ -9,7 +9,7 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{LanguageAdapter, Range};
 use crate::text_utils::compute_line_starts;
 use std::sync::LazyLock;
-use tree_sitter::{Language as TsLanguage, Tree};
+use tree_sitter::Tree;
 /// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
 /// for Python. Mirrors `ai.brokk.analyzer.python.CognitiveComplexityAnalysis`.
 static PYTHON_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
@@ -38,10 +38,6 @@ impl LanguageAdapter for PythonAdapter {
 
     fn query_directory(&self) -> &'static str {
         "resources/treesitter/python"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_python::LANGUAGE.into()
     }
 
     fn file_extension(&self) -> &'static str {
@@ -160,9 +156,5 @@ impl LanguageAdapter for PythonAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&PYTHON_COGNITIVE_CONFIG)
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::PYTHON_STRUCTURAL_SPEC)
     }
 }

@@ -2,7 +2,7 @@ use super::declarations::{CppVisitor, collect_cpp_identifiers, recover_quoted_in
 use super::tests::cpp_contains_tests;
 use super::*;
 use crate::analyzer::LanguageAdapter;
-use tree_sitter::{Language as TsLanguage, Tree};
+use tree_sitter::Tree;
 
 #[derive(Debug, Clone, Default)]
 pub struct CppAdapter;
@@ -14,10 +14,6 @@ impl LanguageAdapter for CppAdapter {
 
     fn query_directory(&self) -> &'static str {
         "resources/treesitter/cpp"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_cpp::LANGUAGE.into()
     }
 
     fn file_extension(&self) -> &'static str {
@@ -63,9 +59,5 @@ impl LanguageAdapter for CppAdapter {
         visitor.visit_container(root, "", None, None, None);
         recover_quoted_includes(source, &mut parsed);
         parsed
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::CPP_STRUCTURAL_SPEC)
     }
 }

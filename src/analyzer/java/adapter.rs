@@ -9,7 +9,7 @@ use super::*;
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{LanguageAdapter, SignatureMetadata};
 use std::sync::LazyLock;
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 /// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
 /// for Java. Mirrors `ai.brokk.analyzer.java.CognitiveComplexityAnalysis`.
@@ -50,10 +50,6 @@ impl LanguageAdapter for JavaAdapter {
 
     fn query_directory(&self) -> &'static str {
         "resources/treesitter/java"
-    }
-
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_java::LANGUAGE.into()
     }
 
     fn file_extension(&self) -> &'static str {
@@ -160,10 +156,6 @@ impl LanguageAdapter for JavaAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&JAVA_COGNITIVE_CONFIG)
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::JAVA_STRUCTURAL_SPEC)
     }
 }
 

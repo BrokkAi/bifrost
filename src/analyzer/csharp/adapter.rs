@@ -1,6 +1,6 @@
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
-use tree_sitter::{Language as TsLanguage, Tree};
+use tree_sitter::Tree;
 
 use super::declarations::parse_csharp_file;
 use super::tests::csharp_contains_tests;
@@ -21,16 +21,8 @@ impl LanguageAdapter for CSharpAdapter {
         "resources/treesitter/c_sharp"
     }
 
-    fn parser_language(&self) -> TsLanguage {
-        tree_sitter_c_sharp::LANGUAGE.into()
-    }
-
     fn file_extension(&self) -> &'static str {
         "cs"
-    }
-
-    fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
-        Some(&super::structural::CSHARP_STRUCTURAL_SPEC)
     }
 
     fn normalize_full_name(&self, fq_name: &str) -> String {

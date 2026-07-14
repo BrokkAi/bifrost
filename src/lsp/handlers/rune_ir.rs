@@ -74,7 +74,7 @@ pub(crate) fn handle(
     let display_text = format!(
         "; Rune IR for {} ({})\n\n{}\n; Starter RQL\n{}\n",
         code_unit_name,
-        language.config_label(),
+        rune_ir_language.config_label(),
         rendered.rune_ir.trim_end(),
         rendered.starter_rql
     );

@@ -9,6 +9,8 @@ use super::CodeQuery;
 use super::extract::extract_file_facts;
 use super::facts::FileFacts;
 use crate::analyzer::Language;
+use crate::analyzer::common::is_unparseable_source;
+use crate::analyzer::{ParserFlavor, parser_flavor_for_path, parser_language_for_flavor};
 use std::fmt;
 use std::ops::Range;
 use std::path::Path;
@@ -62,12 +64,7 @@ impl RuneIrLanguage {
     }
 
     pub fn for_path(language: Language, path: &Path) -> Self {
-        if language == Language::TypeScript
-            && path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"))
-        {
+        if parser_flavor_for_path(language, path) == ParserFlavor::TypeScriptTsx {
             Self::TypeScriptTsx
         } else {
             Self::Standard(language)
@@ -88,11 +85,19 @@ impl RuneIrLanguage {
         }
     }
 
+    pub fn config_labels() -> impl Iterator<Item = &'static str> {
+        Language::ANALYZABLE
+            .iter()
+            .map(|language| language.config_label())
+            .chain(std::iter::once("tsx"))
+    }
+
     fn parser_language(self) -> Option<tree_sitter::Language> {
-        match self {
-            Self::Standard(language) => crate::analyzer::parser_language_for(language),
-            Self::TypeScriptTsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
-        }
+        let flavor = match self {
+            Self::Standard(_) => ParserFlavor::Default,
+            Self::TypeScriptTsx => ParserFlavor::TypeScriptTsx,
+        };
+        parser_language_for_flavor(self.language(), flavor)
     }
 }
 
@@ -122,6 +127,7 @@ pub enum RuneIrError {
     EmptySource,
     InvalidSelection(Range<usize>),
     SourceTooLarge { actual: usize, limit: usize },
+    UnsafeSource,
     NoStructuralFacts,
     InvalidLimits,
     StarterQuery(String),
@@ -143,6 +149,9 @@ impl fmt::Display for RuneIrError {
             Self::SourceTooLarge { actual, limit } => write!(
                 f,
                 "source is {actual} bytes; Rune IR accepts at most {limit} bytes per request"
+            ),
+            Self::UnsafeSource => f.write_str(
+                "source is unsafe to parse because it contains a NUL byte or a line longer than Bifrost's configured parser-safety limit; provide ordinary text source with shorter lines",
             ),
             Self::NoStructuralFacts => f.write_str(
                 "the structural adapter produced no Rune IR facts for the supplied source",
@@ -182,6 +191,9 @@ pub fn render_source_rune_ir(
             actual: source.len(),
             limit: limits.max_input_bytes,
         });
+    }
+    if is_unparseable_source(source) {
+        return Err(RuneIrError::UnsafeSource);
     }
     let selected = match selection {
         RuneIrSelection::WholeSource => None,
@@ -521,6 +533,29 @@ mod tests {
     }
 
     #[test]
+    fn python_rune_ir_covers_import_and_assignment_roles() {
+        let source = "import os\nvalue = \"ready\"\n";
+        let rendered = render_source_rune_ir(
+            Language::Python,
+            source,
+            RuneIrSelection::WholeSource,
+            RuneIrLimits::default(),
+        )
+        .unwrap();
+
+        assert!(rendered.rune_ir.contains("(import"), "{rendered:?}");
+        assert!(rendered.rune_ir.contains("(module"), "{rendered:?}");
+        assert!(rendered.rune_ir.contains(":text \"os\""), "{rendered:?}");
+        assert!(rendered.rune_ir.contains("(assignment"), "{rendered:?}");
+        assert!(rendered.rune_ir.contains("(left"), "{rendered:?}");
+        assert!(rendered.rune_ir.contains("(right"), "{rendered:?}");
+        assert!(
+            !rendered.rune_ir.contains("import_statement"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
     fn typescript_selection_uses_top_level_contained_facts() {
         let source = "const prefix = 1;\nclass Greeter {\n  greet() { return service.name; }\n}\n";
         let start = source.find("class").unwrap();
@@ -649,6 +684,25 @@ mod tests {
             ),
             Err(RuneIrError::SourceTooLarge { limit: 4, .. })
         ));
+        assert_eq!(
+            render_source_rune_ir(
+                Language::Rust,
+                "fn main() {\0}",
+                RuneIrSelection::WholeSource,
+                RuneIrLimits::default()
+            ),
+            Err(RuneIrError::UnsafeSource)
+        );
+        let long_line = "x".repeat(crate::analyzer::common::DEFAULT_MAX_LINE_LENGTH + 1);
+        assert_eq!(
+            render_source_rune_ir(
+                Language::Rust,
+                &long_line,
+                RuneIrSelection::WholeSource,
+                RuneIrLimits::default()
+            ),
+            Err(RuneIrError::UnsafeSource)
+        );
     }
 
     #[test]
