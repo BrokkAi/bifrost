@@ -401,19 +401,33 @@ impl PythonAnalyzer {
             return None;
         }
 
-        let bindings = self.resolve_import_bindings(code_unit.source());
+        let binder = self.import_binder_of(code_unit.source());
         if let Some((head, tail)) = trimmed.split_once('.') {
-            if let Some(bound) = bindings.get(head)
-                && bound.is_module()
+            if let Some(binding) = binder.bindings.get(head)
+                && binding.kind == ImportKind::Namespace
             {
-                let fq_name = format!("{}.{}", bound.fq_name(), tail);
+                let fq_name = format!("{}.{}", binding.module_specifier, tail);
                 return self.inner.definitions(&fq_name).next();
             }
             return self.inner.definitions(trimmed).next();
         }
 
-        if let Some(bound) = bindings.get(trimmed) {
-            return Some(bound.clone());
+        if let Some(binding) = binder.bindings.get(trimmed) {
+            match binding.kind {
+                ImportKind::Namespace => {
+                    return self.resolve_module_code_unit(&binding.module_specifier);
+                }
+                ImportKind::Named => {
+                    let imported_name = binding.imported_name.as_ref()?;
+                    let fqn = format!("{}.{}", binding.module_specifier, imported_name);
+                    return self
+                        .resolve_exported_fqn(&fqn)
+                        .into_iter()
+                        .next()
+                        .or_else(|| self.inner.definitions(&fqn).next());
+                }
+                _ => {}
+            }
         }
 
         let local_fq_name = format!("{}.{}", code_unit.package_name(), trimmed);

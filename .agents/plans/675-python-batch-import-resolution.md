@@ -58,6 +58,9 @@ resolution work.
 - [x] (2026-07-14) Short-circuit the empty-module boundary check exposed by the
   first full-scale sample, preserving its false result without hydrating every
   path-derived Python declaration.
+- [x] (2026-07-14) Resolve Python base classes from the specific binder entry
+  instead of resolving every import in the declaring file during inverse receiver
+  hierarchy checks.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -173,6 +176,14 @@ resolution work.
   a record so this result could be returned directly.
   Evidence: `/private/tmp/bifrost-675-full-acceptance.sample.txt`.
 
+- Observation: After removing the empty-package scan, the next full-limit sample
+  reached inverse usage scanning. `receiver_binds_target` repeatedly traversed class
+  ancestry, and `resolve_base_class` resolved every import in each declaring file
+  even though it needed only the base expression's binder entry. This made generic
+  `resolve_import_bindings` the dominant scaled receiver work again, outside the
+  already-fixed definition-batch context.
+  Evidence: `/private/tmp/bifrost-675-full-acceptance-post-empty.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -265,6 +276,15 @@ resolution work.
   Rationale: `module_code_unit` cannot construct an empty module and the existing
   hydrated query always returned false. The guard preserves the diagnostic outcome
   while removing a one-time scan of every persisted Python declaration.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Resolve Python hierarchy bases through `import_binder_of` and only the
+  binding named by the structured base expression.
+  Rationale: The binder already distinguishes namespace and named imports. A
+  namespace base keeps exact `module.tail` lookup; a named base keeps export-aware
+  resolution followed by the existing direct-definition fallback. Local and
+  unresolved bases retain their prior fallbacks, while unrelated imports are never
+  materialized.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective
