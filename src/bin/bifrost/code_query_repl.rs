@@ -1,7 +1,8 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, StringPredicate,
+    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLimits,
+    RuneIrSelection, StringPredicate, render_source_rune_ir,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
@@ -27,6 +28,10 @@ const COMMANDS: &[MetadataEntry] = &[
     MetadataEntry::new(":kinds", "List normalized structural kinds."),
     MetadataEntry::new(":roles", "List structural role fields."),
     MetadataEntry::new(":languages", "List language filter labels."),
+    MetadataEntry::new(
+        ":ir",
+        "Capture source through :end and print its Rune IR plus starter RQL.",
+    ),
     MetadataEntry::new(":json", "Print the current query as canonical JSON."),
     MetadataEntry::new(
         ":validate",
@@ -130,7 +135,13 @@ impl CtrlCQuitGuard {
 
 pub struct ReplSession {
     current_query: Option<Value>,
+    rune_ir_capture: Option<RuneIrCapture>,
     use_color: bool,
+}
+
+struct RuneIrCapture {
+    language: Language,
+    source: String,
 }
 
 impl ReplSession {
@@ -141,6 +152,7 @@ impl ReplSession {
     fn with_color(use_color: bool) -> Self {
         Self {
             current_query: None,
+            rune_ir_capture: None,
             use_color,
         }
     }
@@ -150,6 +162,9 @@ impl ReplSession {
         line: &str,
         service: Option<&SearchToolsService>,
     ) -> (ReplFlow, String) {
+        if self.rune_ir_capture.is_some() {
+            return self.process_rune_ir_line(line);
+        }
         let line = line.trim();
         if line.is_empty() {
             return (ReplFlow::Continue, String::new());
@@ -207,6 +222,7 @@ impl ReplSession {
             ":kinds" => (ReplFlow::Continue, kinds_text()),
             ":roles" => (ReplFlow::Continue, roles_text()),
             ":languages" => (ReplFlow::Continue, languages_text()),
+            ":ir" => self.start_rune_ir_capture(rest.trim()),
             ":json" => match self.current_query.as_ref() {
                 Some(value) => (ReplFlow::Continue, canonical_json_text(value)),
                 None => (ReplFlow::Continue, "No current query.".to_string()),
@@ -246,6 +262,71 @@ impl ReplSession {
                 ),
             ),
         }
+    }
+
+    fn start_rune_ir_capture(&mut self, label: &str) -> (ReplFlow, String) {
+        if label.is_empty() {
+            return (
+                ReplFlow::Continue,
+                "usage: :ir <language>; finish source input with :end".to_string(),
+            );
+        }
+        let Some(language) = Language::from_config_label(label) else {
+            return (
+                ReplFlow::Continue,
+                format!(
+                    "unsupported Rune IR language `{}`; use :languages to list supported labels",
+                    sanitize_terminal_text(label)
+                ),
+            );
+        };
+        self.rune_ir_capture = Some(RuneIrCapture {
+            language,
+            source: String::new(),
+        });
+        (
+            ReplFlow::Continue,
+            format!(
+                "Capturing {} source for Rune IR. Enter :end on its own line to render.",
+                language.config_label()
+            ),
+        )
+    }
+
+    fn process_rune_ir_line(&mut self, line: &str) -> (ReplFlow, String) {
+        if line.trim() != ":end" {
+            let capture = self
+                .rune_ir_capture
+                .as_mut()
+                .expect("capture checked above");
+            if !capture.source.is_empty() {
+                capture.source.push('\n');
+            }
+            capture.source.push_str(line);
+            return (ReplFlow::Continue, String::new());
+        }
+
+        let capture = self.rune_ir_capture.take().expect("capture checked above");
+        let result = render_source_rune_ir(
+            capture.language,
+            &capture.source,
+            RuneIrSelection::WholeSource,
+            RuneIrLimits::default(),
+        );
+        let output = match result {
+            Ok(rendered) => format!(
+                "Rune IR ({}):\n{}\nStarter RQL:\n{}",
+                capture.language.config_label(),
+                rendered.rune_ir.trim_end(),
+                rendered.starter_rql
+            ),
+            Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
+        };
+        (ReplFlow::Continue, output)
+    }
+
+    fn is_capturing_rune_ir(&self) -> bool {
+        self.rune_ir_capture.is_some()
     }
 }
 
@@ -330,6 +411,17 @@ fn run_scripted(service: &mut LazySearchService) -> Result<(), String> {
     let mut pending_query = String::new();
     for line in stdin.lock().lines() {
         let line = line.map_err(|err| format!("Failed to read REPL input: {err}"))?;
+        if session.is_capturing_rune_ir() {
+            let (flow, output) = process_line_with_lazy_service(&mut session, &line, service)?;
+            if !output.is_empty() {
+                writeln!(stdout, "{output}")
+                    .map_err(|err| format!("Failed to write output: {err}"))?;
+            }
+            if flow == ReplFlow::Quit {
+                break;
+            }
+            continue;
+        }
         let Some(input) = accumulate_scripted_input(&mut pending_query, &line) else {
             continue;
         };
@@ -359,7 +451,7 @@ fn process_line_with_lazy_service(
     line: &str,
     service: &mut LazySearchService,
 ) -> Result<(ReplFlow, String), String> {
-    if line.trim_start().starts_with(":run") {
+    if !session.is_capturing_rune_ir() && line.trim_start().starts_with(":run") {
         let service = service.get_or_init()?;
         Ok(session.process_line(line, Some(service)))
     } else {
@@ -747,6 +839,8 @@ fn help_text() -> String {
         "  :example <name>        Load a named example.".to_string(),
         "  :kinds | :roles        List query vocabulary.".to_string(),
         "  :languages             List language labels.".to_string(),
+        "  :ir <language>         Capture source through :end and print Rune IR plus starter RQL."
+            .to_string(),
         "  :json                  Print canonical JSON for the current query.".to_string(),
         "  :validate              Validate the current query.".to_string(),
         "  :run                   Execute the current query.".to_string(),
@@ -1032,10 +1126,77 @@ mod tests {
     #[test]
     fn code_query_repl_exposes_doc_metadata() {
         assert!(doc_text(":run").contains("Run"));
+        assert!(doc_text(":ir").contains("Rune IR"));
         assert!(doc_text("call").contains("Match call"));
         assert!(doc_text("comments").contains("no block comments"));
         assert!(doc_text("callee").contains("call target"));
         assert!(doc_text("calls").contains("eval"));
+    }
+
+    #[test]
+    fn code_query_repl_renders_multiline_rune_ir_without_search_service() {
+        let mut session = ReplSession::new();
+        let (_, output) = session.process_line(":ir rust", None);
+        assert!(output.contains("Capturing rust source"), "{output}");
+        assert!(
+            session
+                .process_line("fn greet(name: &str) {", None)
+                .1
+                .is_empty()
+        );
+        assert!(
+            session
+                .process_line("    println!(\"{name}\");", None)
+                .1
+                .is_empty()
+        );
+        assert!(session.process_line("}", None).1.is_empty());
+
+        let (_, output) = session.process_line(":end", None);
+        assert!(output.contains("Rune IR (rust):"), "{output}");
+        assert!(output.contains("(function"), "{output}");
+        assert!(output.contains(":name \"greet\""), "{output}");
+        assert!(
+            output.contains("Starter RQL:\n(function :name \"greet\")"),
+            "{output}"
+        );
+        assert!(!output.contains("function_item"), "{output}");
+    }
+
+    #[test]
+    fn code_query_repl_rune_ir_errors_are_actionable() {
+        let mut session = ReplSession::new();
+        let (_, output) = session.process_line(":ir", None);
+        assert!(output.contains("usage: :ir <language>"), "{output}");
+
+        let (_, output) = session.process_line(":ir brainfuck", None);
+        assert!(output.contains("unsupported Rune IR language"), "{output}");
+
+        session.process_line(":ir python", None);
+        let (_, output) = session.process_line(":end", None);
+        assert!(output.contains("source is empty"), "{output}");
+    }
+
+    #[test]
+    fn rune_ir_capture_treats_colon_commands_as_source_until_end() {
+        let mut session = ReplSession::new();
+        session.process_line(":ir python", None);
+        session.process_line(":run", None);
+        assert!(session.is_capturing_rune_ir());
+        let (_, output) = session.process_line(":end", None);
+        assert!(!output.contains("No search service"), "{output}");
+    }
+
+    #[test]
+    fn rune_ir_capture_does_not_initialize_lazy_search_service() {
+        let mut session = ReplSession::new();
+        let mut service = LazySearchService::new(PathBuf::from("unused"));
+        process_line_with_lazy_service(&mut session, ":ir rust", &mut service).unwrap();
+        process_line_with_lazy_service(&mut session, "fn demo() {}", &mut service).unwrap();
+        let (_, output) =
+            process_line_with_lazy_service(&mut session, ":end", &mut service).unwrap();
+        assert!(output.contains("Rune IR (rust):"), "{output}");
+        assert!(service.service.is_none());
     }
 
     #[test]

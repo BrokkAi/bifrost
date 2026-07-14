@@ -12,7 +12,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 
 - [x] (2026-07-14 12:00Z) Read issue #733, refreshed the current issue branch, inspected the existing structural facts, query frontend, REPL, LSP overlay, and VS Code extension seams, and selected the public name Rune IR.
 - [x] (2026-07-14 14:05Z) Implemented and tested a bounded, deterministic Rune IR renderer and starter-RQL generator over the existing `FileFacts` arena; 5 focused library tests pass for Rust, Python, TypeScript, selection, escaping, parseable starters, errors, and all four limits.
-- [ ] Add the index-free multiline `:ir <language>` REPL workflow and behavior-focused Rust, Python, and TypeScript tests.
+- [x] (2026-07-14 14:25Z) Added the index-free multiline `:ir <language>` REPL workflow with explicit `:end`, actionable input errors, colon-preserving source capture, lazy-service isolation, help/completion metadata, 15 passing binary tests, and a successful real scripted Rust smoke run.
 - [ ] Add the overlay-aware private LSP request with smallest-enclosing-`CodeUnit` selection and UTF-16 response ranges.
 - [ ] Add the VS Code source-editor command that displays the server-rendered output without interpreting Rune IR in TypeScript.
 - [ ] Document Rune IR as the source-side representation matched by `CodeQuery`, run focused tests, `cargo fmt`, full feature tests where practical, and clippy with warnings denied.
@@ -42,7 +42,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 
 ## Outcomes & Retrospective
 
-The first implementation milestone is complete. Callers can now render bounded Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer. REPL, LSP, editor, and documentation surfaces remain.
+The first two implementation milestones are complete. Callers can render bounded Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer, and the REPL now exposes that path through `:ir <language>` without initializing its lazy workspace service. LSP, editor, and documentation surfaces remain.
 
 ## Context and Orientation
 
@@ -141,3 +141,5 @@ No new third-party Rust or npm dependency is expected. JSON string escaping shou
 Revision note (2026-07-14): Created the initial self-contained plan after issue and codebase orientation; recorded the Rune IR naming decision and the unavailable Bifrost MCP tooling.
 
 Revision note (2026-07-14 14:05Z): Marked the shared renderer milestone complete and recorded the focused test evidence plus the local PyO3 all-feature linker limitation.
+
+Revision note (2026-07-14 14:25Z): Marked the REPL milestone complete after focused tests and a real piped `bifrost --repl` smoke run proved index-free rendering.
