@@ -112,9 +112,12 @@ Pipeline wrappers transform the result domain. Inner wrappers execute first:
 (supertypes :depth 2 (enclosing-decl (class :name "Service")))
 (subtypes :transitive true (enclosing-decl (class :name "BaseService")))
 (owner (members (enclosing-decl (class :name "Service"))))
+(references-of :proof proven (members (enclosing-decl (class :name "Service"))))
+(used-by :reference-kinds [field-write] (members (enclosing-decl (class :name "Service"))))
+(uses :surface lsp-references (enclosing-decl (method :name "handle")))
 ```
 
-The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. `members` returns direct declarations and `owner` recovers their exact declaring type. `:json` renders every wrapper as an ordered `steps` array.
+The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference options may appear in any order before the nested query; see [Reference Traversal](/code-query-tutorials/reference-traversal/) for kinds, proof tiers, surfaces, exact ownership, and `via` provenance. `:json` renders every wrapper as an ordered `steps` array.
 
 Only declarations indexed by the active workspace analyzer can appear. A visible usage of library code does not imply that the library declaration itself is indexed or queryable.
 

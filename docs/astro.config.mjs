@@ -72,6 +72,7 @@ export default defineConfig({
                   items: [
                     { label: 'Overview', slug: 'code-query-tutorials' },
                     { label: 'Import Traversal', slug: 'code-query-tutorials/import-traversal' },
+                    { label: 'Reference Traversal', slug: 'code-query-tutorials/reference-traversal' },
                     { label: 'Python', slug: 'code-query-tutorials/python' },
                     { label: 'Java', slug: 'code-query-tutorials/java' },
                     { label: 'JavaScript', slug: 'code-query-tutorials/javascript' },

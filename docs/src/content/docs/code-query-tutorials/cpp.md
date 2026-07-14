@@ -5,6 +5,8 @@ description: Query C and C++ together through the cpp structural adapter and lan
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+
 C and C++ files share the `cpp` analyzer, structural adapter, and language-filter label. Use `languages: ["cpp"]` for `.c`, `.cc`, `.cpp`, and the supported C-family header extensions; use `where` when source syntax or directory layout needs a narrower boundary.
 
 ## Fixtures

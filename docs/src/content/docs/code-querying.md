@@ -3,7 +3,7 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing declarations, direct import-file edges, indexed type hierarchies, and declaration ownership. It answers questions such as “find calls to this callee,” “which types derive from this type,” and “which declarations are direct members of those types” across supported languages.
+Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing declarations, exact source references and semantic users, direct import-file edges, indexed type hierarchies, and declaration ownership. It answers questions such as “find calls to this callee,” “which declarations use this field,” “which types derive from this type,” and “which declarations are direct members of those types” across supported languages.
 
 The broader name is intentional. Future versions may add more steps backed by Bifrost's existing usage and type analyses or by future control-flow and data-flow analyses. Version 2 does not traverse call graphs, resolve arbitrary types or aliases, or prove control/data flow.
 
@@ -32,18 +32,21 @@ The matcher only sees this normalized fact arena. Language-specific tree-sitter 
 
 ## Version 2 Typed Pipelines
 
-`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse direct, bounded, or transitive indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance.
+`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations; `references_of`, `used_by`, and `uses` traverse exact structured references; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse direct, bounded, or transitive indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance.
 
 Semantic declaration steps intentionally stop at the analyzer's indexed declaration boundary. Seeing a reference or usage into a dependency is not evidence that the dependency declaration is indexed. Until Bifrost can target library code for indexing, unindexed library declarations are omitted rather than reconstructed from names, and their absence is not reported as a capability error.
 
 | RQL wrapper | JSON step | Input → output | Use it to |
 | --- | --- | --- | --- |
 | `enclosing-decl` | `enclosing_decl` | structural match → indexed declaration | Find the smallest real declaration that contains a matching expression. |
-| `file-of` | `file_of` | structural match or declaration → file | Move from code or its declaration to the exact project file. |
+| `references-of` | `references_of` | declaration → reference site | Return exact structured sites targeting a declaration. |
+| `used-by` | `used_by` | declaration → declaration | Return each smallest exact semantic user, with its proving site under `via`. |
+| `uses` | `uses` | declaration → declaration | Return exact indexed targets used by one semantic declaration, with `via`. |
+| `file-of` | `file_of` | structural match, declaration, or reference site → file | Move from code, a declaration, or a reference to the exact project file. |
 | `imports-of` | `imports_of` | file → file | Follow one resolved direct project-local import. |
 | `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
 
-For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. A future compositional query facet can correlate structured import bindings with calls or member access; version 2 keeps those facts separate rather than guessing.
+For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. The schema-v2 `references-of`, `used-by`, and `uses` steps provide that exact declaration relationship separately, and `references-of` can compose through `file-of` when both symbol and import-file provenance matter. See [Reference Traversal](./code-query-tutorials/reference-traversal/).
 
 The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
 

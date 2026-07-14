@@ -142,7 +142,7 @@ With `result_detail: "full"`, results additionally include:
 - `decorator_ranges` for matched declarations
 - `decorated_range`, the union of the declaration and its decorators
 
-Derived declaration and file results include `provenance`. Each provenance path records the original structural seed and every ordered step result. Compact mode keeps minimal identities; full mode adds stable IDs and precise ranges. At most sixteen paths are retained per terminal result, with `provenance_truncated: true` when more paths converge.
+Derived declaration, reference-site, and file results include `provenance`. Each provenance path records the original structural seed and every ordered step result. Declaration-returning reference steps additionally record the exact proving reference site under `via`. Compact mode keeps minimal identities; full mode adds stable IDs and precise ranges. At most sixteen paths are retained per terminal result, with `provenance_truncated: true` when more paths converge.
 
 ## Typed Pipeline Steps
 
@@ -151,7 +151,10 @@ Steps execute in array order and are validated before the workspace is searched:
 | Operation | Input | Output | Meaning |
 | --- | --- | --- | --- |
 | `enclosing_decl` | structural match | declaration | Smallest non-synthetic indexed declaration containing the exact match range, inclusive of a matched declaration itself. |
-| `file_of` | structural match or declaration | file | Exact project file containing the value. |
+| `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
+| `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
+| `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
+| `file_of` | structural match, declaration, or reference site | file | Exact project file containing the value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
@@ -182,6 +185,8 @@ Hierarchy steps are direct by default. A positive `depth` returns declarations r
 Zero depth, `transitive: false`, unknown fields, `depth` together with `transitive`, and traversal options on `members` or `owner` are rejected. Invalid input declarations are omitted with aggregated per-language diagnostics, while supported hierarchy leaves simply return no rows. `owner` after `members` round-trips each returned member to its exact type.
 
 Hierarchy and ownership results are restricted to declarations returned by the active analyzer's index and having renderable ranges. Bifrost may observe usages that refer to library code without having indexed that library's declaration; such a declaration is intentionally absent from these results. This is the current precision boundary until library code can be targeted and indexed explicitly.
+
+Reference steps accept optional `reference_kinds`, `proof`, and `surface` fields. `reference_kinds` is a non-empty array drawn from `method_call`, `constructor_call`, `field_read`, `field_write`, `type_reference`, `static_reference`, `super_call`, and `inheritance`. `proof` is `proven` or `unproven`. `surface` is `external_usages` (the default) or `lsp_references`. Omitted kind and proof fields include both tiers; a kind filter excludes unclassified structured hits. See the executable [Reference Traversal](/code-query-tutorials/reference-traversal/) recipes.
 
 ## Containment And Descendants
 

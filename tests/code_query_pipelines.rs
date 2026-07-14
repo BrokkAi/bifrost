@@ -382,6 +382,7 @@ fn reference_surface_and_proof_filters_preserve_existing_usage_semantics() {
     let lsp = query("lsp_references", "proven");
     assert_eq!(lsp["results"].as_array().unwrap().len(), 1, "{lsp}");
     assert_eq!(lsp["results"][0]["usage_kind"], "self_receiver", "{lsp}");
+    assert_eq!(lsp["results"][0]["reference_kind"], "method_call", "{lsp}");
 
     let unproven = query("lsp_references", "unproven");
     assert!(

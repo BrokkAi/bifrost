@@ -15,7 +15,7 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 - [x] (2026-07-14 15:00Z) Created this implementation ExecPlan and fixed the public syntax, domains, result shape, exact-user semantics, language scope, and documentation shape.
 - [x] (2026-07-14 17:10Z) Milestone 1: implemented the public reference-step IR, operation-specific schema, JSON/RQL parsing, `reference_site` result domain, provenance `via`, MCP/TextMate vocabulary, CLI/LSP routing, and Python consumer models.
 - [x] (2026-07-14 19:05Z) Milestone 2: implemented cached exact inbound/outbound traversal across all eleven adapters, structured proof/surface/kind filtering, deterministic site identity and provenance, bounded partial-result semantics, reference-scan budget accounting, and focused cross-language/classification/failure tests without changing the legacy usage graph.
-- [ ] Milestone 3: add the executable cross-language reference-traversal cookbook and update public documentation.
+- [x] (2026-07-14 19:45Z) Milestone 3: added and rendered the executable Reference Traversal cookbook, seven exact JSON/RQL/expected-result recipes, all-adapter support matrix and language links, Python consumer coverage, generated agent-skill guidance, and public schema/CLI/MCP documentation.
 - [ ] Milestone 4: run focused and complete validation, review the full diff, fix findings, and record the final outcome.
 
 ## Surprises & Discoveries
@@ -40,6 +40,12 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 
 - Observation: Reference traversal performs analyzer work beyond the structural seed scan and therefore must consume the same workspace limits even when its results deduplicate to few rows.
   Evidence: inbound candidate sets now charge files/source bytes and resolved candidates; outbound per-file scans charge files/source bytes/named leaves once at cache fill. A focused intermediate-domain test proves exhaustion returns no `reference_site` rows from a file-terminal query.
+
+- Observation: A previously running Astro development process served the page shell without the newly added section navigation after the cookbook expanded.
+  Evidence: a fresh server on port 4322 rendered the `External And Editor Surfaces` section in the page outline; the settled browser screenshot showed the complete sidebar, title, introductory recipe, and all six section links.
+
+- Observation: Member calls produce both a normalized call and a nested field-access fact, so choosing the smallest containing fact first misclassified `this.target()` as a field read.
+  Evidence: preferring a covering `Call` fact before `FieldAccess` preserves the structured receiver/surface semantics and makes the executable LSP-surface recipe report `method_call`.
 
 ## Decision Log
 
@@ -73,7 +79,7 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are implemented. JSON and RQL canonicalize configured reference steps; reference sites serialize exact ranges, targets, optional exact enclosing declarations, proof, usage surface kind, and optional classification. Declaration-returning steps retain the exact site under `via`. The pipeline resolves exact inbound and outbound edges across Python, Java, JavaScript, TypeScript, Go, C/C++, Rust, PHP, Scala, C#, and Ruby. Focused Java cases prove all eight reference kinds, inverse `uses`/`used_by`, `file_of` composition, surfaces, proof tiers, and same-name-owner isolation. Reference scans are cached and charged to existing workspace/pipeline budgets; legacy `usage_graph` construction remains unchanged. Documentation and final full-suite validation remain.
+Milestones 1 through 3 are implemented. JSON and RQL canonicalize configured reference steps; reference sites serialize exact ranges, targets, optional exact enclosing declarations, proof, usage surface kind, and optional classification. Declaration-returning steps retain the exact site under `via`. The pipeline resolves exact inbound and outbound edges across Python, Java, JavaScript, TypeScript, Go, C/C++, Rust, PHP, Scala, C#, and Ruby. Focused Java cases prove all eight reference kinds, inverse `uses`/`used_by`, `file_of` composition, surfaces, proof tiers, and same-name-owner isolation. Reference scans are cached and charged to existing workspace/pipeline budgets; legacy `usage_graph` construction remains unchanged. The executable cookbook now proves seven complete reference/import compositions, public consumer and generated-skill documentation is current, Python/editor/docs checks pass, and a fresh browser render has been inspected. Final full Rust validation and diff review remain.
 
 ## Context and Orientation
 

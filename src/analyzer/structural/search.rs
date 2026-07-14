@@ -1745,7 +1745,12 @@ fn classify_reference_kind(
                 )
         })
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|(_, node)| node.range.end_byte - node.range.start_byte);
+    candidates.sort_by_key(|(_, node)| {
+        (
+            usize::from(node.kind != NormalizedKind::Call),
+            node.range.end_byte - node.range.start_byte,
+        )
+    });
     if let Some((id, node)) = candidates.first().copied() {
         let receiver_role = if node.kind == NormalizedKind::FieldAccess {
             Role::Object

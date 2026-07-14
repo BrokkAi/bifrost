@@ -5,6 +5,8 @@ description: Query Ruby keyword calls, blocks, imports, qualified classes, and p
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+
 Ruby maps ordinary and receiver calls, keyword arguments, blocks/lambdas, methods, qualified classes, assignments, and static imports. Import refinement is deliberately conservative: receiver calls named `require` and interpolated strings do not become precise import modules.
 
 ## Fixture

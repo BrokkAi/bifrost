@@ -117,6 +117,11 @@ fn ruby_tutorial() {
 }
 
 #[test]
+fn reference_traversal_tutorial() {
+    verify_tutorial("docs/src/content/docs/code-query-tutorials/reference-traversal.md");
+}
+
+#[test]
 fn tutorials_cover_all_public_kinds_roles_and_pages() {
     const PAGES: &[&str] = &[
         "python",

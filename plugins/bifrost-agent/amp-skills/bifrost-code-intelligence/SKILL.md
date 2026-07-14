@@ -116,8 +116,11 @@ that matches the thing you are looking for.
   analyzer-backed path and should be preferred over grep for code references.
 - Use `query_code` for normalized syntactic shapes such as calls by callee,
   assignments by left/right roles, imports, decorators, containment, or
-  captures. Version 2 also supports typed enclosing-declaration and direct import-file steps; use `scan_usages_by_location` or `usage_graph` when
-  symbol identity or resolved caller/callee edges matter. The schema reference
+  captures. Version 2 also supports typed enclosing-declaration, reference-site,
+  semantic-user, hierarchy/member, and direct import-file steps. Use
+  `references_of`, `used_by`, or `uses` when a structural seed should continue
+  through exact indexed symbol identities; use `scan_usages_by_location` for a
+  location-first lookup or `usage_graph` for the narrower whole-workspace graph. The schema reference
   is https://brokkai.github.io/bifrost/code-query-json/.
 - Use `find_filenames` for path globs, basename searches, and repository file
   discovery.
