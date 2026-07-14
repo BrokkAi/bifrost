@@ -67,6 +67,15 @@ impl Language {
         }
     }
 
+    /// Additional user-facing labels accepted by [`Self::from_config_label`].
+    pub fn config_label_aliases(self) -> &'static [&'static str] {
+        match self {
+            Language::Cpp => &["c++"],
+            Language::CSharp => &["c#"],
+            _ => &[],
+        }
+    }
+
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             Language::None => &[],
@@ -108,18 +117,13 @@ impl Language {
             .trim_start_matches('.')
             .to_ascii_lowercase()
             .replace(['_', '-'], "");
-        for language in Self::ANALYZABLE {
-            if normalized == language.config_label()
+        Self::ANALYZABLE.into_iter().find(|&language| {
+            normalized == language.config_label()
+                || language
+                    .config_label_aliases()
+                    .contains(&normalized.as_str())
                 || language.extensions().contains(&normalized.as_str())
-            {
-                return Some(language);
-            }
-        }
-        match normalized.as_str() {
-            "c++" => Some(Language::Cpp),
-            "c#" => Some(Language::CSharp),
-            _ => None,
-        }
+        })
     }
 }
 

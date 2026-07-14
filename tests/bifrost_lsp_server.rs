@@ -202,6 +202,11 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["textDocumentSync"]["change"], 2,
         "incremental text synchronization should be advertised: {initialize}"
     );
+    assert_eq!(
+        initialize["result"]["capabilities"]["codeActionProvider"]["codeActionKinds"],
+        json!(["quickfix"]),
+        "quick fixes should be advertised: {initialize}"
+    );
     assert!(
         initialize["result"]["capabilities"]["completionProvider"].is_null(),
         "completionProvider should be omitted when the client advertises no completion sub-capabilities: {initialize}"
@@ -791,6 +796,134 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
             .is_some_and(|value| value.contains("normalized node kinds")),
         "{partial_hover}"
     );
+}
+
+#[test]
+fn bifrost_lsp_server_returns_current_rql_quick_fixes() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let rql_path = root.join("query.rql");
+    let rql_uri = uri_for(&rql_path);
+    let mut server = LspServer::start(&root);
+
+    let misspelled = "(call :name \"😀\" :calle (call))";
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": rql_uri,
+                "languageId": "bifrost-rql",
+                "version": 1,
+                "text": misspelled,
+            }
+        }),
+    );
+    let non_overlapping_actions = server.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri_for(&rql_path)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "context": {"diagnostics": []},
+        }),
+    );
+    assert_eq!(
+        non_overlapping_actions["result"],
+        json!([]),
+        "only overlapping diagnostics should produce actions: {non_overlapping_actions}"
+    );
+    let adjacent_actions = server.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri_for(&rql_path)},
+            "range": {"start": {"line": 0, "character": 16}, "end": {"line": 0, "character": 17}},
+            "context": {"diagnostics": []},
+        }),
+    );
+    assert_eq!(
+        adjacent_actions["result"],
+        json!([]),
+        "an end-exclusive selection adjacent to a diagnostic must not produce actions: {adjacent_actions}"
+    );
+    let actions = server.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri_for(&rql_path)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 80}},
+            "context": {"diagnostics": []},
+        }),
+    );
+    let action = &actions["result"][0];
+    assert_eq!(action["kind"], "quickfix", "{actions}");
+    let document_edit = &action["edit"]["documentChanges"][0];
+    assert_eq!(document_edit["textDocument"]["version"], 1, "{actions}");
+    assert_eq!(document_edit["edits"][0]["newText"], ":callee");
+    assert_eq!(
+        document_edit["edits"][0]["range"]["start"]["character"], 17,
+        "the range must use UTF-16 positions after an emoji: {actions}"
+    );
+
+    let wrapping = r#"{"where":"src/**/*.rs","match":{"kind":"call"}}"#;
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri_for(&rql_path), "version": 2},
+            "contentChanges": [{"text": wrapping}],
+        }),
+    );
+    let actions = server.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri_for(&rql_path)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 80}},
+            "context": {"diagnostics": []},
+        }),
+    );
+    let document_edit = &actions["result"][0]["edit"]["documentChanges"][0];
+    assert_eq!(document_edit["textDocument"]["version"], 2, "{actions}");
+    let edits = document_edit["edits"].as_array().expect("wrapping edits");
+    assert_eq!(edits.len(), 2, "paired wrapping edits: {actions}");
+    assert_eq!(edits[0]["newText"], "[");
+    assert_eq!(edits[1]["newText"], "]");
+
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri_for(&rql_path), "version": 3},
+            "contentChanges": [{"text": "(call)"}],
+        }),
+    );
+    let stale_actions = server.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri_for(&rql_path)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 80}},
+            "context": {"diagnostics": []},
+        }),
+    );
+    assert_eq!(stale_actions["result"], json!([]), "{stale_actions}");
+
+    let json_path = root.join("query.json");
+    let json_uri = uri_for(&json_path);
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": json_uri,
+                "languageId": "json",
+                "version": 1,
+                "text": misspelled,
+            }
+        }),
+    );
+    let non_rql_actions = server.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri_for(&json_path)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 80}},
+            "context": {"diagnostics": []},
+        }),
+    );
+    assert_eq!(non_rql_actions["result"], json!([]), "{non_rql_actions}");
 }
 
 #[test]
@@ -7036,15 +7169,8 @@ fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
     server.notify_value(json!({
         "jsonrpc": "2.0",
         "id": 2,
-        "method": "textDocument/codeAction",
-        "params": {
-            "textDocument": {"uri": "file:///nope"},
-            "range": {
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 0, "character": 0}
-            },
-            "context": {"diagnostics": []}
-        }
+        "method": "bifrost/unknownRequest",
+        "params": {}
     }));
     let response = server.read_message();
     assert_eq!(response["id"], 2);

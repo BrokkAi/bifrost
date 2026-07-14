@@ -307,7 +307,8 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
       { scheme: "file", language: "csharp" },
       { scheme: "file", language: "php" },
       { scheme: "file", language: "scala" },
-      { scheme: "file", language: "ruby" }
+      { scheme: "file", language: "ruby" },
+      { scheme: "file", language: RQL_LANGUAGE_ID }
     ],
     outputChannel,
     initializationOptions,
