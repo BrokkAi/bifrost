@@ -31,6 +31,9 @@ resolution work.
 - [x] (2026-07-14) Reject a resolver-local content-qualifier cache after profiling:
   candidate rows span distinct Python files, so it did not reduce
   `python_module_name` work.
+- [x] (2026-07-14) Reject a longest-module-prefix path-symbol selector after a
+  warmed smoke: its non-indexable prefix query dominated the sampled work, so
+  the implementation was reverted.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -64,6 +67,15 @@ resolution work.
   mostly distinct Python files. The experiment was reverted.
   Evidence: `/private/tmp/bifrost-675-warmed-smoke-postfix.sample.txt`.
 
+- Observation: A path-symbol experiment correctly restricted same-blob candidate
+  hydration to the selected Python path, but SQL had to find module names that were
+  prefixes of the requested FQN. The resulting `substr` predicate could not use the
+  FQN index; its 10-second warm sample placed
+  `path_symbol_rows_with_fqn_prefix_for_langs` above the remaining
+  `python_module_name` work. The experiment was reverted before completing the
+  smoke.
+  Evidence: `/private/tmp/bifrost-675-path-narrowing.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -90,6 +102,15 @@ resolution work.
   Rationale: Its key had low reuse in the target corpus and preserved the costly
   one-per-candidate Python module-path stat. The root cause is broad short-name
   candidate retrieval, which needs path-aware filtering before hydration.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Do not use reverse module-prefix scans over `path_symbol_units` for
+  candidate narrowing.
+  Rationale: Even though the path-specific resolver preserved correctness for
+  duplicate blobs, the lookup had to scan path-symbol rows on every target and
+  displaced the original filesystem cost with a larger SQLite cost. Any further
+  path-aware candidate filter must be directly indexable or be supplied by an
+  already-structured lookup key.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective
