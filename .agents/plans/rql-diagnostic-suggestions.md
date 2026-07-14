@@ -13,6 +13,7 @@ RQL authors will receive conservative spelling suggestions and standard editor q
 - [x] (2026-07-14) Served current-buffer `bifrost-rql` quick fixes through `textDocument/codeAction`.
 - [x] (2026-07-14) Added focused source/LSP regression coverage and ran Rust checks. The VS Code suite could not run because this worktree has no installed TypeScript toolchain.
 - [x] (2026-07-14) Addressed guided-review findings: RQL buffers now participate in normal LSP sync, edits carry the current document version, ranges are end-exclusive, and wrapping is limited to fully recognizable values.
+- [x] (2026-07-14) Corrected the CI test fixture for an ambiguous language-extension typo: `.rts` ties Rust's `.rs` with TypeScript's `.ts`, so it now verifies suppression while `.rss` verifies the unambiguous Rust fix.
 
 ## Decision Log
 

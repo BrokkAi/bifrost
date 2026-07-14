@@ -2206,7 +2206,7 @@ mod tests {
             ("(call :calle (call))", ":calle", ":callee"),
             ("(cal)", "cal", "call"),
             ("(language ruts (call))", "ruts", "rust"),
-            ("(language .rts (call))", ".rts", "rust"),
+            ("(language .rss (call))", ".rss", "rust"),
             ("(result-detail ful (call))", "ful", "full"),
             (r#"{"matc":{"kind":"call"}}"#, "\"matc\"", "\"match\""),
             (r#"{"match":{"kind":"cal"}}"#, "\"cal\"", "\"call\""),
@@ -2257,6 +2257,14 @@ mod tests {
                 })
             );
         }
+
+        let ambiguous = "(language .rts (call))";
+        let diagnostic = validate_query_source(ambiguous)
+            .into_iter()
+            .find(|diagnostic| &ambiguous[diagnostic.range.clone()] == ".rts")
+            .expect("language diagnostic");
+        assert!(!diagnostic.message.contains("Did you mean"));
+        assert_eq!(diagnostic.fix, None);
     }
 
     #[test]
