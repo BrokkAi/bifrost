@@ -35,8 +35,8 @@ use crate::analyzer::usages::inverted_edges::{
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
-    csharp_attribute_type_names, csharp_callable_arity, csharp_member_name,
-    csharp_unqualified_invocation_for_name,
+    csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
+    csharp_member_name, csharp_unqualified_invocation_for_name,
 };
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
@@ -373,10 +373,15 @@ fn record_reference(
                 ctx.record(fqn, node);
             }
         }
-        "member_access_expression" => {
-            let (Some(name_node), Some(receiver)) =
-                (member_access_name(node), member_access_receiver(node))
-            else {
+        "member_access_expression" | "conditional_access_expression" => {
+            let access = match node.kind() {
+                "member_access_expression" => {
+                    member_access_receiver(node).zip(member_access_name(node))
+                }
+                _ => csharp_conditional_member_access(node)
+                    .map(|access| (access.receiver, access.name)),
+            };
+            let Some((receiver, name_node)) = access else {
                 return;
             };
             let Some(name_shape) = csharp_member_name(name_node) else {
@@ -429,6 +434,21 @@ fn receiver_type_fqn(
             .enclosing_class(receiver.start_byte())
             .map(str::to_string),
         "invocation_expression" => invocation_return_type_fqn(receiver, ctx, bindings),
+        "parenthesized_expression" | "checked_expression" => receiver
+            .named_child(0)
+            .and_then(|inner| receiver_type_fqn(inner, ctx, bindings)),
+        "cast_expression" | "as_expression" => receiver
+            .child_by_field_name(if receiver.kind() == "cast_expression" {
+                "type"
+            } else {
+                "right"
+            })
+            .and_then(|type_node| {
+                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+            }),
+        "member_access_expression" | "conditional_access_expression" => {
+            expression_type_fqn(receiver, ctx, bindings)
+        }
         "qualified_name" | "generic_name" => {
             ctx.resolve_type_fqn_at(&reference_type_text(receiver, ctx.source), receiver)
         }
@@ -563,6 +583,39 @@ fn expression_type_fqn(
             ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
         }),
         "invocation_expression" => invocation_return_type_fqn(expression, ctx, bindings),
+        "parenthesized_expression" | "checked_expression" => expression
+            .named_child(0)
+            .and_then(|inner| expression_type_fqn(inner, ctx, bindings)),
+        "cast_expression" | "as_expression" => expression
+            .child_by_field_name(if expression.kind() == "cast_expression" {
+                "type"
+            } else {
+                "right"
+            })
+            .and_then(|type_node| {
+                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+            }),
+        "member_access_expression" | "conditional_access_expression" => {
+            let (receiver, name_node) = match expression.kind() {
+                "member_access_expression" => (
+                    member_access_receiver(expression)?,
+                    member_access_name(expression)?,
+                ),
+                _ => {
+                    let access = csharp_conditional_member_access(expression)?;
+                    (access.receiver, access.name)
+                }
+            };
+            let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
+            let name = csharp_member_name(name_node)?;
+            super::resolver::member_declared_type_fq_name(
+                ctx.csharp,
+                ctx.file,
+                &owner,
+                node_text(name.identifier, ctx.source),
+            )
+        }
         "identifier" => {
             let name = node_text(expression, ctx.source);
             first_precise(bindings, name)
@@ -605,9 +658,18 @@ fn invocation_return_type_fqn(
                 type_arguments.as_deref(),
             )
         }
-        "member_access_expression" => {
-            let receiver = member_access_receiver(function)?;
-            let name = csharp_member_name(member_access_name(function)?)?;
+        "member_access_expression" | "conditional_access_expression" => {
+            let (receiver, name_node) = match function.kind() {
+                "member_access_expression" => (
+                    member_access_receiver(function)?,
+                    member_access_name(function)?,
+                ),
+                _ => {
+                    let access = csharp_conditional_member_access(function)?;
+                    (access.receiver, access.name)
+                }
+            };
+            let name = csharp_member_name(name_node)?;
             let type_arguments = resolved_type_arguments(name, ctx);
             let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
             let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;

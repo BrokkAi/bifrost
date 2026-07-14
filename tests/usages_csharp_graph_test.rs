@@ -2952,6 +2952,156 @@ namespace App {
 }
 
 #[test]
+fn csharp_graph_resolves_conditional_member_receiver_shapes_and_overloads() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Lib/Service.cs",
+            r#"
+namespace Lib;
+public class Service {
+    public void Run() {}
+    public void Run(int value) {}
+    public void Run<T>(int first, int second) {}
+    public Service Child => this;
+    public Service GetChild() => this;
+}
+"#,
+        ),
+        (
+            "App/Controller.cs",
+            r#"
+using Lib;
+namespace App;
+public class Controller {
+    private readonly Service _service = new();
+    public void FromParameter(Service service) => service?.Run();
+    public void FromParenthesized(Service service) => ((service))?.Run(1);
+    public void FromCast(object raw) => ((Service)raw)?.Run<string>(1, 2);
+    public void FromField() => _service?.Run();
+    public void FromConditionalProperty(Service service) => service?.Child?.Run();
+    public void FromConditionalReturn(Service service) => service?.GetChild()?.Run();
+    public void FromAs(object raw) => (raw as Service)?.Run();
+}
+"#,
+        ),
+        (
+            "Model.Json.cs",
+            r#"
+namespace Example;
+public partial class Model {
+    private string _value = "";
+    public string Serialize() => (((object)_value)?.ToString());
+    public string Format() => (((object)_value)?.Format());
+}
+"#,
+        ),
+        (
+            "Model.PowerShell.cs",
+            r#"
+namespace Example;
+public partial class Model {
+    public override string ToString() => "model";
+}
+"#,
+        ),
+        (
+            "Extensions.cs",
+            r#"
+namespace Example;
+public static class Extensions {
+    public static string ToString(this Model value) => "wrong";
+    public static string Format(this object value) => "matched";
+}
+"#,
+        ),
+    ]);
+
+    let run_zero = member_function_with_signature(&analyzer, "Lib.Service", "Run", "()");
+    let run_one = member_function_with_signature(&analyzer, "Lib.Service", "Run", "(int)");
+    let run_generic =
+        member_function_with_signature(&analyzer, "Lib.Service", "Run", "`1(int, int)");
+
+    let zero_hits = graph_hits(&analyzer, &run_zero);
+    assert_eq!(5, zero_hits.len(), "{zero_hits:#?}");
+    assert_eq!(1, graph_hits(&analyzer, &run_one).len());
+    assert_eq!(1, graph_hits(&analyzer, &run_generic).len());
+
+    let consumer = project.file("App/Controller.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let authoritative = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&run_generic),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        authoritative.candidate_files,
+        std::iter::once(consumer.clone()).collect()
+    );
+    assert_eq!(
+        1,
+        authoritative
+            .result
+            .into_either()
+            .expect("authoritative conditional access query")
+            .len()
+    );
+
+    let model_to_string =
+        member_function_with_signature(&analyzer, "Example.Model", "ToString", "()");
+    let model_hits = graph_hits(&analyzer, &model_to_string);
+    assert!(
+        model_hits.is_empty(),
+        "the explicit object cast must not target the enclosing partial model override: {model_hits:#?}"
+    );
+
+    let model_consumer = project.file("Model.Json.cs");
+    let model_provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(model_consumer.clone()).collect()));
+    let authoritative_model = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&model_to_string),
+            Some(&model_provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        authoritative_model.candidate_files,
+        std::iter::once(model_consumer).collect()
+    );
+    let authoritative_model_hits = authoritative_model
+        .result
+        .into_either()
+        .expect("authoritative object-cast query");
+    assert!(
+        authoritative_model_hits.is_empty(),
+        "the consumer-only authoritative query must retain the explicit object cast instead of routing to the other partial declaration: {authoritative_model_hits:#?}"
+    );
+
+    let wrong_extension =
+        member_function_with_signature(&analyzer, "Example.Extensions", "ToString", "(Model)");
+    assert!(
+        graph_hits(&analyzer, &wrong_extension).is_empty(),
+        "the explicit object cast must not target an incompatible Model extension"
+    );
+
+    let object_extension =
+        member_function_with_signature(&analyzer, "Example.Extensions", "Format", "(object)");
+    let object_extension_hits = graph_hits(&analyzer, &object_extension);
+    assert_eq!(
+        1,
+        object_extension_hits.len(),
+        "the explicit object cast should resolve the matching builtin extension receiver: {object_extension_hits:#?}"
+    );
+}
+
+#[test]
 fn csharp_graph_finds_constructors_inheritance_and_generic_type_arguments() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (

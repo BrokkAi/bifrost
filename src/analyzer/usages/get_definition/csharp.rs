@@ -1,9 +1,10 @@
 use super::*;
 use crate::analyzer::usages::common::same_node;
+use crate::analyzer::usages::csharp_graph::csharp_resolve_type_fq_name;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
-    csharp_attribute_name_node, csharp_attribute_type_names, csharp_member_name,
-    csharp_method_generic_arity,
+    csharp_attribute_name_node, csharp_attribute_type_names, csharp_conditional_member_access,
+    csharp_member_name, csharp_method_generic_arity, csharp_normalize_full_name,
 };
 
 pub(super) struct CSharpDefinitionProvider<'a> {
@@ -145,7 +146,11 @@ pub(super) fn resolve_csharp(
                 tree.root_node(),
                 receiver,
             );
-            let receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
+            let mut receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
+            if receiver_type_names.is_empty() {
+                receiver_type_names =
+                    csharp_explicit_receiver_type_names(csharp, file, source, receiver);
+            }
             let arity = csharp_invocation_arity(name, source);
             let outcome = csharp_member_outcome(
                 analyzer,
@@ -308,6 +313,57 @@ pub(super) fn resolve_csharp(
             ),
         ),
     }
+}
+
+fn csharp_explicit_receiver_type_names(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    mut receiver: Node<'_>,
+) -> Vec<String> {
+    while matches!(
+        receiver.kind(),
+        "parenthesized_expression" | "checked_expression"
+    ) {
+        let Some(inner) = receiver.named_child(0) else {
+            return Vec::new();
+        };
+        receiver = inner;
+    }
+    let type_node = match receiver.kind() {
+        "cast_expression" => receiver.child_by_field_name("type"),
+        "as_expression" => receiver.child_by_field_name("right"),
+        _ => None,
+    };
+    let Some(type_node) = type_node else {
+        return Vec::new();
+    };
+    let reference = csharp_normalize_full_name(&csharp_reference_type_text(type_node, source));
+    if reference.is_empty() {
+        return Vec::new();
+    }
+    if let Some(resolved) = csharp_resolve_type_fq_name(csharp, file, &reference) {
+        return vec![resolved];
+    }
+
+    let aliases = csharp.using_aliases_of(file);
+    let mut names = vec![
+        aliases
+            .get(&reference)
+            .cloned()
+            .unwrap_or_else(|| reference.clone()),
+    ];
+    if !reference.contains('.') && !aliases.contains_key(&reference) {
+        names.extend(
+            csharp
+                .using_namespaces_of(file)
+                .into_iter()
+                .map(|namespace| format!("{namespace}.{reference}")),
+        );
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn csharp_type_lookup_node_resolution(
@@ -758,6 +814,13 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
                 && (csharp_member_access_name(parent).is_some_and(|name| same_node(name, current))
                     || csharp_member_access_name(parent)
                         .is_some_and(|name| same_node(name, original))))
+            || (parent.kind() == "member_binding_expression"
+                && parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| same_node(name, current) || same_node(name, original)))
+            || (parent.kind() == "conditional_access_expression"
+                && csharp_conditional_member_access(parent)
+                    .is_some_and(|access| same_node(access.binding, current)))
             || (parent.kind() == "object_creation_expression"
                 && (parent.child_by_field_name("type") == Some(current)
                     || csharp_first_type_child(parent) == Some(current)))
@@ -773,6 +836,13 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
             receiver: csharp_member_access_receiver(current)?,
             name: csharp_member_access_name(current)?,
         }),
+        "conditional_access_expression" => {
+            let access = csharp_conditional_member_access(current)?;
+            Some(CSharpReferenceNode::Member {
+                receiver: access.receiver,
+                name: access.name,
+            })
+        }
         "object_creation_expression" => Some(CSharpReferenceNode::Constructor(current)),
         "identifier" | "type" => {
             if csharp_is_unqualified_invocation_target(current) {
@@ -806,7 +876,13 @@ fn csharp_is_unqualified_invocation_target(node: Node<'_>) -> bool {
 fn csharp_invocation_arity(node: Node<'_>, source: &str) -> Option<usize> {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if matches!(parent.kind(), "member_access_expression" | "qualified_name") {
+        if matches!(
+            parent.kind(),
+            "member_access_expression"
+                | "qualified_name"
+                | "member_binding_expression"
+                | "conditional_access_expression"
+        ) {
             current = parent;
             continue;
         }
@@ -1109,6 +1185,9 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
         return csharp_member_access_receiver(parent)
             .is_some_and(|receiver| same_node(receiver, node));
     }
+    if parent.kind() == "member_binding_expression" {
+        return false;
+    }
     if matches!(parent.kind(), "argument" | "attribute_argument")
         && parent.child_by_field_name("name") == Some(node)
     {
@@ -1236,15 +1315,17 @@ fn csharp_receiver_type_units(
             file,
             &csharp_reference_type_text(receiver, source),
         ),
-        "member_access_expression" => csharp_member_access_result_type_units(
-            analyzer,
-            csharp,
-            definitions,
-            file,
-            source,
-            root,
-            receiver,
-        ),
+        "member_access_expression" | "conditional_access_expression" => {
+            csharp_member_access_result_type_units(
+                analyzer,
+                csharp,
+                definitions,
+                file,
+                source,
+                root,
+                receiver,
+            )
+        }
         // `new Foo().Member` — the receiver is typed by the class being constructed.
         "object_creation_expression" => receiver
             .child_by_field_name("type")
@@ -1268,6 +1349,27 @@ fn csharp_receiver_type_units(
             root,
             receiver,
         ),
+        "parenthesized_expression" | "checked_expression" => receiver
+            .named_child(0)
+            .map(|inner| {
+                csharp_receiver_type_units(analyzer, csharp, definitions, file, source, root, inner)
+            })
+            .unwrap_or_default(),
+        "cast_expression" | "as_expression" => receiver
+            .child_by_field_name(if receiver.kind() == "cast_expression" {
+                "type"
+            } else {
+                "right"
+            })
+            .map(|type_node| {
+                csharp_logical_visible_type_candidates(
+                    csharp,
+                    definitions,
+                    file,
+                    &csharp_reference_type_text(type_node, source),
+                )
+            })
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -1282,6 +1384,29 @@ fn csharp_member_access_result_type_units(
     root: Node<'_>,
     expression: Node<'_>,
 ) -> Vec<CodeUnit> {
+    if let Some(access) = csharp_conditional_member_access(expression) {
+        let owners = csharp_receiver_type_units(
+            analyzer,
+            csharp,
+            definitions,
+            file,
+            source,
+            root,
+            access.receiver,
+        );
+        let Some(name) = csharp_member_name(access.name) else {
+            return Vec::new();
+        };
+        return csharp_nearest_member_type_units(
+            analyzer,
+            csharp,
+            definitions,
+            file,
+            owners,
+            csharp_node_text(name.identifier, source),
+        );
+    }
+
     let mut layers = Vec::new();
     let mut base = expression;
     while base.kind() == "member_access_expression" {
@@ -1423,12 +1548,23 @@ fn csharp_invocation_return_type_units(
         Option<Vec<String>>,
     ) = match function.kind() {
         // `obj.Method()` — type the sub-receiver, look up `Method` on it.
-        "member_access_expression" => {
-            let Some(sub_receiver) = csharp_member_access_receiver(function) else {
-                return Vec::new();
-            };
-            let Some(name_node) = function.child_by_field_name("name") else {
-                return Vec::new();
+        "member_access_expression" | "conditional_access_expression" => {
+            let (sub_receiver, name_node) = match function.kind() {
+                "member_access_expression" => {
+                    let Some(receiver) = csharp_member_access_receiver(function) else {
+                        return Vec::new();
+                    };
+                    let Some(name) = csharp_member_access_name(function) else {
+                        return Vec::new();
+                    };
+                    (receiver, name)
+                }
+                _ => {
+                    let Some(access) = csharp_conditional_member_access(function) else {
+                        return Vec::new();
+                    };
+                    (access.receiver, access.name)
+                }
             };
             let Some(name) = csharp_member_name(name_node) else {
                 return Vec::new();

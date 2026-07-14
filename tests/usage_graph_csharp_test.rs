@@ -51,6 +51,103 @@ fn resolves_instance_static_and_unqualified_calls() {
 }
 
 #[test]
+fn inverted_graph_resolves_conditional_member_receivers_without_enclosing_fallback() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Service.cs",
+            r#"
+namespace Demo;
+public class Service {
+    public void Run() {}
+    public void Run(int value) {}
+    public void Run<T>(int first, int second) {}
+    public Service Child => this;
+    public Service GetChild() => this;
+}
+"#,
+        )
+        .file(
+            "Controller.cs",
+            r#"
+namespace Demo;
+public class Controller {
+    private readonly Service _service = new();
+    public void FromParameter(Service service) => service?.Run();
+    public void FromParenthesized(Service service) => ((service))?.Run(1);
+    public void FromCast(object raw) => ((Service)raw)?.Run<string>(1, 2);
+    public void FromField() => _service?.Run();
+    public void FromConditionalProperty(Service service) => service?.Child?.Run();
+    public void FromConditionalReturn(Service service) => service?.GetChild()?.Run();
+    public void FromAs(object raw) => (raw as Service)?.Run();
+}
+"#,
+        )
+        .file(
+            "Model.Json.cs",
+            r#"
+namespace Demo;
+public partial class Model {
+    private string _value = "";
+    public string Serialize() => (((object)_value)?.ToString());
+    public string Format() => (((object)_value)?.Format());
+}
+"#,
+        )
+        .file(
+            "Model.PowerShell.cs",
+            r#"
+namespace Demo;
+public partial class Model {
+    public override string ToString() => "model";
+}
+"#,
+        )
+        .file(
+            "Extensions.cs",
+            r#"
+namespace Demo;
+public static class Extensions {
+    public static string ToString(this Model value) => "wrong";
+    public static string Format(this object value) => "matched";
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in [
+        "Demo.Controller.FromParameter",
+        "Demo.Controller.FromParenthesized",
+        "Demo.Controller.FromCast",
+        "Demo.Controller.FromField",
+        "Demo.Controller.FromConditionalProperty",
+        "Demo.Controller.FromConditionalReturn",
+        "Demo.Controller.FromAs",
+    ] {
+        assert!(
+            has_edge(&value, caller, "Demo.Service.Run"),
+            "expected {caller} -> Demo.Service.Run: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "Demo.Model.Serialize", "Demo.Model.ToString"),
+        "the explicit object cast must not fall back to the enclosing partial model: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.Model.Serialize", "Demo.Extensions.ToString"),
+        "the explicit object cast must not target an incompatible Model extension: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Model.Format", "Demo.Extensions.Format"),
+        "the explicit object cast should resolve the matching builtin extension receiver: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn inverted_graph_resolves_unique_method_group_and_respects_shadowing() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

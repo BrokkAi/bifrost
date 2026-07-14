@@ -12206,6 +12206,122 @@ fn csharp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn csharp_conditional_member_resolves_typed_parenthesized_cast_and_field_receivers() {
+    let source = r#"using Lib;
+namespace App;
+public class Controller {
+    private readonly Service _service = new();
+    public void FromParameter(Service service) => service?.Run();
+    public void FromParenthesized(Service service) => ((service))?.Run(1);
+    public void FromCast(object raw) => ((Service)raw)?.Run<string>(1, 2);
+    public void FromField() => _service?.Run();
+    public void FromConditionalProperty(Service service) => service?.Child?.Run();
+    public void FromConditionalReturn(Service service) => service?.GetChild()?.Run();
+    public void FromAs(object raw) => (raw as Service)?.Run();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Service.cs",
+            r#"namespace Lib;
+public class Service {
+    public void Run() {}
+    public void Run(int value) {}
+    public void Run<T>(int first, int second) {}
+    public Service Child => this;
+    public Service GetChild() => this;
+}
+"#,
+        )
+        .file("App/Controller.cs", source)
+        .build();
+
+    for (needle, expected_signature) in [
+        ("service?.Run()", "()"),
+        ("((service))?.Run(1)", "(int)"),
+        ("((Service)raw)?.Run<string>(1, 2)", "`1(int, int)"),
+        ("_service?.Run()", "()"),
+        ("service?.Child?.Run()", "()"),
+        ("service?.GetChild()?.Run()", "()"),
+        ("(raw as Service)?.Run()", "()"),
+    ] {
+        let member_offset = source.find(needle).expect("conditional access")
+            + needle.find("Run").expect("conditional member name");
+        let value = lookup(
+            project.root(),
+            &location_reference("App/Controller.cs", source, member_offset),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{needle}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"], "Lib.Service.Run",
+            "{needle}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["signature"], expected_signature,
+            "{needle}: {value}"
+        );
+    }
+}
+
+#[test]
+fn csharp_object_cast_conditional_member_does_not_fall_back_to_enclosing_override() {
+    let source = r#"namespace Example;
+public partial class Model {
+    private string _value = "";
+    public string Serialize() => (((object)_value)?.ToString());
+    public string Format() => (((object)_value)?.Format());
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Model.Json.cs", source)
+        .file(
+            "Model.PowerShell.cs",
+            r#"namespace Example;
+public partial class Model {
+    public override string ToString() => "model";
+}
+"#,
+        )
+        .file(
+            "Extensions.cs",
+            r#"namespace Example;
+public static class Extensions {
+    public static string ToString(this Model value) => "extension";
+    public static string Format(this object value) => "extension";
+}
+"#,
+        )
+        .build();
+    let start = source.find("ToString").expect("conditional member name");
+    let value = lookup(
+        project.root(),
+        &location_reference("Model.Json.cs", source, start),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "no_definition",
+        "the explicit object cast targets external System.Object.ToString, not the containing model override: {value}"
+    );
+
+    let format_start = source.find("?.Format").expect("conditional extension") + 2;
+    let value = lookup(
+        project.root(),
+        &location_reference("Model.Json.cs", source, format_start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Example.Extensions.Format",
+        "the explicit object cast should retain the matching builtin extension receiver: {value}"
+    );
+}
+
+#[test]
 fn csharp_nested_owner_member_does_not_merge_dotted_owner_collision() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

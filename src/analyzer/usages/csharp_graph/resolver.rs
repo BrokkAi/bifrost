@@ -4,10 +4,10 @@ use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
-    csharp_as_expression_type_operand, csharp_callable_arity, csharp_member_name,
-    csharp_method_generic_arity, csharp_normalize_full_name, csharp_signature_arity,
-    csharp_signature_return_type, csharp_source_identifier, csharp_type_node_identity,
-    csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_as_expression_type_operand, csharp_callable_arity, csharp_conditional_member_access,
+    csharp_member_name, csharp_method_generic_arity, csharp_normalize_full_name,
+    csharp_signature_arity, csharp_signature_return_type, csharp_source_identifier,
+    csharp_type_node_identity, csharp_using_directive_is_global, csharp_using_directive_is_static,
     csharp_using_directive_namespace, csharp_using_directive_target, resolve_analyzer,
 };
 use crate::hash::HashSet;
@@ -296,17 +296,43 @@ fn expression_type_fq_name(
                 member_declared_type_fq_name(csharp, file, &owner, name)
             })
         }
-        "member_access_expression" => {
-            let receiver = member_access_receiver(expression)?;
-            let name = member_access_name(expression)?;
+        "member_access_expression" | "conditional_access_expression" => {
+            let (receiver, name_node) = match expression.kind() {
+                "member_access_expression" => (
+                    member_access_receiver(expression)?,
+                    member_access_name(expression)?,
+                ),
+                _ => {
+                    let access = csharp_conditional_member_access(expression)?;
+                    (access.receiver, access.name)
+                }
+            };
+            let name = csharp_member_name(name_node)?;
             let owners = receiver_type_units(receiver, csharp, file, source, bindings);
             owners.into_iter().find_map(|owner| {
-                member_declared_type_fq_name(csharp, file, &owner, node_text(name, source))
+                member_declared_type_fq_name(
+                    csharp,
+                    file,
+                    &owner,
+                    node_text(name.identifier, source),
+                )
             })
         }
         "invocation_expression" => {
             invocation_expression_return_type_fq_name(expression, csharp, file, source, bindings)
         }
+        "parenthesized_expression" | "checked_expression" => expression
+            .named_child(0)
+            .and_then(|inner| expression_type_fq_name(inner, csharp, file, source, bindings)),
+        "cast_expression" | "as_expression" => expression
+            .child_by_field_name(if expression.kind() == "cast_expression" {
+                "type"
+            } else {
+                "right"
+            })
+            .and_then(|type_node| {
+                resolve_type_fq_name(csharp, file, &reference_type_text(type_node, source))
+            }),
         _ => None,
     }
 }
@@ -347,9 +373,18 @@ fn invocation_expression_return_type_fq_name(
                 type_arguments.as_deref(),
             )
         }
-        "member_access_expression" => {
-            let receiver = member_access_receiver(function)?;
-            let name = csharp_member_name(member_access_name(function)?)?;
+        "member_access_expression" | "conditional_access_expression" => {
+            let (receiver, name_node) = match function.kind() {
+                "member_access_expression" => (
+                    member_access_receiver(function)?,
+                    member_access_name(function)?,
+                ),
+                _ => {
+                    let access = csharp_conditional_member_access(function)?;
+                    (access.receiver, access.name)
+                }
+            };
+            let name = csharp_member_name(name_node)?;
             let type_arguments = resolved_type_arguments(name, csharp, file, source);
             let owners = receiver_type_units(receiver, csharp, file, source, bindings);
             owners.into_iter().find_map(|owner| {
@@ -706,7 +741,7 @@ pub(super) fn resolve_type_fq_name_at(
         .or_else(|| class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name()))
 }
 
-fn resolve_type_fq_name(
+pub(in crate::analyzer::usages) fn resolve_type_fq_name(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     reference: &str,
@@ -964,7 +999,10 @@ pub(in crate::analyzer::usages) fn visible_extension_method_candidates(
             .filter(|unit| {
                 compatible_receiver_types.is_empty()
                     || extension_method_receiver_type(analyzer, unit).is_none_or(|receiver| {
-                        compatible_receiver_types.contains(&csharp_normalize_full_name(&receiver))
+                        let receiver = csharp_normalize_full_name(&receiver);
+                        compatible_receiver_types
+                            .iter()
+                            .any(|candidate| type_identity_matches(candidate, &receiver))
                     })
             })
             .collect::<Vec<_>>();
@@ -1311,7 +1349,7 @@ fn receiver_type_fq_names(
                 resolution => resolution,
             }
         }
-        "member_access_expression" => {
+        "member_access_expression" | "conditional_access_expression" => {
             expression_type_fq_name(receiver_node, csharp, file, source, bindings)
                 .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
                 .unwrap_or(SymbolResolution::Unknown)
@@ -1321,6 +1359,21 @@ fn receiver_type_fq_names(
                 .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
                 .unwrap_or(SymbolResolution::Unknown)
         }
+        "parenthesized_expression" | "checked_expression" => receiver_node
+            .named_child(0)
+            .map(|inner| receiver_type_fq_names(inner, csharp, file, source, bindings))
+            .unwrap_or(SymbolResolution::Unknown),
+        "cast_expression" | "as_expression" => receiver_node
+            .child_by_field_name(if receiver_node.kind() == "cast_expression" {
+                "type"
+            } else {
+                "right"
+            })
+            .and_then(|type_node| {
+                resolve_type_fq_name(csharp, file, &reference_type_text(type_node, source))
+            })
+            .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
+            .unwrap_or(SymbolResolution::Unknown),
         "this" => enclosing_declared_type(receiver_node, csharp, file, source)
             .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
             .unwrap_or(SymbolResolution::Unknown),

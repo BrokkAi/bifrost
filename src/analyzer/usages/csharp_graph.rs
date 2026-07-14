@@ -15,6 +15,7 @@ pub(in crate::analyzer::usages) use resolver::{
     node_text as csharp_node_text, object_created_type as csharp_object_created_type,
     object_initializer_for_label as csharp_object_initializer_for_label,
     reference_type_text as csharp_reference_type_text,
+    resolve_type_fq_name as csharp_resolve_type_fq_name,
     seed_bindings_before as seed_csharp_bindings_before,
     visible_extension_method_candidates as csharp_visible_extension_method_candidates,
 };

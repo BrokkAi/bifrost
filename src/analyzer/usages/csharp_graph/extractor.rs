@@ -17,8 +17,8 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_terminal_name,
-    csharp_attribute_type_names, csharp_callable_arity, csharp_member_name,
-    csharp_unqualified_invocation_for_name,
+    csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
+    csharp_member_name, csharp_unqualified_invocation_for_name,
 };
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
@@ -279,10 +279,14 @@ fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if node.kind() != "member_access_expression" {
-        return;
-    }
-    let Some(name_node) = member_access_name(node) else {
+    let access = match node.kind() {
+        "member_access_expression" => member_access_receiver(node).zip(member_access_name(node)),
+        "conditional_access_expression" => {
+            csharp_conditional_member_access(node).map(|access| (access.receiver, access.name))
+        }
+        _ => None,
+    };
+    let Some((receiver_node, name_node)) = access else {
         return;
     };
     let Some(name) = csharp_member_name(name_node) else {
@@ -312,10 +316,6 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    let Some(receiver_node) = member_access_receiver(node) else {
-        push_unproven_hit(name.identifier, ctx);
-        return;
-    };
     let receiver = node_text(receiver_node, ctx.source);
     if receiver.is_empty() {
         push_unproven_hit(name.identifier, ctx);
@@ -343,15 +343,25 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
             SymbolResolution::Precise(targets) => {
                 let receiver_type_names = targets.into_iter().collect::<Vec<_>>();
-                if extension_call_resolution(node, name.identifier, &receiver_type_names, ctx)
-                    == TargetMemberResolution::MatchesTarget
+                if extension_call_resolution(
+                    node,
+                    name.identifier,
+                    name.explicit_generic_arity,
+                    &receiver_type_names,
+                    ctx,
+                ) == TargetMemberResolution::MatchesTarget
                 {
                     push_hit(name.identifier, ctx);
                 }
             }
             SymbolResolution::Ambiguous | SymbolResolution::Unknown => {
-                if extension_call_resolution(node, name.identifier, &[], ctx)
-                    == TargetMemberResolution::MatchesTarget
+                if extension_call_resolution(
+                    node,
+                    name.identifier,
+                    name.explicit_generic_arity,
+                    &[],
+                    ctx,
+                ) == TargetMemberResolution::MatchesTarget
                 {
                     push_unproven_hit(name.identifier, ctx);
                 }
@@ -381,6 +391,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn extension_call_resolution(
     member_access: Node<'_>,
     name: Node<'_>,
+    explicit_generic_arity: Option<usize>,
     receiver_type_names: &[String],
     ctx: &mut ScanCtx<'_>,
 ) -> TargetMemberResolution {
@@ -388,10 +399,6 @@ fn extension_call_resolution(
         return TargetMemberResolution::NotFound;
     };
     let call_arity = argument_count(invocation, ctx.source);
-    let explicit_generic_arity = csharp_member_name(
-        member_access_name(member_access).expect("member access name was checked"),
-    )
-    .and_then(|name| name.explicit_generic_arity);
     let mut normalized_receivers = receiver_type_names.to_vec();
     normalized_receivers.sort();
     normalized_receivers.dedup();
@@ -685,9 +692,13 @@ fn identifier_is_member_access_name(node: Node<'_>) -> bool {
         .parent()
         .filter(|parent| parent.kind() == "generic_name")
         .unwrap_or(node);
-    name_node.parent().is_some_and(|parent| {
-        parent.kind() == "member_access_expression" && member_access_name(parent) == Some(name_node)
-    })
+    name_node
+        .parent()
+        .is_some_and(|parent| match parent.kind() {
+            "member_access_expression" => member_access_name(parent) == Some(name_node),
+            "member_binding_expression" => parent.child_by_field_name("name") == Some(name_node),
+            _ => false,
+        })
 }
 
 enum LabelOwnerResolution {

@@ -1,6 +1,7 @@
 //! C# structural spec for `query_code`.
 
 use crate::analyzer::Language;
+use crate::analyzer::csharp_conditional_member_access;
 use crate::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
@@ -122,9 +123,7 @@ fn callable_target_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn conditional_member_binding(node: Node<'_>) -> Option<Node<'_>> {
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == "member_binding_expression")
+    csharp_conditional_member_access(node).map(|access| access.binding)
 }
 
 fn first_argument_value(argument: Node<'_>) -> Option<Node<'_>> {

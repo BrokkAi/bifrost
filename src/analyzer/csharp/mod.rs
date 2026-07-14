@@ -643,6 +643,32 @@ pub(crate) struct CSharpMemberName<'tree> {
     pub(crate) type_arguments: Option<Node<'tree>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CSharpConditionalMemberAccess<'tree> {
+    pub(crate) receiver: Node<'tree>,
+    pub(crate) binding: Node<'tree>,
+    pub(crate) name: Node<'tree>,
+}
+
+pub(crate) fn csharp_conditional_member_access(
+    node: Node<'_>,
+) -> Option<CSharpConditionalMemberAccess<'_>> {
+    if node.kind() != "conditional_access_expression" {
+        return None;
+    }
+    let receiver = node.child_by_field_name("condition")?;
+    let mut cursor = node.walk();
+    let binding = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "member_binding_expression")?;
+    let name = binding.child_by_field_name("name")?;
+    Some(CSharpConditionalMemberAccess {
+        receiver,
+        binding,
+        name,
+    })
+}
+
 pub(crate) fn csharp_member_name(node: Node<'_>) -> Option<CSharpMemberName<'_>> {
     match node.kind() {
         "identifier" => Some(CSharpMemberName {
