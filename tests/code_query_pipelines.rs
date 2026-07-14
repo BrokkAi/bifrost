@@ -280,6 +280,164 @@ fn file_level_import_resolvers_keep_declaration_free_targets() {
 }
 
 #[test]
+fn direct_importers_work_across_supported_language_adapters() {
+    let cases = [
+        (
+            "python",
+            "target",
+            vec![
+                ("target.py", "def target():\n    pass\n"),
+                (
+                    "consumer.py",
+                    "from target import target\n\ndef consume():\n    target()\n",
+                ),
+            ],
+            "consumer.py",
+        ),
+        (
+            "java",
+            "target",
+            vec![
+                (
+                    "example/Target.java",
+                    "package example;\npublic class Target { public static void target() {} }\n",
+                ),
+                (
+                    "example/Consumer.java",
+                    "package example;\nimport example.Target;\npublic class Consumer { void consume() { Target.target(); } }\n",
+                ),
+            ],
+            "example/Consumer.java",
+        ),
+        (
+            "javascript",
+            "target",
+            vec![
+                ("target.js", "export function target() {}\n"),
+                (
+                    "consumer.js",
+                    "import { target } from './target.js';\ntarget();\n",
+                ),
+            ],
+            "consumer.js",
+        ),
+        (
+            "typescript",
+            "target",
+            vec![
+                ("target.ts", "export function target(): void {}\n"),
+                (
+                    "consumer.ts",
+                    "import { target } from './target';\ntarget();\n",
+                ),
+            ],
+            "consumer.ts",
+        ),
+        (
+            "go",
+            "Target",
+            vec![
+                ("go.mod", "module example.com/project\n\ngo 1.22\n"),
+                ("target/target.go", "package target\nfunc Target() {}\n"),
+                (
+                    "main.go",
+                    "package main\nimport \"example.com/project/target\"\nfunc consume() { target.Target() }\n",
+                ),
+            ],
+            "main.go",
+        ),
+        (
+            "cpp",
+            "target",
+            vec![
+                ("target.h", "inline int target() { return 0; }\n"),
+                (
+                    "main.cpp",
+                    "#include \"target.h\"\nint consume() { return target(); }\n",
+                ),
+            ],
+            "main.cpp",
+        ),
+        (
+            "rust",
+            "target",
+            vec![
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"example\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("src/shared.rs", "pub fn target() {}\n"),
+                (
+                    "src/main.rs",
+                    "mod shared;\nuse crate::shared::target;\nfn consume() { target(); }\n",
+                ),
+            ],
+            "src/main.rs",
+        ),
+        (
+            "scala",
+            "target",
+            vec![
+                (
+                    "example/Target.scala",
+                    "package example\nobject Target { def target(): Unit = () }\n",
+                ),
+                (
+                    "example/Consumer.scala",
+                    "package example\nimport example.Target\nobject Consumer { def consume(): Unit = Target.target() }\n",
+                ),
+            ],
+            "example/Consumer.scala",
+        ),
+        (
+            "csharp",
+            "target",
+            vec![
+                (
+                    "Target.cs",
+                    "namespace Example; public class Target { public static void target() {} }\n",
+                ),
+                (
+                    "Consumer.cs",
+                    "using Example; public class Consumer { void Consume() { Target.target(); } }\n",
+                ),
+            ],
+            "Consumer.cs",
+        ),
+        (
+            "ruby",
+            "target",
+            vec![
+                ("target.rb", "def target; end\n"),
+                (
+                    "consumer.rb",
+                    "require_relative 'target'\ndef consume; target; end\n",
+                ),
+            ],
+            "consumer.rb",
+        ),
+    ];
+
+    for (language, name, files, expected) in cases {
+        let result = run(
+            &files,
+            json!({
+                "languages": [language],
+                "match": { "kind": "callable", "name": name },
+                "steps": [{ "op": "file_of" }, { "op": "importers_of" }]
+            }),
+        );
+        let value = serialized(&result);
+        assert_eq!(
+            value["results"].as_array().unwrap().len(),
+            1,
+            "{language}: {value}"
+        );
+        assert_eq!(value["results"][0]["path"], expected, "{language}: {value}");
+    }
+}
+
+#[test]
 fn imports_of_is_direct_and_cycles_terminate() {
     let files = [
         ("a.rb", "require_relative 'b'\ndef target; end\n"),

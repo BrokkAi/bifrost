@@ -630,6 +630,51 @@ fn query_file_runs_rql_from_the_current_workspace() {
 }
 
 #[test]
+fn query_file_runs_direct_importers_pipeline() {
+    let root = TempDir::new().expect("workspace");
+    fs::write(root.path().join("target.rb"), "def target; end\n").expect("target source");
+    fs::write(
+        root.path().join("first_importer.rb"),
+        "require_relative 'target'\ndef first; end\n",
+    )
+    .expect("first importer source");
+    fs::write(
+        root.path().join("second_importer.rb"),
+        "require_relative 'target'\ndef second; end\n",
+    )
+    .expect("second importer source");
+    let queries = root.path().join("queries");
+    fs::create_dir(&queries).expect("query directory");
+    fs::write(
+        queries.join("importers.rql"),
+        "(importers-of (file-of (language ruby (function :name \"target\"))))\n",
+    )
+    .expect("RQL query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .current_dir(root.path())
+        .arg("--query-file")
+        .arg("queries/importers.rql")
+        .output()
+        .expect("run bifrost --query-file importers pipeline");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("query-file JSON output");
+    assert_eq!(payload["isError"], false, "{payload}");
+    let results = payload["structuredContent"]["results"]
+        .as_array()
+        .expect("file results");
+    assert_eq!(results.len(), 2, "{payload}");
+    assert_eq!(results[0]["result_type"], "file", "{payload}");
+    assert_eq!(results[0]["path"], "first_importer.rb", "{payload}");
+    assert_eq!(results[1]["path"], "second_importer.rb", "{payload}");
+}
+
+#[test]
 fn query_file_runs_json_with_an_explicit_root() {
     let root = TempDir::new().expect("workspace");
     fs::write(root.path().join("app.py"), "class App:\n    pass\n").expect("source file");

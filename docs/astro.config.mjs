@@ -71,6 +71,7 @@ export default defineConfig({
                   label: 'Language Tutorials',
                   items: [
                     { label: 'Overview', slug: 'code-query-tutorials' },
+                    { label: 'Import Traversal', slug: 'code-query-tutorials/import-traversal' },
                     { label: 'Python', slug: 'code-query-tutorials/python' },
                     { label: 'Java', slug: 'code-query-tutorials/java' },
                     { label: 'JavaScript', slug: 'code-query-tutorials/javascript' },

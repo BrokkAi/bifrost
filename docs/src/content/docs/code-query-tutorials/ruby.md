@@ -59,6 +59,14 @@ def graph_target
 end
 ```
 
+<!-- code-query-fixture:ruby/graph/also_imports_c.rb -->
+```ruby
+require_relative "c"
+
+def another_graph_entry
+end
+```
+
 ## Typed declaration and import pipelines
 
 Pipeline wrappers transform syntax matches into declarations or files. `enclosing-decl` is inclusive and returns the smallest indexed declaration containing the match. `file-of` converts a syntax match or declaration to its exact project file.
@@ -218,16 +226,104 @@ Pipeline wrappers transform syntax matches into declarations or files. `enclosin
 <!-- code-query-case:importers-of:rql -->
 ```lisp
 (importers-of
-  (importers-of
-    (file-of (language ruby (function :name "graph_target")))))
+  (file-of (language ruby (function :name "graph_target"))))
 ```
 
 <!-- code-query-case:importers-of:json -->
 ```json
-{"languages":["ruby"],"match":{"kind":"function","name":"graph_target"},"steps":[{"op":"file_of"},{"op":"importers_of"},{"op":"importers_of"}]}
+{"languages":["ruby"],"match":{"kind":"function","name":"graph_target"},"steps":[{"op":"file_of"},{"op":"importers_of"}]}
 ```
 
 <!-- code-query-case:importers-of:expected -->
+```json
+{
+  "results": [
+    {
+      "language": "ruby",
+      "path": "ruby/graph/also_imports_c.rb",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 2,
+            "kind": "function",
+            "path": "ruby/graph/c.rb",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "file_of",
+              "result": {
+                "path": "ruby/graph/c.rb",
+                "result_type": "file"
+              }
+            },
+            {
+              "op": "importers_of",
+              "result": {
+                "path": "ruby/graph/also_imports_c.rb",
+                "result_type": "file"
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "file"
+    },
+    {
+      "language": "ruby",
+      "path": "ruby/graph/b.rb",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 2,
+            "kind": "function",
+            "path": "ruby/graph/c.rb",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "file_of",
+              "result": {
+                "path": "ruby/graph/c.rb",
+                "result_type": "file"
+              }
+            },
+            {
+              "op": "importers_of",
+              "result": {
+                "path": "ruby/graph/b.rb",
+                "result_type": "file"
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "file"
+    }
+  ],
+  "truncated": false
+}
+```
+
+This is the direct answer to “which project files import the declaration `graph_target`?”: first convert the declaration match to `graph/c.rb`, then follow one reverse edge. It returns every project file with a resolved direct import of that file; it does **not** claim that each importer calls `graph_target`, nor does it turn an external package import into a synthetic declaration.
+
+To inspect actual uses today, run a structural call query (or a resolved `scan_usages` query when the declaration is indexed) separately. A pipeline cannot yet feed its file results back into a second structural query as a correlated scope, so it cannot express “among these importers, find calls to this imported member” in one query.
+
+<!-- code-query-case:importers-of-two-hops:rql -->
+```lisp
+(importers-of
+  (importers-of
+    (file-of (language ruby (function :name "graph_target")))))
+```
+
+<!-- code-query-case:importers-of-two-hops:json -->
+```json
+{"languages":["ruby"],"match":{"kind":"function","name":"graph_target"},"steps":[{"op":"file_of"},{"op":"importers_of"},{"op":"importers_of"}]}
+```
+
+<!-- code-query-case:importers-of-two-hops:expected -->
 ```json
 {
   "results": [

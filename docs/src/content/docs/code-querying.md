@@ -34,6 +34,15 @@ The matcher only sees this normalized fact arena. Language-specific tree-sitter 
 
 `query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations, `file_of` converts matches or declarations to files, and `imports_of` / `importers_of` traverse one direct project-local file edge per step. Derived results retain seed-and-edge provenance.
 
+| RQL wrapper | JSON step | Input → output | Use it to |
+| --- | --- | --- | --- |
+| `enclosing-decl` | `enclosing_decl` | structural match → indexed declaration | Find the smallest real declaration that contains a matching expression. |
+| `file-of` | `file_of` | structural match or declaration → file | Move from code or its declaration to the exact project file. |
+| `imports-of` | `imports_of` | file → file | Follow one resolved direct project-local import. |
+| `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
+
+For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. A future compositional query facet can correlate structured import bindings with calls or member access; version 2 keeps those facts separate rather than guessing.
+
 The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
 
 ## Query Representations
