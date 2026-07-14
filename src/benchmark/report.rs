@@ -162,12 +162,20 @@ impl BenchmarkCompareReport {
         let thresholds = CompareThresholds::default();
         let baseline_index = index_scenarios(baseline);
         let candidate_index = index_scenarios(candidate);
+        let selected_repo = candidate.selected_repo.as_deref();
 
-        let mut keys = baseline_index.keys().copied().collect::<Vec<_>>();
+        let mut keys = baseline_index
+            .keys()
+            .filter(|key| selected_repo.is_none_or(|repo| key.repo_name == repo))
+            .copied()
+            .collect::<Vec<_>>();
         keys.extend(
             candidate_index
                 .keys()
-                .filter(|key| !baseline_index.contains_key(*key))
+                .filter(|key| {
+                    selected_repo.is_none_or(|repo| key.repo_name == repo)
+                        && !baseline_index.contains_key(*key)
+                })
                 .copied(),
         );
         keys.sort_unstable_by(compare_keys);

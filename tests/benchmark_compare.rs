@@ -124,6 +124,49 @@ fn isolated_timing_regressions_remain_actionable() {
 }
 
 #[test]
+fn selected_repo_comparison_ignores_unselected_baseline_scenarios() {
+    let baseline = report_with_scenarios(vec![
+        repo_with_scenarios(
+            "fixture-a",
+            vec![
+                scenario(BenchmarkScenario::WorkspaceBuild, true, Some(100.0)),
+                scenario(BenchmarkScenario::ScanUsages, true, Some(100.0)),
+            ],
+        ),
+        repo_with_scenarios(
+            "fixture-b",
+            vec![scenario(
+                BenchmarkScenario::SearchSymbols,
+                true,
+                Some(100.0),
+            )],
+        ),
+    ]);
+    let mut candidate = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-a",
+        vec![scenario(
+            BenchmarkScenario::WorkspaceBuild,
+            true,
+            Some(100.0),
+        )],
+    )]);
+    candidate.selected_repo = Some("fixture-a".to_string());
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+
+    assert_eq!(comparison.compared_scenarios_count, 2, "{comparison:?}");
+    assert_eq!(comparison.regression_count, 1, "{comparison:?}");
+    assert_eq!(comparison.missing_candidate_count, 1, "{comparison:?}");
+    assert!(comparison.has_regressions, "{comparison:?}");
+    assert!(
+        comparison
+            .scenarios
+            .iter()
+            .all(|scenario| scenario.repo_name == "fixture-a")
+    );
+}
+
+#[test]
 fn broad_workspace_slowdown_is_classified_as_environment_variance() {
     let baseline = report_with_scenarios(broad_slowdown_repos(200.0, 100.0, 200.0));
     let candidate = report_with_scenarios(broad_slowdown_repos(260.0, 125.0, 230.0));

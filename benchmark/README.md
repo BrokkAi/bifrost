@@ -184,6 +184,10 @@ when `environment_variance_detected` is true, render
 `environment_variance_covered_regression_count` as warning context, not as a
 failed benchmark by itself.
 
+When a candidate report declares `selected_repo`, comparison is limited to that
+repository. Scenarios from other baseline repositories were intentionally not
+run and are not reported as missing-candidate regressions.
+
 Slack-side setup:
 
 - update the Slack Workflow Builder message template to consume the benchmark payload above rather than the older Brokk perf-only fields
