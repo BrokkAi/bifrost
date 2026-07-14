@@ -44,7 +44,8 @@ pub use query::{
     StringPredicate,
 };
 pub use rune_ir::{
-    RenderedRuneIr, RuneIrError, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
+    RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
+    render_source_rune_ir,
 };
 pub use search::{
     CodeQueryCapture, CodeQueryDeclaration, CodeQueryExecutionLimits, CodeQueryFile,

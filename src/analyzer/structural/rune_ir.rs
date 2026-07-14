@@ -11,12 +11,14 @@ use super::facts::FileFacts;
 use crate::analyzer::Language;
 use std::fmt;
 use std::ops::Range;
+use std::path::Path;
 
 const TRUNCATION_RESERVE: usize = 96;
 const MIN_OUTPUT_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuneIrLimits {
+    pub max_input_bytes: usize,
     pub max_nodes: usize,
     pub max_depth: usize,
     pub max_source_bytes: usize,
@@ -26,11 +28,77 @@ pub struct RuneIrLimits {
 impl Default for RuneIrLimits {
     fn default() -> Self {
         Self {
+            max_input_bytes: 256 * 1024,
             max_nodes: 10_000,
             max_depth: 128,
             max_source_bytes: 64 * 1024,
             max_output_bytes: 256 * 1024,
         }
+    }
+}
+
+/// The parser flavor used to extract Rune IR from a source snippet.
+///
+/// Most languages have one grammar. TypeScript is the exception because `.ts`
+/// and `.tsx` files use distinct tree-sitter grammars while sharing the same
+/// normalized structural adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuneIrLanguage {
+    Standard(Language),
+    TypeScriptTsx,
+}
+
+impl RuneIrLanguage {
+    pub fn from_config_label(label: &str) -> Option<Self> {
+        let normalized = label
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .replace(['_', '-'], "");
+        if matches!(normalized.as_str(), "tsx" | "typescriptreact") {
+            return Some(Self::TypeScriptTsx);
+        }
+        Language::from_config_label(label).map(Self::Standard)
+    }
+
+    pub fn for_path(language: Language, path: &Path) -> Self {
+        if language == Language::TypeScript
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"))
+        {
+            Self::TypeScriptTsx
+        } else {
+            Self::Standard(language)
+        }
+    }
+
+    pub fn language(self) -> Language {
+        match self {
+            Self::Standard(language) => language,
+            Self::TypeScriptTsx => Language::TypeScript,
+        }
+    }
+
+    pub fn config_label(self) -> &'static str {
+        match self {
+            Self::Standard(language) => language.config_label(),
+            Self::TypeScriptTsx => "tsx",
+        }
+    }
+
+    fn parser_language(self) -> Option<tree_sitter::Language> {
+        match self {
+            Self::Standard(language) => crate::analyzer::parser_language_for(language),
+            Self::TypeScriptTsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        }
+    }
+}
+
+impl From<Language> for RuneIrLanguage {
+    fn from(language: Language) -> Self {
+        Self::Standard(language)
     }
 }
 
@@ -53,6 +121,7 @@ pub enum RuneIrError {
     UnsupportedLanguage(String),
     EmptySource,
     InvalidSelection(Range<usize>),
+    SourceTooLarge { actual: usize, limit: usize },
     NoStructuralFacts,
     InvalidLimits,
     StarterQuery(String),
@@ -71,12 +140,16 @@ impl fmt::Display for RuneIrError {
                 "source selection {}..{} is outside the supplied source",
                 range.start, range.end
             ),
+            Self::SourceTooLarge { actual, limit } => write!(
+                f,
+                "source is {actual} bytes; Rune IR accepts at most {limit} bytes per request"
+            ),
             Self::NoStructuralFacts => f.write_str(
                 "the structural adapter produced no Rune IR facts for the supplied source",
             ),
             Self::InvalidLimits => write!(
                 f,
-                "Rune IR node, depth, and source limits must be greater than zero, and the output limit must be at least {MIN_OUTPUT_BYTES} bytes"
+                "Rune IR input, node, depth, and source-copy limits must be greater than zero, and the output limit must be at least {MIN_OUTPUT_BYTES} bytes"
             ),
             Self::StarterQuery(error) => {
                 write!(f, "generated starter RQL did not parse: {error}")
@@ -88,7 +161,7 @@ impl fmt::Display for RuneIrError {
 impl std::error::Error for RuneIrError {}
 
 pub fn render_source_rune_ir(
-    language: Language,
+    language: impl Into<RuneIrLanguage>,
     source: &str,
     selection: RuneIrSelection,
     limits: RuneIrLimits,
@@ -96,12 +169,19 @@ pub fn render_source_rune_ir(
     if source.is_empty() {
         return Err(RuneIrError::EmptySource);
     }
-    if limits.max_nodes == 0
+    if limits.max_input_bytes == 0
+        || limits.max_nodes == 0
         || limits.max_depth == 0
         || limits.max_source_bytes == 0
         || limits.max_output_bytes < MIN_OUTPUT_BYTES
     {
         return Err(RuneIrError::InvalidLimits);
+    }
+    if source.len() > limits.max_input_bytes {
+        return Err(RuneIrError::SourceTooLarge {
+            actual: source.len(),
+            limit: limits.max_input_bytes,
+        });
     }
     let selected = match selection {
         RuneIrSelection::WholeSource => None,
@@ -116,8 +196,14 @@ pub fn render_source_rune_ir(
             Some(range)
         }
     };
-    let (spec, grammar) = crate::analyzer::structural_language(language)
-        .ok_or_else(|| RuneIrError::UnsupportedLanguage(language.config_label().to_string()))?;
+    let language = language.into();
+    let analyzer_language = language.language();
+    let spec = crate::analyzer::structural_spec_for(analyzer_language).ok_or_else(|| {
+        RuneIrError::UnsupportedLanguage(analyzer_language.config_label().to_string())
+    })?;
+    let grammar = language.parser_language().ok_or_else(|| {
+        RuneIrError::UnsupportedLanguage(analyzer_language.config_label().to_string())
+    })?;
     let facts = extract_file_facts(spec, &grammar, source).ok_or(RuneIrError::NoStructuralFacts)?;
     let roots = selected_roots(&facts, selected.as_ref());
     if roots.is_empty() {
@@ -312,9 +398,6 @@ impl<'a> Renderer<'a> {
                 role.span.start_byte,
                 role.span.end_byte
             );
-            if let Some(target) = role.node {
-                role_line.push_str(&format!(" :node {target}"));
-            }
             if let Some(keyword) = role.keyword {
                 let Some(value) = self.source_value(keyword.text(self.facts.source())) else {
                     return;
@@ -457,6 +540,22 @@ mod tests {
     }
 
     #[test]
+    fn tsx_uses_the_file_specific_parser_grammar() {
+        let source = "function View() { return <div>{value}</div>; }";
+        let rendered = render_source_rune_ir(
+            RuneIrLanguage::TypeScriptTsx,
+            source,
+            RuneIrSelection::WholeSource,
+            RuneIrLimits::default(),
+        )
+        .unwrap();
+
+        assert!(rendered.rune_ir.starts_with("(function"), "{rendered:?}");
+        assert!(rendered.rune_ir.contains(":name \"View\""));
+        assert_eq!(rendered.starter_rql, "(function :name \"View\")");
+    }
+
+    #[test]
     fn renderer_marks_each_bounded_dimension() {
         let source = "fn outer() { if true { loop { return; } } }";
         let cases = [
@@ -538,5 +637,32 @@ mod tests {
             ),
             Err(RuneIrError::UnsupportedLanguage(_))
         ));
+        assert!(matches!(
+            render_source_rune_ir(
+                Language::Rust,
+                "fn oversized() {}",
+                RuneIrSelection::WholeSource,
+                RuneIrLimits {
+                    max_input_bytes: 4,
+                    ..RuneIrLimits::default()
+                }
+            ),
+            Err(RuneIrError::SourceTooLarge { limit: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn role_edges_do_not_expose_internal_arena_ids() {
+        let rendered = render_source_rune_ir(
+            Language::Rust,
+            "fn f() { g(x); }",
+            RuneIrSelection::WholeSource,
+            RuneIrLimits::default(),
+        )
+        .unwrap();
+
+        assert!(rendered.rune_ir.contains("(callee"));
+        assert!(rendered.rune_ir.contains("(args"));
+        assert!(!rendered.rune_ir.contains(":node"));
     }
 }

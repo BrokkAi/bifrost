@@ -1,6 +1,5 @@
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use std::path::Path;
-use tree_sitter::Language as TsLanguage;
 
 /// Default longest single line a source file may contain before tree-sitter parsing is
 /// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
@@ -150,7 +149,7 @@ fn is_identifier_text(name: &str) -> bool {
 }
 
 fn is_reserved_identifier(language: Language, name: &str) -> bool {
-    let Some(parser_language) = parser_language_for(language) else {
+    let Some(parser_language) = super::parser_language_for(language) else {
         return false;
     };
     (0..parser_language.node_kind_count()).any(|id| {
@@ -159,23 +158,6 @@ fn is_reserved_identifier(language: Language, name: &str) -> bool {
         };
         !parser_language.node_kind_is_named(id)
             && parser_language.node_kind_for_id(id) == Some(name)
-    })
-}
-
-fn parser_language_for(language: Language) -> Option<TsLanguage> {
-    Some(match language {
-        Language::Java => tree_sitter_java::LANGUAGE.into(),
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
-        Language::Scala => tree_sitter_scala::LANGUAGE.into(),
-        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-        Language::None => return None,
     })
 }
 

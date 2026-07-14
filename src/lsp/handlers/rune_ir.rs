@@ -1,7 +1,9 @@
 use lsp_types::{Position, Range as LspRange, TextDocumentIdentifier};
 
 use crate::analyzer::common::{display_identifier_for_target, language_for_file};
-use crate::analyzer::structural::{RuneIrLimits, RuneIrSelection, render_source_rune_ir};
+use crate::analyzer::structural::{
+    RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
+};
 use crate::analyzer::{Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::document_symbol::primary_range;
@@ -59,8 +61,9 @@ pub(crate) fn handle(
     }
 
     let language = language_for_file(&file);
+    let rune_ir_language = RuneIrLanguage::for_path(language, file.rel_path());
     let rendered = render_source_rune_ir(
-        language,
+        rune_ir_language,
         &source,
         RuneIrSelection::ByteRange(code_unit_range.start_byte..code_unit_range.end_byte),
         RuneIrLimits::default(),

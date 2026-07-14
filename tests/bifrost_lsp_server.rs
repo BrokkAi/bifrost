@@ -1,7 +1,9 @@
 mod common;
 
 use brokk_bifrost::Language;
-use brokk_bifrost::analyzer::structural::{RuneIrLimits, RuneIrSelection, render_source_rune_ir};
+use brokk_bifrost::analyzer::structural::{
+    RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
+};
 use common::lsp_client::{LspServer, uri_for};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -733,8 +735,10 @@ fn bifrost_lsp_server_renders_rune_ir_from_unsaved_overlay_and_indexed_code_unit
     let root = temp.path().canonicalize().expect("canonical root");
     let rust_path = root.join("live.rs");
     let ts_path = root.join("widget.ts");
+    let tsx_path = root.join("view.tsx");
     fs::write(&rust_path, "fn disk_name() {}\n").expect("write Rust fixture");
     fs::write(&ts_path, "class DiskWidget {}\n").expect("write TypeScript fixture");
+    fs::write(&tsx_path, "function DiskView() { return <div />; }\n").expect("write TSX fixture");
     let mut server = LspServer::start(&root);
 
     let rust_source = "/*😀*/ fn fresh_name() {\n    client.send(\"live\");\n}\n";
@@ -826,6 +830,42 @@ fn bifrost_lsp_server_renders_rune_ir_from_unsaved_overlay_and_indexed_code_unit
         assert!(response["error"].is_null(), "{response}");
         assert_eq!(response["result"]["codeUnit"], expected, "{response}");
     }
+
+    let tsx_source = "function View() { return <div>{value}</div>; }\n";
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri_for(&tsx_path),
+                "languageId": "typescriptreact",
+                "version": 1,
+                "text": tsx_source,
+            }
+        }),
+    );
+    let response = server.request(
+        "bifrost/runeIr",
+        json!({
+            "textDocument": {"uri": uri_for(&tsx_path)},
+            "position": {"line": 0, "character": 10},
+        }),
+    );
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["codeUnit"], "View", "{response}");
+    assert!(
+        response["result"]["runeIr"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("(function") && text.contains(":name \"View\"")),
+        "{response}"
+    );
+    let tsx_direct = render_source_rune_ir(
+        RuneIrLanguage::for_path(Language::TypeScript, &tsx_path),
+        tsx_source,
+        RuneIrSelection::WholeSource,
+        RuneIrLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(response["result"]["runeIr"], tsx_direct.rune_ir);
 
     let invalid = server.request(
         "bifrost/runeIr",

@@ -17,6 +17,9 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 - [x] (2026-07-14 15:05Z) Added **Bifrost: Show Rune IR** for supported source editors, using selection-or-cursor request params and opening the server-provided display text verbatim; TypeScript and manifest tests pass as part of all 48 VS Code tests.
 - [x] (2026-07-14 15:25Z) Documented Rune IR as the source-side representation matched by `CodeQuery`, documented both query-by-example surfaces, passed Astro content checks and the production build, and visually verified the rendered code-querying page in the in-app browser.
 - [x] (2026-07-14 12:14Z) Reviewed the complete branch diff, repaired truncation so every bounded Rune IR result remains a balanced S-expression, passed `cargo fmt --check`, 7 focused library tests, 15 REPL tests, the overlay LSP integration test, all 48 VS Code tests, and all-target/all-feature clippy with warnings denied. The full `nlp,python` test binary remains un-linkable in this local PyO3 environment as recorded below.
+- [x] (2026-07-14) Remediated guided-review findings in structural extraction and LSP: centralized the default grammar registry, preserved explicit/path-derived TSX grammar selection, rejected source above 256 KiB before parsing, removed unresolvable arena IDs from role forms, and passed 9 focused library tests plus the TSX-aware overlay LSP integration test.
+- [ ] Remediate guided-review findings in the REPL: make explicit-terminator capture independent of query delimiter validation and bound accumulated source input.
+- [ ] Remediate the duplicated VS Code source-language registry, run the focused validation matrix, and complete the post-fix review.
 
 ## Surprises & Discoveries
 
@@ -30,6 +33,10 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
   Evidence: after the focused tests passed, the first clippy attempts rejected dependency metadata with E0514. `type -a cargo-clippy` showed Homebrew's subcommand before rustup's even though `cargo` itself came from rustup. Running with `/Users/dave/.cargo/bin` first on `PATH` and a fresh target directory passed `cargo clippy --all-targets --all-features -- -D warnings`; deleting the shared target directory was unnecessary.
 - Observation: a truncation marker alone was not enough to preserve Rune IR's S-expression contract when a node or depth limit interrupted nested output.
   Evidence: the complete-diff review showed open node forms could remain unclosed. The renderer now reserves space for compact closing parentheses, and every bounded-dimension test verifies balanced parentheses while respecting the byte limit.
+- Observation: the initial pathless `Language -> grammar` registry erased the existing file-sensitive TypeScript/TSX distinction.
+  Evidence: `:ir tsx` on `function View() { return <div>{value}</div>; }` rendered only identifiers and generated an identifier starter, while `TypescriptAdapter::parser_language_for_file` deliberately selects the TSX grammar for `.tsx` files.
+- Observation: the interactive Reedline validator receives input before `ReplSession`, so session-local capture state cannot make malformed source lines complete.
+  Evidence: an unclosed `(` keeps Reedline's query validator in multiline mode and prevents a later `:end` line from reaching `process_rune_ir_line`; capture state must be shared with validation or interactive capture must use a raw input path.
 
 ## Decision Log
 
@@ -41,6 +48,15 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
   Date/Author: 2026-07-14 / Codex
 - Decision: Render containment as nested node forms and role edges as explicit `(role-label ...)` child forms, including a span-only target form when the adapter has no normalized target node.
   Rationale: The distinction is matcher-visible, deterministic, and preserves role targets that cannot be represented as containment nodes or a single RQL pattern.
+  Date/Author: 2026-07-14 / Codex
+- Decision: Treat the six confirmed guided-review findings as three independently verifiable remediation milestones: structural/LSP correctness, REPL input behavior, and editor registry consistency.
+  Rationale: The first two milestones change separate runtime surfaces and need focused behavioral verification; the editor cleanup is mechanical and can be validated by the extension suite. The grouping preserves checkpoint commits without mixing unrelated fixes.
+  Date/Author: 2026-07-14 / Codex
+- Decision: Keep role forms self-contained with canonical role, span, keyword/name, and escaped text rather than exporting `FileFacts` arena offsets.
+  Rationale: Arena IDs are storage details, were not identified on rendered nodes, and could point outside a selected or truncated result. Removing them preserves the observable role edge without publishing an unstable reference protocol.
+  Date/Author: 2026-07-14 / Codex
+- Decision: Bound Rune IR source input at 256 KiB before parsing while continuing to parse the full bounded document for LSP parity.
+  Rationale: Parsing only a declaration fragment can change adapter behavior for fields and other context-dependent constructs. A hard pre-parse bound prevents unbounded synchronous work without sacrificing equivalence to matcher-visible full-file facts inside the supported envelope.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective
@@ -154,3 +170,7 @@ Revision note (2026-07-14 15:05Z): Marked the VS Code milestone complete after l
 Revision note (2026-07-14 15:25Z): Marked documentation complete after Astro checks, production build, and an in-app rendered-page inspection; separated final repository gates into their own remaining milestone.
 
 Revision note (2026-07-14 12:14Z): Completed the final review and validation milestone, recorded the rustup/Homebrew clippy collision and workaround, and strengthened bounded rendering so truncation always leaves balanced S-expressions.
+
+Revision note (2026-07-14): Reopened the plan after the merge-base guided review and added three remediation milestones covering all six confirmed findings, with the TSX and interactive-capture evidence that drives the revised design.
+
+Revision note (2026-07-14): Completed the structural/LSP remediation milestone with file-sensitive TSX parsing, a pre-parse input cap, self-contained roles, and focused Rust/LSP proof.

@@ -1,8 +1,8 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLimits,
-    RuneIrSelection, StringPredicate, render_source_rune_ir,
+    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLanguage,
+    RuneIrLimits, RuneIrSelection, StringPredicate, render_source_rune_ir,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
@@ -140,7 +140,7 @@ pub struct ReplSession {
 }
 
 struct RuneIrCapture {
-    language: Language,
+    language: RuneIrLanguage,
     source: String,
 }
 
@@ -271,7 +271,7 @@ impl ReplSession {
                 "usage: :ir <language>; finish source input with :end".to_string(),
             );
         }
-        let Some(language) = Language::from_config_label(label) else {
+        let Some(language) = RuneIrLanguage::from_config_label(label) else {
             return (
                 ReplFlow::Continue,
                 format!(
