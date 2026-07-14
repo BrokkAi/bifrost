@@ -1,5 +1,7 @@
 mod common;
 
+use brokk_bifrost::Language;
+use brokk_bifrost::analyzer::structural::{RuneIrLimits, RuneIrSelection, render_source_rune_ir};
 use common::lsp_client::{LspServer, uri_for};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -722,6 +724,118 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
             .as_str()
             .is_some_and(|message| message.contains("Failed to parse query source")),
         "expected source parse error, got {invalid}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_renders_rune_ir_from_unsaved_overlay_and_indexed_code_units() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let rust_path = root.join("live.rs");
+    let ts_path = root.join("widget.ts");
+    fs::write(&rust_path, "fn disk_name() {}\n").expect("write Rust fixture");
+    fs::write(&ts_path, "class DiskWidget {}\n").expect("write TypeScript fixture");
+    let mut server = LspServer::start(&root);
+
+    let rust_source = "/*😀*/ fn fresh_name() {\n    client.send(\"live\");\n}\n";
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri_for(&rust_path),
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn disk_name() {}\n",
+            }
+        }),
+    );
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri_for(&rust_path), "version": 2},
+            "contentChanges": [{"text": rust_source}],
+        }),
+    );
+    let response = server.request(
+        "bifrost/runeIr",
+        json!({
+            "textDocument": {"uri": uri_for(&rust_path)},
+            "position": {"line": 1, "character": 8},
+        }),
+    );
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["codeUnit"], "fresh_name", "{response}");
+    assert_eq!(
+        response["result"]["sourceRange"]["start"],
+        json!({"line": 0, "character": 7}),
+        "the range must count the emoji as two UTF-16 units: {response}"
+    );
+    assert!(
+        response["result"]["runeIr"]
+            .as_str()
+            .is_some_and(|text| text.contains(":name \"fresh_name\"")
+                && text.contains("(callee")
+                && !text.contains("disk_name")
+                && !text.contains("function_item")),
+        "{response}"
+    );
+    assert_eq!(
+        response["result"]["starterRql"], "(function :name \"fresh_name\")",
+        "{response}"
+    );
+    let rust_start = rust_source.find("fn fresh_name").unwrap();
+    let rust_end = rust_source.rfind('}').unwrap() + 1;
+    let direct = render_source_rune_ir(
+        Language::Rust,
+        rust_source,
+        RuneIrSelection::ByteRange(rust_start..rust_end),
+        RuneIrLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(response["result"]["runeIr"], direct.rune_ir);
+    assert_eq!(response["result"]["starterRql"], direct.starter_rql);
+    assert_eq!(
+        response["result"]["displayText"],
+        format!(
+            "Rune IR for fresh_name (rust)\n\n{}\nStarter RQL:\n{}\n",
+            direct.rune_ir.trim_end(),
+            direct.starter_rql
+        )
+    );
+
+    let ts_source = "class Widget {\n  value = 1;\n  constructor() {}\n  run() {}\n}\n";
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri_for(&ts_path),
+                "languageId": "typescript",
+                "version": 1,
+                "text": ts_source,
+            }
+        }),
+    );
+    for (line, expected) in [(0, "Widget"), (1, "value"), (2, "constructor"), (3, "run")] {
+        let response = server.request(
+            "bifrost/runeIr",
+            json!({
+                "textDocument": {"uri": uri_for(&ts_path)},
+                "position": {"line": line, "character": 3},
+            }),
+        );
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["codeUnit"], expected, "{response}");
+    }
+
+    let invalid = server.request(
+        "bifrost/runeIr",
+        json!({"textDocument": {"uri": uri_for(&rust_path)}}),
+    );
+    assert!(
+        invalid["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("must provide `position` or `range`")),
+        "{invalid}"
     );
 }
 

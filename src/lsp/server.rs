@@ -58,7 +58,7 @@ use crate::lsp::handlers::util::{
 };
 use crate::lsp::handlers::{
     call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
-    folding_range, formatting, hover, references, rename, semantic_tokens, signature_help,
+    folding_range, formatting, hover, references, rename, rune_ir, semantic_tokens, signature_help,
     type_definition, type_hierarchy, workspace_symbol,
 };
 use crate::lsp::progress::work_done_progress_message;
@@ -693,6 +693,9 @@ fn handle_request(
         QueryHover::METHOD => {
             decode_and_run::<QueryHover, _>(req, |params| Ok(query_hover_request(params)))
         }
+        RuneIrRequest::METHOD => decode_and_run::<RuneIrRequest, _>(req, |params| {
+            rune_ir::handle(&state.workspace, state.project(), params)
+        }),
         CodeActionRequest::METHOD => decode_and_run::<CodeActionRequest, _>(req, |params| {
             Ok(Some(rql_code_actions(state, params)))
         }),
@@ -1761,6 +1764,17 @@ impl lsp_types::request::Request for QueryHover {
     type Result = Option<Hover>;
 
     const METHOD: &'static str = "bifrost/queryHover";
+}
+
+/// Inspect the matcher-visible Rune IR for the smallest indexed declaration
+/// enclosing a cursor or selection in the current overlay.
+enum RuneIrRequest {}
+
+impl lsp_types::request::Request for RuneIrRequest {
+    type Params = rune_ir::RuneIrParams;
+    type Result = rune_ir::RuneIrResponse;
+
+    const METHOD: &'static str = "bifrost/runeIr";
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
