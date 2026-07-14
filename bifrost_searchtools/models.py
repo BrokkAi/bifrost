@@ -199,6 +199,10 @@ class CodeQueryResultRef:
     end_line: int | None = None
     id: str | None = None
     node_range: CodeQueryRange | None = None
+    range: CodeQueryRange | None = None
+    target_fq_name: str | None = None
+    proof: str | None = None
+    reference_kind: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryResultRef:
@@ -213,6 +217,12 @@ class CodeQueryResultRef:
             node_range=CodeQueryRange.from_dict(data["node_range"])
             if "node_range" in data
             else None,
+            range=CodeQueryRange.from_dict(data["range"])
+            if "range" in data
+            else None,
+            target_fq_name=data.get("target_fq_name"),
+            proof=data.get("proof"),
+            reference_kind=data.get("reference_kind"),
         )
 
 
@@ -220,10 +230,15 @@ class CodeQueryResultRef:
 class CodeQueryProvenanceStep:
     op: str
     result: CodeQueryResultRef
+    via: CodeQueryResultRef | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryProvenanceStep:
-        return cls(op=data["op"], result=CodeQueryResultRef.from_dict(data["result"]))
+        return cls(
+            op=data["op"],
+            result=CodeQueryResultRef.from_dict(data["result"]),
+            via=CodeQueryResultRef.from_dict(data["via"]) if "via" in data else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -370,7 +385,48 @@ class CodeQueryFile:
         return f"{self.path} [file; {self.language}]"
 
 
-CodeQueryResultItem = CodeQueryMatch | CodeQueryDeclaration | CodeQueryFile
+@dataclass(frozen=True)
+class CodeQueryReferenceSite:
+    path: str
+    language: str
+    range: CodeQueryRange
+    target: CodeQueryDeclaration
+    enclosing_declaration: CodeQueryDeclaration | None
+    usage_kind: str
+    proof: str
+    reference_kind: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryReferenceSite:
+        return cls(
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            target=CodeQueryDeclaration.from_dict(data["target"]),
+            enclosing_declaration=CodeQueryDeclaration.from_dict(
+                data["enclosing_declaration"]
+            )
+            if "enclosing_declaration" in data
+            else None,
+            usage_kind=data["usage_kind"],
+            proof=data["proof"],
+            reference_kind=data.get("reference_kind"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[reference; {self.usage_kind}; {self.proof}] -> {self.target.fq_name}"
+        )
+
+
+CodeQueryResultItem = (
+    CodeQueryMatch | CodeQueryDeclaration | CodeQueryFile | CodeQueryReferenceSite
+)
 
 
 def _code_query_result_item(data: dict) -> CodeQueryResultItem:
@@ -381,6 +437,8 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryDeclaration.from_dict(data)
     if result_type == "file":
         return CodeQueryFile.from_dict(data)
+    if result_type == "reference_site":
+        return CodeQueryReferenceSite.from_dict(data)
     raise ValueError(f"unknown code query result_type: {result_type!r}")
 
 

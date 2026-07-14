@@ -904,6 +904,7 @@ fn handle_run_rql_query_request(req: Request, workspace: &WorkspaceAnalyzer) -> 
                     CodeQueryResultValue::StructuralMatch { value } => &value.path,
                     CodeQueryResultValue::Declaration { value } => &value.path,
                     CodeQueryResultValue::File { value } => &value.path,
+                    CodeQueryResultValue::ReferenceSite { value } => &value.path,
                 };
                 RunRqlQueryResultItem {
                     uri: path_to_uri_string(&workspace_root.join(path)),

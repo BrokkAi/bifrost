@@ -13,8 +13,8 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 - [x] (2026-07-14 15:00Z) Confirmed the issue branch is clean and exactly matches current `origin/master` at `9ce0857f` with issues #715 and #716 present.
 - [x] (2026-07-14 15:00Z) Inspected the typed query IR/executor, schema-driven JSON/RQL help, result/provenance models, usage finder, targeted resolvers, inverted edge builders, clients, editor, and executable cookbook harness.
 - [x] (2026-07-14 15:00Z) Created this implementation ExecPlan and fixed the public syntax, domains, result shape, exact-user semantics, language scope, and documentation shape.
-- [ ] Milestone 1: implement the public reference-step IR, schema, parsing, result domain, provenance `via`, and public consumer models.
-- [ ] Milestone 2: expose analyzer-owned structured inbound/outbound reference hits and implement `references_of`, `used_by`, and `uses` across all eleven usage adapters without changing existing usage surfaces.
+- [x] (2026-07-14 17:10Z) Milestone 1: implemented the public reference-step IR, operation-specific schema, JSON/RQL parsing, `reference_site` result domain, provenance `via`, MCP/TextMate vocabulary, CLI/LSP routing, and Python consumer models.
+- [ ] Milestone 2: expose analyzer-owned structured inbound/outbound reference hits and implement `references_of`, `used_by`, and `uses` across all eleven usage adapters without changing existing usage surfaces. The shared all-language resolver path and Java vertical slice are complete; adapter matrix coverage and failure/cancellation hardening remain.
 - [ ] Milestone 3: add the executable cross-language reference-traversal cookbook and update public documentation.
 - [ ] Milestone 4: run focused and complete validation, review the full diff, fix findings, and record the final outcome.
 
@@ -28,6 +28,12 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
 
 - Observation: issue #716 has already made exact member/owner traversal available across every cookbook language.
   Evidence: current `QueryStep` contains hierarchy/member variants and every language tutorial is required by `tests/code_query_tutorials.rs` to execute `supertypes`, `subtypes`, `members`, and `owner`.
+
+- Observation: The existing `get_definition` batch resolver is already a structured, tree-sitter-backed outbound reference resolver for all eleven languages and returns exact reference focus ranges plus exact `CodeUnit` candidates.
+  Evidence: `parse_tree_for_language` dispatches every supported adapter and `resolve_definition_batch_with_source` preserves `Resolved`, `Ambiguous`, unsupported, and unresolved outcomes without source-text guessing.
+
+- Observation: The requested all-feature focused test command currently fails to link the Python extension on this macOS environment because the linker cannot resolve Python symbols. Featureless focused Rust tests link and run successfully, while `cargo check --features nlp,python` succeeds.
+  Evidence: `cargo test --features nlp,python --test code_query_pipelines` reached the dylib link and failed on `_Py*` symbols; the same pipeline tests without features pass.
 
 ## Decision Log
 
@@ -55,9 +61,13 @@ The public operations are `references_of`, `used_by`, and `uses`. JSON and RQL l
   Rationale: A single query vocabulary should not silently vary by language; explicit capability diagnostics cover genuinely unsupported target shapes. Centralized recipes avoid duplicating large exact outputs across every language page.
   Date/Author: 2026-07-14 / user and Codex
 
+- Decision: Implement outbound `uses` by batching the existing structured `get_definition` resolver over named tree-sitter leaf nodes once per file, then filter the cached exact hits by `enclosing_code_unit` identity.
+  Rationale: This reuses the target resolver already maintained for every language, preserves exact `CodeUnit` identity and ambiguity, avoids a second language-specific resolution stack, and satisfies the required one-scan-per-file cache. The legacy graph builders remain unchanged and continue deriving their narrower class/callable edges independently.
+  Date/Author: 2026-07-14 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation has not started. The branch currently contains only this ExecPlan. Update this section after every milestone and at completion with demonstrated behavior, remaining gaps, and validation evidence.
+Milestone 1 is implemented. JSON and RQL now canonicalize configured reference steps; reference sites serialize exact ranges, targets, optional exact enclosing declarations, proof, usage surface kind, and optional classification. Declaration-returning steps retain the exact site under `via`. Java integration tests demonstrate inbound references, inverse `uses`/`used_by`, `file_of` composition, and field-write filtering. The schema and full-feature library compile; broader adapter/documentation coverage remains before completion.
 
 ## Context and Orientation
 

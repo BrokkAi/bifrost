@@ -1,6 +1,7 @@
 use super::super::kinds::{NormalizedKind, Role};
 use super::schema::QueryStepOp;
 use crate::analyzer::Language;
+use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use regex::Regex;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -25,6 +26,7 @@ pub const SCHEMA_VERSION: u64 = 2;
 pub enum QueryValueKind {
     StructuralMatch,
     Declaration,
+    ReferenceSite,
     File,
 }
 
@@ -33,9 +35,17 @@ impl QueryValueKind {
         match self {
             Self::StructuralMatch => "structural_match",
             Self::Declaration => "declaration",
+            Self::ReferenceSite => "reference_site",
             Self::File => "file",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReferenceTraversalFilter {
+    pub reference_kinds: Vec<ReferenceKind>,
+    pub proof: Option<UsageProof>,
+    pub surface: UsageHitSurface,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +65,9 @@ pub enum QueryStep {
     Subtypes(HierarchyTraversal),
     Members,
     Owner,
+    ReferencesOf(ReferenceTraversalFilter),
+    UsedBy(ReferenceTraversalFilter),
+    Uses(ReferenceTraversalFilter),
 }
 
 impl QueryStep {
@@ -72,6 +85,9 @@ impl QueryStep {
             Self::Subtypes(_) => QueryStepOp::Subtypes,
             Self::Members => QueryStepOp::Members,
             Self::Owner => QueryStepOp::Owner,
+            Self::ReferencesOf(_) => QueryStepOp::ReferencesOf,
+            Self::UsedBy(_) => QueryStepOp::UsedBy,
+            Self::Uses(_) => QueryStepOp::Uses,
         }
     }
 
@@ -85,6 +101,11 @@ impl QueryStep {
             QueryStepOp::Subtypes => Some(Self::Subtypes(HierarchyTraversal::Direct)),
             QueryStepOp::Members => Some(Self::Members),
             QueryStepOp::Owner => Some(Self::Owner),
+            QueryStepOp::ReferencesOf => {
+                Some(Self::ReferencesOf(ReferenceTraversalFilter::default()))
+            }
+            QueryStepOp::UsedBy => Some(Self::UsedBy(ReferenceTraversalFilter::default())),
+            QueryStepOp::Uses => Some(Self::Uses(ReferenceTraversalFilter::default())),
         }
     }
 
@@ -93,9 +114,12 @@ impl QueryStep {
             (Self::EnclosingDecl, QueryValueKind::StructuralMatch) => {
                 Some(QueryValueKind::Declaration)
             }
-            (Self::FileOf, QueryValueKind::StructuralMatch | QueryValueKind::Declaration) => {
-                Some(QueryValueKind::File)
-            }
+            (
+                Self::FileOf,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::Declaration
+                | QueryValueKind::ReferenceSite,
+            ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
             }
@@ -103,6 +127,12 @@ impl QueryStep {
                 Self::Supertypes(_) | Self::Subtypes(_) | Self::Members | Self::Owner,
                 QueryValueKind::Declaration,
             ) => Some(QueryValueKind::Declaration),
+            (Self::ReferencesOf(_), QueryValueKind::Declaration) => {
+                Some(QueryValueKind::ReferenceSite)
+            }
+            (Self::UsedBy(_) | Self::Uses(_), QueryValueKind::Declaration) => {
+                Some(QueryValueKind::Declaration)
+            }
             _ => None,
         }
     }
@@ -120,12 +150,13 @@ pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind
     for (index, step) in steps.iter().enumerate() {
         let expected_input = match step {
             QueryStep::EnclosingDecl => "structural_match",
-            QueryStep::FileOf => "structural_match or declaration",
+            QueryStep::FileOf => "structural_match, declaration, or reference_site",
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
             | QueryStep::Subtypes(_)
             | QueryStep::Members
             | QueryStep::Owner => "declaration",
+            QueryStep::ReferencesOf(_) | QueryStep::UsedBy(_) | QueryStep::Uses(_) => "declaration",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(

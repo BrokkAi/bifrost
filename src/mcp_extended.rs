@@ -1,4 +1,6 @@
-use crate::analyzer::structural::query::schema::ALL_QUERY_STEP_OPS;
+use crate::analyzer::structural::query::schema::{
+    ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, reference_kind_label,
+};
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
     MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
@@ -36,7 +38,7 @@ fn query_step_input_variants() -> Vec<Value> {
     let plain = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
-        .filter(|op| !op.allows_hierarchy_options())
+        .filter(|op| !op.allows_hierarchy_options() && !op.allows_reference_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let hierarchy = ALL_QUERY_STEP_OPS
@@ -44,6 +46,17 @@ fn query_step_input_variants() -> Vec<Value> {
         .copied()
         .filter(|op| op.allows_hierarchy_options())
         .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let references = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_reference_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let reference_kinds = ALL_REFERENCE_KINDS
+        .iter()
+        .copied()
+        .map(reference_kind_label)
         .collect::<Vec<_>>();
     vec![
         json!({
@@ -74,6 +87,22 @@ fn query_step_input_variants() -> Vec<Value> {
                 "transitive": { "const": true }
             },
             "required": ["op", "transitive"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": references },
+                "reference_kinds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": reference_kinds }
+                },
+                "proof": { "type": "string", "enum": ["proven", "unproven"] },
+                "surface": { "type": "string", "enum": ["external_usages", "lsp_references"] }
+            },
+            "required": ["op"],
             "additionalProperties": false
         }),
     ]

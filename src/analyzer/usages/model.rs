@@ -48,6 +48,12 @@ pub enum UsageHitSurface {
     LspReferences,
 }
 
+impl Default for UsageHitSurface {
+    fn default() -> Self {
+        Self::ExternalUsages
+    }
+}
+
 impl UsageHitKind {
     pub fn included_in(self, surface: UsageHitSurface) -> bool {
         match surface {
@@ -81,6 +87,9 @@ pub struct UsageHit {
     pub snippet: String,
     pub kind: UsageHitKind,
     pub proof: UsageProof,
+    /// Structured source-reference classification when the analyzer can
+    /// determine it without guessing from source text.
+    pub reference_kind: Option<ReferenceKind>,
 }
 
 impl UsageHit {
@@ -103,6 +112,7 @@ impl UsageHit {
             snippet: snippet.into(),
             kind: UsageHitKind::Reference,
             proof: UsageProof::Proven,
+            reference_kind: None,
         }
     }
 
@@ -140,7 +150,13 @@ impl UsageHit {
             snippet: self.snippet.clone(),
             kind: self.kind,
             proof: self.proof,
+            reference_kind: self.reference_kind,
         }
+    }
+
+    pub fn with_reference_kind(mut self, kind: ReferenceKind) -> Self {
+        self.reference_kind = Some(kind);
+        self
     }
 }
 
@@ -183,9 +199,11 @@ pub struct ReferenceHit {
     pub file: ProjectFile,
     pub range: Range,
     pub enclosing_unit: CodeUnit,
-    pub kind: ReferenceKind,
+    pub kind: Option<ReferenceKind>,
     pub resolved: CodeUnit,
     pub confidence: u32,
+    pub usage_kind: UsageHitKind,
+    pub proof: UsageProof,
 }
 
 impl ReferenceHit {

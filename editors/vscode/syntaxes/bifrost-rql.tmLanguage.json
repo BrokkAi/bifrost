@@ -42,7 +42,7 @@
     },
     {
       "name": "variable.parameter.role.bifrost-rql",
-      "match": ":(?:args|callee|capture|decorators|depth|field|has|kwargs|left|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|receiver|right|text/regex|transitive)(?=$|[\\s()\\[\\]])"
+      "match": ":(?:args|callee|capture|decorators|depth|field|has|kwargs|left|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|proof|receiver|reference-kinds|right|surface|text/regex|transitive)(?=$|[\\s()\\[\\]])"
     },
     {
       "name": "entity.name.type.kind.bifrost-rql",
@@ -50,7 +50,7 @@
     },
     {
       "name": "support.function.wrapper.bifrost-rql",
-      "match": "\\b(?:enclosing-decl|file-of|importers-of|imports-of|inside|language|languages|limit|members|not-inside|owner|result-detail|subtypes|supertypes|where)\\b"
+      "match": "\\b(?:enclosing-decl|file-of|importers-of|imports-of|inside|language|languages|limit|members|not-inside|owner|references-of|result-detail|subtypes|supertypes|used-by|uses|where)\\b"
     },
     {
       "name": "support.function.predicate.bifrost-rql",

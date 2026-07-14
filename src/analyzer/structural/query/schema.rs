@@ -6,6 +6,8 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
+use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
     Query,
@@ -24,6 +26,9 @@ pub enum ValueShape {
     ResultDetail,
     SchemaVersion,
     TrueBoolean,
+    ReferenceKindList,
+    UsageProof,
+    UsageSurface,
 }
 
 impl ValueShape {
@@ -45,6 +50,9 @@ impl ValueShape {
             Self::ResultDetail => "compact or full",
             Self::SchemaVersion => "schema version 2",
             Self::TrueBoolean => "the boolean true",
+            Self::ReferenceKindList => "one or more structured reference kinds",
+            Self::UsageProof => "proven or unproven",
+            Self::UsageSurface => "external_usages or lsp_references",
         }
     }
 }
@@ -99,6 +107,10 @@ macro_rules! query_step_ops {
             pub fn allows_hierarchy_options(self) -> bool {
                 matches!(self, Self::Supertypes | Self::Subtypes)
             }
+
+            pub fn allows_reference_options(self) -> bool {
+                matches!(self, Self::ReferencesOf | Self::UsedBy | Self::Uses)
+            }
         }
     };
 }
@@ -112,6 +124,9 @@ query_step_ops! {
     Subtypes { label: "subtypes", signature: "declaration -> declaration", description: "Traverse indexed subtypes from supported type declarations." }
     Members { label: "members", signature: "declaration -> declaration", description: "Return direct indexed members of type declarations." }
     Owner { label: "owner", signature: "declaration -> declaration", description: "Return the exact indexed declaring type of member declarations." }
+    ReferencesOf { label: "references_of", signature: "declaration -> reference_site", description: "Return resolved source reference sites for exact indexed declarations." }
+    UsedBy { label: "used_by", signature: "declaration -> declaration", description: "Return exact declarations containing references to each input declaration." }
+    Uses { label: "uses", signature: "declaration -> declaration", description: "Return exact declarations referenced by each input declaration." }
 }
 
 macro_rules! rql_forms {
@@ -195,7 +210,10 @@ macro_rules! rql_forms {
                     | Self::Supertypes
                     | Self::Subtypes
                     | Self::Members
-                    | Self::Owner => None,
+                    | Self::Owner
+                    | Self::ReferencesOf
+                    | Self::UsedBy
+                    | Self::Uses => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -307,6 +325,27 @@ rql_forms! {
         shape: Query,
         signature: "(owner query)",
         description: "Return the exact indexed declaring type of each input member.",
+    }
+    ReferencesOf {
+        labels: ["references-of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(references-of [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
+        description: "Return exact resolved reference sites for each input declaration.",
+    }
+    UsedBy {
+        labels: ["used-by"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(used-by [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
+        description: "Return exact declarations containing references to each input declaration.",
+    }
+    Uses {
+        labels: ["uses"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(uses [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
+        description: "Return exact indexed declarations referenced by each input declaration.",
     }
     Name {
         labels: ["name"],
@@ -532,6 +571,70 @@ json_fields! {
     Op { label: "op", shape: String, signature: "\"op\": \"step_name\"", description: "Select the typed pipeline transformation." }
     Depth { label: "depth", shape: PositiveInteger, signature: "\"depth\": positive integer", description: "Traverse all hierarchy edges from distance one through this depth." }
     Transitive { label: "transitive", shape: TrueBoolean, signature: "\"transitive\": true", description: "Traverse the complete indexed hierarchy under the execution budget." }
+    ReferenceKinds { label: "reference_kinds", shape: ReferenceKindList, signature: "\"reference_kinds\": [\"field_write\", ...]", description: "Restrict traversal to structured source-reference kinds." }
+    Proof { label: "proof", shape: UsageProof, signature: "\"proof\": \"proven\" | \"unproven\"", description: "Restrict traversal to one usage-proof tier." }
+    Surface { label: "surface", shape: UsageSurface, signature: "\"surface\": \"external_usages\" | \"lsp_references\"", description: "Choose the external-usage or editor-visible reference surface." }
+}
+
+pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[
+    ReferenceKind::MethodCall,
+    ReferenceKind::ConstructorCall,
+    ReferenceKind::FieldRead,
+    ReferenceKind::FieldWrite,
+    ReferenceKind::TypeReference,
+    ReferenceKind::StaticReference,
+    ReferenceKind::SuperCall,
+    ReferenceKind::Inheritance,
+];
+
+pub fn reference_kind_label(kind: ReferenceKind) -> &'static str {
+    match kind {
+        ReferenceKind::MethodCall => "method_call",
+        ReferenceKind::ConstructorCall => "constructor_call",
+        ReferenceKind::FieldRead => "field_read",
+        ReferenceKind::FieldWrite => "field_write",
+        ReferenceKind::TypeReference => "type_reference",
+        ReferenceKind::StaticReference => "static_reference",
+        ReferenceKind::SuperCall => "super_call",
+        ReferenceKind::Inheritance => "inheritance",
+    }
+}
+
+pub fn reference_kind_from_label(label: &str) -> Option<ReferenceKind> {
+    ALL_REFERENCE_KINDS
+        .iter()
+        .copied()
+        .find(|kind| reference_kind_label(*kind) == label)
+}
+
+pub fn usage_proof_label(proof: UsageProof) -> &'static str {
+    match proof {
+        UsageProof::Proven => "proven",
+        UsageProof::Unproven => "unproven",
+    }
+}
+
+pub fn usage_proof_from_label(label: &str) -> Option<UsageProof> {
+    match label {
+        "proven" => Some(UsageProof::Proven),
+        "unproven" => Some(UsageProof::Unproven),
+        _ => None,
+    }
+}
+
+pub fn usage_surface_label(surface: UsageHitSurface) -> &'static str {
+    match surface {
+        UsageHitSurface::ExternalUsages => "external_usages",
+        UsageHitSurface::LspReferences => "lsp_references",
+    }
+}
+
+pub fn usage_surface_from_label(label: &str) -> Option<UsageHitSurface> {
+    match label {
+        "external_usages" => Some(UsageHitSurface::ExternalUsages),
+        "lsp_references" => Some(UsageHitSurface::LspReferences),
+        _ => None,
+    }
 }
 
 json_fields! {

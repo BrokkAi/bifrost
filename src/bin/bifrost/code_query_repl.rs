@@ -617,6 +617,19 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.language
                     ));
                 }
+                CodeQueryResultValue::ReferenceSite { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let target = sanitize_terminal_text(&value.target.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "reference:", use_color),
+                        paint(Style::new().bold(), &target, use_color),
+                        value.proof
+                    ));
+                }
             }
             if !result.provenance.is_empty() {
                 out.push_str(&format!(

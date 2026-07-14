@@ -37,6 +37,144 @@ fn result_fq_names(value: &Value) -> Vec<String> {
 }
 
 #[test]
+fn java_reference_steps_preserve_exact_site_and_semantic_owner() {
+    let files = [
+        ("Target.java", "class Target { int status; }\n"),
+        (
+            "User.java",
+            "class User { int read(Target target) { return target.status; } }\n",
+        ),
+    ];
+    let references = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "references_of" }
+            ],
+            "result_detail": "full"
+        }),
+    ));
+    assert_eq!(
+        references["results"].as_array().unwrap().len(),
+        1,
+        "{references}"
+    );
+    let site = &references["results"][0];
+    assert_eq!(site["result_type"], "reference_site", "{references}");
+    assert_eq!(site["path"], "User.java", "{references}");
+    assert_eq!(site["target"]["fq_name"], "Target.status", "{references}");
+    assert_eq!(
+        site["enclosing_declaration"]["fq_name"], "User.read",
+        "{references}"
+    );
+    assert_eq!(site["proof"], "proven", "{references}");
+    assert!(
+        site["range"]["start_column"].as_u64().unwrap() > 0,
+        "{references}"
+    );
+
+    let used_by = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "used_by" }
+            ]
+        }),
+    ));
+    assert_eq!(result_fq_names(&used_by), vec!["User.read"], "{used_by}");
+    assert_eq!(
+        used_by["results"][0]["provenance"][0]["steps"][2]["via"]["result_type"], "reference_site",
+        "{used_by}"
+    );
+}
+
+#[test]
+fn java_uses_is_inverse_of_used_by_and_reference_file_composes() {
+    let files = [
+        ("Target.java", "class Target { int status; }\n"),
+        (
+            "User.java",
+            "class User { int read(Target target) { return target.status; } }\n",
+        ),
+    ];
+    let uses = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "method", "name": "read" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "uses" }
+            ]
+        }),
+    ));
+    assert!(
+        result_fq_names(&uses)
+            .iter()
+            .any(|name| name == "Target.status"),
+        "{uses}"
+    );
+    let status = uses["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["fq_name"] == "Target.status")
+        .expect("status dependency");
+    assert_eq!(
+        status["provenance"][0]["steps"][1]["via"]["target_fq_name"], "Target.status",
+        "{uses}"
+    );
+
+    let files_result = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "references_of" },
+                { "op": "file_of" }
+            ]
+        }),
+    ));
+    assert_eq!(
+        files_result["results"][0]["path"], "User.java",
+        "{files_result}"
+    );
+}
+
+#[test]
+fn java_reference_kind_filter_distinguishes_field_writes() {
+    let result = serialized(&run(
+        &[
+            ("Target.java", "class Target { int status; }\n"),
+            (
+                "User.java",
+                "class User { int update(Target target) { target.status = 1; return target.status; } }\n",
+            ),
+        ],
+        json!({
+            "match": { "kind": "class", "name": "Target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "references_of", "reference_kinds": ["field_write"] }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(
+        result["results"][0]["reference_kind"], "field_write",
+        "{result}"
+    );
+}
+
+#[test]
 fn enclosing_decl_is_inclusive_and_excludes_file_scope() {
     let files = [(
         "app.py",

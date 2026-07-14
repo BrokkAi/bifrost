@@ -7,15 +7,24 @@
 //! diagnostics.
 
 use super::facts::{FileFacts, Span};
-use super::kinds::Role;
+use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
-use super::query::{CodeQuery, CodeQueryResultDetail, HierarchyTraversal, QueryStep};
+use super::query::{
+    CodeQuery, CodeQueryResultDetail, HierarchyTraversal, QueryStep, ReferenceTraversalFilter,
+};
 use crate::analyzer::structural::capabilities::QueryFeature;
+use crate::analyzer::usages::get_definition::{
+    DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
+    resolve_definition_batch_with_source,
+};
+use crate::analyzer::usages::{
+    FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind, UsageProof,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
-use crate::text_utils::{compute_line_starts, line_column_for_offset};
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset, line_column_for_offset};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -63,6 +72,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: CodeQueryFile,
     },
+    ReferenceSite {
+        #[serde(flatten)]
+        value: CodeQueryReferenceSite,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +122,20 @@ pub struct CodeQueryFile {
     pub language: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryReferenceSite {
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub target: CodeQueryDeclaration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_declaration: Option<CodeQueryDeclaration>,
+    pub usage_kind: &'static str,
+    pub proof: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_kind: Option<&'static str>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CodeQueryProvenance {
     pub seed: CodeQueryResultRef,
@@ -119,6 +146,8 @@ pub struct CodeQueryProvenance {
 pub struct CodeQueryProvenanceStep {
     pub op: &'static str,
     pub result: CodeQueryResultRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<CodeQueryResultRef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,6 +177,14 @@ pub enum CodeQueryResultRef {
     File {
         path: String,
     },
+    ReferenceSite {
+        path: String,
+        range: CodeQueryRange,
+        target_fq_name: String,
+        proof: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference_kind: Option<&'static str>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,7 +198,7 @@ pub struct CodeQueryCapture {
     pub kind: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct CodeQueryRange {
     pub start_line: usize,
     pub start_column: usize,
@@ -191,6 +228,17 @@ struct SeedMatch {
 struct DeclarationValue {
     unit: CodeUnit,
     range: Range,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReferenceSiteValue {
+    file: ProjectFile,
+    range: Range,
+    target: DeclarationValue,
+    enclosing: Option<DeclarationValue>,
+    usage_kind: UsageHitKind,
+    proof: UsageProof,
+    reference_kind: Option<ReferenceKind>,
 }
 
 #[derive(Default)]
@@ -296,6 +344,7 @@ fn primary_range_key(range: &Range) -> (usize, usize, usize, usize) {
 struct PipelineExpansion {
     value: PipelineValue,
     trace_values: Vec<PipelineTraceValue>,
+    via: Option<ReferenceSiteValue>,
     budgeted: bool,
 }
 
@@ -304,6 +353,7 @@ enum PipelineValue {
     StructuralMatch(Arc<SeedMatch>),
     Declaration(DeclarationValue),
     File(ProjectFile),
+    ReferenceSite(ReferenceSiteValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -311,6 +361,7 @@ enum PipelineKey {
     StructuralMatch(ProjectFile, u32),
     Declaration(DeclarationValue),
     File(ProjectFile),
+    ReferenceSite(ReferenceSiteValue),
 }
 
 impl PipelineValue {
@@ -321,6 +372,7 @@ impl PipelineValue {
             }
             Self::Declaration(declaration) => PipelineKey::Declaration(declaration.clone()),
             Self::File(file) => PipelineKey::File(file.clone()),
+            Self::ReferenceSite(site) => PipelineKey::ReferenceSite(site.clone()),
         }
     }
 }
@@ -335,12 +387,21 @@ struct PipelineTrace {
 struct PipelineTraceStep {
     op: QueryStep,
     value: PipelineTraceValue,
+    via: Option<ReferenceSiteValue>,
 }
 
 #[derive(Debug, Clone)]
 enum PipelineTraceValue {
     Declaration(DeclarationValue),
     File(ProjectFile),
+    ReferenceSite(ReferenceSiteValue),
+}
+
+#[derive(Default)]
+struct ReferenceTraversalCache {
+    inbound: HashMap<CodeUnit, Vec<ReferenceHit>>,
+    outbound: HashMap<ProjectFile, Vec<ReferenceHit>>,
+    reported_inbound: HashSet<CodeUnit>,
 }
 
 #[derive(Debug)]
@@ -680,6 +741,7 @@ pub fn execute_with_limits(
     budget.pipeline_rows = rows.len();
 
     let mut indexed_declarations = None;
+    let mut reference_cache = ReferenceTraversalCache::default();
 
     let mut import_graph = None;
     let mut import_graph_budget_diagnostic_emitted = false;
@@ -692,6 +754,9 @@ pub fn execute_with_limits(
                     | QueryStep::Subtypes(_)
                     | QueryStep::Members
                     | QueryStep::Owner
+                    | QueryStep::ReferencesOf(_)
+                    | QueryStep::UsedBy(_)
+                    | QueryStep::Uses(_)
             )
         {
             indexed_declarations = Some(IndexedDeclarations::default());
@@ -710,7 +775,9 @@ pub fn execute_with_limits(
                     .iter()
                     .filter_map(|row| match &row.value {
                         PipelineValue::File(file) => Some(file.clone()),
-                        PipelineValue::StructuralMatch(_) | PipelineValue::Declaration(_) => None,
+                        PipelineValue::StructuralMatch(_)
+                        | PipelineValue::Declaration(_)
+                        | PipelineValue::ReferenceSite(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -737,6 +804,7 @@ pub fn execute_with_limits(
             rows,
             import_graph.as_ref(),
             indexed_declarations.as_mut(),
+            &mut reference_cache,
             &mut budget,
             limits.max_pipeline_rows,
             &mut diagnostics,
@@ -890,6 +958,7 @@ fn apply_pipeline_step(
     rows: Vec<PipelineRow>,
     import_graph: Option<&DirectImportGraph>,
     indexed_declarations: Option<&mut IndexedDeclarations>,
+    reference_cache: &mut ReferenceTraversalCache,
     budget: &mut CodeQueryExecutionBudget,
     max_pipeline_rows: usize,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -920,6 +989,9 @@ fn apply_pipeline_step(
                 vec![pipeline_expansion(PipelineValue::File(
                     declaration.unit.source().clone(),
                 ))]
+            }
+            (PipelineValue::ReferenceSite(site), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(site.file.clone()))]
             }
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
@@ -1022,6 +1094,37 @@ fn apply_pipeline_step(
                     None => Vec::new(),
                 }
             }
+            (
+                PipelineValue::Declaration(declaration),
+                QueryStep::ReferencesOf(filter) | QueryStep::UsedBy(filter),
+            ) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                inbound_reference_expansions(
+                    analyzer,
+                    declaration,
+                    step,
+                    filter,
+                    indexed,
+                    reference_cache,
+                    diagnostics,
+                    max_pipeline_rows.saturating_sub(budget.pipeline_rows),
+                )
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::Uses(filter)) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                outbound_reference_expansions(
+                    analyzer,
+                    declaration,
+                    filter,
+                    indexed,
+                    reference_cache,
+                    diagnostics,
+                )
+            }
             _ => unreachable!("query step domains are validated before execution"),
         };
 
@@ -1044,6 +1147,7 @@ fn apply_pipeline_step(
                             PipelineTraceStep {
                                 op: step.clone(),
                                 value,
+                                via: expansion.via.clone(),
                             }
                         }));
                     trace
@@ -1103,6 +1207,7 @@ fn pipeline_expansion(value: PipelineValue) -> PipelineExpansion {
     PipelineExpansion {
         value,
         trace_values: vec![trace_value],
+        via: None,
         budgeted: false,
     }
 }
@@ -1111,8 +1216,461 @@ fn budgeted_declaration_expansion(declaration: DeclarationValue) -> PipelineExpa
     PipelineExpansion {
         value: PipelineValue::Declaration(declaration.clone()),
         trace_values: vec![PipelineTraceValue::Declaration(declaration)],
+        via: None,
         budgeted: true,
     }
+}
+
+fn reference_expansion(value: PipelineValue, site: ReferenceSiteValue) -> PipelineExpansion {
+    let trace_value =
+        pipeline_trace_value(&value).expect("reference steps produce a semantic value");
+    PipelineExpansion {
+        value,
+        trace_values: vec![trace_value],
+        via: Some(site),
+        budgeted: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inbound_reference_expansions(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    step: &QueryStep,
+    filter: &ReferenceTraversalFilter,
+    indexed: &mut IndexedDeclarations,
+    cache: &mut ReferenceTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    max_hits: usize,
+) -> Vec<PipelineExpansion> {
+    if !cache.inbound.contains_key(&declaration.unit) {
+        let query = UsageFinder::new().query(
+            analyzer,
+            std::slice::from_ref(&declaration.unit),
+            MAX_SCANNED_FILES,
+            max_hits.max(1),
+        );
+        let mut hits = Vec::new();
+        let report = cache.reported_inbound.insert(declaration.unit.clone());
+        if report && query.candidate_files_truncated {
+            diagnostics.push(CodeQueryDiagnostic {
+                language: crate::analyzer::common::language_for_file(declaration.unit.source())
+                    .config_label(),
+                message: format!(
+                    "references_of candidate files were truncated for {}",
+                    declaration.unit.fq_name()
+                ),
+            });
+        }
+        match query.result {
+            FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+            } => {
+                hits.extend(hits_by_overload.into_values().flatten().map(|hit| {
+                    reference_hit_for_target(
+                        analyzer,
+                        hit,
+                        declaration.unit.clone(),
+                        UsageProof::Proven,
+                    )
+                }));
+                hits.extend(unproven_by_overload.into_values().flatten().map(|hit| {
+                    reference_hit_for_target(
+                        analyzer,
+                        hit,
+                        declaration.unit.clone(),
+                        UsageProof::Unproven,
+                    )
+                }));
+                if report {
+                    let omitted = unproven_total_by_overload
+                        .values()
+                        .sum::<usize>()
+                        .saturating_sub(
+                            hits.iter()
+                                .filter(|hit| hit.proof == UsageProof::Unproven)
+                                .count(),
+                        );
+                    if omitted > 0 {
+                        diagnostics.push(CodeQueryDiagnostic {
+                            language: crate::analyzer::common::language_for_file(
+                                declaration.unit.source(),
+                            )
+                            .config_label(),
+                            message: format!(
+                                "references_of omitted {omitted} unproven reference candidates for {}",
+                                declaration.unit.fq_name()
+                            ),
+                        });
+                    }
+                }
+            }
+            FuzzyResult::Ambiguous {
+                hits_by_overload, ..
+            } => {
+                hits.extend(hits_by_overload.into_values().flatten().map(|hit| {
+                    reference_hit_for_target(
+                        analyzer,
+                        hit,
+                        declaration.unit.clone(),
+                        UsageProof::Unproven,
+                    )
+                }));
+                if report {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        language: crate::analyzer::common::language_for_file(
+                            declaration.unit.source(),
+                        )
+                        .config_label(),
+                        message: format!(
+                            "references_of emitted ambiguous candidates for {} as unproven",
+                            declaration.unit.fq_name()
+                        ),
+                    });
+                }
+            }
+            FuzzyResult::TooManyCallsites {
+                total_callsites,
+                limit,
+                ..
+            } => {
+                if report {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        language: crate::analyzer::common::language_for_file(
+                            declaration.unit.source(),
+                        )
+                        .config_label(),
+                        message: format!(
+                            "references_of found {total_callsites} call sites for {}, exceeding limit {limit}",
+                            declaration.unit.fq_name()
+                        ),
+                    });
+                }
+            }
+            FuzzyResult::Failure { reason, .. } => {
+                if report {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        language: crate::analyzer::common::language_for_file(
+                            declaration.unit.source(),
+                        )
+                        .config_label(),
+                        message: format!(
+                            "references_of does not support {}: {reason}",
+                            declaration.unit.fq_name()
+                        ),
+                    });
+                }
+            }
+        }
+        cache.inbound.insert(declaration.unit.clone(), hits);
+    }
+
+    let mut sites = cache
+        .inbound
+        .get(&declaration.unit)
+        .into_iter()
+        .flatten()
+        .filter(|hit| reference_hit_matches(hit, filter))
+        .filter_map(|hit| reference_site_value(analyzer, hit, declaration.clone(), indexed))
+        .collect::<Vec<_>>();
+    sort_reference_sites(&mut sites);
+    sites.dedup();
+    sites
+        .into_iter()
+        .filter_map(|site| match step {
+            QueryStep::ReferencesOf(_) => Some(reference_expansion(
+                PipelineValue::ReferenceSite(site.clone()),
+                site,
+            )),
+            QueryStep::UsedBy(_) => site
+                .enclosing
+                .clone()
+                .map(|enclosing| reference_expansion(PipelineValue::Declaration(enclosing), site)),
+            _ => unreachable!("inbound helper is only used by inbound reference steps"),
+        })
+        .collect()
+}
+
+fn reference_hit_for_target(
+    analyzer: &dyn IAnalyzer,
+    hit: crate::analyzer::usages::UsageHit,
+    target: CodeUnit,
+    proof: UsageProof,
+) -> ReferenceHit {
+    let kind = hit.reference_kind.or_else(|| {
+        classify_reference_kind(
+            analyzer,
+            &hit.file,
+            hit.start_offset,
+            hit.end_offset,
+            &target,
+        )
+    });
+    ReferenceHit {
+        file: hit.file,
+        range: Range {
+            start_byte: hit.start_offset,
+            end_byte: hit.end_offset,
+            start_line: hit.line,
+            end_line: hit.line,
+        },
+        enclosing_unit: hit.enclosing,
+        kind,
+        resolved: target,
+        confidence: (hit.confidence.clamp(0.0, 1.0) * 1_000_000.0) as u32,
+        usage_kind: hit.kind,
+        proof,
+    }
+}
+
+fn reference_hit_matches(hit: &ReferenceHit, filter: &ReferenceTraversalFilter) -> bool {
+    hit.usage_kind.included_in(filter.surface)
+        && filter.proof.is_none_or(|proof| proof == hit.proof)
+        && (filter.reference_kinds.is_empty()
+            || hit
+                .kind
+                .is_some_and(|kind| filter.reference_kinds.contains(&kind)))
+}
+
+fn reference_site_value(
+    analyzer: &dyn IAnalyzer,
+    hit: &ReferenceHit,
+    target: DeclarationValue,
+    indexed: &mut IndexedDeclarations,
+) -> Option<ReferenceSiteValue> {
+    let enclosing = indexed.get(analyzer, &hit.enclosing_unit);
+    Some(ReferenceSiteValue {
+        file: hit.file.clone(),
+        range: hit.range,
+        target,
+        enclosing,
+        usage_kind: hit.usage_kind,
+        proof: hit.proof,
+        reference_kind: hit.kind,
+    })
+}
+
+fn outbound_reference_expansions(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    filter: &ReferenceTraversalFilter,
+    indexed: &mut IndexedDeclarations,
+    cache: &mut ReferenceTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    if !cache.outbound.contains_key(declaration.unit.source()) {
+        let hits = scan_outbound_reference_hits(analyzer, declaration.unit.source(), diagnostics);
+        cache
+            .outbound
+            .insert(declaration.unit.source().clone(), hits);
+    }
+    let mut sites = cache
+        .outbound
+        .get(declaration.unit.source())
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit.enclosing_unit == declaration.unit)
+        .filter(|hit| reference_hit_matches(hit, filter))
+        .filter_map(|hit| {
+            let target = indexed.get(analyzer, &hit.resolved)?;
+            reference_site_value(analyzer, hit, target, indexed)
+        })
+        .collect::<Vec<_>>();
+    sort_reference_sites(&mut sites);
+    sites.dedup();
+    sites
+        .into_iter()
+        .map(|site| reference_expansion(PipelineValue::Declaration(site.target.clone()), site))
+        .collect()
+}
+
+fn scan_outbound_reference_hits(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<ReferenceHit> {
+    let language = crate::analyzer::common::language_for_file(file);
+    let Ok(source) = file.read_to_string() else {
+        return Vec::new();
+    };
+    let source = Arc::new(source);
+    let Some(tree) = parse_tree_for_language(file, language, &source) else {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!("uses does not support parsing {}", rel_path_string(file)),
+        });
+        return Vec::new();
+    };
+    let mut nodes = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        if children.is_empty() && node.is_named() && node.start_byte() < node.end_byte() {
+            nodes.push((node.start_byte(), node.end_byte()));
+        } else {
+            stack.extend(children.into_iter().rev());
+        }
+    }
+    const MAX_OUTBOUND_SITES_PER_FILE: usize = 50_000;
+    if nodes.len() > MAX_OUTBOUND_SITES_PER_FILE {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!(
+                "uses omitted {} candidate reference sites in {} after reaching the per-file limit of {MAX_OUTBOUND_SITES_PER_FILE}",
+                nodes.len() - MAX_OUTBOUND_SITES_PER_FILE,
+                rel_path_string(file)
+            ),
+        });
+        nodes.truncate(MAX_OUTBOUND_SITES_PER_FILE);
+    }
+    let requests = nodes
+        .into_iter()
+        .map(|(start_byte, end_byte)| DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start_byte),
+            end_byte: Some(end_byte),
+        })
+        .collect();
+    let outcomes =
+        resolve_definition_batch_with_source(analyzer, requests, file.clone(), Arc::clone(&source));
+    let line_starts = compute_line_starts(&source);
+    let mut hits = Vec::new();
+    let mut ambiguous = 0usize;
+    for outcome in outcomes {
+        let proof = match outcome.status {
+            DefinitionLookupStatus::Resolved => UsageProof::Proven,
+            DefinitionLookupStatus::Ambiguous => {
+                ambiguous += 1;
+                UsageProof::Unproven
+            }
+            _ => continue,
+        };
+        let Some(reference) = outcome.reference else {
+            continue;
+        };
+        let range = Range {
+            start_byte: reference.focus_start_byte,
+            end_byte: reference.focus_end_byte,
+            start_line: find_line_index_for_offset(&line_starts, reference.focus_start_byte) + 1,
+            end_line: find_line_index_for_offset(
+                &line_starts,
+                reference.focus_end_byte.saturating_sub(1),
+            ) + 1,
+        };
+        let Some(enclosing_unit) = analyzer.enclosing_code_unit(file, &range) else {
+            continue;
+        };
+        hits.extend(outcome.definitions.into_iter().map(|resolved| {
+            let kind = classify_reference_kind(
+                analyzer,
+                file,
+                range.start_byte,
+                range.end_byte,
+                &resolved,
+            );
+            ReferenceHit {
+                file: file.clone(),
+                range,
+                enclosing_unit: enclosing_unit.clone(),
+                kind,
+                resolved,
+                confidence: if proof == UsageProof::Proven {
+                    1_000_000
+                } else {
+                    500_000
+                },
+                usage_kind: UsageHitKind::Reference,
+                proof,
+            }
+        }));
+    }
+    if ambiguous > 0 {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!(
+                "uses emitted {ambiguous} ambiguous reference site{} in {} as unproven",
+                if ambiguous == 1 { "" } else { "s" },
+                rel_path_string(file)
+            ),
+        });
+    }
+    hits
+}
+
+fn sort_reference_sites(sites: &mut [ReferenceSiteValue]) {
+    sites.sort_by(|left, right| {
+        rel_path_string(&left.file)
+            .cmp(&rel_path_string(&right.file))
+            .then_with(|| primary_range_key(&left.range).cmp(&primary_range_key(&right.range)))
+            .then_with(|| left.target.unit.cmp(&right.target.unit))
+            .then_with(|| {
+                left.enclosing
+                    .as_ref()
+                    .map(|value| &value.unit)
+                    .cmp(&right.enclosing.as_ref().map(|value| &value.unit))
+            })
+    });
+}
+
+fn classify_reference_kind(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    start_byte: usize,
+    end_byte: usize,
+    target: &CodeUnit,
+) -> Option<ReferenceKind> {
+    let language = crate::analyzer::common::language_for_file(file);
+    let facts = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)?
+        .structural_facts(file)?;
+    let covers = |span: Span| span.start_byte <= start_byte && end_byte <= span.end_byte;
+    let mut candidates = facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.name.is_some_and(covers)
+                && matches!(
+                    node.kind,
+                    NormalizedKind::Call | NormalizedKind::FieldAccess
+                )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, node)| node.range.end_byte - node.range.start_byte);
+    if let Some((id, node)) = candidates.first().copied() {
+        if node.kind == NormalizedKind::Call {
+            return Some(
+                if target.is_class() || target.kind().display_lowercase() == "constructor" {
+                    ReferenceKind::ConstructorCall
+                } else {
+                    ReferenceKind::MethodCall
+                },
+            );
+        }
+        let mut parent = Some(id as u32);
+        while let Some(current) = parent {
+            let fact = facts.node(current);
+            if fact.kind == NormalizedKind::Assignment {
+                return Some(
+                    if fact.role_targets(Role::Left).any(|role| covers(role.span)) {
+                        ReferenceKind::FieldWrite
+                    } else {
+                        ReferenceKind::FieldRead
+                    },
+                );
+            }
+            parent = fact.parent;
+        }
+        return Some(ReferenceKind::FieldRead);
+    }
+    target.is_class().then_some(ReferenceKind::TypeReference)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1202,6 +1760,7 @@ fn expand_hierarchy(
             expansions.push(PipelineExpansion {
                 value: PipelineValue::Declaration(value),
                 trace_values: hierarchy_trace_values(&paths, path_tail, next_depth),
+                via: None,
                 budgeted: true,
             });
 
@@ -1348,6 +1907,7 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
             Some(PipelineTraceValue::Declaration(declaration.clone()))
         }
         PipelineValue::File(file) => Some(PipelineTraceValue::File(file.clone())),
+        PipelineValue::ReferenceSite(site) => Some(PipelineTraceValue::ReferenceSite(site.clone())),
     }
 }
 
@@ -1408,6 +1968,9 @@ fn render_pipeline_item(
         PipelineValue::File(file) => CodeQueryResultValue::File {
             value: render_file(&file),
         },
+        PipelineValue::ReferenceSite(site) => CodeQueryResultValue::ReferenceSite {
+            value: render_reference_site(analyzer, &site, detail, cache),
+        },
     };
     CodeQueryResultItem {
         value,
@@ -1434,7 +1997,17 @@ fn render_provenance(
                         render_declaration_ref(analyzer, declaration, detail, cache)
                     }
                     PipelineTraceValue::File(file) => render_file_ref(file),
+                    PipelineTraceValue::ReferenceSite(site) => {
+                        render_reference_site_ref(analyzer, site, cache)
+                    }
                 },
+                via: matches!(step.op, QueryStep::UsedBy(_) | QueryStep::Uses(_))
+                    .then(|| {
+                        step.via
+                            .as_ref()
+                            .map(|site| render_reference_site_ref(analyzer, site, cache))
+                    })
+                    .flatten(),
             })
             .collect(),
     }
@@ -1483,6 +2056,20 @@ fn render_file_ref(file: &ProjectFile) -> CodeQueryResultRef {
     }
 }
 
+fn render_reference_site_ref(
+    analyzer: &dyn IAnalyzer,
+    site: &ReferenceSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    CodeQueryResultRef::ReferenceSite {
+        path: rel_path_string(&site.file),
+        range: render_reference_range(analyzer, site, cache),
+        target_fq_name: site.target.unit.fq_name(),
+        proof: usage_proof_label(site.proof),
+        reference_kind: site.reference_kind.map(reference_kind_label),
+    }
+}
+
 fn render_declaration(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
@@ -1518,6 +2105,79 @@ fn render_file(file: &ProjectFile) -> CodeQueryFile {
     CodeQueryFile {
         path: rel_path_string(file),
         language: crate::analyzer::common::language_for_file(file).config_label(),
+    }
+}
+
+fn render_reference_site(
+    analyzer: &dyn IAnalyzer,
+    site: &ReferenceSiteValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReferenceSite {
+    CodeQueryReferenceSite {
+        path: rel_path_string(&site.file),
+        language: crate::analyzer::common::language_for_file(&site.file).config_label(),
+        range: render_reference_range(analyzer, site, cache),
+        target: render_declaration(analyzer, &site.target, detail, cache),
+        enclosing_declaration: site
+            .enclosing
+            .as_ref()
+            .map(|declaration| render_declaration(analyzer, declaration, detail, cache)),
+        usage_kind: usage_kind_label(site.usage_kind),
+        proof: usage_proof_label(site.proof),
+        reference_kind: site.reference_kind.map(reference_kind_label),
+    }
+}
+
+fn render_reference_range(
+    _analyzer: &dyn IAnalyzer,
+    site: &ReferenceSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryRange {
+    cache
+        .coordinates_for(&site.file, || site.file.read_to_string().ok())
+        .map(|coordinates| {
+            range_for_offsets(
+                &coordinates.source,
+                &coordinates.line_starts,
+                site.range.start_byte,
+                site.range.end_byte,
+            )
+        })
+        .unwrap_or(CodeQueryRange {
+            start_line: site.range.start_line,
+            start_column: 1,
+            end_line: site.range.end_line,
+            end_column: 1,
+        })
+}
+
+fn usage_kind_label(kind: UsageHitKind) -> &'static str {
+    match kind {
+        UsageHitKind::Reference => "reference",
+        UsageHitKind::Import => "import",
+        UsageHitKind::SelfReceiver => "self_receiver",
+        UsageHitKind::OverrideDeclaration => "override_declaration",
+    }
+}
+
+fn usage_proof_label(proof: UsageProof) -> &'static str {
+    match proof {
+        UsageProof::Proven => "proven",
+        UsageProof::Unproven => "unproven",
+    }
+}
+
+fn reference_kind_label(kind: ReferenceKind) -> &'static str {
+    match kind {
+        ReferenceKind::MethodCall => "method_call",
+        ReferenceKind::ConstructorCall => "constructor_call",
+        ReferenceKind::FieldRead => "field_read",
+        ReferenceKind::FieldWrite => "field_write",
+        ReferenceKind::TypeReference => "type_reference",
+        ReferenceKind::StaticReference => "static_reference",
+        ReferenceKind::SuperCall => "super_call",
+        ReferenceKind::Inheritance => "inheritance",
     }
 }
 
@@ -1742,9 +2402,9 @@ impl CodeQueryResult {
             .iter()
             .filter_map(|result| match &result.value {
                 CodeQueryResultValue::StructuralMatch { value } => Some(value),
-                CodeQueryResultValue::Declaration { .. } | CodeQueryResultValue::File { .. } => {
-                    None
-                }
+                CodeQueryResultValue::Declaration { .. }
+                | CodeQueryResultValue::File { .. }
+                | CodeQueryResultValue::ReferenceSite { .. } => None,
             })
             .collect()
     }
@@ -1800,6 +2460,17 @@ impl CodeQueryResult {
                     }
                     CodeQueryResultValue::File { value } => {
                         out.push_str(&format!("{} [file; {}]\n", value.path, value.language));
+                    }
+                    CodeQueryResultValue::ReferenceSite { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [reference; {}; {}] -> {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.usage_kind,
+                            value.proof,
+                            value.target.fq_name
+                        ));
                     }
                 }
                 if !result.provenance.is_empty() {
