@@ -48,7 +48,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     vec![
         tool_descriptor(
             "query_code",
-            "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports enclosing_decl, file_of, imports_of, and importers_of; import steps traverse direct project-local file edges and can be repeated for multiple hops. Terminal values are tagged structural_match, declaration, or file results with provenance. It does not yet traverse call graphs, resolve arbitrary types or aliases, or perform control-flow or data-flow analysis. Minimal query: {\"match\":{\"kind\":\"call\",\"callee\":{\"name\":\"eval\"}}}. Pipeline example: {\"match\":{\"kind\":\"call\"},\"steps\":[{\"op\":\"file_of\"},{\"op\":\"imports_of\"}]}. Guide: https://brokkai.github.io/bifrost/code-querying/",
+            "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports enclosing_decl, file_of, direct import traversal, type hierarchy traversal, members, and owner. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, or file results with provenance. It does not traverse call graphs or perform control-flow or data-flow analysis. Minimal query: {\"match\":{\"kind\":\"call\",\"callee\":{\"name\":\"eval\"}}}. Pipeline example: {\"match\":{\"kind\":\"class\",\"name\":\"Service\"},\"steps\":[{\"op\":\"enclosing_decl\"},{\"op\":\"subtypes\",\"transitive\":true},{\"op\":\"members\"}]}. Guide: https://brokkai.github.io/bifrost/code-querying/",
             json!({
                 "type": "object",
                 "properties": {
@@ -80,17 +80,40 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "type": "array",
                         "maxItems": MAX_QUERY_STEPS,
                         "items": {
-                            "type": "object",
-                            "properties": {
-                                "op": {
-                                    "type": "string",
-                                    "enum": ["enclosing_decl", "file_of", "imports_of", "importers_of"]
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": { "op": { "type": "string", "enum": ["enclosing_decl", "file_of", "imports_of", "importers_of", "members", "owner"] } },
+                                    "required": ["op"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": { "op": { "type": "string", "enum": ["supertypes", "subtypes"] } },
+                                    "required": ["op"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "type": "string", "enum": ["supertypes", "subtypes"] },
+                                        "depth": { "type": "integer", "minimum": 1 }
+                                    },
+                                    "required": ["op", "depth"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "type": "string", "enum": ["supertypes", "subtypes"] },
+                                        "transitive": { "const": true }
+                                    },
+                                    "required": ["op", "transitive"],
+                                    "additionalProperties": false
                                 }
-                            },
-                            "required": ["op"],
-                            "additionalProperties": false
+                            ]
                         },
-                        "description": "Ordered typed transformations applied after structural matching. enclosing_decl consumes a structural match; file_of consumes a structural match or declaration; import steps consume files."
+                        "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files."
                     },
                     "limit": {
                         "type": "integer",
@@ -392,8 +415,19 @@ mod tests {
         let steps = &query_code["inputSchema"]["properties"]["steps"];
         assert_eq!(steps["maxItems"], MAX_QUERY_STEPS);
         assert_eq!(
-            steps["items"]["properties"]["op"]["enum"],
-            json!(["enclosing_decl", "file_of", "imports_of", "importers_of"])
+            steps["items"]["oneOf"][0]["properties"]["op"]["enum"],
+            json!([
+                "enclosing_decl",
+                "file_of",
+                "imports_of",
+                "importers_of",
+                "members",
+                "owner"
+            ])
+        );
+        assert_eq!(
+            steps["items"]["oneOf"][2]["properties"]["depth"]["minimum"],
+            1
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],

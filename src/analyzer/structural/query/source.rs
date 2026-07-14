@@ -1,9 +1,9 @@
 //! Source-oriented parsing, validation, and help for unsaved RQL documents.
 
 use super::schema::{
-    ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_RQL_FORMS, ALL_RQL_PROPERTIES,
-    ALL_STRING_PREDICATE_FIELDS, PatternField, QueryField, RqlForm, RqlFormClass, RqlProperty,
-    StringPredicateField,
+    ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
+    ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, PatternField, QueryField, QueryStepField,
+    RqlForm, RqlFormClass, RqlProperty, StringPredicateField,
 };
 use super::sexp::query_to_json;
 use super::syntax::{Expr, ExprKind, parse_rql};
@@ -285,9 +285,9 @@ fn result_detail_candidates() -> Vec<SuggestionCandidate> {
 }
 
 fn query_step_candidates() -> Vec<SuggestionCandidate> {
-    QueryStep::ALL
+    ALL_QUERY_STEP_OPS
         .iter()
-        .map(|step| (step.label().to_string(), step.label().to_string()))
+        .map(|op| (op.label().to_string(), op.label().to_string()))
         .collect()
 }
 
@@ -575,7 +575,12 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
                 validate_rql_pattern(&args[0], field, analysis);
             }
         }
-        RqlForm::EnclosingDecl | RqlForm::FileOf | RqlForm::ImportsOf | RqlForm::ImportersOf => {
+        RqlForm::EnclosingDecl
+        | RqlForm::FileOf
+        | RqlForm::ImportsOf
+        | RqlForm::ImportersOf
+        | RqlForm::Members
+        | RqlForm::Owner => {
             if args.len() != 1 {
                 analysis.error(
                     query.range.clone(),
@@ -584,6 +589,52 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
                 );
             }
         }
+        RqlForm::Supertypes | RqlForm::Subtypes => match args {
+            [_query] => {}
+            [key, value, _query] => match key.as_symbol() {
+                Some(":depth") => {
+                    analysis.add_help(
+                        key.range.clone(),
+                        ":depth positive-integer",
+                        QueryStepField::Depth.description(),
+                    );
+                    if !matches!(value.kind, ExprKind::Number(number) if number > 0) {
+                        analysis.error(
+                            value.range.clone(),
+                            "wrong-value-shape",
+                            "hierarchy depth must be a positive integer",
+                        );
+                    }
+                }
+                Some(":transitive") => {
+                    analysis.add_help(
+                        key.range.clone(),
+                        ":transitive true",
+                        QueryStepField::Transitive.description(),
+                    );
+                    if value.as_symbol() != Some("true") {
+                        analysis.error(
+                            value.range.clone(),
+                            "wrong-value-shape",
+                            "hierarchy transitive option must be true",
+                        );
+                    }
+                }
+                _ => analysis.error(
+                    key.range.clone(),
+                    "unknown-property",
+                    "hierarchy traversal accepts only :depth or :transitive",
+                ),
+            },
+            _ => analysis.error(
+                query.range.clone(),
+                "wrong-value-shape",
+                format!(
+                    "{} expects a query, optionally preceded by :depth count or :transitive true",
+                    form.label()
+                ),
+            ),
+        },
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -842,7 +893,8 @@ fn validate_property_value(
         | super::schema::ValueShape::LanguageList
         | super::schema::ValueShape::PositiveInteger
         | super::schema::ValueShape::ResultDetail
-        | super::schema::ValueShape::SchemaVersion => {
+        | super::schema::ValueShape::SchemaVersion
+        | super::schema::ValueShape::TrueBoolean => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
     }
@@ -1796,18 +1848,85 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
             );
             continue;
         };
+        let op_label = object
+            .iter()
+            .find(|(key, _)| key.get_ref() == "op")
+            .and_then(|(_, child)| child.as_string());
+        let hierarchy = matches!(op_label, Some("supertypes" | "subtypes"));
         let mut seen_op = false;
+        let mut seen_depth = false;
+        let mut seen_transitive = false;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
             analysis.path(&child_path, child.range());
-            if key.get_ref() != "op" {
+            let field = QueryStepField::from_label(key.get_ref());
+            if field == Some(QueryStepField::Depth) && hierarchy {
+                analysis.add_help(
+                    key.range(),
+                    QueryStepField::Depth.signature(),
+                    QueryStepField::Depth.description(),
+                );
+                if seen_depth {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'depth'",
+                    );
+                }
+                seen_depth = true;
+                if !matches!(spanned_to_json(child), Value::Number(number) if number.as_u64().is_some_and(|value| value > 0))
+                {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        "hierarchy depth must be a positive integer",
+                    );
+                }
+                continue;
+            }
+            if field == Some(QueryStepField::Transitive) && hierarchy {
+                analysis.add_help(
+                    key.range(),
+                    QueryStepField::Transitive.signature(),
+                    QueryStepField::Transitive.description(),
+                );
+                if seen_transitive {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'transitive'",
+                    );
+                }
+                seen_transitive = true;
+                if spanned_to_json(child) != Value::Bool(true) {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        "hierarchy transitive option must be true",
+                    );
+                }
+                continue;
+            }
+            if field != Some(QueryStepField::Op) {
+                let candidates = ALL_QUERY_STEP_FIELDS
+                    .iter()
+                    .filter(|candidate| {
+                        **candidate == QueryStepField::Op || hierarchy
+                    })
+                    .map(|candidate| {
+                        (
+                            candidate.label().to_string(),
+                            candidate.label().to_string(),
+                        )
+                    })
+                    .collect();
                 add_spelling_error(
                     analysis,
                     key.range(),
                     "unknown-property",
                     format!("unknown query step property '{key}'"),
                     key.get_ref(),
-                    vec![("op".to_string(), "op".to_string())],
+                    candidates,
                     |suggestion| {
                         serde_json::to_string(suggestion).expect("suggestions are JSON strings")
                     },
@@ -1820,8 +1939,8 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
             seen_op = true;
             analysis.add_help(
                 key.range(),
-                "\"op\": \"enclosing_decl\" | \"file_of\" | \"imports_of\" | \"importers_of\"",
-                "Apply one typed query transformation.",
+                QueryStepField::Op.signature(),
+                QueryStepField::Op.description(),
             );
             let Some(label) = child.as_string() else {
                 analysis.error(
@@ -1845,7 +1964,14 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 );
                 continue;
             };
-            analysis.add_help(child.range(), step.label(), query_step_description(step));
+            analysis.add_help(child.range(), step.label(), query_step_description(&step));
+        }
+        if seen_depth && seen_transitive {
+            analysis.error(
+                step.range(),
+                "invalid-query-step",
+                "depth and transitive are mutually exclusive",
+            );
         }
     }
 }
@@ -1866,15 +1992,8 @@ fn json_single_query_step_is_recognizable(value: &spanned::Value) -> bool {
             .is_some_and(|label| QueryStep::from_label(label).is_some())
 }
 
-fn query_step_description(step: QueryStep) -> &'static str {
-    match step {
-        QueryStep::EnclosingDecl => {
-            "Map structural matches to their smallest real enclosing declarations."
-        }
-        QueryStep::FileOf => "Map structural matches or declarations to their workspace files.",
-        QueryStep::ImportsOf => "Traverse one direct project-local import edge forward.",
-        QueryStep::ImportersOf => "Traverse one direct project-local import edge backward.",
-    }
+fn query_step_description(step: &QueryStep) -> &'static str {
+    step.op().description()
 }
 
 fn validate_json_result_detail(value: &spanned::Value, analysis: &mut Analysis) {
@@ -2185,6 +2304,25 @@ mod tests {
         assert_eq!(diagnostic.code, "invalid-query");
         assert_eq!(&invalid[diagnostic.range], r#"{"op":"imports_of"}"#);
         assert!(diagnostic.message.contains("requires file"));
+    }
+
+    #[test]
+    fn hierarchy_step_help_and_option_diagnostics_are_range_precise() {
+        let rql = "(subtypes :depth 2 (enclosing-decl (class)))";
+        for token in ["subtypes", ":depth"] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no hierarchy help for {token}"));
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        let invalid = r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","depth":0}]}"#;
+        let diagnostics = validate_query_source(invalid);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            &invalid[diagnostic.range.clone()] == "0"
+                && diagnostic.message.contains("positive integer")
+        }));
     }
 
     #[test]

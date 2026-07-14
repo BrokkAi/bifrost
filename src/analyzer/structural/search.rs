@@ -574,10 +574,10 @@ pub fn execute_with_limits(
 
     let mut import_graph = None;
     let mut import_graph_budget_diagnostic_emitted = false;
-    for (step_index, &step) in query.steps.iter().enumerate() {
+    for (step_index, step) in query.steps.iter().enumerate() {
         if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
             let graph = import_graph.get_or_insert_with(|| DirectImportGraph::new(analyzer));
-            let graph_exhausted = if step == QueryStep::ImportersOf {
+            let graph_exhausted = if step == &QueryStep::ImportersOf {
                 ensure_complete_import_graph(
                     analyzer,
                     graph,
@@ -764,7 +764,7 @@ fn ensure_forward_import_edges(
 #[allow(clippy::too_many_arguments)]
 fn apply_pipeline_step(
     analyzer: &dyn IAnalyzer,
-    step: QueryStep,
+    step: &QueryStep,
     rows: Vec<PipelineRow>,
     import_graph: Option<&DirectImportGraph>,
     budget: &mut CodeQueryExecutionBudget,
@@ -834,7 +834,7 @@ fn apply_pipeline_step(
                 .cloned()
                 .map(|mut trace| {
                     trace.steps.push(PipelineTraceStep {
-                        op: step,
+                        op: step.clone(),
                         value: trace_value.clone(),
                     });
                     trace
@@ -850,7 +850,7 @@ fn apply_pipeline_step(
         }
     }
 
-    if step == QueryStep::ImportersOf
+    if step == &QueryStep::ImportersOf
         && let Some(graph) = import_graph
     {
         unsupported_languages.extend(

@@ -23,6 +23,7 @@ pub enum ValueShape {
     PositiveInteger,
     ResultDetail,
     SchemaVersion,
+    TrueBoolean,
 }
 
 impl ValueShape {
@@ -43,6 +44,7 @@ impl ValueShape {
             Self::PositiveInteger => "a positive integer",
             Self::ResultDetail => "compact or full",
             Self::SchemaVersion => "schema version 2",
+            Self::TrueBoolean => "the boolean true",
         }
     }
 }
@@ -51,6 +53,61 @@ impl ValueShape {
 pub enum RqlFormClass {
     Wrapper,
     Predicate,
+}
+
+macro_rules! query_step_ops {
+    ($($variant:ident {
+        label: $label:literal,
+        signature: $signature:literal,
+        description: $description:literal $(,)?
+    })+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum QueryStepOp {
+            $($variant,)+
+        }
+
+        pub const ALL_QUERY_STEP_OPS: &[QueryStepOp] = &[
+            $(QueryStepOp::$variant,)+
+        ];
+
+        impl QueryStepOp {
+            pub fn from_label(label: &str) -> Option<Self> {
+                match label {
+                    $($label => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+
+            pub fn signature(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $signature,)+
+                }
+            }
+
+            pub fn description(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $description,)+
+                }
+            }
+        }
+    };
+}
+
+query_step_ops! {
+    EnclosingDecl { label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
+    FileOf { label: "file_of", signature: "structural_match|declaration -> file", description: "Map structural matches or declarations to their workspace files." }
+    ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
+    ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
+    Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
+    Subtypes { label: "subtypes", signature: "declaration -> declaration", description: "Traverse indexed subtypes from supported type declarations." }
+    Members { label: "members", signature: "declaration -> declaration", description: "Return direct indexed members of type declarations." }
+    Owner { label: "owner", signature: "declaration -> declaration", description: "Return the exact indexed declaring type of member declarations." }
 }
 
 macro_rules! rql_forms {
@@ -130,7 +187,11 @@ macro_rules! rql_forms {
                     | Self::EnclosingDecl
                     | Self::FileOf
                     | Self::ImportsOf
-                    | Self::ImportersOf => None,
+                    | Self::ImportersOf
+                    | Self::Supertypes
+                    | Self::Subtypes
+                    | Self::Members
+                    | Self::Owner => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -214,6 +275,34 @@ rql_forms! {
         shape: Query,
         signature: "(importers-of query)",
         description: "Return files that directly import each input file.",
+    }
+    Supertypes {
+        labels: ["supertypes"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(supertypes [:depth count | :transitive true] query)",
+        description: "Return indexed direct, depth-bounded, or transitive supertypes.",
+    }
+    Subtypes {
+        labels: ["subtypes"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(subtypes [:depth count | :transitive true] query)",
+        description: "Return indexed direct, depth-bounded, or transitive subtypes.",
+    }
+    Members {
+        labels: ["members"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(members query)",
+        description: "Return direct indexed member declarations of each input type.",
+    }
+    Owner {
+        labels: ["owner"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(owner query)",
+        description: "Return the exact indexed declaring type of each input member.",
     }
     Name {
         labels: ["name"],
@@ -434,6 +523,14 @@ json_fields! {
 }
 
 json_fields! {
+    QueryStepField,
+    ALL_QUERY_STEP_FIELDS,
+    Op { label: "op", shape: String, signature: "\"op\": \"step_name\"", description: "Select the typed pipeline transformation." }
+    Depth { label: "depth", shape: PositiveInteger, signature: "\"depth\": positive integer", description: "Traverse all hierarchy edges from distance one through this depth." }
+    Transitive { label: "transitive", shape: TrueBoolean, signature: "\"transitive\": true", description: "Traverse the complete indexed hierarchy under the execution budget." }
+}
+
+json_fields! {
     StringPredicateField,
     ALL_STRING_PREDICATE_FIELDS,
     Regex { label: "regex", shape: String, signature: "\"regex\": \"pattern\"", description: "Match the value with a regular expression." }
@@ -468,6 +565,14 @@ mod tests {
             }
         }
 
+        let mut step_ops = HashSet::new();
+        for op in ALL_QUERY_STEP_OPS {
+            assert!(step_ops.insert(op.label()), "duplicate query step op");
+            assert!(!op.signature().is_empty());
+            assert!(!op.description().is_empty());
+            assert_eq!(QueryStepOp::from_label(op.label()), Some(*op));
+        }
+
         let mut properties = HashSet::new();
         for property in ALL_RQL_PROPERTIES {
             assert!(!property.signature().is_empty());
@@ -485,6 +590,11 @@ mod tests {
             assert!(!field.signature().is_empty());
             assert!(!field.description().is_empty());
             assert_eq!(QueryField::from_label(field.label()), Some(*field));
+        }
+        for field in ALL_QUERY_STEP_FIELDS {
+            assert!(!field.signature().is_empty());
+            assert!(!field.description().is_empty());
+            assert_eq!(QueryStepField::from_label(field.label()), Some(*field));
         }
         for field in ALL_PATTERN_FIELDS {
             assert!(!field.signature().is_empty());

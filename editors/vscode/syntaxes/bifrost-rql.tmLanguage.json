@@ -42,7 +42,7 @@
     },
     {
       "name": "variable.parameter.role.bifrost-rql",
-      "match": ":(?:args|callee|capture|decorators|field|has|kwargs|left|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|receiver|right|text/regex)(?=$|[\\s()\\[\\]])"
+      "match": ":(?:args|callee|capture|decorators|depth|field|has|kwargs|left|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|receiver|right|text/regex|transitive)(?=$|[\\s()\\[\\]])"
     },
     {
       "name": "entity.name.type.kind.bifrost-rql",
@@ -50,11 +50,35 @@
     },
     {
       "name": "support.function.wrapper.bifrost-rql",
-      "match": "\\b(?:inside|language|languages|limit|not-inside|result-detail|where)\\b"
+      "match": "\\b(?:enclosing-decl|file-of|importers-of|imports-of|inside|language|languages|limit|members|not-inside|owner|result-detail|subtypes|supertypes|where)\\b"
     },
     {
       "name": "support.function.predicate.bifrost-rql",
       "match": "\\b(?:capture|has|name(?:/regex)?|not[-_]has|not[-_]kind|text/regex)\\b"
+    },
+    {
+      "name": "meta.hierarchy-depth.bifrost-rql",
+      "match": "(:depth\\s+)([0-9]+)(?=\\s)",
+      "captures": {
+        "1": {
+          "name": "variable.parameter.role.bifrost-rql"
+        },
+        "2": {
+          "name": "constant.numeric.integer.decimal.bifrost-rql"
+        }
+      }
+    },
+    {
+      "name": "meta.hierarchy-transitive.bifrost-rql",
+      "match": "(:transitive\\s+)(true)(?=\\s)",
+      "captures": {
+        "1": {
+          "name": "variable.parameter.role.bifrost-rql"
+        },
+        "2": {
+          "name": "constant.language.boolean.true.bifrost-rql"
+        }
+      }
     },
     {
       "name": "meta.limit.bifrost-rql",
