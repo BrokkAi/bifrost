@@ -754,7 +754,13 @@ pub(in crate::analyzer::usages) fn collect_scope_facts_from_parsed_source(
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
     let mut factory_return_types = collect_factory_return_types_from_root(root, source);
     collect_imported_factory_return_types(analyzer, py, file, &mut factory_return_types);
-    collect_scope_facts_with_factory_returns(analyzer, file, target_short, &factory_return_types)
+    collect_scope_facts_with_factory_returns(
+        analyzer,
+        file,
+        target_short,
+        source,
+        &factory_return_types,
+    )
 }
 
 fn collect_imported_factory_return_types(
@@ -860,6 +866,7 @@ fn collect_scope_facts_with_factory_returns(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     target_short: &str,
+    source: &str,
     factory_return_types: &HashMap<String, String>,
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
     let declarations = analyzer.declarations(file);
@@ -869,11 +876,11 @@ fn collect_scope_facts_with_factory_returns(
         .iter()
         .filter(|declaration| declaration.is_class())
     {
-        let Some(source) = analyzer.get_source(declaration, false) else {
+        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
         let facts = collect_scope_facts_from_source(
-            &source,
+            &declaration_source,
             target_short,
             true,
             false,
@@ -891,7 +898,7 @@ fn collect_scope_facts_with_factory_returns(
         .iter()
         .filter(|declaration| declaration.is_function())
     {
-        let Some(source) = analyzer.get_source(declaration, false) else {
+        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
         let owner = declaration
@@ -899,7 +906,7 @@ fn collect_scope_facts_with_factory_returns(
             .rsplit_once('.')
             .map(|(owner, _)| owner);
         let mut facts = collect_scope_facts_from_source(
-            &source,
+            &declaration_source,
             target_short,
             false,
             false,
@@ -919,11 +926,11 @@ fn collect_scope_facts_with_factory_returns(
     // its bindings must be recorded too, otherwise constructed-local receivers
     // used at module scope resolve to no type.
     for declaration in declarations.iter().filter(|d| d.is_module()) {
-        let Some(source) = analyzer.get_source(declaration, false) else {
+        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
         let facts = collect_scope_facts_from_source(
-            &source,
+            &declaration_source,
             target_short,
             false,
             true,
@@ -933,6 +940,20 @@ fn collect_scope_facts_with_factory_returns(
         scope_facts.insert(declaration.clone(), facts);
     }
     scope_facts
+}
+
+fn declaration_source(
+    analyzer: &dyn IAnalyzer,
+    declaration: &CodeUnit,
+    file_source: &str,
+) -> Option<String> {
+    let mut ranges = analyzer.ranges(declaration);
+    ranges.sort_by_key(|range| range.start_byte);
+    let slices = ranges
+        .into_iter()
+        .filter_map(|range| file_source.get(range.start_byte..range.end_byte))
+        .collect::<Vec<_>>();
+    (!slices.is_empty()).then(|| slices.join("\n\n"))
 }
 
 fn collect_scope_facts_from_source(

@@ -64,6 +64,8 @@ resolution work.
 - [x] (2026-07-14) Index the already-collected per-file scope-fact ranges for
   inverse scanning instead of rediscovering the enclosing code unit for every AST
   candidate.
+- [x] (2026-07-14) Build scan-local scope inputs from the parsed file source and
+  persisted declaration ranges instead of generic overload-aware `get_source`.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -194,6 +196,12 @@ resolution work.
   of the relevant per-function facts for that file.
   Evidence: `/private/tmp/bifrost-675-full-acceptance-binder.sample.txt`.
 
+- Observation: Once per-node enclosing lookup was indexed, scope-fact construction
+  became dominant. It called public `get_source` for each concrete class/function;
+  function rendering re-resolved the same FQN to combine overloads, returning to
+  broad short-name candidate hydration and `python_module_name` filesystem work.
+  Evidence: `/private/tmp/bifrost-675-full-acceptance-scope-index.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -304,6 +312,15 @@ resolution work.
   byte plus a prefix maximum end supports nested scopes and fast rejection outside
   any function. The index stores only ranges and `CodeUnit`s for one file scan; it
   retains no source or tree state.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Slice every concrete scope declaration from the scan's existing file
+  source using that declaration's persisted ranges, joining multiple ranges in
+  source order before local inference.
+  Rationale: This preserves overload grouping for a single selected `CodeUnit`
+  without asking public source rendering to rediscover same-FQN definitions. The
+  source is already owned by the per-file graph and no additional source or tree is
+  retained after the scan.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective
