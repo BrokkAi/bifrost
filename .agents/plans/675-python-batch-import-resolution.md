@@ -55,6 +55,9 @@ resolution work.
   from reverting to a primary-key scan.
 - [x] (2026-07-14) Resolve Python module-existence checks directly from path-backed
   module units instead of hydrating broad same-short-name definition candidates.
+- [x] (2026-07-14) Short-circuit the empty-module boundary check exposed by the
+  first full-scale sample, preserving its false result without hydrating every
+  path-derived Python declaration.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -162,6 +165,14 @@ resolution work.
   `.agents/docs/reference-differential/675-python-path-module-fast-smoke.jsonl`
   and `/private/tmp/bifrost-675-path-module-fast.sample.txt`.
 
+- Observation: The first full-limit sample was dominated by one boundary check for
+  an unqualified FQN. `python_crosses_unindexed_boundary` asked whether the empty
+  module existed; because Python declaration qualifiers are path-derived and stored
+  empty, `persisted_package_exists("")` selected and path-hydrated every Python
+  declaration before returning false. The full campaign was stopped before writing
+  a record so this result could be returned directly.
+  Evidence: `/private/tmp/bifrost-675-full-acceptance.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -247,6 +258,13 @@ resolution work.
   dirty files. Both a hit and a miss are therefore answered by the structured
   module projection; broad short-name candidate hydration cannot add a valid module
   result and made export-index construction scale with unrelated declarations.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Treat the empty Python module name as nonexistent before consulting
+  bounded package or FQN lookup.
+  Rationale: `module_code_unit` cannot construct an empty module and the existing
+  hydrated query always returned false. The guard preserves the diagnostic outcome
+  while removing a one-time scan of every persisted Python declaration.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective

@@ -536,6 +536,9 @@ fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn:
 }
 
 fn python_workspace_module_exists(support: &dyn BoundedDefinitionLookup, module: &str) -> bool {
+    if module.is_empty() {
+        return false;
+    }
     support.package_exists(module) || support.fqn_exists(module)
 }
 
