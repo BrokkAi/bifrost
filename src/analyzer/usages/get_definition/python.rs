@@ -290,8 +290,11 @@ impl PythonDefinitionContext {
         raw_type: &str,
         target_self_file: bool,
     ) -> Option<CodeUnit> {
-        debug_assert_eq!(&self.file, file);
         let raw_type = raw_type.trim();
+        if &self.file != file {
+            return self.generic_receiver_type(analyzer, file, raw_type, target_self_file);
+        }
+
         let key = (raw_type.to_string(), target_self_file);
         if let Some(cached) = self
             .receiver_types
@@ -310,13 +313,7 @@ impl PythonDefinitionContext {
 
         let resolved = self
             .receiver_type_for_object(py, support, raw_type)
-            .or_else(|| {
-                #[cfg(test)]
-                self.build_counters
-                    .generic_receiver_type_fallbacks
-                    .fetch_add(1, Ordering::Relaxed);
-                resolve_python_receiver_type(analyzer, file, raw_type, target_self_file)
-            });
+            .or_else(|| self.generic_receiver_type(analyzer, file, raw_type, target_self_file));
 
         let mut cache = self
             .receiver_types
@@ -326,6 +323,20 @@ impl PythonDefinitionContext {
             cache.values.insert(key, resolved.clone());
         }
         resolved
+    }
+
+    fn generic_receiver_type(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        raw_type: &str,
+        target_self_file: bool,
+    ) -> Option<CodeUnit> {
+        #[cfg(test)]
+        self.build_counters
+            .generic_receiver_type_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        resolve_python_receiver_type(analyzer, file, raw_type, target_self_file)
     }
 
     #[cfg(test)]
@@ -345,10 +356,6 @@ impl PythonDefinitionContext {
             .expect("Python receiver type cache mutex poisoned")
             .values
             .len()
-    }
-
-    fn belongs_to(&self, file: &ProjectFile) -> bool {
-        &self.file == file
     }
 
     fn scope_facts(
@@ -672,12 +679,7 @@ fn python_callable_return_type(
 
     if let Some(return_type) = function.child_by_field_name("return_type") {
         let text = python_slice(return_type, &source).trim();
-        let class = if context.belongs_to(file) {
-            context.receiver_type(analyzer, py, support, file, text, true)
-        } else {
-            resolve_python_receiver_type(analyzer, file, text, true)
-        };
-        if let Some(class) = class {
+        if let Some(class) = context.receiver_type(analyzer, py, support, file, text, true) {
             return Some(class);
         }
     }
@@ -700,13 +702,8 @@ fn python_callable_return_type(
                 "identifier" => Some(python_slice(value, &source)),
                 _ => None,
             };
-            let class = name.and_then(|name| {
-                if context.belongs_to(file) {
-                    context.receiver_type(analyzer, py, support, file, name, true)
-                } else {
-                    resolve_python_receiver_type(analyzer, file, name, true)
-                }
-            });
+            let class = name
+                .and_then(|name| context.receiver_type(analyzer, py, support, file, name, true));
             if let Some(class) = class {
                 return Some(class);
             }

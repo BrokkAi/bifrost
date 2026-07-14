@@ -182,6 +182,7 @@ impl PythonAnalyzer {
         file: &ProjectFile,
         state: &FileState,
         module_name: &str,
+        binder: &ImportBinder,
     ) -> ExportIndex {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
@@ -225,7 +226,7 @@ impl PythonAnalyzer {
             ));
         }
 
-        if reexport_order_requires_source(&state.imports, &local_names)
+        if import_order_requires_source(binder, &local_names)
             && let Ok(source) = file.read_to_string()
             && let Some(tree) = parse_python_tree(&source)
         {
@@ -596,20 +597,11 @@ impl PythonAnalyzer {
     }
 }
 
-fn reexport_order_requires_source(imports: &[ImportInfo], local_names: &HashSet<String>) -> bool {
-    imports.iter().any(|import| {
-        let Some(PythonImportDetails::FromImport {
-            name,
-            alias,
-            wildcard: false,
-            ..
-        }) = parse_python_import_details(&import.raw_snippet)
-        else {
-            return false;
-        };
-        let exported_name = alias.as_deref().unwrap_or(&name);
-        !exported_name.starts_with('_') && local_names.contains(exported_name)
-    })
+fn import_order_requires_source(binder: &ImportBinder, local_names: &HashSet<String>) -> bool {
+    binder
+        .bindings
+        .keys()
+        .any(|bound_name| local_names.contains(bound_name))
 }
 
 impl IAnalyzer for PythonAnalyzer {

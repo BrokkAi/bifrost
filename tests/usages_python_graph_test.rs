@@ -767,9 +767,13 @@ def run():
         &candidates,
         1000,
     );
-    let _hits = result
+    let hits = result
         .into_either()
         .expect("graph should retain the imported module's usage seed");
+    assert!(
+        hits.is_empty(),
+        "module seed should resolve completely without inventing a type hit: {hits:#?}"
+    );
 }
 
 #[test]

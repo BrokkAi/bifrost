@@ -90,14 +90,12 @@ impl PythonUsageIndex {
                     .push(file.clone());
 
                 if let Some(state) = file_states.get(file) {
+                    let binder = analyzer.import_binder_from_imports(file, &state.imports);
                     exports_by_file.insert(
                         file.clone(),
-                        analyzer.export_index_from_file_state(file, state, &module_name),
+                        analyzer.export_index_from_file_state(file, state, &module_name, &binder),
                     );
-                    binders_by_file.insert(
-                        file.clone(),
-                        analyzer.import_binder_from_imports(file, &state.imports),
-                    );
+                    binders_by_file.insert(file.clone(), binder);
                 } else {
                     exports_by_file.insert(file.clone(), analyzer.export_index_of(file));
                     binders_by_file.insert(file.clone(), analyzer.import_binder_of(file));

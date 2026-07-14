@@ -72,6 +72,10 @@ resolution work.
 - [x] (2026-07-14) Complete the full 1,000-file / 10,000-site / 1,000-target
   acceptance record after a 228 GiB disk preflight. The final record completed
   in 132.3 seconds with a report identical to the 174.1-second pre-batch run.
+- [x] (2026-07-14) Complete a post-acceptance simplification pass: centralize
+  cross-file receiver fallback in the context resolver, reuse binder keys for
+  import/local ordering collisions, keep deterministic SQL ordering in SQL,
+  strengthen the empty module-result assertion, and remove an unreferenced probe.
 
 ## Surprises & Discoveries
 
@@ -398,6 +402,13 @@ definition and usage tests, and the complete `cargo test --features nlp,python`
 suite. The NLP-sidecar timeout test needed access to the existing host `uv` cache;
 the first temp-storage attempt was also rerun after restoring `/usr/sbin` to `PATH`,
 which made `lsof` available as expected.
+
+The post-acceptance cleanup reduced the follow-up diff while preserving its
+boundaries: every callable return lookup now enters the context resolver, which
+owns the exact-file decision and delegates cross-file cases to the unchanged generic
+resolver; the bulk export path uses the binder it already needs instead of parsing
+import snippets a second time; and the module-seed regression now states that the
+correct outcome is complete with no invented type hit.
 
 ## Context and Orientation
 
