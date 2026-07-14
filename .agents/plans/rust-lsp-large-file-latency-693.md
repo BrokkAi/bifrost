@@ -19,7 +19,7 @@ Rust definition and hover requests should remain interactive after Bifrost finis
 - [x] (2026-07-14 08:10Z) Re-profiled current HEAD against the exact LGTM checkout and isolated a residual open-overlay hotspot after the original export-projection fix.
 - [x] (2026-07-14 08:48Z) Cached overlay content identity for one analyzer query, scoped synchronous analyzer-backed LSP dispatch and the references worker, isolated cloned-project query caches, and added operation-count regressions for nesting, freshness, and snapshots.
 - [x] (2026-07-14 09:20Z) Re-ran the synthetic overlay regression and exact release profile, then passed formatting, all-target/all-feature clippy, focused Rust/LSP coverage, and the feature-complete test suite.
-- [ ] Commit the residual issue #693 implementation, tests, profile evidence, and updated ExecPlan on the current issue branch.
+- [x] (2026-07-14 09:22Z) Committed the residual issue #693 implementation, tests, profile evidence, and updated ExecPlan on the current issue branch as `91ac3a0e`.
 
 ## Surprises & Discoveries
 
@@ -165,3 +165,5 @@ Revision note (2026-07-12 20:02Z): Marked implementation and validation complete
 Revision note (2026-07-14): Reopened the completed plan after profiling current HEAD with a real `didOpen` overlay, recorded the repeated content-hash hotspot, and fixed the follow-up design around request-scoped OID reuse and snapshot cache isolation.
 
 Revision note (2026-07-14 09:20Z): Completed the residual overlay milestone, recorded operation-count and exact-checkout evidence, and documented successful focused, clippy, formatting, and feature-complete validation.
+
+Revision note (2026-07-14 09:22Z): Recorded checkpoint commit `91ac3a0e` and closed the follow-up milestone.
