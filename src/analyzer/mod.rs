@@ -121,3 +121,60 @@ pub use tree_sitter_analyzer::{
 pub use typescript::TypescriptAnalyzer;
 pub(crate) use usage_facts::UsageFactsIndex;
 pub use workspace::{EmptyAnalyzer, WorkspaceAnalyzer};
+
+/// Resolve the parser grammar and normalized structural adapter registered for
+/// a language without constructing a workspace analyzer.
+pub(crate) fn structural_language(
+    language: Language,
+) -> Option<(
+    &'static dyn structural::StructuralSpec,
+    tree_sitter::Language,
+)> {
+    Some(match language {
+        Language::Java => (
+            &java::structural::JAVA_STRUCTURAL_SPEC,
+            tree_sitter_java::LANGUAGE.into(),
+        ),
+        Language::Go => (
+            &go::structural::GO_STRUCTURAL_SPEC,
+            tree_sitter_go::LANGUAGE.into(),
+        ),
+        Language::Cpp => (
+            &cpp::structural::CPP_STRUCTURAL_SPEC,
+            tree_sitter_cpp::LANGUAGE.into(),
+        ),
+        Language::JavaScript => (
+            &js_ts::structural::JAVASCRIPT_STRUCTURAL_SPEC,
+            tree_sitter_javascript::LANGUAGE.into(),
+        ),
+        Language::TypeScript => (
+            &js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ),
+        Language::Python => (
+            &python::structural::PYTHON_STRUCTURAL_SPEC,
+            tree_sitter_python::LANGUAGE.into(),
+        ),
+        Language::Rust => (
+            &rust::structural::RUST_STRUCTURAL_SPEC,
+            tree_sitter_rust::LANGUAGE.into(),
+        ),
+        Language::Php => (
+            &php::structural::PHP_STRUCTURAL_SPEC,
+            tree_sitter_php::LANGUAGE_PHP.into(),
+        ),
+        Language::Scala => (
+            &scala::structural::SCALA_STRUCTURAL_SPEC,
+            tree_sitter_scala::LANGUAGE.into(),
+        ),
+        Language::CSharp => (
+            &csharp::structural::CSHARP_STRUCTURAL_SPEC,
+            tree_sitter_c_sharp::LANGUAGE.into(),
+        ),
+        Language::Ruby => (
+            &ruby::structural::RUBY_STRUCTURAL_SPEC,
+            tree_sitter_ruby::LANGUAGE.into(),
+        ),
+        Language::None => return None,
+    })
+}

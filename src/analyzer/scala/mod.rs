@@ -3,7 +3,7 @@ mod clones;
 mod declarations;
 mod hierarchy;
 pub(crate) mod imports;
-mod structural;
+pub(crate) mod structural;
 mod supertypes;
 mod tests;
 

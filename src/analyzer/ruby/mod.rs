@@ -4,7 +4,7 @@ mod declarations;
 mod hierarchy;
 mod imports;
 mod mixins;
-mod structural;
+pub(crate) mod structural;
 mod tests;
 
 use crate::analyzer::js_ts::build_weighted_cache;

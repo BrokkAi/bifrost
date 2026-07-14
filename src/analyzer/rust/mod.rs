@@ -8,7 +8,7 @@ mod graph_support;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
-mod structural;
+pub(crate) mod structural;
 mod tests;
 mod usage_index;
 

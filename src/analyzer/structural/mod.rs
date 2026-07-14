@@ -29,6 +29,7 @@ pub mod matcher;
 pub mod planner;
 pub mod provider;
 pub mod query;
+pub mod rune_ir;
 pub mod search;
 pub mod spec;
 
@@ -41,6 +42,9 @@ pub use query::{
     MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
     MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind, SCHEMA_VERSION,
     StringPredicate,
+};
+pub use rune_ir::{
+    RenderedRuneIr, RuneIrError, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
 };
 pub use search::{
     CodeQueryCapture, CodeQueryDeclaration, CodeQueryExecutionLimits, CodeQueryFile,

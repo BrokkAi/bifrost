@@ -4,7 +4,7 @@ mod clones;
 mod composer;
 mod declarations;
 mod diagnostics;
-mod structural;
+pub(crate) mod structural;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};

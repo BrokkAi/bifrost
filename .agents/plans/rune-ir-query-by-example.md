@@ -11,7 +11,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 ## Progress
 
 - [x] (2026-07-14 12:00Z) Read issue #733, refreshed the current issue branch, inspected the existing structural facts, query frontend, REPL, LSP overlay, and VS Code extension seams, and selected the public name Rune IR.
-- [ ] Implement and test a bounded, deterministic Rune IR renderer and starter-RQL generator over the existing `FileFacts` arena.
+- [x] (2026-07-14 14:05Z) Implemented and tested a bounded, deterministic Rune IR renderer and starter-RQL generator over the existing `FileFacts` arena; 5 focused library tests pass for Rust, Python, TypeScript, selection, escaping, parseable starters, errors, and all four limits.
 - [ ] Add the index-free multiline `:ir <language>` REPL workflow and behavior-focused Rust, Python, and TypeScript tests.
 - [ ] Add the overlay-aware private LSP request with smallest-enclosing-`CodeUnit` selection and UTF-16 response ranges.
 - [ ] Add the VS Code source-editor command that displays the server-rendered output without interpreting Rune IR in TypeScript.
@@ -23,6 +23,10 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
   Evidence: `docs/src/content/docs/code-querying.md` calls RQL “Rune Query Language,” and `editors/vscode/syntaxes/bifrost-rql.tmLanguage.json` uses the same name. This makes Rune IR a coherent paired name for the source representation that Rune queries inspect, but the docs must still distinguish Rune IR from the query-side `CodeQuery` IR.
 - Observation: The Bifrost code-intelligence skills are installed but their MCP tools are not exposed in this session.
   Evidence: the available tool inventory contained no `search_symbols`, `get_summaries`, `get_symbol_sources`, `scan_usages`, or filename-search endpoint, so repository exploration used bounded `rg` and direct source reads.
+- Observation: The local all-feature Rust link gate cannot resolve PyO3 symbols on this macOS environment.
+  Evidence: `cargo test rune_ir --features nlp,python` compiled the Rune IR code, then failed while linking `libbrokk_bifrost.dylib` with undefined `_Py*` symbols. `cargo test --lib rune_ir` avoids the unrelated optional Python bridge while still parsing Python through the always-available tree-sitter adapter and passes all 5 tests.
+- Observation: `cargo clippy` and `cargo test` are selecting incompatible local Rust compiler identities while sharing `target/` artifacts, even though both report Rust 1.96.0.
+  Evidence: after the focused tests passed, `cargo clippy --lib -- -D warnings` rejected 27 dependency metadata files with E0514 and advised rebuilding them. A later isolated-target clippy run is required; deleting the shared target directory is unnecessary and would discard useful user build artifacts.
 
 ## Decision Log
 
@@ -38,7 +42,7 @@ The observable REPL workflow is `:ir rust`, followed by multiline Rust source an
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. The branch is current and the feature boundary is understood; no runtime behavior has changed yet.
+The first implementation milestone is complete. Callers can now render bounded Rune IR and a validated starter RQL directly from source for every registered structural language without constructing a workspace analyzer. REPL, LSP, editor, and documentation surfaces remain.
 
 ## Context and Orientation
 
@@ -135,3 +139,5 @@ The private LSP method is `bifrost/runeIr`. Its result contains `codeUnit`, `sou
 No new third-party Rust or npm dependency is expected. JSON string escaping should use existing `serde_json`; grammar and structural adapters are already dependencies of the analyzer.
 
 Revision note (2026-07-14): Created the initial self-contained plan after issue and codebase orientation; recorded the Rune IR naming decision and the unavailable Bifrost MCP tooling.
+
+Revision note (2026-07-14 14:05Z): Marked the shared renderer milestone complete and recorded the focused test evidence plus the local PyO3 all-feature linker limitation.
