@@ -22,19 +22,21 @@ use super::extractor::{
     member_access_receiver,
 };
 use super::resolver::{
-    UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name, first_type_child,
-    is_type_reference_node, method_unit_return_type_fq_name, nearest_member_candidates_for_owner,
-    node_text, reference_type_text, resolve_type_fq_name_at,
-    resolve_unqualified_method_group_for_owner, signature_arity,
+    UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
+    extension_visibility_site_key, first_type_child, is_type_reference_node,
+    method_return_type_fq_name_for_arity, nearest_member_candidates_for_owner, node_text,
+    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
+    visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
-    CSharpAnalyzer, CallableArity, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_type_names,
-    csharp_callable_arity, csharp_normalize_full_name,
+    CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
+    csharp_attribute_type_names, csharp_callable_arity, csharp_member_name,
+    csharp_unqualified_invocation_for_name,
 };
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
@@ -60,6 +62,7 @@ where
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 method_group_cache: HashMap::default(),
                 member_cache: HashMap::default(),
+                extension_cache: HashMap::default(),
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -75,9 +78,12 @@ struct CsScan<'a, 'b> {
     source: &'a str,
     class_ranges: ClassRangeIndex,
     method_group_cache: HashMap<(String, String), UnqualifiedMethodGroupResolution>,
-    member_cache: HashMap<(String, String), Vec<CachedMember>>,
+    member_cache: HashMap<(String, String, Option<usize>), Vec<CachedMember>>,
+    extension_cache: HashMap<ExtensionCacheKey, Vec<String>>,
     collector: &'a mut EdgeCollector<'b>,
 }
+
+type ExtensionCacheKey = (String, String, usize, Option<usize>, usize, usize);
 
 struct CachedMember {
     fqn: String,
@@ -123,12 +129,23 @@ impl CsScan<'_, '_> {
         name: &str,
         node: Node<'_>,
         call_arity: Option<usize>,
+        explicit_generic_arity: Option<usize>,
     ) {
-        let key = (owner_fqn.to_string(), name.to_string());
+        let key = (
+            owner_fqn.to_string(),
+            name.to_string(),
+            explicit_generic_arity,
+        );
         if !self.member_cache.contains_key(&key) {
             let candidates = class_unit_for_fq_name(self.csharp, owner_fqn)
                 .map(|owner| {
-                    nearest_member_candidates_for_owner(self.analyzer, self.csharp, &owner, name)
+                    nearest_member_candidates_for_owner(
+                        self.analyzer,
+                        self.csharp,
+                        &owner,
+                        name,
+                        explicit_generic_arity,
+                    )
                 })
                 .unwrap_or_default()
                 .into_iter()
@@ -145,10 +162,6 @@ impl CsScan<'_, '_> {
             .member_cache
             .get(&key)
             .expect("member cache entry was inserted");
-        if candidates.is_empty() {
-            self.record(format!("{owner_fqn}.{name}"), node);
-            return;
-        }
         let callees = candidates
             .iter()
             .filter(|candidate| {
@@ -160,8 +173,65 @@ impl CsScan<'_, '_> {
             })
             .map(|candidate| candidate.fqn.clone())
             .collect::<Vec<_>>();
-        for callee in callees {
-            self.record(callee, node);
+        if !callees.is_empty() {
+            for callee in callees {
+                self.record(callee, node);
+            }
+            return;
+        }
+
+        let extension_callees = call_arity
+            .map(|call_arity| {
+                let (scope_start, scope_end) = extension_visibility_site_key(node);
+                let extension_key = (
+                    owner_fqn.to_string(),
+                    name.to_string(),
+                    call_arity,
+                    explicit_generic_arity,
+                    scope_start,
+                    scope_end,
+                );
+                if !self.extension_cache.contains_key(&extension_key) {
+                    let receiver_types = [owner_fqn.to_string()];
+                    let mut extensions = visible_extension_method_candidates(
+                        self.csharp,
+                        self.analyzer,
+                        self.file,
+                        self.source,
+                        node,
+                        &receiver_types,
+                        name,
+                        Some(call_arity),
+                        explicit_generic_arity,
+                        false,
+                    )
+                    .into_iter()
+                    .map(|extension| extension.fq_name())
+                    .collect::<Vec<_>>();
+                    extensions.sort();
+                    extensions.dedup();
+                    self.extension_cache
+                        .insert(extension_key.clone(), extensions);
+                }
+                self.extension_cache
+                    .get(&extension_key)
+                    .expect("extension cache entry was inserted")
+                    .clone()
+            })
+            .unwrap_or_default();
+        if !extension_callees.is_empty() {
+            for callee in extension_callees {
+                self.record(callee, node);
+            }
+            return;
+        }
+
+        if candidates.is_empty() {
+            if explicit_generic_arity.is_some() {
+                self.record_unproven(name, node);
+            } else {
+                self.record(format!("{owner_fqn}.{name}"), node);
+            }
         }
     }
 }
@@ -221,23 +291,31 @@ fn record_reference(
         // node. `new Foo()`'s type child is itself a type reference, so it is
         // covered here without a separate object-creation case.
         "identifier" | "type" => {
+            if node.kind() == "identifier"
+                && let Some((invocation, explicit_generic_arity)) =
+                    csharp_unqualified_invocation_for_name(node)
+            {
+                let name = node_text(node, ctx.source);
+                if unqualified_member_has_local_binding(node, ctx.source, bindings)
+                    || unqualified_member_has_structured_shadow(node, ctx.source)
+                {
+                    return;
+                }
+                if let Some(owner) = ctx.enclosing_class(node.start_byte()).map(str::to_string) {
+                    let arity = argument_count(invocation, ctx.source);
+                    ctx.record_nearest_member(
+                        &owner,
+                        name,
+                        node,
+                        Some(arity),
+                        explicit_generic_arity,
+                    );
+                }
+                return;
+            }
             if is_declaration_name(node) || !is_type_reference_node(node) {
                 // An unqualified `Member(..)` call attributes to the enclosing class.
-                if is_unqualified_invocation_target(node) {
-                    let name = node_text(node, ctx.source);
-                    if unqualified_member_has_local_binding(node, ctx.source, bindings)
-                        || unqualified_member_has_structured_shadow(node, ctx.source)
-                    {
-                        return;
-                    }
-                    if let Some(owner) = ctx.enclosing_class(node.start_byte()).map(str::to_string)
-                    {
-                        let arity = node
-                            .parent()
-                            .map(|invocation| argument_count(invocation, ctx.source));
-                        ctx.record_nearest_member(&owner, name, node, arity);
-                    }
-                } else if is_unqualified_method_group_argument(node, ctx.source) {
+                if is_unqualified_method_group_argument(node, ctx.source) {
                     let Some(owner_fqn) = ctx
                         .class_ranges
                         .enclosing(node.start_byte())
@@ -301,7 +379,10 @@ fn record_reference(
             else {
                 return;
             };
-            let name = node_text(name_node, ctx.source);
+            let Some(name_shape) = csharp_member_name(name_node) else {
+                return;
+            };
+            let name = node_text(name_shape.identifier, ctx.source);
             if name.is_empty() {
                 return;
             }
@@ -311,21 +392,19 @@ fn record_reference(
                         && parent.child_by_field_name("function") == Some(node))
                     .then(|| argument_count(parent, ctx.source))
                 });
-                ctx.record_nearest_member(&owner, name, name_node, call_arity);
+                ctx.record_nearest_member(
+                    &owner,
+                    name,
+                    name_shape.identifier,
+                    call_arity,
+                    name_shape.explicit_generic_arity,
+                );
             } else {
-                ctx.record_unproven(name, name_node);
+                ctx.record_unproven(name, name_shape.identifier);
             }
         }
         _ => {}
     }
-}
-
-/// True when `node` is the bare callee of an `Foo(..)` invocation (no receiver).
-fn is_unqualified_invocation_target(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "invocation_expression"
-            && parent.child_by_field_name("function") == Some(node)
-    })
 }
 
 /// The fqn of a receiver expression's type, for the shapes that resolve without
@@ -349,6 +428,7 @@ fn receiver_type_fqn(
         "this" | "base" => ctx
             .enclosing_class(receiver.start_byte())
             .map(str::to_string),
+        "invocation_expression" => invocation_return_type_fqn(receiver, ctx, bindings),
         "qualified_name" | "generic_name" => {
             ctx.resolve_type_fqn_at(&reference_type_text(receiver, ctx.source), receiver)
         }
@@ -502,18 +582,42 @@ fn invocation_return_type_fqn(
             let name = node_text(function, ctx.source);
             let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
             let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
-            method_return_type_for_call(ctx, &owner, name, argument_count(invocation, ctx.source))
+            method_return_type_for_call(
+                ctx,
+                &owner,
+                name,
+                argument_count(invocation, ctx.source),
+                None,
+                None,
+            )
+        }
+        "generic_name" => {
+            let name = csharp_member_name(function)?;
+            let type_arguments = resolved_type_arguments(name, ctx);
+            let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
+            let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
+            method_return_type_for_call(
+                ctx,
+                &owner,
+                node_text(name.identifier, ctx.source),
+                argument_count(invocation, ctx.source),
+                name.explicit_generic_arity,
+                type_arguments.as_deref(),
+            )
         }
         "member_access_expression" => {
             let receiver = member_access_receiver(function)?;
-            let name = member_access_name(function)?;
+            let name = csharp_member_name(member_access_name(function)?)?;
+            let type_arguments = resolved_type_arguments(name, ctx);
             let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
             let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
             method_return_type_for_call(
                 ctx,
                 &owner,
-                node_text(name, ctx.source),
+                node_text(name.identifier, ctx.source),
                 argument_count(invocation, ctx.source),
+                name.explicit_generic_arity,
+                type_arguments.as_deref(),
             )
         }
         _ => None,
@@ -525,57 +629,30 @@ fn method_return_type_for_call(
     owner: &CodeUnit,
     method_name: &str,
     arity: usize,
+    explicit_generic_arity: Option<usize>,
+    explicit_type_arguments: Option<&[String]>,
 ) -> Option<String> {
-    let mut resolved = csharp_method_return_types_for_owner(ctx, owner, method_name, arity);
-    resolved.sort();
-    resolved.dedup();
-    (resolved.len() == 1).then(|| resolved.remove(0))
+    method_return_type_fq_name_for_arity(
+        ctx.csharp,
+        ctx.file,
+        owner,
+        method_name,
+        Some(arity),
+        explicit_generic_arity,
+        explicit_type_arguments,
+    )
 }
 
-fn csharp_method_return_types_for_owner(
+fn resolved_type_arguments(
+    name: CSharpMemberName<'_>,
     ctx: &CsScan<'_, '_>,
-    owner: &CodeUnit,
-    method_name: &str,
-    arity: usize,
-) -> Vec<String> {
-    let mut owners = vec![owner.clone()];
-    if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
-        owners.extend(provider.get_ancestors(owner));
-    }
-    let mut returns = Vec::new();
-    for candidate in owners {
-        returns.extend(
-            ctx.csharp
-                .definition_lookup_index()
-                .members_for_owner_name(
-                    &candidate.fq_name(),
-                    &csharp_normalize_full_name(&candidate.fq_name()),
-                    method_name,
-                )
-                .into_iter()
-                .filter(|method| method.is_function())
-                .filter_map(|method| {
-                    let facts = ctx.csharp.usage_facts_index().fact_for_declaration(method);
-                    let callable_arity = facts
-                        .and_then(|facts| facts.callable_arity)
-                        .unwrap_or_else(|| {
-                            crate::analyzer::CallableArity::exact(
-                                facts
-                                    .and_then(|facts| facts.arity)
-                                    .unwrap_or_else(|| signature_arity(method.signature())),
-                            )
-                        });
-                    if !callable_arity.accepts(arity) {
-                        return None;
-                    }
-                    let return_type = facts
-                        .and_then(|facts| facts.return_type_fqn.clone())
-                        .or_else(|| {
-                            method_unit_return_type_fq_name(ctx.csharp, &candidate, method)
-                        })?;
-                    Some(return_type)
-                }),
-        );
-    }
-    returns
+) -> Option<Vec<String>> {
+    let arguments = name.type_arguments?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .map(|argument| {
+            ctx.resolve_type_fqn_at(&reference_type_text(argument, ctx.source), argument)
+        })
+        .collect()
 }

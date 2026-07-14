@@ -246,7 +246,7 @@ impl<'a> CSharpVisitor<'a> {
         if name.is_empty() {
             return;
         }
-        let signature_key = csharp_parameter_key(node, self.source);
+        let signature_key = csharp_method_signature_key(node, self.source);
         let code_unit = CodeUnit::with_signature(
             self.file.clone(),
             CodeUnitType::Function,
@@ -583,15 +583,38 @@ fn csharp_method_skeleton(node: Node<'_>, source: &str) -> String {
     format!("{} {{ … }}", head.trim_end_matches(';').trim())
 }
 
+fn csharp_method_signature_key(node: Node<'_>, source: &str) -> String {
+    let parameters = csharp_parameter_key(node, source);
+    let generic_arity = node
+        .child_by_field_name("type_parameters")
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "type_parameter_list")
+        })
+        .map_or(0, |type_parameters| type_parameters.named_child_count());
+    if generic_arity == 0 {
+        parameters
+    } else {
+        format!("`{generic_arity}{parameters}")
+    }
+}
+
 fn csharp_constructor_skeleton(node: Node<'_>, source: &str) -> String {
     csharp_method_skeleton(node, source)
 }
 
 fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
     let callable_arity = csharp_callable_arity(node);
+    let type_parameters = csharp_method_type_parameters(node, source);
+    let bare_return_type_parameter =
+        csharp_bare_return_type_parameter(node, source, &type_parameters);
     let parameter_text = csharp_rendered_parameter_text(node, source);
     let Some(parameters_start) = signature.find(&parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new()).with_callable_arity(callable_arity);
+        return SignatureMetadata::new(signature, Vec::new())
+            .with_callable_arity(callable_arity)
+            .with_type_parameters(type_parameters)
+            .with_bare_return_type_parameter(bare_return_type_parameter);
     };
     let parameters_end = parameters_start + parameter_text.len();
     let mut search_start = parameters_start;
@@ -610,7 +633,53 @@ fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters).with_callable_arity(callable_arity)
+    SignatureMetadata::new(signature, parameters)
+        .with_callable_arity(callable_arity)
+        .with_type_parameters(type_parameters)
+        .with_bare_return_type_parameter(bare_return_type_parameter)
+}
+
+fn csharp_bare_return_type_parameter(
+    node: Node<'_>,
+    source: &str,
+    type_parameters: &[String],
+) -> Option<String> {
+    let return_type = node
+        .child_by_field_name("returns")
+        .or_else(|| node.child_by_field_name("return_type"))?;
+    if return_type.kind() != "identifier" {
+        return None;
+    }
+    let return_type = source
+        .get(return_type.start_byte()..return_type.end_byte())
+        .map(str::trim)
+        .filter(|return_type| !return_type.is_empty())?;
+    type_parameters
+        .iter()
+        .any(|parameter| parameter == return_type)
+        .then(|| return_type.to_string())
+}
+
+fn csharp_method_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(type_parameters) = node.child_by_field_name("type_parameters").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "type_parameter_list")
+    }) else {
+        return Vec::new();
+    };
+    let mut cursor = type_parameters.walk();
+    type_parameters
+        .named_children(&mut cursor)
+        .filter_map(|parameter| {
+            let name = parameter
+                .child_by_field_name("name")
+                .or_else(|| parameter.named_child(0))
+                .unwrap_or(parameter);
+            let text = cs_node_text(name, source).trim();
+            (!text.is_empty()).then(|| text.to_string())
+        })
+        .collect()
 }
 
 fn csharp_callable_arity(node: Node<'_>) -> CallableArity {

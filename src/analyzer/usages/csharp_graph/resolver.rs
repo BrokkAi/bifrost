@@ -3,10 +3,12 @@ pub(super) use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
-    CSharpAnalyzer, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
-    csharp_as_expression_type_operand, csharp_callable_arity, csharp_normalize_full_name,
-    csharp_signature_arity, csharp_signature_return_type, csharp_source_identifier,
-    csharp_type_node_identity, csharp_using_directive_is_static, resolve_analyzer,
+    CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
+    csharp_as_expression_type_operand, csharp_callable_arity, csharp_member_name,
+    csharp_method_generic_arity, csharp_normalize_full_name, csharp_signature_arity,
+    csharp_signature_return_type, csharp_source_identifier, csharp_type_node_identity,
+    csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_using_directive_namespace, csharp_using_directive_target, resolve_analyzer,
 };
 use crate::hash::HashSet;
 use tree_sitter::Node;
@@ -25,8 +27,8 @@ pub(super) struct TargetSpec {
     pub(super) owner: CodeUnit,
     pub(super) member_name: String,
     pub(super) callable_arity: Option<CallableArity>,
+    pub(super) generic_arity: Option<usize>,
     pub(super) is_extension_method: bool,
-    pub(super) extension_receiver_type: Option<String>,
 }
 
 impl TargetSpec {
@@ -38,8 +40,8 @@ impl TargetSpec {
                 owner: target.clone(),
                 member_name: csharp_source_identifier(target).to_string(),
                 callable_arity: None,
+                generic_arity: None,
                 is_extension_method: false,
-                extension_receiver_type: None,
             });
         }
 
@@ -59,16 +61,19 @@ impl TargetSpec {
             member_name: target.identifier().to_string(),
             callable_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
                 .then(|| csharp_callable_arity(analyzer, target)),
+            generic_arity: (kind == TargetKind::Method)
+                .then(|| csharp_method_generic_arity(target.signature())),
             is_extension_method: kind == TargetKind::Method
                 && is_extension_method(analyzer, target),
-            extension_receiver_type: (kind == TargetKind::Method)
-                .then(|| extension_method_receiver_type(analyzer, target))
-                .flatten(),
         })
     }
 
     pub(super) fn is_extension_method(&self) -> bool {
         self.is_extension_method
+    }
+
+    pub(super) fn accepts_explicit_generic_arity(&self, arity: Option<usize>) -> bool {
+        arity.is_none_or(|arity| self.generic_arity == Some(arity))
     }
 }
 
@@ -324,19 +329,38 @@ fn invocation_expression_return_type_fq_name(
                 &owner,
                 node_text(function, source),
                 Some(arity),
+                None,
+                None,
+            )
+        }
+        "generic_name" => {
+            let name = csharp_member_name(function)?;
+            let type_arguments = resolved_type_arguments(name, csharp, file, source);
+            let owner = enclosing_declared_type(function, csharp, file, source)?;
+            method_return_type_fq_name_for_arity(
+                csharp,
+                file,
+                &owner,
+                node_text(name.identifier, source),
+                Some(arity),
+                name.explicit_generic_arity,
+                type_arguments.as_deref(),
             )
         }
         "member_access_expression" => {
             let receiver = member_access_receiver(function)?;
-            let name = member_access_name(function)?;
+            let name = csharp_member_name(member_access_name(function)?)?;
+            let type_arguments = resolved_type_arguments(name, csharp, file, source);
             let owners = receiver_type_units(receiver, csharp, file, source, bindings);
             owners.into_iter().find_map(|owner| {
                 method_return_type_fq_name_for_arity(
                     csharp,
                     file,
                     &owner,
-                    node_text(name, source),
+                    node_text(name.identifier, source),
                     Some(arity),
+                    name.explicit_generic_arity,
+                    type_arguments.as_deref(),
                 )
             })
         }
@@ -362,6 +386,7 @@ fn receiver_type_units(
             } else {
                 enclosing_declared_type(receiver, csharp, file, source)
                     .and_then(|owner| member_declared_type_fq_name(csharp, file, &owner, name))
+                    .or_else(|| resolve_type_fq_name(csharp, file, name))
                     .into_iter()
                     .flat_map(|fq_name| type_declarations_for_fq_name(csharp, &fq_name))
                     .collect()
@@ -479,68 +504,84 @@ pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
 /// receiver (`GetFoo().Member`) can be typed by the callee. The stored member
 /// `signature()` keeps only the parameter list, so read the return type from the
 /// full signature text (`signatures`), which is `Return Name(params) { … }`.
-pub(in crate::analyzer::usages) fn method_return_type_fq_name(
-    csharp: &CSharpAnalyzer,
-    file: &ProjectFile,
-    owner: &CodeUnit,
-    method_name: &str,
-) -> Option<String> {
-    method_return_type_fq_name_for_arity(csharp, file, owner, method_name, None)
-}
-
 pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
     csharp: &CSharpAnalyzer,
     _file: &ProjectFile,
     owner: &CodeUnit,
     method_name: &str,
     arity: Option<usize>,
+    explicit_generic_arity: Option<usize>,
+    explicit_type_arguments: Option<&[String]>,
 ) -> Option<String> {
-    let method_fqn = format!("{}.{}", owner.fq_name(), method_name);
-    let mut resolved = csharp
-        .definition_lookup_index()
-        .members_for_owner_name(
-            owner.fq_name().as_str(),
-            &csharp_normalize_full_name(&owner.fq_name()),
-            method_name,
-        )
-        .into_iter()
-        .filter(|unit| unit.is_function() && unit.fq_name() == method_fqn)
-        .filter_map(|unit| {
-            let facts = csharp.usage_facts_index().fact_for_declaration(unit);
-            let callable_arity =
-                facts
-                    .and_then(|facts| facts.callable_arity)
-                    .unwrap_or_else(|| {
-                        CallableArity::exact(
-                            facts
-                                .and_then(|facts| facts.arity)
-                                .unwrap_or_else(|| signature_arity(unit.signature())),
-                        )
-                    });
-            if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
-                return None;
-            }
-            let return_type = facts
-                .and_then(|facts| facts.return_type_fqn.clone())
-                .or_else(|| {
-                    let type_text = method_return_type(csharp, unit)?;
-                    resolve_member_type_fq_name(csharp, unit.source(), owner, &type_text)
-                })?;
-            Some(return_type)
-        })
-        .collect::<Vec<_>>();
+    let mut resolved = nearest_member_candidates_for_owner(
+        csharp,
+        csharp,
+        owner,
+        method_name,
+        explicit_generic_arity,
+    )
+    .into_iter()
+    .filter(|unit| unit.is_function())
+    .filter_map(|unit| {
+        let facts = csharp.usage_facts_index().fact_for_declaration(&unit);
+        let callable_arity = facts
+            .and_then(|facts| facts.callable_arity)
+            .unwrap_or_else(|| {
+                CallableArity::exact(
+                    facts
+                        .and_then(|facts| facts.arity)
+                        .unwrap_or_else(|| signature_arity(unit.signature())),
+                )
+            });
+        if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
+            return None;
+        }
+        let metadata = explicit_type_arguments.map(|_| csharp.signature_metadata(&unit));
+        if let Some(substituted) = metadata.as_deref().and_then(|metadata| {
+            substituted_method_type_parameter(metadata, explicit_type_arguments)
+        }) {
+            return Some(substituted);
+        }
+        if let Some(return_type) = facts.and_then(|facts| facts.return_type_fqn.clone()) {
+            return Some(return_type);
+        }
+        let declared_type = method_return_type(csharp, &unit)?;
+        let declaring_owner = csharp.parent_of(&unit).unwrap_or_else(|| owner.clone());
+        resolve_member_type_fq_name(csharp, unit.source(), &declaring_owner, &declared_type)
+    })
+    .collect::<Vec<_>>();
     resolved.sort();
     resolved.dedup();
     (resolved.len() == 1).then(|| resolved.remove(0))
 }
 
-pub(in crate::analyzer::usages) fn method_unit_return_type_fq_name(
+fn resolved_type_arguments(
+    name: CSharpMemberName<'_>,
     csharp: &CSharpAnalyzer,
-    owner: &CodeUnit,
-    method: &CodeUnit,
+    file: &ProjectFile,
+    source: &str,
+) -> Option<Vec<String>> {
+    let arguments = name.type_arguments?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .map(|argument| resolve_type_fq_name(csharp, file, &reference_type_text(argument, source)))
+        .collect()
+}
+
+fn substituted_method_type_parameter(
+    metadata: &[crate::analyzer::SignatureMetadata],
+    explicit_type_arguments: Option<&[String]>,
 ) -> Option<String> {
-    let type_text = method_return_type(csharp, method)?;
-    resolve_member_type_fq_name(csharp, method.source(), owner, &type_text)
+    let arguments = explicit_type_arguments?;
+    metadata.iter().find_map(|metadata| {
+        let return_type = metadata.bare_return_type_parameter()?;
+        metadata
+            .type_parameters()
+            .iter()
+            .position(|parameter| parameter == return_type)
+            .and_then(|index| arguments.get(index).cloned())
+    })
 }
 
 fn resolve_member_type_fq_name(
@@ -854,6 +895,324 @@ pub(in crate::analyzer::usages) fn extension_method_receiver_type(
         })
 }
 
+#[derive(Default)]
+struct CSharpExtensionScope {
+    namespaces: HashSet<String>,
+    static_owner_fqns: HashSet<String>,
+}
+
+pub(super) fn extension_visibility_site_key(site: Node<'_>) -> (usize, usize) {
+    let mut root = site;
+    while let Some(parent) = root.parent() {
+        if parent.kind() == "namespace_declaration" {
+            return (parent.start_byte(), parent.end_byte());
+        }
+        root = parent;
+    }
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .find(|child| child.kind() == "file_scoped_namespace_declaration")
+        .map_or((root.start_byte(), root.end_byte()), |namespace| {
+            (namespace.start_byte(), namespace.end_byte())
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::analyzer::usages) fn visible_extension_method_candidates(
+    csharp: &CSharpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    _file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
+    receiver_type_names: &[String],
+    member: &str,
+    call_arity: Option<usize>,
+    explicit_generic_arity: Option<usize>,
+    fallback_when_inapplicable: bool,
+) -> Vec<CodeUnit> {
+    let compatible_receiver_types =
+        compatible_receiver_type_names(csharp, analyzer, receiver_type_names);
+    let scopes = extension_visibility_scopes(csharp, source, site);
+    let named_candidates = csharp
+        .declaration_candidates_by_identifier(member)
+        .into_iter()
+        .filter(|unit| unit.is_function() && unit.identifier() == member)
+        .collect::<Vec<_>>();
+    for scope in scopes {
+        let mut candidates = named_candidates
+            .iter()
+            .filter(|unit| scope.namespaces.contains(unit.package_name()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for owner_fqn in &scope.static_owner_fqns {
+            candidates.extend(
+                csharp
+                    .member_candidates_for_owner(owner_fqn, member)
+                    .into_iter()
+                    .filter(|unit| unit.is_function() && unit.identifier() == member),
+            );
+        }
+        candidates.sort();
+        candidates.dedup();
+        let candidates = candidates
+            .into_iter()
+            .filter(|unit| {
+                explicit_generic_arity
+                    .is_none_or(|arity| csharp_method_generic_arity(unit.signature()) == arity)
+            })
+            .filter(|unit| is_extension_method(analyzer, unit))
+            .filter(|unit| {
+                compatible_receiver_types.is_empty()
+                    || extension_method_receiver_type(analyzer, unit).is_none_or(|receiver| {
+                        compatible_receiver_types.contains(&csharp_normalize_full_name(&receiver))
+                    })
+            })
+            .collect::<Vec<_>>();
+        let Some(call_arity) = call_arity else {
+            if !candidates.is_empty() {
+                return candidates;
+            }
+            continue;
+        };
+        let Some(declared_arity) = call_arity.checked_add(1) else {
+            return Vec::new();
+        };
+        let applicable = candidates
+            .iter()
+            .filter(|candidate| csharp_callable_arity(analyzer, candidate).accepts(declared_arity))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !applicable.is_empty() {
+            return applicable;
+        }
+        if fallback_when_inapplicable && !candidates.is_empty() {
+            return candidates;
+        }
+    }
+    Vec::new()
+}
+
+fn extension_visibility_scopes(
+    csharp: &CSharpAnalyzer,
+    source: &str,
+    site: Node<'_>,
+) -> Vec<CSharpExtensionScope> {
+    let mut root = site;
+    let mut namespace_nodes = Vec::new();
+    while let Some(parent) = root.parent() {
+        if parent.kind() == "namespace_declaration" {
+            namespace_nodes.push(parent);
+        }
+        root = parent;
+    }
+
+    let mut namespace_declarations = Vec::with_capacity(namespace_nodes.len());
+    let mut namespace = String::new();
+    for declaration in namespace_nodes.iter().rev() {
+        let Some(name) = declaration.child_by_field_name("name") else {
+            continue;
+        };
+        let segment = csharp_type_node_identity(name, source);
+        if segment.is_empty() {
+            continue;
+        }
+        let parent_namespace = namespace.clone();
+        namespace = if parent_namespace.is_empty() {
+            segment
+        } else {
+            format!("{parent_namespace}.{segment}")
+        };
+        namespace_declarations.push((*declaration, parent_namespace, namespace.clone()));
+    }
+
+    let mut scopes = Vec::new();
+    for (declaration, parent_namespace, namespace) in namespace_declarations.iter().rev() {
+        push_namespace_scopes(
+            csharp,
+            source,
+            &mut scopes,
+            namespace,
+            parent_namespace,
+            declaration.child_by_field_name("body"),
+            0,
+            usize::MAX,
+        );
+    }
+
+    let file_scoped_declaration = if namespace_nodes.is_empty() {
+        let mut cursor = root.walk();
+        root.named_children(&mut cursor)
+            .find(|child| child.kind() == "file_scoped_namespace_declaration")
+    } else {
+        None
+    };
+    if let Some(declaration) = file_scoped_declaration
+        && let Some(namespace) = declaration
+            .child_by_field_name("name")
+            .map(|name| csharp_type_node_identity(name, source))
+            .filter(|namespace| !namespace.is_empty())
+    {
+        push_namespace_scopes(
+            csharp,
+            source,
+            &mut scopes,
+            &namespace,
+            "",
+            Some(root),
+            declaration.end_byte(),
+            usize::MAX,
+        );
+    }
+
+    let mut compilation_scope = CSharpExtensionScope::default();
+    compilation_scope.namespaces.insert(String::new());
+    collect_scope_using_directives(
+        csharp,
+        source,
+        root,
+        "",
+        0,
+        file_scoped_declaration.map_or(usize::MAX, |declaration| declaration.start_byte()),
+        &mut compilation_scope,
+    );
+    compilation_scope
+        .namespaces
+        .extend(csharp.global_using_namespaces().iter().cloned());
+    compilation_scope.static_owner_fqns.extend(
+        csharp
+            .global_static_using_types()
+            .iter()
+            .map(CodeUnit::fq_name),
+    );
+    scopes.push(compilation_scope);
+    scopes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_namespace_scopes(
+    csharp: &CSharpAnalyzer,
+    source: &str,
+    scopes: &mut Vec<CSharpExtensionScope>,
+    namespace: &str,
+    parent_namespace: &str,
+    using_scope_node: Option<Node<'_>>,
+    using_start: usize,
+    using_end: usize,
+) {
+    let mut current = namespace.to_string();
+    let mut include_usings = true;
+    while !current.is_empty() && current != parent_namespace {
+        let mut scope = CSharpExtensionScope::default();
+        scope.namespaces.insert(current.clone());
+        if include_usings && let Some(scope_node) = using_scope_node {
+            collect_scope_using_directives(
+                csharp,
+                source,
+                scope_node,
+                &current,
+                using_start,
+                using_end,
+                &mut scope,
+            );
+        }
+        scopes.push(scope);
+        include_usings = false;
+        let Some((parent, _)) = current.rsplit_once('.') else {
+            break;
+        };
+        current.truncate(parent.len());
+    }
+}
+
+fn collect_scope_using_directives(
+    csharp: &CSharpAnalyzer,
+    source: &str,
+    scope_node: Node<'_>,
+    resolution_namespace: &str,
+    using_start: usize,
+    using_end: usize,
+    scope: &mut CSharpExtensionScope,
+) {
+    let mut cursor = scope_node.walk();
+    for directive in scope_node.named_children(&mut cursor).filter(|child| {
+        child.kind() == "using_directive"
+            && !csharp_using_directive_is_global(*child)
+            && using_start <= child.start_byte()
+            && child.end_byte() <= using_end
+    }) {
+        if csharp_using_directive_is_static(directive) {
+            if let Some(target) = csharp_using_directive_target(directive, source)
+                && let Some(owner) = namespace_relative_names(resolution_namespace, &target)
+                    .into_iter()
+                    .find_map(|candidate| class_unit_for_fq_name(csharp, &candidate))
+            {
+                scope.static_owner_fqns.insert(owner.fq_name());
+            }
+        } else if let Some(target) = csharp_using_directive_namespace(directive, source) {
+            let namespace = namespace_relative_names(resolution_namespace, &target)
+                .into_iter()
+                .find(|candidate| csharp.workspace_namespace_exists(candidate))
+                .unwrap_or_else(|| normalize_type_text(&target));
+            if !namespace.is_empty() {
+                scope.namespaces.insert(namespace);
+            }
+        }
+    }
+}
+
+fn namespace_relative_names(namespace: &str, target: &str) -> Vec<String> {
+    let target = normalize_type_text(target);
+    if target.is_empty() {
+        return Vec::new();
+    }
+    if target.starts_with("global::") {
+        return vec![target.trim_start_matches("global::").to_string()];
+    }
+    let mut names = Vec::new();
+    let mut prefix = namespace;
+    while !prefix.is_empty() {
+        names.push(format!("{prefix}.{target}"));
+        prefix = prefix.rsplit_once('.').map_or("", |(parent, _)| parent);
+    }
+    names.push(target);
+    names
+}
+
+fn compatible_receiver_type_names(
+    csharp: &CSharpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    receiver_type_names: &[String],
+) -> HashSet<String> {
+    let mut compatible = HashSet::default();
+    for receiver_type in receiver_type_names {
+        compatible.insert(csharp_normalize_full_name(receiver_type));
+        let owners = csharp
+            .definition_lookup_index()
+            .by_fqn(receiver_type)
+            .iter()
+            .chain(
+                csharp
+                    .definition_lookup_index()
+                    .by_normalized_fqn(&csharp_normalize_full_name(receiver_type))
+                    .iter(),
+            )
+            .filter(|unit| unit.is_class())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(provider) = analyzer.type_hierarchy_provider() {
+            for owner in owners {
+                compatible.extend(
+                    provider
+                        .get_ancestors(&owner)
+                        .into_iter()
+                        .map(|ancestor| csharp_normalize_full_name(&ancestor.fq_name())),
+                );
+            }
+        }
+    }
+    compatible
+}
+
 fn extension_receiver_type_from_signature(signature: &str) -> Option<String> {
     let parameters = signature.split_once('(')?.1;
     let first_parameter = parameters.split(')').next()?.split(',').next()?.trim();
@@ -1024,6 +1383,7 @@ pub(super) fn nearest_member_candidates_for_owner(
     csharp: &CSharpAnalyzer,
     owner: &CodeUnit,
     name: &str,
+    explicit_generic_arity: Option<usize>,
 ) -> Vec<CodeUnit> {
     let hierarchy = analyzer.type_hierarchy_provider();
     let mut seen = HashSet::default();
@@ -1042,7 +1402,13 @@ pub(super) fn nearest_member_candidates_for_owner(
                 csharp
                     .member_candidates_for_owner(&current.fq_name(), name)
                     .into_iter()
-                    .filter(|candidate| candidate.identifier() == name),
+                    .filter(|candidate| candidate.identifier() == name)
+                    .filter(|candidate| {
+                        explicit_generic_arity.is_none_or(|arity| {
+                            candidate.is_function()
+                                && csharp_method_generic_arity(candidate.signature()) == arity
+                        })
+                    }),
             );
             current_level.push(current);
         }
@@ -1088,7 +1454,7 @@ pub(super) fn resolve_unqualified_method_group_for_owner(
     owner: &CodeUnit,
     name: &str,
 ) -> UnqualifiedMethodGroupResolution {
-    let members = nearest_member_candidates_for_owner(analyzer, csharp, owner, name);
+    let members = nearest_member_candidates_for_owner(analyzer, csharp, owner, name, None);
     if members.is_empty() {
         return UnqualifiedMethodGroupResolution::NoMember;
     }

@@ -38,6 +38,33 @@ pub(crate) fn csharp_using_directive_is_static(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "static")
 }
 
+pub(crate) fn csharp_using_directive_is_global(node: Node<'_>) -> bool {
+    if node.kind() != "using_directive" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "global")
+}
+
+pub(crate) fn csharp_using_directive_target(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "using_directive" {
+        return None;
+    }
+    let alias = node.child_by_field_name("name");
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| alias.is_none_or(|alias| child != &alias))
+        .map(|target| csharp_type_node_identity(target, source))
+        .filter(|target| !target.is_empty())
+}
+
+pub(crate) fn csharp_using_directive_namespace(node: Node<'_>, source: &str) -> Option<String> {
+    (!csharp_using_directive_is_static(node) && node.child_by_field_name("name").is_none())
+        .then(|| csharp_using_directive_target(node, source))
+        .flatten()
+}
+
 pub(crate) fn csharp_as_expression_type_operand(parent: Node<'_>, node: Node<'_>) -> bool {
     parent.kind() == "as_expression"
         && parent.child_by_field_name("right").is_some_and(|right| {
@@ -201,29 +228,7 @@ impl CSharpAnalyzer {
         aliases
     }
 
-    pub(crate) fn static_using_types_of(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        if let Some(cached) = self.memo_caches.static_using_types.get(file) {
-            return (*cached).clone();
-        }
-
-        let mut types = self
-            .inner
-            .import_info_of(file)
-            .iter()
-            .filter(|import| !import.raw_snippet.trim_start().starts_with("global using "))
-            .filter_map(csharp_static_using_from_import)
-            .flat_map(|target| self.visible_type_candidates(file, target))
-            .collect::<Vec<_>>();
-        types.extend(self.global_static_using_types().iter().cloned());
-        types.sort();
-        types.dedup();
-        self.memo_caches
-            .static_using_types
-            .insert(file.clone(), Arc::new(types.clone()));
-        types
-    }
-
-    fn global_using_namespaces(&self) -> &HashSet<String> {
+    pub(crate) fn global_using_namespaces(&self) -> &HashSet<String> {
         self.memo_caches.global_using_namespaces.get_or_init(|| {
             self.inner
                 .all_files()
@@ -231,6 +236,12 @@ impl CSharpAnalyzer {
                 .flat_map(|file| self.inner.import_info_of(&file).into_iter())
                 .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
                 .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+                .map(|namespace| {
+                    normalize_csharp_type_fragment(
+                        namespace.strip_prefix("global::").unwrap_or(&namespace),
+                    )
+                })
+                .filter(|namespace| !namespace.is_empty())
                 .collect()
         })
     }
@@ -247,20 +258,22 @@ impl CSharpAnalyzer {
         })
     }
 
-    fn global_static_using_types(&self) -> &Vec<CodeUnit> {
+    pub(crate) fn global_static_using_types(&self) -> &[CodeUnit] {
         self.memo_caches.global_static_using_types.get_or_init(|| {
             let mut types = Vec::new();
             for file in self.inner.all_files() {
-                types.extend(
-                    self.inner
-                        .import_info_of(&file)
-                        .iter()
-                        .filter(|import| {
-                            import.raw_snippet.trim_start().starts_with("global using ")
-                        })
-                        .filter_map(csharp_static_using_from_import)
-                        .flat_map(|target| self.visible_type_candidates(&file, target)),
-                );
+                for target in self
+                    .inner
+                    .import_info_of(&file)
+                    .iter()
+                    .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+                    .filter_map(csharp_static_using_from_import)
+                {
+                    let target = normalize_csharp_type_fragment(
+                        target.strip_prefix("global::").unwrap_or(target),
+                    );
+                    types.extend(self.type_candidates_by_fqn(&target));
+                }
             }
             types.sort();
             types.dedup();
@@ -623,6 +636,56 @@ pub(crate) fn csharp_attribute_terminal_name<'a>(
         .filter(|terminal| !terminal.is_empty())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CSharpMemberName<'tree> {
+    pub(crate) identifier: Node<'tree>,
+    pub(crate) explicit_generic_arity: Option<usize>,
+    pub(crate) type_arguments: Option<Node<'tree>>,
+}
+
+pub(crate) fn csharp_member_name(node: Node<'_>) -> Option<CSharpMemberName<'_>> {
+    match node.kind() {
+        "identifier" => Some(CSharpMemberName {
+            identifier: node,
+            explicit_generic_arity: None,
+            type_arguments: None,
+        }),
+        "generic_name" => {
+            let identifier = node
+                .child_by_field_name("name")
+                .or_else(|| node.named_child(0))?;
+            let type_arguments = node.child_by_field_name("type_arguments").or_else(|| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "type_argument_list")
+            })?;
+            Some(CSharpMemberName {
+                identifier,
+                explicit_generic_arity: Some(type_arguments.named_child_count()),
+                type_arguments: Some(type_arguments),
+            })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn csharp_unqualified_invocation_for_name(
+    identifier: Node<'_>,
+) -> Option<(Node<'_>, Option<usize>)> {
+    let (function, explicit_generic_arity) = identifier
+        .parent()
+        .filter(|parent| parent.kind() == "generic_name")
+        .and_then(|generic_name| {
+            let name = csharp_member_name(generic_name)?;
+            (name.identifier == identifier).then_some((generic_name, name.explicit_generic_arity))
+        })
+        .unwrap_or((identifier, None));
+    let invocation = function.parent()?;
+    (invocation.kind() == "invocation_expression"
+        && invocation.child_by_field_name("function") == Some(function))
+    .then_some((invocation, explicit_generic_arity))
+}
+
 pub(crate) fn csharp_signature_arity(signature: Option<&str>) -> usize {
     let Some(signature) = signature else {
         return 0;
@@ -636,6 +699,14 @@ pub(crate) fn csharp_signature_arity(signature: Option<&str>) -> usize {
         return 0;
     }
     count_top_level_comma_separated(inner)
+}
+
+pub(crate) fn csharp_method_generic_arity(signature: Option<&str>) -> usize {
+    signature
+        .and_then(|signature| signature.strip_prefix('`'))
+        .and_then(|signature| signature.split_once('(').map(|(arity, _)| arity))
+        .and_then(|arity| arity.parse().ok())
+        .unwrap_or(0)
 }
 
 pub(crate) fn csharp_callable_arity(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> CallableArity {

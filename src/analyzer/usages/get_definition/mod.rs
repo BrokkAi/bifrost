@@ -9,11 +9,11 @@ use crate::analyzer::usages::cpp_graph::{
     cpp_split_top_level_commas, extract_variable_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
-    csharp_argument_count, csharp_extension_method_receiver_type, csharp_first_type_child,
-    csharp_is_declaration_name, csharp_is_extension_method, csharp_is_type_reference_node,
-    csharp_member_declared_type_fq_name, csharp_method_return_type_fq_name, csharp_node_text,
-    csharp_object_created_type, csharp_object_initializer_for_label, csharp_reference_type_text,
-    member_access_name as csharp_member_access_name,
+    csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,
+    csharp_is_type_reference_node, csharp_member_declared_type_fq_name,
+    csharp_method_return_type_fq_name_for_arity, csharp_node_text, csharp_object_created_type,
+    csharp_object_initializer_for_label, csharp_reference_type_text,
+    csharp_visible_extension_method_candidates, member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{

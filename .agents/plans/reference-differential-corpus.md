@@ -96,6 +96,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 17:20Z) Filed #737 only after a reduced authoritative-scope regression proved that a uniquely declared unqualified method-group argument resolves forward but disappears from both inverse paths. Added a shared AST classifier, lexical shadowing checks, nearest-owner and partial-type hierarchy resolution, conservative overload handling, and cached inverted-graph owner/name lookup. Delegated read-only review found the final implementation clean. All 78 targeted C# graph tests, 24 whole-workspace graph tests, 60 C# definition tests, formatting, and affected all-feature clippy pass; all-target clippy remains blocked only by the preserved unrelated Rust needless borrow. The exact Azure `onDefault` site at bytes `60843..60852` is now consistent with a proven exact-range inverse hit in `/tmp/csharp-exact-737-ondefault-fixed.jsonl`.
 - [x] (2026-07-13 17:27Z) Pushed #737 as `3ca1a8fe`, closed it with the exact production evidence, and verified the complete Rust/Python CI matrix green on Linux, Windows, macOS, Android, and the configured cross targets.
 - [x] (2026-07-13 18:12Z) Filed #738 only after the reduced three-level inheritance test resolved `Base.Report` forward and returned zero authoritative inverse hits from the derived consumer. Replaced exact-owner matching with a shared iterative nearest-declaring-level walk across partial type parts, preserved hiding and callable applicability, kept exact generic identity ahead of normalized fallback, rejected lexical shadows, and cached both targeted and whole-workspace lookups. Delegated review found and verified fixes for shadowed-call unproven leakage, generic inverted identity, and repeated hierarchy work. All 79 targeted C# graph tests, 25 whole-workspace graph tests, 60 C# definition tests, affected all-feature clippy, and the complete `cargo test --features nlp,python` gate pass; all-target clippy remains blocked only by the preserved unrelated Rust needless borrow. The exact Azure `this.PrintSdkExceptionDetail` site at bytes `5184..5207` is consistent with a proven exact-range inverse hit in `/tmp/csharp-exact-738-inherited-final.jsonl`.
+- [x] (2026-07-14) Pushed #738 as `6d89ff5c`, closed it with exact Azure evidence, and completed the post-#738 Azure PowerShell N=1 run using the binary pinned to pushed HEAD. It reports 4,737 forward-resolved sites, 1,903 consistent, 40 unproven, 6 missing, and 8,051 inconclusive classifications. The JSONL truthfully records `bifrost_dirty:true` because #739 worktree edits began while the run was in flight; this is a pushed-commit binary result, not a clean-worktree record.
+- [x] (2026-07-14) Filed #739 only after a reduced inline regression proved that the fully qualified explicit generic call `PsHelpers.RunScript<T>(...)` resolves forward while an authoritative inverse scan of only the consumer returns zero hits. Implemented metadata-arity method identity, explicit generic-arity filtering before value applicability and hiding, AST-carried actual type arguments, persisted bare method-type-parameter return facts, and one shared lexical extension-visibility model across forward, targeted inverse, and whole-workspace graph resolution. The shared signature serialization change bumps the global store epoch. Delegated read-only review found and verified fixes for instance-member precedence, ambiguous-receiver gating, lexical sibling isolation, cache keys, inherited declaring-owner return resolution, wrapped-return negatives, and persistence after reopening. All 84 targeted C# usage tests, 27 whole-workspace graph tests, 60 C# definition tests, formatting, diff checks, affected all-feature clippy, and the complete `cargo test --features nlp,python` gate pass; all-target clippy remains blocked only by the preserved unrelated Rust needless borrow. The epoch-rebuilt Azure exact site at bytes `7144..7153` is consistent with the exact generic signature `` `1(CommandInvocationIntrinsics, string)`` and a proven exact-range inverse hit in `/tmp/csharp-exact-739-generic-final.jsonl`.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -208,6 +210,12 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - Observation: Precise C# receiver typing did not imply precise declaring-member identity across inheritance.
   Evidence: `this.PrintSdkExceptionDetail(ex)` typed its receiver as the derived Azure cmdlet, but targeted inverse scanning accepted only exact equality with the base declaration owner and the whole-workspace graph synthesized `Derived.PrintSdkExceptionDetail`. The shared nearest-level walk now reaches the indexed base declaration, stops at derived hiding members even when their arity is inapplicable, unions partial type parts at every level, and preserves metadata arity when generic and nongeneric owners share a normalized name.
 
+- Observation: C# method generic arity is a declaration and lookup identity dimension distinct from value-argument arity.
+  Evidence: `RunScript<T>(CommandInvocation, string)` and its nongeneric sibling have the same source-facing FQN and value-parameter shape. Before #739 their internal signature keys collided and generic calls stopped at `generic_name` without carrying metadata arity into inverse matching. The reduced regression and production site now exercise one shared generic-arity selector across forward lookup, targeted inverse scanning, whole-workspace edges, extension lookup, hiding, and return inference.
+
+- Observation: C# extension visibility is lexical, not merely a property of the enclosing namespace FQN.
+  Evidence: Same-FQN sibling namespace blocks can have different local usings; file-scoped namespaces distinguish pre-marker compilation-unit usings from post-marker namespace usings; qualified namespaces expose syntactic parent frames; and global usings apply across files. The #739 tests prove these scopes independently and require cache keys to retain the exact AST frame range so sibling blocks cannot leak candidates.
+
 ## Decision Log
 
 - Decision: Implement a library-owned engine plus a dedicated Rust binary, not a unit test or brokkbench production trajectory.
@@ -265,6 +273,18 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - Decision: Resolve ordinary C# inverse member ownership at the nearest hierarchy level that declares the exact name, expanding every logical partial type before descending.
   Rationale: Accepting any ancestor would misattribute hidden members, while flattening the hierarchy would lose the level where C# name hiding becomes decisive. Callable arity filters candidates only after the declaring level is fixed; an inapplicable nearer declaration must not reopen a base member. Per-file caches keep the structured breadth-first lookup bounded in both targeted and whole-workspace scans.
   Date/Author: 2026-07-13 / Codex
+
+- Decision: Encode C# method generic arity in the structural signature key while retaining the source-facing FQN, and apply an explicit call-site arity before value applicability and hiding.
+  Rationale: Metadata arity distinguishes declarations that C# permits to share the same name and value-parameter shape. An explicit `M<T>` call can reject a wrong-arity declaration structurally, while a call without explicit type arguments must leave generic inference eligible rather than inventing a zero-arity constraint.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Carry generic call arguments from tree-sitter nodes and persist only an AST-proven bare method-type-parameter return marker for substitution.
+  Rationale: Exact `T` returns can be substituted from the explicit call arguments, while `T[]`, `T?`, and constructed forms require their existing structured return facts and must not be treated as bare `T`. Persisting this fact avoids source mini-parsing and supports reopened analyzers; changing shared bincode metadata requires a global store-epoch bump rather than relying on serde defaults.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Derive C# extension visibility from ordered AST lexical frames and share it across forward, targeted inverse, and whole-workspace resolution.
+  Rationale: Visibility must respect namespace-block range, file-scoped pre/post partitions, qualified parents, static aliases, and global usings. A common structured candidate set preserves instance-member precedence and prevents both false inverse hits and cache leakage between same-named namespace blocks.
+  Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective
 
@@ -353,6 +373,10 @@ The canonical campaign output will live at `.agents/docs/reference-differential/
 
 The N=1 ranking uses whole-repository recorded LOC, not per-language LOC. This is the corpus's existing uniform size measure. The report also records matching tracked-file counts so mixed-language repositories remain interpretable.
 
+The post-#738 C# result is a binary-pinned pushed-commit measurement whose JSONL records a dirty worktree because #739 edits overlapped the run. Treat its counts as the aggregate #737/#738 boundary and use the post-#739 clean-head rerun as the next durable resumption record.
+
+The #739 production proof is `/tmp/csharp-exact-739-generic-final.jsonl`: Azure PowerShell `PsExtensions.cs` bytes `7144..7153` resolve to `Microsoft.Azure.PowerShell.Cmdlets.CustomProviders.Runtime.PowerShell.PsHelpers.RunScript` with signature `` `1(CommandInvocationIntrinsics, string)`` and retain a proven exact inverse range after the global store-epoch rebuild.
+
 ## Interfaces and Dependencies
 
 In `src/analyzer/reference_candidates.rs`, provide an iterative function that accepts a tree-sitter root and `Language` and returns stable `Range` values for structured identifier leaves, with a caller-provided limit or explicit overflow result. Semantic tokens and the differential engine must call this shared function.
@@ -410,3 +434,5 @@ Revision note (2026-07-13): Recorded #732's delegated review, conservative calla
 Revision note (2026-07-13): Recorded pushed #732, its green CI and final fixing-head Azure record, plus #737's reduced method-group boundary, reviewed structured fix, complete affected validation, and exact production proof.
 
 Revision note (2026-07-13): Recorded pushed/closed #737 with green CI, then #738's reduced inherited-member differential, reviewed nearest-level implementation, full feature-suite validation, and exact Azure production proof.
+
+Revision note (2026-07-14): Recorded pushed/closed #738 and its binary-pinned post-fix corpus counts, then #739's reduced explicit-generic-method boundary, shared generic-arity and lexical-visibility design, delegated review, complete feature-suite validation, and exact Azure production proof.

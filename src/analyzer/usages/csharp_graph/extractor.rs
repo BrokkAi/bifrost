@@ -1,15 +1,15 @@
-use crate::analyzer::csharp_normalize_full_name;
 use crate::analyzer::usages::csharp_graph::hits::{push_hit, push_unproven_hit};
 use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution, argument_count, binding_scope_node,
     class_field_receiver_type, class_unit_for_fq_name, enclosing_declared_type,
-    expression_resolves_to_type, first_type_child, is_type_reference_node,
-    member_name_is_locally_bound, nearest_member_candidates_for_owner, node_text,
-    normalize_type_text, object_initializer_for_label, receiver_targets_owner, reference_type_node,
-    reference_type_text, resolve_unqualified_method_group_for_owner, resolves_to_target,
-    resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
-    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    unqualified_member_resolves_to_owner,
+    expression_resolves_to_type, extension_visibility_site_key, first_type_child,
+    is_type_reference_node, member_name_is_locally_bound, nearest_member_candidates_for_owner,
+    node_text, normalize_type_text, object_initializer_for_label, receiver_targets_owner,
+    reference_type_node, reference_type_text, resolve_unqualified_method_group_for_owner,
+    resolves_to_target, resolves_to_target_at, same_node, seed_visible_bindings_at,
+    type_identity_matches, unqualified_member_has_local_binding,
+    unqualified_member_has_structured_shadow, unqualified_member_resolves_to_owner,
+    visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::SymbolResolution;
@@ -17,7 +17,8 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_terminal_name,
-    csharp_attribute_type_names,
+    csharp_attribute_type_names, csharp_callable_arity, csharp_member_name,
+    csharp_unqualified_invocation_for_name,
 };
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
@@ -76,6 +77,7 @@ pub(super) fn scan_file(
         limit_exceeded: state.limit_exceeded,
         enclosing_cache: HashMap::default(),
         nearest_member_target_cache: HashMap::default(),
+        extension_target_cache: HashMap::default(),
         class_ranges: ClassRangeIndex::build(csharp, file),
     };
     scan_node(tree.root_node(), &mut ctx);
@@ -93,9 +95,12 @@ pub(super) struct ScanCtx<'a> {
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
-    nearest_member_target_cache: HashMap<String, TargetMemberResolution>,
+    nearest_member_target_cache: HashMap<(String, Option<usize>), TargetMemberResolution>,
+    extension_target_cache: HashMap<ExtensionTargetCacheKey, TargetMemberResolution>,
     pub(super) class_ranges: ClassRangeIndex,
 }
+
+type ExtensionTargetCacheKey = (Vec<String>, usize, Option<usize>, usize, usize);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TargetMemberResolution {
@@ -280,33 +285,40 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name_node) = member_access_name(node) else {
         return;
     };
-    if node_text(name_node, ctx.source) != ctx.spec.member_name {
+    let Some(name) = csharp_member_name(name_node) else {
+        return;
+    };
+    if node_text(name.identifier, ctx.source) != ctx.spec.member_name
+        || (ctx.spec.kind == TargetKind::Method
+            && !ctx
+                .spec
+                .accepts_explicit_generic_arity(name.explicit_generic_arity))
+    {
         return;
     }
     // `nameof(receiver.Member)` is a compile-time string, not a member reference.
     if is_nameof_argument(node, ctx.source) {
         return;
     }
-    let extension_call_arity_matches = extension_call_arity_matches(node, ctx);
     let ordinary_call_arity_matches = enclosing_invocation(node).is_none_or(|invocation| {
         ctx.spec
             .callable_arity
             .is_none_or(|arity| arity.accepts(argument_count(invocation, ctx.source)))
     });
     if ctx.spec.kind == TargetKind::Method
+        && !ctx.spec.is_extension_method()
         && !ordinary_call_arity_matches
-        && !extension_call_arity_matches
     {
         return;
     }
 
     let Some(receiver_node) = member_access_receiver(node) else {
-        push_unproven_hit(name_node, ctx);
+        push_unproven_hit(name.identifier, ctx);
         return;
     };
     let receiver = node_text(receiver_node, ctx.source);
     if receiver.is_empty() {
-        push_unproven_hit(name_node, ctx);
+        push_unproven_hit(name.identifier, ctx);
         return;
     }
 
@@ -314,7 +326,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if ctx.spec.kind == TargetKind::Method && !ordinary_call_arity_matches {
             return;
         }
-        push_hit(name_node, ctx);
+        push_hit(name.identifier, ctx);
         return;
     }
 
@@ -327,21 +339,22 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.source,
         &mut bindings,
     );
-    if extension_call_arity_matches {
+    if ctx.spec.kind == TargetKind::Method && ctx.spec.is_extension_method() {
         match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
             SymbolResolution::Precise(targets) => {
-                if targets.iter().any(|target| {
-                    extension_receiver_type_matches(
-                        target,
-                        ctx.spec.extension_receiver_type.as_deref(),
-                        ctx,
-                    )
-                }) {
-                    push_hit(name_node, ctx);
+                let receiver_type_names = targets.into_iter().collect::<Vec<_>>();
+                if extension_call_resolution(node, name.identifier, &receiver_type_names, ctx)
+                    == TargetMemberResolution::MatchesTarget
+                {
+                    push_hit(name.identifier, ctx);
                 }
             }
             SymbolResolution::Ambiguous | SymbolResolution::Unknown => {
-                push_unproven_hit(name_node, ctx);
+                if extension_call_resolution(node, name.identifier, &[], ctx)
+                    == TargetMemberResolution::MatchesTarget
+                {
+                    push_unproven_hit(name.identifier, ctx);
+                }
             }
         }
         return;
@@ -349,74 +362,92 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
         SymbolResolution::Precise(targets)
             if targets.iter().any(|target| {
-                receiver_fqn_target_member_resolution(target, ctx)
+                receiver_fqn_target_member_resolution(target, name.explicit_generic_arity, ctx)
                     == TargetMemberResolution::MatchesTarget
             }) =>
         {
-            push_hit(name_node, ctx);
+            push_hit(name.identifier, ctx);
         }
         SymbolResolution::Ambiguous => {
-            push_unproven_hit(name_node, ctx);
+            push_unproven_hit(name.identifier, ctx);
         }
         SymbolResolution::Unknown => {
-            push_unproven_hit(name_node, ctx);
+            push_unproven_hit(name.identifier, ctx);
         }
         SymbolResolution::Precise(_) => {}
     }
 }
 
-fn extension_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if ctx.spec.kind != TargetKind::Method || !ctx.spec.is_extension_method() {
-        return false;
-    }
-    let Some(declared_arity) = ctx.spec.callable_arity else {
-        return false;
+fn extension_call_resolution(
+    member_access: Node<'_>,
+    name: Node<'_>,
+    receiver_type_names: &[String],
+    ctx: &mut ScanCtx<'_>,
+) -> TargetMemberResolution {
+    let Some(invocation) = enclosing_invocation(member_access) else {
+        return TargetMemberResolution::NotFound;
     };
-    enclosing_invocation(node).is_some_and(|invocation| {
-        argument_count(invocation, ctx.source)
-            .checked_add(1)
-            .is_some_and(|arity| declared_arity.accepts(arity))
-    })
-}
-
-fn extension_receiver_type_matches(
-    receiver_type: &str,
-    extension_receiver_type: Option<&str>,
-    ctx: &ScanCtx<'_>,
-) -> bool {
-    let Some(extension_receiver_type) = extension_receiver_type else {
-        return false;
-    };
-    if type_identity_matches(receiver_type, extension_receiver_type) {
-        return true;
+    let call_arity = argument_count(invocation, ctx.source);
+    let explicit_generic_arity = csharp_member_name(
+        member_access_name(member_access).expect("member access name was checked"),
+    )
+    .and_then(|name| name.explicit_generic_arity);
+    let mut normalized_receivers = receiver_type_names.to_vec();
+    normalized_receivers.sort();
+    normalized_receivers.dedup();
+    let (scope_start, scope_end) = extension_visibility_site_key(name);
+    let cache_key = (
+        normalized_receivers,
+        call_arity,
+        explicit_generic_arity,
+        scope_start,
+        scope_end,
+    );
+    if let Some(resolution) = ctx.extension_target_cache.get(&cache_key) {
+        return *resolution;
     }
-    let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
-        return false;
-    };
-    let mut receiver_units = ctx
-        .csharp
-        .definition_lookup_index()
-        .by_fqn(receiver_type)
-        .iter()
-        .chain(
-            ctx.csharp
-                .definition_lookup_index()
-                .by_normalized_fqn(&csharp_normalize_full_name(receiver_type))
-                .iter(),
-        )
-        .filter(|unit| unit.is_class())
-        .cloned()
-        .collect::<Vec<_>>();
-    ctx.csharp.sort_dedup_type_candidates(&mut receiver_units);
-    if receiver_units.is_empty() {
-        return false;
+    let ordinary_member_is_applicable = receiver_type_names.iter().any(|receiver_fqn| {
+        class_unit_for_fq_name(ctx.csharp, receiver_fqn).is_some_and(|owner| {
+            nearest_member_candidates_for_owner(
+                ctx.analyzer,
+                ctx.csharp,
+                &owner,
+                &ctx.spec.member_name,
+                explicit_generic_arity,
+            )
+            .into_iter()
+            .any(|candidate| {
+                candidate.is_function()
+                    && csharp_callable_arity(ctx.analyzer, &candidate).accepts(call_arity)
+            })
+        })
+    });
+    if ordinary_member_is_applicable {
+        ctx.extension_target_cache
+            .insert(cache_key, TargetMemberResolution::KnownOther);
+        return TargetMemberResolution::KnownOther;
     }
-    receiver_units.iter().any(|receiver_unit| {
-        provider
-            .get_ancestors(receiver_unit)
-            .iter()
-            .any(|ancestor| ancestor.fq_name() == extension_receiver_type)
-    })
+    let candidates = visible_extension_method_candidates(
+        ctx.csharp,
+        ctx.analyzer,
+        ctx.file,
+        ctx.source,
+        name,
+        receiver_type_names,
+        &ctx.spec.member_name,
+        Some(call_arity),
+        explicit_generic_arity,
+        false,
+    );
+    let resolution = if candidates.contains(&ctx.spec.target) {
+        TargetMemberResolution::MatchesTarget
+    } else if candidates.is_empty() {
+        TargetMemberResolution::NotFound
+    } else {
+        TargetMemberResolution::KnownOther
+    };
+    ctx.extension_target_cache.insert(cache_key, resolution);
+    resolution
 }
 
 fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -426,18 +457,15 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node_text(node, ctx.source) != ctx.spec.member_name {
         return;
     }
-    if node.parent().is_some_and(|parent| {
-        parent.kind() == "member_access_expression" && member_access_name(parent) == Some(node)
-    }) {
+    if identifier_is_member_access_name(node) {
         return;
     }
     match ctx.spec.kind {
-        TargetKind::Method
-            if node
-                .parent()
-                .is_some_and(|parent| parent.kind() == "invocation_expression") =>
-        {
-            match unqualified_method_call_resolution(node, ctx) {
+        TargetKind::Method if csharp_unqualified_invocation_for_name(node).is_some() => {
+            let (invocation, explicit_generic_arity) =
+                csharp_unqualified_invocation_for_name(node).expect("call shape was checked");
+            match unqualified_method_call_resolution(node, invocation, explicit_generic_arity, ctx)
+            {
                 TargetMemberResolution::MatchesTarget => push_hit(node, ctx),
                 TargetMemberResolution::KnownOther => {}
                 TargetMemberResolution::NotFound => push_unproven_hit(node, ctx),
@@ -578,12 +606,14 @@ fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
 
 fn unqualified_method_call_resolution(
     node: Node<'_>,
+    invocation: Node<'_>,
+    explicit_generic_arity: Option<usize>,
     ctx: &mut ScanCtx<'_>,
 ) -> TargetMemberResolution {
-    let Some(invocation) = node.parent() else {
-        return TargetMemberResolution::NotFound;
-    };
-    if invocation.kind() != "invocation_expression" {
+    if !ctx
+        .spec
+        .accepts_explicit_generic_arity(explicit_generic_arity)
+    {
         return TargetMemberResolution::NotFound;
     }
     if ctx
@@ -611,15 +641,19 @@ fn unqualified_method_call_resolution(
         return TargetMemberResolution::KnownOther;
     }
     enclosing_declared_type(node, ctx.csharp, ctx.file, ctx.source)
-        .map(|enclosing| receiver_fqn_target_member_resolution(&enclosing.fq_name(), ctx))
+        .map(|enclosing| {
+            receiver_fqn_target_member_resolution(&enclosing.fq_name(), explicit_generic_arity, ctx)
+        })
         .unwrap_or(TargetMemberResolution::NotFound)
 }
 
 fn receiver_fqn_target_member_resolution(
     receiver_fqn: &str,
+    explicit_generic_arity: Option<usize>,
     ctx: &mut ScanCtx<'_>,
 ) -> TargetMemberResolution {
-    if let Some(resolution) = ctx.nearest_member_target_cache.get(receiver_fqn) {
+    let key = (receiver_fqn.to_string(), explicit_generic_arity);
+    if let Some(resolution) = ctx.nearest_member_target_cache.get(&key) {
         return *resolution;
     }
     let resolution = class_unit_for_fq_name(ctx.csharp, receiver_fqn)
@@ -629,6 +663,7 @@ fn receiver_fqn_target_member_resolution(
                 ctx.csharp,
                 &receiver_owner,
                 &ctx.spec.member_name,
+                explicit_generic_arity,
             )
         })
         .map(|candidates| {
@@ -641,9 +676,18 @@ fn receiver_fqn_target_member_resolution(
             }
         })
         .unwrap_or(TargetMemberResolution::NotFound);
-    ctx.nearest_member_target_cache
-        .insert(receiver_fqn.to_string(), resolution);
+    ctx.nearest_member_target_cache.insert(key, resolution);
     resolution
+}
+
+fn identifier_is_member_access_name(node: Node<'_>) -> bool {
+    let name_node = node
+        .parent()
+        .filter(|parent| parent.kind() == "generic_name")
+        .unwrap_or(node);
+    name_node.parent().is_some_and(|parent| {
+        parent.kind() == "member_access_expression" && member_access_name(parent) == Some(name_node)
+    })
 }
 
 enum LabelOwnerResolution {

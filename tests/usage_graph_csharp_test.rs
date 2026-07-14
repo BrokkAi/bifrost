@@ -217,6 +217,258 @@ public sealed class GenericConsumer : Box<int> {
 }
 
 #[test]
+fn inverted_graph_resolves_explicit_generic_calls_and_their_return_types() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo.cs",
+            r#"
+using Imported;
+
+namespace Demo;
+
+public sealed class Source {}
+
+public sealed class BlockedSource {
+    public void Filter<T>(T value) {}
+}
+
+public sealed class GenericResult {
+    public void GenericOnly() {}
+}
+
+public sealed class Box<T> {
+    public void BoxOnly() {}
+}
+
+public sealed class PlainResult {}
+
+public static class Factory {
+    public static T Create<T>() => default(T);
+    public static T[] CreateArray<T>() => new T[0];
+    public static Box<T> CreateBox<T>() => new Box<T>();
+    public static GenericResult? CreateNullable() => new GenericResult();
+    public static PlainResult Create() => new PlainResult();
+}
+
+public class BaseFactory {
+    public sealed class NestedResult {
+        public void NestedOnly() {}
+    }
+
+    protected NestedResult Build<T>() => new NestedResult();
+}
+
+public class Base {
+    protected void Pick<T>(int value) {}
+}
+
+public sealed class Consumer : Base {
+    private void Pick(int value) {}
+
+    public void Run(Demo.Source source, Demo.BlockedSource blocked) {
+        source.Select<int>(1);
+        blocked.Filter<int>(1);
+        Factory.Create<GenericResult>().GenericOnly();
+        Pick<int>(1);
+    }
+
+    public void RunWrapped() {
+        Factory.CreateArray<GenericResult>().GenericOnly();
+    }
+
+    public void RunBoxed() {
+        Factory.CreateBox<GenericResult>().BoxOnly();
+    }
+
+    public void RunNullable() {
+        Factory.CreateNullable().GenericOnly();
+    }
+
+    public void RunWrongArityOnly() {
+        Missing<int>(1);
+    }
+
+    private void Missing(int value) {}
+}
+
+public sealed class DerivedFactory : BaseFactory {
+    public void Run() {
+        Build<int>().NestedOnly();
+    }
+}
+"#,
+        )
+        .file(
+            "Extensions.cs",
+            r#"
+namespace Imported {
+    public static class Extensions {
+        public static T Select<T>(this Demo.Source source, T value) => value;
+        public static T Filter<T>(this Demo.BlockedSource source, T value) => value;
+    }
+}
+
+namespace Other {
+    public static class Extensions {
+        public static T Select<T>(this Demo.Source source, T value) => value;
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "Demo.DerivedFactory.Run",
+            "Demo.BaseFactory$NestedResult.NestedOnly"
+        ),
+        "inherited generic return types should resolve nested types from the declaring owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "Demo.Consumer.RunWrapped",
+            "Demo.GenericResult.GenericOnly"
+        ),
+        "an array-wrapped method type parameter must not seed the bare result type: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Consumer.RunBoxed", "Demo.Box`1.BoxOnly"),
+        "constructed generic return facts should retain the generic owner: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "Demo.Consumer.RunNullable",
+            "Demo.GenericResult.GenericOnly"
+        ),
+        "nullable concrete return facts should retain the underlying owner: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Consumer.Run", "Imported.Extensions.Select"),
+        "generic extension calls should edge to the visible imported declaration: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.Consumer.Run", "Other.Extensions.Select"),
+        "a nonvisible competing extension must not receive an edge: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Consumer.Run", "Demo.BlockedSource.Filter"),
+        "an applicable generic instance method should receive the call edge: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.Consumer.Run", "Imported.Extensions.Filter"),
+        "an applicable instance method must suppress extension fallback: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "Demo.Consumer.Run",
+            "Demo.GenericResult.GenericOnly"
+        ),
+        "generic return-type inference should preserve the selected overload: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Consumer.Run", "Demo.Base.Pick"),
+        "wrong generic arity on the derived member must not hide the base call: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.Consumer.Run", "Demo.Consumer.Pick"),
+        "the explicit generic call must not edge to the nongeneric sibling: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "Demo.Consumer.RunWrongArityOnly",
+            "Demo.Consumer.Missing"
+        ),
+        "a call with incompatible explicit generic arity must not synthesize an edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn inverted_graph_scopes_extensions_to_the_call_site_namespace() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Declarations.cs",
+            r#"
+namespace Demo {
+    public sealed class Source {}
+}
+
+namespace Imported {
+    public static class Extensions {
+        public static T Select<T>(this Demo.Source source, T value) => value;
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers.cs",
+            r#"
+namespace Shared {
+    using Imported;
+
+    public sealed class ImportedConsumer {
+        public void Run(Demo.Source source) {
+            source.Select<int>(1);
+        }
+    }
+}
+
+namespace Shared {
+    public sealed class SiblingConsumer {
+        public void Run(Demo.Source source) {
+            source.Select<int>(2);
+        }
+    }
+}
+
+namespace Other {
+    public sealed class OtherConsumer {
+        public void Run(Demo.Source source) {
+            source.Select<int>(3);
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "Shared.ImportedConsumer.Run",
+            "Imported.Extensions.Select"
+        ),
+        "the namespace containing the using should resolve the extension: {}",
+        value["edges"]
+    );
+    for caller in ["Shared.SiblingConsumer.Run", "Other.OtherConsumer.Run"] {
+        assert!(
+            !has_edge(&value, caller, "Imported.Extensions.Select"),
+            "a namespace-scoped using must not leak into {caller}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn receiver_typing_is_type_based_not_name_based() {
     let value = usage_graph();
 

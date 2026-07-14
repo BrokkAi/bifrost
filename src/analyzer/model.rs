@@ -249,6 +249,10 @@ pub struct SignatureMetadata {
     declaration_only: bool,
     #[serde(default)]
     callable_arity: Option<CallableArity>,
+    #[serde(default)]
+    type_parameters: Vec<String>,
+    #[serde(default)]
+    bare_return_type_parameter: Option<String>,
 }
 
 impl SignatureMetadata {
@@ -259,6 +263,8 @@ impl SignatureMetadata {
             return_type_text: None,
             declaration_only: false,
             callable_arity: None,
+            type_parameters: Vec::new(),
+            bare_return_type_parameter: None,
         }
     }
 
@@ -296,6 +302,8 @@ impl SignatureMetadata {
             return_type_text: None,
             declaration_only: false,
             callable_arity: None,
+            type_parameters: Vec::new(),
+            bare_return_type_parameter: None,
         }
     }
 
@@ -317,6 +325,22 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_type_parameters(mut self, type_parameters: Vec<String>) -> Self {
+        self.type_parameters = type_parameters;
+        self
+    }
+
+    pub fn with_bare_return_type_parameter(
+        mut self,
+        bare_return_type_parameter: Option<impl Into<String>>,
+    ) -> Self {
+        self.bare_return_type_parameter = bare_return_type_parameter
+            .map(Into::into)
+            .map(|parameter| parameter.trim().to_string())
+            .filter(|parameter| !parameter.is_empty());
+        self
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -335,6 +359,14 @@ impl SignatureMetadata {
 
     pub fn callable_arity(&self) -> Option<CallableArity> {
         self.callable_arity
+    }
+
+    pub fn type_parameters(&self) -> &[String] {
+        &self.type_parameters
+    }
+
+    pub fn bare_return_type_parameter(&self) -> Option<&str> {
+        self.bare_return_type_parameter.as_deref()
     }
 }
 

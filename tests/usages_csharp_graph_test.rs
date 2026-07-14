@@ -1117,6 +1117,711 @@ namespace Demo.Runtime {
 }
 
 #[test]
+fn usage_finder_csharp_finds_explicit_generic_static_method_invocation() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/PsHelpers.cs",
+            r#"
+namespace Demo {
+    public sealed class CommandInvocation { }
+    public sealed class ScriptResult {
+        public void ResultOnly() { }
+    }
+
+    public static class PsHelpers {
+        public static T RunScript<T>(CommandInvocation command, string script) => default(T);
+        public static object RunScript(CommandInvocation command, string script) => new object();
+    }
+
+    public static class Factory {
+        public static T Create<T>() => default(T);
+    }
+}
+"#,
+        ),
+        (
+            "Demo/Consumer.cs",
+            r#"
+namespace Demo {
+    public sealed class Consumer {
+        public T Forward<T>(CommandInvocation command, string script) {
+            return PsHelpers.RunScript<T>(command, script);
+        }
+
+        public void Chain(CommandInvocation command, string script) {
+            Factory.Create<ScriptResult>().ResultOnly();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let mut run_script_signatures = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Function && unit.fq_name() == "Demo.PsHelpers.RunScript"
+        })
+        .filter_map(|unit| unit.signature().map(str::to_string))
+        .collect::<Vec<_>>();
+    run_script_signatures.sort();
+    assert_eq!(
+        run_script_signatures,
+        vec![
+            "(CommandInvocation, string)".to_string(),
+            "`1(CommandInvocation, string)".to_string(),
+        ],
+        "generic arity must distinguish otherwise identical overloads"
+    );
+    let target = member_function_with_signature(
+        &analyzer,
+        "Demo.PsHelpers",
+        "RunScript",
+        "`1(CommandInvocation, string)",
+    );
+    let consumer = project.file("Demo/Consumer.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let use_start = source.find("RunScript<T>").expect("explicit generic call");
+    let chained_start = source.find("ResultOnly()").expect("chained generic return");
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Consumer.cs",
+        use_start,
+        use_start + "RunScript".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "explicit generic arity should select one overload: {forward}"
+    );
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.PsHelpers.RunScript",
+        "{forward}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect()
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("explicit generic static method query should resolve");
+    assert_eq!(1, hits.len(), "expected one exact inverse hit: {hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= use_start
+                && use_start + "RunScript".len() <= hit.end_offset
+        }),
+        "inverse lookup should cover the generic method identifier: {hits:#?}"
+    );
+
+    drop(analyzer);
+    let reopened = CSharpAnalyzer::from_project(project.project().clone());
+    let mut persisted_signatures = reopened
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Function && unit.fq_name() == "Demo.PsHelpers.RunScript"
+        })
+        .filter_map(|unit| unit.signature().map(str::to_string))
+        .collect::<Vec<_>>();
+    persisted_signatures.sort();
+    assert_eq!(
+        persisted_signatures, run_script_signatures,
+        "persisted declaration identity must retain both generic-arity overloads"
+    );
+    let chained = member_function_with_arity(&reopened, "Demo.ScriptResult", "ResultOnly", 0);
+    let persisted_hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &reopened,
+            std::slice::from_ref(&chained),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("persisted generic return query should resolve");
+    assert!(
+        persisted_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= chained_start
+                && chained_start + "ResultOnly".len() <= hit.end_offset
+        }),
+        "persisted type-parameter metadata must retain chained return inference: {persisted_hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_resolves_unqualified_and_inherited_generic_methods() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/Base.cs",
+            r#"
+namespace Demo {
+    public class Base {
+        protected T Pick<T>(int value) => default(T);
+    }
+}
+"#,
+        ),
+        (
+            "Demo/Consumer.cs",
+            r#"
+namespace Demo {
+    public sealed class Consumer : Base {
+        protected object Pick(int value) => new object();
+        private T Identity<T>(T value) => value;
+
+        public T Run<T>(T value) {
+            var inherited = Pick<T>(1);
+            return Identity(value);
+        }
+    }
+}
+"#,
+        ),
+    ]);
+    let inherited = member_function_with_signature(&analyzer, "Demo.Base", "Pick", "`1(int)");
+    let inferred = member_function_with_signature(&analyzer, "Demo.Consumer", "Identity", "`1(T)");
+    let consumer = project.file("Demo/Consumer.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let inherited_start = source.find("Pick<T>").expect("inherited generic call");
+    let inferred_start = source
+        .find("Identity(value)")
+        .expect("inferred generic call");
+
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Consumer.cs",
+        inherited_start,
+        inherited_start + "Pick".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.Base.Pick",
+        "a nearer wrong-generic-arity member must not hide the matching base method: {forward}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    for (target, expected_start) in [(inherited, inherited_start), (inferred, inferred_start)] {
+        let hits = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result
+            .into_either()
+            .expect("generic method query should resolve");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= expected_start
+                    && expected_start + target.identifier().len() <= hit.end_offset
+            }),
+            "inverse lookup should find the generic call for {target:?}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn usage_finder_csharp_resolves_explicit_generic_extension_and_chained_return_type() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/Declarations.cs",
+            r#"
+namespace Demo {
+    public sealed class Source {
+        public void Select(int value) { }
+    }
+
+    public sealed class BlockedSource {
+        public void Filter<T>(T value) { }
+    }
+
+    public sealed class GenericResult {
+        public void GenericOnly() { }
+    }
+
+    public sealed class Box<T> {
+        public void BoxOnly() { }
+    }
+
+    public sealed class PlainResult { }
+
+    public static class Factory {
+        public static T Create<T>() => default(T);
+        public static T[] CreateArray<T>() => new T[0];
+        public static Box<T> CreateBox<T>() => new Box<T>();
+        public static GenericResult? CreateNullable() => new GenericResult();
+        public static PlainResult Create() => new PlainResult();
+    }
+
+    public class BaseFactory {
+        public sealed class NestedResult {
+            public void NestedOnly() { }
+        }
+
+        protected NestedResult Build<T>() => new NestedResult();
+    }
+}
+
+namespace Imported {
+    public static class Extensions {
+        public static T Select<T>(this Demo.Source source, T value) => value;
+        public static T Filter<T>(this Demo.BlockedSource source, T value) => value;
+    }
+}
+
+namespace Other {
+    public static class Extensions {
+        public static T Select<T>(this Demo.Source source, T value) => value;
+    }
+}
+"#,
+        ),
+        (
+            "Demo/Consumer.cs",
+            r#"
+using Imported;
+
+namespace Demo {
+    public sealed class Consumer {
+        public void Run(Source source, BlockedSource blocked) {
+            source.Select<int>(1);
+            blocked.Filter<int>(1);
+            Factory.Create<GenericResult>().GenericOnly();
+            Factory.CreateArray<GenericResult>().GenericOnly();
+            Factory.CreateBox<GenericResult>().BoxOnly();
+            Factory.CreateNullable().GenericOnly();
+        }
+    }
+
+    public sealed class DerivedFactory : BaseFactory {
+        public void Run() {
+            Build<int>().NestedOnly();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+    let extension = member_function_matching_signature(
+        &analyzer,
+        "Imported.Extensions",
+        "Select",
+        |signature| signature.is_some_and(|signature| signature.contains("Demo.Source")),
+    );
+    let blocked_extension = member_function_matching_signature(
+        &analyzer,
+        "Imported.Extensions",
+        "Filter",
+        |signature| signature.is_some_and(|signature| signature.contains("Demo.BlockedSource")),
+    );
+    let hidden_extension =
+        member_function_matching_signature(&analyzer, "Other.Extensions", "Select", |signature| {
+            signature.is_some_and(|signature| signature.starts_with("`1("))
+        });
+    let chained = member_function_with_arity(&analyzer, "Demo.GenericResult", "GenericOnly", 0);
+    let boxed = member_function_with_arity(&analyzer, "Demo.Box`1", "BoxOnly", 0);
+    let inherited_chained =
+        member_function_with_arity(&analyzer, "Demo.BaseFactory$NestedResult", "NestedOnly", 0);
+    let consumer = project.file("Demo/Consumer.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let extension_start = source.find("Select<int>").expect("generic extension call");
+    let blocked_start = source
+        .find("blocked.Filter<int>")
+        .map(|start| start + "blocked.".len())
+        .expect("instance-precedence call");
+    let chained_start = source.find("GenericOnly()").expect("chained member call");
+    let wrapped_start = source
+        .find("CreateArray<GenericResult>().GenericOnly()")
+        .map(|start| start + "CreateArray<GenericResult>().".len())
+        .expect("wrapped generic return call");
+    let boxed_start = source.find("BoxOnly()").expect("constructed return call");
+    let nullable_start = source
+        .find("CreateNullable().GenericOnly()")
+        .map(|start| start + "CreateNullable().".len())
+        .expect("nullable return call");
+    let inherited_start = source.find("NestedOnly()").expect("inherited chained call");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for (expected_start, expected_fqn) in [
+        (extension_start, "Imported.Extensions.Select"),
+        (blocked_start, "Demo.BlockedSource.Filter"),
+        (chained_start, "Demo.GenericResult.GenericOnly"),
+        (boxed_start, "Demo.Box`1.BoxOnly"),
+        (nullable_start, "Demo.GenericResult.GenericOnly"),
+        (inherited_start, "Demo.BaseFactory$NestedResult.NestedOnly"),
+    ] {
+        let forward = definition_lookup(
+            project.root(),
+            "Demo/Consumer.cs",
+            expected_start,
+            expected_start + expected_fqn.rsplit('.').next().unwrap().len(),
+        );
+        assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+        assert_eq!(
+            forward["results"][0]["definitions"][0]["fqn"], expected_fqn,
+            "{forward}"
+        );
+    }
+
+    let wrapped_forward = definition_lookup(
+        project.root(),
+        "Demo/Consumer.cs",
+        wrapped_start,
+        wrapped_start + "GenericOnly".len(),
+    );
+    assert_eq!(
+        wrapped_forward["results"][0]["status"], "no_definition",
+        "an array-wrapped method type parameter must not be substituted as bare T: {wrapped_forward}"
+    );
+
+    for (target, expected_start) in [
+        (extension, extension_start),
+        (chained.clone(), chained_start),
+        (boxed, boxed_start),
+        (inherited_chained, inherited_start),
+    ] {
+        let hits = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result
+            .into_either()
+            .expect("generic call query should resolve");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= expected_start
+                    && expected_start + target.identifier().len() <= hit.end_offset
+            }),
+            "inverse lookup should find the generic call for {target:?}: {hits:#?}"
+        );
+    }
+
+    let blocked_extension_hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&blocked_extension),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("blocked extension query should resolve");
+    assert!(
+        blocked_extension_hits.is_empty(),
+        "an applicable instance method must take precedence over an imported extension: {blocked_extension_hits:#?}"
+    );
+
+    let chained_hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&chained),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("chained member query should resolve");
+    assert!(
+        chained_hits.iter().all(|hit| {
+            hit.file != consumer
+                || wrapped_start + "GenericOnly".len() <= hit.start_offset
+                || hit.end_offset <= wrapped_start
+        }),
+        "a T[] return must not create a GenericResult member hit: {chained_hits:#?}"
+    );
+    assert!(
+        chained_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= nullable_start
+                && nullable_start + "GenericOnly".len() <= hit.end_offset
+        }),
+        "nullable concrete return facts must retain chained receiver typing: {chained_hits:#?}"
+    );
+
+    let hidden_hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&hidden_extension),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("nonvisible extension query should resolve");
+    assert!(
+        hidden_hits.is_empty(),
+        "an extension outside the consumer import scope must not be proven: {hidden_hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_scopes_extensions_to_the_call_site_namespace() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/Declarations.cs",
+            r#"
+namespace Demo {
+    public sealed class Source { }
+}
+
+namespace Imported {
+    public static class Extensions {
+        public static T Select<T>(this Demo.Source source, T value) => value;
+    }
+}
+"#,
+        ),
+        (
+            "Demo/Consumers.cs",
+            r#"
+namespace Shared {
+    using Imported;
+
+    public sealed class ImportedConsumer {
+        public void Run(Demo.Source source) {
+            source.Select<int>(1);
+        }
+    }
+}
+
+namespace Shared {
+    public sealed class SiblingConsumer {
+        public void Run(Demo.Source source) {
+            source.Select<int>(2);
+        }
+    }
+}
+
+namespace Other {
+    public sealed class OtherConsumer {
+        public void Run(Demo.Source source) {
+            source.Select<int>(3);
+        }
+    }
+}
+"#,
+        ),
+    ]);
+    let extension = member_function_matching_signature(
+        &analyzer,
+        "Imported.Extensions",
+        "Select",
+        |signature| signature.is_some_and(|signature| signature.starts_with("`1(")),
+    );
+    let consumers = project.file("Demo/Consumers.cs");
+    let source = consumers.read_to_string().expect("consumer source");
+    let calls = source
+        .match_indices("Select<int>")
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 3);
+
+    for (index, expected_status) in ["resolved", "no_definition", "no_definition"]
+        .into_iter()
+        .enumerate()
+    {
+        let forward = definition_lookup(
+            project.root(),
+            "Demo/Consumers.cs",
+            calls[index],
+            calls[index] + "Select".len(),
+        );
+        assert_eq!(
+            forward["results"][0]["status"], expected_status,
+            "call-site namespace scope should control extension visibility: {forward}"
+        );
+    }
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumers.clone()).collect()));
+    let hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&extension),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("namespace-scoped extension query should resolve");
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the importing namespace may prove a hit"
+    );
+    let hit = hits.iter().next().expect("one imported extension hit");
+    assert!(
+        hit.start_offset <= calls[0] && calls[0] + "Select".len() <= hit.end_offset,
+        "the proven hit should be the call in the importing namespace: {hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_extension_visibility_handles_file_scoped_namespace_frames() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/Declarations.cs",
+            r#"
+namespace Demo {
+    public sealed class Source { }
+}
+
+namespace RootImported {
+    public static class Extensions {
+        public static T RootOnly<T>(this Demo.Source source, T value) => value;
+    }
+}
+
+namespace File.Scope {
+    public static class Extensions {
+        public static T SameOnly<T>(this Demo.Source source, T value) => value;
+    }
+}
+
+namespace File {
+    public static class Extensions {
+        public static T ParentOnly<T>(this Demo.Source source, T value) => value;
+    }
+}
+
+namespace PostImported {
+    public static class Extensions {
+        public static T PostOnly<T>(this Demo.Source source, T value) => value;
+    }
+}
+
+namespace GlobalImported {
+    public static class Extensions {
+        public static T GlobalOnly<T>(this Demo.Source source, T value) => value;
+    }
+}
+"#,
+        ),
+        (
+            "Demo/GlobalUsings.cs",
+            "global using global::GlobalImported;\n",
+        ),
+        (
+            "Demo/FileScoped.cs",
+            r#"
+using RootImported;
+namespace File.Scope;
+using PostImported;
+
+public sealed class Consumer {
+    public void Run(Demo.Source source) {
+        source.RootOnly<int>(1);
+        source.SameOnly<int>(2);
+        source.ParentOnly<int>(3);
+        source.PostOnly<int>(4);
+        source.GlobalOnly<int>(5);
+    }
+}
+"#,
+        ),
+    ]);
+    let consumer = project.file("Demo/FileScoped.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for (namespace, method) in [
+        ("RootImported", "RootOnly"),
+        ("File.Scope", "SameOnly"),
+        ("File", "ParentOnly"),
+        ("PostImported", "PostOnly"),
+        ("GlobalImported", "GlobalOnly"),
+    ] {
+        let target = member_function_matching_signature(
+            &analyzer,
+            &format!("{namespace}.Extensions"),
+            method,
+            |signature| signature.is_some_and(|signature| signature.starts_with("`1(")),
+        );
+        let start = source
+            .find(&format!("{method}<int>"))
+            .expect("file-scoped extension call");
+        let forward = definition_lookup(
+            project.root(),
+            "Demo/FileScoped.cs",
+            start,
+            start + method.len(),
+        );
+        assert_eq!(
+            forward["results"][0]["status"], "resolved",
+            "{method} should resolve through its lexical extension frame: {forward}"
+        );
+        assert_eq!(
+            forward["results"][0]["definitions"][0]["fqn"],
+            format!("{namespace}.Extensions.{method}"),
+            "{forward}"
+        );
+        let hits = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result
+            .into_either()
+            .expect("file-scoped extension query should resolve");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= start
+                    && start + method.len() <= hit.end_offset
+            }),
+            "{method} should be proven from the same lexical frame: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn usage_finder_csharp_finds_as_expression_type_in_authoritative_and_default_scope() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (
