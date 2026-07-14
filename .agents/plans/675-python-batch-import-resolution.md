@@ -40,6 +40,9 @@ resolution work.
 - [x] (2026-07-14) Follow explicit named re-export chains through existing import
   binders before the generic export resolver, with regression coverage that keeps
   the generic receiver fallback at zero.
+- [x] (2026-07-14) Short-circuit scope-fact import resolution after direct
+  definitions or explicit reexports, so it does not eagerly construct Python export
+  indexes for every named import.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -92,6 +95,17 @@ resolution work.
   ambiguous shapes continue to use the established resolver.
   Evidence: `/private/tmp/bifrost-675-exact-indexed.sample.txt`.
 
+- Observation: Scope-fact construction had an eager iterator chain that invoked
+  `resolve_exported_fqn` even after `analyzer.definitions` had found the imported
+  class. After short-circuiting through direct definitions and named reexports,
+  `export_index_of` is no longer the dominant sampled receiver work. A 20-file,
+  100-site, 20-target warmed smoke was still stopped after nearly five minutes with
+  no JSONL record; its remaining cost was one-time `MultiAnalyzer` global declaration
+  hydration and `python_module_name`, not generic import binding.
+  Evidence: `/private/tmp/bifrost-675-direct-reexport.sample.txt`,
+  `/private/tmp/bifrost-675-short-circuit.sample.txt`, and
+  `/private/tmp/bifrost-675-short-circuit-later.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -137,6 +151,13 @@ resolution work.
   retain the existing comprehensive behavior.
   Date/Author: 2026-07-14 / Codex
 
+- Decision: Make scope-fact imported-factory lookup short-circuit in priority order:
+  direct definition, explicit named reexport, then the existing generic export walk.
+  Rationale: The old iterator chain evaluated every source even when the direct
+  result was enough. The ordering preserves the generic fallback while avoiding its
+  parse and index construction cost for ordinary named imports.
+  Date/Author: 2026-07-14 / Codex
+
 ## Outcomes & Retrospective
 
 The implementation is complete and the new focused behavior is covered. A
@@ -146,11 +167,11 @@ binder's exact named import map, then same-file classes, and only then takes the
 unchanged shared graph-resolver fallback. The context remains removed after its last
 request, so no cache survives the batch-file lifecycle.
 
-The full validation and acceptance benchmark remains pending. The direct named import
-path is covered, including an explicit facade re-export, but only a completed warmed
-smoke can establish whether the remaining generic resolver work is now below the
-typed receiver path. Do not close #675 or start the full limits before that record
-exists.
+The full validation and acceptance benchmark remains pending. The receiver path is
+now covered for direct imports and explicit facade reexports, and the sampled generic
+export work is no longer dominant. The current blocker is one-time global declaration
+hydration in `MultiAnalyzer`, so do not close #675 or start the full limits before a
+separate bounded approach to that workspace-wide setup produces a completed record.
 
 ## Context and Orientation
 
