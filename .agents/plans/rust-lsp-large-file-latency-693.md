@@ -16,6 +16,10 @@ Rust definition and hover requests should remain interactive after Bifrost finis
 - [x] (2026-07-12 19:47Z) Implemented one-parse export visibility collection, preserved cross-file public-module ancestry, and added synthetic plus exact-reproduction LSP coverage.
 - [x] (2026-07-12 20:01Z) Re-ran the exact reproduction and focused tests, then passed formatting, all-target/all-feature clippy, and the feature-complete `nlp,python` test suite.
 - [x] (2026-07-12 20:02Z) Committed only the issue #693 implementation, tests, harness support, and this ExecPlan on the current `master` branch; a final follow-up commit records the clippy-only test cleanup and completed plan.
+- [x] (2026-07-14 08:10Z) Re-profiled current HEAD against the exact LGTM checkout and isolated a residual open-overlay hotspot after the original export-projection fix.
+- [x] (2026-07-14 08:48Z) Cached overlay content identity for one analyzer query, scoped synchronous analyzer-backed LSP dispatch and the references worker, isolated cloned-project query caches, and added operation-count regressions for nesting, freshness, and snapshots.
+- [x] (2026-07-14 09:20Z) Re-ran the synthetic overlay regression and exact release profile, then passed formatting, all-target/all-feature clippy, focused Rust/LSP coverage, and the feature-complete test suite.
+- [ ] Commit the residual issue #693 implementation, tests, profile evidence, and updated ExecPlan on the current issue branch.
 
 ## Surprises & Discoveries
 
@@ -33,6 +37,18 @@ Rust definition and hover requests should remain interactive after Bifrost finis
 
 - Observation: The corrected implementation reduced the first exact definition request from 10,601 ms to 128.6 ms in release mode, an approximately 82-fold improvement; the export-index phase itself fell from roughly 10.5 seconds to 32.4 ms.
   Evidence: The ignored exact-reproduction driver in `tests/issue_693_profile.rs` returned the same `config.rs` field locations and hover content before and after the change.
+
+- Observation: Current HEAD no longer reproduces the original stall, but an open `textDocument/didOpen` overlay still makes definition and hover repeatedly hash the entire 7,672-line buffer while scanning declaration ranges.
+  Evidence: A macOS sample placed 370 of 1,133 request samples in declaration-site selection, with repeated `TreeSitterAnalyzer::ranges` calls descending through `resolve_live_oid_for_file` and libgit2 SHA-1 hashing. A temporary query-scope and overlay-OID cache experiment reduced debug definitions from 1.1-2.0 seconds to 0.34-0.45 seconds and hovers from about 1.0 second to 0.21-0.25 seconds.
+
+- Observation: The existing exact profiler did not send `textDocument/didOpen`, so its 66-129 ms results exercised disk-backed source identity rather than the residual overlay path used by editors.
+  Evidence: `tests/issue_693_profile.rs::profile_lgtm_large_rust_definition_and_hover` started the server and issued requests directly without opening the document.
+
+- Observation: Request-scoped live-OID reuse removes the residual overlay cost without weakening freshness. On the exact checkout with `main.rs` opened as an overlay, all four release requests completed in 53.5-72.9 ms and returned the expected `config.rs` fields.
+  Evidence: Definition requests took 72.9 ms for `font` and 67.4 ms for `mono_family`; hover requests took 53.5 ms and 59.2 ms. Before the change, the same overlay path took 1.1-2.0 seconds for definition and about 1.0 second for hover in the debug-profile sampling run.
+
+- Observation: The local macOS command environment mixed rustup `cargo`/`rustc` with Homebrew `cargo-clippy`/`clippy-driver`, and PyO3's `extension-module` feature intentionally omitted libpython link lines for test executables.
+  Evidence: The initial clippy run failed with E0514 before checking Bifrost; pinning all Rust executables to the rustup toolchain passed. The full suite passed after explicitly linking the installed Python 3.14 dylib. A first full-suite attempt in a temporary target was interrupted when that target disappeared mid-run, while the persistent-target rerun completed successfully.
 
 ## Decision Log
 
@@ -52,9 +68,13 @@ Rust definition and hover requests should remain interactive after Bifrost finis
   Rationale: The ignored test preserves reproducible before/after evidence without vendoring external source, while the synthetic test continuously checks correct definition, correct hover, and a generous five-second catastrophic-regression bound on every machine.
   Date/Author: 2026-07-12 / Codex
 
+- Decision: Reuse the existing request-scoped `AnalyzerQueryScope`, consult its live-OID cache before hashing overlays, and give `clone_with_project` snapshots an independent query cache.
+  Rationale: This removes repeated work without making overlay identities persistent. Independent caches preserve correctness when the main LSP thread and a background references request operate on different frozen overlay generations.
+  Date/Author: 2026-07-14 / Codex
+
 ## Outcomes & Retrospective
 
-Issue #693 is fixed and fully validated. The exact LGTM field query now resolves in 128.6 ms rather than 10.6 seconds in the same release-profile environment, and subsequent definition/hover requests take 66-68 ms. The generated real-LSP scale regression completes in 0.24 seconds in the debug test profile and verifies both the field definition and nested-field hover. Formatting, all-target/all-feature clippy, all 108 Rust usage graph tests, all 25 active Rust go-to-definition tests, and the complete `cargo test --features nlp,python` run pass. The key lesson is that an apparently request-local Rust inference stall was caused by a shared export projection repeatedly parsing the same source; phase-level profiling prevented an ineffective resolver-specific optimization.
+The original issue #693 stall and the residual open-overlay hashing cost are fixed and fully validated. The first exact disk-backed LGTM field query fell from 10.6 seconds to 128.6 ms with the original export-projection change. With `main.rs` now opened through `textDocument/didOpen`, the follow-up release profile returns correct `config.rs` field targets in 67.4-72.9 ms and hover content in 53.5-59.2 ms. The analyzer operation-count tests prove that a request hashes one overlay identity, nested scopes retain it, the next outer request observes changed content, and frozen snapshots have independent caches. The generated real-LSP scale regression exercises the overlay path and retains its five-second CI guard. Formatting, all-target/all-feature clippy, focused analyzer/LSP/Rust-definition tests, and the complete `cargo test --features nlp,python` run pass.
 
 ## Context and Orientation
 
@@ -71,6 +91,8 @@ First build the current server in an optimized-enough configuration that does no
 Next translate the profile into a root-cause change. Prefer bounded indexes, one-pass AST fact collection, or cached per-file structured state over repeated whole-file walks. Preserve exact Rust semantics and cross-platform path behavior. Do not introduce regular expressions, source splitting, manual delimiter parsing, or a timeout that merely suppresses work.
 
 Add behavior-focused coverage through the existing real LSP harness in `tests/common/lsp_client.rs` or, if tighter measurement requires direct analyzer control, through `InlineTestProject` from `tests/common/inline_project.rs`. The regression must exercise enough repeated Rust structure to fail or demonstrate the superlinear behavior before the fix, assert correct definition and hover results, and include a generous latency or operation-bound guard that is stable in CI. Avoid checking internal registry membership or exact incidental ordering.
+
+For the residual overlay milestone, enter `AnalyzerQueryScope` around central synchronous analyzer-backed LSP dispatch and around the background references worker. Keep handler-local scopes because handlers also have direct callers and nested scopes are supported. Resolve live file identity from the active request cache before reading and hashing an overlay, and retain the computed overlay or disk OID until the outer scope ends. Reset the query cache in `clone_with_project` so concurrent frozen overlay snapshots cannot reuse another generation's OID. Exercise the behavior with a counting overlay project and make the synthetic and exact LSP profiles send `textDocument/didOpen`.
 
 Finally repeat the external profile and record before/after times. Run the focused regression, existing Rust definition tests, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `UV_CACHE_DIR=/tmp/bifrost-uv-cache BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python`. Fix any failure attributable to this change before committing.
 
@@ -121,6 +143,15 @@ Local release-profile transcript on the full 7,672-line file at the exact revisi
     After:  definition cfg.font   128.6 ms; export_index_of_declarations 32.4 ms
     After:  definition mono_family 68.3 ms; hover requests 65.8 ms and 66.5 ms
 
+Residual open-overlay profile on the same checkout:
+
+    Before (debug): definition requests 1.1-2.0 s; hover requests about 1.0 s
+    Temporary scoped-cache experiment (debug): definitions 0.34-0.45 s; hovers 0.21-0.25 s
+    After (release): definition font 72.9 ms; definition mono_family 67.4 ms
+    After (release): hover font 53.5 ms; hover mono_family 59.2 ms
+
+The post-change release run used `BIFROST_ISSUE_693_ROOT=/Users/dave/Workspace/test-repos/lgtm`, opened `crates/app/src/main.rs` as an overlay, and verified both definitions still point to the expected fields in `config.rs`. All requests are below the 500 ms idle-machine acceptance bound and materially below the pre-change overlay baseline.
+
 ## Interfaces and Dependencies
 
 No new external dependency is used. The existing `brokk_bifrost::profiling` module provides opt-in wall-clock scopes. Tree-sitter remains the source of syntax structure. `RustAnalyzer::export_visible_declarations` in `src/analyzer/rust/graph_support.rs` reads and parses one source file once and returns the export-visible CodeUnits; `RustAnalyzer::is_module_export_candidate` consumes that set plus a cache for parent modules sourced from other files.
@@ -130,3 +161,7 @@ Revision note (2026-07-12): Created the plan after issue intake and initial requ
 Revision note (2026-07-12 19:47Z): Recorded the exact profile, the repeated-parse root cause, the cross-file module correction, the chosen one-parse design, focused test results, and before/after latency evidence.
 
 Revision note (2026-07-12 20:02Z): Marked implementation and validation complete after the all-feature clippy and full `nlp,python` suite passed, and summarized the final measured outcome.
+
+Revision note (2026-07-14): Reopened the completed plan after profiling current HEAD with a real `didOpen` overlay, recorded the repeated content-hash hotspot, and fixed the follow-up design around request-scoped OID reuse and snapshot cache isolation.
+
+Revision note (2026-07-14 09:20Z): Completed the residual overlay milestone, recorded operation-count and exact-checkout evidence, and documented successful focused, clippy, formatting, and feature-complete validation.

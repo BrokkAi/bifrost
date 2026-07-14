@@ -814,6 +814,7 @@ impl<A> TreeSitterAnalyzer<A> {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut snapshot = self.clone();
         snapshot.project = project;
+        snapshot.query_read_cache = Arc::new(Mutex::new(QueryReadCache::default()));
         snapshot
     }
 }
@@ -1811,10 +1812,6 @@ where
     }
 
     fn resolve_live_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {
-        if self.project.has_overlay(file) {
-            let source = self.project.read_source(file).ok()?;
-            return Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok();
-        }
         {
             let cache = self
                 .query_read_cache
@@ -1826,7 +1823,10 @@ where
                 return oid;
             }
         }
-        let oid = if let Some(oid) = self
+        let oid = if self.project.has_overlay(file) {
+            let source = self.project.read_source(file).ok()?;
+            Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()
+        } else if let Some(oid) = self
             .store_context
             .live_paths
             .snapshot()
@@ -3700,6 +3700,67 @@ mod tests {
     use crate::analyzer::{AnalyzerConfig, IAnalyzer, JavaAnalyzer, Language, TestProject};
     use git2::{ObjectType, Oid};
     use std::path::Path;
+    use std::sync::RwLock;
+
+    #[derive(Clone)]
+    struct CountingOverlayProject {
+        delegate: TestProject,
+        source: Arc<RwLock<String>>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl CountingOverlayProject {
+        fn new(root: impl Into<std::path::PathBuf>, source: impl Into<String>) -> Self {
+            Self {
+                delegate: TestProject::new(root, Language::Rust),
+                source: Arc::new(RwLock::new(source.into())),
+                reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn set_source(&self, source: impl Into<String>) {
+            *self.source.write().expect("source lock poisoned") = source.into();
+        }
+
+        fn reset_reads(&self) {
+            self.reads.store(0, Ordering::Relaxed);
+        }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Project for CountingOverlayProject {
+        fn root(&self) -> &Path {
+            self.delegate.root()
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.delegate.analyzer_languages()
+        }
+
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.all_files()
+        }
+
+        fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.analyzable_files(language)
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            self.delegate.file_by_rel_path(rel_path)
+        }
+
+        fn read_source(&self, _file: &ProjectFile) -> std::io::Result<String> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.source.read().expect("source lock poisoned").clone())
+        }
+
+        fn has_overlay(&self, _file: &ProjectFile) -> bool {
+            true
+        }
+    }
 
     fn parse_javascript(source: &str) -> Tree {
         let mut parser = Parser::new();
@@ -4159,6 +4220,121 @@ mod tests {
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
             TRANSIENT_FILE_STATE_CACHE_CAPACITY + 2
+        );
+    }
+
+    #[test]
+    fn query_read_cache_hashes_overlay_once_and_refreshes_after_outer_scope() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+            .expect("source directory");
+        let source = "pub struct Example;\nimpl Example { pub fn value(&self) -> usize { 1 } }\n";
+        file.write(source).expect("rust source");
+        let project = Arc::new(CountingOverlayProject::new(root, source));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        project.reset_reads();
+
+        let outer_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let first_oid = analyzer
+            .resolve_live_oid_for_file(&file)
+            .expect("first overlay oid");
+        assert_eq!(
+            project.read_count(),
+            1,
+            "the first OID lookup reads the overlay"
+        );
+        assert_eq!(analyzer.resolve_live_oid_for_file(&file), Some(first_oid));
+        assert_eq!(
+            project.read_count(),
+            1,
+            "repeated OID lookup must use the query cache"
+        );
+
+        let declarations = analyzer.declarations(&file);
+        let reads_after_hydration = project.read_count();
+        for declaration in declarations {
+            assert!(!analyzer.ranges(&declaration).is_empty());
+        }
+        assert_eq!(
+            project.read_count(),
+            reads_after_hydration,
+            "range traversal must not reread the overlay"
+        );
+
+        {
+            let _inner_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            assert_eq!(analyzer.resolve_live_oid_for_file(&file), Some(first_oid));
+            assert_eq!(
+                project.read_count(),
+                reads_after_hydration,
+                "nested scopes must reuse the outer cache"
+            );
+        }
+        assert_eq!(analyzer.resolve_live_oid_for_file(&file), Some(first_oid));
+        assert_eq!(
+            project.read_count(),
+            reads_after_hydration,
+            "dropping the inner scope must retain the cache"
+        );
+        drop(outer_scope);
+
+        project.set_source(format!("{source}\n"));
+        let _next_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let next_oid = analyzer
+            .resolve_live_oid_for_file(&file)
+            .expect("updated overlay oid");
+        assert_ne!(
+            next_oid, first_oid,
+            "the next query must observe changed overlay text"
+        );
+        assert_eq!(
+            project.read_count(),
+            reads_after_hydration + 1,
+            "the next query should read the overlay once"
+        );
+    }
+
+    #[test]
+    fn clone_with_project_has_an_independent_query_read_cache() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+            .expect("source directory");
+        file.write("fn disk() {}\n").expect("rust source");
+
+        let live_project = Arc::new(CountingOverlayProject::new(&root, "fn live() {}\n"));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&live_project) as Arc<dyn Project>, RustAdapter);
+        live_project.reset_reads();
+        let _live_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let live_oid = analyzer
+            .resolve_live_oid_for_file(&file)
+            .expect("live overlay oid");
+
+        let snapshot_project = Arc::new(CountingOverlayProject::new(
+            &root,
+            "fn frozen_snapshot() {}\n",
+        ));
+        let snapshot =
+            analyzer.clone_with_project(Arc::clone(&snapshot_project) as Arc<dyn Project>);
+        snapshot_project.reset_reads();
+        let _snapshot_scope = crate::analyzer::AnalyzerQueryScope::new(&snapshot);
+        let snapshot_oid = snapshot
+            .resolve_live_oid_for_file(&file)
+            .expect("snapshot overlay oid");
+
+        assert_ne!(
+            snapshot_oid, live_oid,
+            "project snapshots must not share live OIDs"
+        );
+        assert_eq!(
+            snapshot_project.read_count(),
+            1,
+            "snapshot should read its own overlay"
         );
     }
 

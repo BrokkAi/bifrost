@@ -5,6 +5,8 @@ mod common;
 use brokk_bifrost::Language;
 use common::InlineTestProject;
 use common::lsp_client::{LspServer, uri_for};
+use serde_json::json;
+use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -21,7 +23,7 @@ fn large_rust_file_definition_and_hover_stay_interactive() {
     main.push_str("}\n");
 
     let fixture = InlineTestProject::with_language(Language::Rust)
-        .file("src/main.rs", main)
+        .file("src/main.rs", main.clone())
         .file(
             "src/config.rs",
             "pub struct Config {\n    pub font: FontConfig,\n}\npub struct FontConfig {\n    pub mono_family: String,\n}\n",
@@ -30,6 +32,18 @@ fn large_rust_file_definition_and_hover_stay_interactive() {
     let mut server = LspServer::start(fixture.root());
     let main_uri = uri_for(&fixture.file("src/main.rs").abs_path());
     let config_uri = uri_for(&fixture.file("src/config.rs").abs_path());
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": main,
+            }
+        }),
+    );
+    let _ = server.read_notification("textDocument/publishDiagnostics");
 
     let started = Instant::now();
     let definition =
@@ -75,6 +89,20 @@ fn profile_lgtm_large_rust_definition_and_hover() {
     );
 
     let uri = uri_for(&root.join("crates/app/src/main.rs"));
+    let source = fs::read_to_string(root.join("crates/app/src/main.rs"))
+        .expect("read LGTM main.rs for didOpen overlay");
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    let _ = server.read_notification("textDocument/publishDiagnostics");
     for (method, line, character) in [
         ("textDocument/definition", 42, 12),
         ("textDocument/definition", 42, 17),

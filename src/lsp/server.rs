@@ -39,8 +39,8 @@ use lsp_types::{
 use crate::analyzer::structural::query::{query_source_help_at, validate_query_source};
 use crate::analyzer::structural::{CodeQuery, CodeQueryResultItem, CodeQueryResultValue, execute};
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
-    OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, BuildProgressEvent, BuildProgressPhase, FilesystemProject,
+    MultiRootProject, OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::lsp::capabilities::server_capabilities;
@@ -679,6 +679,7 @@ fn handle_request(
     let id = req.id.clone();
     let id_for_log = format!("{id:?}");
     let method = req.method.clone();
+    let _query_scope = AnalyzerQueryScope::new(state.workspace.analyzer());
     let response = match req.method.as_str() {
         RunRqlQuery::METHOD => handle_run_rql_query_request(req, &state.workspace),
         ValidateQuery::METHOD => {
@@ -1005,6 +1006,7 @@ fn handle_references_request(
     let handle = match thread::Builder::new()
         .name("bifrost-lsp-references".to_string())
         .spawn(move || {
+            let _query_scope = AnalyzerQueryScope::new(workspace.analyzer());
             context.begin();
             let response = finish_reference_request(
                 &worker_id,
