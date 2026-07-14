@@ -3,7 +3,7 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing-declaration and direct import-file steps. It answers questions such as “find calls to this callee,” “which declaration contains them,” and “which project files directly import their files” across supported languages.
+Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing declarations, direct import-file edges, indexed type hierarchies, and declaration ownership. It answers questions such as “find calls to this callee,” “which types derive from this type,” and “which declarations are direct members of those types” across supported languages.
 
 The broader name is intentional. Future versions may add more steps backed by Bifrost's existing usage and type analyses or by future control-flow and data-flow analyses. Version 2 does not traverse call graphs, resolve arbitrary types or aliases, or prove control/data flow.
 
@@ -16,7 +16,7 @@ Use the narrowest tool that directly answers the question:
 | “Where is `Parser.parse` declared?” | `search_symbols` | Searches indexed declarations by name. |
 | “Who references this exact symbol?” | `scan_usages_by_reference` or `scan_usages_by_location` | Resolves a known declaration to reference sites from a symbol or source location. |
 | “What is the workspace caller/callee graph?” | `usage_graph` | Returns the existing whole-workspace resolved usage graph. |
-| “Which code has this shape, enclosing declaration, or direct import relationship?” | `query_code` | Matches normalized kinds and applies typed declaration/file steps. |
+| “Which code has this shape, enclosing declaration, import relationship, or indexed type/member relationship?” | `query_code` | Matches normalized kinds and applies typed declaration/file steps. |
 | “Which code is conceptually about retry policy?” | `semantic_search` | Retrieves code by meaning rather than exact structure. |
 | “Where does this literal text occur?” | `search_file_contents` | Searches source text without structural interpretation. |
 
@@ -32,7 +32,9 @@ The matcher only sees this normalized fact arena. Language-specific tree-sitter 
 
 ## Version 2 Typed Pipelines
 
-`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations, `file_of` converts matches or declarations to files, and `imports_of` / `importers_of` traverse one direct project-local file edge per step. Derived results retain seed-and-edge provenance.
+`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse direct, bounded, or transitive indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance.
+
+Semantic declaration steps intentionally stop at the analyzer's indexed declaration boundary. Seeing a reference or usage into a dependency is not evidence that the dependency declaration is indexed. Until Bifrost can target library code for indexing, unindexed library declarations are omitted rather than reconstructed from names, and their absence is not reported as a capability error.
 
 | RQL wrapper | JSON step | Input → output | Use it to |
 | --- | --- | --- | --- |

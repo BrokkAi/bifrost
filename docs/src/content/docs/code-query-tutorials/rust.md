@@ -3,7 +3,7 @@ title: Rust
 description: Query Rust calls, assignments, imports, closures, and method receivers with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 Rust maps turbofish calls, method receivers, grouped `use` declarations, closures, signed literals, and compound assignments into the normalized `query_code` model. The fixture includes both production code and a closure so containment and exclusion remain observable.
 
@@ -189,3 +189,225 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
 ```
 
 Rust does not expose `kwargs`, `decorators`, or a normalized null-literal syntax in this adapter. Queries for those shapes should retain the returned capability diagnostic and be refined to roles Rust can prove, such as `receiver`, `args`, `module`, `left`, and `right`.
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:rust/hierarchy.rs -->
+```rust
+trait QueryRoot {
+    fn query_member(&self);
+}
+
+struct QueryLeaf {
+    value: i32,
+}
+
+impl QueryRoot for QueryLeaf {
+    fn query_member(&self) {}
+}
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes :transitive true (enclosing-decl (language rust (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["rust"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","transitive":true}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 3,
+      "fq_name": "rust.QueryRoot",
+      "kind": "class",
+      "language": "rust",
+      "path": "rust/hierarchy.rs",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 7,
+            "kind": "class",
+            "path": "rust/hierarchy.rs",
+            "result_type": "structural_match",
+            "start_line": 5
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 7,
+                "fq_name": "rust.QueryLeaf",
+                "kind": "class",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 3,
+                "fq_name": "rust.QueryRoot",
+                "kind": "class",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "trait QueryRoot {",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes (enclosing-decl (language rust (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["rust"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes"},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 7,
+      "fq_name": "rust.QueryLeaf",
+      "kind": "class",
+      "language": "rust",
+      "path": "rust/hierarchy.rs",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 3,
+            "kind": "class",
+            "path": "rust/hierarchy.rs",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 3,
+                "fq_name": "rust.QueryRoot",
+                "kind": "class",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "rust.QueryLeaf",
+                "kind": "class",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 10,
+                "fq_name": "rust.QueryLeaf.query_member",
+                "kind": "function",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 10
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "rust.QueryLeaf",
+                "kind": "class",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            }
+          ]
+        },
+        {
+          "seed": {
+            "end_line": 3,
+            "kind": "class",
+            "path": "rust/hierarchy.rs",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 3,
+                "fq_name": "rust.QueryRoot",
+                "kind": "class",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "rust.QueryLeaf",
+                "kind": "class",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 6,
+                "fq_name": "rust.QueryLeaf.value",
+                "kind": "field",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "rust.QueryLeaf",
+                "kind": "class",
+                "path": "rust/hierarchy.rs",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "struct QueryLeaf {",
+      "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```

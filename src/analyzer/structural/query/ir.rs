@@ -1,7 +1,9 @@
 use super::super::kinds::{NormalizedKind, Role};
+use super::schema::QueryStepOp;
 use crate::analyzer::Language;
 use regex::Regex;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 1000;
@@ -37,41 +39,56 @@ impl QueryValueKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchyTraversal {
+    Direct,
+    Depth(NonZeroUsize),
+    Transitive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryStep {
     EnclosingDecl,
     FileOf,
     ImportsOf,
     ImportersOf,
+    Supertypes(HierarchyTraversal),
+    Subtypes(HierarchyTraversal),
+    Members,
+    Owner,
 }
 
 impl QueryStep {
-    pub const ALL: [Self; 4] = [
-        Self::EnclosingDecl,
-        Self::FileOf,
-        Self::ImportsOf,
-        Self::ImportersOf,
-    ];
+    pub fn label(&self) -> &'static str {
+        self.op().label()
+    }
 
-    pub fn label(self) -> &'static str {
+    pub fn op(&self) -> QueryStepOp {
         match self {
-            Self::EnclosingDecl => "enclosing_decl",
-            Self::FileOf => "file_of",
-            Self::ImportsOf => "imports_of",
-            Self::ImportersOf => "importers_of",
+            Self::EnclosingDecl => QueryStepOp::EnclosingDecl,
+            Self::FileOf => QueryStepOp::FileOf,
+            Self::ImportsOf => QueryStepOp::ImportsOf,
+            Self::ImportersOf => QueryStepOp::ImportersOf,
+            Self::Supertypes(_) => QueryStepOp::Supertypes,
+            Self::Subtypes(_) => QueryStepOp::Subtypes,
+            Self::Members => QueryStepOp::Members,
+            Self::Owner => QueryStepOp::Owner,
         }
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "enclosing_decl" => Some(Self::EnclosingDecl),
-            "file_of" => Some(Self::FileOf),
-            "imports_of" => Some(Self::ImportsOf),
-            "importers_of" => Some(Self::ImportersOf),
-            _ => None,
+        match QueryStepOp::from_label(label)? {
+            QueryStepOp::EnclosingDecl => Some(Self::EnclosingDecl),
+            QueryStepOp::FileOf => Some(Self::FileOf),
+            QueryStepOp::ImportsOf => Some(Self::ImportsOf),
+            QueryStepOp::ImportersOf => Some(Self::ImportersOf),
+            QueryStepOp::Supertypes => Some(Self::Supertypes(HierarchyTraversal::Direct)),
+            QueryStepOp::Subtypes => Some(Self::Subtypes(HierarchyTraversal::Direct)),
+            QueryStepOp::Members => Some(Self::Members),
+            QueryStepOp::Owner => Some(Self::Owner),
         }
     }
 
-    pub fn output_kind(self, input: QueryValueKind) -> Option<QueryValueKind> {
+    pub fn output_kind(&self, input: QueryValueKind) -> Option<QueryValueKind> {
         match (self, input) {
             (Self::EnclosingDecl, QueryValueKind::StructuralMatch) => {
                 Some(QueryValueKind::Declaration)
@@ -82,6 +99,10 @@ impl QueryStep {
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
             }
+            (
+                Self::Supertypes(_) | Self::Subtypes(_) | Self::Members | Self::Owner,
+                QueryValueKind::Declaration,
+            ) => Some(QueryValueKind::Declaration),
             _ => None,
         }
     }
@@ -96,11 +117,15 @@ pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind
     }
 
     let mut value_kind = QueryValueKind::StructuralMatch;
-    for (index, &step) in steps.iter().enumerate() {
+    for (index, step) in steps.iter().enumerate() {
         let expected_input = match step {
             QueryStep::EnclosingDecl => "structural_match",
             QueryStep::FileOf => "structural_match or declaration",
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
+            QueryStep::Supertypes(_)
+            | QueryStep::Subtypes(_)
+            | QueryStep::Members
+            | QueryStep::Owner => "declaration",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(

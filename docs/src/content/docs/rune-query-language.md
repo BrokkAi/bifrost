@@ -108,9 +108,15 @@ Pipeline wrappers transform the result domain. Inner wrappers execute first:
 (file-of (function :name "handle"))
 (imports-of (file-of (function :name "handle")))
 (importers-of (importers-of (file-of (function :name "target"))))
+(supertypes (enclosing-decl (class :name "Service")))
+(supertypes :depth 2 (enclosing-decl (class :name "Service")))
+(subtypes :transitive true (enclosing-decl (class :name "BaseService")))
+(owner (members (enclosing-decl (class :name "Service"))))
 ```
 
-The last expression performs two direct reverse-import hops. `:json` renders these wrappers as an ordered `steps` array using `enclosing_decl`, `file_of`, `imports_of`, and `importers_of`.
+The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. `members` returns direct declarations and `owner` recovers their exact declaring type. `:json` renders every wrapper as an ordered `steps` array.
+
+Only declarations indexed by the active workspace analyzer can appear. A visible usage of library code does not imply that the library declaration itself is indexed or queryable.
 
 RQL is not yet a stable external API. It is intended to make interactive exploration pleasant while preserving `query_code` and JSON `CodeQuery` as the stable integration surface.
 

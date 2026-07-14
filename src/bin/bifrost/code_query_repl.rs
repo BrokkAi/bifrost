@@ -68,6 +68,11 @@ const EXAMPLES: &[Example] = &[
         "Calls inside a named function.",
         r#"(inside (function :name "handler") (call :callee (name "eval")))"#,
     ),
+    Example::new(
+        "hierarchy-members",
+        "Members declared by every indexed transitive subtype of a named type.",
+        r#"(members (subtypes :transitive true (enclosing-decl (class :name "Service"))))"#,
+    ),
 ];
 
 const CTRL_C_QUIT_HINT: &str = "Press Ctrl+C again to quit...";

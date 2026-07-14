@@ -82,7 +82,7 @@ The many per-rule tuning knobs on code-quality smell reports are accepted throug
 
 ## Code Query
 
-`query_code(...)` is the version-2 typed query surface. Omit `schema_version` for v2 or pass `schema_version=2` explicitly. Supply ordered `steps` such as `[{"op": "enclosing_decl"}]` or `[{"op": "file_of"}, {"op": "imports_of"}]` to transform syntax matches into declarations or direct import-file neighbors. See [Code Querying](../code-querying/) for tool selection and [JSON CodeQuery](../code-query-json/) for the complete schema.
+`query_code(...)` is the version-2 typed query surface. Omit `schema_version` for v2 or pass `schema_version=2` explicitly. Supply ordered `steps` such as `[{"op": "enclosing_decl"}, {"op": "subtypes", "transitive": true}, {"op": "members"}]` to transform syntax matches into exact indexed declarations, or use `file_of` and the import steps for project files. Hierarchy steps are direct by default and also accept a positive `depth`. Library declarations are absent unless the workspace analyzer indexed them. See [Code Querying](../code-querying/) for tool selection and [JSON CodeQuery](../code-query-json/) for the complete schema.
 
 `CodeQueryResult.results` contains `CodeQueryMatch`, `CodeQueryDeclaration`, or `CodeQueryFile` objects according to each item's `result_type`. Compact output is the default and retains minimal provenance for derived results. Pass `result_detail="full"` when a rule, refactoring step, or follow-up tool call needs deterministic IDs, 1-based character columns, decorator ranges, and capture ranges.
 

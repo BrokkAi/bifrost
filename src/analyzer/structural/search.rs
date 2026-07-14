@@ -10,14 +10,14 @@ use super::facts::{FileFacts, Span};
 use super::kinds::Role;
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
-use super::query::{CodeQuery, CodeQueryResultDetail, QueryStep};
+use super::query::{CodeQuery, CodeQueryResultDetail, HierarchyTraversal, QueryStep};
 use crate::analyzer::structural::capabilities::QueryFeature;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 /// Longest match/capture snippet reported inline; full content is always
@@ -193,6 +193,112 @@ struct DeclarationValue {
     range: Range,
 }
 
+#[derive(Default)]
+struct IndexedDeclarations {
+    by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>>,
+    by_unit: HashMap<CodeUnit, Option<DeclarationValue>>,
+    owner_by_member: HashMap<CodeUnit, CodeUnit>,
+}
+
+impl IndexedDeclarations {
+    fn get(&mut self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DeclarationValue> {
+        if let Some(value) = self.by_unit.get(unit) {
+            return value.clone();
+        }
+
+        let value = if unit.is_synthetic() || unit.is_file_scope() {
+            None
+        } else {
+            let declarations = self
+                .by_file
+                .entry(unit.source().clone())
+                .or_insert_with(|| analyzer.declarations(unit.source()));
+            declarations.contains(unit).then(|| {
+                analyzer
+                    .ranges_of(unit)
+                    .into_iter()
+                    .min_by_key(primary_range_key)
+                    .map(|range| DeclarationValue {
+                        unit: unit.clone(),
+                        range,
+                    })
+            })?
+        };
+        self.by_unit.insert(unit.clone(), value.clone());
+        value
+    }
+
+    fn record_owner(&mut self, member: &CodeUnit, owner: &CodeUnit) {
+        self.owner_by_member
+            .entry(member.clone())
+            .or_insert_with(|| owner.clone());
+    }
+
+    fn owner_of(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        member: &CodeUnit,
+        work: &mut usize,
+        max_work: usize,
+    ) -> (Option<DeclarationValue>, bool) {
+        if let Some(owner) = self.owner_by_member.get(member).cloned() {
+            if *work >= max_work {
+                return (None, true);
+            }
+            *work += 1;
+            return (self.get(analyzer, &owner), false);
+        }
+
+        let owner = {
+            let declarations = self
+                .by_file
+                .entry(member.source().clone())
+                .or_insert_with(|| analyzer.declarations(member.source()));
+            let mut found = None;
+            'owners: for candidate in declarations.iter() {
+                if *work >= max_work {
+                    return (None, true);
+                }
+                *work += 1;
+                if !is_type_declaration(analyzer, candidate) {
+                    continue;
+                }
+                for child in analyzer.direct_children(candidate) {
+                    if *work >= max_work {
+                        return (None, true);
+                    }
+                    *work += 1;
+                    if &child == member {
+                        found = Some(candidate.clone());
+                        break 'owners;
+                    }
+                }
+            }
+            found
+        };
+        if let Some(owner) = owner {
+            self.record_owner(member, &owner);
+            return (self.get(analyzer, &owner), false);
+        }
+        (None, false)
+    }
+}
+
+fn primary_range_key(range: &Range) -> (usize, usize, usize, usize) {
+    (
+        range.start_line,
+        range.start_byte,
+        range.end_line,
+        range.end_byte,
+    )
+}
+
+struct PipelineExpansion {
+    value: PipelineValue,
+    trace_values: Vec<PipelineTraceValue>,
+    budgeted: bool,
+}
+
 #[derive(Debug, Clone)]
 enum PipelineValue {
     StructuralMatch(Arc<SeedMatch>),
@@ -357,6 +463,7 @@ struct CodeQueryExecutionBudget {
     scanned_source_bytes: usize,
     fact_nodes: usize,
     pipeline_rows: usize,
+    provenance_steps: usize,
 }
 
 #[doc(hidden)]
@@ -572,12 +679,26 @@ pub fn execute_with_limits(
         .collect::<Vec<_>>();
     budget.pipeline_rows = rows.len();
 
+    let mut indexed_declarations = None;
+
     let mut import_graph = None;
     let mut import_graph_budget_diagnostic_emitted = false;
-    for (step_index, &step) in query.steps.iter().enumerate() {
+    for (step_index, step) in query.steps.iter().enumerate() {
+        if !rows.is_empty()
+            && indexed_declarations.is_none()
+            && matches!(
+                step,
+                QueryStep::Supertypes(_)
+                    | QueryStep::Subtypes(_)
+                    | QueryStep::Members
+                    | QueryStep::Owner
+            )
+        {
+            indexed_declarations = Some(IndexedDeclarations::default());
+        }
         if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
             let graph = import_graph.get_or_insert_with(|| DirectImportGraph::new(analyzer));
-            let graph_exhausted = if step == QueryStep::ImportersOf {
+            let graph_exhausted = if step == &QueryStep::ImportersOf {
                 ensure_complete_import_graph(
                     analyzer,
                     graph,
@@ -615,6 +736,7 @@ pub fn execute_with_limits(
             step,
             rows,
             import_graph.as_ref(),
+            indexed_declarations.as_mut(),
             &mut budget,
             limits.max_pipeline_rows,
             &mut diagnostics,
@@ -764,9 +886,10 @@ fn ensure_forward_import_edges(
 #[allow(clippy::too_many_arguments)]
 fn apply_pipeline_step(
     analyzer: &dyn IAnalyzer,
-    step: QueryStep,
+    step: &QueryStep,
     rows: Vec<PipelineRow>,
     import_graph: Option<&DirectImportGraph>,
+    indexed_declarations: Option<&mut IndexedDeclarations>,
     budget: &mut CodeQueryExecutionBudget,
     max_pipeline_rows: usize,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -774,23 +897,29 @@ fn apply_pipeline_step(
     let mut output = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut unsupported_languages = BTreeSet::new();
+    let mut semantic_omissions: BTreeMap<(Language, &'static str), usize> = BTreeMap::new();
     let mut enclosing_declarations: HashMap<ProjectFile, Vec<DeclarationValue>> =
         HashMap::default();
     let mut exhausted = false;
 
+    let mut indexed_declarations = indexed_declarations;
     'rows: for row in rows {
-        let values = match (&row.value, step) {
+        let mut row_exhausted = false;
+        let expansions = match (&row.value, step) {
             (PipelineValue::StructuralMatch(seed), QueryStep::EnclosingDecl) => {
                 enclosing_declaration_value(analyzer, seed, &mut enclosing_declarations)
                     .map(PipelineValue::Declaration)
                     .into_iter()
+                    .map(pipeline_expansion)
                     .collect()
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::FileOf) => {
-                vec![PipelineValue::File(seed.file.clone())]
+                vec![pipeline_expansion(PipelineValue::File(seed.file.clone()))]
             }
             (PipelineValue::Declaration(declaration), QueryStep::FileOf) => {
-                vec![PipelineValue::File(declaration.unit.source().clone())]
+                vec![pipeline_expansion(PipelineValue::File(
+                    declaration.unit.source().clone(),
+                ))]
             }
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
@@ -805,6 +934,7 @@ fn apply_pipeline_step(
                         .flatten()
                         .cloned()
                         .map(PipelineValue::File)
+                        .map(pipeline_expansion)
                         .collect()
                 }
             }
@@ -816,41 +946,124 @@ fn apply_pipeline_step(
                 .flatten()
                 .cloned()
                 .map(PipelineValue::File)
+                .map(pipeline_expansion)
                 .collect(),
+            (
+                PipelineValue::Declaration(declaration),
+                QueryStep::Supertypes(traversal) | QueryStep::Subtypes(traversal),
+            ) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let (expansions, hierarchy_exhausted) = expand_hierarchy(
+                    analyzer,
+                    declaration,
+                    step,
+                    *traversal,
+                    indexed,
+                    budget,
+                    max_pipeline_rows,
+                    &mut semantic_omissions,
+                );
+                row_exhausted = hierarchy_exhausted;
+                expansions
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::Members) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                if !is_type_declaration(analyzer, &declaration.unit) {
+                    record_semantic_omission(
+                        &mut semantic_omissions,
+                        &declaration.unit,
+                        "input is not a type declaration",
+                    );
+                    Vec::new()
+                } else {
+                    let mut children = analyzer.direct_children(&declaration.unit);
+                    children.sort();
+                    children.dedup();
+                    let mut expansions = Vec::new();
+                    for unit in children {
+                        if budget.pipeline_rows >= max_pipeline_rows {
+                            row_exhausted = true;
+                            break;
+                        }
+                        budget.pipeline_rows += 1;
+                        if let Some(child) = indexed.get(analyzer, &unit) {
+                            indexed.record_owner(&unit, &declaration.unit);
+                            expansions.push(budgeted_declaration_expansion(child));
+                        }
+                    }
+                    expansions
+                }
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::Owner) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let (owner, owner_exhausted) = indexed.owner_of(
+                    analyzer,
+                    &declaration.unit,
+                    &mut budget.pipeline_rows,
+                    max_pipeline_rows,
+                );
+                row_exhausted = owner_exhausted;
+                match owner {
+                    Some(owner) => vec![budgeted_declaration_expansion(owner)],
+                    None if !owner_exhausted => {
+                        record_semantic_omission(
+                            &mut semantic_omissions,
+                            &declaration.unit,
+                            "input is not a direct member declaration",
+                        );
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
+            }
             _ => unreachable!("query step domains are validated before execution"),
         };
 
-        for value in values {
-            if budget.pipeline_rows >= max_pipeline_rows {
+        for expansion in expansions {
+            if !expansion.budgeted && budget.pipeline_rows >= max_pipeline_rows {
                 exhausted = true;
                 break 'rows;
             }
-            budget.pipeline_rows += 1;
-            let trace_value = pipeline_trace_value(&value)
-                .expect("every semantic query step produces a semantic value");
+            if !expansion.budgeted {
+                budget.pipeline_rows += 1;
+            }
             let traces = row
                 .traces
                 .iter()
                 .cloned()
                 .map(|mut trace| {
-                    trace.steps.push(PipelineTraceStep {
-                        op: step,
-                        value: trace_value.clone(),
-                    });
+                    trace
+                        .steps
+                        .extend(expansion.trace_values.iter().cloned().map(|value| {
+                            PipelineTraceStep {
+                                op: step.clone(),
+                                value,
+                            }
+                        }));
                     trace
                 })
                 .collect();
             insert_pipeline_row(
                 &mut output,
                 &mut indexes,
-                value,
+                expansion.value,
                 traces,
                 row.provenance_truncated,
             );
         }
+        if row_exhausted {
+            exhausted = true;
+            break;
+        }
     }
 
-    if step == QueryStep::ImportersOf
+    if step == &QueryStep::ImportersOf
         && let Some(graph) = import_graph
     {
         unsupported_languages.extend(
@@ -871,7 +1084,211 @@ fn apply_pipeline_step(
             ),
         });
     }
+    for ((language, reason), count) in semantic_omissions {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!(
+                "{} omitted {count} input{} because {reason}",
+                step.label(),
+                if count == 1 { "" } else { "s" }
+            ),
+        });
+    }
     (output, exhausted)
+}
+
+fn pipeline_expansion(value: PipelineValue) -> PipelineExpansion {
+    let trace_value =
+        pipeline_trace_value(&value).expect("every semantic query step produces a semantic value");
+    PipelineExpansion {
+        value,
+        trace_values: vec![trace_value],
+        budgeted: false,
+    }
+}
+
+fn budgeted_declaration_expansion(declaration: DeclarationValue) -> PipelineExpansion {
+    PipelineExpansion {
+        value: PipelineValue::Declaration(declaration.clone()),
+        trace_values: vec![PipelineTraceValue::Declaration(declaration)],
+        budgeted: true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_hierarchy(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    step: &QueryStep,
+    traversal: HierarchyTraversal,
+    indexed: &mut IndexedDeclarations,
+    budget: &mut CodeQueryExecutionBudget,
+    max_pipeline_rows: usize,
+    omissions: &mut BTreeMap<(Language, &'static str), usize>,
+) -> (Vec<PipelineExpansion>, bool) {
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        record_semantic_omission(
+            omissions,
+            &declaration.unit,
+            "its language does not provide type hierarchy analysis",
+        );
+        return (Vec::new(), false);
+    };
+    if !provider.supports_type_hierarchy(&declaration.unit) {
+        record_semantic_omission(
+            omissions,
+            &declaration.unit,
+            "input is not a supported type declaration",
+        );
+        return (Vec::new(), false);
+    }
+
+    let max_depth = match traversal {
+        HierarchyTraversal::Direct => 1,
+        HierarchyTraversal::Depth(depth) => depth.get(),
+        HierarchyTraversal::Transitive => usize::MAX,
+    };
+    let mut queue = VecDeque::from([HierarchyWork {
+        unit: declaration.unit.clone(),
+        depth: 0,
+        path_tail: None,
+    }]);
+    let mut paths = Vec::new();
+    let mut expansions = Vec::new();
+
+    while let Some(work) = queue.pop_front() {
+        let mut related = match step {
+            QueryStep::Supertypes(_) => provider.get_direct_ancestors(&work.unit),
+            QueryStep::Subtypes(_) => provider
+                .get_direct_descendants(&work.unit)
+                .into_iter()
+                .collect(),
+            _ => unreachable!("hierarchy expansion requires a hierarchy step"),
+        };
+        related.sort();
+        related.dedup();
+        for unit in related {
+            if budget.pipeline_rows >= max_pipeline_rows {
+                return (expansions, true);
+            }
+            budget.pipeline_rows += 1;
+            match hierarchy_path_contains(
+                &paths,
+                work.path_tail,
+                &declaration.unit,
+                &unit,
+                &mut budget.provenance_steps,
+                max_pipeline_rows,
+            ) {
+                Some(true) => continue,
+                Some(false) => {}
+                None => return (expansions, true),
+            }
+            let Some(value) = indexed.get(analyzer, &unit) else {
+                // Structured relations may observe an external name, but this
+                // pipeline only returns declarations indexed by this analyzer.
+                continue;
+            };
+            let next_depth = work.depth + 1;
+            if budget.provenance_steps.saturating_add(next_depth) > max_pipeline_rows {
+                return (expansions, true);
+            }
+            budget.provenance_steps += next_depth;
+            let path_tail = paths.len();
+            paths.push(HierarchyPathNode {
+                value: value.clone(),
+                parent: work.path_tail,
+            });
+            expansions.push(PipelineExpansion {
+                value: PipelineValue::Declaration(value),
+                trace_values: hierarchy_trace_values(&paths, path_tail, next_depth),
+                budgeted: true,
+            });
+
+            if next_depth < max_depth {
+                queue.push_back(HierarchyWork {
+                    unit,
+                    depth: next_depth,
+                    path_tail: Some(path_tail),
+                });
+            }
+        }
+    }
+    (expansions, false)
+}
+
+struct HierarchyWork {
+    unit: CodeUnit,
+    depth: usize,
+    path_tail: Option<usize>,
+}
+
+struct HierarchyPathNode {
+    value: DeclarationValue,
+    parent: Option<usize>,
+}
+
+fn hierarchy_path_contains(
+    paths: &[HierarchyPathNode],
+    mut tail: Option<usize>,
+    root: &CodeUnit,
+    candidate: &CodeUnit,
+    work: &mut usize,
+    max_work: usize,
+) -> Option<bool> {
+    if *work >= max_work {
+        return None;
+    }
+    *work += 1;
+    if candidate == root {
+        return Some(true);
+    }
+    while let Some(index) = tail {
+        if *work >= max_work {
+            return None;
+        }
+        *work += 1;
+        let node = &paths[index];
+        if &node.value.unit == candidate {
+            return Some(true);
+        }
+        tail = node.parent;
+    }
+    Some(false)
+}
+
+fn hierarchy_trace_values(
+    paths: &[HierarchyPathNode],
+    mut tail: usize,
+    depth: usize,
+) -> Vec<PipelineTraceValue> {
+    let mut values = Vec::with_capacity(depth);
+    loop {
+        let node = &paths[tail];
+        values.push(PipelineTraceValue::Declaration(node.value.clone()));
+        let Some(parent) = node.parent else {
+            break;
+        };
+        tail = parent;
+    }
+    values.reverse();
+    values
+}
+
+fn is_type_declaration(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    unit.is_class()
+        || analyzer
+            .type_hierarchy_provider()
+            .is_some_and(|provider| provider.supports_type_hierarchy(unit))
+}
+
+fn record_semantic_omission(
+    omissions: &mut BTreeMap<(Language, &'static str), usize>,
+    unit: &CodeUnit,
+    reason: &'static str,
+) {
+    let language = crate::analyzer::common::language_for_file(unit.source());
+    *omissions.entry((language, reason)).or_default() += 1;
 }
 
 fn enclosing_declaration_value(

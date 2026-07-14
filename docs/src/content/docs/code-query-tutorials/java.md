@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 Java normalizes methods, constructors, annotations, object creation, member calls, imports, assignments, exceptions, and control flow. The fixture includes two `post` receivers so receiver filtering proves a real exclusion.
 
@@ -281,3 +281,166 @@ Java has positional arguments but no keyword-argument syntax. Asking for `kwargs
 ## Precision Boundary
 
 Receiver names are syntactic. `receiver: "client"` does not prove that the variable has type `Client`; use symbol and usage tools when identity matters.
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:java/QueryHierarchy.java -->
+```java
+class QueryRoot {
+    void rootMember() {}
+}
+
+class QueryLeaf extends QueryRoot {
+    void leafMember() {}
+}
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes (enclosing-decl (language java (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["java"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes"}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 3,
+      "fq_name": "QueryRoot",
+      "kind": "class",
+      "language": "java",
+      "path": "java/QueryHierarchy.java",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 7,
+            "kind": "class",
+            "path": "java/QueryHierarchy.java",
+            "result_type": "structural_match",
+            "start_line": 5
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "java/QueryHierarchy.java",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "java/QueryHierarchy.java",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryRoot {",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes :transitive true (enclosing-decl (language java (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["java"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes","transitive":true},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 7,
+      "fq_name": "QueryLeaf",
+      "kind": "class",
+      "language": "java",
+      "path": "java/QueryHierarchy.java",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 3,
+            "kind": "class",
+            "path": "java/QueryHierarchy.java",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 3,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "java/QueryHierarchy.java",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "java/QueryHierarchy.java",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 6,
+                "fq_name": "QueryLeaf.leafMember",
+                "kind": "function",
+                "path": "java/QueryHierarchy.java",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "java/QueryHierarchy.java",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryLeaf extends QueryRoot {",
+      "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```

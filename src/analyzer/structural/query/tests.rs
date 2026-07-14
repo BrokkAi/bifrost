@@ -187,6 +187,64 @@ fn parses_and_validates_typed_steps() {
 }
 
 #[test]
+fn parses_configured_hierarchy_and_member_steps() {
+    let query = parse_ok(json!({
+        "match": { "kind": "class" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "supertypes" },
+            { "op": "subtypes", "depth": 3 },
+            { "op": "subtypes", "transitive": true },
+            { "op": "members" },
+            { "op": "owner" }
+        ]
+    }));
+    assert_eq!(
+        query.steps,
+        vec![
+            QueryStep::EnclosingDecl,
+            QueryStep::Supertypes(HierarchyTraversal::Direct),
+            QueryStep::Subtypes(HierarchyTraversal::Depth(
+                std::num::NonZeroUsize::new(3).unwrap()
+            )),
+            QueryStep::Subtypes(HierarchyTraversal::Transitive),
+            QueryStep::Members,
+            QueryStep::Owner,
+        ]
+    );
+    assert_eq!(
+        query.to_canonical_json()["steps"],
+        json!([
+            { "op": "enclosing_decl" },
+            { "op": "supertypes" },
+            { "op": "subtypes", "depth": 3 },
+            { "op": "subtypes", "transitive": true },
+            { "op": "members" },
+            { "op": "owner" }
+        ])
+    );
+
+    for (step, path) in [
+        (json!({ "op": "supertypes", "depth": 0 }), "steps[1].depth"),
+        (
+            json!({ "op": "supertypes", "transitive": false }),
+            "steps[1].transitive",
+        ),
+        (
+            json!({ "op": "subtypes", "depth": 2, "transitive": true }),
+            "steps[1].transitive",
+        ),
+        (json!({ "op": "members", "depth": 2 }), "steps[1].depth"),
+    ] {
+        let error = error_of(json!({
+            "match": { "kind": "class" },
+            "steps": [{ "op": "enclosing_decl" }, step]
+        }));
+        assert_eq!(error.path, path);
+    }
+}
+
+#[test]
 fn rejects_more_than_the_step_budget() {
     let steps = (0..=MAX_QUERY_STEPS)
         .map(|_| json!({ "op": "file_of" }))

@@ -106,7 +106,12 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             insert_unique(&mut query, field, pattern_to_json(&items[1])?)?;
             Ok(Some(Value::Object(query)))
         }
-        RqlForm::EnclosingDecl | RqlForm::FileOf | RqlForm::ImportsOf | RqlForm::ImportersOf => {
+        RqlForm::EnclosingDecl
+        | RqlForm::FileOf
+        | RqlForm::ImportsOf
+        | RqlForm::ImportersOf
+        | RqlForm::Members
+        | RqlForm::Owner => {
             expect_len(items, 2, head)?;
             let mut query = query_object(&items[1])?;
             let steps = query
@@ -119,9 +124,55 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                 RqlForm::FileOf => "file_of",
                 RqlForm::ImportsOf => "imports_of",
                 RqlForm::ImportersOf => "importers_of",
+                RqlForm::Members => "members",
+                RqlForm::Owner => "owner",
                 _ => unreachable!("typed pipeline wrapper filtered above"),
             };
             steps.push(json!({ "op": op }));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::Supertypes | RqlForm::Subtypes => {
+            let (query_expr, option) = match items.len() {
+                2 => (&items[1], None),
+                4 => (&items[3], Some((&items[1], &items[2]))),
+                _ => {
+                    return Err(format!(
+                        "({head} ...) expects a query, optionally preceded by :depth count or :transitive true"
+                    ));
+                }
+            };
+            let mut query = query_object(query_expr)?;
+            let op = if form == RqlForm::Supertypes {
+                "supertypes"
+            } else {
+                "subtypes"
+            };
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.to_string()));
+            if let Some((key, value)) = option {
+                match key.as_symbol() {
+                    Some(":depth") => {
+                        step.insert("depth".to_string(), number_value(value, head)?);
+                    }
+                    Some(":transitive") => {
+                        if value.as_symbol() != Some("true") {
+                            return Err(format!("({head} :transitive ...) requires true"));
+                        }
+                        step.insert("transitive".to_string(), Value::Bool(true));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "({head} ...) accepts only :depth count or :transitive true"
+                        ));
+                    }
+                }
+            }
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Name
@@ -217,7 +268,11 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
         | RqlForm::EnclosingDecl
         | RqlForm::FileOf
         | RqlForm::ImportsOf
-        | RqlForm::ImportersOf => unreachable!("wrapper filtered above"),
+        | RqlForm::ImportersOf
+        | RqlForm::Supertypes
+        | RqlForm::Subtypes
+        | RqlForm::Members
+        | RqlForm::Owner => unreachable!("wrapper filtered above"),
     }
     Ok(Value::Object(object))
 }
@@ -489,6 +544,34 @@ mod tests {
                 ]
             }))
         );
+    }
+
+    #[test]
+    fn structural_query_sexp_lowers_hierarchy_options_and_members() {
+        assert_eq!(
+            canonical(
+                r#"(owner (members (subtypes :transitive true (supertypes :depth 2 (enclosing-decl (class :name "Service"))))))"#
+            ),
+            canonical_json(json!({
+                "match": { "kind": "class", "name": "Service" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "supertypes", "depth": 2 },
+                    { "op": "subtypes", "transitive": true },
+                    { "op": "members" },
+                    { "op": "owner" }
+                ]
+            }))
+        );
+
+        for invalid in [
+            r#"(supertypes :depth 0 (enclosing-decl (class)))"#,
+            r#"(subtypes :transitive false (enclosing-decl (class)))"#,
+            r#"(subtypes :transitive "true" (enclosing-decl (class)))"#,
+            r#"(supertypes :unknown 2 (enclosing-decl (class)))"#,
+        ] {
+            assert!(CodeQuery::from_sexp(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

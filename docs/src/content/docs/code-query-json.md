@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations and direct project import edges. It does not yet traverse call graphs, resolve arbitrary types or aliases, or perform control-flow or data-flow analysis.
+Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations, direct project import edges, indexed type hierarchies, and declaration ownership. It does not traverse call graphs, infer override families, resolve arbitrary aliases, or perform control-flow or data-flow analysis.
 
 ## Minimal Query
 
@@ -154,6 +154,10 @@ Steps execute in array order and are validated before the workspace is searched:
 | `file_of` | structural match or declaration | file | Exact project file containing the value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
+| `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
+| `subtypes` | declaration | declaration | Direct descendants by default, or a bounded/full indexed descendant closure. |
+| `members` | declaration | declaration | Real direct declaration children of a type. |
+| `owner` | declaration | declaration | Exact declaring type of a direct member. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
 
@@ -166,6 +170,18 @@ Repeat an import step for multiple hops. Traversal is cycle-safe and determinist
   ]
 }
 ```
+
+Hierarchy steps are direct by default. A positive `depth` returns declarations reachable in one through that many edges; `transitive: true` returns the full reachable closure under the global execution budget:
+
+```json
+{"op":"supertypes"}
+{"op":"supertypes","depth":2}
+{"op":"subtypes","transitive":true}
+```
+
+Zero depth, `transitive: false`, unknown fields, `depth` together with `transitive`, and traversal options on `members` or `owner` are rejected. Invalid input declarations are omitted with aggregated per-language diagnostics, while supported hierarchy leaves simply return no rows. `owner` after `members` round-trips each returned member to its exact type.
+
+Hierarchy and ownership results are restricted to declarations returned by the active analyzer's index and having renderable ranges. Bifrost may observe usages that refer to library code without having indexed that library's declaration; such a declaration is intentionally absent from these results. This is the current precision boundary until library code can be targeted and indexed explicitly.
 
 ## Containment And Descendants
 

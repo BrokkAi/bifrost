@@ -1,4 +1,4 @@
-use super::ir::{CodeQuery, Pattern, StringPredicate};
+use super::ir::{CodeQuery, HierarchyTraversal, Pattern, QueryStep, StringPredicate};
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Value, json};
 
@@ -41,12 +41,7 @@ impl CodeQuery {
         if !self.steps.is_empty() {
             object.insert(
                 "steps".to_string(),
-                Value::Array(
-                    self.steps
-                        .iter()
-                        .map(|step| json!({ "op": step.label() }))
-                        .collect(),
-                ),
+                Value::Array(self.steps.iter().map(query_step_to_json).collect()),
             );
         }
         object.insert("limit".to_string(), json!(self.limit));
@@ -56,6 +51,30 @@ impl CodeQuery {
         );
         Value::Object(object)
     }
+}
+
+fn query_step_to_json(step: &QueryStep) -> Value {
+    let mut object = Map::new();
+    object.insert("op".to_string(), json!(step.label()));
+    match step {
+        QueryStep::Supertypes(HierarchyTraversal::Depth(depth))
+        | QueryStep::Subtypes(HierarchyTraversal::Depth(depth)) => {
+            object.insert("depth".to_string(), json!(depth.get()));
+        }
+        QueryStep::Supertypes(HierarchyTraversal::Transitive)
+        | QueryStep::Subtypes(HierarchyTraversal::Transitive) => {
+            object.insert("transitive".to_string(), Value::Bool(true));
+        }
+        QueryStep::Supertypes(HierarchyTraversal::Direct)
+        | QueryStep::Subtypes(HierarchyTraversal::Direct)
+        | QueryStep::EnclosingDecl
+        | QueryStep::FileOf
+        | QueryStep::ImportsOf
+        | QueryStep::ImportersOf
+        | QueryStep::Members
+        | QueryStep::Owner => {}
+    }
+    Value::Object(object)
 }
 
 fn kind_list_to_json(kinds: &[NormalizedKind]) -> Value {

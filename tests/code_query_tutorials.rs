@@ -155,6 +155,7 @@ fn tutorials_cover_all_public_kinds_roles_and_pages() {
         let tutorial = parse_tutorial(&path, &markdown);
         assert_valid_date(&path, &tutorial.verified_on);
         assert!(seen_pages.insert(*page), "duplicate tutorial page {page}");
+        let mut semantic_steps = std::collections::BTreeSet::new();
         for case in tutorial.cases.values() {
             let json = case
                 .json
@@ -163,7 +164,23 @@ fn tutorials_cover_all_public_kinds_roles_and_pages() {
             let value: Value = serde_json::from_str(json)
                 .unwrap_or_else(|error| panic!("invalid JSON in {relative}: {error}"));
             collect_vocabulary(&value, &mut seen_kinds, &mut seen_roles);
+            if let Some(steps) = value.get("steps").and_then(Value::as_array) {
+                semantic_steps.extend(steps.iter().filter_map(|step| {
+                    step.get("op")
+                        .and_then(Value::as_str)
+                        .filter(|op| matches!(*op, "supertypes" | "subtypes" | "members" | "owner"))
+                        .map(str::to_string)
+                }));
+            }
         }
+        assert_eq!(
+            semantic_steps,
+            ["members", "owner", "subtypes", "supertypes"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            "{relative} must execute every hierarchy/member operation"
+        );
     }
 
     assert_eq!(seen_pages, PAGES.iter().copied().collect());

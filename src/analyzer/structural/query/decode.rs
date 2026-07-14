@@ -1,15 +1,18 @@
 use super::ir::{
-    CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
-    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
-    MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, SCHEMA_VERSION,
-    StringPredicate, validate_query_steps,
+    CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, HierarchyTraversal, MAX_CAPTURE_LENGTH,
+    MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
+    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS,
+    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
+    QueryStep, SCHEMA_VERSION, StringPredicate, validate_query_steps,
 };
-use super::schema::{PatternField, QueryField, StringPredicateField};
+use super::schema::{
+    ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
+};
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
 use regex::Regex;
 use serde_json::{Map, Value};
+use std::num::NonZeroUsize;
 
 impl CodeQuery {
     pub fn from_json(value: &Value) -> Result<Self, QueryError> {
@@ -260,26 +263,79 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
     for (index, entry) in entries.iter().enumerate() {
         let entry_path = index_path(path, index);
         let object = as_object(entry, &entry_path)?;
-        if let Some(key) = object.keys().find(|key| key.as_str() != "op") {
-            return Err(QueryError::new(
-                child_path(&entry_path, key),
-                "unknown field in query step object",
-            ));
-        }
         let op_path = child_path(&entry_path, "op");
         let label = object
             .get("op")
             .ok_or_else(|| QueryError::new(&op_path, "required field is missing"))?
             .as_str()
             .ok_or_else(|| QueryError::new(&op_path, "expected a step name string"))?;
-        let step = QueryStep::from_label(label).ok_or_else(|| {
+        let mut step = QueryStep::from_label(label).ok_or_else(|| {
+            let expected = ALL_QUERY_STEP_OPS
+                .iter()
+                .map(|op| op.label())
+                .collect::<Vec<_>>()
+                .join(", ");
             QueryError::new(
                 &op_path,
-                format!(
-                    "unknown query step {label:?}; expected enclosing_decl, file_of, imports_of, or importers_of"
-                ),
+                format!("unknown query step {label:?}; expected {expected}"),
             )
         })?;
+        let hierarchy = matches!(step, QueryStep::Supertypes(_) | QueryStep::Subtypes(_));
+        for key in object.keys() {
+            match QueryStepField::from_label(key) {
+                Some(QueryStepField::Op) => {}
+                Some(QueryStepField::Depth | QueryStepField::Transitive) if hierarchy => {}
+                Some(QueryStepField::Depth | QueryStepField::Transitive) | None => {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, key),
+                        "unknown field in query step object",
+                    ));
+                }
+            }
+        }
+        if hierarchy {
+            let depth = object.get("depth");
+            let transitive = object.get("transitive");
+            if depth.is_some() && transitive.is_some() {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "transitive"),
+                    "depth and transitive are mutually exclusive",
+                ));
+            }
+            let traversal = if let Some(value) = depth {
+                let raw = value.as_u64().ok_or_else(|| {
+                    QueryError::new(
+                        child_path(&entry_path, "depth"),
+                        "expected a positive integer",
+                    )
+                })?;
+                let depth = usize::try_from(raw)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .ok_or_else(|| {
+                        QueryError::new(
+                            child_path(&entry_path, "depth"),
+                            "depth must be a positive platform-sized integer",
+                        )
+                    })?;
+                HierarchyTraversal::Depth(depth)
+            } else if let Some(value) = transitive {
+                if value.as_bool() != Some(true) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "transitive"),
+                        "transitive must be true when present",
+                    ));
+                }
+                HierarchyTraversal::Transitive
+            } else {
+                HierarchyTraversal::Direct
+            };
+            step = match step {
+                QueryStep::Supertypes(_) => QueryStep::Supertypes(traversal),
+                QueryStep::Subtypes(_) => QueryStep::Subtypes(traversal),
+                _ => unreachable!("hierarchy step filtered above"),
+            };
+        }
         steps.push(step);
     }
     validate_query_steps(&steps)?;

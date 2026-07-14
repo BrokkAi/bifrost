@@ -12,7 +12,7 @@ pub(super) struct JavaMemoCaches {
     pub(super) relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     pub(super) direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    pub(super) direct_descendant_index: OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>,
+    pub(super) direct_descendant_index: OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>,
     pub(super) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) same_package_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,

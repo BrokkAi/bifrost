@@ -3,7 +3,7 @@ title: Ruby
 description: Query Ruby keyword calls, blocks, imports, qualified classes, and precision boundaries with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 Ruby maps ordinary and receiver calls, keyword arguments, blocks/lambdas, methods, qualified classes, assignments, and static imports. Import refinement is deliberately conservative: receiver calls named `require` and interpolated strings do not become precise import modules.
 
@@ -598,6 +598,171 @@ Qualified declarations such as `class App::External` are nameable through their 
       "path": "ruby/app.rb",
       "start_line": 24,
       "text": "nil"
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:ruby/hierarchy.rb -->
+```ruby
+class QueryRoot
+  def root_member
+  end
+end
+
+class QueryLeaf < QueryRoot
+  def leaf_member
+  end
+end
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes (enclosing-decl (language ruby (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["ruby"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes"}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 4,
+      "fq_name": "QueryRoot",
+      "kind": "class",
+      "language": "ruby",
+      "path": "ruby/hierarchy.rb",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 9,
+            "kind": "class",
+            "path": "ruby/hierarchy.rb",
+            "result_type": "structural_match",
+            "start_line": 6
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 9,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "ruby/hierarchy.rb",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 4,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "ruby/hierarchy.rb",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryRoot",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes :depth 2 (enclosing-decl (language ruby (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["ruby"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes","depth":2},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 9,
+      "fq_name": "QueryLeaf",
+      "kind": "class",
+      "language": "ruby",
+      "path": "ruby/hierarchy.rb",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 4,
+            "kind": "class",
+            "path": "ruby/hierarchy.rb",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 4,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "ruby/hierarchy.rb",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 9,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "ruby/hierarchy.rb",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 8,
+                "fq_name": "QueryLeaf.leaf_member",
+                "kind": "function",
+                "path": "ruby/hierarchy.rb",
+                "result_type": "declaration",
+                "start_line": 7
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 9,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "ruby/hierarchy.rb",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryLeaf < QueryRoot",
+      "start_line": 6
     }
   ],
   "truncated": false

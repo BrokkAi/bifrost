@@ -3,7 +3,7 @@ title: Go
 description: Query Go selector calls, multi-value assignments, imports, methods, and capability diagnostics with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 Go normalizes selector calls, functions and methods, type declarations and aliases, function literals, grouped imports, multi-value assignments, returns, conditionals, and loops. It does not model keyword arguments or decorators.
 
@@ -207,3 +207,168 @@ The module role is the imported path, not the local alias used by later Go expre
 ## Precision Boundary
 
 The `ServiceAlias` type alias is a normalized `declaration`; Go's `type Service struct{}` is class-like. Import queries expose `fmt`, not its local alias `log`. These normalized facts intentionally do not reproduce every Go declaration or binding distinction.
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:go/hierarchy.go -->
+```go
+package hierarchy
+
+type QueryRoot interface {
+    QueryMember()
+}
+
+type QueryLeaf struct{}
+
+func (QueryLeaf) QueryMember() {}
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes (enclosing-decl (language go (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["go"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes"}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 5,
+      "fq_name": "go.QueryRoot",
+      "kind": "class",
+      "language": "go",
+      "path": "go/hierarchy.go",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 7,
+            "kind": "class",
+            "path": "go/hierarchy.go",
+            "result_type": "structural_match",
+            "start_line": 7
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 7,
+                "fq_name": "go.QueryLeaf",
+                "kind": "class",
+                "path": "go/hierarchy.go",
+                "result_type": "declaration",
+                "start_line": 7
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 5,
+                "fq_name": "go.QueryRoot",
+                "kind": "class",
+                "path": "go/hierarchy.go",
+                "result_type": "declaration",
+                "start_line": 3
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "QueryRoot interface {",
+      "start_line": 3
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes :transitive true (enclosing-decl (language go (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["go"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes","transitive":true},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 7,
+      "fq_name": "go.QueryLeaf",
+      "kind": "class",
+      "language": "go",
+      "path": "go/hierarchy.go",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 5,
+            "kind": "class",
+            "path": "go/hierarchy.go",
+            "result_type": "structural_match",
+            "start_line": 3
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 5,
+                "fq_name": "go.QueryRoot",
+                "kind": "class",
+                "path": "go/hierarchy.go",
+                "result_type": "declaration",
+                "start_line": 3
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "go.QueryLeaf",
+                "kind": "class",
+                "path": "go/hierarchy.go",
+                "result_type": "declaration",
+                "start_line": 7
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 9,
+                "fq_name": "go.QueryLeaf.QueryMember",
+                "kind": "function",
+                "path": "go/hierarchy.go",
+                "result_type": "declaration",
+                "start_line": 9
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "go.QueryLeaf",
+                "kind": "class",
+                "path": "go/hierarchy.go",
+                "result_type": "declaration",
+                "start_line": 7
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "QueryLeaf struct {",
+      "start_line": 7
+    }
+  ],
+  "truncated": false
+}
+```

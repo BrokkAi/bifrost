@@ -3,7 +3,7 @@ title: C and C++
 description: Query C and C++ together through the cpp structural adapter and language filter.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 C and C++ files share the `cpp` analyzer, structural adapter, and language-filter label. Use `languages: ["cpp"]` for `.c`, `.cc`, `.cpp`, and the supported C-family header extensions; use `where` when source syntax or directory layout needs a narrower boundary.
 
@@ -191,3 +191,168 @@ The path glob excludes the C fixture. Receiver, callee, and argument roles ident
 ## Precision Boundary
 
 C naturally produces only the subset of normalized facts its syntax supports. Neither C nor C++ models `kwargs` or decorators, and version 2 does not resolve the static type of `service`.
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:cpp/hierarchy.cpp -->
+```cpp
+class QueryRoot {
+public:
+    virtual void root_member() {}
+};
+
+class QueryLeaf : public QueryRoot {
+public:
+    void leaf_member() {}
+};
+```
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes :depth 2 (enclosing-decl (language cpp (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["cpp"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","depth":2}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 4,
+      "fq_name": "QueryRoot",
+      "kind": "class",
+      "language": "cpp",
+      "path": "cpp/hierarchy.cpp",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 9,
+            "kind": "class",
+            "path": "cpp/hierarchy.cpp",
+            "result_type": "structural_match",
+            "start_line": 6
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 9,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "cpp/hierarchy.cpp",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 4,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "cpp/hierarchy.cpp",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryRoot {",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes (enclosing-decl (language cpp (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["cpp"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes"},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 9,
+      "fq_name": "QueryLeaf",
+      "kind": "class",
+      "language": "cpp",
+      "path": "cpp/hierarchy.cpp",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 4,
+            "kind": "class",
+            "path": "cpp/hierarchy.cpp",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 4,
+                "fq_name": "QueryRoot",
+                "kind": "class",
+                "path": "cpp/hierarchy.cpp",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 9,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "cpp/hierarchy.cpp",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 8,
+                "fq_name": "QueryLeaf.leaf_member",
+                "kind": "function",
+                "path": "cpp/hierarchy.cpp",
+                "result_type": "declaration",
+                "start_line": 8
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 9,
+                "fq_name": "QueryLeaf",
+                "kind": "class",
+                "path": "cpp/hierarchy.cpp",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryLeaf : public QueryRoot {",
+      "start_line": 6
+    }
+  ],
+  "truncated": false
+}
+```

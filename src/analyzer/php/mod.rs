@@ -44,7 +44,7 @@ pub struct PhpAnalyzer {
     memo_budget: u64,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
+    direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
     composer_autoload: Arc<PhpComposerAutoload>,
 }
 
@@ -299,7 +299,7 @@ impl TypeHierarchyProvider for PhpAnalyzer {
         let descendants = self
             .direct_descendant_index
             .get_or_init(|| build_direct_descendant_index(self, self))
-            .get(&code_unit.fq_name())
+            .get(code_unit)
             .map(|descendants| descendants.as_ref().clone())
             .unwrap_or_default();
         self.direct_descendants

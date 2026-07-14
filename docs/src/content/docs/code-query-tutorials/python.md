@@ -3,7 +3,7 @@ title: Python
 description: Query Python calls, decorators, assignments, keyword arguments, and callable containment with query_code.
 ---
 
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
 Python exposes calls, receiver/member access, positional and keyword arguments, imports, assignments, decorated declarations, callable refinements, literals, and control-flow nodes through the normalized model. These examples deliberately include two `client.post(...)` calls so the narrowing query has something real to exclude.
 
@@ -195,3 +195,170 @@ This query requires a `route` decorator and an assignment whose left side is the
 ## Precision Boundary
 
 These matches are syntactic. `receiver: "client"` checks the normalized receiver name; it does not prove the receiver's runtime type. Use `scan_usages` after `query_code` when symbol identity matters.
+
+## Traverse Indexed Types And Members
+
+<!-- code-query-fixture:python/hierarchy.py -->
+```python
+class QueryRoot:
+    def root_member(self):
+        pass
+
+class QueryLeaf(QueryRoot):
+    def leaf_member(self):
+        pass
+```
+
+`supertypes` supports bounded closure; here depth two includes every indexed ancestor one or two edges away.
+
+<!-- code-query-case:hierarchy-supertypes:rql -->
+```lisp
+(supertypes :depth 2 (enclosing-decl (language python (class :name "QueryLeaf"))))
+```
+
+<!-- code-query-case:hierarchy-supertypes:json -->
+```json
+{"languages":["python"],"match":{"kind":"class","name":"QueryLeaf"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","depth":2}]}
+```
+
+<!-- code-query-case:hierarchy-supertypes:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 3,
+      "fq_name": "python.hierarchy.QueryRoot",
+      "kind": "class",
+      "language": "python",
+      "path": "python/hierarchy.py",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 7,
+            "kind": "class",
+            "path": "python/hierarchy.py",
+            "result_type": "structural_match",
+            "start_line": 5
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 7,
+                "fq_name": "python.hierarchy.QueryLeaf",
+                "kind": "class",
+                "path": "python/hierarchy.py",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "supertypes",
+              "result": {
+                "end_line": 3,
+                "fq_name": "python.hierarchy.QueryRoot",
+                "kind": "class",
+                "path": "python/hierarchy.py",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryRoot:",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
+```
+
+This compact pipeline finds direct `subtypes`, lists their direct `members`, then uses `owner` to recover each exact declaring type.
+
+<!-- code-query-case:hierarchy-subtype-members-owner:rql -->
+```lisp
+(owner (members (subtypes (enclosing-decl (language python (class :name "QueryRoot"))))))
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:json -->
+```json
+{"languages":["python"],"match":{"kind":"class","name":"QueryRoot"},"steps":[{"op":"enclosing_decl"},{"op":"subtypes"},{"op":"members"},{"op":"owner"}]}
+```
+
+<!-- code-query-case:hierarchy-subtype-members-owner:expected -->
+```json
+{
+  "results": [
+    {
+      "end_line": 7,
+      "fq_name": "python.hierarchy.QueryLeaf",
+      "kind": "class",
+      "language": "python",
+      "path": "python/hierarchy.py",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 3,
+            "kind": "class",
+            "path": "python/hierarchy.py",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 3,
+                "fq_name": "python.hierarchy.QueryRoot",
+                "kind": "class",
+                "path": "python/hierarchy.py",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "subtypes",
+              "result": {
+                "end_line": 7,
+                "fq_name": "python.hierarchy.QueryLeaf",
+                "kind": "class",
+                "path": "python/hierarchy.py",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            },
+            {
+              "op": "members",
+              "result": {
+                "end_line": 7,
+                "fq_name": "python.hierarchy.QueryLeaf.leaf_member",
+                "kind": "function",
+                "path": "python/hierarchy.py",
+                "result_type": "declaration",
+                "start_line": 6
+              }
+            },
+            {
+              "op": "owner",
+              "result": {
+                "end_line": 7,
+                "fq_name": "python.hierarchy.QueryLeaf",
+                "kind": "class",
+                "path": "python/hierarchy.py",
+                "result_type": "declaration",
+                "start_line": 5
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class QueryLeaf(QueryRoot):",
+      "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```
