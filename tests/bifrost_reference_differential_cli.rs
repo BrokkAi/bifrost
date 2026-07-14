@@ -14,6 +14,15 @@ fn help_describes_repo_and_corpus_modes() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("run-repo"), "{stdout}");
     assert!(stdout.contains("run-corpus"), "{stdout}");
+
+    let repo_help = Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
+        .args(["run-repo", "--help"])
+        .output()
+        .expect("run repository help");
+    assert!(repo_help.status.success());
+    let repo_stdout = String::from_utf8(repo_help.stdout).expect("utf8 stdout");
+    assert!(repo_stdout.contains("--cache-mode"), "{repo_stdout}");
+    assert!(repo_stdout.contains("ephemeral"), "{repo_stdout}");
 }
 
 #[test]
@@ -118,6 +127,7 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
     assert!(record["bifrost_version"].is_string(), "{record}");
     assert!(record["bifrost_head"].is_string(), "{record}");
     assert!(record["report"]["summary"].is_object(), "{record}");
+    assert!(repo_root.join(".brokk/bifrost_cache.db").is_file());
 
     let resumed = run();
     assert!(
@@ -136,6 +146,70 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
             .lines()
             .count(),
         1
+    );
+}
+
+#[test]
+fn run_repo_ephemeral_cache_does_not_create_persisted_database() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo_root = temp.path().join("tiny__rust_ephemeral");
+    fs::create_dir_all(&repo_root).expect("repo root");
+    fs::write(
+        repo_root.join("lib.rs"),
+        "pub fn target() {}\npub fn caller() { target(); }\n",
+    )
+    .expect("rust source");
+    init_repo(&repo_root);
+    let output_path = temp.path().join("ephemeral-report.jsonl");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
+        .arg("run-repo")
+        .arg("--root")
+        .arg(&repo_root)
+        .arg("--language")
+        .arg("rust")
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--cache-mode")
+        .arg("ephemeral")
+        .arg("--max-files")
+        .arg("10")
+        .arg("--max-sites")
+        .arg("10")
+        .arg("--max-targets")
+        .arg("10")
+        .output()
+        .expect("run ephemeral repository differential");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output_path.is_file());
+    assert!(!repo_root.join(".brokk/bifrost_cache.db").exists());
+}
+
+#[test]
+fn invalid_cache_mode_is_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
+        .args([
+            "run-repo",
+            "--root",
+            ".",
+            "--language",
+            "rust",
+            "--output",
+            "/tmp/unused-reference-differential.jsonl",
+            "--cache-mode",
+            "temporary",
+        ])
+        .output()
+        .expect("run invalid cache mode");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--cache-mode expects `persisted` or `ephemeral`")
     );
 }
 

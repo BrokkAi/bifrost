@@ -70,6 +70,7 @@ struct EngineOptions {
     seed: u64,
     include_tests: bool,
     exact_site: Option<ExactReferenceSite>,
+    cache_mode: CacheMode,
 }
 
 impl Default for EngineOptions {
@@ -85,6 +86,25 @@ impl Default for EngineOptions {
             seed: 0,
             include_tests: false,
             exact_site: None,
+            cache_mode: CacheMode::Persisted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheMode {
+    Persisted,
+    Ephemeral,
+}
+
+impl CacheMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "persisted" => Ok(Self::Persisted),
+            "ephemeral" => Ok(Self::Ephemeral),
+            _ => Err(format!(
+                "--cache-mode expects `persisted` or `ephemeral`, got `{value}`"
+            )),
         }
     }
 }
@@ -278,6 +298,7 @@ fn parse_engine_option(
                 .map_err(|_| format!("--seed expects a non-negative integer, got `{value}`"))?;
         }
         "--include-tests" => options.include_tests = true,
+        "--cache-mode" => options.cache_mode = CacheMode::parse(&take_value(args, index, option)?)?,
         "--path" => {
             let value = take_value(args, index, option)?;
             let site = options.exact_site.get_or_insert_with(empty_exact_site);
@@ -401,7 +422,7 @@ fn run_repo_command(args: RunRepoArgs) -> Result<bool, String> {
 
     eprintln!("run {} {} ({})", args.language, repo_slug, root.display());
     let started = Instant::now();
-    let result = run_engine(&root, &config);
+    let result = run_engine(&root, &config, args.options.cache_mode);
     let record = repository_record(
         &args.language,
         &repo_slug,
@@ -505,7 +526,7 @@ fn run_corpus_command(args: RunCorpusArgs) -> Result<bool, String> {
             selected_repo.code_loc
         );
         let started = Instant::now();
-        let result = run_engine(&selected_repo.root, &config);
+        let result = run_engine(&selected_repo.root, &config, args.options.cache_mode);
         let record = repository_record(
             &selected_repo.language,
             &selected_repo.slug,
@@ -533,12 +554,18 @@ fn run_corpus_command(args: RunCorpusArgs) -> Result<bool, String> {
 fn run_engine(
     root: &Path,
     config: &ReferenceDifferentialConfig,
+    cache_mode: CacheMode,
 ) -> Result<ReferenceDifferentialReport, String> {
     let project: Arc<dyn Project> = Arc::new(
         FilesystemProject::new(root.to_path_buf())
             .map_err(|err| format!("failed to open project: {err}"))?,
     );
-    let workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+    let workspace = match cache_mode {
+        CacheMode::Persisted => {
+            WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+        }
+        CacheMode::Ephemeral => WorkspaceAnalyzer::build(project, AnalyzerConfig::default()),
+    };
     run_reference_differential(workspace.analyzer(), config)
 }
 
@@ -1001,6 +1028,9 @@ fn print_common_options() {
     );
     println!("  --seed N                 Deterministic sampling seed (default: 0)");
     println!("  --include-tests          Include references in test files");
+    println!(
+        "  --cache-mode MODE        persisted for warm/resumable campaigns (default); ephemeral for one-off smoke runs"
+    );
     println!("  --path PATH --start-byte N [--end-byte N]   Re-run one exact site");
     println!("  --strict                 Exit 2 when actionable findings are present");
     println!("  --force                  Ignore completed records already in output");
