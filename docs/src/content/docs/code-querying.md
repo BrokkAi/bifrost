@@ -22,13 +22,39 @@ Use the narrowest tool that directly answers the question:
 
 Start with `search_symbols` or the mode-appropriate scan-usages tool when you already know the symbol. Use `query_code` when the shape matters more than symbol identity. A useful workflow is to capture structural candidates with `query_code`, then pass their locations or enclosing symbols to the more semantic tools.
 
-Each language adapter starts from tree-sitter parses, then maps grammar-specific nodes and fields into a shared structural model:
+Each language adapter starts from tree-sitter parses, then maps grammar-specific nodes and fields into **Rune IR**, Bifrost's normalized structural intermediate representation:
 
 - normalized kinds such as `function`, `method`, `class`, `call`, `literal`, and `field_access`
 - normalized roles such as `callee`, `receiver`, `args`, `left`, `right`, `module`, `decorators`, `object`, and `field`
 - source ranges, names, parent links, and role edges that let the matcher reason about containment and relationships
 
-The matcher only sees this normalized fact arena. Language-specific tree-sitter node names stop at the adapter boundary, so a query can ask for a `call` with a `callee` across supported languages without knowing each grammar's internal node labels.
+The matcher only sees this normalized fact arena. Language-specific tree-sitter node names stop at the adapter boundary, so a query can ask for a `call` with a `callee` across supported languages without knowing each grammar's internal node labels. `FileFacts` is the internal arena-backed storage type for one source file; Rune IR is the public name for the source-side representation it contains.
+
+Rune IR and `CodeQuery` are separate intermediate representations on opposite sides of the matcher:
+
+```text
+source -> language adapter -> Rune IR
+RQL    -> CodeQuery
+matcher(CodeQuery, Rune IR)
+```
+
+Rune IR is not a raw tree-sitter parse tree and never exposes grammar-specific node names. `CodeQuery` is the typed query to evaluate, not a copy of source structure. Keeping the two models separate lets one normalized query match equivalent structure in several languages.
+
+## Inspect Rune IR
+
+Use query-by-example when you know the source shape but not yet the right RQL pattern. In the query REPL, `:ir <language>` captures source through an explicit `:end` line and prints both the complete bounded Rune IR and a conservative starter query:
+
+```text
+:ir rust
+fn greet(name: &str) {
+    println!("{name}");
+}
+:end
+```
+
+This path parses the supplied source through the real Rust structural adapter and does not initialize a workspace index. The starter uses the selected top-level node's canonical kind and exact name when available, and Bifrost validates it through the same `CodeQuery` frontend used for normal RQL. The complete Rune IR may contain several containment children and role edges that one starter `Pattern` cannot express.
+
+In VS Code, place the cursor or a selection inside an indexed declaration and run **Bifrost: Show Rune IR** from the editor context menu or command palette. The server reads the current unsaved overlay, selects the smallest enclosing indexed code unit, and returns Rune IR plus starter RQL. The extension displays that server-rendered result without maintaining its own structural vocabulary.
 
 ## Version 2 Typed Pipelines
 

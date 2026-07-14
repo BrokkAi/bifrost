@@ -27,6 +27,8 @@ For source-first examples across every structural adapter, see the [language tut
 
 Use `:json` in the REPL to inspect the canonical JSON generated for the current RQL query.
 
+Use `:ir <language>` for the opposite direction: paste source code through a line containing only `:end`, then inspect the [Rune IR](/code-querying/#inspect-rune-ir) produced by that language's real structural adapter and copy the generated starter RQL. Rune IR is the normalized source-side representation matched by `CodeQuery`; it is not RQL's query-side IR.
+
 ## Complete Example
 
 This query finds calls to `eval` inside a function, captures the first positional argument, limits the search to Python source files, and requests full ranges:
@@ -127,6 +129,7 @@ RQL is not yet a stable external API. It is intended to make interactive explora
 - `:examples` lists named examples.
 - `:example <name>` loads a named example.
 - `:kinds`, `:roles`, and `:languages` list the current vocabulary.
+- `:ir <language>` captures source through `:end` and prints Rune IR plus starter RQL without indexing a workspace.
 - `:validate` validates the current query without running it.
 - `:json` prints canonical JSON for the current query.
 - `:run` executes the current query.
