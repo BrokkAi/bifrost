@@ -66,6 +66,8 @@ resolution work.
   candidate.
 - [x] (2026-07-14) Build scan-local scope inputs from the parsed file source and
   persisted declaration ranges instead of generic overload-aware `get_source`.
+- [ ] Bulk-hydrate the one-time Python usage index and parse source only for
+  files whose local declarations collide with named reexports.
 - [ ] Run the full 1,000-file / 10,000-site / 1,000-target acceptance record when
   disk preflight permits, then record the result and close #675 only if it completes.
 
@@ -202,6 +204,12 @@ resolution work.
   broad short-name candidate hydration and `python_module_name` filesystem work.
   Evidence: `/private/tmp/bifrost-675-full-acceptance-scope-index.sample.txt`.
 
+- Observation: The first completed full record took 174.1 seconds and spent its
+  sampled warm-up almost entirely building `PythonUsageIndex`: `export_index_of`
+  reparsed every file and fetched each persisted file state independently.
+  Evidence: `/private/tmp/bifrost-675-full-acceptance-scope-source.sample.txt` and
+  `.agents/docs/reference-differential/675-python-full-acceptance.jsonl`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -321,6 +329,17 @@ resolution work.
   without asking public source rendering to rediscover same-FQN definitions. The
   source is already owned by the per-file graph and no additional source or tree is
   retained after the scan.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: Build the workspace usage index from fixed-size batches of persisted
+  file states, reducing each batch immediately to compact module/export/binder
+  entries. Reparse only when a named reexport and a local declaration expose the
+  same name.
+  Rationale: Source order can change the winner only for that collision. Import
+  ordinals already preserve ordering between reexports, while unrelated local
+  names commute with them. Batching removes the global parse and repeated
+  single-file queries without retaining all 36,100 hydrated corpus states or
+  weakening the existing later-local/later-reexport semantics.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective

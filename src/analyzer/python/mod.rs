@@ -13,6 +13,7 @@ mod usage_index;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -169,9 +170,66 @@ impl PythonAnalyzer {
         {
             self.collect_reexport_events(file, tree.root_node(), &source, &mut events, &mut index);
         } else {
-            self.collect_reexport_events_from_import_info(file, &mut events, &mut index);
+            let imports = self.inner.import_info_of(file);
+            self.collect_reexport_events_from_imports(file, &imports, &mut events, &mut index);
         }
 
+        Self::finish_export_index(events, index)
+    }
+
+    pub(super) fn export_index_from_file_state(
+        &self,
+        file: &ProjectFile,
+        state: &FileState,
+    ) -> ExportIndex {
+        let mut index = ExportIndex::empty();
+        let mut events = Vec::new();
+        let mut local_names = HashSet::default();
+
+        for code_unit in &state.top_level_declarations {
+            let identifier = code_unit.identifier().trim();
+            if identifier.is_empty() || identifier.starts_with('_') {
+                continue;
+            }
+            local_names.insert(identifier.to_string());
+            let start_byte = state
+                .ranges
+                .get(code_unit)
+                .into_iter()
+                .flatten()
+                .map(|range| range.start_byte)
+                .min()
+                .unwrap_or(usize::MAX);
+            events.push((
+                start_byte,
+                identifier.to_string(),
+                ExportEntry::Local {
+                    local_name: identifier.to_string(),
+                },
+            ));
+        }
+
+        if reexport_order_requires_source(&state.imports, &local_names)
+            && let Ok(source) = file.read_to_string()
+            && let Some(tree) = parse_python_tree(&source)
+        {
+            self.collect_reexport_events(file, tree.root_node(), &source, &mut events, &mut index);
+        } else {
+            self.collect_reexport_events_from_imports(
+                file,
+                &state.imports,
+                &mut events,
+                &mut index,
+            );
+        }
+
+        Self::finish_export_index(events, index)
+    }
+
+    fn finish_export_index(
+        mut events: Vec<(usize, String, ExportEntry)>,
+        mut index: ExportIndex,
+    ) -> ExportIndex {
         events.sort_by_key(|(start_byte, _, _)| *start_byte);
         for (_, exported_name, entry) in events {
             index.exports_by_name.insert(exported_name, entry);
@@ -197,13 +255,14 @@ impl PythonAnalyzer {
         }
     }
 
-    fn collect_reexport_events_from_import_info(
+    fn collect_reexport_events_from_imports(
         &self,
         file: &ProjectFile,
+        imports: &[ImportInfo],
         events: &mut Vec<(usize, String, ExportEntry)>,
         index: &mut ExportIndex,
     ) {
-        for import in self.inner.import_info_of(file) {
+        for import in imports {
             self.record_reexport_event(file, &import.raw_snippet, usize::MAX, events, index);
         }
     }
@@ -519,6 +578,22 @@ impl PythonAnalyzer {
         }
         Some(rendered)
     }
+}
+
+fn reexport_order_requires_source(imports: &[ImportInfo], local_names: &HashSet<String>) -> bool {
+    imports.iter().any(|import| {
+        let Some(PythonImportDetails::FromImport {
+            name,
+            alias,
+            wildcard: false,
+            ..
+        }) = parse_python_import_details(&import.raw_snippet)
+        else {
+            return false;
+        };
+        let exported_name = alias.as_deref().unwrap_or(&name);
+        !exported_name.starts_with('_') && local_names.contains(exported_name)
+    })
 }
 
 impl IAnalyzer for PythonAnalyzer {

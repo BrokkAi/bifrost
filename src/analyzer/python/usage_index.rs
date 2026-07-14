@@ -14,13 +14,15 @@
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportEdge, ImportEdgeKind, ImportKind,
 };
-use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{BulkFileStateSource, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
 use std::collections::{BTreeSet, VecDeque};
 
 use super::PythonAnalyzer;
 use super::declarations::python_module_name;
 use super::imports::resolve_python_relative_module;
+
+const FILE_STATE_BATCH_SIZE: usize = 256;
 
 /// Re-export and reverse-import indices over the Python workspace.
 #[derive(Debug, Default)]
@@ -65,22 +67,46 @@ impl PythonUsageIndex {
         files.dedup();
 
         let mut module_index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-        for file in &files {
-            module_index
-                .entry(python_module_name(file))
-                .or_default()
-                .push(file.clone());
+        let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
+        let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
+        for batch in files.chunks(FILE_STATE_BATCH_SIZE) {
+            let file_states = analyzer
+                .inner
+                .bulk_file_states(batch.iter().cloned(), BulkFileStateSource::Omit);
+            for file in batch {
+                let module_name = file_states
+                    .get(file)
+                    .and_then(|state| {
+                        state
+                            .top_level_declarations
+                            .iter()
+                            .find(|unit| unit.is_module())
+                    })
+                    .map(|unit| unit.fq_name().to_string())
+                    .unwrap_or_else(|| python_module_name(file));
+                module_index
+                    .entry(module_name)
+                    .or_default()
+                    .push(file.clone());
+
+                if let Some(state) = file_states.get(file) {
+                    exports_by_file.insert(
+                        file.clone(),
+                        analyzer.export_index_from_file_state(file, state),
+                    );
+                    binders_by_file.insert(
+                        file.clone(),
+                        analyzer.import_binder_from_imports(file, &state.imports),
+                    );
+                } else {
+                    exports_by_file.insert(file.clone(), analyzer.export_index_of(file));
+                    binders_by_file.insert(file.clone(), analyzer.import_binder_of(file));
+                }
+            }
         }
         for resolved in module_index.values_mut() {
             resolved.sort();
             resolved.dedup();
-        }
-
-        let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
-        let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
-        for file in &files {
-            exports_by_file.insert(file.clone(), analyzer.export_index_of(file));
-            binders_by_file.insert(file.clone(), analyzer.import_binder_of(file));
         }
 
         let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
