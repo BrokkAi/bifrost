@@ -63,6 +63,26 @@ skips every `#![cfg(feature = "nlp")]` integration suite (they report `ok. 0 pas
 We are okay with allow(clippy::too_many_arguments) rather than packing necessary parms into a struct just to
 make clippy shut up.
 
+# Temporary validation storage
+
+Do not create manually named `CARGO_TARGET_DIR=/tmp/bifrost-*` or `/private/tmp/bifrost-*` directories. Cargo does
+not remove them. Run isolated builds through `scripts/with-isolated-cargo-target.sh`, for example:
+
+    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+
+The helper removes its unique target on success, failure, or interruption. Set `BIFROST_KEEP_TARGET=1` only when the
+artifacts are deliberately needed after the command; retained targets are marked so automated cleanup skips them.
+
+Use `scripts/cleanup-bifrost-tmp.sh` to inspect stale Bifrost temporary directories. It is a dry run by default; review
+its candidates before rerunning with `--apply`. The command skips young directories, live helper PIDs, open directories,
+symlinks, and intentionally retained targets. Apply mode automatically removes only directories carrying the helper's
+managed-target marker. Historical manually named `bifrost-*` directories remain report-only unless you explicitly add
+`--include-unmanaged` after reviewing them.
+
+For `bifrost_reference_differential`, use `--cache-mode ephemeral` for one-off smoke runs that should not write
+`.brokk/bifrost_cache.db`. Keep the default `--cache-mode persisted` for deliberately warmed or resumable corpus
+campaigns.
+
 # RQL syntax maintenance
 
 All new CodeQuery JSON fields, RQL forms, properties, roles, kinds, aliases, and constrained values must enter through
