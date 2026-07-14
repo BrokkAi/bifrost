@@ -1910,17 +1910,10 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 continue;
             }
             if field != Some(QueryStepField::Op) {
-                let candidates = ALL_QUERY_STEP_FIELDS
+                let candidates: Vec<_> = ALL_QUERY_STEP_FIELDS
                     .iter()
-                    .filter(|candidate| {
-                        **candidate == QueryStepField::Op || hierarchy
-                    })
-                    .map(|candidate| {
-                        (
-                            candidate.label().to_string(),
-                            candidate.label().to_string(),
-                        )
-                    })
+                    .filter(|candidate| **candidate == QueryStepField::Op || hierarchy)
+                    .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))
                     .collect();
                 add_spelling_error(
                     analysis,

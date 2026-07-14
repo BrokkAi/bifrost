@@ -831,6 +831,191 @@ fn hierarchy_preserves_module_scoped_identity_and_cycles_do_not_return_the_seed(
 }
 
 #[test]
+fn subtypes_and_owner_preserve_duplicate_fq_name_identity() {
+    let files = [
+        (
+            "left/Types.java",
+            "package duplicate; class Base { void leftMember() {} } class LeftChild extends Base {}\n",
+        ),
+        (
+            "right/Types.java",
+            "package duplicate; class Base { void rightMember() {} } class RightChild extends Base {}\n",
+        ),
+    ];
+    let subtypes = serialized(&run(
+        &files,
+        json!({
+            "where": ["left/**"],
+            "match": { "kind": "class", "name": "Base" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "subtypes" }]
+        }),
+    ));
+    assert_eq!(result_fq_names(&subtypes), vec!["duplicate.LeftChild"]);
+    assert_eq!(
+        subtypes["results"][0]["path"], "left/Types.java",
+        "{subtypes}"
+    );
+
+    let owner = serialized(&run(
+        &files,
+        json!({
+            "where": ["left/**"],
+            "match": { "kind": "class", "name": "Base" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "members" },
+                { "op": "owner" }
+            ]
+        }),
+    ));
+    assert_eq!(result_fq_names(&owner), vec!["duplicate.Base"]);
+    assert_eq!(owner["results"][0]["path"], "left/Types.java", "{owner}");
+}
+
+#[test]
+fn empty_semantic_frontier_does_not_project_workspace_declarations() {
+    let project = InlineTestProject::new()
+        .file("app.py", "class Present:\n    pass\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    workspace
+        .analyzer()
+        .reset_full_declaration_scan_count_for_test();
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "class", "name": "Missing" },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "members" }]
+    }))
+    .unwrap();
+    let result = execute(workspace.analyzer(), &query);
+    assert!(result.results.is_empty());
+    assert_eq!(
+        workspace.analyzer().full_declaration_scan_count_for_test(),
+        0
+    );
+}
+
+#[test]
+fn narrow_semantic_query_does_not_project_workspace_declarations() {
+    let project = InlineTestProject::new()
+        .file(
+            "target.py",
+            "class Target:\n    def member(self):\n        pass\n",
+        )
+        .file("unrelated_a.py", "class UnrelatedA:\n    pass\n")
+        .file("unrelated_b.py", "class UnrelatedB:\n    pass\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    workspace
+        .analyzer()
+        .reset_full_declaration_scan_count_for_test();
+    let query = CodeQuery::from_json(&json!({
+        "where": ["target.py"],
+        "match": { "kind": "class", "name": "Target" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "members" },
+            { "op": "owner" }
+        ]
+    }))
+    .unwrap();
+    let result = execute(workspace.analyzer(), &query);
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(
+        workspace.analyzer().full_declaration_scan_count_for_test(),
+        0
+    );
+}
+
+#[test]
+fn members_stop_examining_edges_at_the_pipeline_budget() {
+    let methods = (0..20)
+        .map(|index| format!("    def member_{index}(self):\n        pass\n"))
+        .collect::<String>();
+    let project = InlineTestProject::new()
+        .file("wide.py", format!("class Wide:\n{methods}"))
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "class", "name": "Wide" },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "members" }],
+        "limit": 100
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(result.truncated);
+    assert_eq!(result.results.len(), 1);
+}
+
+#[test]
+fn standalone_owner_stops_scanning_at_the_pipeline_budget() {
+    let project = InlineTestProject::new()
+        .file(
+            "Owners.java",
+            "class A {} class B {} class ZTarget { void target() { sink(); } void sink() {} }\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "sink" } },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "owner" }]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    let value = serialized(&result);
+    assert!(result.truncated, "{value}");
+    assert!(result.results.is_empty(), "{value}");
+}
+
+#[test]
+fn deep_hierarchy_provenance_is_bounded_by_pipeline_work_budget() {
+    let mut source = String::from("class C0:\n    pass\n");
+    for index in 1..200 {
+        source.push_str(&format!("class C{index}(C{}):\n    pass\n", index - 1));
+    }
+    let project = InlineTestProject::new().file("deep.py", source).build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "class", "name": "C0" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "subtypes", "transitive": true }
+        ],
+        "limit": 1000
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 1000,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(result.truncated);
+    assert!(result.results.len() < 100, "{}", result.results.len());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.message.contains("pipeline budget exhausted") })
+    );
+}
+
+#[test]
 fn hierarchy_does_not_manufacture_unindexed_library_declarations() {
     let result = run(
         &[("app.py", "class Local(ExternalLibraryType):\n    pass\n")],

@@ -1,3 +1,4 @@
+use crate::analyzer::structural::query::schema::ALL_QUERY_STEP_OPS;
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
     MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
@@ -31,6 +32,53 @@ pub fn run_extended_stdio_server(
     run_stdio_server(root, render_options, &spec)
 }
 
+fn query_step_input_variants() -> Vec<Value> {
+    let plain = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| !op.allows_hierarchy_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let hierarchy = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_hierarchy_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    vec![
+        json!({
+            "type": "object",
+            "properties": { "op": { "type": "string", "enum": plain } },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": { "op": { "type": "string", "enum": hierarchy.clone() } },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": hierarchy.clone() },
+                "depth": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["op", "depth"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": hierarchy },
+                "transitive": { "const": true }
+            },
+            "required": ["op", "transitive"],
+            "additionalProperties": false
+        }),
+    ]
+}
+
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     let kind_vocabulary = ALL_KINDS
         .iter()
@@ -45,10 +93,19 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     let pattern_schema_description = format!(
         "A structural pattern object. Fields are optional: kind (one normalized kind or an array forming a subtype-aware union; vocabulary: {kind_vocabulary}), not_kind (kind or array to exclude), name (string for exact match or {{\"regex\": ...}}, max {MAX_STRING_PREDICATE_LENGTH} bytes), text ({{\"regex\": ...}}, max {MAX_STRING_PREDICATE_LENGTH} bytes), capture (max {MAX_CAPTURE_LENGTH} bytes), has / not_has (descendant patterns), and role sub-patterns valid for the declared kind: {role_vocabulary}. Query budget: max {MAX_PATTERN_NODES} pattern nodes, max depth {MAX_PATTERN_DEPTH}, max {MAX_ROLE_LIST_ENTRIES} role-list entries per list, max {MAX_KWARGS} kwargs, max keyword length {MAX_KWARG_NAME_LENGTH} bytes."
     );
+    let step_vocabulary = ALL_QUERY_STEP_OPS
+        .iter()
+        .map(|op| op.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query_code_description = format!(
+        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, or file results with provenance. It does not traverse call graphs or perform control-flow or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Pipeline example: {{\"match\":{{\"kind\":\"class\",\"name\":\"Service\"}},\"steps\":[{{\"op\":\"enclosing_decl\"}},{{\"op\":\"subtypes\",\"transitive\":true}},{{\"op\":\"members\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
+    );
+    let query_step_variants = query_step_input_variants();
     vec![
         tool_descriptor(
             "query_code",
-            "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports enclosing_decl, file_of, imports_of, importers_of, supertypes, subtypes, members, and owner. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, or file results with provenance. It does not traverse call graphs or perform control-flow or data-flow analysis. Minimal query: {\"match\":{\"kind\":\"call\",\"callee\":{\"name\":\"eval\"}}}. Pipeline example: {\"match\":{\"kind\":\"class\",\"name\":\"Service\"},\"steps\":[{\"op\":\"enclosing_decl\"},{\"op\":\"subtypes\",\"transitive\":true},{\"op\":\"members\"}]}. Guide: https://brokkai.github.io/bifrost/code-querying/",
+            &query_code_description,
             json!({
                 "type": "object",
                 "properties": {
@@ -80,38 +137,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "type": "array",
                         "maxItems": MAX_QUERY_STEPS,
                         "items": {
-                            "oneOf": [
-                                {
-                                    "type": "object",
-                                    "properties": { "op": { "type": "string", "enum": ["enclosing_decl", "file_of", "imports_of", "importers_of", "members", "owner"] } },
-                                    "required": ["op"],
-                                    "additionalProperties": false
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": { "op": { "type": "string", "enum": ["supertypes", "subtypes"] } },
-                                    "required": ["op"],
-                                    "additionalProperties": false
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "op": { "type": "string", "enum": ["supertypes", "subtypes"] },
-                                        "depth": { "type": "integer", "minimum": 1 }
-                                    },
-                                    "required": ["op", "depth"],
-                                    "additionalProperties": false
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "op": { "type": "string", "enum": ["supertypes", "subtypes"] },
-                                        "transitive": { "const": true }
-                                    },
-                                    "required": ["op", "transitive"],
-                                    "additionalProperties": false
-                                }
-                            ]
+                            "oneOf": query_step_variants
                         },
                         "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files."
                     },
@@ -429,6 +455,23 @@ mod tests {
             steps["items"]["oneOf"][2]["properties"]["depth"]["minimum"],
             1
         );
+        let advertised = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+            })
+            .map(|label| label.as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let registered = ALL_QUERY_STEP_OPS
+            .iter()
+            .map(|op| op.label())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(advertised, registered);
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
             json!([2])

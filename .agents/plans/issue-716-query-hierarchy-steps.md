@@ -16,6 +16,7 @@ The feature is observable through JSON and RQL queries, exact tagged declaration
 - [x] (2026-07-14 08:40Z) Milestone 2: implemented budgeted exact hierarchy/member execution, diagnostics, provenance, and focused integration tests.
 - [x] (2026-07-14 10:30Z) Milestone 3: added executable examples for all four operations to all eleven language cookbooks and updated public reference documentation.
 - [x] (2026-07-14 10:45Z) Milestone 4: ran the Rust and docs validation bundle, reviewed the full diff, tightened public help and validation ranges, added mixed-input coverage, and recorded the outcome.
+- [x] (2026-07-14 11:30Z) Guided-review remediation: fixed all seven security, identity, resource-accounting, schema-drift, parser-consistency, and validation findings and reran the complete constrained feature suite.
 
 ## Surprises & Discoveries
 
@@ -36,6 +37,9 @@ The feature is observable through JSON and RQL queries, exact tagged declaration
 
 - Observation: the elevated complete-suite run suffered a single `SIGKILL` in `lsp_server_drop_cleanup_exits_cleanly_after_initialize` after 178 sibling LSP tests passed.
   Evidence: rerunning that exact test with the same features and linker flags passed 1/1, indicating resource pressure in the fully parallel integration run rather than a reproducible test failure.
+
+- Observation: Cargo selected rustup's compiler for the constrained suite but the final doctest phase found Homebrew's identically versioned `rustdoc`, whose crate metadata is incompatible despite the matching version label.
+  Evidence: every unit and integration target passed with two build jobs and one test thread; pinning rustup first in `PATH` made the separate all-feature doctest phase pass as well.
 
 ## Decision Log
 
@@ -59,6 +63,14 @@ The feature is observable through JSON and RQL queries, exact tagged declaration
   Rationale: the feature must not manufacture library declarations from names or usages when the analyzer has not indexed those declarations.
   Date/Author: 2026-07-14 / Codex
 
+- Decision: charge both retained provenance length and path-membership work against the global pipeline-work limit, and represent traversal ancestry with parent-linked nodes rather than cloned paths and visited sets.
+  Rationale: an edge-count limit alone permits quadratic allocation and cycle-check work on deep or cyclic hierarchies; the combined accounting keeps memory and CPU bounded while retaining deterministic diamond provenance.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: key shared reverse hierarchy relations and member ownership by exact `CodeUnit` identity, using same-source declarations to disambiguate duplicate FQNs before indexing.
+  Rationale: public hierarchy steps promise exact indexed identity, which FQN-keyed reverse maps and name-derived parents cannot preserve across duplicate source declarations.
+  Date/Author: 2026-07-14 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 now provides the complete public syntax without execution semantics. JSON and RQL canonicalize named hierarchy options identically, invalid configurations point to their exact fields, and the declarative registries drive help for the new forms and fields.
@@ -68,6 +80,8 @@ Milestone 2 projects semantic results through the analyzer's bulk indexed-declar
 Milestone 3 adds two executable hierarchy/ownership recipes to every language cookbook, including exact declaration results and per-edge provenance. Bounded and transitive options are distributed across the languages, and a coverage assertion now prevents any cookbook from omitting one of the four operations. The overview, JSON/RQL references, CLI, MCP/Python client documentation, and package README explain direct/bounded/transitive semantics and the indexed-declarations-only precision boundary. Rust docs tests, Astro check, Astro build, and generated-HTML inspection pass.
 
 Milestone 4's review synchronized the MCP description with the literal public operation names, narrowed the JSON depth/transitive conflict diagnostic to the `transitive` value, and added a mixed valid/invalid input regression proving that valid hierarchy rows survive an aggregated shape diagnostic. Formatting, the 71-test focused feature gate, all-target/all-feature clippy, Astro check, and Astro build pass. The complete feature suite was also exercised: its sandbox-only uv cache failure was cleared by rerunning with normal host cache access, then one highly parallel LSP test process was killed after 178 sibling tests passed; the exact failed test passed immediately in isolation. No compatibility shim, textual resolver fallback, duplicate schema vocabulary, or unrelated file change remains in the branch diff.
+
+The guided review then found seven issues and all were remediated. Hierarchy ancestry is parent-linked and cumulative provenance/cycle-check work is budgeted; exact descendant indexes use `CodeUnit` keys; duplicate FQNs prefer their unique same-source declaration; `owner` is derived from exact indexed `direct_children`; semantic projection lazily checks only files reached by relation candidates; MCP schema and decoder vocabulary derive from the declarative step registry; and RQL accepts only symbolic `true`. New regressions cover deep chains, empty and nonempty narrow semantic frontiers, bounded member/owner scans, duplicate-FQN subtype and owner round trips, MCP registry exhaustiveness, and quoted-boolean rejection. The 79-test focused all-feature gate and all-target/all-feature clippy pass. The complete feature suite passed every unit and integration target with constrained concurrency, including all 179 LSP tests; its doctest phase also passed after pinning the same rustup toolchain used for compilation.
 
 ## Context and Orientation
 
@@ -154,3 +168,5 @@ Revision note (2026-07-14 08:40Z): Marked execution milestone complete after rev
 Revision note (2026-07-14 10:30Z): Marked the documentation milestone complete after executing all JSON/RQL cookbook recipes, recording exact provenance-bearing outputs, updating public references and clients, and validating the rendered static site.
 
 Revision note (2026-07-14 10:45Z): Completed final review and validation, including precise conflict ranges, synchronized MCP operation help, mixed-input execution coverage, and documentation of the one non-reproducible parallel-suite `SIGKILL`.
+
+Revision note (2026-07-14 11:30Z): Recorded guided-review remediation for all seven findings and the successful constrained full-suite plus pinned-toolchain doctest validation.

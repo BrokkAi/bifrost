@@ -195,32 +195,92 @@ struct DeclarationValue {
 
 #[derive(Default)]
 struct IndexedDeclarations {
-    by_unit: HashMap<CodeUnit, DeclarationValue>,
+    by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>>,
+    by_unit: HashMap<CodeUnit, Option<DeclarationValue>>,
+    owner_by_member: HashMap<CodeUnit, CodeUnit>,
 }
 
 impl IndexedDeclarations {
-    fn new(analyzer: &dyn IAnalyzer) -> Self {
-        let mut by_unit: HashMap<CodeUnit, DeclarationValue> = HashMap::default();
-        for (unit, range) in analyzer.all_declarations_with_primary_ranges() {
-            if unit.is_synthetic() || unit.is_file_scope() {
-                continue;
-            }
-            let Some(range) = range else {
-                continue;
-            };
-            let candidate_key = primary_range_key(&range);
-            let replace = by_unit
-                .get(&unit)
-                .is_none_or(|current| candidate_key < primary_range_key(&current.range));
-            if replace {
-                by_unit.insert(unit.clone(), DeclarationValue { unit, range });
-            }
+    fn get(&mut self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DeclarationValue> {
+        if let Some(value) = self.by_unit.get(unit) {
+            return value.clone();
         }
-        Self { by_unit }
+
+        let value = if unit.is_synthetic() || unit.is_file_scope() {
+            None
+        } else {
+            let declarations = self
+                .by_file
+                .entry(unit.source().clone())
+                .or_insert_with(|| analyzer.declarations(unit.source()));
+            declarations.contains(unit).then(|| {
+                analyzer
+                    .ranges_of(unit)
+                    .into_iter()
+                    .min_by_key(primary_range_key)
+                    .map(|range| DeclarationValue {
+                        unit: unit.clone(),
+                        range,
+                    })
+            })?
+        };
+        self.by_unit.insert(unit.clone(), value.clone());
+        value
     }
 
-    fn get(&self, unit: &CodeUnit) -> Option<DeclarationValue> {
-        self.by_unit.get(unit).cloned()
+    fn record_owner(&mut self, member: &CodeUnit, owner: &CodeUnit) {
+        self.owner_by_member
+            .entry(member.clone())
+            .or_insert_with(|| owner.clone());
+    }
+
+    fn owner_of(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        member: &CodeUnit,
+        work: &mut usize,
+        max_work: usize,
+    ) -> (Option<DeclarationValue>, bool) {
+        if let Some(owner) = self.owner_by_member.get(member).cloned() {
+            if *work >= max_work {
+                return (None, true);
+            }
+            *work += 1;
+            return (self.get(analyzer, &owner), false);
+        }
+
+        let owner = {
+            let declarations = self
+                .by_file
+                .entry(member.source().clone())
+                .or_insert_with(|| analyzer.declarations(member.source()));
+            let mut found = None;
+            'owners: for candidate in declarations.iter() {
+                if *work >= max_work {
+                    return (None, true);
+                }
+                *work += 1;
+                if !is_type_declaration(analyzer, candidate) {
+                    continue;
+                }
+                for child in analyzer.direct_children(candidate) {
+                    if *work >= max_work {
+                        return (None, true);
+                    }
+                    *work += 1;
+                    if &child == member {
+                        found = Some(candidate.clone());
+                        break 'owners;
+                    }
+                }
+            }
+            found
+        };
+        if let Some(owner) = owner {
+            self.record_owner(member, &owner);
+            return (self.get(analyzer, &owner), false);
+        }
+        (None, false)
     }
 }
 
@@ -403,6 +463,7 @@ struct CodeQueryExecutionBudget {
     scanned_source_bytes: usize,
     fact_nodes: usize,
     pipeline_rows: usize,
+    provenance_steps: usize,
 }
 
 #[doc(hidden)]
@@ -618,23 +679,23 @@ pub fn execute_with_limits(
         .collect::<Vec<_>>();
     budget.pipeline_rows = rows.len();
 
-    let indexed_declarations = query
-        .steps
-        .iter()
-        .any(|step| {
-            matches!(
+    let mut indexed_declarations = None;
+
+    let mut import_graph = None;
+    let mut import_graph_budget_diagnostic_emitted = false;
+    for (step_index, step) in query.steps.iter().enumerate() {
+        if !rows.is_empty()
+            && indexed_declarations.is_none()
+            && matches!(
                 step,
                 QueryStep::Supertypes(_)
                     | QueryStep::Subtypes(_)
                     | QueryStep::Members
                     | QueryStep::Owner
             )
-        })
-        .then(|| IndexedDeclarations::new(analyzer));
-
-    let mut import_graph = None;
-    let mut import_graph_budget_diagnostic_emitted = false;
-    for (step_index, step) in query.steps.iter().enumerate() {
+        {
+            indexed_declarations = Some(IndexedDeclarations::default());
+        }
         if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
             let graph = import_graph.get_or_insert_with(|| DirectImportGraph::new(analyzer));
             let graph_exhausted = if step == &QueryStep::ImportersOf {
@@ -675,7 +736,7 @@ pub fn execute_with_limits(
             step,
             rows,
             import_graph.as_ref(),
-            indexed_declarations.as_ref(),
+            indexed_declarations.as_mut(),
             &mut budget,
             limits.max_pipeline_rows,
             &mut diagnostics,
@@ -828,7 +889,7 @@ fn apply_pipeline_step(
     step: &QueryStep,
     rows: Vec<PipelineRow>,
     import_graph: Option<&DirectImportGraph>,
-    indexed_declarations: Option<&IndexedDeclarations>,
+    indexed_declarations: Option<&mut IndexedDeclarations>,
     budget: &mut CodeQueryExecutionBudget,
     max_pipeline_rows: usize,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -841,6 +902,7 @@ fn apply_pipeline_step(
         HashMap::default();
     let mut exhausted = false;
 
+    let mut indexed_declarations = indexed_declarations;
     'rows: for row in rows {
         let mut row_exhausted = false;
         let expansions = match (&row.value, step) {
@@ -890,7 +952,9 @@ fn apply_pipeline_step(
                 PipelineValue::Declaration(declaration),
                 QueryStep::Supertypes(traversal) | QueryStep::Subtypes(traversal),
             ) => {
-                let indexed = indexed_declarations.expect("semantic declaration index exists");
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
                 let (expansions, hierarchy_exhausted) = expand_hierarchy(
                     analyzer,
                     declaration,
@@ -905,7 +969,9 @@ fn apply_pipeline_step(
                 expansions
             }
             (PipelineValue::Declaration(declaration), QueryStep::Members) => {
-                let indexed = indexed_declarations.expect("semantic declaration index exists");
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
                 if !is_type_declaration(analyzer, &declaration.unit) {
                     record_semantic_omission(
                         &mut semantic_omissions,
@@ -917,22 +983,35 @@ fn apply_pipeline_step(
                     let mut children = analyzer.direct_children(&declaration.unit);
                     children.sort();
                     children.dedup();
-                    children
-                        .into_iter()
-                        .filter_map(|unit| indexed.get(&unit))
-                        .map(declaration_expansion)
-                        .collect()
+                    let mut expansions = Vec::new();
+                    for unit in children {
+                        if budget.pipeline_rows >= max_pipeline_rows {
+                            row_exhausted = true;
+                            break;
+                        }
+                        budget.pipeline_rows += 1;
+                        if let Some(child) = indexed.get(analyzer, &unit) {
+                            indexed.record_owner(&unit, &declaration.unit);
+                            expansions.push(budgeted_declaration_expansion(child));
+                        }
+                    }
+                    expansions
                 }
             }
             (PipelineValue::Declaration(declaration), QueryStep::Owner) => {
-                let indexed = indexed_declarations.expect("semantic declaration index exists");
-                match analyzer.parent_of(&declaration.unit) {
-                    Some(owner) if is_type_declaration(analyzer, &owner) => indexed
-                        .get(&owner)
-                        .map(declaration_expansion)
-                        .into_iter()
-                        .collect(),
-                    _ => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let (owner, owner_exhausted) = indexed.owner_of(
+                    analyzer,
+                    &declaration.unit,
+                    &mut budget.pipeline_rows,
+                    max_pipeline_rows,
+                );
+                row_exhausted = owner_exhausted;
+                match owner {
+                    Some(owner) => vec![budgeted_declaration_expansion(owner)],
+                    None if !owner_exhausted => {
                         record_semantic_omission(
                             &mut semantic_omissions,
                             &declaration.unit,
@@ -940,6 +1019,7 @@ fn apply_pipeline_step(
                         );
                         Vec::new()
                     }
+                    None => Vec::new(),
                 }
             }
             _ => unreachable!("query step domains are validated before execution"),
@@ -1027,11 +1107,11 @@ fn pipeline_expansion(value: PipelineValue) -> PipelineExpansion {
     }
 }
 
-fn declaration_expansion(declaration: DeclarationValue) -> PipelineExpansion {
+fn budgeted_declaration_expansion(declaration: DeclarationValue) -> PipelineExpansion {
     PipelineExpansion {
         value: PipelineValue::Declaration(declaration.clone()),
         trace_values: vec![PipelineTraceValue::Declaration(declaration)],
-        budgeted: false,
+        budgeted: true,
     }
 }
 
@@ -1041,7 +1121,7 @@ fn expand_hierarchy(
     declaration: &DeclarationValue,
     step: &QueryStep,
     traversal: HierarchyTraversal,
-    indexed: &IndexedDeclarations,
+    indexed: &mut IndexedDeclarations,
     budget: &mut CodeQueryExecutionBudget,
     max_pipeline_rows: usize,
     omissions: &mut BTreeMap<(Language, &'static str), usize>,
@@ -1068,14 +1148,12 @@ fn expand_hierarchy(
         HierarchyTraversal::Depth(depth) => depth.get(),
         HierarchyTraversal::Transitive => usize::MAX,
     };
-    let mut root_seen = HashSet::default();
-    root_seen.insert(declaration.unit.clone());
     let mut queue = VecDeque::from([HierarchyWork {
         unit: declaration.unit.clone(),
         depth: 0,
-        path: Vec::new(),
-        seen: root_seen,
+        path_tail: None,
     }]);
+    let mut paths = Vec::new();
     let mut expansions = Vec::new();
 
     while let Some(work) = queue.pop_front() {
@@ -1094,35 +1172,44 @@ fn expand_hierarchy(
                 return (expansions, true);
             }
             budget.pipeline_rows += 1;
-            if work.seen.contains(&unit) {
-                continue;
+            match hierarchy_path_contains(
+                &paths,
+                work.path_tail,
+                &declaration.unit,
+                &unit,
+                &mut budget.provenance_steps,
+                max_pipeline_rows,
+            ) {
+                Some(true) => continue,
+                Some(false) => {}
+                None => return (expansions, true),
             }
-            let Some(value) = indexed.get(&unit) else {
+            let Some(value) = indexed.get(analyzer, &unit) else {
                 // Structured relations may observe an external name, but this
                 // pipeline only returns declarations indexed by this analyzer.
                 continue;
             };
-            let mut path = work.path.clone();
-            path.push(value.clone());
+            let next_depth = work.depth + 1;
+            if budget.provenance_steps.saturating_add(next_depth) > max_pipeline_rows {
+                return (expansions, true);
+            }
+            budget.provenance_steps += next_depth;
+            let path_tail = paths.len();
+            paths.push(HierarchyPathNode {
+                value: value.clone(),
+                parent: work.path_tail,
+            });
             expansions.push(PipelineExpansion {
                 value: PipelineValue::Declaration(value),
-                trace_values: path
-                    .iter()
-                    .cloned()
-                    .map(PipelineTraceValue::Declaration)
-                    .collect(),
+                trace_values: hierarchy_trace_values(&paths, path_tail, next_depth),
                 budgeted: true,
             });
 
-            let next_depth = work.depth + 1;
             if next_depth < max_depth {
-                let mut seen = work.seen.clone();
-                seen.insert(unit.clone());
                 queue.push_back(HierarchyWork {
                     unit,
                     depth: next_depth,
-                    path,
-                    seen,
+                    path_tail: Some(path_tail),
                 });
             }
         }
@@ -1133,8 +1220,59 @@ fn expand_hierarchy(
 struct HierarchyWork {
     unit: CodeUnit,
     depth: usize,
-    path: Vec<DeclarationValue>,
-    seen: HashSet<CodeUnit>,
+    path_tail: Option<usize>,
+}
+
+struct HierarchyPathNode {
+    value: DeclarationValue,
+    parent: Option<usize>,
+}
+
+fn hierarchy_path_contains(
+    paths: &[HierarchyPathNode],
+    mut tail: Option<usize>,
+    root: &CodeUnit,
+    candidate: &CodeUnit,
+    work: &mut usize,
+    max_work: usize,
+) -> Option<bool> {
+    if *work >= max_work {
+        return None;
+    }
+    *work += 1;
+    if candidate == root {
+        return Some(true);
+    }
+    while let Some(index) = tail {
+        if *work >= max_work {
+            return None;
+        }
+        *work += 1;
+        let node = &paths[index];
+        if &node.value.unit == candidate {
+            return Some(true);
+        }
+        tail = node.parent;
+    }
+    Some(false)
+}
+
+fn hierarchy_trace_values(
+    paths: &[HierarchyPathNode],
+    mut tail: usize,
+    depth: usize,
+) -> Vec<PipelineTraceValue> {
+    let mut values = Vec::with_capacity(depth);
+    loop {
+        let node = &paths[tail];
+        values.push(PipelineTraceValue::Declaration(node.value.clone()));
+        let Some(parent) = node.parent else {
+            break;
+        };
+        tail = parent;
+    }
+    values.reverse();
+    values
 }
 
 fn is_type_declaration(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {

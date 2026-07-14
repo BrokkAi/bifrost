@@ -233,19 +233,38 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
 pub(crate) fn build_direct_descendant_index<A, P>(
     analyzer: &A,
     provider: &P,
-) -> HashMap<String, Arc<HashSet<CodeUnit>>>
+) -> HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>
 where
     A: IAnalyzer,
     P: TypeHierarchyProvider + ?Sized,
 {
-    let mut reverse: HashMap<String, HashSet<CodeUnit>> = HashMap::default();
-    for candidate in analyzer
+    let mut candidates = analyzer
         .all_declarations()
         .filter(|candidate| candidate.is_class())
-    {
+        .collect::<Vec<_>>();
+    candidates.sort();
+    let mut types_by_fq_name: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+    for candidate in &candidates {
+        types_by_fq_name
+            .entry(candidate.fq_name())
+            .or_default()
+            .push(candidate.clone());
+    }
+    let mut reverse: HashMap<CodeUnit, HashSet<CodeUnit>> = HashMap::default();
+    for candidate in candidates {
         for ancestor in provider.get_direct_ancestors(&candidate) {
+            let ancestor = types_by_fq_name
+                .get(&ancestor.fq_name())
+                .and_then(|same_name| {
+                    let mut same_source = same_name
+                        .iter()
+                        .filter(|unit| unit.source() == candidate.source());
+                    let exact = same_source.next()?;
+                    same_source.next().is_none().then(|| exact.clone())
+                })
+                .unwrap_or(ancestor);
             reverse
-                .entry(ancestor.fq_name())
+                .entry(ancestor)
                 .or_default()
                 .insert(candidate.clone());
         }

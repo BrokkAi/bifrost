@@ -5,7 +5,9 @@ use super::ir::{
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
     QueryStep, SCHEMA_VERSION, StringPredicate, validate_query_steps,
 };
-use super::schema::{PatternField, QueryField, QueryStepField, StringPredicateField};
+use super::schema::{
+    ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
+};
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
 use regex::Regex;
@@ -268,11 +270,14 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             .as_str()
             .ok_or_else(|| QueryError::new(&op_path, "expected a step name string"))?;
         let mut step = QueryStep::from_label(label).ok_or_else(|| {
+            let expected = ALL_QUERY_STEP_OPS
+                .iter()
+                .map(|op| op.label())
+                .collect::<Vec<_>>()
+                .join(", ");
             QueryError::new(
                 &op_path,
-                format!(
-                    "unknown query step {label:?}; expected enclosing_decl, file_of, imports_of, importers_of, supertypes, subtypes, members, or owner"
-                ),
+                format!("unknown query step {label:?}; expected {expected}"),
             )
         })?;
         let hierarchy = matches!(step, QueryStep::Supertypes(_) | QueryStep::Subtypes(_));

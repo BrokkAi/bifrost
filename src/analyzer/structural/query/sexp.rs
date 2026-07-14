@@ -155,7 +155,7 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                         step.insert("depth".to_string(), number_value(value, head)?);
                     }
                     Some(":transitive") => {
-                        if symbol_or_string(value)?.as_str() != "true" {
+                        if value.as_symbol() != Some("true") {
                             return Err(format!("({head} :transitive ...) requires true"));
                         }
                         step.insert("transitive".to_string(), Value::Bool(true));
@@ -567,6 +567,7 @@ mod tests {
         for invalid in [
             r#"(supertypes :depth 0 (enclosing-decl (class)))"#,
             r#"(subtypes :transitive false (enclosing-decl (class)))"#,
+            r#"(subtypes :transitive "true" (enclosing-decl (class)))"#,
             r#"(supertypes :unknown 2 (enclosing-decl (class)))"#,
         ] {
             assert!(CodeQuery::from_sexp(invalid).is_err(), "{invalid}");

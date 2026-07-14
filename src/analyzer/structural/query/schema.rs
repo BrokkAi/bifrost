@@ -95,6 +95,10 @@ macro_rules! query_step_ops {
                     $(Self::$variant => $description,)+
                 }
             }
+
+            pub fn allows_hierarchy_options(self) -> bool {
+                matches!(self, Self::Supertypes | Self::Subtypes)
+            }
         }
     };
 }
