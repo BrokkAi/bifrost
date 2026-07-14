@@ -138,7 +138,7 @@ fn cleanup_preserves_young_active_retained_open_and_symlinked_directories() {
     }
     fs::write(
         active.join(".bifrost-active-pid"),
-        format!("{}\n", std::process::id()),
+        format!("2147483647\n{}\n", std::process::id()),
     )
     .expect("write active marker");
     fs::write(retained.join(".bifrost-keep"), "").expect("write keep marker");

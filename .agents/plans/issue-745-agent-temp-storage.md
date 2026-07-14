@@ -16,7 +16,7 @@ The behavior is observable without a large build: run the isolated-target helper
 - [x] (2026-07-14T11:48Z) Added the dry-run-by-default stale-directory cleanup command and safety tests for prefix, age, PID, open directory, retained marker, and symlink boundaries.
 - [x] (2026-07-14T11:48Z) Added explicit persisted and ephemeral reference-differential cache modes, preserving persisted mode as the default.
 - [x] (2026-07-14T11:48Z) Updated `AGENTS.md` with the commands and the smoke-versus-campaign cache policy.
-- [ ] Run formatting, focused tests, strict Clippy, and a final diff review.
+- [x] (2026-07-14T11:53Z) Ran shell syntax checks, formatting, 11 focused integration tests, strict all-feature Clippy in a clean pinned-toolchain target, a manual helper smoke, and the final safety diff review.
 
 ## Surprises & Discoveries
 
@@ -28,6 +28,8 @@ The behavior is observable without a large build: run the isolated-target helper
   Evidence: `rg` finds examples in `.agents/plans/issue-575-incremental-lsp-text-synchronization.md`, `.agents/plans/issue-577-lsp-semantic-tokens.md`, and `.agents/plans/issue-584-shared-cache-liveness.md`; `scripts/` has no matching helper.
 - Observation: the Bifrost code-intelligence skills were installed, but their advertised MCP tools were not callable in this session.
   Evidence: the available tool inventory exposed the GitHub connector but no `search_symbols`, `get_summaries`, or `get_symbol_sources` tool, so repository exploration used narrow `rg` and source reads instead.
+- Observation: the ordinary strict Clippy command selected Homebrew Rust against Rustup-built shared artifacts and failed with `E0514`, even though both compilers report version 1.96.0.
+  Evidence: the first run reported incompatible metadata for 30 dependencies. Pinning `PATH` to `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` and running Clippy through `scripts/with-isolated-cargo-target.sh` passed in 1 minute 29 seconds, after which the helper removed `/private/tmp/bifrost-cargo-target.jCvDMA`.
 
 ## Decision Log
 
@@ -46,7 +48,9 @@ The behavior is observable without a large build: run the isolated-target helper
 
 ## Outcomes & Retrospective
 
-The three user-visible layers are implemented. The isolated helper removes its target on success, failure, and `TERM`, and can retain a marked target explicitly. Cleanup is dry-run by default and the focused tests prove its path and activity exclusions. The differential CLI now defaults to persisted behavior and offers an ephemeral in-memory mode that leaves `.brokk/bifrost_cache.db` absent. Focused tests pass; strict Clippy and the final review remain before completion.
+Completed on 2026-07-14. The isolated helper removes its target on success, failure, and `TERM`, records both the helper and direct-child PIDs for stale-cleanup protection, and can retain a marked target explicitly. Cleanup is dry-run by default and the focused tests prove its path, age, PID, open-directory, retained-marker, and symlink exclusions. The differential CLI defaults to persisted behavior and offers an ephemeral in-memory mode that leaves `.brokk/bifrost_cache.db` absent. `AGENTS.md` makes these commands and the cache policy the repository-wide default for future validation.
+
+Validation passed: `bash -n` for both scripts; `cargo fmt --check`; `cargo test --test temp_storage_scripts --test bifrost_reference_differential_cli` with 11 tests passed; a manual clean-on-exit smoke; `git diff --check`; and `cargo clippy --all-targets --all-features -- -D warnings` through the isolated helper with a pinned Rustup toolchain. The final review strengthened the active marker to include the child PID as well as the helper PID, covering a helper killed before it can clean up while Cargo remains alive.
 
 ## Context and Orientation
 
@@ -60,7 +64,7 @@ Cargo places compiled dependencies and other build artifacts in `target/`, or in
 
 ## Plan of Work
 
-First add `scripts/with-isolated-cargo-target.sh`. It will reject an empty command, create a `bifrost-cargo-target.XXXXXX` directory with `mktemp`, write its shell PID to `.bifrost-active-pid`, export `CARGO_TARGET_DIR`, and run the requested command. An exit trap removes the exact created directory. Signal traps forward interruption to the direct child, wait for it, and then exit through the same cleanup path. `BIFROST_KEEP_TARGET=1` replaces deletion with a `.bifrost-keep` marker after removing the active marker.
+First add `scripts/with-isolated-cargo-target.sh`. It will reject an empty command, create a `bifrost-cargo-target.XXXXXX` directory with `mktemp`, write its shell PID and direct-child PID to `.bifrost-active-pid`, export `CARGO_TARGET_DIR`, and run the requested command. An exit trap removes the exact created directory. Signal traps forward interruption to the direct child, wait for it, and then exit through the same cleanup path. `BIFROST_KEEP_TARGET=1` replaces deletion with a `.bifrost-keep` marker after removing the active marker.
 
 Next add `scripts/cleanup-bifrost-tmp.sh`. It will accept `--apply`, `--older-than-hours N`, and a testable `--tmp-root PATH`; default age is 24 hours and the default root is `BIFROST_TMP_ROOT` when set, `/private/tmp` when available, and `${TMPDIR:-/tmp}` otherwise. It will enumerate only direct directories whose basenames start `bifrost-`, never follow symlinks, skip `.bifrost-keep`, skip a live PID from `.bifrost-active-pid`, skip directories newer than the threshold, and skip any candidate for which `lsof +D` reports activity. Apply mode will also skip all candidates if `lsof` is unavailable, because inactivity would not be provable. Dry-run mode reports what would be removed without mutating anything.
 
@@ -128,3 +132,5 @@ The implementation adds two executable shell scripts, one Rust integration test 
 In `src/bin/bifrost_reference_differential.rs`, define a private `CacheMode` with `Persisted` and `Ephemeral`, parse it from `--cache-mode`, and pass it to `run_engine`. No library API changes are needed.
 
 Plan created on 2026-07-14 for issue #745. It records the conservative cleanup boundary and preserves persisted differential behavior by default.
+
+Plan updated on 2026-07-14 after implementation and review to record completed behavior, validation evidence, the mixed-toolchain discovery, and the child-PID safety hardening.

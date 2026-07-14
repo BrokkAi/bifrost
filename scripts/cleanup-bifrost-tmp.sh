@@ -93,17 +93,22 @@ for candidate in "${tmp_root%/}"/bifrost-*; do
 
   active_pid=""
   if [ -f "${candidate}/.bifrost-active-pid" ]; then
-    IFS= read -r active_pid < "${candidate}/.bifrost-active-pid" || true
+    while IFS= read -r marker_pid; do
+      case "${marker_pid}" in
+        ''|*[!0-9]*) ;;
+        *)
+          if kill -0 "${marker_pid}" 2>/dev/null; then
+            active_pid="${marker_pid}"
+            break
+          fi
+          ;;
+      esac
+    done < "${candidate}/.bifrost-active-pid"
   fi
-  case "${active_pid}" in
-    ''|*[!0-9]*) ;;
-    *)
-      if kill -0 "${active_pid}" 2>/dev/null; then
-        echo "Skip active PID ${active_pid}: ${candidate}"
-        continue
-      fi
-      ;;
-  esac
+  if [ -n "${active_pid}" ]; then
+    echo "Skip active PID ${active_pid}: ${candidate}"
+    continue
+  fi
 
   modified_at="$(directory_mtime "${candidate}")" || {
     echo "Skip unreadable timestamp: ${candidate}" >&2

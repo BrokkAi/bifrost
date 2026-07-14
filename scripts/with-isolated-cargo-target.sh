@@ -48,6 +48,12 @@ forward_signal() {
   signal="$1"
   status="$2"
   trap - "${signal}"
+  if [ -z "${child_pid}" ]; then
+    for job_pid in $(jobs -pr); do
+      child_pid="${job_pid}"
+      break
+    done
+  fi
   if [ -n "${child_pid}" ] && kill -0 "${child_pid}" 2>/dev/null; then
     kill -s "${signal}" "${child_pid}" 2>/dev/null || true
     wait "${child_pid}" 2>/dev/null || true
@@ -63,6 +69,7 @@ trap 'forward_signal TERM 143' TERM
 echo "Using isolated Cargo target: ${target_dir}" >&2
 "$@" &
 child_pid=$!
+printf '%s\n%s\n' "$$" "${child_pid}" > "${active_marker}"
 wait "${child_pid}"
 status=$?
 child_pid=""
