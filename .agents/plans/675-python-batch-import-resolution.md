@@ -26,8 +26,8 @@ resolution work.
 - [x] (2026-07-14) Rebase the checkpoint onto merged PR #750 and rerun the focused
   Python batch and integration tests.
 - [ ] Run clippy and the complete `nlp,python` suite.
-- [ ] Repeat the warmed Python differential smoke after addressing the remaining
-  candidate-lookup hotspot identified by the latest runtime sample.
+- [x] (2026-07-14) Complete the warmed Python differential smoke after addressing
+  the remaining candidate-lookup hotspot; retain the JSONL evidence.
 - [x] (2026-07-14) Reject a resolver-local content-qualifier cache after profiling:
   candidate rows span distinct Python files, so it did not reduce
   `python_module_name` work.
@@ -151,6 +151,17 @@ resolution work.
   `python_module_name` before eventually consulting path-backed module units.
   Evidence: `/private/tmp/bifrost-675-indexed-path-module.sample.txt`.
 
+- Observation: After direct path-module resolution, the identical warmed
+  20-file / 100-site / 20-target smoke completed in 88.1 seconds and queried all
+  seven distinct sampled targets. Its runtime sample contains none of the earlier
+  generic import-binding or global declaration hydration stacks; broad
+  short-name definition lookup is also gone from module checks. The remaining
+  one-time startup cost is `PythonUsageIndex::build` parsing workspace files to
+  preserve local-definition versus re-export ordering.
+  Evidence:
+  `.agents/docs/reference-differential/675-python-path-module-fast-smoke.jsonl`
+  and `/private/tmp/bifrost-675-path-module-fast.sample.txt`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -250,8 +261,10 @@ request, so no cache survives the batch-file lifecycle.
 The full validation and acceptance benchmark remains pending. The receiver path is
 covered for direct imports, explicit facade reexports, and imported class factory
 methods. Focused counters prove it no longer builds `MultiAnalyzer`'s global index or
-scans every declaration; the next warmed smoke must confirm that result on the corpus
-before the full limits are started.
+scans every declaration. The completed warmed corpus smoke confirms the bounded path
+finishes without generic import binding or broad definition hydration dominating typed
+receiver resolution, so the full limits may now be started after the required disk
+preflight.
 
 ## Context and Orientation
 
