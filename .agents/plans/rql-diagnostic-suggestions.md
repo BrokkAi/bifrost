@@ -12,6 +12,7 @@ RQL authors will receive conservative spelling suggestions and standard editor q
 - [x] (2026-07-14) Added schema-backed spelling selection, structured source fixes, and registry iteration for constrained values.
 - [x] (2026-07-14) Served current-buffer `bifrost-rql` quick fixes through `textDocument/codeAction`.
 - [x] (2026-07-14) Added focused source/LSP regression coverage and ran Rust checks. The VS Code suite could not run because this worktree has no installed TypeScript toolchain.
+- [x] (2026-07-14) Addressed guided-review findings: RQL buffers now participate in normal LSP sync, edits carry the current document version, ranges are end-exclusive, and wrapping is limited to fully recognizable values.
 
 ## Decision Log
 
@@ -23,6 +24,9 @@ RQL authors will receive conservative spelling suggestions and standard editor q
   Date/Author: 2026-07-14 / Codex
 - Decision: only wrap scalar values where the enclosing list structure is unambiguous.
   Rationale: automatic fixes must not invent semantic objects or map entries.
+  Date/Author: 2026-07-14 / Codex
+- Decision: validate a candidate pattern or query step before offering a container-wrapping fix.
+  Rationale: a syntactically object-shaped value can still contain unknown fields, invalid roles, or malformed nested patterns that must remain manual fixes.
   Date/Author: 2026-07-14 / Codex
 
 ## Context and Orientation
@@ -39,7 +43,7 @@ Run `cargo fmt`, focused source and `bifrost_lsp_server` tests with `--features 
 
 ## Outcomes & Retrospective
 
-Validation now emits canonical schema suggestions only when a unique nearby spelling exists, and it carries replacement or paired wrapping edits without changing the unsaved source. The LSP server advertises `quickfix` code actions, retains the document language id, and recomputes fixes from the latest open RQL buffer so stale editor diagnostics cannot produce edits.
+Validation now emits canonical schema suggestions only when a unique nearby spelling exists, and it carries replacement or paired wrapping edits without changing the unsaved source. The LSP server advertises `quickfix` code actions, retains the document language id, and recomputes fixes from the latest open RQL buffer so stale editor diagnostics cannot produce edits. The VS Code client now synchronizes `bifrost-rql` documents to that server; returned edits use `documentChanges` with the current version, and wrapping is withheld unless the value itself validates as a single pattern or query step.
 
 ## Surprises & Discoveries
 

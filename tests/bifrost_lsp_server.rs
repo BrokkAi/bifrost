@@ -831,6 +831,19 @@ fn bifrost_lsp_server_returns_current_rql_quick_fixes() {
         json!([]),
         "only overlapping diagnostics should produce actions: {non_overlapping_actions}"
     );
+    let adjacent_actions = server.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri_for(&rql_path)},
+            "range": {"start": {"line": 0, "character": 16}, "end": {"line": 0, "character": 17}},
+            "context": {"diagnostics": []},
+        }),
+    );
+    assert_eq!(
+        adjacent_actions["result"],
+        json!([]),
+        "an end-exclusive selection adjacent to a diagnostic must not produce actions: {adjacent_actions}"
+    );
     let actions = server.request(
         "textDocument/codeAction",
         json!({
@@ -841,13 +854,11 @@ fn bifrost_lsp_server_returns_current_rql_quick_fixes() {
     );
     let action = &actions["result"][0];
     assert_eq!(action["kind"], "quickfix", "{actions}");
+    let document_edit = &action["edit"]["documentChanges"][0];
+    assert_eq!(document_edit["textDocument"]["version"], 1, "{actions}");
+    assert_eq!(document_edit["edits"][0]["newText"], ":callee");
     assert_eq!(
-        action["edit"]["changes"][uri_for(&rql_path)][0]["newText"],
-        ":callee"
-    );
-    assert_eq!(
-        action["edit"]["changes"][uri_for(&rql_path)][0]["range"]["start"]["character"],
-        17,
+        document_edit["edits"][0]["range"]["start"]["character"], 17,
         "the range must use UTF-16 positions after an emoji: {actions}"
     );
 
@@ -867,9 +878,9 @@ fn bifrost_lsp_server_returns_current_rql_quick_fixes() {
             "context": {"diagnostics": []},
         }),
     );
-    let edits = actions["result"][0]["edit"]["changes"][uri_for(&rql_path)]
-        .as_array()
-        .expect("wrapping edits");
+    let document_edit = &actions["result"][0]["edit"]["documentChanges"][0];
+    assert_eq!(document_edit["textDocument"]["version"], 2, "{actions}");
+    let edits = document_edit["edits"].as_array().expect("wrapping edits");
     assert_eq!(edits.len(), 2, "paired wrapping edits: {actions}");
     assert_eq!(edits[0]["newText"], "[");
     assert_eq!(edits[1]["newText"], "]");

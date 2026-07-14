@@ -31,10 +31,12 @@ use lsp_types::{
     CodeActionResponse, ConfigurationItem, ConfigurationParams, Diagnostic, DiagnosticSeverity,
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, FileChangeType, Hover, HoverContents, InitializeParams,
-    MarkupContent, MarkupKind, NumberOrString, Position, ProgressToken, PublishDiagnosticsParams,
-    Registration, RegistrationParams, TextEdit, Uri, WorkDoneProgress, WorkDoneProgressBegin,
-    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit,
+    DidSaveTextDocumentParams, DocumentChanges, FileChangeType, Hover, HoverContents,
+    InitializeParams, MarkupContent, MarkupKind, NumberOrString, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Position, ProgressToken, PublishDiagnosticsParams,
+    Registration, RegistrationParams, TextDocumentEdit, TextEdit, Uri, WorkDoneProgress,
+    WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
+    WorkDoneProgressReport, WorkspaceEdit,
 };
 
 use crate::analyzer::structural::query::{
@@ -1820,8 +1822,15 @@ fn rql_code_actions(state: &ServerState, params: CodeActionParams) -> CodeAction
         return Vec::new();
     }
 
+    let diagnostics = validate_query_source(&document.text);
+    if !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.fix.is_some())
+    {
+        return Vec::new();
+    }
     let line_starts = compute_line_starts(&document.text);
-    validate_query_source(&document.text)
+    diagnostics
         .into_iter()
         .filter_map(|diagnostic| {
             let fix = diagnostic.fix?;
@@ -1872,8 +1881,14 @@ fn rql_code_actions(state: &ServerState, params: CodeActionParams) -> CodeAction
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: Some(vec![diagnostic]),
                 edit: Some(WorkspaceEdit {
-                    changes: Some(HashMap::from([(uri.clone(), edits)])),
-                    document_changes: None,
+                    changes: None,
+                    document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier::new(
+                            uri.clone(),
+                            document.version,
+                        ),
+                        edits: edits.into_iter().map(OneOf::Left).collect(),
+                    }])),
                     change_annotations: None,
                 }),
                 command: None,
@@ -1886,7 +1901,10 @@ fn rql_code_actions(state: &ServerState, params: CodeActionParams) -> CodeAction
 }
 
 fn ranges_overlap(left: &lsp_types::Range, right: &lsp_types::Range) -> bool {
-    left.start <= right.end && right.start <= left.end
+    if left.start == left.end {
+        return right.start <= left.start && left.start < right.end;
+    }
+    left.start < right.end && right.start < left.end
 }
 
 fn query_hover_request(params: QueryHoverParams) -> Option<Hover> {

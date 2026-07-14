@@ -260,11 +260,13 @@ fn language_candidates() -> Vec<SuggestionCandidate> {
                 .iter()
                 .map(|extension| (language.config_label().to_string(), format!(".{extension}"))),
         );
+        candidates.extend(
+            language
+                .config_label_aliases()
+                .iter()
+                .map(|alias| (language.config_label().to_string(), (*alias).to_string())),
+        );
     }
-    candidates.extend([
-        ("cpp".to_string(), "c++".to_string()),
-        ("csharp".to_string(), "c#".to_string()),
-    ]);
     candidates
 }
 
@@ -774,10 +776,17 @@ fn rql_single_pattern(value: &Expr) -> bool {
     let Some((head, _, _)) = list_head(value) else {
         return false;
     };
-    matches!(value.kind, ExprKind::List(_))
-        && (NormalizedKind::from_label(head).is_some()
+    if !matches!(value.kind, ExprKind::List(_))
+        || !(NormalizedKind::from_label(head).is_some()
             || RqlForm::from_label(head)
                 .is_some_and(|form| form.class() == RqlFormClass::Predicate))
+    {
+        return false;
+    }
+
+    let mut analysis = Analysis::default();
+    validate_rql_pattern(value, "", &mut analysis);
+    analysis.diagnostics.is_empty()
 }
 
 fn add_rql_property_help(label: &str, range: Range<usize>, analysis: &mut Analysis) {
@@ -1553,7 +1562,7 @@ fn validate_string_predicate(
 
 fn validate_json_pattern_array(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
     let Some(values) = value.as_array() else {
-        if value.as_object().is_some() {
+        if json_single_pattern_is_recognizable(value) {
             analysis.error_with_fix(
                 value.range(),
                 "wrong-value-shape",
@@ -1585,6 +1594,15 @@ fn validate_json_pattern_array(value: &spanned::Value, path: &str, analysis: &mu
     for (index, value) in values.iter().enumerate() {
         validate_json_pattern(value, &format!("{path}[{index}]"), analysis);
     }
+}
+
+fn json_single_pattern_is_recognizable(value: &spanned::Value) -> bool {
+    if value.as_object().is_none() {
+        return false;
+    }
+    let mut analysis = Analysis::default();
+    validate_json_pattern(value, "", &mut analysis);
+    analysis.diagnostics.is_empty()
 }
 
 fn validate_json_pattern_map(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
@@ -1738,7 +1756,7 @@ fn validate_json_languages(value: &spanned::Value, path: &str, analysis: &mut An
 
 fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
     let Some(steps) = value.as_array() else {
-        if value.as_object().is_some() {
+        if json_single_query_step_is_recognizable(value) {
             analysis.error_with_fix(
                 value.range(),
                 "wrong-value-shape",
@@ -1830,6 +1848,22 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
             analysis.add_help(child.range(), step.label(), query_step_description(step));
         }
     }
+}
+
+fn json_single_query_step_is_recognizable(value: &spanned::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 1 {
+        return false;
+    }
+    let Some((key, value)) = object.iter().next() else {
+        return false;
+    };
+    key.get_ref() == "op"
+        && value
+            .as_string()
+            .is_some_and(|label| QueryStep::from_label(label).is_some())
 }
 
 fn query_step_description(step: QueryStep) -> &'static str {
@@ -2306,12 +2340,30 @@ mod tests {
             r#"{"where":1,"match":{"kind":"call"}}"#,
             r#"{"match":{"kind":"call","args":"item"}}"#,
             r#"{"match":{"kind":"call","kwargs":[]}}"#,
+            r#"{"match":{"kind":"call","args":{"wat":{"kind":"call"}}}}"#,
+            r#"{"steps":{"wat":"file_of"},"match":{"kind":"call"}}"#,
+            r#"{"steps":{"op":"wat"},"match":{"kind":"call"}}"#,
             "(call :args \"item\")",
+            "(call :args (call :wat 1))",
         ] {
             assert!(
                 validate_query_source(source)
                     .into_iter()
                     .all(|diagnostic| diagnostic.fix.is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_language_aliases_do_not_produce_diagnostics() {
+        for source in [
+            "(language c++ (call))",
+            "(language c# (call))",
+            r#"{"languages":["c++","c#"],"match":{"kind":"call"}}"#,
+        ] {
+            assert!(
+                validate_query_source(source).is_empty(),
+                "accepted language alias should validate: {source}"
             );
         }
     }
