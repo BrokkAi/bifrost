@@ -15,7 +15,7 @@
 #[path = "common/memory_benchmark.rs"]
 mod memory_benchmark;
 
-use memory_benchmark::run_usage_graph_peak_rss_benchmark;
+use memory_benchmark::{GeneratedFixtureExpectations, run_usage_graph_peak_rss_benchmark};
 use std::fs;
 use std::path::Path;
 
@@ -23,23 +23,25 @@ use std::path::Path;
 const MODULE_COUNT: usize = 2000;
 
 /// Write a Python workspace with enough per-file content that the syntax trees are
-/// substantial. Every module imports a shared `Widget` (so `usage_graph` resolves real
+/// substantial. Every module imports a shared `render` function (so `usage_graph` resolves real
 /// cross-file edges) and defines a class with several methods.
 fn generate_large_python_workspace(root: &Path, module_count: usize) {
-    fs::write(
-        root.join("widget.py"),
-        "class Widget:\n    def render(self) -> str:\n        return \"widget\"\n",
-    )
-    .expect("write widget.py");
+    let mut widget_source = String::new();
+    for module in 0..module_count {
+        widget_source.push_str(&format!(
+            "def render_{module:05}() -> str:\n    return \"widget\"\n\n"
+        ));
+    }
+    fs::write(root.join("widget.py"), widget_source).expect("write widget.py");
 
     for module in 0..module_count {
-        let mut source = format!("from widget import Widget\n\n\nclass Mod{module:05}:\n");
+        let mut source =
+            format!("from widget import render_{module:05}\n\n\nclass Mod{module:05}:\n");
         for method in 0..6 {
             source.push_str(&format!(
                 "    def method{method}(self, value: int) -> str:\n\
-                 \x20       widget = Widget()\n\
                  \x20       total = value + {method}\n\
-                 \x20       return widget.render() + str(total)\n\n"
+                 \x20       return render_{module:05}() + str(total)\n\n"
             ));
         }
         fs::write(root.join(format!("mod_{module:05}.py")), source).expect("write module");
@@ -49,7 +51,13 @@ fn generate_large_python_workspace(root: &Path, module_count: usize) {
 #[test]
 #[ignore = "measure-first memory benchmark; run explicitly with --ignored --nocapture"]
 fn python_usage_graph_peak_rss() {
-    run_usage_graph_peak_rss_benchmark("Python", |root| {
-        generate_large_python_workspace(root, MODULE_COUNT);
-    });
+    run_usage_graph_peak_rss_benchmark(
+        "Python",
+        GeneratedFixtureExpectations {
+            minimum_nodes: MODULE_COUNT,
+            minimum_edges: MODULE_COUNT,
+            expected_edge_suffixes: ("Mod00000.method0", "widget.render_00000"),
+        },
+        |root| generate_large_python_workspace(root, MODULE_COUNT),
+    );
 }

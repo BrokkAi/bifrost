@@ -15,6 +15,7 @@
 
 mod common;
 
+use brokk_bifrost::{Language, SearchToolsService};
 use common::InlineTestProject;
 use common::usage_graph::{has_edge, usage_graph_at};
 use serde_json::Value;
@@ -62,6 +63,38 @@ fn cross_package_selector_call_resolves_to_an_edge() {
             "example.com/app/sub.Helper"
         ),
         "cross-package selector call should produce an edge; edges: {:?}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn persisted_service_resolves_cross_package_selector_call() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "sub/sub.go",
+            "package sub\n\nfunc Helper() string { return \"helper\" }\n",
+        )
+        .file(
+            "caller.go",
+            "package app\n\nimport \"example.com/app/sub\"\n\nfunc caller() string { return sub.Helper() }\n",
+        )
+        .build();
+
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("persisted service");
+    let payload = service
+        .call_tool_json("usage_graph", "{}")
+        .expect("usage_graph call failed");
+    let graph: Value = serde_json::from_str(&payload).expect("usage_graph JSON");
+
+    assert!(
+        has_edge(
+            &graph,
+            "example.com/app.caller",
+            "example.com/app/sub.Helper"
+        ),
+        "persisted workspace should resolve a cross-package selector call: {}",
         graph["edges"]
     );
 }

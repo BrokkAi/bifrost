@@ -11,7 +11,7 @@ use crate::analyzer::usages::model::{
 use crate::analyzer::usages::reexport_seeds;
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
-    CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
+    CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -21,6 +21,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
 use tree_sitter::{Node, Parser, Tree};
 
+type NamespacePackages = (HashMap<String, Vec<String>>, Vec<String>);
+
 pub(crate) struct ParsedFile {
     pub(super) source: Arc<String>,
     pub(super) tree: Tree,
@@ -28,6 +30,7 @@ pub(crate) struct ParsedFile {
     /// per-symbol scan does not recompute them for every symbol that scans this
     /// file.
     pub(super) line_starts: Vec<usize>,
+    imports: Vec<ImportInfo>,
     package_name: String,
 }
 
@@ -234,8 +237,7 @@ pub(crate) struct GoEdgeIndex {
     type_units: Vec<CodeUnit>,
     direct_member_fqns: HashMap<String, HashMap<String, Vec<String>>>,
     embedded_field_type_fqns: HashMap<String, Vec<String>>,
-    dir_index: ParentDirIndex,
-    module_path: Option<String>,
+    namespace_packages_by_file: HashMap<ProjectFile, NamespacePackages>,
 }
 
 impl GoEdgeIndex {
@@ -253,18 +255,11 @@ impl GoEdgeIndex {
 
     /// See [`GoProjectGraph::namespace_packages`]; resolves target package names
     /// from the tree-free per-file map instead of retained parse trees.
-    pub(super) fn namespace_packages(
-        &self,
-        analyzer: &GoAnalyzer,
-        file: &ProjectFile,
-    ) -> (HashMap<String, Vec<String>>, Vec<String>) {
-        namespace_packages_from(
-            analyzer,
-            file,
-            &self.dir_index,
-            self.module_path.as_deref(),
-            |target| self.package_names.get(target).cloned(),
-        )
+    pub(super) fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
+        self.namespace_packages_by_file
+            .get(file)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(super) fn constructor_return_types(&self, callee: &str) -> Option<&Vec<String>> {
@@ -371,6 +366,20 @@ fn build_go_edge_index_from_parsed(
         collect_constructor_names_by_return_type(&constructor_return_types);
 
     let dir_index = build_parent_dir_index(package_names.keys());
+    let namespace_packages_by_file = parsed_files
+        .iter()
+        .map(|(file, parsed)| {
+            (
+                file.clone(),
+                namespace_packages_from_imports(
+                    &parsed.imports,
+                    &dir_index,
+                    module_path.as_deref(),
+                    |target| package_names.get(target).cloned(),
+                ),
+            )
+        })
+        .collect();
     let indexed_files: Vec<ProjectFile> =
         parsed_files.iter().map(|(file, _)| file.clone()).collect();
     let declaration_facts = collect_go_declaration_facts(analyzer, &indexed_files);
@@ -390,8 +399,7 @@ fn build_go_edge_index_from_parsed(
         type_units: declaration_facts.type_units,
         direct_member_fqns: declaration_facts.direct_member_fqns,
         embedded_field_type_fqns,
-        dir_index,
-        module_path,
+        namespace_packages_by_file,
     }
 }
 
@@ -625,10 +633,20 @@ fn namespace_packages_from(
     dir_index: &ParentDirIndex,
     module_path: Option<&str>,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
-) -> (HashMap<String, Vec<String>>, Vec<String>) {
+) -> NamespacePackages {
+    let imports = analyzer.import_info_of(file);
+    namespace_packages_from_imports(&imports, dir_index, module_path, target_package_name)
+}
+
+fn namespace_packages_from_imports(
+    imports: &[ImportInfo],
+    dir_index: &ParentDirIndex,
+    module_path: Option<&str>,
+    target_package_name: impl Fn(&ProjectFile) -> Option<String>,
+) -> NamespacePackages {
     let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
     let mut dot_imports: Vec<String> = Vec::new();
-    for import in analyzer.import_info_of(file) {
+    for import in imports {
         let alias = import.alias.as_deref();
         if alias == Some("_") {
             continue;
@@ -683,7 +701,7 @@ pub(crate) fn resolve_go_import_namespaces(
     analyzer: &GoAnalyzer,
     file: &ProjectFile,
     package_names: &HashMap<ProjectFile, String>,
-) -> (HashMap<String, Vec<String>>, Vec<String>) {
+) -> NamespacePackages {
     let dir_index = build_parent_dir_index(package_names.keys());
     let module_path = read_go_module_path(file.root());
     namespace_packages_from(
@@ -702,10 +720,12 @@ fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
     let tree = parser.parse(source.as_str(), None)?;
     let package_name = package_name(tree.root_node(), &source);
     let line_starts = crate::text_utils::compute_line_starts(&source);
+    let imports = crate::analyzer::go::collect_go_import_infos(tree.root_node(), &source);
     Some(ParsedFile {
         source: Arc::new(source),
         tree,
         line_starts,
+        imports,
         package_name,
     })
 }

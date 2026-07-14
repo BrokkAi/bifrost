@@ -89,12 +89,11 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
     }
 }
 
-pub(crate) struct GoEdgeResolver<'a> {
-    go: &'a GoAnalyzer,
+pub(crate) struct GoEdgeResolver {
     index: GoEdgeIndex,
 }
 
-impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
+impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
         let files = analyzed_files_for_language(analyzer, Language::Go);
@@ -104,7 +103,7 @@ impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
         // A tree-free resolution index; the per-file walk re-parses on demand and
         // drops each tree, so the whole-workspace build retains no syntax trees.
         let index = build_go_edge_index(go, &files)?;
-        Some(Self { go, index })
+        Some(Self { index })
     }
 
     fn build_edges<F>(
@@ -116,7 +115,7 @@ impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_go_edges(analyzer, self.go, &self.index, nodes, keep_file)
+        inverted::build_go_edges(analyzer, &self.index, nodes, keep_file)
     }
 }
 

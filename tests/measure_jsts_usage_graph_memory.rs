@@ -12,7 +12,7 @@
 #[path = "common/memory_benchmark.rs"]
 mod memory_benchmark;
 
-use memory_benchmark::run_usage_graph_peak_rss_benchmark;
+use memory_benchmark::{GeneratedFixtureExpectations, run_usage_graph_peak_rss_benchmark};
 use std::fs;
 use std::path::Path;
 
@@ -20,31 +20,28 @@ use std::path::Path;
 const MODULE_COUNT: usize = 2000;
 
 /// Write a TypeScript workspace with enough per-file content that the syntax trees are
-/// substantial. Every module imports a shared `Widget` (so `usage_graph` resolves real
+/// substantial. Every module imports a shared `render` function (so `usage_graph` resolves real
 /// cross-file edges) and defines a class with several methods.
 fn generate_large_ts_workspace(root: &Path, module_count: usize) {
     let core_dir = root.join("core");
     fs::create_dir_all(&core_dir).expect("create core dir");
-    fs::write(
-        core_dir.join("widget.ts"),
-        "export class Widget {\n    render(): string {\n        return \"widget\";\n    }\n}\n",
-    )
-    .expect("write widget.ts");
-    fs::write(
-        root.join("index.ts"),
-        "export { Widget } from \"./core/widget\";\n",
-    )
-    .expect("write index.ts");
+    let mut widget_source = String::new();
+    for module in 0..module_count {
+        widget_source.push_str(&format!(
+            "export function render{module:05}(): string {{\n    return \"widget\";\n}}\n\n"
+        ));
+    }
+    fs::write(core_dir.join("widget.ts"), widget_source).expect("write widget.ts");
 
     for module in 0..module_count {
-        let mut source =
-            format!("import {{ Widget }} from \"./index\";\n\nexport class Mod{module:05} {{\n");
+        let mut source = format!(
+            "import {{ render{module:05} }} from \"./core/widget\";\n\nexport class Mod{module:05} {{\n"
+        );
         for method in 0..6 {
             source.push_str(&format!(
                 "    method{method}(input: number): string {{\n\
-                 \x20       const widget = new Widget();\n\
                  \x20       const total = input + {method};\n\
-                 \x20       return widget.render() + total.toString();\n\
+                 \x20       return render{module:05}() + total.toString();\n\
                  \x20   }}\n"
             ));
         }
@@ -56,7 +53,13 @@ fn generate_large_ts_workspace(root: &Path, module_count: usize) {
 #[test]
 #[ignore = "measure-first memory benchmark; run explicitly with --ignored --nocapture"]
 fn jsts_usage_graph_peak_rss() {
-    run_usage_graph_peak_rss_benchmark("JS/TS", |root| {
-        generate_large_ts_workspace(root, MODULE_COUNT);
-    });
+    run_usage_graph_peak_rss_benchmark(
+        "JS/TS",
+        GeneratedFixtureExpectations {
+            minimum_nodes: MODULE_COUNT,
+            minimum_edges: MODULE_COUNT,
+            expected_edge_suffixes: ("Mod00000.method0", "render00000"),
+        },
+        |root| generate_large_ts_workspace(root, MODULE_COUNT),
+    );
 }

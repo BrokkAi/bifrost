@@ -27,7 +27,7 @@ use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdges, build_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile};
+use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -41,10 +41,9 @@ use tree_sitter::Node;
 /// Trees are parsed on demand inside the per-file walk and dropped when the closure
 /// returns, so live trees are bounded by the worker count rather than the workspace
 /// size (#200). Cross-file resolution comes from the tree-free [`GoEdgeIndex`] and
-/// the analyzer's per-file import info — no other file's tree is read during a scan.
+/// the index's per-file import facts — no other file's tree is read during a scan.
 pub(super) fn build_go_edges<F>(
     analyzer: &dyn IAnalyzer,
-    go: &GoAnalyzer,
     index: &GoEdgeIndex,
     nodes: &HashSet<String>,
     keep_file: F,
@@ -57,7 +56,7 @@ where
     build_edges(&files, keep_file, |file| {
         let file_pkg = index.package_name_of(file)?;
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
-            let (alias_packages, dot_packages) = index.namespace_packages(go, file);
+            let (alias_packages, dot_packages) = index.namespace_packages(file);
             let mut ctx = FileScan {
                 source: parsed.source.as_str(),
                 file_pkg,
