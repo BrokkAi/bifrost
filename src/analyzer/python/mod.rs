@@ -181,6 +181,7 @@ impl PythonAnalyzer {
         &self,
         file: &ProjectFile,
         state: &FileState,
+        module_name: &str,
     ) -> ExportIndex {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
@@ -202,6 +203,21 @@ impl PythonAnalyzer {
                 .unwrap_or(usize::MAX);
             events.push((
                 start_byte,
+                identifier.to_string(),
+                ExportEntry::Local {
+                    local_name: identifier.to_string(),
+                },
+            ));
+        }
+
+        if !state.top_level_declarations.iter().any(CodeUnit::is_module)
+            && let Some(identifier) = module_name.rsplit('.').next()
+            && !identifier.is_empty()
+            && !identifier.starts_with('_')
+        {
+            local_names.insert(identifier.to_string());
+            events.push((
+                0,
                 identifier.to_string(),
                 ExportEntry::Local {
                     local_name: identifier.to_string(),

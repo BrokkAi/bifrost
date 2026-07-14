@@ -210,6 +210,12 @@ resolution work.
   Evidence: `/private/tmp/bifrost-675-full-acceptance-scope-source.sample.txt` and
   `.agents/docs/reference-differential/675-python-full-acceptance.jsonl`.
 
+- Observation: Source-omitting bulk hydration does not synthesize path-derived
+  module `CodeUnit`s. The first batched run therefore changed 175 module targets
+  from `missing` to inconclusive `export graph produced no seeds`, despite
+  identical forward results.
+  Evidence: `.agents/docs/reference-differential/675-python-full-acceptance-batched.jsonl`.
+
 ## Decision Log
 
 - Decision: Cache receiver type results only in `PythonDefinitionContext`, keyed by
@@ -340,6 +346,13 @@ resolution work.
   names commute with them. Batching removes the global parse and repeated
   single-file queries without retaining all 36,100 hydrated corpus states or
   weakening the existing later-local/later-reexport semantics.
+  Date/Author: 2026-07-14 / Codex
+
+- Decision: When a source-omitting batch state has no synthetic module unit,
+  explicitly add its already-computed module identifier as a local export event.
+  Rationale: The ordinary hydrated path exposes the module itself as a seed.
+  Restoring that compact event keeps batch hydration behaviorally equivalent
+  without loading source merely to synthesize a path-derived unit.
   Date/Author: 2026-07-14 / Codex
 
 ## Outcomes & Retrospective

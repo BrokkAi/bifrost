@@ -85,14 +85,14 @@ impl PythonUsageIndex {
                     .map(|unit| unit.fq_name().to_string())
                     .unwrap_or_else(|| python_module_name(file));
                 module_index
-                    .entry(module_name)
+                    .entry(module_name.clone())
                     .or_default()
                     .push(file.clone());
 
                 if let Some(state) = file_states.get(file) {
                     exports_by_file.insert(
                         file.clone(),
-                        analyzer.export_index_from_file_state(file, state),
+                        analyzer.export_index_from_file_state(file, state, &module_name),
                     );
                     binders_by_file.insert(
                         file.clone(),
