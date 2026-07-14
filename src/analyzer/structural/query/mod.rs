@@ -25,7 +25,8 @@ pub use ir::{
     SCHEMA_VERSION, StringPredicate,
 };
 pub use source::{
-    QuerySourceDiagnostic, QuerySourceHelp, query_source_help_at, validate_query_source,
+    QuerySourceDiagnostic, QuerySourceEdit, QuerySourceFix, QuerySourceHelp, query_source_help_at,
+    validate_query_source,
 };
 
 #[cfg(test)]

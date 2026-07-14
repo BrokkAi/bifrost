@@ -1,5 +1,6 @@
 use lsp_types::{
-    ClientCapabilities, CompletionClientCapabilities, CompletionOptions, DiagnosticOptions,
+    ClientCapabilities, CodeActionKind, CodeActionOptions, CodeActionProviderCapability,
+    CompletionClientCapabilities, CompletionOptions, DiagnosticOptions,
     DiagnosticServerCapabilities, DocumentFormattingOptions, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability, OneOf, ReferencesOptions,
     RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
@@ -61,6 +62,11 @@ pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCa
             inter_file_dependencies: false,
             workspace_diagnostics: false,
             work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+            resolve_provider: Some(false),
         })),
         workspace: Some(lsp_types::WorkspaceServerCapabilities {
             workspace_folders: Some(WorkspaceFoldersServerCapabilities {

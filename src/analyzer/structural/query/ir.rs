@@ -45,6 +45,13 @@ pub enum QueryStep {
 }
 
 impl QueryStep {
+    pub const ALL: [Self; 4] = [
+        Self::EnclosingDecl,
+        Self::FileOf,
+        Self::ImportsOf,
+        Self::ImportersOf,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::EnclosingDecl => "enclosing_decl",
@@ -116,6 +123,8 @@ pub enum CodeQueryResultDetail {
 }
 
 impl CodeQueryResultDetail {
+    pub const ALL: [Self; 2] = [Self::Compact, Self::Full];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Compact => "compact",

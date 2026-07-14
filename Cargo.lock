@@ -224,6 +224,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "strsim",
  "tempfile",
  "tokenizers",
  "toml",

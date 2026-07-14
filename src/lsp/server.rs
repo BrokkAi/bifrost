@@ -18,25 +18,28 @@ use lsp_types::notification::{
     Notification as LspNotificationTrait, PublishDiagnostics,
 };
 use lsp_types::request::{
-    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
-    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
-    FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
-    HoverRequest, PrepareRenameRequest, References, RegisterCapability, Rename,
+    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
+    CodeActionRequest, Completion, DocumentDiagnosticRequest, DocumentHighlightRequest,
+    DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation,
+    GotoTypeDefinition, HoverRequest, PrepareRenameRequest, References, RegisterCapability, Rename,
     Request as LspRequestTrait, SemanticTokensFullRequest, SignatureHelpRequest,
     TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate,
     WorkspaceConfiguration, WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CancelParams, ConfigurationItem, ConfigurationParams, Diagnostic, DiagnosticSeverity,
+    CancelParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionResponse, ConfigurationItem, ConfigurationParams, Diagnostic, DiagnosticSeverity,
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, FileChangeType, Hover, HoverContents, InitializeParams,
     MarkupContent, MarkupKind, NumberOrString, Position, ProgressToken, PublishDiagnosticsParams,
-    Registration, RegistrationParams, Uri, WorkDoneProgress, WorkDoneProgressBegin,
-    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
+    Registration, RegistrationParams, TextEdit, Uri, WorkDoneProgress, WorkDoneProgressBegin,
+    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit,
 };
 
-use crate::analyzer::structural::query::{query_source_help_at, validate_query_source};
+use crate::analyzer::structural::query::{
+    QuerySourceEdit, query_source_help_at, validate_query_source,
+};
 use crate::analyzer::structural::{CodeQuery, CodeQueryResultItem, CodeQueryResultValue, execute};
 use crate::analyzer::{
     AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
@@ -687,6 +690,9 @@ fn handle_request(
         QueryHover::METHOD => {
             decode_and_run::<QueryHover, _>(req, |params| Ok(query_hover_request(params)))
         }
+        CodeActionRequest::METHOD => decode_and_run::<CodeActionRequest, _>(req, |params| {
+            Ok(Some(rql_code_actions(state, params)))
+        }),
         DocumentSymbolRequest::METHOD => {
             decode_and_run::<DocumentSymbolRequest, _>(req, |params| {
                 Ok(document_symbol::handle(
@@ -1309,10 +1315,12 @@ fn handle_notification(
                     )
                 })?;
             let document = params.text_document;
+            let language_id = document.language_id.clone();
             if let Some(file) = resolve_project_file(state.project(), &document.uri) {
                 state.remember_open_document(
                     document.uri.clone(),
                     file.abs_path(),
+                    language_id,
                     document.version,
                     document.text.clone(),
                 );
@@ -1329,6 +1337,7 @@ fn handle_notification(
                 state.remember_open_document(
                     document.uri,
                     abs_path,
+                    language_id,
                     document.version,
                     document.text,
                 );
@@ -1677,6 +1686,7 @@ struct BifrostInitializationOptions {
 struct OpenDocument {
     uri: Uri,
     abs_path: PathBuf,
+    language_id: String,
     version: i32,
     text: String,
 }
@@ -1786,6 +1796,97 @@ fn validate_query_request(params: QuerySourceParams) -> ValidateQueryResult {
         })
         .collect();
     ValidateQueryResult { diagnostics }
+}
+
+const RQL_LANGUAGE_ID: &str = "bifrost-rql";
+
+/// Revalidate the current open buffer so quick fixes never depend on stale
+/// diagnostic data retained by an editor extension.
+fn rql_code_actions(state: &ServerState, params: CodeActionParams) -> CodeActionResponse {
+    if params
+        .context
+        .only
+        .as_ref()
+        .is_some_and(|kinds| !kinds.iter().any(|kind| kind == &CodeActionKind::QUICKFIX))
+    {
+        return Vec::new();
+    }
+
+    let uri = params.text_document.uri;
+    let Some(document) = state.open_documents.get(uri.as_str()) else {
+        return Vec::new();
+    };
+    if document.language_id != RQL_LANGUAGE_ID {
+        return Vec::new();
+    }
+
+    let line_starts = compute_line_starts(&document.text);
+    validate_query_source(&document.text)
+        .into_iter()
+        .filter_map(|diagnostic| {
+            let fix = diagnostic.fix?;
+            let range = lsp_types::Range {
+                start: byte_offset_to_position(
+                    &document.text,
+                    &line_starts,
+                    diagnostic.range.start,
+                ),
+                end: byte_offset_to_position(&document.text, &line_starts, diagnostic.range.end),
+            };
+            if !ranges_overlap(&params.range, &range) {
+                return None;
+            }
+
+            let edits = match fix.edit {
+                QuerySourceEdit::Replace { new_text } => {
+                    vec![TextEdit::new(range, new_text)]
+                }
+                QuerySourceEdit::Surround { prefix, suffix } => vec![
+                    TextEdit::new(
+                        lsp_types::Range {
+                            start: range.start,
+                            end: range.start,
+                        },
+                        prefix,
+                    ),
+                    TextEdit::new(
+                        lsp_types::Range {
+                            start: range.end,
+                            end: range.end,
+                        },
+                        suffix,
+                    ),
+                ],
+            };
+            let diagnostic = Diagnostic::new(
+                range,
+                Some(DiagnosticSeverity::ERROR),
+                Some(NumberOrString::String(diagnostic.code.to_string())),
+                Some("Bifrost RQL".to_string()),
+                diagnostic.message,
+                None,
+                None,
+            );
+            Some(CodeActionOrCommand::CodeAction(CodeAction {
+                title: fix.title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(HashMap::from([(uri.clone(), edits)])),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                command: None,
+                is_preferred: Some(true),
+                disabled: None,
+                data: None,
+            }))
+        })
+        .collect()
+}
+
+fn ranges_overlap(left: &lsp_types::Range, right: &lsp_types::Range) -> bool {
+    left.start <= right.end && right.start <= left.end
 }
 
 fn query_hover_request(params: QueryHoverParams) -> Option<Hover> {
@@ -2293,13 +2394,21 @@ impl ServerState {
         }
     }
 
-    fn remember_open_document(&mut self, uri: Uri, abs_path: PathBuf, version: i32, text: String) {
+    fn remember_open_document(
+        &mut self,
+        uri: Uri,
+        abs_path: PathBuf,
+        language_id: String,
+        version: i32,
+        text: String,
+    ) {
         self.bump_document_generation(&uri);
         self.open_documents.insert(
             uri.as_str().to_string(),
             OpenDocument {
                 uri,
                 abs_path,
+                language_id,
                 version,
                 text,
             },
