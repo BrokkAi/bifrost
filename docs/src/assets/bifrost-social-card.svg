@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
+  <title id="title">Bifrost social card</title>
+  <desc id="description">Bifrost static analysis for agents, editors, and large repositories, illustrated with the symbol graph from the documentation home page.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#181614"/>
+      <stop offset="0.55" stop-color="#100f0e"/>
+      <stop offset="1" stop-color="#090909"/>
+    </linearGradient>
+    <radialGradient id="graphGlow" cx="50%" cy="50%" r="52%">
+      <stop offset="0" stop-color="#eb3f33" stop-opacity="0.18"/>
+      <stop offset="0.6" stop-color="#eb3f33" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#eb3f33" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#background)"/>
+  <rect x="1" y="1" width="1198" height="628" rx="18" fill="none" stroke="#35312d" stroke-width="2"/>
+  <path d="M0 112H1200" stroke="#2c2926"/>
+  <path d="M760 112V630" stroke="#2c2926"/>
+
+  <g transform="translate(70 55)">
+    <rect width="34" height="34" transform="rotate(45 17 17)" fill="#eb3f33"/>
+    <rect x="9" y="9" width="16" height="16" transform="rotate(45 17 17)" fill="#181614"/>
+    <text x="58" y="27" fill="#f4f1ec" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="27" font-weight="700" letter-spacing="5">BIFROST</text>
+  </g>
+
+  <g transform="translate(70 208)">
+    <text fill="#f4f1ec" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="64" font-weight="720" letter-spacing="-2">
+      <tspan x="0" y="0">Static analysis</tspan>
+      <tspan x="0" y="76">built for code</tspan>
+      <tspan x="0" y="152">intelligence.</tspan>
+    </text>
+    <text x="2" y="224" fill="#aaa39b" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="27">
+      <tspan x="2">Agents · Editors · Large repositories</tspan>
+    </text>
+  </g>
+
+  <g transform="translate(70 562)">
+    <circle cx="6" cy="-7" r="5" fill="#eb3f33"/>
+    <text x="22" y="0" fill="#d1cbc4" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" letter-spacing="1.2">BROKKAI.GITHUB.IO/BIFROST</text>
+  </g>
+
+  <g transform="translate(754 101)">
+    <circle cx="240" cy="260" r="250" fill="url(#graphGlow)"/>
+    <g transform="translate(38 58) scale(1.55)">
+      <g stroke="#5f5a52" stroke-width="1.4" opacity="0.6" fill="none">
+        <line x1="40" y1="180" x2="80" y2="120"/><line x1="80" y1="120" x2="120" y2="70"/><line x1="120" y1="70" x2="165" y2="60"/><line x1="165" y1="60" x2="205" y2="95"/><line x1="205" y1="95" x2="225" y2="150"/><line x1="80" y1="120" x2="60" y2="90"/><line x1="60" y1="90" x2="120" y2="70"/><line x1="130" y1="140" x2="120" y2="70"/><line x1="130" y1="140" x2="165" y2="60"/><line x1="130" y1="140" x2="180" y2="190"/><line x1="90" y1="200" x2="40" y2="180"/><line x1="90" y1="200" x2="130" y2="140"/><line x1="180" y1="190" x2="225" y2="150"/><line x1="180" y1="190" x2="205" y2="95"/>
+      </g>
+      <g stroke="#ff6a5f" stroke-width="2" fill="none" stroke-dasharray="6 16" opacity="0.92" filter="url(#glow)">
+        <line x1="40" y1="180" x2="80" y2="120"/><line x1="80" y1="120" x2="120" y2="70"/><line x1="120" y1="70" x2="165" y2="60"/><line x1="165" y1="60" x2="205" y2="95"/><line x1="205" y1="95" x2="225" y2="150"/><line x1="60" y1="90" x2="120" y2="70"/><line x1="130" y1="140" x2="120" y2="70"/><line x1="130" y1="140" x2="165" y2="60"/><line x1="130" y1="140" x2="180" y2="190"/><line x1="90" y1="200" x2="130" y2="140"/><line x1="180" y1="190" x2="225" y2="150"/><line x1="180" y1="190" x2="205" y2="95"/>
+      </g>
+      <g fill="#f4f1ec" filter="url(#glow)">
+        <rect x="35" y="175" width="10" height="10" transform="rotate(45 40 180)"/><rect x="75" y="115" width="10" height="10" transform="rotate(45 80 120)"/><rect x="160" y="55" width="10" height="10" transform="rotate(45 165 60)"/><rect x="200" y="90" width="10" height="10" transform="rotate(45 205 95)"/><rect x="55" y="85" width="10" height="10" transform="rotate(45 60 90)"/><rect x="85" y="195" width="10" height="10" transform="rotate(45 90 200)"/><rect x="175" y="185" width="10" height="10" transform="rotate(45 180 190)"/>
+      </g>
+      <g fill="#eb3f33" filter="url(#glow)">
+        <rect x="114" y="64" width="12" height="12" transform="rotate(45 120 70)"/><rect x="124" y="134" width="12" height="12" transform="rotate(45 130 140)"/><rect x="219" y="144" width="12" height="12" transform="rotate(45 225 150)"/>
+      </g>
+      <g transform="translate(130 140)" filter="url(#glow)">
+        <rect x="-10" y="-10" width="20" height="20" fill="#100f0e" stroke="#ff6a5f" stroke-width="2" transform="rotate(45)"/>
+        <rect x="-4" y="-4" width="8" height="8" fill="#ff6a5f" transform="rotate(45)"/>
+      </g>
+    </g>
+    <text x="240" y="492" text-anchor="middle" fill="#8f8881" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" letter-spacing="5">READ  ·  ANALYZE  ·  SERVE</text>
+  </g>
+</svg>

@@ -6,6 +6,13 @@ import rehypeBasePathLinks from './rehype-base-path-links.mjs';
 const site = process.env.PUBLIC_DOCS_SITE ?? 'https://brokkai.github.io';
 const productionBase = process.env.PUBLIC_DOCS_BASE ?? '/bifrost';
 const isDev = process.argv.includes('dev');
+const socialCardPath = [
+  productionBase.replace(/^\/+|\/+$/g, ''),
+  'bifrost-social-card.png',
+]
+  .filter(Boolean)
+  .join('/');
+const socialCardUrl = new URL(`/${socialCardPath}`, site).href;
 
 export default defineConfig({
   site,
@@ -19,6 +26,27 @@ export default defineConfig({
     starlight({
       title: 'Bifrost Docs',
       description: 'Documentation for Brokk Bifrost, the analyzer behind Brokk code intelligence.',
+      head: [
+        { tag: 'meta', attrs: { property: 'og:image', content: socialCardUrl } },
+        { tag: 'meta', attrs: { property: 'og:image:type', content: 'image/png' } },
+        { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+        { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+        {
+          tag: 'meta',
+          attrs: {
+            property: 'og:image:alt',
+            content: 'Bifrost static analysis for agents, editors, and large repositories.',
+          },
+        },
+        { tag: 'meta', attrs: { name: 'twitter:image', content: socialCardUrl } },
+        {
+          tag: 'meta',
+          attrs: {
+            name: 'twitter:image:alt',
+            content: 'Bifrost static analysis for agents, editors, and large repositories.',
+          },
+        },
+      ],
       customCss: ['./src/styles/brokk.css'],
       favicon: '/favicon.png',
       editLink: {
