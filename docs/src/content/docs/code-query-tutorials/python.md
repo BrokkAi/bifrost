@@ -196,7 +196,7 @@ This query requires a `route` decorator and an assignment whose left side is the
 
 ## Precision Boundary
 
-These matches are syntactic. `receiver: "client"` checks the normalized receiver name; it does not prove the receiver's runtime type. Use `scan_usages` after `query_code` when symbol identity matters.
+These matches are syntactic. `receiver: "client"` checks the normalized receiver name; it does not prove the receiver's runtime type. When symbol identity matters, resolve the indexed declaration and use `scan_usages_by_reference`, or use `scan_usages_by_location` when you already know its declaration range.
 
 ## Traverse Indexed Types And Members
 

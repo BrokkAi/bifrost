@@ -144,9 +144,7 @@ fn ten_minute_evaluation_tutorial() {
         );
     }
 
-    let published_query = root.join(
-        "docs/fixtures/ten-minute-evaluation/queries/find-audit.rql",
-    );
+    let published_query = root.join("docs/fixtures/ten-minute-evaluation/queries/find-audit.rql");
     let query_contents = fs::read_to_string(&published_query)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", published_query.display()));
     let documented_query = tutorial

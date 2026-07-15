@@ -139,6 +139,32 @@ fn current_public_query_surfaces_use_the_new_name() {
     }
 }
 
+#[test]
+fn query_documentation_tracks_public_contracts() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rust_library = fs::read_to_string(root.join("docs/src/content/docs/rust-library.md"))
+        .expect("read Rust library documentation");
+    assert!(
+        rust_library.contains(&format!(
+            "brokk-bifrost = \"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "Rust dependency example must match the workspace package version"
+    );
+
+    for relative in [
+        "docs/src/content/docs/code-query-tutorials/python.md",
+        "docs/src/content/docs/code-query-tutorials/ruby.md",
+    ] {
+        let contents = fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"));
+        assert!(
+            !contents.contains("`scan_usages`"),
+            "{relative} must name one of the public mode-specific usage tools"
+        );
+    }
+}
+
 fn marked_examples(path: &Path, contents: &str) -> Vec<MarkedExample> {
     let lines = contents.lines().collect::<Vec<_>>();
     let mut examples = Vec::new();

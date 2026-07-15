@@ -311,7 +311,7 @@ Pipeline wrappers transform syntax matches into declarations or files. `enclosin
 
 This is the direct answer to “which project files import the declaration `graph_target`?”: first convert the declaration match to `graph/c.rb`, then follow one reverse edge. It returns every project file with a resolved direct import of that file; it does **not** claim that each importer calls `graph_target`, nor does it turn an external package import into a synthetic declaration.
 
-To inspect actual uses today, run a structural call query (or a resolved `scan_usages` query when the declaration is indexed) separately. A pipeline cannot yet feed its file results back into a second structural query as a correlated scope, so it cannot express “among these importers, find calls to this imported member” in one query.
+To inspect actual uses today, run a structural call query separately. When the declaration is indexed, use `scan_usages_by_reference` with its exact symbol or `scan_usages_by_location` with its declaration range. A pipeline cannot yet feed its file results back into a second structural query as a correlated scope, so it cannot express “among these importers, find calls to this imported member” in one query.
 
 <!-- code-query-case:importers-of-two-hops:rql -->
 ```lisp

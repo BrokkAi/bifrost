@@ -122,7 +122,8 @@ operations traverse one direct project-local edge per step. Hierarchy operations
 are direct by default and accept a positive `depth` or `transitive: true`.
 Declaration results are limited to declarations indexed by the workspace
 analyzer, so references into an unindexed library do not manufacture library
-declarations. Results are tagged as structural matches, declarations, or files.
+declarations. Results are tagged as structural matches, declarations, reference
+sites, call sites, expression sites, or files.
 Compact output retains minimal pipeline provenance. Pass `result_detail="full"`
 when follow-up tooling needs deterministic IDs and precise ranges.
 
