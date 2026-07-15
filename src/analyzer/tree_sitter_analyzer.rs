@@ -945,6 +945,8 @@ pub struct TreeSitterAnalyzer<A> {
     /// Per-request persisted read model. Live OIDs are validated once and
     /// hydrated states remain available for the graph traversal.
     query_read_cache: Arc<Mutex<QueryReadCache>>,
+    #[cfg(test)]
+    live_oid_validation_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
     transient_file_states: Arc<Mutex<FileStateCache>>,
     source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
@@ -970,6 +972,8 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             structural_cache: Arc::clone(&self.structural_cache),
             store_context: self.store_context.clone(),
             query_read_cache: Arc::clone(&self.query_read_cache),
+            #[cfg(test)]
+            live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
             transient_file_states: Arc::clone(&self.transient_file_states),
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
@@ -1123,6 +1127,8 @@ where
             structural_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            #[cfg(test)]
+            live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 TRANSIENT_FILE_STATE_CACHE_CAPACITY,
             ))),
@@ -1186,6 +1192,8 @@ where
             structural_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            #[cfg(test)]
+            live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 TRANSIENT_FILE_STATE_CACHE_CAPACITY,
             ))),
@@ -2595,6 +2603,15 @@ where
                 return oid;
             }
         }
+        #[cfg(test)]
+        if !self.project.has_overlay(file) {
+            *self
+                .live_oid_validation_counts
+                .lock()
+                .expect("live OID validation count mutex poisoned")
+                .entry(file.clone())
+                .or_default() += 1;
+        }
         let oid = if self.project.has_overlay(file) {
             let source = self.project.read_source(file).ok()?;
             Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()
@@ -2625,6 +2642,24 @@ where
             cache.live_oids.insert(file.clone(), oid);
         }
         oid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_live_oid_validation_counts_for_test(&self) {
+        self.live_oid_validation_counts
+            .lock()
+            .expect("live OID validation count mutex poisoned")
+            .clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_oid_validation_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.live_oid_validation_counts
+            .lock()
+            .expect("live OID validation count mutex poisoned")
+            .get(file)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn git_index_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {

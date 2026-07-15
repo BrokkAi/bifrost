@@ -148,6 +148,16 @@ impl CppAnalyzer {
             .map(|token| token.trim_matches(':').to_string())
             .collect()
     }
+
+    #[cfg(test)]
+    pub(crate) fn reset_live_oid_validation_counts_for_test(&self) {
+        self.inner.reset_live_oid_validation_counts_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_oid_validation_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.inner.live_oid_validation_count_for_test(file)
+    }
 }
 
 impl IAnalyzer for CppAnalyzer {

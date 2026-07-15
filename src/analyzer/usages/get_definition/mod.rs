@@ -67,11 +67,11 @@ use crate::analyzer::usages::scala_graph::{
     scala_node_text, scala_normalized_fq_name,
 };
 use crate::analyzer::{
-    AliasResolver, AnalyzerDefinitionLookup, BoundedDefinitionLookup, CSharpAnalyzer, CodeUnit,
-    CppAnalyzer, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
-    PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
-    cpp_include_paths, cpp_node_text, csharp_callable_arity, resolve_analyzer,
-    resolve_include_targets,
+    AliasResolver, AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,
+    CSharpAnalyzer, CodeUnit, CppAnalyzer, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
+    JavaAnalyzer, Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer,
+    RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text, csharp_callable_arity,
+    resolve_analyzer, resolve_include_targets,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -244,6 +244,7 @@ fn resolve_definition_requests(
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
 ) -> Vec<DefinitionLookupOutcome> {
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
     for request in &requests {
         if language_for_file(&request.file) == Language::Python {
@@ -840,6 +841,7 @@ fn sort_units(units: &mut [CodeUnit]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::{Project, TestProject};
     use crate::test_support::AnalyzerFixture;
 
     #[test]
@@ -882,5 +884,61 @@ mod tests {
         }));
         assert_eq!(context.python_build_counts(), (1, 1));
         assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
+    fn cpp_definition_batch_validates_each_candidate_file_once_per_batch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let types = ProjectFile::new(root.clone(), "types.hpp");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        types.write("using Size = unsigned long;\n").unwrap();
+        let source = "#include \"types.hpp\"\nSize first;\nSize second;\n";
+        consumer.write(source).unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = CppAnalyzer::new(project);
+        analyzer.reset_live_oid_validation_counts_for_test();
+        let requests = source
+            .match_indices("Size")
+            .map(|(start_byte, name)| DefinitionLookupRequest {
+                file: consumer.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + name.len()),
+            })
+            .collect::<Vec<_>>();
+
+        let first = resolve_definition_batch_with_source(
+            &analyzer,
+            requests.clone(),
+            consumer.clone(),
+            Arc::new(source.to_string()),
+        );
+        let first_batch_validations = analyzer.live_oid_validation_count_for_test(&types);
+        let second = resolve_definition_batch_with_source(
+            &analyzer,
+            vec![requests[0].clone()],
+            consumer,
+            Arc::new(source.to_string()),
+        );
+        let after_second_batch = analyzer.live_oid_validation_count_for_test(&types);
+
+        assert!(first.iter().all(|outcome| {
+            outcome.status == DefinitionLookupStatus::Resolved
+                && outcome
+                    .definitions
+                    .iter()
+                    .any(|unit| unit.short_name() == "Size")
+        }));
+        assert_eq!(second[0].status, DefinitionLookupStatus::Resolved);
+        assert_eq!(
+            (
+                first_batch_validations,
+                after_second_batch.saturating_sub(first_batch_validations),
+            ),
+            (1, 1),
+            "reuse validation within one batch, then revalidate once in a separate batch"
+        );
     }
 }
