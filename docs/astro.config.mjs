@@ -64,6 +64,7 @@ export default defineConfig({
           label: 'Start',
           items: [
             { label: 'Choose Bifrost', slug: 'choose-bifrost' },
+            { label: 'License and Use Cases', slug: 'license-use-cases' },
             { label: 'Overview', slug: 'overview' },
             { label: 'Capabilities', slug: 'capabilities' },
             { label: '10-Minute Evaluation', slug: 'evaluate-bifrost' },

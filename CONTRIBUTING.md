@@ -44,6 +44,24 @@ That wrapper provisions a uv-managed Python 3.12 environment, makes `maturin` av
 
 For repo-local development without installing the package, `SearchToolsClient(..., library_path=...)` can load a built debug library such as `target/debug/libbrokk_bifrost.so`.
 
+## Citation Authorship Policy
+
+`CITATION.cff` uses **Bifrost contributors** as the collective software author
+and lists Brokk, Inc. as the project contact. Citation authorship records
+creative and scholarly credit; it is separate from copyright ownership.
+
+Keep the collective author unless the project adopts an explicit named-author
+policy. Do not derive citation authorship from commit counts: they omit design,
+review, testing, documentation, and work ported between repositories. Any future
+named-author list should use documented contribution criteria, contributors'
+preferred names and ORCIDs, and a release-by-release review.
+
+Bifrost is a Rust port and continuation of analyzer work developed in Brokk's
+Java codebase. Preserve the Brokk software reference in `CITATION.cff` so that
+lineage remains machine-readable and contributors whose work predates the Rust
+repository are not silently excluded. The public rationale and suggested
+citation live in [`docs/src/content/docs/cite-bifrost.md`](docs/src/content/docs/cite-bifrost.md).
+
 ## Release Process
 
 The Rust crate, the `bifrost` binary, the Python wheel, and the agent/editor

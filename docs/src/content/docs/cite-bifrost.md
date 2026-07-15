@@ -3,19 +3,50 @@ title: Cite Bifrost
 description: Attribute the software and identify the exact analyzed version.
 ---
 
-Bifrost does not currently publish a DOI or `CITATION.cff`. Cite it as versioned software and include the full Git commit used for the analysis. A release number alone is insufficient when the run used an unreleased checkout.
+Bifrost publishes machine-readable citation metadata in
+[`CITATION.cff`](https://github.com/BrokkAi/bifrost/blob/master/CITATION.cff).
+GitHub uses this file for its **Cite this repository** action. Bifrost does not
+currently publish a DOI, so cite it as versioned software and include the full
+Git commit used for the analysis. A release number alone is insufficient when
+the run used an unreleased checkout.
+
+## Authorship And Project Lineage
+
+The citation uses **Bifrost contributors** as a collective author. This is
+intentional:
+
+- Citation authorship records creative and scholarly credit; it is separate from
+  copyright ownership. Brokk, Inc. remains the copyright owner and is listed as
+  the project contact.
+- Bifrost is a Rust port and continuation of analyzer architecture, resources,
+  and tests developed in the Brokk Java codebase. The CFF metadata references
+  [Brokk](https://github.com/BrokkAi/brokk) so that lineage is machine-readable
+  instead of crediting only the people whose commits appear in the newer Rust
+  repository.
+- A Git commit count is not an authorship policy. It omits design, review,
+  testing, documentation, and work ported across repositories, while treating
+  every commit as the same kind of contribution.
+
+The collective author avoids inventing an incomplete or arbitrary list of named
+authors. If the project later adopts named authorship, define contribution
+criteria first, ask people how they want their names and ORCIDs represented, and
+review the ordered list for every release. The [Bifrost contributor
+history](https://github.com/BrokkAi/bifrost/graphs/contributors) and [Brokk
+contributor history](https://github.com/BrokkAi/brokk/graphs/contributors) remain
+useful acknowledgements, but neither graph is a complete record of intellectual
+contribution.
 
 ## Suggested Citation
 
 Use this human-readable form and replace the placeholders:
 
-> BrokkAi. *Bifrost: Tree-sitter-backed multi-language code analyzer*, version `<version>`, commit `<full-commit>`, `<year>`. https://github.com/BrokkAi/bifrost
+> Bifrost contributors. *Bifrost: Tree-sitter-backed multi-language code analyzer*, version `<version>`, commit `<full-commit>`, `<year>`. https://github.com/BrokkAi/bifrost
 
 A BibTeX software entry can use:
 
 ```bibtex
-@software{brokkai_bifrost_<year>,
-  author  = {{BrokkAi}},
+@software{bifrost_contributors_<year>,
+  author  = {{Bifrost contributors}},
   title   = {Bifrost: Tree-sitter-backed Multi-language Code Analyzer},
   version = {<version>},
   year    = {<year>},
