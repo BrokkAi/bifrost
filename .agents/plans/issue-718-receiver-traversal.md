@@ -20,7 +20,7 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - [x] (2026-07-15) Milestone 4: reviewed the complete diff, repaired exported and static factory receiver regressions, and ran the full repository validation bundle.
 - [x] (2026-07-15) Post-milestone guided review: queued and repaired all seven confirmed findings covering prepared-context reuse, terminal-limit short-circuiting, nonhalting receiver truncation, complete text rendering, schema-owned capture bounds, exact factory association, `file_of` metadata, and shared member-site extraction.
 - [x] (2026-07-15) Re-ran the complete publish gate: formatting/diff checks, isolated all-feature clippy, isolated `nlp,python` tests, Python, VS Code, and docs check/build all pass.
-- [ ] (2026-07-15) Push the reviewed branch and open the user-authorized ready-for-review pull request.
+- [x] (2026-07-15) Pushed the reviewed branch and opened ready-for-review pull request #793.
 
 ## Surprises & Discoveries
 
@@ -251,6 +251,8 @@ Revision note (2026-07-15): Completed Milestone 4 by repairing exported-range an
 Revision note (2026-07-15): Applied every confirmed guided-review finding: reusable and metered receiver setup, terminal-limit short-circuiting, nonhalting receiver truncation, complete recursive renderers, schema-driven capture validation and `file_of` metadata, exact factory association, and one shared member-site walk. Focused Rust, Python, and VS Code regressions pass; final publish validation is pending.
 
 Revision note (2026-07-15): Completed the publish gate. The first sandboxed full run proved all receiver/query paths but could not exercise subprocess and git-history tests; the unrestricted isolated rerun initially omitted `/usr/sbin` and therefore could not locate `lsof`. The corrected pinned PATH produced a completely green all-feature run and self-cleaned its target.
+
+Revision note (2026-07-15): Rebased without conflicts onto current `origin/master` at `91cddbf2`, reran formatting plus the 31 receiver and 61 query-pipeline tests, pushed the reviewed branch, and opened ready pull request #793.
 
 ## Interfaces and Dependencies
 
