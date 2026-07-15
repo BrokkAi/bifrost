@@ -110,6 +110,15 @@ impl FileFacts {
         &self.nodes[id as usize]
     }
 
+    /// Total semantic role edges retained across every fact in this file.
+    ///
+    /// This is representation-neutral bookkeeping for diagnostics and
+    /// memory benchmarks; callers that need the edges themselves should use
+    /// the fact-level role accessors.
+    pub fn role_count(&self) -> usize {
+        self.nodes.iter().map(|node| node.roles.len()).sum()
+    }
+
     pub fn subtree_end(&self, id: u32) -> u32 {
         self.node(id).subtree_end
     }
@@ -210,5 +219,6 @@ mod tests {
 
         assert!(capacity_based > length_based);
         assert_eq!(facts.estimated_bytes(), capacity_based);
+        assert_eq!(facts.role_count(), 1);
     }
 }
