@@ -1,7 +1,7 @@
 mod common;
 
 use brokk_bifrost::usages::{
-    FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer, UsageFinder,
+    FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHitKind,
 };
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer,
@@ -456,6 +456,22 @@ fn flatten_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages::UsageHit
             .filter(|hit| {
                 hit.kind
                     .included_in(brokk_bifrost::usages::UsageHitSurface::ExternalUsages)
+            })
+            .collect(),
+        other => panic!("expected Success, got {other:?}"),
+    }
+}
+
+fn flatten_lsp_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
+            .into_values()
+            .flat_map(BTreeSet::into_iter)
+            .filter(|hit| {
+                hit.kind
+                    .included_in(brokk_bifrost::usages::UsageHitSurface::LspReferences)
             })
             .collect(),
         other => panic!("expected Success, got {other:?}"),
@@ -1000,14 +1016,30 @@ fn ts_local_barrel_reexport_is_followed() {
         cu.identifier() == "LayoutService" && cu.is_class()
     });
 
-    let hits = flatten_hits(
-        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
-    );
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = flatten_hits(result.clone());
+    let lsp_hits = flatten_lsp_hits(result);
 
     assert_eq!(
-        2,
+        1,
         hits.len(),
-        "expected the barrel and consumer references: {hits:?}"
+        "external usages should omit the barrel: {hits:?}"
+    );
+    assert_eq!(
+        1,
+        lsp_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reexport)
+            .count(),
+        "IDE references should retain the barrel re-export: {lsp_hits:?}"
+    );
+    assert_eq!(
+        2,
+        lsp_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Import)
+            .count(),
+        "IDE references should retain both import bindings: {lsp_hits:?}"
     );
 }
 
@@ -1034,14 +1066,30 @@ fn ts_chained_local_barrel_reexport_is_followed() {
         cu.identifier() == "LayoutService" && cu.is_class()
     });
 
-    let hits = flatten_hits(
-        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
-    );
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = flatten_hits(result.clone());
+    let lsp_hits = flatten_lsp_hits(result);
 
     assert_eq!(
-        3,
+        1,
         hits.len(),
-        "expected both barrel references and the consumer reference: {hits:?}"
+        "external usages should omit both barrels: {hits:?}"
+    );
+    assert_eq!(
+        2,
+        lsp_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reexport)
+            .count(),
+        "IDE references should retain both barrel re-exports: {lsp_hits:?}"
+    );
+    assert_eq!(
+        2,
+        lsp_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Import)
+            .count(),
+        "IDE references should retain both import bindings: {lsp_hits:?}"
     );
 }
 
@@ -1079,36 +1127,51 @@ export { UnrelatedSuccessCorpus as SuccessCorpus };
         cu.identifier() == "SuccessCorpus" && cu.is_class()
     });
 
-    let hits = flatten_hits(
-        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
-    );
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = flatten_hits(result.clone());
+    let lsp_hits = flatten_lsp_hits(result);
 
-    assert_eq!(6, hits.len(), "expected one hit per export value: {hits:?}");
     assert!(
-        hits.iter()
+        hits.is_empty(),
+        "binding-only exports should be absent from external usages: {hits:?}"
+    );
+    let reexport_hits: Vec<_> = lsp_hits
+        .iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reexport)
+        .collect();
+    assert_eq!(
+        6,
+        reexport_hits.len(),
+        "expected one re-export hit per export value: {lsp_hits:?}"
+    );
+    assert!(
+        reexport_hits
+            .iter()
             .filter(|hit| hit.file == project.file("local-exports.ts"))
             .count()
             == 5,
-        "local named, type, default, and renamed export values should resolve: {hits:?}"
+        "local named, type, default, and renamed export values should resolve: {lsp_hits:?}"
     );
     assert!(
-        hits.iter()
+        reexport_hits
+            .iter()
             .any(|hit| hit.file == project.file("cross-file-export.ts")),
-        "cross-file type re-export should resolve to the source declaration: {hits:?}"
+        "cross-file type re-export should resolve to the source declaration: {lsp_hits:?}"
     );
     assert!(
-        hits.iter().all(|hit| {
+        reexport_hits.iter().all(|hit| {
             let source = hit.file.read_to_string().expect("read hit source");
             source
                 .get(hit.start_offset..hit.end_offset)
                 .is_some_and(|text| text == "SuccessCorpus")
         }),
-        "only export-specifier value names, never aliases, should be reported: {hits:?}"
+        "only export-specifier value names, never aliases, should be reported: {lsp_hits:?}"
     );
     assert!(
-        hits.iter()
+        reexport_hits
+            .iter()
             .all(|hit| hit.file != project.file("unrelated.ts")),
-        "an unrelated export alias must not count as a SuccessCorpus reference: {hits:?}"
+        "an unrelated export alias must not count as a SuccessCorpus reference: {lsp_hits:?}"
     );
 }
 
@@ -1987,6 +2050,24 @@ fn js_commonjs_exports_property_resolves_destructured_require() {
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
     );
 
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("lib.js")
+                && hit.kind == brokk_bifrost::usages::UsageHitKind::Reference
+                && hit
+                    .file
+                    .read_to_string()
+                    .ok()
+                    .and_then(|source| {
+                        source
+                            .get(hit.start_offset..hit.end_offset)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("Foo")
+        }),
+        "a CommonJS export RHS reads the exported value and remains an external usage: {hits:?}"
+    );
     assert!(
         hits.iter()
             .any(|hit| hit.file == project.file("consumer.js"))

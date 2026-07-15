@@ -12,13 +12,14 @@ pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// `confidence` and `snippet` are excluded so duplicate hits coming from different patterns
 /// collapse into one.
 /// Whether a hit is a real reference to the symbol (a call, read, write, type
-/// use, ...), a binding that brings the symbol into a file (an `import`), or an
-/// internal self/this receiver reference.
+/// use, ...), a binding that brings or forwards the symbol (`import` / re-export),
+/// or an internal self/this receiver reference.
 ///
 /// The call-graph / relevance surfaces (SearchTools, dead-code, rename, call
 /// hierarchy) care about ordinary external `Reference` hits and override /
 /// implementation declarations. The LSP `textDocument/references` surface (IDE
-/// "find references") also wants import bindings and self-receiver references.
+/// "find references") also wants import/re-export bindings and self-receiver
+/// references.
 /// Keeping all in one graph with a kind lets each consumer choose through
 /// [`UsageHitSurface`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -26,6 +27,7 @@ pub enum UsageHitKind {
     #[default]
     Reference,
     Import,
+    Reexport,
     SelfReceiver,
     /// A declaration that overrides/implements the queried declaration.
     OverrideDeclaration,
@@ -54,6 +56,7 @@ impl UsageHitKind {
         match self {
             UsageHitKind::Reference => "reference",
             UsageHitKind::Import => "import",
+            UsageHitKind::Reexport => "reexport",
             UsageHitKind::SelfReceiver => "self_receiver",
             UsageHitKind::OverrideDeclaration => "override_declaration",
         }
@@ -75,7 +78,7 @@ impl UsageHitKind {
         match self {
             UsageHitKind::Reference => None,
             UsageHitKind::OverrideDeclaration => Some("override_declaration"),
-            UsageHitKind::Import | UsageHitKind::SelfReceiver => None,
+            UsageHitKind::Import | UsageHitKind::Reexport | UsageHitKind::SelfReceiver => None,
         }
     }
 }
@@ -123,6 +126,13 @@ impl UsageHit {
     /// Reclassify this hit as an `Import` binding.
     pub fn into_import(mut self) -> Self {
         self.kind = UsageHitKind::Import;
+        self
+    }
+
+    /// Reclassify this hit as a binding-only re-export. It remains available to
+    /// editor find-references while agent/search surfaces omit it as noise.
+    pub fn into_reexport(mut self) -> Self {
+        self.kind = UsageHitKind::Reexport;
         self
     }
 
@@ -346,8 +356,8 @@ impl FuzzyResult {
     }
 
     /// Returns every external-usage hit, regardless of overload bucket. Excludes
-    /// import bindings and self/this receiver hits because call-graph/relevance
-    /// surfaces want externally meaningful references only.
+    /// import/re-export bindings and self/this receiver hits because
+    /// call-graph/relevance surfaces want externally meaningful references only.
     pub fn all_hits(&self) -> BTreeSet<UsageHit> {
         self.all_hits_for_surface(UsageHitSurface::ExternalUsages)
     }
@@ -360,7 +370,7 @@ impl FuzzyResult {
             .collect()
     }
 
-    /// Returns every editor-visible hit, including `Import` bindings and
+    /// Returns every editor-visible hit, including import/re-export bindings and
     /// self/this receiver hits.
     pub fn all_hits_including_imports(&self) -> BTreeSet<UsageHit> {
         self.all_hits_for_surface(UsageHitSurface::LspReferences)
@@ -622,6 +632,16 @@ mod tests {
             "import",
         )
         .into_import();
+        let reexport = UsageHit::new(
+            project_file("index.ts"),
+            13,
+            130,
+            136,
+            unit.clone(),
+            1.0,
+            "export { Target } from './target'",
+        )
+        .into_reexport();
         let self_receiver = UsageHit::new(
             project_file("Foo.java"),
             14,
@@ -646,6 +666,7 @@ mod tests {
         let mut hits = BTreeSet::new();
         hits.insert(reference.clone());
         hits.insert(import.clone());
+        hits.insert(reexport.clone());
         hits.insert(self_receiver.clone());
         hits.insert(override_declaration.clone());
         let result = FuzzyResult::success(unit, hits);
@@ -658,9 +679,15 @@ mod tests {
         );
         assert_eq!(
             result.all_hits_for_surface(UsageHitSurface::LspReferences),
-            [reference, import, self_receiver, override_declaration]
-                .into_iter()
-                .collect()
+            [
+                reference,
+                import,
+                reexport,
+                self_receiver,
+                override_declaration,
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
