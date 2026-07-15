@@ -1306,6 +1306,103 @@ second.execute
 }
 
 #[test]
+fn bare_new_factory_inference_respects_bindings_defaults_setters_and_overrides() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "factory.rb",
+        r#"
+class Other
+  def execute; end
+end
+
+class Service
+  def execute; end
+
+  def self.from_parameter(new)
+    new
+  end
+
+  def self.from_assignment
+    new = Other.new
+    new
+  end
+
+  def self.from_operator_assignment
+    new ||= Other.new
+    new
+  end
+
+  def self.from_default(value = new)
+    new
+  end
+
+  def self.from_setter
+    new.value = 1
+    new
+  end
+end
+
+class Overridden
+  def execute; end
+
+  def self.new
+    Other.new
+  end
+
+  def self.build
+    new
+  end
+end
+
+Service.from_parameter(Other.new).execute
+Service.from_assignment.execute
+Service.from_operator_assignment.execute
+Service.from_default.execute
+Service.from_setter.execute
+Overridden.build.execute
+"#,
+    )]);
+
+    let service_execute = definition(&analyzer, "Service.execute");
+    let service_hits = analyzer
+        .find_usages(&[service_execute])
+        .into_either()
+        .expect("Service#execute lookup should succeed");
+    let service_lines = hit_source_lines(&service_hits);
+    assert_eq!(
+        vec![
+            "Service.from_default.execute".to_string(),
+            "Service.from_setter.execute".to_string(),
+        ],
+        service_lines,
+        "only non-binding uses of new should preserve the Service owner"
+    );
+
+    let overridden_execute = definition(&analyzer, "Overridden.execute");
+    let overridden_hits = analyzer
+        .find_usages(&[overridden_execute])
+        .into_either()
+        .expect("Overridden#execute lookup should succeed");
+    assert!(
+        overridden_hits.is_empty(),
+        "an overridden singleton new must not be treated as allocation of its invocation owner"
+    );
+
+    let other_execute = definition(&analyzer, "Other.execute");
+    let other_lines = hit_source_lines(
+        &analyzer
+            .find_usages(&[other_execute])
+            .into_either()
+            .expect("Other#execute lookup should succeed"),
+    );
+    assert!(
+        other_lines
+            .iter()
+            .any(|line| line == "Overridden.build.execute"),
+        "the overridden new return should flow through the factory chain: {other_lines:?}"
+    );
+}
+
+#[test]
 fn recursive_factory_receiver_returns_unproven_without_inventing_hit() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app.rb",

@@ -745,7 +745,7 @@ fn ruby_factory_method_outcome(
             RubyMethodLookupMode::SingletonMethod,
         )
     {
-        return FactoryMethodOutcome::Owner(frame.invocation_owner_fq_name.clone());
+        return ruby_bare_new_outcome(semantic, frame);
     }
     if expression.kind() != "call"
         || expression
@@ -761,7 +761,7 @@ fn ruby_factory_method_outcome(
             RubyMethodLookupMode::SingletonMethod,
         )
     {
-        return FactoryMethodOutcome::Owner(frame.invocation_owner_fq_name.clone());
+        return ruby_bare_new_outcome(semantic, frame);
     }
     let Some(receiver) = expression.child_by_field_name("receiver") else {
         return FactoryMethodOutcome::Unknown;
@@ -776,16 +776,50 @@ fn ruby_factory_method_outcome(
     )
 }
 
+fn ruby_bare_new_outcome(
+    semantic: &RubySemanticIndex<'_>,
+    frame: &FactoryInferenceFrame,
+) -> FactoryMethodOutcome {
+    let visible_files = semantic.visible_files_from(frame.method.source());
+    let receiver = ReceiverType {
+        owner_fq_name: frame.invocation_owner_fq_name.clone(),
+        mode: ReceiverMode::Class,
+    };
+    let overrides = semantic.resolve_method_candidates(
+        semantic.analyzer.global_usage_definition_index(),
+        &visible_files,
+        &receiver,
+        "new",
+    );
+    if overrides.is_empty() {
+        return FactoryMethodOutcome::Owner(frame.invocation_owner_fq_name.clone());
+    }
+    FactoryMethodOutcome::Chain(
+        overrides
+            .into_iter()
+            .map(|method| FactoryInferenceFrame {
+                method,
+                invocation_owner_fq_name: frame.invocation_owner_fq_name.clone(),
+            })
+            .collect(),
+    )
+}
+
 fn ruby_method_declares_local(method: Node<'_>, name: &str, source: &str) -> bool {
     if method
         .child_by_field_name("parameters")
-        .is_some_and(|parameters| ruby_subtree_contains_identifier(parameters, name, source))
+        .is_some_and(|parameters| {
+            let mut cursor = parameters.walk();
+            parameters
+                .named_children(&mut cursor)
+                .any(|parameter| ruby_parameter_declares_name(parameter, name, source))
+        })
     {
         return true;
     }
     let mut stack: Vec<_> = method.child_by_field_name("body").into_iter().collect();
     while let Some(node) = stack.pop() {
-        if node.kind() == "assignment"
+        if matches!(node.kind(), "assignment" | "operator_assignment")
             && node
                 .child_by_field_name("left")
                 .is_some_and(|left| ruby_assignment_declares_name(left, name, source))
@@ -809,23 +843,35 @@ fn ruby_method_declares_local(method: Node<'_>, name: &str, source: &str) -> boo
     false
 }
 
-fn ruby_subtree_contains_identifier(node: Node<'_>, name: &str, source: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "identifier" && node_text(current, source) == name {
-            return true;
+fn ruby_parameter_declares_name(node: Node<'_>, name: &str, source: &str) -> bool {
+    match node.kind() {
+        "identifier" => node_text(node, source) == name,
+        "optional_parameter"
+        | "keyword_parameter"
+        | "splat_parameter"
+        | "hash_splat_parameter"
+        | "block_parameter" => node
+            .child_by_field_name("name")
+            .is_some_and(|binding| node_text(binding, source) == name),
+        "destructured_parameter" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .any(|child| ruby_parameter_declares_name(child, name, source))
         }
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
+        _ => false,
     }
-    false
 }
 
 fn ruby_assignment_declares_name(node: Node<'_>, name: &str, source: &str) -> bool {
-    ruby_subtree_contains_identifier(node, name, source)
+    match node.kind() {
+        "identifier" => node_text(node, source) == name,
+        "left_assignment_list" | "destructured_left_assignment" | "rest_assignment" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .any(|child| ruby_assignment_declares_name(child, name, source))
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn ruby_method_node_for_ranges<'tree>(

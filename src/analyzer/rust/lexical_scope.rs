@@ -64,7 +64,7 @@ pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &Imp
             .all(|ch| ch.is_ascii_lowercase() || ch == '_')
     {
         (
-            imported_name.clone(),
+            local_name,
             ImportKind::Namespace,
             None,
             format!("{module_specifier}::{imported_name}"),

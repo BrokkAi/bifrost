@@ -48,21 +48,10 @@ pub(crate) fn resolve_rust_path_fqn(
     file: &ProjectFile,
     full_path: &str,
 ) -> Option<String> {
-    let lexical = || {
-        refs.resolve_bare(full_path)
-            .map(str::to_string)
-            .or_else(|| refs.resolve_scoped_owner(full_path))
-            .or_else(|| rust.resolve_module_package(file, full_path))
-    };
-    if matches!(
-        full_path.split("::").next(),
-        Some("crate" | "self" | "super")
-    ) {
-        lexical()
-    } else {
-        rust.canonical_exported_fqn(file, full_path)
-            .or_else(lexical)
-    }
+    refs.resolve_bare(full_path)
+        .map(str::to_string)
+        .or_else(|| refs.resolve_scoped_owner(full_path))
+        .or_else(|| rust.resolve_module_package(file, full_path))
 }
 
 pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
@@ -172,10 +161,7 @@ pub(crate) fn resolve_scoped_associated_item(
         }
     }
 
-    let Some(owner_fqn) = rust
-        .canonical_exported_fqn(file, path)
-        .or_else(|| refs.resolve_scoped_owner(path))
-    else {
+    let Some(owner_fqn) = refs.resolve_scoped_owner(path) else {
         return ReceiverAnalysisOutcome::Unknown;
     };
     let direct = if owner_fqn.is_empty() {

@@ -31,6 +31,11 @@ pub struct RustReferenceContext {
     pub(super) named: HashMap<String, String>,
     /// local alias -> package for `use crate::util;` namespace bindings.
     pub(super) namespace: HashMap<String, String>,
+    /// scoped import path -> canonical declaration fqn for namespace imports
+    /// whose members are re-exported from another module.
+    scoped: HashMap<String, String>,
+    /// local name -> canonical declaration fqn for unambiguous glob imports.
+    glob: HashMap<String, String>,
     /// identifier -> fqn for items declared in this file.
     pub(super) same_file: HashMap<String, String>,
 }
@@ -44,10 +49,11 @@ impl RustReferenceContext {
     /// or a free function imported via `use path::func;` (the binder classifies
     /// the latter as a namespace whose resolved value is the function's own fqn).
     pub fn resolve_bare(&self, name: &str) -> Option<&str> {
-        self.named
+        self.same_file
             .get(name)
+            .or_else(|| self.named.get(name))
             .or_else(|| self.namespace.get(name))
-            .or_else(|| self.same_file.get(name))
+            .or_else(|| self.glob.get(name))
             .map(String::as_str)
     }
 
@@ -56,6 +62,7 @@ impl RustReferenceContext {
             .iter()
             .chain(self.namespace.iter())
             .chain(self.same_file.iter())
+            .chain(self.glob.iter())
             .filter(|&(_, fqn)| fqn == target_fqn)
             .map(|(name, _)| name.clone())
             .collect()
@@ -71,6 +78,9 @@ impl RustReferenceContext {
     /// The owner fqn a scoped `path::name` begins from: a namespace import, a
     /// rooted module path, or an imported / same-file type.
     pub fn resolve_scoped_owner(&self, path: &str) -> Option<String> {
+        if let Some(canonical) = self.scoped.get(path) {
+            return Some(canonical.clone());
+        }
         if let Some((module_path, item_name)) = path.rsplit_once("::")
             && let Some(package) = self.resolve_scoped_owner(module_path)
         {
@@ -85,9 +95,10 @@ impl RustReferenceContext {
         {
             return Some(package);
         }
-        self.named
+        self.same_file
             .get(path)
-            .or_else(|| self.same_file.get(path))
+            .or_else(|| self.named.get(path))
+            .or_else(|| self.glob.get(path))
             .cloned()
     }
 }
@@ -115,6 +126,26 @@ fn insert_single_reexport_target(
     named
         .entry(exported_name)
         .or_insert_with(|| join_rust_fqn(&rust_package_name(&target_file), &target_name));
+}
+
+fn single_rust_target_fqn(
+    analyzer: &RustAnalyzer,
+    targets: BTreeSet<(ProjectFile, String)>,
+) -> Option<String> {
+    let mut fq_names = targets
+        .into_iter()
+        .flat_map(|(target_file, target_name)| {
+            analyzer
+                .declarations(&target_file)
+                .into_iter()
+                .filter(move |unit| unit.identifier() == target_name)
+                .filter(|unit| analyzer.is_rust_export_visible_declaration(unit))
+                .map(|unit| unit.fq_name())
+        })
+        .collect::<Vec<_>>();
+    fq_names.sort();
+    fq_names.dedup();
+    (fq_names.len() == 1).then(|| fq_names.remove(0))
 }
 
 fn is_rooted_rust_module_path(path: &str) -> bool {
@@ -241,35 +272,6 @@ impl RustAnalyzer {
     ) -> Vec<(ProjectFile, String)> {
         let binder = self.import_binder_of(file);
         self.resolve_imported_export_from_binder(file, &binder, reference)
-    }
-
-    pub(crate) fn canonical_exported_fqn(
-        &self,
-        file: &ProjectFile,
-        reference: &str,
-    ) -> Option<String> {
-        let targets = if let Some((module_specifier, name)) = reference.rsplit_once("::") {
-            let module_files = self.resolve_module_files(file, module_specifier);
-            let mut targets = self.exported_targets_from_files(&module_files, name);
-            if targets.is_empty() {
-                targets.extend(rust_declaration_targets_in_files(self, &module_files, name));
-            }
-            targets.into_iter().collect::<Vec<_>>()
-        } else {
-            self.resolve_imported_export(file, reference)
-        };
-        let mut fq_names = targets
-            .into_iter()
-            .flat_map(|(target_file, target_name)| {
-                self.declarations(&target_file)
-                    .into_iter()
-                    .filter(move |unit| unit.identifier() == target_name)
-                    .map(|unit| unit.fq_name())
-            })
-            .collect::<Vec<_>>();
-        fq_names.sort();
-        fq_names.dedup();
-        (fq_names.len() == 1).then(|| fq_names.remove(0))
     }
 
     pub(crate) fn resolve_imported_export_from_binder_forward(
@@ -403,16 +405,33 @@ impl RustAnalyzer {
     fn build_reference_context(&self, file: &ProjectFile, forward: bool) -> RustReferenceContext {
         let _scope = crate::profiling::scope("RustAnalyzer::build_reference_context");
         let binder = self.import_binder_of(file);
+        let same_file: HashMap<String, String> = self
+            .declarations(file)
+            .into_iter()
+            .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
+            .collect();
         let mut named: HashMap<String, String> = HashMap::default();
         let mut namespace: HashMap<String, String> = HashMap::default();
+        let mut scoped: HashMap<String, String> = HashMap::default();
+        let mut glob_candidates: HashMap<String, HashSet<String>> = HashMap::default();
         for (local, binding) in &binder.bindings {
             match binding.kind {
                 ImportKind::Named => {
-                    if let Some(imported) = &binding.imported_name
-                        && let Some(package) =
-                            self.resolve_module_package(file, &binding.module_specifier)
-                    {
-                        named.insert(local.clone(), join_rust_fqn(&package, imported));
+                    if let Some(imported) = &binding.imported_name {
+                        let resolved = self
+                            .canonical_export_fqn(
+                                file,
+                                &binding.module_specifier,
+                                imported,
+                                forward,
+                            )
+                            .or_else(|| {
+                                self.resolve_module_package(file, &binding.module_specifier)
+                                    .map(|package| join_rust_fqn(&package, imported))
+                            });
+                        if let Some(resolved) = resolved {
+                            named.insert(local.clone(), resolved);
+                        }
                     }
                 }
                 ImportKind::Namespace => {
@@ -421,22 +440,90 @@ impl RustAnalyzer {
                     {
                         namespace.insert(local.clone(), package);
                     }
+                    self.insert_namespace_export_bindings(
+                        file,
+                        local,
+                        &binding.module_specifier,
+                        forward,
+                        &mut scoped,
+                    );
                 }
-                ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
+                ImportKind::Glob => self.collect_glob_reference_bindings(
+                    file,
+                    &binding.module_specifier,
+                    forward,
+                    &mut glob_candidates,
+                ),
+                ImportKind::Default | ImportKind::CommonJsRequire => {}
             }
         }
         self.insert_reexport_reference_bindings(file, &mut named, forward);
-        let same_file: HashMap<String, String> = self
-            .declarations(file)
+        let glob = glob_candidates
             .into_iter()
-            .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
+            .filter_map(|(name, mut candidates)| {
+                (candidates.len() == 1)
+                    .then(|| (name, candidates.drain().next().expect("one glob candidate")))
+            })
             .collect();
         RustReferenceContext {
             package: rust_package_name(file),
             crate_package: rust_crate_root_package(file),
             named,
             namespace,
+            scoped,
+            glob,
             same_file,
+        }
+    }
+
+    fn canonical_export_fqn(
+        &self,
+        file: &ProjectFile,
+        module_specifier: &str,
+        name: &str,
+        forward: bool,
+    ) -> Option<String> {
+        let module_files = self.resolve_module_files(file, module_specifier);
+        let targets = if forward {
+            self.forward_exported_targets_from_files(&module_files, name)
+        } else {
+            self.exported_targets_from_files(&module_files, name)
+        };
+        single_rust_target_fqn(self, targets)
+    }
+
+    fn insert_namespace_export_bindings(
+        &self,
+        file: &ProjectFile,
+        local: &str,
+        module_specifier: &str,
+        forward: bool,
+        scoped: &mut HashMap<String, String>,
+    ) {
+        let module_files = self.resolve_module_files(file, module_specifier);
+        let mut names = HashSet::default();
+        self.collect_export_names_from_files(&module_files, &mut HashSet::default(), &mut names);
+        for name in names {
+            if let Some(fqn) = self.canonical_export_fqn(file, module_specifier, &name, forward) {
+                scoped.insert(format!("{local}::{name}"), fqn);
+            }
+        }
+    }
+
+    fn collect_glob_reference_bindings(
+        &self,
+        file: &ProjectFile,
+        module_specifier: &str,
+        forward: bool,
+        candidates: &mut HashMap<String, HashSet<String>>,
+    ) {
+        let module_files = self.resolve_module_files(file, module_specifier);
+        let mut names = HashSet::default();
+        self.collect_export_names_from_files(&module_files, &mut HashSet::default(), &mut names);
+        for name in names {
+            if let Some(fqn) = self.canonical_export_fqn(file, module_specifier, &name, forward) {
+                candidates.entry(name).or_default().insert(fqn);
+            }
         }
     }
 

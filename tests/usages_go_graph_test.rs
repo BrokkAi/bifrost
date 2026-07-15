@@ -3,6 +3,7 @@ mod common;
 use brokk_bifrost::IAnalyzer;
 use brokk_bifrost::usages::{FuzzyResult, GoUsageGraphStrategy, UsageAnalyzer, UsageFinder};
 use common::{definition, go_analyzer_with_files};
+use std::collections::BTreeSet;
 
 #[test]
 fn usage_finder_routes_go_targets_through_graph_strategy() {
@@ -1329,7 +1330,21 @@ type Recorder interface {
     Record()
 }
 
+type RecorderAlias = Recorder
+
 func NewWorker() Worker { return Worker{} }
+"#,
+        ),
+        (
+            "factory/factory.go",
+            r#"
+package factory
+
+import "example.com/app/worker"
+
+type Recorder = worker.Recorder
+
+func NewRecorder() Recorder { return worker.NewWorker() }
 "#,
         ),
         (
@@ -1338,13 +1353,37 @@ func NewWorker() Worker { return Worker{} }
 package main
 
 import . "example.com/app/worker"
+import factory "example.com/app/factory"
 
 func main() {
     worker := NewWorker()
     worker.Record()
     _, paired := 0, NewWorker()
     paired.Record()
+    literal := Worker{}
+    literal.Record()
     var recorder Recorder = worker
+    recorder.Record()
+    var aliased RecorderAlias = worker
+    aliased.Record()
+    viaFactory := factory.NewRecorder()
+    viaFactory.Record()
+}
+"#,
+        ),
+        (
+            "cmd/qualified/main.go",
+            r#"
+package main
+
+import worker "example.com/app/worker"
+
+func main() {
+    constructed := worker.NewWorker()
+    constructed.Record()
+    literal := worker.Worker{}
+    literal.Record()
+    var recorder worker.RecorderAlias = literal
     recorder.Record()
 }
 "#,
@@ -1363,6 +1402,7 @@ func main() {
     match result {
         FuzzyResult::Success {
             hits_by_overload,
+            unproven_by_overload,
             unproven_total_by_overload,
             ..
         } => {
@@ -1370,18 +1410,26 @@ func main() {
                 .get(&target)
                 .expect("interface receiver call should be proven");
             assert_eq!(
-                1,
+                4,
                 hits.len(),
-                "only recorder.Record should be proven: {hits:#?}"
+                "only interface and interface-alias receivers should be proven: {hits:#?}"
             );
-            assert!(hits.iter().all(|hit| {
-                hit.file == project.file("cmd/app/main.go")
-                    && hit.snippet.contains("recorder.Record()")
-            }));
+            assert_eq!(
+                BTreeSet::from([
+                    (project.file("cmd/app/main.go"), 15),
+                    (project.file("cmd/app/main.go"), 17),
+                    (project.file("cmd/app/main.go"), 19),
+                    (project.file("cmd/qualified/main.go"), 12),
+                ]),
+                hits.iter()
+                    .map(|hit| (hit.file.clone(), hit.line))
+                    .collect::<BTreeSet<_>>()
+            );
             assert_eq!(
                 None,
                 unproven_total_by_overload.get(&target),
-                "known concrete receivers must not be interface-method candidates"
+                "known concrete receivers must not be interface-method candidates: {:#?}",
+                unproven_by_overload.get(&target)
             );
         }
         other => panic!("expected interface proof-tier result, got {other:#?}"),
