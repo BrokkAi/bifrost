@@ -9,9 +9,9 @@ Bifrost can parse mixed-language workspaces, expose code intelligence through MC
 
 ## Built for Large Repositories
 
-Bifrost is designed to stay lean on real repositories, not just small demos. The workspace model keeps memory usage capped by indexing declarations and other durable repository facts first, while avoiding a permanently resident graph of every expensive analysis result.
+Bifrost is designed to stay lean on real repositories, not just small demos. The workspace model indexes declarations and other durable repository facts first, while avoiding a permanently resident graph of every expensive analysis result.
 
-More complex static analysis runs on demand when a tool call needs it. Results can be cached, but the source of truth stays incremental: file changes update the declaration index, and deeper relationship, usage, summary, or type analysis is recomputed only for the affected work. This keeps the MCP server responsive without trading correctness for raw text shortcuts.
+More complex static analysis runs on demand when a tool call needs it. Results can be cached, but the source of truth stays incremental: file changes update the declaration index, and deeper relationship, usage, summary, or type analysis is recomputed only for the affected work. This architecture is intended to reduce long-lived memory and repeated work without trading correctness for raw text shortcuts; it is not itself a measured performance result. See [Evidence and Evaluation Methodology](/evaluation-evidence/) for the current public evidence and remaining benchmark gaps.
 
 ## Language Coverage
 

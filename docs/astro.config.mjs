@@ -97,6 +97,15 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Evaluate and Trust',
+          items: [
+            { label: 'Evidence and Methodology', slug: 'evaluation-evidence' },
+            { label: 'Data Boundaries', slug: 'data-boundaries' },
+            { label: 'Cite Bifrost', slug: 'cite-bifrost' },
+            { label: 'Reproduce an Analysis', slug: 'reproduce-analysis' },
+          ],
+        },
+        {
           label: 'Use Bifrost as a Library',
           items: [
             { label: 'Rust Library', slug: 'rust-library' },

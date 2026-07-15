@@ -36,11 +36,11 @@ MCP and LSP are separate Bifrost processes. A VS Code Play action proves that th
 
 ### Evaluate Bifrost for research
 
-Read [Language and Analysis Capabilities](/capabilities/) first. It distinguishes structural support, exact graph-backed references and calls, proof tiers, named arguments, imports, hierarchy, external-dependency limits, and unsupported whole-program analyses. Then complete the [ten-minute evaluation](/evaluate-bifrost/) and use the [executable language tutorials](/code-query-tutorials/) to inspect source, query, and exact expected output together.
+Read [Language and Analysis Capabilities](/capabilities/) first. It distinguishes structural support, exact graph-backed references and calls, proof tiers, named arguments, imports, hierarchy, external-dependency limits, and unsupported whole-program analyses. Then review the [current evidence and evaluation method](/evaluation-evidence/), complete the [ten-minute evaluation](/evaluate-bifrost/), and use the [executable language tutorials](/code-query-tutorials/) to inspect source, query, and exact expected output together.
 
 ### Build or study an agent platform
 
-Start with the [MCP toolsets](/mcp/#toolsets), choose `symbol|extended`, and run both query-access smoke tests. Keep symbol tools, structural query results, and text search as different evidence sources. A successful symbol call does not establish that `query_code` is enabled, and a truncated or diagnostic-bearing result is not a completeness proof.
+Start with the [MCP toolsets](/mcp/#toolsets), choose `symbol|extended`, and run both query-access smoke tests. Keep symbol tools, structural query results, and text search as different evidence sources. A successful symbol call does not establish that `query_code` is enabled, and a truncated or diagnostic-bearing result is not a completeness proof. Review [workspace, cache, launcher, and model boundaries](/data-boundaries/) before connecting a repository to a hosted model.
 
 ### Add Bifrost to an editor workflow
 
