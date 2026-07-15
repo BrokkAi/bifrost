@@ -48,9 +48,10 @@ pub use rune_ir::{
     render_source_rune_ir,
 };
 pub use search::{
-    CodeQueryCapture, CodeQueryDeclaration, CodeQueryExecutionLimits, CodeQueryFile,
-    CodeQueryMatch, CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange,
-    CodeQueryReferenceSite, CodeQueryResult, CodeQueryResultItem, CodeQueryResultRef,
-    CodeQueryResultValue, execute, execute_with_limits,
+    CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture, CodeQueryDeclaration,
+    CodeQueryExecutionLimits, CodeQueryExpressionSite, CodeQueryFile, CodeQueryMatch,
+    CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReferenceSite,
+    CodeQueryResult, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, execute,
+    execute_with_limits,
 };
 pub use spec::{RoleSink, StructuralSpec};

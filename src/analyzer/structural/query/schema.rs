@@ -8,6 +8,8 @@
 
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 
+use super::ir::MAX_KWARG_NAME_LENGTH;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
     Query,
@@ -16,6 +18,7 @@ pub enum ValueShape {
     PatternList,
     PatternMap,
     String,
+    ParameterName,
     RegexString,
     StringList,
     StringPredicate,
@@ -23,6 +26,7 @@ pub enum ValueShape {
     KindList,
     LanguageList,
     PositiveInteger,
+    NonNegativeInteger,
     ResultDetail,
     SchemaVersion,
     TrueBoolean,
@@ -40,6 +44,7 @@ impl ValueShape {
             Self::PatternList => "a list/vector of patterns",
             Self::PatternMap => "a map of names to patterns",
             Self::String => "a string",
+            Self::ParameterName => "a non-empty parameter name",
             Self::RegexString => "a regular expression string",
             Self::StringList => "one or more strings",
             Self::StringPredicate => "an exact string or regex predicate",
@@ -47,6 +52,7 @@ impl ValueShape {
             Self::KindList => "a normalized kind or list of kinds",
             Self::LanguageList => "one or more language labels",
             Self::PositiveInteger => "a positive integer",
+            Self::NonNegativeInteger => "a non-negative integer",
             Self::ResultDetail => "compact or full",
             Self::SchemaVersion => "schema version 2",
             Self::TrueBoolean => "the boolean true",
@@ -54,6 +60,18 @@ impl ValueShape {
             Self::UsageProof => "proven or unproven",
             Self::UsageSurface => "external_usages or lsp_references",
         }
+    }
+
+    pub fn string_length_bounds(self) -> Option<(usize, usize)> {
+        match self {
+            Self::ParameterName => Some((1, MAX_KWARG_NAME_LENGTH)),
+            _ => None,
+        }
+    }
+
+    pub fn accepts_string(self, value: &str) -> bool {
+        self.string_length_bounds()
+            .is_none_or(|(minimum, maximum)| value.len() >= minimum && value.len() <= maximum)
     }
 }
 
@@ -111,13 +129,21 @@ macro_rules! query_step_ops {
             pub fn allows_reference_options(self) -> bool {
                 matches!(self, Self::ReferencesOf | Self::UsedBy | Self::Uses)
             }
+
+            pub fn allows_call_options(self) -> bool {
+                matches!(self, Self::Callers | Self::Callees)
+            }
+
+            pub fn allows_call_site_options(self) -> bool {
+                matches!(self, Self::CallSitesTo | Self::CallSitesFrom)
+            }
         }
     };
 }
 
 query_step_ops! {
     EnclosingDecl { label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|reference_site -> file", description: "Map structural matches, declarations, or reference sites to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|reference_site|call_site|expression_site -> file", description: "Map structural matches, declarations, reference sites, call sites, or expression sites to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -127,6 +153,11 @@ query_step_ops! {
     ReferencesOf { label: "references_of", signature: "declaration -> reference_site", description: "Return resolved source reference sites for exact indexed declarations." }
     UsedBy { label: "used_by", signature: "declaration -> declaration", description: "Return exact declarations containing references to each input declaration." }
     Uses { label: "uses", signature: "declaration -> declaration", description: "Return exact declarations referenced by each input declaration." }
+    Callers { label: "callers", signature: "declaration -> declaration", description: "Traverse resolved incoming call edges to caller declarations, optionally to a bounded depth." }
+    Callees { label: "callees", signature: "declaration -> declaration", description: "Traverse resolved outgoing call edges to callee declarations, optionally to a bounded depth." }
+    CallSitesTo { label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
+    CallSitesFrom { label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
+    CallInput { label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
 }
 
 macro_rules! rql_forms {
@@ -213,7 +244,12 @@ macro_rules! rql_forms {
                     | Self::Owner
                     | Self::ReferencesOf
                     | Self::UsedBy
-                    | Self::Uses => None,
+                    | Self::Uses
+                    | Self::Callers
+                    | Self::Callees
+                    | Self::CallSitesTo
+                    | Self::CallSitesFrom
+                    | Self::CallInput => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -346,6 +382,41 @@ rql_forms! {
         shape: Query,
         signature: "(uses [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
         description: "Return exact indexed declarations referenced by each input declaration.",
+    }
+    Callers {
+        labels: ["callers"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callers [:depth count] [:proof proven|unproven] query)",
+        description: "Traverse incoming calls to caller declarations with a finite depth bound.",
+    }
+    Callees {
+        labels: ["callees"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callees [:depth count] [:proof proven|unproven] query)",
+        description: "Traverse outgoing calls to callee declarations with a finite depth bound.",
+    }
+    CallSitesTo {
+        labels: ["call-sites-to", "call_sites_to"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-sites-to [:proof proven|unproven] query)",
+        description: "Return structured incoming call sites for each declaration.",
+    }
+    CallSitesFrom {
+        labels: ["call-sites-from", "call_sites_from"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-sites-from [:proof proven|unproven] query)",
+        description: "Return structured outgoing call sites for each declaration.",
+    }
+    CallInput {
+        labels: ["call-input", "call_input"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-input (:receiver true | :parameter-index index | :parameter-name name) query)",
+        description: "Project the receiver or one formal parameter's direct argument expressions.",
     }
     Name {
         labels: ["name"],
@@ -574,6 +645,9 @@ json_fields! {
     ReferenceKinds { label: "reference_kinds", shape: ReferenceKindList, signature: "\"reference_kinds\": [\"field_write\", ...]", description: "Restrict traversal to structured source-reference kinds." }
     Proof { label: "proof", shape: UsageProof, signature: "\"proof\": \"proven\" | \"unproven\"", description: "Restrict traversal to one usage-proof tier." }
     Surface { label: "surface", shape: UsageSurface, signature: "\"surface\": \"external_usages\" | \"lsp_references\"", description: "Choose the external-usage or editor-visible reference surface." }
+    Receiver { label: "receiver", shape: TrueBoolean, signature: "\"receiver\": true", description: "Select the explicit base or receiver expression of a call site." }
+    ParameterIndex { label: "parameter_index", shape: NonNegativeInteger, signature: "\"parameter_index\": non-negative integer", description: "Select a zero-based formal parameter slot, excluding receiver-bound parameters." }
+    ParameterName { label: "parameter_name", shape: ParameterName, signature: "\"parameter_name\": \"name\"", description: "Select a formal parameter slot by its declared name." }
 }
 
 pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[

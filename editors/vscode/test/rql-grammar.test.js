@@ -120,10 +120,10 @@ test("highlights registered underscore predicate aliases", async () => {
   assertScoped(tokens, "not_kind", "support.function.predicate.bifrost-rql");
 });
 
-test("highlights reference traversal forms and options", async () => {
-  const tokens = tokenize(
+test("highlights semantic traversal forms and options", async () => {
+  const tokens = tokenizeGrammar(
     await grammar(),
-    "(references-of :reference-kinds [field-write] :proof proven :surface external-usages (class :name \"Target\")) (used-by (class)) (uses (method))"
+    "(references-of :reference-kinds [field-write] :proof proven :surface external-usages (class :name \"Target\")) (used-by (class)) (uses (method)) (call-input :parameter-name \"payload\" (call-sites-to (method))) (callers :depth 2 (method))"
   );
   assertScoped(tokens, "references-of", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, ":reference-kinds", "variable.parameter.role.bifrost-rql");
@@ -131,4 +131,8 @@ test("highlights reference traversal forms and options", async () => {
   assertScoped(tokens, ":surface", "variable.parameter.role.bifrost-rql");
   assertScoped(tokens, "used-by", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, "uses", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "call-input", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":parameter-name", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, "call-sites-to", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "callers", "support.function.wrapper.bifrost-rql");
 });

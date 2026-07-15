@@ -23,6 +23,34 @@ pub(crate) fn attach_role_with_derived_name<'tree>(
     sink.role_maybe_named(role, target, name_of(target));
 }
 
+pub(crate) fn attach_argument_role_with_derived_name<'tree>(
+    sink: &mut RoleSink<'_>,
+    argument: Node<'tree>,
+    name_of: impl FnOnce(Node<'tree>) -> Option<Node<'tree>>,
+) {
+    sink.argument_maybe_named(
+        argument,
+        name_of(argument),
+        is_spread_argument_node(argument),
+    );
+}
+
+pub(crate) fn is_spread_argument_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "spread_element"
+            | "splat_argument"
+            | "hash_splat_argument"
+            | "list_splat"
+            | "dictionary_splat"
+            | "spread_argument"
+            | "variadic_unpacking"
+    ) || (node.kind() == "argument"
+        && (0..node.named_child_count())
+            .filter_map(|index| node.named_child(index))
+            .any(|child| child.kind() == "variadic_unpacking"))
+}
+
 pub(crate) fn attach_positional_argument_roles<'tree, F>(
     sink: &mut RoleSink<'_>,
     arguments: Node<'tree>,
@@ -34,7 +62,7 @@ pub(crate) fn attach_positional_argument_roles<'tree, F>(
         let Some(argument) = arguments.named_child(index) else {
             continue;
         };
-        attach_role_with_derived_name(sink, Role::Arg, argument, name_of);
+        attach_argument_role_with_derived_name(sink, argument, name_of);
     }
 }
 

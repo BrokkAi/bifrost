@@ -27,6 +27,8 @@ pub enum QueryValueKind {
     StructuralMatch,
     Declaration,
     ReferenceSite,
+    CallSite,
+    ExpressionSite,
     File,
 }
 
@@ -36,6 +38,8 @@ impl QueryValueKind {
             Self::StructuralMatch => "structural_match",
             Self::Declaration => "declaration",
             Self::ReferenceSite => "reference_site",
+            Self::CallSite => "call_site",
+            Self::ExpressionSite => "expression_site",
             Self::File => "file",
         }
     }
@@ -46,6 +50,33 @@ pub struct ReferenceTraversalFilter {
     pub reference_kinds: Vec<ReferenceKind>,
     pub proof: Option<UsageProof>,
     pub surface: UsageHitSurface,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallTraversalFilter {
+    pub depth: NonZeroUsize,
+    pub proof: Option<UsageProof>,
+}
+
+impl Default for CallTraversalFilter {
+    fn default() -> Self {
+        Self {
+            depth: NonZeroUsize::MIN,
+            proof: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CallSiteTraversalFilter {
+    pub proof: Option<UsageProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallInputSelector {
+    Receiver,
+    ParameterIndex(usize),
+    ParameterName(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +99,11 @@ pub enum QueryStep {
     ReferencesOf(ReferenceTraversalFilter),
     UsedBy(ReferenceTraversalFilter),
     Uses(ReferenceTraversalFilter),
+    Callers(CallTraversalFilter),
+    Callees(CallTraversalFilter),
+    CallSitesTo(CallSiteTraversalFilter),
+    CallSitesFrom(CallSiteTraversalFilter),
+    CallInput(CallInputSelector),
 }
 
 impl QueryStep {
@@ -88,6 +124,11 @@ impl QueryStep {
             Self::ReferencesOf(_) => QueryStepOp::ReferencesOf,
             Self::UsedBy(_) => QueryStepOp::UsedBy,
             Self::Uses(_) => QueryStepOp::Uses,
+            Self::Callers(_) => QueryStepOp::Callers,
+            Self::Callees(_) => QueryStepOp::Callees,
+            Self::CallSitesTo(_) => QueryStepOp::CallSitesTo,
+            Self::CallSitesFrom(_) => QueryStepOp::CallSitesFrom,
+            Self::CallInput(_) => QueryStepOp::CallInput,
         }
     }
 
@@ -106,6 +147,13 @@ impl QueryStep {
             }
             QueryStepOp::UsedBy => Some(Self::UsedBy(ReferenceTraversalFilter::default())),
             QueryStepOp::Uses => Some(Self::Uses(ReferenceTraversalFilter::default())),
+            QueryStepOp::Callers => Some(Self::Callers(CallTraversalFilter::default())),
+            QueryStepOp::Callees => Some(Self::Callees(CallTraversalFilter::default())),
+            QueryStepOp::CallSitesTo => Some(Self::CallSitesTo(CallSiteTraversalFilter::default())),
+            QueryStepOp::CallSitesFrom => {
+                Some(Self::CallSitesFrom(CallSiteTraversalFilter::default()))
+            }
+            QueryStepOp::CallInput => Some(Self::CallInput(CallInputSelector::Receiver)),
         }
     }
 
@@ -118,7 +166,9 @@ impl QueryStep {
                 Self::FileOf,
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::Declaration
-                | QueryValueKind::ReferenceSite,
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::CallSite
+                | QueryValueKind::ExpressionSite,
             ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
@@ -133,6 +183,13 @@ impl QueryStep {
             (Self::UsedBy(_) | Self::Uses(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Declaration)
             }
+            (Self::Callers(_) | Self::Callees(_), QueryValueKind::Declaration) => {
+                Some(QueryValueKind::Declaration)
+            }
+            (Self::CallSitesTo(_) | Self::CallSitesFrom(_), QueryValueKind::Declaration) => {
+                Some(QueryValueKind::CallSite)
+            }
+            (Self::CallInput(_), QueryValueKind::CallSite) => Some(QueryValueKind::ExpressionSite),
             _ => None,
         }
     }
@@ -150,13 +207,20 @@ pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind
     for (index, step) in steps.iter().enumerate() {
         let expected_input = match step {
             QueryStep::EnclosingDecl => "structural_match",
-            QueryStep::FileOf => "structural_match, declaration, or reference_site",
+            QueryStep::FileOf => {
+                "structural_match, declaration, reference_site, call_site, or expression_site"
+            }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
             | QueryStep::Subtypes(_)
             | QueryStep::Members
             | QueryStep::Owner => "declaration",
             QueryStep::ReferencesOf(_) | QueryStep::UsedBy(_) | QueryStep::Uses(_) => "declaration",
+            QueryStep::Callers(_)
+            | QueryStep::Callees(_)
+            | QueryStep::CallSitesTo(_)
+            | QueryStep::CallSitesFrom(_) => "declaration",
+            QueryStep::CallInput(_) => "call_site",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(

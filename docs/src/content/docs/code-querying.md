@@ -3,9 +3,9 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing declarations, exact source references and semantic users, direct import-file edges, indexed type hierarchies, and declaration ownership. It answers questions such as “find calls to this callee,” “which declarations use this field,” “which types derive from this type,” and “which declarations are direct members of those types” across supported languages.
+Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing declarations, exact source references and semantic users, resolved call edges and call-site inputs, direct import-file edges, indexed type hierarchies, and declaration ownership. It answers questions such as “find calls to this callee,” “which declarations call this function,” “what enters this sensitive formal parameter,” “which types derive from this type,” and “which declarations are direct members of those types” across supported languages.
 
-The broader name is intentional. Future versions may add more steps backed by Bifrost's existing usage and type analyses or by future control-flow and data-flow analyses. Version 2 does not traverse call graphs, resolve arbitrary types or aliases, or prove control/data flow.
+The broader name is intentional. Future versions may add more steps backed by future control-flow and data-flow analyses. Version 2 traverses resolved calls but does not resolve arbitrary types or aliases or prove control/data flow. `call_input` projects only the expression written directly at the call site; it does not follow assignments into that expression.
 
 ## Choose The Right Tool
 
@@ -30,7 +30,7 @@ See [Rune IR](/rune-ir/) for the representation, `.rune` files and VS Code previ
 
 ## Version 2 Typed Pipelines
 
-`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations; `references_of`, `used_by`, and `uses` traverse exact structured references; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse direct, bounded, or transitive indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance.
+`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations; `references_of`, `used_by`, and `uses` traverse exact structured references; `callers`, `callees`, and the call-site steps traverse only AST-confirmed calls; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance.
 
 Semantic declaration steps intentionally stop at the analyzer's indexed declaration boundary. Seeing a reference or usage into a dependency is not evidence that the dependency declaration is indexed. Until Bifrost can target library code for indexing, unindexed library declarations are omitted rather than reconstructed from names, and their absence is not reported as a capability error.
 
@@ -40,7 +40,12 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 | `references-of` | `references_of` | declaration → reference site | Return exact structured sites targeting a declaration. |
 | `used-by` | `used_by` | declaration → declaration | Return each smallest exact semantic user, with its proving site under `via`. |
 | `uses` | `uses` | declaration → declaration | Return exact indexed targets used by one semantic declaration, with `via`. |
-| `file-of` | `file_of` | structural match, declaration, or reference site → file | Move from code, a declaration, or a reference to the exact project file. |
+| `callers` | `callers` | declaration → declaration | Follow incoming calls, direct by default or through a positive `depth`. |
+| `callees` | `callees` | declaration → declaration | Follow outgoing calls, direct by default or through a positive `depth`. |
+| `call-sites-to` | `call_sites_to` | declaration → call site | Return incoming call sites with caller, callee, proof, receiver, and bound arguments. |
+| `call-sites-from` | `call_sites_from` | declaration → call site | Return call sites lexically owned by the declaration. |
+| `call-input` | `call_input` | call site → expression site | Select `receiver: true`, a zero-based `parameter_index`, or `parameter_name`. |
+| `file-of` | `file_of` | structural match or semantic source value → file | Move from code, a declaration, reference, call, or input expression to its project file. |
 | `imports-of` | `imports_of` | file → file | Follow one resolved direct project-local import. |
 | `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
 

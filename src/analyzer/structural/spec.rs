@@ -118,12 +118,18 @@ impl<'a> RoleSink<'a> {
 
     /// Attach a role edge without a derived name.
     pub fn role(&mut self, role: Role, target: Node<'_>) {
-        self.push(role, None, target, None);
+        self.push(role, false, None, target, None);
     }
 
     /// Attach a role edge whose name is the span of `name_node`.
     pub fn role_named(&mut self, role: Role, target: Node<'_>, name_node: Node<'_>) {
-        self.push(role, None, target, Some(span_of(name_node)));
+        self.push(role, false, None, target, Some(span_of(name_node)));
+    }
+
+    /// Attach an argument role, preserving whether it came from a
+    /// spread/unpack expression.
+    pub fn argument_maybe_named(&mut self, target: Node<'_>, name: Option<Node<'_>>, spread: bool) {
+        self.push(Role::Arg, spread, None, target, name.map(span_of));
     }
 
     /// Attach a role edge with a derived name when the language spec found
@@ -138,18 +144,26 @@ impl<'a> RoleSink<'a> {
 
     /// Attach a role edge whose name is a precise span inside `target`.
     pub fn role_named_span(&mut self, role: Role, target: Node<'_>, name: Span) {
-        self.push(role, None, target, Some(name));
+        self.push(role, false, None, target, Some(name));
     }
 
     /// Attach a keyword-argument edge (`shell=True` → keyword `shell`,
     /// target the value node).
     pub fn kwarg(&mut self, keyword_node: Node<'_>, value: Node<'_>) {
-        self.push(Role::Kwarg, Some(span_of(keyword_node)), value, None);
+        self.push(Role::Kwarg, false, Some(span_of(keyword_node)), value, None);
     }
 
-    fn push(&mut self, role: Role, keyword: Option<Span>, target: Node<'_>, name: Option<Span>) {
+    fn push(
+        &mut self,
+        role: Role,
+        spread: bool,
+        keyword: Option<Span>,
+        target: Node<'_>,
+        name: Option<Span>,
+    ) {
         self.roles.push(RoleTarget {
             role,
+            spread,
             keyword,
             node: self.fact_by_ts_node.get(&target.id()).copied(),
             span: span_of(target),

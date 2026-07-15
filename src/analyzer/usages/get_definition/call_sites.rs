@@ -1,5 +1,6 @@
 use tree_sitter::{Node, Tree};
 
+use crate::analyzer::structural::{FileFacts, NormalizedKind, Role, Span};
 use crate::analyzer::{Language, ProjectFile, Range};
 
 use super::{parse_tree_for_language, scala::scala_postfix_method_node};
@@ -11,16 +12,37 @@ pub(crate) struct CallSignatureContext {
     pub(crate) active_parameter: u32,
 }
 
-pub(crate) fn call_reference_ranges(
-    file: &ProjectFile,
-    source: &str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CallSyntaxKind {
+    Function,
+    Method,
+    Constructor,
+    Super,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CallArgumentSyntax {
+    pub(crate) range: Range,
+    pub(crate) name: Option<String>,
+    pub(crate) position: Option<usize>,
+    pub(crate) spread: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CallSiteSyntax {
+    pub(crate) range: Range,
+    pub(crate) callee_range: Range,
+    pub(crate) receiver: Option<Range>,
+    pub(crate) arguments: Vec<CallArgumentSyntax>,
+    pub(crate) kind: CallSyntaxKind,
+}
+
+pub(crate) fn call_reference_ranges_in_tree(
+    tree: &Tree,
+    language: Language,
     search_range: &Range,
     limit: usize,
 ) -> Vec<Range> {
-    let language = language_for_file(file);
-    let Some(tree) = parse_tree_for_language(file, language, source) else {
-        return Vec::new();
-    };
     collect_call_reference_ranges(tree.root_node(), language, search_range, limit)
 }
 
@@ -37,6 +59,81 @@ pub(crate) fn is_call_reference_range_in_tree(
         return false;
     };
     is_call_reference_candidate(node, language)
+}
+
+pub(crate) fn call_site_syntax_for_reference(
+    facts: &FileFacts,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<CallSiteSyntax> {
+    let call = facts
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == NormalizedKind::Call)
+        .filter(|node| {
+            node.name
+                .is_some_and(|name| name.start_byte <= start_byte && end_byte <= name.end_byte)
+        })
+        .min_by_key(|node| node.range.end_byte.saturating_sub(node.range.start_byte))?;
+    let callee = call.name?;
+    let receiver = call
+        .role_targets(Role::Receiver)
+        .next()
+        .map(|target| range_for_span(facts, target.span));
+    let mut position = 0;
+    let arguments = call
+        .roles
+        .iter()
+        .filter_map(|target| match target.role {
+            Role::Arg => {
+                let current = position;
+                position += 1;
+                Some(CallArgumentSyntax {
+                    range: range_for_span(facts, target.span),
+                    name: None,
+                    position: Some(current),
+                    spread: target.spread,
+                })
+            }
+            Role::Kwarg => Some(CallArgumentSyntax {
+                range: range_for_span(facts, target.span),
+                name: target
+                    .keyword
+                    .map(|keyword| keyword.text(facts.source()).to_owned()),
+                position: None,
+                spread: target.spread,
+            }),
+            _ => None,
+        })
+        .collect();
+    let kind = match receiver {
+        Some(range)
+            if matches!(
+                facts.source().get(range.start_byte..range.end_byte),
+                Some("super" | "base")
+            ) =>
+        {
+            CallSyntaxKind::Super
+        }
+        Some(_) => CallSyntaxKind::Method,
+        None => CallSyntaxKind::Function,
+    };
+    Some(CallSiteSyntax {
+        range: call.range,
+        callee_range: range_for_span(facts, callee),
+        receiver,
+        arguments,
+        kind,
+    })
+}
+
+fn range_for_span(facts: &FileFacts, span: Span) -> Range {
+    Range {
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        start_line: facts.line_of_byte(span.start_byte),
+        end_line: facts.line_of_byte(span.end_byte),
+    }
 }
 
 pub(crate) fn call_signature_context(
@@ -572,6 +669,9 @@ fn csharp_call_reference_candidate(node: Node<'_>) -> bool {
 }
 
 fn ruby_call_reference_candidate(node: Node<'_>) -> bool {
+    if ruby_bare_call_identifier(node) {
+        return true;
+    }
     let mut current = node;
     while let Some(parent) = current.parent() {
         match parent.kind() {
@@ -585,12 +685,21 @@ fn ruby_call_reference_candidate(node: Node<'_>) -> bool {
     false
 }
 
+fn ruby_bare_call_identifier(node: Node<'_>) -> bool {
+    node.kind() == "identifier"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "body_statement")
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
 
-    use super::call_signature_context;
+    use super::{call_signature_context, call_site_syntax_for_reference};
     use crate::analyzer::ProjectFile;
+    use crate::analyzer::ruby::structural::RUBY_STRUCTURAL_SPEC;
+    use crate::analyzer::structural::extract::extract_file_facts;
 
     fn file(name: &str) -> ProjectFile {
         ProjectFile::new(env::temp_dir().join("bifrost-signature-help"), name)
@@ -598,6 +707,25 @@ mod tests {
 
     fn offset_after(source: &str, needle: &str) -> usize {
         source.find(needle).expect("needle exists") + needle.len()
+    }
+
+    #[test]
+    fn ruby_bare_call_has_a_structured_call_site() {
+        let source = "def target; end\ndef caller; target; end\n";
+        let grammar = tree_sitter_ruby::LANGUAGE.into();
+        let facts = extract_file_facts(&RUBY_STRUCTURAL_SPEC, &grammar, source)
+            .expect("Ruby structural facts");
+        let start = source.rfind("target").expect("call target");
+        let site = call_site_syntax_for_reference(&facts, start, start + "target".len())
+            .expect("bare Ruby call site");
+        assert_eq!(
+            &source[site.callee_range.start_byte..site.callee_range.end_byte],
+            "target"
+        );
+        assert_eq!(
+            &source[site.range.start_byte..site.range.end_byte],
+            "target"
+        );
     }
 
     #[test]

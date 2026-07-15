@@ -37,6 +37,216 @@ fn result_fq_names(value: &Value) -> Vec<String> {
 }
 
 #[test]
+fn call_traversal_and_formal_input_projection_share_structured_call_sites() {
+    let files = [(
+        "Sample.java",
+        r#"class Sample {
+    static void sink(String payload, int mode) {}
+    void recurse() { recurse(); }
+    void caller() { sink("secret", 7); this.recurse(); }
+}
+"#,
+    )];
+
+    let callers = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "callable", "name": "sink" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "callers", "proof": "proven" }]
+        }),
+    ));
+    assert_eq!(
+        result_fq_names(&callers),
+        vec!["Sample.caller"],
+        "{callers}"
+    );
+    assert_eq!(
+        callers["results"][0]["provenance"][0]["steps"][1]["via"]["result_type"], "call_site",
+        "{callers}"
+    );
+
+    let callees = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "callable", "name": "caller" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "callees" }]
+        }),
+    ));
+    assert_eq!(
+        result_fq_names(&callees),
+        vec!["Sample.sink", "Sample.recurse"],
+        "{callees}"
+    );
+
+    let input = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "callable", "name": "sink" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_index": 0 }
+            ],
+            "result_detail": "full"
+        }),
+    ));
+    assert_eq!(input["results"].as_array().unwrap().len(), 1, "{input}");
+    assert_eq!(
+        input["results"][0]["result_type"], "expression_site",
+        "{input}"
+    );
+    assert_eq!(input["results"][0]["text"], "\"secret\"", "{input}");
+    assert_eq!(input["results"][0]["parameter_index"], 0, "{input}");
+    assert_eq!(input["results"][0]["parameter_name"], "payload", "{input}");
+
+    let receiver = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "callable", "name": "caller" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_from" },
+                { "op": "call_input", "receiver": true }
+            ]
+        }),
+    ));
+    assert_eq!(
+        receiver["results"].as_array().unwrap().len(),
+        1,
+        "{receiver}"
+    );
+    assert_eq!(receiver["results"][0]["text"], "this", "{receiver}");
+    assert_eq!(
+        receiver["results"][0]["input_kind"], "receiver",
+        "{receiver}"
+    );
+}
+
+#[test]
+fn call_input_supports_keyword_binding_and_call_cycles_terminate() {
+    let files = [(
+        "sample.py",
+        r#"def sink(payload, mode=0):
+    return payload
+
+def first():
+    sink(mode=2, payload="named")
+    second()
+
+def second():
+    first()
+"#,
+    )];
+    let keyword = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "callable", "name": "sink" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to" },
+                { "op": "call_input", "parameter_name": "payload" }
+            ]
+        }),
+    ));
+    assert_eq!(keyword["results"][0]["text"], "\"named\"", "{keyword}");
+    assert_eq!(keyword["results"][0]["parameter_index"], 0, "{keyword}");
+
+    let bounded = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "callable", "name": "first" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "callees", "depth": 8 }]
+        }),
+    ));
+    assert_eq!(
+        result_fq_names(&bounded),
+        vec!["sample.sink", "sample.second", "sample.first"],
+        "{bounded}"
+    );
+}
+
+#[test]
+fn python_static_method_keeps_its_first_formal_parameter() {
+    let result = serialized(&run(
+        &[(
+            "static.py",
+            r#"class Box:
+    @staticmethod
+    def emit(payload):
+        return payload
+
+def caller():
+    Box.emit("kept")
+"#,
+        )],
+        json!({
+            "match": { "kind": "method", "name": "emit" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_index": 0 }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"][0]["text"], "\"kept\"", "{result}");
+    assert_eq!(
+        result["results"][0]["parameter_name"], "payload",
+        "{result}"
+    );
+
+    let instance = serialized(&run(
+        &[(
+            "instance.py",
+            r#"class Box:
+    def send(self, payload):
+        return payload
+
+    def caller(self):
+        self.send("instance")
+"#,
+        )],
+        json!({
+            "match": { "kind": "method", "name": "caller" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_from", "proof": "proven" },
+                { "op": "call_input", "parameter_index": 0 }
+            ]
+        }),
+    ));
+    assert_eq!(instance["results"][0]["text"], "\"instance\"", "{instance}");
+    assert_eq!(
+        instance["results"][0]["parameter_name"], "payload",
+        "{instance}"
+    );
+
+    let incoming_instance = serialized(&run(
+        &[(
+            "instance.py",
+            r#"class Box:
+    def send(self, payload):
+        return payload
+
+    def caller(self):
+        self.send("instance")
+"#,
+        )],
+        json!({
+            "match": { "kind": "method", "name": "send" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_index": 0 }
+            ]
+        }),
+    ));
+    assert_eq!(
+        incoming_instance["results"][0]["text"], "\"instance\"",
+        "{incoming_instance}"
+    );
+}
+
+#[test]
 fn java_reference_steps_preserve_exact_site_and_semantic_owner() {
     let files = [
         ("Target.java", "class Target { int status; }\n"),
@@ -257,57 +467,57 @@ fn reference_traversal_resolves_inbound_and_outbound_across_all_adapters() {
         (
             "python",
             "sample.py",
-            "def target():\n    pass\n\ndef caller():\n    target()\n",
+            "def target(payload):\n    pass\n\ndef caller():\n    target(\"input\")\n",
         ),
         (
             "java",
             "Sample.java",
-            "class Sample { static void target() {} static void caller() { target(); } }\n",
+            "class Sample { static void target(String payload) {} static void caller() { target(\"input\"); } }\n",
         ),
         (
             "javascript",
             "sample.js",
-            "function target() {}\nfunction caller() { target(); }\n",
+            "function target(payload) {}\nfunction caller() { target(\"input\"); }\n",
         ),
         (
             "typescript",
             "sample.ts",
-            "function target(): void {}\nfunction caller(): void { target(); }\n",
+            "function target(payload: string): void {}\nfunction caller(): void { target(\"input\"); }\n",
         ),
         (
             "go",
             "sample.go",
-            "package sample\nfunc target() {}\nfunc caller() { target() }\n",
+            "package sample\nfunc target(payload string) {}\nfunc caller() { target(\"input\") }\n",
         ),
         (
             "cpp",
             "sample.cpp",
-            "void target() {}\nvoid caller() { target(); }\n",
+            "void target(const char* payload) {}\nvoid caller() { target(\"input\"); }\n",
         ),
         (
             "rust",
             "sample.rs",
-            "fn target() {}\nfn caller() { target(); }\n",
+            "fn target(payload: &str) {}\nfn caller() { target(\"input\"); }\n",
         ),
         (
             "php",
             "sample.php",
-            "<?php\nfunction target() {}\nfunction caller() { target(); }\n",
+            "<?php\nfunction target($payload) {}\nfunction caller() { target(\"input\"); }\n",
         ),
         (
             "scala",
             "Sample.scala",
-            "object Sample { def target(): Unit = (); def caller(): Unit = target() }\n",
+            "object Sample { def target(payload: String): Unit = (); def caller(): Unit = target(\"input\") }\n",
         ),
         (
             "csharp",
             "Sample.cs",
-            "class Sample { static void target() {} static void caller() { target(); } }\n",
+            "class Sample { static void target(string payload) {} static void caller() { target(\"input\"); } }\n",
         ),
         (
             "ruby",
             "sample.rb",
-            "def target; end\ndef caller; target; end\n",
+            "def target(payload); end\ndef caller; target(\"input\"); end\n",
         ),
     ];
 
@@ -351,7 +561,294 @@ fn reference_traversal_resolves_inbound_and_outbound_across_all_adapters() {
                 .any(|name| name.ends_with("target")),
             "missing outbound {language} reference: {outbound}"
         );
+
+        let callers = serialized(&run(
+            &[(path, source)],
+            json!({
+                "languages": [language],
+                "match": { "kind": "callable", "name": "target" },
+                "steps": [{ "op": "enclosing_decl" }, { "op": "callers", "proof": "proven" }]
+            }),
+        ));
+        assert!(
+            result_fq_names(&callers)
+                .iter()
+                .any(|name| name.ends_with("caller")),
+            "missing {language} caller: inbound={inbound}; callers={callers}"
+        );
+
+        let callees = serialized(&run(
+            &[(path, source)],
+            json!({
+                "languages": [language],
+                "match": { "kind": "callable", "name": "caller" },
+                "steps": [{ "op": "enclosing_decl" }, { "op": "callees", "proof": "proven" }]
+            }),
+        ));
+        assert!(
+            result_fq_names(&callees)
+                .iter()
+                .any(|name| name.ends_with("target")),
+            "missing {language} callee: {callees}"
+        );
+
+        let input = serialized(&run(
+            &[(path, source)],
+            json!({
+                "languages": [language],
+                "match": { "kind": "callable", "name": "target" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "call_sites_to", "proof": "proven" },
+                    { "op": "call_input", "parameter_index": 0 }
+                ]
+            }),
+        ));
+        assert!(
+            input["results"].as_array().is_some_and(|rows| rows
+                .iter()
+                .any(|row| row["text"] == "\"input\"" && row["parameter_index"] == 0)),
+            "missing {language} positional input: {input}"
+        );
     }
+}
+
+#[test]
+fn named_call_inputs_bind_to_formals_across_keyword_adapters() {
+    let cases = [
+        (
+            "python",
+            "sample.py",
+            "def target(payload, mode=0):\n    pass\n\ndef caller():\n    target(mode=2, payload=\"named\")\n",
+        ),
+        (
+            "php",
+            "sample.php",
+            "<?php\nfunction target($payload, $mode = 0) {}\nfunction caller() { target(mode: 2, payload: \"named\"); }\n",
+        ),
+        (
+            "scala",
+            "Sample.scala",
+            "object Sample { def target(payload: String, mode: Int = 0): Unit = (); def caller(): Unit = target(mode = 2, payload = \"named\") }\n",
+        ),
+        (
+            "csharp",
+            "Sample.cs",
+            "class Sample { static void target(string payload, int mode = 0) {} static void caller() { target(mode: 2, payload: \"named\"); } }\n",
+        ),
+        (
+            "ruby",
+            "sample.rb",
+            "def target(payload:, mode: 0); end\ndef caller; target(mode: 2, payload: \"named\"); end\n",
+        ),
+    ];
+
+    for (language, path, source) in cases {
+        let input = serialized(&run(
+            &[(path, source)],
+            json!({
+                "languages": [language],
+                "match": { "kind": "callable", "name": "target" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "call_sites_to", "proof": "proven" },
+                    { "op": "call_input", "parameter_name": "payload" }
+                ]
+            }),
+        ));
+        assert!(
+            input["results"].as_array().is_some_and(|rows| rows
+                .iter()
+                .any(|row| row["text"] == "\"named\"" && row["parameter_name"] == "payload")),
+            "missing {language} named input: {input}"
+        );
+    }
+}
+
+#[test]
+fn call_input_handles_variadics_defaults_and_spreads_without_guessing() {
+    let files = [(
+        "sample.py",
+        r#"def target(required, optional="default", *rest):
+    pass
+
+def caller(items):
+    target("required", "explicit", "first", "second")
+    target("required")
+    target("required", *items)
+"#,
+    )];
+
+    let variadic = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "callable", "name": "target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_name": "rest" }
+            ]
+        }),
+    ));
+    let mut texts = variadic["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["text"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    texts.sort_unstable();
+    assert_eq!(texts, vec!["\"first\"", "\"second\""]);
+
+    let optional = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "callable", "name": "target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_name": "optional" }
+            ]
+        }),
+    ));
+    assert_eq!(
+        optional["results"].as_array().unwrap().len(),
+        1,
+        "{optional}"
+    );
+    assert_eq!(optional["results"][0]["text"], "\"explicit\"");
+}
+
+#[test]
+fn incoming_call_discovery_is_not_limited_by_unrelated_calls() {
+    let result = serialized(&run(
+        &[(
+            "Sample.java",
+            r#"class Sample {
+    static void first() {}
+    static void second() {}
+    static void target() {}
+    static void caller() { first(); second(); target(); }
+}
+"#,
+        )],
+        json!({
+            "match": { "kind": "callable", "name": "target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" }
+            ],
+            "limit": 1
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(
+        result["results"][0]["caller"]["fq_name"], "Sample.caller",
+        "{result}"
+    );
+}
+
+#[test]
+fn incoming_call_relations_include_direct_self_recursion() {
+    let result = serialized(&run(
+        &[("recursive.py", "def recurse():\n    recurse()\n")],
+        json!({
+            "match": { "kind": "callable", "name": "recurse" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(
+        result["results"][0]["caller"]["fq_name"], result["results"][0]["callee"]["fq_name"],
+        "{result}"
+    );
+}
+
+#[test]
+fn python_unbound_method_calls_do_not_consume_the_self_parameter() {
+    let result = serialized(&run(
+        &[(
+            "unbound.py",
+            r#"class Sink:
+    def send(self, payload):
+        return payload
+
+def caller(instance):
+    Sink.send(instance, "secret")
+"#,
+        )],
+        json!({
+            "match": { "kind": "method", "name": "send" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_name": "payload" }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"][0]["text"], "\"secret\"", "{result}");
+    assert_eq!(result["results"][0]["parameter_index"], 1, "{result}");
+}
+
+#[test]
+fn class_target_calls_do_not_borrow_an_arbitrary_member_signature() {
+    let result = serialized(&run(
+        &[(
+            "constructor.py",
+            r#"class Base:
+    def __init__(self, inherited):
+        self.inherited = inherited
+
+class Sink(Base):
+    def payload(value):
+        return value
+
+def caller():
+    Sink("secret")
+"#,
+        )],
+        json!({
+            "match": { "kind": "class", "name": "Sink" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_name": "value" }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 0, "{result}");
+}
+
+#[test]
+fn keyword_variadics_receive_unmatched_named_arguments() {
+    let result = serialized(&run(
+        &[(
+            "kwargs.py",
+            r#"def sink(**kwargs):
+    return kwargs
+
+def caller():
+    sink(payload="secret", mode=2)
+"#,
+        )],
+        json!({
+            "match": { "kind": "callable", "name": "sink" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_name": "kwargs" }
+            ]
+        }),
+    ));
+    let texts = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["text"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec!["\"secret\"", "2"], "{result}");
 }
 
 #[test]
@@ -1020,6 +1517,45 @@ fn reference_scans_charge_workspace_budgets_and_do_not_leak_intermediate_sites()
 }
 
 #[test]
+fn call_scans_report_zero_remaining_workspace_budget() {
+    let project = InlineTestProject::new()
+        .file(
+            "Sample.java",
+            "class Sample { static void target(String value) {} static void caller() { target(\"secret\"); } }\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "callable", "name": "target" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "call_sites_to" },
+            { "op": "call_input", "parameter_index": 0 }
+        ]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+
+    assert!(result.truncated, "{:?}", result.diagnostics);
+    assert!(result.results.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("execution budget exhausted")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn inbound_reference_scan_admits_candidate_sources_before_graph_work() {
     let target_source = "class Target { static void target() {} }\n";
     let project = InlineTestProject::new()
@@ -1485,6 +2021,82 @@ fn deep_hierarchy_provenance_is_bounded_by_pipeline_work_budget() {
             .diagnostics
             .iter()
             .any(|diagnostic| { diagnostic.message.contains("pipeline budget exhausted") })
+    );
+}
+
+#[test]
+fn deep_call_provenance_is_bounded_by_pipeline_work_budget() {
+    let mut source = String::new();
+    for index in 0..200 {
+        if index + 1 < 200 {
+            source.push_str(&format!("def f{index}():\n    f{}()\n\n", index + 1));
+        } else {
+            source.push_str(&format!("def f{index}():\n    pass\n"));
+        }
+    }
+    let project = InlineTestProject::new().file("deep.py", source).build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "callable", "name": "f0" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "callees", "depth": 200 }
+        ],
+        "limit": 1000
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 1000,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(result.truncated);
+    assert!(result.results.len() < 100, "{}", result.results.len());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("pipeline budget exhausted")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn transitive_call_provenance_preserves_alternate_paths() {
+    let result = serialized(&run(
+        &[(
+            "Paths.java",
+            r#"class Paths {
+    static void a() { b(); c(); }
+    static void b() { d(); }
+    static void c() { d(); }
+    static void d() { e(); }
+    static void e() {}
+}
+"#,
+        )],
+        json!({
+            "match": { "kind": "callable", "name": "a" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "callees", "depth": 4 }
+            ]
+        }),
+    ));
+    let terminal = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["fq_name"] == "Paths.e")
+        .unwrap_or_else(|| panic!("missing terminal e: {result}"));
+    assert_eq!(
+        terminal["provenance"].as_array().unwrap().len(),
+        2,
+        "{result}"
     );
 }
 

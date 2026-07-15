@@ -2,7 +2,8 @@
 
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, first_named_child,
+    attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
+    first_named_child,
 };
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
 use tree_sitter::Node;
@@ -110,6 +111,13 @@ fn call_method_node(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("method")
 }
 
+fn is_bare_call_identifier(node: Node<'_>) -> bool {
+    node.kind() == "identifier"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "body_statement")
+}
+
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
     for index in 0..arguments.named_child_count() {
         let Some(argument) = arguments.named_child(index) else {
@@ -124,7 +132,7 @@ fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
                 sink.kwarg(expression_name_node(key).unwrap_or(key), value);
             }
         } else {
-            attach_role_with_derived_name(sink, Role::Arg, argument, expression_name_node);
+            attach_argument_role_with_derived_name(sink, argument, expression_name_node);
         }
     }
 }
@@ -186,7 +194,9 @@ impl StructuralSpec for RubyStructuralSpec {
         enclosing: Option<NormalizedKind>,
         source: &str,
     ) -> NormalizedKind {
-        if node.kind() == "call" && is_import_call(node, source) {
+        if is_bare_call_identifier(node) {
+            NormalizedKind::Call
+        } else if node.kind() == "call" && is_import_call(node, source) {
             NormalizedKind::Import
         } else if node.kind() == "method"
             && kind == NormalizedKind::Function
@@ -235,7 +245,9 @@ impl StructuralSpec for RubyStructuralSpec {
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         match kind {
             NormalizedKind::Call => {
-                if let Some(method) = call_method_node(node) {
+                if is_bare_call_identifier(node) {
+                    attach_terminal_callee(sink, node, Some(node));
+                } else if let Some(method) = call_method_node(node) {
                     attach_terminal_callee(sink, method, expression_name_node(method));
                 }
                 if let Some(receiver) = node.child_by_field_name("receiver") {

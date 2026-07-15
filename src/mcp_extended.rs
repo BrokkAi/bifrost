@@ -1,5 +1,5 @@
 use crate::analyzer::structural::query::schema::{
-    ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, reference_kind_label,
+    ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryStepField, reference_kind_label,
 };
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
@@ -35,10 +35,20 @@ pub fn run_extended_stdio_server(
 }
 
 fn query_step_input_variants() -> Vec<Value> {
+    let (parameter_name_minimum, parameter_name_maximum) = QueryStepField::ParameterName
+        .value_shape()
+        .string_length_bounds()
+        .expect("parameter-name shape has string bounds");
     let plain = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
-        .filter(|op| !op.allows_hierarchy_options() && !op.allows_reference_options())
+        .filter(|op| {
+            !op.allows_hierarchy_options()
+                && !op.allows_reference_options()
+                && !op.allows_call_options()
+                && !op.allows_call_site_options()
+                && op.label() != "call_input"
+        })
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let hierarchy = ALL_QUERY_STEP_OPS
@@ -51,6 +61,18 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_reference_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let calls = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_call_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let call_sites = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_call_site_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let reference_kinds = ALL_REFERENCE_KINDS
@@ -105,6 +127,56 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": calls },
+                "depth": { "type": "integer", "minimum": 1 },
+                "proof": { "type": "string", "enum": ["proven", "unproven"] }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": call_sites },
+                "proof": { "type": "string", "enum": ["proven", "unproven"] }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "const": "call_input" },
+                "receiver": { "const": true }
+            },
+            "required": ["op", "receiver"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "const": "call_input" },
+                "parameter_index": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["op", "parameter_index"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "const": "call_input" },
+                "parameter_name": {
+                    "type": "string",
+                    "minLength": parameter_name_minimum,
+                    "maxLength": parameter_name_maximum
+                }
+            },
+            "required": ["op", "parameter_name"],
+            "additionalProperties": false
+        }),
     ]
 }
 
@@ -128,7 +200,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Reference steps preserve exact indexed targets and sites; they may filter reference_kinds, proof, and the external_usages or lsp_references surface. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, or reference_site results with provenance. It does not perform points-to, control-flow, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Pipeline example: {{\"match\":{{\"kind\":\"class\",\"name\":\"Service\"}},\"steps\":[{{\"op\":\"enclosing_decl\"}},{{\"op\":\"members\"}},{{\"op\":\"uses\",\"proof\":\"proven\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
+        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, or expression_site results with provenance. It does not perform points-to, control-flow, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Call-input example: {{\"match\":{{\"kind\":\"callable\",\"name\":\"execute\"}},\"steps\":[{{\"op\":\"enclosing_decl\"}},{{\"op\":\"call_sites_to\",\"proof\":\"proven\"}},{{\"op\":\"call_input\",\"parameter_name\":\"payload\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     vec![
@@ -491,10 +563,11 @@ mod tests {
             .flat_map(|variant| {
                 variant["properties"]["op"]["enum"]
                     .as_array()
-                    .unwrap()
-                    .iter()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .chain(variant["properties"]["op"]["const"].as_str())
             })
-            .map(|label| label.as_str().unwrap())
             .collect::<std::collections::BTreeSet<_>>();
         let registered = ALL_QUERY_STEP_OPS
             .iter()

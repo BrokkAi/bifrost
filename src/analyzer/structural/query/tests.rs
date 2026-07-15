@@ -79,6 +79,67 @@ fn parses_and_canonicalizes_reference_traversal_filters() {
 }
 
 #[test]
+fn parses_call_traversal_sites_and_formal_input_selectors() {
+    let query = parse_ok(json!({
+        "match": { "kind": "callable", "name": "sink" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "callers", "depth": 3, "proof": "proven" },
+            { "op": "call_sites_from", "proof": "unproven" },
+            { "op": "call_input", "parameter_index": 0 },
+            { "op": "file_of" }
+        ]
+    }));
+    assert_eq!(
+        query.steps[1],
+        QueryStep::Callers(CallTraversalFilter {
+            depth: std::num::NonZeroUsize::new(3).unwrap(),
+            proof: Some(UsageProof::Proven),
+        })
+    );
+    assert_eq!(
+        query.steps[2],
+        QueryStep::CallSitesFrom(CallSiteTraversalFilter {
+            proof: Some(UsageProof::Unproven),
+        })
+    );
+    assert_eq!(
+        query.steps[3],
+        QueryStep::CallInput(CallInputSelector::ParameterIndex(0))
+    );
+    assert_eq!(query.to_canonical_json()["steps"][1]["depth"], 3);
+
+    let rql = CodeQuery::from_sexp(
+        r#"(call-input :parameter-name "payload" (call-sites-to :proof proven (enclosing-decl (method (name "sink")))))"#,
+    )
+    .expect("RQL call pipeline should parse");
+    assert_eq!(
+        rql.steps,
+        vec![
+            QueryStep::EnclosingDecl,
+            QueryStep::CallSitesTo(CallSiteTraversalFilter {
+                proof: Some(UsageProof::Proven),
+            }),
+            QueryStep::CallInput(CallInputSelector::ParameterName("payload".to_string())),
+        ]
+    );
+
+    for step in [
+        json!({ "op": "call_input" }),
+        json!({ "op": "call_input", "receiver": true, "parameter_index": 0 }),
+        json!({ "op": "callers", "transitive": true }),
+    ] {
+        assert!(
+            parse(json!({
+                "match": { "kind": "callable", "name": "sink" },
+                "steps": [{ "op": "enclosing_decl" }, step]
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn reference_options_are_operation_specific_and_constrained() {
     for (step, path) in [
         (

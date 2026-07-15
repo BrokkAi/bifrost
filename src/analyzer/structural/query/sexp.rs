@@ -191,6 +191,97 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Callers | RqlForm::Callees | RqlForm::CallSitesTo | RqlForm::CallSitesFrom => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(format!(
+                    "({head} ...) expects option/value pairs followed by a query"
+                ));
+            }
+            let query_expr = items.last().expect("call wrapper has a query");
+            let mut query = query_object(query_expr)?;
+            let op = match form {
+                RqlForm::Callers => "callers",
+                RqlForm::Callees => "callees",
+                RqlForm::CallSitesTo => "call_sites_to",
+                RqlForm::CallSitesFrom => "call_sites_from",
+                _ => unreachable!("call wrapper filtered above"),
+            };
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.to_string()));
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0]
+                    .as_symbol()
+                    .ok_or_else(|| format!("({head} ...) option names must be symbols"))?;
+                let (field, value) = match key {
+                    ":depth" if matches!(form, RqlForm::Callers | RqlForm::Callees) => {
+                        ("depth", number_value(&pair[1], head)?)
+                    }
+                    ":proof" => (
+                        "proof",
+                        Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
+                    ),
+                    _ => {
+                        return Err(format!(
+                            "({head} ...) accepts :proof{}",
+                            if matches!(form, RqlForm::Callers | RqlForm::Callees) {
+                                " and :depth"
+                            } else {
+                                ""
+                            }
+                        ));
+                    }
+                };
+                if step.insert(field.to_string(), value).is_some() {
+                    return Err(format!("({head} ...) repeats option {key}"));
+                }
+            }
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::CallInput => {
+            if items.len() != 4 {
+                return Err(format!(
+                    "({head} ...) expects one selector option followed by a query"
+                ));
+            }
+            let key = items[1]
+                .as_symbol()
+                .ok_or_else(|| format!("({head} ...) selector must be a symbol"))?;
+            let (field, value) = match key {
+                ":receiver" if items[2].as_symbol() == Some("true") => {
+                    ("receiver", Value::Bool(true))
+                }
+                ":receiver" => {
+                    return Err(format!("({head} :receiver ...) requires true"));
+                }
+                ":parameter-index" => ("parameter_index", number_value(&items[2], head)?),
+                ":parameter-name" => (
+                    "parameter_name",
+                    Value::String(symbol_or_string(&items[2])?),
+                ),
+                _ => {
+                    return Err(format!(
+                        "({head} ...) requires :receiver, :parameter-index, or :parameter-name"
+                    ));
+                }
+            };
+            let mut query = query_object(&items[3])?;
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String("call_input".to_string()));
+            step.insert(field.to_string(), value);
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Supertypes | RqlForm::Subtypes => {
             let (query_expr, option) = match items.len() {
                 2 => (&items[1], None),
@@ -335,7 +426,12 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
         | RqlForm::Owner
         | RqlForm::ReferencesOf
         | RqlForm::UsedBy
-        | RqlForm::Uses => unreachable!("wrapper filtered above"),
+        | RqlForm::Uses
+        | RqlForm::Callers
+        | RqlForm::Callees
+        | RqlForm::CallSitesTo
+        | RqlForm::CallSitesFrom
+        | RqlForm::CallInput => unreachable!("wrapper filtered above"),
     }
     Ok(Value::Object(object))
 }

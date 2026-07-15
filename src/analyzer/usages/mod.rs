@@ -12,6 +12,7 @@
 //! - Language-specific graph strategies for JavaScript / TypeScript, Python, PHP, Rust,
 //!   Java, C#, C++, Go, and Scala targets.
 
+mod call_relations;
 mod candidates;
 mod common;
 mod cpp_call_match;
@@ -40,6 +41,10 @@ pub(crate) mod scala_graph;
 pub(crate) mod target_kind;
 mod traits;
 
+pub(crate) use call_relations::{
+    CallBindingCache, CallRelationLimits, CallRelationResult, CallRelationService, CallSite,
+    bind_call_site_arguments, is_call_relation_unit, nearest_call_relation_unit,
+};
 pub use candidates::{
     ExplicitCandidateProvider, FallbackCandidateProvider, ImportGraphCandidateProvider,
     TextSearchCandidateProvider, default_provider,

@@ -27,6 +27,10 @@ impl Span {
 #[derive(Debug, Clone)]
 pub struct RoleTarget {
     pub role: Role,
+    /// Whether this argument role was produced by a language spread/unpack
+    /// form (`*args`, `...args`, and equivalents). False for non-argument
+    /// roles and ordinary arguments.
+    pub spread: bool,
     /// For [`Role::Kwarg`]: the span of the keyword name (`shell` in
     /// `run(cmd, shell=True)`). `None` for every other role.
     pub keyword: Option<Span>,

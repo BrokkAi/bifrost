@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations, direct project import edges, indexed type hierarchies, and declaration ownership. It does not traverse call graphs, infer override families, resolve arbitrary aliases, or perform control-flow or data-flow analysis.
+Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations, resolved call edges and direct call-site inputs, direct project import edges, indexed type hierarchies, and declaration ownership. It does not infer override families, resolve arbitrary aliases, or perform control-flow or data-flow analysis.
 
 ## Minimal Query
 
@@ -132,7 +132,7 @@ Each `args` pattern must match a distinct positional argument in source order, b
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
+The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `reference_site`, `call_site`, `expression_site`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
 
 With `result_detail: "full"`, results additionally include:
 
@@ -154,7 +154,12 @@ Steps execute in array order and are validated before the workspace is searched:
 | `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
 | `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
 | `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
-| `file_of` | structural match, declaration, or reference site | file | Exact project file containing the value. |
+| `callers` | declaration | declaration | Resolved incoming call edges; accepts positive `depth` and optional `proof`. |
+| `callees` | declaration | declaration | Resolved outgoing call edges; accepts positive `depth` and optional `proof`. |
+| `call_sites_to` | declaration | call site | Structured incoming sites; accepts optional `proof`. |
+| `call_sites_from` | declaration | call site | Structured outgoing sites; accepts optional `proof`. |
+| `call_input` | call site | expression site | Direct receiver or formal-parameter input selected by exactly one selector. |
+| `file_of` | structural match, declaration, reference site, call site, or expression site | file | Exact project file containing the value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
@@ -187,6 +192,23 @@ Zero depth, `transitive: false`, unknown fields, `depth` together with `transiti
 Hierarchy and ownership results are restricted to declarations returned by the active analyzer's index and having renderable ranges. Bifrost may observe usages that refer to library code without having indexed that library's declaration; such a declaration is intentionally absent from these results. This is the current precision boundary until library code can be targeted and indexed explicitly.
 
 Reference steps accept optional `reference_kinds`, `proof`, and `surface` fields. `reference_kinds` is a non-empty array drawn from `method_call`, `constructor_call`, `field_read`, `field_write`, `type_reference`, `static_reference`, `super_call`, and `inheritance`. `proof` is `proven` or `unproven`. `surface` is `external_usages` (the default) or `lsp_references`. Omitted kind and proof fields include both tiers; a kind filter excludes unclassified structured hits. See the executable [Reference Traversal](/code-query-tutorials/reference-traversal/) recipes.
+
+Call traversal is direct by default. `callers` and `callees` accept a positive finite `depth`; there is deliberately no unbounded `transitive` form. Traversal is iterative and cycle-safe. A real recursive or cyclic edge is returned, but a declaration already queued for expansion is not expanded again. Every declaration reached by a call step records the proving `call_site` under provenance `via`.
+
+`call_sites_to` and `call_sites_from` expose the full call range, callee range, caller and callee declarations, call kind, proof tier, optional explicit receiver, and arguments. `call_input` requires exactly one of `{"receiver":true}`, `{"parameter_index":0}`, or `{"parameter_name":"payload"}`. Parameter indexes are zero-based formal slots and exclude receiver-bound parameters; keyword/named arguments bind by the callee's declared parameter name. A variadic slot may yield several expression rows. Spreads/splats are retained on the call-site result but are not guessed into a formal slot. An implicit receiver has no synthetic expression row.
+
+These steps use tree-sitter call shapes and the existing definition/usage resolvers for Java, Go, C/C++, JavaScript, TypeScript, Python, Rust, PHP, Scala, C#, and Ruby. Resolution precision still varies with each language analyzer: unresolved calls are omitted, ambiguous edges are `unproven`, and formal input projection appears only when Bifrost can pair the resolved callee with structured parameter syntax. This is direct call-site projection, not local or interprocedural data flow.
+
+```json
+{
+  "match": {"kind": "callable", "name": "dangerous"},
+  "steps": [
+    {"op": "enclosing_decl"},
+    {"op": "call_sites_to", "proof": "proven"},
+    {"op": "call_input", "parameter_name": "payload"}
+  ]
+}
+```
 
 ## Containment And Descendants
 

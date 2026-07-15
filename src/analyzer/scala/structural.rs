@@ -2,7 +2,8 @@
 
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, first_named_child,
+    attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
+    first_named_child,
 };
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
 use tree_sitter::Node;
@@ -14,6 +15,8 @@ pub(crate) static SCALA_STRUCTURAL_SPEC: ScalaStructuralSpec = ScalaStructuralSp
 
 const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("call_expression", NormalizedKind::Call),
+    ("infix_expression", NormalizedKind::Call),
+    ("postfix_expression", NormalizedKind::Call),
     ("field_expression", NormalizedKind::FieldAccess),
     ("function_definition", NormalizedKind::Function),
     ("function_declaration", NormalizedKind::Function),
@@ -92,8 +95,15 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
 }
 
 fn call_function_node(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("function")
-        .map(expression_target_node)
+    match node.kind() {
+        "infix_expression" => node.child_by_field_name("operator"),
+        "postfix_expression" => (0..node.named_child_count())
+            .filter_map(|index| node.named_child(index))
+            .rfind(|child| matches!(child.kind(), "identifier" | "operator_identifier")),
+        _ => node
+            .child_by_field_name("function")
+            .map(expression_target_node),
+    }
 }
 
 fn callable_target_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -147,7 +157,7 @@ fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
                 if let Some((keyword, value)) = named_argument_parts(argument) {
                     sink.kwarg(keyword, value);
                 } else {
-                    attach_role_with_derived_name(sink, Role::Arg, argument, expression_name_node);
+                    attach_argument_role_with_derived_name(sink, argument, expression_name_node);
                 }
             }
         }
@@ -336,6 +346,27 @@ impl StructuralSpec for ScalaStructuralSpec {
             NormalizedKind::Call => {
                 if let Some(function) = call_function_node(node) {
                     attach_terminal_callee(sink, function, expression_name_node(function));
+                    if node.kind() == "infix_expression"
+                        && let Some(receiver) = node.child_by_field_name("left")
+                    {
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Receiver,
+                            receiver,
+                            expression_name_node,
+                        );
+                    }
+                    if node.kind() == "postfix_expression"
+                        && let Some(receiver) = node.named_child(0)
+                        && receiver.end_byte() <= function.start_byte()
+                    {
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Receiver,
+                            receiver,
+                            expression_name_node,
+                        );
+                    }
                     if let Some(target) = callable_target_node(function)
                         && target.kind() == "field_expression"
                         && let Some(receiver) = target.child_by_field_name("value")
@@ -347,6 +378,11 @@ impl StructuralSpec for ScalaStructuralSpec {
                             expression_name_node,
                         );
                     }
+                }
+                if node.kind() == "infix_expression"
+                    && let Some(argument) = node.child_by_field_name("right")
+                {
+                    attach_argument_role_with_derived_name(sink, argument, expression_name_node);
                 }
                 if let Some(arguments) = node.child_by_field_name("arguments") {
                     attach_argument_roles(sink, arguments);
