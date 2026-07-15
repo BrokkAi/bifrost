@@ -288,10 +288,14 @@
   "scripts": {
     "compile": "node esbuild.mjs",
     "compile:test": "tsc -p tsconfig.test.json",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"*.{json,mjs,md}\" \"syntaxes/*.json\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"*.{json,mjs,md}\" \"syntaxes/*.json\"",
+    "lint": "eslint src test esbuild.mjs eslint.config.mjs",
+    "lint:fix": "npm run lint -- --fix",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.tools.json",
     "watch": "node esbuild.mjs --watch",
-    "lint": "tsc --noEmit",
-    "test": "npm run lint && npm run compile && npm run test:unit",
-    "test:unit": "npm run compile:test && node --test test/*.test.js",
+    "test": "npm run format:check && npm run typecheck && npm run lint && npm run compile && npm run test:unit",
+    "test:unit": "npm run compile:test && node --test out-test/test/*.test.js",
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
@@ -300,11 +304,16 @@
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^20.0.0",
     "@types/vscode": "1.90.0",
     "@vscode/vsce": "3.9.2",
-    "esbuild": "^0.19.0",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.7.0",
+    "globals": "^17.7.0",
+    "prettier": "^3.9.5",
     "typescript": "^5.4.0",
+    "typescript-eslint": "^8.64.0",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.3.2"
   }

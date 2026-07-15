@@ -25,6 +25,27 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
+  vscode:
+    name: vscode
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install extension dependencies
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Check extension
+        run: npm test
+        working-directory: editors/vscode
+
   rust:
     name: rust (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}

@@ -13,15 +13,15 @@ hover, and related editor features.
 
 ## Configuration
 
-| Setting | Description |
-|---------|-------------|
-| `bifrost.launchMode` | How to start Bifrost: `auto`, `bundled`, or `path`. |
-| `bifrost.serverPath` | Path to the `bifrost` binary, or command name on `PATH`. |
-| `bifrost.debug` | Enable verbose LSP request and notification tracing. |
-| `bifrost.slowRequestMs` | Log LSP handlers that take at least this many milliseconds. |
-| `bifrost.extraArgs` | Extra command-line arguments appended to the LSP server launch. |
-| `bifrost.roots` | Workspace-relative or absolute directories to index instead of the full VS Code workspace. |
-| `bifrost.exclude` | Workspace-relative or absolute files or directories to exclude from indexing and LSP lookups. |
+| Setting                 | Description                                                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------------- |
+| `bifrost.launchMode`    | How to start Bifrost: `auto`, `bundled`, or `path`.                                           |
+| `bifrost.serverPath`    | Path to the `bifrost` binary, or command name on `PATH`.                                      |
+| `bifrost.debug`         | Enable verbose LSP request and notification tracing.                                          |
+| `bifrost.slowRequestMs` | Log LSP handlers that take at least this many milliseconds.                                   |
+| `bifrost.extraArgs`     | Extra command-line arguments appended to the LSP server launch.                               |
+| `bifrost.roots`         | Workspace-relative or absolute directories to index instead of the full VS Code workspace.    |
+| `bifrost.exclude`       | Workspace-relative or absolute files or directories to exclude from indexing and LSP lookups. |
 
 Launch mode behavior:
 
@@ -67,10 +67,15 @@ Install and compile the extension:
 
 ```bash
 cd editors/vscode
-npm install
+npm ci
 npm run compile
 npm test
 ```
+
+`npm test` is the complete editor-package quality gate: it checks Prettier
+formatting, TypeScript types (including tests and build configuration), ESLint,
+the production bundle, and unit tests. Use `npm run format` to apply the
+repository formatting rules and `npm run lint:fix` for safe ESLint fixes.
 
 Open `editors/vscode` in VS Code, run the extension in an Extension
 Development Host, and open a workspace with a supported source file. For local

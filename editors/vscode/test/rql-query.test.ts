@@ -1,7 +1,6 @@
-const assert = require("node:assert/strict");
-const test = require("node:test");
-
-const {
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import {
   RQL_LANGUAGE_ID,
   RUN_RQL_QUERY_METHOD,
   groupRqlQueryResults,
@@ -10,30 +9,32 @@ const {
   queryResultLabel,
   queryResultRange,
   queryResultTooltip,
-  runRqlQuery
-} = require("../out-test/rql_query.js");
+  runRqlQuery,
+  type RqlQueryRunner,
+  type RqlReferenceSiteResult
+} from "../src/rql_query";
 
-function runner(overrides = {}) {
+function runner(overrides: Partial<RqlQueryRunner> = {}): RqlQueryRunner {
   return {
     isReady: () => true,
-    sendRequest: async () => ({ text: "1 result\n", results: [] }),
+    sendRequest: () => Promise.resolve({ text: "1 result\n", results: [] }),
     showError: () => {},
     showWarning: () => {},
     ...overrides
   };
 }
 
-test("runs unsaved RQL editor text and returns typed results", async () => {
-  const requests = [];
+void test("runs unsaved RQL editor text and returns typed results", async () => {
+  const requests: Array<[string, { query: string }]> = [];
   const response = await runRqlQuery(
     {
       languageId: RQL_LANGUAGE_ID,
       text: '(class :name "UnsavedClass")'
     },
     runner({
-      sendRequest: async (method, params) => {
+      sendRequest: (method, params) => {
         requests.push([method, params]);
-        return {
+        return Promise.resolve({
           text: "1 match\n\nsrc/app.py:1 [class] `class UnsavedClass`\n",
           results: [
             {
@@ -47,19 +48,18 @@ test("runs unsaved RQL editor text and returns typed results", async () => {
               text: "class UnsavedClass"
             }
           ]
-        };
+        });
       }
     })
   );
 
-  assert.deepEqual(requests, [
-    [RUN_RQL_QUERY_METHOD, { query: '(class :name "UnsavedClass")' }]
-  ]);
+  assert.ok(response);
+  assert.deepEqual(requests, [[RUN_RQL_QUERY_METHOD, { query: '(class :name "UnsavedClass")' }]]);
   assert.equal(response.results[0].path, "src/app.py");
 });
 
-test("warns without issuing a request when Bifrost is not ready", async () => {
-  const warnings = [];
+void test("warns without issuing a request when Bifrost is not ready", async () => {
+  const warnings: string[] = [];
   const response = await runRqlQuery(
     { languageId: RQL_LANGUAGE_ID, text: "(class)" },
     runner({
@@ -69,17 +69,18 @@ test("warns without issuing a request when Bifrost is not ready", async () => {
   );
 
   assert.equal(response, undefined);
-  assert.deepEqual(warnings, ["Bifrost is not ready. Start the language server and wait for indexing to finish."]);
+  assert.deepEqual(warnings, [
+    "Bifrost is not ready. Start the language server and wait for indexing to finish."
+  ]);
 });
 
-test("reports request failures through the error UI", async () => {
-  const errors = [];
+void test("reports request failures through the error UI", async () => {
+  const errors: string[] = [];
   const response = await runRqlQuery(
     { languageId: RQL_LANGUAGE_ID, text: "(class" },
     runner({
-      sendRequest: async () => {
-        throw new Error("Failed to parse query source: unexpected end of input");
-      },
+      sendRequest: () =>
+        Promise.reject(new Error("Failed to parse query source: unexpected end of input")),
       showError: (message) => errors.push(message)
     })
   );
@@ -90,12 +91,12 @@ test("reports request failures through the error UI", async () => {
   ]);
 });
 
-test("reports an outdated server response without attempting to render it", async () => {
-  const errors = [];
+void test("reports an outdated server response without attempting to render it", async () => {
+  const errors: string[] = [];
   const response = await runRqlQuery(
     { languageId: RQL_LANGUAGE_ID, text: "(class)" },
     runner({
-      sendRequest: async () => ({ text: "1 match\n" }),
+      sendRequest: () => Promise.resolve({ text: "1 match\n" }),
       showError: (message) => errors.push(message)
     })
   );
@@ -106,7 +107,7 @@ test("reports an outdated server response without attempting to render it", asyn
   ]);
 });
 
-test("groups mixed typed results by path while preserving result order", () => {
+void test("groups mixed typed results by path while preserving result order", () => {
   const grouped = groupRqlQueryResults([
     {
       uri: "file:///a.rs",
@@ -145,8 +146,8 @@ test("groups mixed typed results by path while preserving result order", () => {
   );
 });
 
-test("renders and navigates an exact reference-site result", () => {
-  const reference = {
+void test("renders and navigates an exact reference-site result", () => {
+  const reference: RqlReferenceSiteResult = {
     uri: "file:///workspace/src/user.ts",
     path: "src/user.ts",
     result_type: "reference_site",
