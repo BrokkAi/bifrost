@@ -14,6 +14,10 @@ const ALPHA: f64 = 0.85;
 const CONVERGENCE_EPSILON: f64 = 1.0e-6;
 const SCORE_BUCKET_SCALE: f64 = 1.0e9;
 const MAX_ITERS: usize = 75;
+/// The numerical baseline uses the current fixed-iteration PageRank solver.
+/// Allowing a small tolerance keeps the test portable across supported CPUs.
+#[cfg(test)]
+const PAGE_RANK_SCORE_TOLERANCE: f64 = 1.0e-6;
 const IMPORT_DEPTH: usize = 2;
 const COMMITS_TO_PROCESS: usize = 1_000;
 pub(crate) const DEFAULT_RECENCY_HALF_LIFE: f64 = 250.0;
@@ -1716,8 +1720,24 @@ mod tests {
         let analyzer = java_analyzer(root);
         let results = related_files_by_imports(&analyzer, &hash_map([(a, 1.0)]), 10, false);
 
-        assert!(file_by_name(&results, "B.java").is_some());
-        assert!(file_by_name(&results, "C.java").is_some());
+        let b_score = file_by_name(&results, "B.java")
+            .expect("B should be ranked")
+            .score;
+        let c_score = file_by_name(&results, "C.java")
+            .expect("C should be ranked")
+            .score;
+
+        // Personalized PageRank over A -> B -> C, with A as the only teleport
+        // target. These values deliberately pin the existing fixed-iteration
+        // algorithm so storage-only graph changes cannot alter ranking behavior.
+        assert!(
+            (b_score - 0.330_416_201).abs() <= super::PAGE_RANK_SCORE_TOLERANCE,
+            "B score changed: {b_score}"
+        );
+        assert!(
+            (c_score - 0.280_853_771).abs() <= super::PAGE_RANK_SCORE_TOLERANCE,
+            "C score changed: {c_score}"
+        );
     }
 
     #[test]

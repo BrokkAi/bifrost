@@ -15,7 +15,9 @@
 #[path = "common/memory_benchmark.rs"]
 mod memory_benchmark;
 
-use memory_benchmark::{GeneratedFixtureExpectations, run_usage_graph_peak_rss_benchmark};
+use memory_benchmark::{
+    GeneratedFixtureExpectations, benchmark_module_count, run_usage_graph_peak_rss_benchmark,
+};
 use std::fs;
 use std::path::Path;
 
@@ -51,13 +53,15 @@ fn generate_large_python_workspace(root: &Path, module_count: usize) {
 #[test]
 #[ignore = "measure-first memory benchmark; run explicitly with --ignored --nocapture"]
 fn python_usage_graph_peak_rss() {
+    let module_count = benchmark_module_count(MODULE_COUNT);
     run_usage_graph_peak_rss_benchmark(
         "Python",
+        module_count,
         GeneratedFixtureExpectations {
-            minimum_nodes: MODULE_COUNT,
-            minimum_edges: MODULE_COUNT,
+            minimum_nodes: module_count,
+            minimum_edges: module_count,
             expected_edge_suffixes: ("Mod00000.method0", "widget.render_00000"),
         },
-        |root| generate_large_python_workspace(root, MODULE_COUNT),
+        |root| generate_large_python_workspace(root, module_count),
     );
 }
