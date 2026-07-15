@@ -5240,6 +5240,37 @@ namespace NzbDrone.Core
 }
 
 #[test]
+fn csharp_graph_should_find_generic_extension_method_on_constructed_receiver() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/Precision.cs",
+        r#"
+namespace Precision;
+
+public sealed class Registered {}
+
+public static class Extensions {
+    public static T Echo<T>(this T value) => value;
+}
+
+public static class Consumer {
+    public static Registered Run() => new Registered().Echo();
+}
+"#,
+    )]);
+
+    let echo = member_function(&analyzer, "Precision.Extensions", "Echo");
+    let hits = graph_hits(&analyzer, &echo);
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/Precision.cs")
+                && hit.snippet.contains("new Registered().Echo()")
+        }),
+        "constructed receiver should prove the generic extension call: {hits:#?}"
+    );
+}
+
+#[test]
 fn csharp_scan_usages_target_anchor_should_find_primitive_extension_receiver_usage() {
     let (project, _analyzer) = csharp_analyzer_with_files(&[
         (

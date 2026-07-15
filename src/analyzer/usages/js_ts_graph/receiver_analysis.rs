@@ -5,6 +5,7 @@
 //! factory calls that return constructed values, and class factory methods whose body
 //! returns a constructed value.
 
+use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::slice;
 use crate::analyzer::usages::get_definition::js_ts::{
     parse_js_ts_tree, resolve_js_ts_module_binding_candidates,
@@ -870,6 +871,16 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return None;
         }
 
+        self.summarize_external_functions(functions, depth, budget, tracker)
+    }
+
+    fn summarize_external_functions(
+        &self,
+        functions: Vec<CodeUnit>,
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
         let mut outcomes = Vec::new();
         for function in functions {
             let Ok(source) = function.source().read_to_string() else {
@@ -899,6 +910,43 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .then(|| ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget))
     }
 
+    fn summarize_module_member_function(
+        &self,
+        object: Node<'tree>,
+        member: &str,
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
+        if self.language != Language::JavaScript {
+            return None;
+        }
+        let module_specifier =
+            require_call_module_specifier(object, self.source).or_else(|| {
+                let binding_name = simple_identifier_text(object, self.source)?;
+                let binding = self.imports.bindings.get(binding_name)?;
+                matches!(
+                    binding.kind,
+                    ImportKind::Namespace | ImportKind::CommonJsRequire
+                )
+                .then(|| binding.module_specifier.clone())
+            })?;
+        let functions = resolve_js_ts_module_binding_candidates(
+            self.analyzer,
+            self.support,
+            self.language,
+            self.file,
+            &module_specifier,
+            member,
+            Some(&self.aliases),
+            true,
+        )
+        .into_iter()
+        .filter(|unit| unit.is_function())
+        .collect::<Vec<_>>();
+        self.summarize_external_functions(functions, depth, budget, tracker)
+    }
+
     fn summarize_member_call(
         &self,
         member_expression: Node<'tree>,
@@ -916,6 +964,11 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let member = slice(property, self.source);
         if member.is_empty() {
             return ReceiverAnalysisOutcome::Unknown;
+        }
+        if let Some(outcome) =
+            self.summarize_module_member_function(object, member, depth + 1, budget, tracker)
+        {
+            return outcome;
         }
         let class_values = self.resolve_static_object_expression(object, call_byte, budget);
         let ReceiverAnalysisOutcome::Precise(values) = class_values else {

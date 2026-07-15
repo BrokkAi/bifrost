@@ -22,7 +22,7 @@ use super::extractor::{
     parameter_names, receiver_symbol_from_qualifier, rhs_expressions, selector_parts,
     type_ref_from_node, var_spec_names,
 };
-use super::resolver::{GoEdgeIndex, TypeRef, node_text};
+use super::resolver::{GoEdgeIndex, TypeRef, constructor_call_type_fqns, node_text};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
     parse_and_collect,
@@ -124,68 +124,6 @@ impl FileScan<'_, '_> {
             }
         }
         Vec::new()
-    }
-
-    fn constructor_call_type_tokens(
-        &self,
-        node: Node<'_>,
-        locals: Option<&LocalInferenceEngine<String>>,
-    ) -> Vec<String> {
-        if node.kind() != "call_expression" {
-            return Vec::new();
-        }
-        let Some(function) = node
-            .child_by_field_name("function")
-            .or_else(|| super::extractor::first_named_child(node))
-        else {
-            return Vec::new();
-        };
-        match function.kind() {
-            "identifier" => {
-                let name = node_text(function, self.source);
-                if locals.is_some_and(|locals| locals.is_shadowed(name)) {
-                    return Vec::new();
-                }
-                self.constructor_return_types_for(name)
-            }
-            "selector_expression" => {
-                let Some((qualifier, _, field)) = selector_parts(function, self.source) else {
-                    return Vec::new();
-                };
-                if locals.is_some_and(|locals| locals.is_shadowed(&qualifier)) {
-                    return Vec::new();
-                }
-                let field = node_text(field, self.source);
-                let Some(packages) = self.alias_packages.get(&qualifier) else {
-                    return Vec::new();
-                };
-                packages
-                    .iter()
-                    .flat_map(|package| {
-                        self.constructor_return_types_for_fqn(&format!("{package}.{field}"))
-                    })
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    fn constructor_return_types_for(&self, name: &str) -> Vec<String> {
-        let mut tokens =
-            self.constructor_return_types_for_fqn(&format!("{}.{}", self.file_pkg, name));
-        for package in &self.dot_packages {
-            tokens.extend(self.constructor_return_types_for_fqn(&format!("{package}.{name}")));
-        }
-        tokens.sort();
-        tokens.dedup();
-        tokens
-    }
-
-    fn constructor_return_types_for_fqn(&self, callee: &str) -> Vec<String> {
-        self.index
-            .constructor_return_types(callee)
-            .cloned()
-            .unwrap_or_default()
     }
 
     fn member_callees(&mut self, owner_fqn: &str, member: &str) -> Vec<String> {
@@ -556,7 +494,15 @@ fn infer_names_from_values(
         .zip(values.iter())
         .filter_map(|(name, value)| {
             let name = name.as_ref()?;
-            let mut tokens = ctx.constructor_call_type_tokens(*value, Some(locals));
+            let mut tokens = constructor_call_type_fqns(
+                *value,
+                ctx.source,
+                &ctx.file_pkg,
+                &ctx.alias_packages,
+                &ctx.dot_packages,
+                ctx.index,
+                Some(locals),
+            );
             if tokens.is_empty() {
                 tokens = ctx.expression_type_tokens(*value);
             }
