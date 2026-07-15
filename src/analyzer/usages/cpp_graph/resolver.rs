@@ -382,14 +382,19 @@ impl VisibilityIndex {
         }
         let mut canonical_candidates = Vec::new();
         for candidate in candidates {
-            let Some(canonical) = self.canonical_type_unit(analyzer, file, candidate) else {
-                return false;
+            let resolved = if same_visible_symbol(candidate, target) {
+                candidate.clone()
+            } else {
+                let Some(canonical) = self.canonical_type_unit(analyzer, file, candidate) else {
+                    return false;
+                };
+                canonical
             };
             if !canonical_candidates
                 .iter()
-                .any(|existing| same_visible_symbol(existing, &canonical))
+                .any(|existing| same_visible_symbol(existing, &resolved))
             {
-                canonical_candidates.push(canonical);
+                canonical_candidates.push(resolved);
                 if canonical_candidates.len() > 1 {
                     return false;
                 }

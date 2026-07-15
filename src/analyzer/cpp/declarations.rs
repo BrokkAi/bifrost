@@ -107,15 +107,22 @@ fn recover_exported_class_declaration<'tree>(
     source: &str,
 ) -> Option<(Node<'tree>, String)> {
     let class_node = first_class_like_child(node)?;
-    if has_direct_cpp_declarator(node)
-        && class_node
-            .child_by_field_name("name")
-            .map(|name_node| {
-                !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(name_node, source)))
-            })
-            .unwrap_or(false)
-    {
-        return None;
+    if let Some(name_node) = class_node.child_by_field_name("name") {
+        let class_name = normalize_cpp_whitespace(node_text(name_node, source));
+        if cpp_export_macro_token(&class_name) {
+            // Tree-sitter can parse `class EXPORT Name` as an EXPORT class plus a
+            // Name declarator. Only a bare declarator can be the displaced class name;
+            // wrappers describe an object whose type merely happens to look macro-like.
+            let mut cursor = node.walk();
+            if node
+                .children_by_field_name("declarator", &mut cursor)
+                .any(|declarator| !matches!(declarator.kind(), "identifier" | "type_identifier"))
+            {
+                return None;
+            }
+        } else if has_direct_cpp_declarator(node) {
+            return None;
+        }
     }
     let name = exported_class_name_from_node(class_node, source)?;
     Some((class_node, name))

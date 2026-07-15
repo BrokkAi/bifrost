@@ -1752,6 +1752,245 @@ CanonicalArray array_value;
 }
 
 #[test]
+fn authoritative_c_usage_preserves_typedef_alias_target_identity() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "aliases.h",
+            r#"typedef unsigned char ByteAlias;
+typedef struct ContainerTag { int value; } ContainerAlias;
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "aliases.h"
+
+ByteAlias make(void) {
+    ByteAlias local = 0;
+    return local;
+}
+
+void use(ContainerAlias *container) {
+    (void)container;
+}
+"#,
+        ),
+    ]);
+
+    let consumer = project.file("consumer.c");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let mut missing_alias_usages = Vec::new();
+
+    for (alias, expected_starts) in [
+        (
+            "ByteAlias",
+            source
+                .match_indices("ByteAlias")
+                .map(|(start, _)| start)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "ContainerAlias",
+            source
+                .match_indices("ContainerAlias")
+                .map(|(start, _)| start)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let target = definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.identifier() == alias
+                && unit.source().rel_path().to_string_lossy() == "aliases.h"
+        });
+        assert_eq!(alias, target.fq_name());
+        assert!(!expected_starts.is_empty(), "missing {alias} reference");
+
+        if alias == "ByteAlias" {
+            for &start in &expected_starts {
+                let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+                let line = source[..start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    + 1;
+                let column = source[line_start..start].chars().count() + 1;
+                let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+                    &analyzer,
+                    brokk_bifrost::searchtools::GetDefinitionParams {
+                        references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                            path: "consumer.c".to_string(),
+                            line: Some(line),
+                            column: Some(column),
+                        }],
+                    },
+                );
+                let forward_result = &forward.results[0];
+                assert_eq!(
+                    "resolved", forward_result.status,
+                    "forward lookup should resolve {alias} at {start}: {forward_result:#?}"
+                );
+                assert!(
+                    forward_result
+                        .definitions
+                        .iter()
+                        .any(|definition| definition.fqn.as_deref() == Some(alias)),
+                    "forward lookup should preserve primitive typedef alias target {alias} at {start}: {forward_result:#?}"
+                );
+            }
+        }
+
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            );
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = query.result
+        else {
+            panic!(
+                "expected authoritative typedef-alias C success for {alias}, got {:#?}",
+                query.result
+            );
+        };
+        let hits = hits_by_overload
+            .get(&target)
+            .unwrap_or_else(|| panic!("{alias} should have a proven-hit bucket"));
+        for &start in &expected_starts {
+            if !hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= start
+                    && start + alias.len() <= hit.end_offset
+            }) {
+                missing_alias_usages.push(format!(
+                    "inverse {alias}@{start} was not proven (hits: {hits:#?})"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        missing_alias_usages.is_empty(),
+        "exact typedef-alias type_identifiers should resolve to their alias targets: {missing_alias_usages:#?}"
+    );
+}
+
+#[test]
+fn authoritative_c_usage_resolves_tagged_typedef_despite_member_type_reference() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "pcb.h",
+            r#"typedef struct _PCB { int x; } PCB_t;
+struct Holder {
+    struct _PCB *pcb;
+    struct Nested;
+};
+"#,
+        ),
+        (
+            "consumer.c",
+            r#"#include "pcb.h"
+
+void configure(void) {
+    PCB_t *pcbp = 0;
+    (void)pcbp;
+}
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "_PCB"
+            && unit.source().rel_path().to_string_lossy() == "pcb.h"
+    });
+    assert!(
+        analyzer.get_all_declarations().iter().any(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "Holder$Nested"
+                && unit.source().rel_path().to_string_lossy() == "pcb.h"
+        }),
+        "a true nested forward declaration should remain represented"
+    );
+    assert!(
+        analyzer.get_all_declarations().iter().any(|unit| {
+            unit.kind() == CodeUnitType::Field
+                && unit.fq_name() == "Holder.pcb"
+                && unit.source().rel_path().to_string_lossy() == "pcb.h"
+        }),
+        "the real pointer field should remain persisted"
+    );
+
+    let consumer = project.file("consumer.c");
+    let source = consumer.read_to_string().expect("consumer source");
+    let token = "PCB_t";
+    let start = source.find(token).expect("PCB_t type reference");
+    let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+    let line = source[..start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..start].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.c".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let forward_result = &forward.results[0];
+    assert_eq!("resolved", forward_result.status, "{forward_result:#?}");
+    assert!(
+        forward_result
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("_PCB")),
+        "forward lookup should resolve PCB_t to canonical _PCB: {forward_result:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative canonical _PCB success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("_PCB should have a proven-hit bucket");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= start
+                && start + token.len() <= hit.end_offset
+        }),
+        "exact PCB_t type_identifier should resolve to canonical _PCB: {hits:#?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_recovers_macro_decorated_function_return_type() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         ("routerstatus.h", "struct routerstatus_t { int value; };\n"),
