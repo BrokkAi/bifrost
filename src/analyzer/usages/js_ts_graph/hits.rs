@@ -20,6 +20,15 @@ pub(super) fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+/// Record `node` as a binding-only re-export. The token is useful to IDE
+/// find-references and rename operations, but is omitted from the quieter
+/// agent/search usage surface.
+pub(super) fn record_reexport_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(hit) = build_hit(node, ctx) {
+        ctx.hits.insert(hit.into_reexport());
+    }
+}
+
 /// Record `node` as a self/this receiver hit. IDE references include these; the
 /// call-graph / relevance surfaces filter them out.
 pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
