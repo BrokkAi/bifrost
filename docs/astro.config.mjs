@@ -1,5 +1,7 @@
+import { unified } from '@astrojs/markdown-remark';
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import rehypeBasePathLinks from './rehype-base-path-links.mjs';
 
 const site = process.env.PUBLIC_DOCS_SITE ?? 'https://brokkai.github.io';
 const productionBase = process.env.PUBLIC_DOCS_BASE ?? '/bifrost';
@@ -8,6 +10,11 @@ const isDev = process.argv.includes('dev');
 export default defineConfig({
   site,
   base: isDev ? '/' : productionBase,
+  markdown: {
+    processor: unified({
+      rehypePlugins: [[rehypeBasePathLinks, { base: isDev ? '/' : productionBase }]],
+    }),
+  },
   integrations: [
     starlight({
       title: 'Bifrost Docs',
