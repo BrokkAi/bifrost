@@ -5744,3 +5744,223 @@ void MissingContainer::call() {
     );
     assert_success_counts(query.result, &target, 0, 1);
 }
+
+#[test]
+fn authoritative_cpp_usage_routes_default_argument_redeclarations_in_either_target_order() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/api.h",
+            r#"#pragma once
+namespace demo {
+void route(int required, int optional = 0);
+}
+"#,
+        ),
+        (
+            "src/api.cc",
+            r#"#include "../include/api.h"
+namespace demo {
+void route(int required, int optional) {}
+}
+"#,
+        ),
+        (
+            "app/consumer.cc",
+            r#"#include "../include/api.h"
+void consume() {
+    demo::route(1);
+}
+"#,
+        ),
+    ]);
+
+    let physical_route = |path: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "demo.route"
+                && slash_path(unit.source()) == path
+        })
+    };
+    let implementation = physical_route("src/api.cc");
+    let declaration = physical_route("include/api.h");
+    assert_ne!(implementation.source(), declaration.source());
+    assert_eq!(implementation.fq_name(), declaration.fq_name());
+
+    let consumer = project.file("app/consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let call = source.find("demo::route(1)").expect("route call");
+    let start = call;
+    let end = start + "demo::route".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for targets in [
+        [implementation.clone(), declaration.clone()],
+        [declaration.clone(), implementation.clone()],
+    ] {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+        assert_eq!(
+            query.candidate_files,
+            std::iter::once(consumer.clone()).collect(),
+            "authoritative query must scan only the explicit consumer"
+        );
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = query.result
+        else {
+            panic!("expected authoritative route success for {targets:#?}");
+        };
+        let hits = hits_by_overload
+            .get(&targets[0])
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(hits.len(), 1, "target-order route hits: {hits:#?}");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+            }),
+            "missing exact route terminal {start}..{end}: {hits:#?}"
+        );
+        assert_eq!(
+            unproven_total_by_overload
+                .get(&targets[0])
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "default-argument call should be proven in either physical target order"
+        );
+    }
+
+    for targets in [
+        [implementation.clone(), declaration.clone()],
+        [declaration.clone(), implementation.clone()],
+    ] {
+        let query = UsageFinder::new().query(&analyzer, &targets, 100, 1000);
+        assert!(
+            query.candidate_files.contains(&consumer),
+            "every target must contribute default routing candidates: {targets:#?}, candidates={:#?}",
+            query.candidate_files
+        );
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = query.result
+        else {
+            panic!("expected routed route success for {targets:#?}");
+        };
+        let hits = hits_by_overload
+            .get(&targets[0])
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            hits.len(),
+            1,
+            "queried physical target definitions must not leak into grouped results: {targets:#?}, hits={hits:#?}"
+        );
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+            }),
+            "later-target routing must reach the exact consumer call: {targets:#?}, hits={hits:#?}"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.file == consumer),
+            "only the consumer call should remain after exact target-group suppression: {targets:#?}, hits={hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_usage_routes_overload_group_in_either_target_order() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "api.h",
+            r#"#pragma once
+namespace demo {
+void choose(int value);
+void choose(const char* value);
+}
+"#,
+        ),
+        (
+            "api.cc",
+            r#"#include "api.h"
+namespace demo {
+void choose(int value) {}
+void choose(const char* value) {}
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "api.h"
+void consume(char selected) {
+    demo::choose(&selected);
+}
+"#,
+        ),
+    ]);
+
+    let declared_overload = |matches_signature: fn(&str) -> bool| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "demo.choose"
+                && slash_path(unit.source()) == "api.h"
+                && unit.signature().is_some_and(matches_signature)
+        })
+    };
+    let integer = declared_overload(|signature| signature == "(int)");
+    let character_pointer = declared_overload(|signature| signature.contains("char"));
+
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let call = source.find("demo::choose(&selected)").expect("choose call");
+    let start = call;
+    let end = start + "demo::choose".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for targets in [
+        [integer.clone(), character_pointer.clone()],
+        [character_pointer.clone(), integer.clone()],
+    ] {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+        assert_eq!(
+            query.candidate_files,
+            std::iter::once(consumer.clone()).collect(),
+            "authoritative query must scan only the explicit consumer"
+        );
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = query.result
+        else {
+            panic!("expected authoritative overload-group success for {targets:#?}");
+        };
+        let hits = hits_by_overload
+            .get(&targets[0])
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(hits.len(), 1, "target-order overload hits: {hits:#?}");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+            }),
+            "missing exact choose terminal {start}..{end}: {hits:#?}"
+        );
+        assert_eq!(
+            unproven_total_by_overload
+                .get(&targets[0])
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the selected overload should be proven in either target order"
+        );
+    }
+}

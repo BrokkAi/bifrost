@@ -156,21 +156,34 @@ impl UsageFinder {
         }
 
         let target = &overloads[0];
-        let mut candidates: HashSet<ProjectFile> = match explicit_provider {
-            Some(provider) => provider.find_candidates(target, analyzer),
-            None => find_default_candidates_with_cancellation(target, analyzer, &self.cancellation),
-        };
-        if self.cancellation.is_cancelled() {
-            return cancelled_query_result();
+        let mut candidates = HashSet::default();
+        for overload in overloads {
+            let routed = match explicit_provider {
+                Some(provider) => provider.find_candidates(overload, analyzer),
+                None => find_default_candidates_with_cancellation(
+                    overload,
+                    analyzer,
+                    &self.cancellation,
+                ),
+            };
+            candidates.extend(routed);
+            if self.cancellation.is_cancelled() {
+                return cancelled_query_result();
+            }
         }
         let mut protected_candidates = candidates.clone();
 
         if explicit_provider.is_none() {
-            add_php_composer_candidates(target, analyzer, &mut candidates);
-            if self.cancellation.is_cancelled() {
-                return cancelled_query_result();
+            for overload in overloads {
+                add_php_composer_candidates(overload, analyzer, &mut candidates);
+                if self.cancellation.is_cancelled() {
+                    return cancelled_query_result();
+                }
+                add_php_import_alias_candidates(overload, analyzer, &mut candidates);
+                if self.cancellation.is_cancelled() {
+                    return cancelled_query_result();
+                }
             }
-            add_php_import_alias_candidates(target, analyzer, &mut candidates);
         }
 
         if let Some(filter) = self.file_filter.as_ref() {

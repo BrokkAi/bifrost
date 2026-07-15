@@ -31,13 +31,18 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
-        let Some(spec) = TargetSpec::from_target(analyzer, target) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
-                "CppUsageGraphStrategy",
-            );
-        };
+        let mut specs = Vec::with_capacity(overloads.len());
+        for overload in overloads {
+            let Some(spec) = TargetSpec::from_target(analyzer, overload) else {
+                return GraphUsageOutcome::fallback_safe(
+                    overload.fq_name(),
+                    GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
+                    "CppUsageGraphStrategy",
+                );
+            };
+            specs.push(spec);
+        }
+        let target_group: HashSet<CodeUnit> = overloads.iter().cloned().collect();
 
         let candidate_files = scan_scope.candidate_files();
         let mut files: HashSet<ProjectFile> = candidate_files
@@ -45,8 +50,10 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             .filter(|file| language_for_file(file) == Language::Cpp)
             .cloned()
             .collect();
-        if scan_scope.allows(target.source()) {
-            files.insert(target.source().clone());
+        for overload in overloads {
+            if scan_scope.allows(overload.source()) {
+                files.insert(overload.source().clone());
+            }
         }
         let visibility = VisibilityIndex::build_with_cancellation(
             self.cpp,
@@ -71,9 +78,21 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             if scan_scope.is_cancelled() {
                 break;
             }
-            scan_file(analyzer, &visibility, &file, &spec, &mut state);
-            if *state.limit_exceeded {
-                break;
+            for spec in &specs {
+                if scan_scope.is_cancelled() {
+                    break;
+                }
+                scan_file(
+                    analyzer,
+                    &visibility,
+                    &file,
+                    spec,
+                    &target_group,
+                    &mut state,
+                );
+                if *state.limit_exceeded {
+                    break;
+                }
             }
         }
 

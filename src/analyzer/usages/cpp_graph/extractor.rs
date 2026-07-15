@@ -11,7 +11,7 @@ use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, cpp_node_text as node_text};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -32,6 +32,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
+    pub(super) target_group: &'a HashSet<CodeUnit>,
     pub(super) bindings: LocalInferenceEngine<CppScanBinding>,
     local_shadows: LocalInferenceEngine<()>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -54,6 +55,7 @@ pub(super) fn scan_file(
     visibility: &VisibilityIndex,
     file: &ProjectFile,
     spec: &TargetSpec,
+    target_group: &HashSet<CodeUnit>,
     state: &mut ScanState<'_>,
 ) {
     if *state.limit_exceeded || language_for_file(file) != Language::Cpp {
@@ -83,6 +85,7 @@ pub(super) fn scan_file(
         source: &source,
         line_starts: &line_starts,
         spec,
+        target_group,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         local_shadows: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         hits: state.hits,

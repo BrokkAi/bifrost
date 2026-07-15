@@ -30,6 +30,9 @@ pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
+    if ctx.target_group.contains(&enclosing) {
+        return;
+    }
     if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
         return;
     }
@@ -64,6 +67,9 @@ fn push_hit_with_options(
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
+    if ctx.target_group.contains(&enclosing) {
+        return;
+    }
     if enclosing == ctx.spec.target
         || (!allow_logical_target_enclosing && same_logical_symbol(&enclosing, &ctx.spec.target))
     {
