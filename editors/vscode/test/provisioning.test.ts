@@ -1,29 +1,53 @@
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const test = require("node:test");
-const Module = require("node:module");
-const { pathToFileURL } = require("node:url");
-const tar = require("tar");
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import Module, { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+import { pathToFileURL } from "node:url";
+import * as tar from "tar";
+import type * as LifecycleModule from "../src/lifecycle";
+import type * as ProvisioningModule from "../src/provisioning";
 
-const originalLoad = Module._load;
-Module._load = function loadWithVscodeShim(request, parent, isMain) {
+interface LauncherModule {
+  SUPPORTED_TARGETS: string[];
+  releaseTargetFor(platform: NodeJS.Platform, arch: NodeJS.Architecture): string;
+}
+
+type ModuleLoader = (
+  request: string,
+  parent: NodeModule | null | undefined,
+  isMain: boolean
+) => unknown;
+
+const moduleWithLoader = Module as typeof Module & { _load: ModuleLoader };
+const originalLoad = moduleWithLoader._load;
+moduleWithLoader._load = function loadWithVscodeShim(request, parent, isMain) {
   if (request === "vscode") {
     return {
       workspace: {
         workspaceFolders: [],
-        createFileSystemWatcher: (pattern) => ({ pattern })
+        createFileSystemWatcher: (pattern: unknown) => ({ pattern })
       }
     };
   }
-  return originalLoad.call(this, request, parent, isMain);
+  return originalLoad(request, parent, isMain);
 };
 
-const lifecycle = require("../out-test/lifecycle.js");
-const provisioning = require("../out-test/provisioning.js");
+const loadModule = createRequire(__filename);
+const lifecycle = loadModule("../src/lifecycle") as typeof LifecycleModule;
+const provisioning = loadModule("../src/provisioning") as typeof ProvisioningModule;
+const extensionRoot = path.resolve(__dirname, "../..");
+const repositoryRoot = path.resolve(extensionRoot, "../..");
 
-test("maps VS Code runtime platforms to release targets", () => {
+function requestUrl(input: Parameters<typeof fetch>[0]): string {
+  if (typeof input === "string") {
+    return input;
+  }
+  return input instanceof URL ? input.href : input.url;
+}
+
+void test("maps VS Code runtime platforms to release targets", () => {
   assert.equal(provisioning.releaseTargetFor("darwin", "arm64"), "universal-apple-darwin");
   assert.equal(provisioning.releaseTargetFor("darwin", "x64"), "universal-apple-darwin");
   assert.equal(provisioning.releaseTargetFor("linux", "x64"), "x86_64-unknown-linux-gnu");
@@ -33,10 +57,10 @@ test("maps VS Code runtime platforms to release targets", () => {
   assert.throws(() => provisioning.releaseTargetFor("freebsd", "x64"), /Unsupported platform/);
 });
 
-test("keeps VS Code and agent plugin release targets aligned", async () => {
-  const launcher = await import(
-    pathToFileURL(path.resolve(__dirname, "../../../plugins/bifrost-agent/bin/bifrost-launcher.mjs")).href
-  );
+void test("keeps VS Code and agent plugin release targets aligned", async () => {
+  const launcher = (await import(
+    pathToFileURL(path.join(repositoryRoot, "plugins/bifrost-agent/bin/bifrost-launcher.mjs")).href
+  )) as LauncherModule;
   const cases = [
     ["darwin", "arm64"],
     ["darwin", "x64"],
@@ -44,7 +68,7 @@ test("keeps VS Code and agent plugin release targets aligned", async () => {
     ["linux", "arm64"],
     ["win32", "x64"],
     ["win32", "arm64"]
-  ];
+  ] satisfies Array<[NodeJS.Platform, NodeJS.Architecture]>;
 
   assert.deepEqual(
     cases.map(([platform, arch]) => provisioning.releaseTargetFor(platform, arch)),
@@ -56,7 +80,7 @@ test("keeps VS Code and agent plugin release targets aligned", async () => {
   );
 });
 
-test("constructs release archive names and URLs", () => {
+void test("constructs release archive names and URLs", () => {
   const asset = provisioning.releaseAssetFor("0.6.8", "linux", "x64");
   assert.equal(asset.archiveName, "bifrost-v0.6.8-x86_64-unknown-linux-gnu.tar.gz");
   assert.equal(asset.checksumName, "bifrost-v0.6.8-x86_64-unknown-linux-gnu.tar.gz.sha256");
@@ -70,17 +94,29 @@ test("constructs release archive names and URLs", () => {
   assert.equal(windows.checksumName, "bifrost-v0.6.8-aarch64-pc-windows-msvc.zip.sha256");
 });
 
-test("parses and validates SHA-256 sidecars", () => {
+void test("parses and validates SHA-256 sidecars", () => {
   const hash = "a".repeat(64);
-  assert.equal(provisioning.parseSha256(`${hash}  bifrost-v0.6.8-target.tar.gz\n`, "bifrost-v0.6.8-target.tar.gz"), hash);
-  assert.equal(provisioning.parseSha256(`${hash} *bifrost-v0.6.8-target.tar.gz\n`, "bifrost-v0.6.8-target.tar.gz"), hash);
+  assert.equal(
+    provisioning.parseSha256(
+      `${hash}  bifrost-v0.6.8-target.tar.gz\n`,
+      "bifrost-v0.6.8-target.tar.gz"
+    ),
+    hash
+  );
+  assert.equal(
+    provisioning.parseSha256(
+      `${hash} *bifrost-v0.6.8-target.tar.gz\n`,
+      "bifrost-v0.6.8-target.tar.gz"
+    ),
+    hash
+  );
   assert.throws(
     () => provisioning.parseSha256(`${hash}  other-file\n`, "bifrost-v0.6.8-target.tar.gz"),
     /No SHA-256 checksum/
   );
 });
 
-test("installs verified binary and cleans old managed versions", async () => {
+void test("installs verified binary and cleans old managed versions", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const oldDir = path.join(temp, "binaries", "0.6.7", "linux-x64");
   fs.mkdirSync(oldDir, { recursive: true });
@@ -97,11 +133,11 @@ test("installs verified binary and cleans old managed versions", async () => {
 
   const archive = fs.readFileSync(archivePath);
   const checksum = provisioning.sha256(archive);
-  const fetchImpl = async (url) => {
-    if (url.endsWith(".sha256")) {
-      return new Response(`${checksum}  ${archiveName}\n`);
+  const fetchImpl: typeof fetch = (url) => {
+    if (requestUrl(url).endsWith(".sha256")) {
+      return Promise.resolve(new Response(`${checksum}  ${archiveName}\n`));
     }
-    return new Response(archive);
+    return Promise.resolve(new Response(archive));
   };
 
   const installed = await provisioning.installManagedBinary({
@@ -118,14 +154,16 @@ test("installs verified binary and cleans old managed versions", async () => {
   assert.equal(fs.existsSync(path.join(temp, "binaries", "0.6.7")), false);
 });
 
-test("rejects checksum mismatch during install", async () => {
+void test("rejects checksum mismatch during install", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const expectedSha256 = "a".repeat(64);
-  const fetchImpl = async (url) => {
-    if (url.endsWith(".sha256")) {
-      return new Response(`${"b".repeat(64)}  bifrost-v0.6.8-x86_64-unknown-linux-gnu.tar.gz\n`);
+  const fetchImpl: typeof fetch = (url) => {
+    if (requestUrl(url).endsWith(".sha256")) {
+      return Promise.resolve(
+        new Response(`${"b".repeat(64)}  bifrost-v0.6.8-x86_64-unknown-linux-gnu.tar.gz\n`)
+      );
     }
-    return new Response(Buffer.from("not-a-real-archive"));
+    return Promise.resolve(new Response(Buffer.from("not-a-real-archive")));
   };
 
   await assert.rejects(
@@ -141,14 +179,16 @@ test("rejects checksum mismatch during install", async () => {
   );
 });
 
-test("rejects archive bytes that do not match the pinned checksum", async () => {
+void test("rejects archive bytes that do not match the pinned checksum", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const expectedSha256 = "a".repeat(64);
-  const fetchImpl = async (url) => {
-    if (url.endsWith(".sha256")) {
-      return new Response(`${expectedSha256}  bifrost-v0.6.8-x86_64-unknown-linux-gnu.tar.gz\n`);
+  const fetchImpl: typeof fetch = (url) => {
+    if (requestUrl(url).endsWith(".sha256")) {
+      return Promise.resolve(
+        new Response(`${expectedSha256}  bifrost-v0.6.8-x86_64-unknown-linux-gnu.tar.gz\n`)
+      );
     }
-    return new Response(Buffer.from("not-a-real-archive"));
+    return Promise.resolve(new Response(Buffer.from("not-a-real-archive")));
   };
 
   await assert.rejects(
@@ -164,7 +204,7 @@ test("rejects archive bytes that do not match the pinned checksum", async () => 
   );
 });
 
-test("resolves launch mode precedence", () => {
+void test("resolves launch mode precedence", () => {
   assert.equal(lifecycle.resolveLaunchMode("auto", "/tmp/bifrost", "/managed/bifrost"), "path");
   assert.equal(lifecycle.resolveLaunchMode("auto", "bifrost", "/managed/bifrost"), "managed");
   assert.equal(lifecycle.resolveLaunchMode("auto", "bifrost", null), "path");
@@ -172,7 +212,7 @@ test("resolves launch mode precedence", () => {
   assert.equal(lifecycle.resolveLaunchMode("path", "bifrost", "/managed/bifrost"), "path");
 });
 
-test("builds managed launch config when bundled mode has an installed binary", () => {
+void test("builds managed launch config when bundled mode has an installed binary", () => {
   const config = lifecycle.buildLaunchConfig(
     "/workspace",
     "/extension",
@@ -190,7 +230,7 @@ test("builds managed launch config when bundled mode has an installed binary", (
   assert.equal(config.env.BIFROST_LSP_SLOW_MS, "123");
 });
 
-test("builds managed MCP config with searchtools toolset", () => {
+void test("builds managed MCP config with searchtools toolset", () => {
   const config = lifecycle.buildMcpConfig(
     "/workspace",
     "/extension",
@@ -208,7 +248,7 @@ test("builds managed MCP config with searchtools toolset", () => {
   });
 });
 
-test("builds path MCP config from configured server path", () => {
+void test("builds path MCP config from configured server path", () => {
   const config = lifecycle.buildMcpConfig(
     "/workspace",
     "/extension",
@@ -222,7 +262,7 @@ test("builds path MCP config from configured server path", () => {
   });
 });
 
-test("normalizes configured server path before validating and spawning", () => {
+void test("normalizes configured server path before validating and spawning", () => {
   const config = lifecycle.buildLaunchConfig(
     "/workspace",
     "/extension",
@@ -237,7 +277,7 @@ test("normalizes configured server path before validating and spawning", () => {
   assert.equal(config.command, "/custom/bin/bifrost");
 });
 
-test("builds path MCP config from local development binary", () => {
+void test("builds path MCP config from local development binary", () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const extensionDir = path.join(temp, "editors", "vscode");
   const binaryPath = path.join(temp, "target", "debug", "bifrost");
@@ -245,20 +285,14 @@ test("builds path MCP config from local development binary", () => {
   fs.mkdirSync(extensionDir, { recursive: true });
   fs.writeFileSync(binaryPath, "binary");
 
-  const config = lifecycle.buildMcpConfig(
-    "/workspace",
-    extensionDir,
-    "path",
-    "bifrost",
-    null
-  );
+  const config = lifecycle.buildMcpConfig("/workspace", extensionDir, "path", "bifrost", null);
   assert.deepEqual(config.mcpServers.bifrost, {
     command: binaryPath,
     args: ["--root", "/workspace", "--mcp", "searchtools"]
   });
 });
 
-test("validates configured absolute launch command before startup", async () => {
+void test("validates configured absolute launch command before startup", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const binaryPath = path.join(temp, "bifrost");
   fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
@@ -275,7 +309,7 @@ test("validates configured absolute launch command before startup", async () => 
   });
 });
 
-test("rejects unnormalized absolute launch command before startup", async () => {
+void test("rejects unnormalized absolute launch command before startup", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const binaryPath = path.join(temp, "bifrost");
   fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
@@ -295,7 +329,7 @@ test("rejects unnormalized absolute launch command before startup", async () => 
   );
 });
 
-test("rejects missing configured absolute launch command before startup", async () => {
+void test("rejects missing configured absolute launch command before startup", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const binaryPath = path.join(temp, "missing-bifrost");
 
@@ -311,7 +345,7 @@ test("rejects missing configured absolute launch command before startup", async 
   );
 });
 
-test("validates relative launch command from workspace cwd before startup", async () => {
+void test("validates relative launch command from workspace cwd before startup", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const binaryPath = path.join(temp, "target", "debug", "bifrost");
   fs.mkdirSync(path.dirname(binaryPath), { recursive: true });
@@ -329,9 +363,14 @@ test("validates relative launch command from workspace cwd before startup", asyn
   });
 });
 
-test("validates relative PATH launch command from workspace cwd before startup", async () => {
+void test("validates relative PATH launch command from workspace cwd before startup", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
-  const binaryPath = path.join(temp, "target", "debug", process.platform === "win32" ? "bifrost.exe" : "bifrost");
+  const binaryPath = path.join(
+    temp,
+    "target",
+    "debug",
+    process.platform === "win32" ? "bifrost.exe" : "bifrost"
+  );
   fs.mkdirSync(path.dirname(binaryPath), { recursive: true });
   fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
   if (process.platform !== "win32") {
@@ -347,7 +386,7 @@ test("validates relative PATH launch command from workspace cwd before startup",
   });
 });
 
-test("validates PATH launch command before startup", async () => {
+void test("validates PATH launch command before startup", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const binaryPath = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
   fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
@@ -364,7 +403,7 @@ test("validates PATH launch command before startup", async () => {
   });
 });
 
-test("rejects missing PATH launch command before startup", async () => {
+void test("rejects missing PATH launch command before startup", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
 
   await assert.rejects(
@@ -379,7 +418,7 @@ test("rejects missing PATH launch command before startup", async () => {
   );
 });
 
-test("preserves PATH candidate validation errors before startup", async () => {
+void test("preserves PATH candidate validation errors before startup", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const binaryPath = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
   fs.mkdirSync(binaryPath);
@@ -396,7 +435,7 @@ test("preserves PATH candidate validation errors before startup", async () => {
   );
 });
 
-test("builds MCP host commands from config", () => {
+void test("builds MCP host commands from config", () => {
   const commands = lifecycle.buildMcpHostCommands({
     mcpServers: {
       bifrost: {
@@ -416,7 +455,7 @@ test("builds MCP host commands from config", () => {
   );
 });
 
-test("builds complete runtime settings snapshots for initialization and pulls", () => {
+void test("builds complete runtime settings snapshots for initialization and pulls", () => {
   const formatter = { include: ["*.rs"], command: "rustfmt" };
   const settings = lifecycle.buildBifrostInitializationOptions(
     "/workspace",
@@ -432,13 +471,15 @@ test("builds complete runtime settings snapshots for initialization and pulls", 
     formatterCommands: [formatter],
     unrecognizedSymbolDiagnostics: true
   });
-  assert.deepEqual(
-    lifecycle.buildBifrostInitializationOptions("/workspace", [], [], [], false),
-    { roots: [], exclude: [], formatterCommands: [], unrecognizedSymbolDiagnostics: false }
-  );
+  assert.deepEqual(lifecycle.buildBifrostInitializationOptions("/workspace", [], [], [], false), {
+    roots: [],
+    exclude: [],
+    formatterCommands: [],
+    unrecognizedSymbolDiagnostics: false
+  });
 });
 
-test("selects formatter commands from user settings only", () => {
+void test("selects formatter commands from user settings only", () => {
   const globalRule = { command: "/user/formatter" };
   const workspaceRule = { command: "/workspace/untrusted-formatter" };
 
@@ -455,8 +496,8 @@ test("selects formatter commands from user settings only", () => {
   });
 });
 
-test("requires restart only for process launch settings", () => {
-  const changed = (section) => section === "bifrost.serverPath";
+void test("requires restart only for process launch settings", () => {
+  const changed = (section: string): boolean => section === "bifrost.serverPath";
   assert.equal(lifecycle.bifrostConfigurationChangeRequiresRestart(changed), true);
 
   for (const runtimeSetting of ["roots", "exclude", "formatterCommands"]) {
@@ -469,14 +510,14 @@ test("requires restart only for process launch settings", () => {
   }
 });
 
-test("detects existing bifrost gitignore entries", () => {
+void test("detects existing bifrost gitignore entries", () => {
   assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost\n"), true);
   assert.equal(lifecycle.gitignoreIncludesBifrostEntry("/.bifrost/\n"), true);
   assert.equal(lifecycle.gitignoreIncludesBifrostEntry("# .bifrost\nnode_modules\n"), false);
   assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost-cache\n"), false);
 });
 
-test("appends bifrost gitignore entry when missing", async () => {
+void test("appends bifrost gitignore entry when missing", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const gitignorePath = path.join(temp, ".gitignore");
   fs.writeFileSync(gitignorePath, "target");
@@ -488,7 +529,7 @@ test("appends bifrost gitignore entry when missing", async () => {
   assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), false);
 });
 
-test("creates gitignore with bifrost entry when missing", async () => {
+void test("creates gitignore with bifrost entry when missing", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
 
   assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), true);
@@ -497,7 +538,7 @@ test("creates gitignore with bifrost entry when missing", async () => {
   assert.equal(fs.readFileSync(path.join(temp, ".gitignore"), "utf8"), ".bifrost\n");
 });
 
-test("parses bifrost --version output", () => {
+void test("parses bifrost --version output", () => {
   assert.equal(provisioning.parseBifrostVersion("bifrost 0.6.8\n"), "0.6.8");
   assert.equal(provisioning.parseBifrostVersion("bifrost v0.6.8\n"), "0.6.8");
   assert.equal(provisioning.parseBifrostVersion("not bifrost\n"), null);

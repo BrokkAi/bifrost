@@ -1,61 +1,85 @@
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const test = require("node:test");
-
-const {
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { test } from "node:test";
+import {
   RUNE_IR_LANGUAGE_ID,
   RUNE_IR_METHOD,
   RUNE_IR_SOURCE_LANGUAGE_IDS,
   isRuneIrSourceLanguage,
-  showRuneIr
-} = require("../out-test/rune_ir.js");
+  showRuneIr,
+  type RuneIrRunner
+} from "../src/rune_ir";
 
-function languagesFromWhenClause(value) {
+interface ExtensionManifest {
+  contributes: {
+    menus: {
+      commandPalette: Array<{ command: string; when: string }>;
+      "editor/context": Array<{ command: string; when: string }>;
+    };
+  };
+}
+
+interface RunnerMessages {
+  errors: string[];
+  warnings: string[];
+  documents: Array<{ text: string; languageId: string }>;
+}
+
+const extensionRoot = path.resolve(__dirname, "../..");
+
+function languagesFromWhenClause(value: string): string[] {
   return [...value.matchAll(/resourceLangId == ([a-z]+)/g)].map((match) => match[1]);
 }
 
-function runner(overrides = {}) {
-  const messages = { errors: [], warnings: [], documents: [] };
+function runner(overrides: Partial<RuneIrRunner> = {}): {
+  messages: RunnerMessages;
+  value: RuneIrRunner;
+} {
+  const messages: RunnerMessages = { errors: [], warnings: [], documents: [] };
   return {
     messages,
     value: {
       isReady: () => true,
-      sendRequest: async () => ({
-        codeUnit: "demo",
-        sourceRange: {
-          start: { line: 0, character: 0 },
-          end: { line: 0, character: 12 }
-        },
-        runeIr: "(function :name \"demo\")\n",
-        starterRql: "(function :name \"demo\")",
-        truncated: false,
-        displayText: "opaque server text\n"
-      }),
+      sendRequest: () =>
+        Promise.resolve({
+          codeUnit: "demo",
+          sourceRange: {
+            start: { line: 0, character: 0 },
+            end: { line: 0, character: 12 }
+          },
+          runeIr: '(function :name "demo")\n',
+          starterRql: '(function :name "demo")',
+          truncated: false,
+          displayText: "opaque server text\n"
+        }),
       showError: (message) => messages.errors.push(message),
       showWarning: (message) => messages.warnings.push(message),
-      showDocument: async (text, languageId) => messages.documents.push({ text, languageId }),
+      showDocument: (text, languageId) => {
+        messages.documents.push({ text, languageId });
+        return Promise.resolve();
+      },
       ...overrides
     }
   };
 }
 
-test("showRuneIr sends a cursor request and displays server text verbatim", async () => {
-  let observed;
+void test("showRuneIr sends a cursor request and displays server text verbatim", async () => {
+  let observed: { method: string; params: Parameters<RuneIrRunner["sendRequest"]>[1] } | undefined;
   const state = runner({
-    sendRequest: async (method, params) => {
+    sendRequest: (method, params) => {
       observed = { method, params };
-      return {
+      return Promise.resolve({
         codeUnit: "demo",
         sourceRange: {
           start: { line: 0, character: 0 },
           end: { line: 2, character: 1 }
         },
         runeIr: "client must not parse this",
-        starterRql: "(function :name \"demo\")",
+        starterRql: '(function :name "demo")',
         truncated: false,
         displayText: "exact server-rendered document\n"
-      };
+      });
     }
   });
   const result = await showRuneIr(
@@ -65,11 +89,13 @@ test("showRuneIr sends a cursor request and displays server text verbatim", asyn
     state.value
   );
 
+  assert.ok(observed);
   assert.equal(observed.method, RUNE_IR_METHOD);
   assert.deepEqual(observed.params, {
     textDocument: { uri: "file:///workspace/demo.rs" },
     position: { line: 1, character: 4 }
   });
+  assert.ok(result);
   assert.equal(result.codeUnit, "demo");
   assert.deepEqual(state.messages.documents, [
     {
@@ -79,12 +105,12 @@ test("showRuneIr sends a cursor request and displays server text verbatim", asyn
   ]);
 });
 
-test("showRuneIr sends a non-empty selection instead of a cursor", async () => {
-  let observed;
+void test("showRuneIr sends a non-empty selection instead of a cursor", async () => {
+  let observed: Parameters<RuneIrRunner["sendRequest"]>[1] | undefined;
   const state = runner({
-    sendRequest: async (_method, params) => {
+    sendRequest: async (method, params) => {
       observed = params;
-      return runner().value.sendRequest();
+      return runner().value.sendRequest(method, params);
     }
   });
   const range = {
@@ -103,7 +129,7 @@ test("showRuneIr sends a non-empty selection instead of a cursor", async () => {
   });
 });
 
-test("showRuneIr reports unsupported, not-ready, and request failures", async () => {
+void test("showRuneIr reports unsupported, not-ready, and request failures", async () => {
   const unsupported = runner();
   assert.equal(isRuneIrSourceLanguage("plaintext"), false);
   assert.equal(isRuneIrSourceLanguage("typescriptreact"), true);
@@ -125,9 +151,7 @@ test("showRuneIr reports unsupported, not-ready, and request failures", async ()
   assert.match(notReady.messages.warnings[0], /not ready/);
 
   const failed = runner({
-    sendRequest: async () => {
-      throw new Error("no declaration here");
-    }
+    sendRequest: () => Promise.reject(new Error("no declaration here"))
   });
   await showRuneIr(
     { uri: "file:///demo.java", languageId: "java" },
@@ -139,10 +163,10 @@ test("showRuneIr reports unsupported, not-ready, and request failures", async ()
   assert.deepEqual(failed.messages.documents, []);
 });
 
-test("Rune IR manifest contexts match the runtime source-language registry", () => {
+void test("Rune IR manifest contexts match the runtime source-language registry", () => {
   const manifest = JSON.parse(
-    fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8")
-  );
+    fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8")
+  ) as ExtensionManifest;
   const palette = manifest.contributes.menus.commandPalette.find(
     (entry) => entry.command === "bifrost.showRuneIr"
   );
@@ -150,6 +174,8 @@ test("Rune IR manifest contexts match the runtime source-language registry", () 
     (entry) => entry.command === "bifrost.showRuneIr"
   );
 
+  assert.ok(palette);
+  assert.ok(editorContext);
   assert.deepEqual(languagesFromWhenClause(palette.when), [...RUNE_IR_SOURCE_LANGUAGE_IDS]);
   assert.deepEqual(languagesFromWhenClause(editorContext.when), [...RUNE_IR_SOURCE_LANGUAGE_IDS]);
 });

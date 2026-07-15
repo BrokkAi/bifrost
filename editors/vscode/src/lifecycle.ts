@@ -1,4 +1,5 @@
-import { ChildProcess, spawn } from "child_process";
+import type { ChildProcess } from "child_process";
+import { spawn } from "child_process";
 import { constants as fsConstants, existsSync, promises as fs, statSync } from "fs";
 import path from "path";
 import * as vscode from "vscode";
@@ -90,12 +91,7 @@ export function buildLaunchConfig(
   managedBinaryPath?: string | null
 ): BifrostLaunchConfig {
   const resolvedMode = resolveLaunchMode(mode, configuredPath, managedBinaryPath);
-  const command = commandForMode(
-    resolvedMode,
-    extensionDir,
-    configuredPath,
-    managedBinaryPath
-  );
+  const command = commandForMode(resolvedMode, extensionDir, configuredPath, managedBinaryPath);
   const args = ["--root", workspaceRoot, "--lsp", ...extraArgs];
   return {
     command,
@@ -119,12 +115,7 @@ export function buildMcpConfig(
   managedBinaryPath?: string | null
 ): BifrostMcpConfig {
   const resolvedMode = resolveLaunchMode(mode, configuredPath, managedBinaryPath);
-  const command = commandForMode(
-    resolvedMode,
-    extensionDir,
-    configuredPath,
-    managedBinaryPath
-  );
+  const command = commandForMode(resolvedMode, extensionDir, configuredPath, managedBinaryPath);
   return {
     mcpServers: {
       bifrost: {
@@ -177,7 +168,9 @@ export function spawnBifrostServer(
 export async function validateLaunchCommand(config: BifrostLaunchConfig): Promise<void> {
   const command = config.command;
   if (!command.trim()) {
-    throw new Error("Bifrost server path is empty. Configure bifrost.serverPath or choose bundled launch mode.");
+    throw new Error(
+      "Bifrost server path is empty. Configure bifrost.serverPath or choose bundled launch mode."
+    );
   }
 
   if (isPathLikeCommand(command)) {
@@ -222,9 +215,7 @@ export function supportedWorkspaceRoot(): string | null {
   return folders[0].uri.fsPath;
 }
 
-export async function workspaceGitignoreNeedsBifrostEntry(
-  workspaceRoot: string
-): Promise<boolean> {
+export async function workspaceGitignoreNeedsBifrostEntry(workspaceRoot: string): Promise<boolean> {
   const gitignorePath = path.join(workspaceRoot, ".gitignore");
   try {
     const content = await fs.readFile(gitignorePath, "utf8");
@@ -397,7 +388,8 @@ async function validateExecutablePath(command: string, cwd?: string): Promise<vo
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") {
       throw new Error(
-        `Bifrost binary was not found at ${resolvedCommand}. Configure bifrost.serverPath, rebuild the binary, or choose bundled launch mode.`
+        `Bifrost binary was not found at ${resolvedCommand}. Configure bifrost.serverPath, rebuild the binary, or choose bundled launch mode.`,
+        { cause: error }
       );
     }
     throw error;
@@ -477,9 +469,7 @@ function formatSpawnError(error: Error): string {
     spawnError.errno ? `errno=${String(spawnError.errno)}` : "",
     spawnError.syscall ? `syscall=${spawnError.syscall}` : "",
     spawnError.path ? `path=${spawnError.path}` : "",
-    Array.isArray(spawnError.spawnargs)
-      ? `spawnargs=${JSON.stringify(spawnError.spawnargs)}`
-      : ""
+    Array.isArray(spawnError.spawnargs) ? `spawnargs=${JSON.stringify(spawnError.spawnargs)}` : ""
   ]
     .filter(Boolean)
     .join(", ");

@@ -60,10 +60,7 @@ export interface RqlFileResult extends RqlQueryResultBase {
 }
 
 export type RqlQueryResultItem =
-  | RqlStructuralMatchResult
-  | RqlDeclarationResult
-  | RqlFileResult
-  | RqlReferenceSiteResult;
+  RqlStructuralMatchResult | RqlDeclarationResult | RqlFileResult | RqlReferenceSiteResult;
 
 export interface RqlQueryResponse {
   text: string;
@@ -96,7 +93,9 @@ export async function runRqlQuery(
     return undefined;
   }
   if (!runner.isReady()) {
-    runner.showWarning("Bifrost is not ready. Start the language server and wait for indexing to finish.");
+    runner.showWarning(
+      "Bifrost is not ready. Start the language server and wait for indexing to finish."
+    );
     return undefined;
   }
 

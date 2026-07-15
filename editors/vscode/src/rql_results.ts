@@ -1,13 +1,11 @@
 import * as vscode from "vscode";
+import type { RqlQueryFileGroup, RqlQueryResultItem, RqlQueryResult } from "./rql_query";
 import {
   groupRqlQueryResults,
   queryResultDescription,
   queryResultIcon,
   queryResultLabel,
-  queryResultTooltip,
-  RqlQueryFileGroup,
-  RqlQueryResultItem,
-  RqlQueryResult
+  queryResultTooltip
 } from "./rql_query";
 
 type RqlQueryTreeItem = RqlQueryFileItem | RqlQueryValueItem;

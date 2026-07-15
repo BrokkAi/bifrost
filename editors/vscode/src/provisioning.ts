@@ -107,7 +107,10 @@ export function managedBinaryPath(
   platform: NodeJS.Platform = process.platform,
   arch: NodeJS.Architecture = process.arch
 ): string {
-  return path.join(managedBinaryDir(storageDir, version, platform, arch), executableNameFor(platform));
+  return path.join(
+    managedBinaryDir(storageDir, version, platform, arch),
+    executableNameFor(platform)
+  );
 }
 
 export async function findManagedBinary(
@@ -233,9 +236,7 @@ export function parseSha256(text: string, expectedName?: string): string {
     }
   }
   throw new Error(
-    expectedName
-      ? `No SHA-256 checksum found for ${expectedName}`
-      : "No SHA-256 checksum found"
+    expectedName ? `No SHA-256 checksum found for ${expectedName}` : "No SHA-256 checksum found"
   );
 }
 
@@ -244,7 +245,10 @@ export function sha256(bytes: Buffer): string {
 }
 
 export function normalizeSha256(hash: string, name = "archive"): string {
-  const normalized = hash.trim().toLowerCase().replace(/^sha256:/, "");
+  const normalized = hash
+    .trim()
+    .toLowerCase()
+    .replace(/^sha256:/, "");
   if (!/^[a-f0-9]{64}$/.test(normalized)) {
     throw new Error(`Invalid SHA-256 checksum configured for ${name}`);
   }

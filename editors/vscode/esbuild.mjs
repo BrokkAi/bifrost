@@ -1,3 +1,5 @@
+// @ts-check
+
 import * as esbuild from "esbuild";
 
 const watch = process.argv.includes("--watch");
@@ -23,4 +25,3 @@ if (watch) {
   await esbuild.build(extensionOptions);
   console.log("Build complete.");
 }
-
