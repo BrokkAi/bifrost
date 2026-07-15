@@ -1814,6 +1814,154 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_trait_ufcs_through_barrel_reexport() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub trait Worker {
+    fn run(&self);
+}
+
+pub struct Local;
+
+impl Worker for Local {
+    fn run(&self) {}
+}
+"#,
+        ),
+        (
+            "src/facade.rs",
+            r#"
+pub use crate::service::{Local, Worker};
+
+pub type LocalAlias = Local;
+
+pub fn build() -> Local { Local }
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+pub mod facade;
+
+pub use facade::Worker;
+
+pub fn consume() {
+    let worker = facade::build();
+    Worker::run(&worker);
+    let other: facade::LocalAlias = facade::build();
+    Worker::run(&other);
+}
+"#,
+        ),
+    ]);
+
+    let run = member(&analyzer, &project.file("src/service.rs"), "Worker", "run");
+    let worker = definition(&analyzer, "service.Worker");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+
+    let run_hits = strategy
+        .find_usages(&analyzer, &[run], &candidates, 1000)
+        .into_either()
+        .expect("barrel-reexported trait method lookup should succeed");
+    assert_eq!(
+        2,
+        run_hits
+            .iter()
+            .filter(|hit| hit.file == project.file("src/lib.rs"))
+            .count(),
+        "both Worker::run calls should resolve to the trait method: {run_hits:#?}"
+    );
+    assert!(
+        run_hits.iter().all(
+            |hit| hit.file != project.file("src/facade.rs") && !hit.snippet.contains("pub use")
+        ),
+        "import and re-export sites stay filtered: {run_hits:#?}"
+    );
+
+    let worker_hits = strategy
+        .find_usages(&analyzer, &[worker], &candidates, 1000)
+        .into_either()
+        .expect("barrel-reexported trait qualifier lookup should succeed");
+    assert_eq!(
+        2,
+        worker_hits
+            .iter()
+            .filter(|hit| {
+                hit.file == project.file("src/lib.rs") && hit.snippet.contains("Worker::run")
+            })
+            .count(),
+        "both UFCS qualifiers should resolve to the original trait: {worker_hits:#?}"
+    );
+    assert!(
+        worker_hits.iter().all(
+            |hit| hit.file != project.file("src/facade.rs") && !hit.snippet.contains("pub use")
+        ),
+        "import and re-export sites stay filtered: {worker_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_resolves_trait_ufcs_through_aliased_barrel_namespace() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            "pub trait Worker { fn run(&self); }\npub struct Local;\nimpl Worker for Local { fn run(&self) {} }\n",
+        ),
+        (
+            "src/facade.rs",
+            "pub use crate::service::{Local, Worker};\npub fn build() -> Local { Local }\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod service;\npub mod facade;\nuse crate::facade as api;\npub fn consume() { let worker = api::build(); api::Worker::run(&worker); }\n",
+        ),
+    ]);
+    let run = member(&analyzer, &project.file("src/service.rs"), "Worker", "run");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, &[run], &candidates, 1000)
+        .into_either()
+        .expect("aliased barrel UFCS lookup should succeed");
+
+    assert_eq!(
+        vec![4],
+        hits.iter()
+            .filter(|hit| hit.file == project.file("src/lib.rs"))
+            .map(|hit| hit.line)
+            .collect::<Vec<_>>(),
+        "the aliased namespace call should resolve through the barrel: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_prefers_local_declaration_over_glob_reexport() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub trait Worker { fn run(); }\n"),
+        ("src/facade.rs", "pub use crate::service::Worker;\n"),
+        (
+            "src/lib.rs",
+            "mod service;\nmod facade;\nuse crate::facade::*;\nstruct Worker;\nimpl Worker { fn run() {} }\nfn consume() { Worker::run(); }\n",
+        ),
+    ]);
+    let run = member(&analyzer, &project.file("src/service.rs"), "Worker", "run");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, &[run], &candidates, 1000)
+        .into_either()
+        .expect("shadowed glob lookup should complete");
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("src/lib.rs")),
+        "the local Worker must shadow the glob-reexported trait: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_resolves_impl_side_trait_method_through_implementer_export() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
