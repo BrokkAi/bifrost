@@ -13,6 +13,8 @@ use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::hash::Hash;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tree_sitter::{Node, Parser};
 
@@ -170,6 +172,8 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     aliases_by_file: OnceLock<HashMap<ProjectFile, Vec<CppAlias>>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<String>>>,
+    #[cfg(test)]
+    qualified_candidate_inspections: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -240,6 +244,8 @@ impl VisibilityIndex {
             aliases_by_file: OnceLock::new(),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            #[cfg(test)]
+            qualified_candidate_inspections: AtomicUsize::new(0),
         }
     }
 
@@ -253,16 +259,6 @@ impl VisibilityIndex {
                 .visible_by_file
                 .get(file)
                 .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
-    }
-
-    pub(in crate::analyzer::usages) fn visible_units<'b>(
-        &'b self,
-        file: &ProjectFile,
-    ) -> Box<dyn Iterator<Item = &'b CodeUnit> + 'b> {
-        match self.visible_by_file.get(file) {
-            Some(visible) => Box::new(visible.iter()),
-            None => Box::new(std::iter::empty()),
-        }
     }
 
     pub(in crate::analyzer::usages) fn resolve_type(
@@ -666,14 +662,36 @@ impl VisibilityIndex {
         kind: TargetKind,
     ) -> Vec<&'b CodeUnit> {
         if normalized.contains("::") {
+            let Some(identifier) = normalized
+                .rsplit("::")
+                .find(|component| !component.is_empty())
+            else {
+                return Vec::new();
+            };
             let fqns = cpp_reference_fqn_candidates(normalized, kind);
             return self
-                .visible_units(file)
-                .filter(|unit| fqns.iter().any(|fqn| unit.fq_name() == *fqn))
+                .visible_identifier_candidates(file, identifier)
+                .filter(|unit| {
+                    #[cfg(test)]
+                    self.qualified_candidate_inspections
+                        .fetch_add(1, Ordering::Relaxed);
+                    fqns.iter().any(|fqn| unit.fq_name() == *fqn)
+                })
                 .collect();
         }
         self.visible_identifier_candidates(file, normalized)
             .collect()
+    }
+
+    #[cfg(test)]
+    fn reset_qualified_candidate_inspections(&self) {
+        self.qualified_candidate_inspections
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn qualified_candidate_inspections(&self) -> usize {
+        self.qualified_candidate_inspections.load(Ordering::Relaxed)
     }
 }
 
@@ -2223,4 +2241,200 @@ pub(super) fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
     left.kind() == right.kind()
         && left.fq_name() == right.fq_name()
         && left.signature() == right.signature()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn visibility_index(
+        visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+    ) -> VisibilityIndex {
+        VisibilityIndex {
+            visible_by_identifier: build_visible_identifier_index(&visible_by_file),
+            visible_by_file,
+            alias_source_files: HashSet::default(),
+            aliases_by_file: OnceLock::new(),
+            field_type_facts: Mutex::new(HashMap::default()),
+            structured_alias_targets: Mutex::new(HashMap::default()),
+            qualified_candidate_inspections: AtomicUsize::new(0),
+        }
+    }
+
+    #[test]
+    fn qualified_type_lookup_inspects_only_exact_fqn_candidates() {
+        const UNRELATED_DECLARATIONS: usize = 256;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let target_a_file = ProjectFile::new(root.clone(), "include/target_a.h");
+        let target_b_file = ProjectFile::new(root.clone(), "include/target_b.h");
+        let target_a = CodeUnit::new(target_a_file, CodeUnitType::Class, "perf", "Exact");
+        let target_b = CodeUnit::new(target_b_file, CodeUnitType::Class, "perf", "Exact");
+        let same_fqn_function = CodeUnit::with_signature(
+            ProjectFile::new(root.clone(), "include/function.h"),
+            CodeUnitType::Function,
+            "perf",
+            "Exact",
+            Some("void Exact()".to_string()),
+            false,
+        );
+        let alias = CodeUnit::with_signature(
+            ProjectFile::new(root.clone(), "include/alias.h"),
+            CodeUnitType::Field,
+            "perf",
+            "Alias",
+            Some("using Alias = Exact;".to_string()),
+            false,
+        );
+        let global = CodeUnit::new(
+            ProjectFile::new(root.clone(), "include/global.h"),
+            CodeUnitType::Class,
+            "",
+            "Global",
+        );
+        let hidden_same_fqn = CodeUnit::new(
+            ProjectFile::new(root.clone(), "hidden/target.h"),
+            CodeUnitType::Class,
+            "perf",
+            "Exact",
+        );
+
+        let mut visible = HashSet::default();
+        for index in 0..UNRELATED_DECLARATIONS {
+            visible.insert(CodeUnit::new(
+                ProjectFile::new(root.clone(), format!("include/unrelated_{index}.h")),
+                CodeUnitType::Class,
+                format!("unrelated{index}"),
+                format!("Type{index}"),
+            ));
+        }
+        visible.extend([
+            target_a.clone(),
+            target_b.clone(),
+            same_fqn_function.clone(),
+            alias.clone(),
+            global.clone(),
+        ]);
+        let visible_by_file = HashMap::from_iter([
+            (consumer.clone(), visible.clone()),
+            (alias.source().clone(), visible),
+        ]);
+        let visibility = visibility_index(visible_by_file);
+
+        visibility.reset_qualified_candidate_inspections();
+        let candidates = visibility.type_candidates(&consumer, "perf::Exact");
+        let inspected = visibility.qualified_candidate_inspections();
+        assert_eq!(
+            candidates.len(),
+            2,
+            "qualified type candidates: {candidates:#?}"
+        );
+        assert!(candidates.contains(&&target_a));
+        assert!(candidates.contains(&&target_b));
+        assert!(!candidates.contains(&&hidden_same_fqn));
+        let raw_type_candidates = visibility.type_name_candidates(&consumer, "perf::Exact");
+        assert_eq!(raw_type_candidates.len(), 3);
+        assert!(raw_type_candidates.contains(&&same_fqn_function));
+        assert_eq!(
+            visibility.named_candidates_for_normalized(
+                &consumer,
+                "perf::Exact",
+                TargetKind::FreeFunction
+            ),
+            vec![&same_fqn_function],
+            "target-kind filtering must distinguish a same-FQN free function from types"
+        );
+        assert_eq!(
+            visibility.resolve_type(&consumer, "::Global"),
+            Some(global),
+            "a leading global qualifier must still resolve the visible global type"
+        );
+        assert_eq!(
+            visibility.resolve_type(&consumer, "perf::Alias"),
+            Some(alias.clone()),
+            "a namespace-qualified alias must remain a type candidate"
+        );
+        assert_eq!(
+            visibility.alias_target(&alias).map(|unit| unit.fq_name()),
+            Some("perf.Exact".to_string()),
+            "a qualified namespace alias must resolve its namespace-relative target"
+        );
+        assert_eq!(
+            inspected, 3,
+            "qualified lookup should inspect only the two visible type declarations and the same-FQN non-type declaration"
+        );
+    }
+
+    #[test]
+    fn qualified_lookup_uses_the_final_cpp_scope_component_verbatim() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let header = ProjectFile::new(root, "include/types.h");
+        let nested = CodeUnit::new(header.clone(), CodeUnitType::Class, "ns", "Outer$Inner");
+        let constructor = CodeUnit::with_signature(
+            header.clone(),
+            CodeUnitType::Function,
+            "ns",
+            "Widget.Widget",
+            Some("Widget()".to_string()),
+            false,
+        );
+        let arrow = CodeUnit::with_signature(
+            header.clone(),
+            CodeUnitType::Function,
+            "ns",
+            "Widget.operator->",
+            Some("Widget* operator->()".to_string()),
+            false,
+        );
+        let destructor = CodeUnit::with_signature(
+            header,
+            CodeUnitType::Function,
+            "ns",
+            "Widget.~Widget",
+            Some("~Widget()".to_string()),
+            false,
+        );
+        let visible_by_file = HashMap::from_iter([(
+            consumer.clone(),
+            HashSet::from_iter([
+                nested.clone(),
+                constructor.clone(),
+                arrow.clone(),
+                destructor.clone(),
+            ]),
+        )]);
+        let visibility = visibility_index(visible_by_file);
+
+        assert_eq!(
+            visibility.candidate_units(&consumer, "ns::Outer::Inner", TargetKind::Type),
+            vec![&nested]
+        );
+        assert_eq!(
+            visibility.resolve_type(&consumer, "ns::Outer::Inner<int>"),
+            Some(nested),
+            "template arguments must be removed before selecting the final identifier bucket"
+        );
+        assert_eq!(
+            visibility.candidate_units(&consumer, "ns::Widget::Widget", TargetKind::Constructor),
+            vec![&constructor]
+        );
+        assert_eq!(
+            visibility.candidate_units(&consumer, "ns::Widget::operator->", TargetKind::Method),
+            vec![&arrow],
+            "operator-> must not be reduced with terminal_name-style punctuation splitting"
+        );
+        assert_eq!(
+            visibility.candidate_units(&consumer, "ns::Widget::~Widget", TargetKind::Method),
+            vec![&destructor]
+        );
+        assert!(
+            visibility
+                .candidate_units(&consumer, "::", TargetKind::Type)
+                .is_empty(),
+            "a degenerate qualified name must fail closed"
+        );
+    }
 }
