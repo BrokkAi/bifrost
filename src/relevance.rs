@@ -270,8 +270,7 @@ fn related_files_by_imports(
         }
     }
 
-    let mut neighbors = vec![Vec::new(); nodes.len()];
-    let mut out_degree = vec![0usize; nodes.len()];
+    let mut outgoing = vec![Vec::new(); nodes.len()];
     for (index, file) in nodes.iter().enumerate() {
         let outs = adjacency.get(file).cloned().unwrap_or_default();
         let mut out_indices = outs
@@ -279,47 +278,13 @@ fn related_files_by_imports(
             .filter_map(|neighbor| index_by_file.get(&neighbor).copied())
             .collect::<Vec<_>>();
         out_indices.sort_unstable();
-        out_degree[index] = out_indices.len();
-        neighbors[index] = out_indices;
+        outgoing[index] = out_indices
+            .into_iter()
+            .map(|neighbor| (neighbor, 1.0))
+            .collect();
     }
 
-    let mut rank = teleport.clone();
-    let mut next = vec![0.0; nodes.len()];
-    for _ in 0..MAX_ITERS {
-        for (index, teleport_weight) in teleport.iter().enumerate() {
-            next[index] = (1.0 - ALPHA) * teleport_weight;
-        }
-
-        let mut dangling_mass = 0.0;
-        for index in 0..nodes.len() {
-            if out_degree[index] == 0 {
-                dangling_mass += rank[index];
-                continue;
-            }
-
-            let share = ALPHA * rank[index] / out_degree[index] as f64;
-            for neighbor in &neighbors[index] {
-                next[*neighbor] += share;
-            }
-        }
-
-        if dangling_mass.abs() > 1.0e-10 {
-            let add = ALPHA * dangling_mass;
-            for (index, teleport_weight) in teleport.iter().enumerate() {
-                next[index] += add * teleport_weight;
-            }
-        }
-
-        let diff = next
-            .iter()
-            .zip(&rank)
-            .map(|(left, right)| (left - right).abs())
-            .sum::<f64>();
-        std::mem::swap(&mut rank, &mut next);
-        if diff < CONVERGENCE_EPSILON {
-            break;
-        }
-    }
+    let rank = weighted_page_rank(&outgoing, &teleport);
 
     let seed_files: HashSet<_> = positive_seeds.keys().cloned().collect();
     let mut ranked = nodes
@@ -338,6 +303,103 @@ fn related_files_by_imports(
     ranked.sort_by(compare_file_relevance);
     ranked.truncate(k);
     ranked
+}
+
+/// Run weighted PageRank over a dense, caller-supplied node order.
+///
+/// Each outgoing entry is `(target_index, positive_weight)`. Transition mass is
+/// divided by the source's total outgoing weight. A non-empty `teleport` vector
+/// is normalized before use; an empty vector selects uniform teleportation,
+/// which is the ordinary global-centrality form of PageRank. Dangling mass is
+/// redistributed through the same teleport vector so personalized rank remains
+/// anchored to its seeds.
+fn weighted_page_rank(outgoing: &[Vec<(usize, f64)>], teleport: &[f64]) -> Vec<f64> {
+    let node_count = outgoing.len();
+    if node_count == 0 {
+        return Vec::new();
+    }
+    assert!(
+        teleport.is_empty() || teleport.len() == node_count,
+        "teleport vector must be empty or match the graph node count"
+    );
+
+    let normalized_teleport = if teleport.is_empty() {
+        vec![1.0 / node_count as f64; node_count]
+    } else {
+        let total = teleport
+            .iter()
+            .copied()
+            .filter(|weight| weight.is_finite() && *weight > 0.0)
+            .sum::<f64>();
+        if total <= 0.0 {
+            vec![1.0 / node_count as f64; node_count]
+        } else {
+            teleport
+                .iter()
+                .map(|weight| {
+                    if weight.is_finite() && *weight > 0.0 {
+                        *weight / total
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        }
+    };
+    // Avoid a separate initialization rule: PageRank starts from the same
+    // distribution it teleports to, preserving the previous personalized path.
+    let mut rank = normalized_teleport.clone();
+    let mut next = vec![0.0; node_count];
+    let outgoing_weight = outgoing
+        .iter()
+        .map(|edges| {
+            edges
+                .iter()
+                .filter_map(|(_, weight)| (weight.is_finite() && *weight > 0.0).then_some(*weight))
+                .sum::<f64>()
+        })
+        .collect::<Vec<_>>();
+
+    for _ in 0..MAX_ITERS {
+        for (index, teleport_weight) in normalized_teleport.iter().enumerate() {
+            next[index] = (1.0 - ALPHA) * teleport_weight;
+        }
+
+        let mut dangling_mass = 0.0;
+        for (source, edges) in outgoing.iter().enumerate() {
+            let total_weight = outgoing_weight[source];
+            if total_weight <= 0.0 {
+                dangling_mass += rank[source];
+                continue;
+            }
+
+            let source_mass = ALPHA * rank[source] / total_weight;
+            for (target, weight) in edges {
+                if *target < node_count && weight.is_finite() && *weight > 0.0 {
+                    next[*target] += source_mass * weight;
+                }
+            }
+        }
+
+        if dangling_mass.abs() > 1.0e-10 {
+            let redistributed = ALPHA * dangling_mass;
+            for (index, teleport_weight) in normalized_teleport.iter().enumerate() {
+                next[index] += redistributed * teleport_weight;
+            }
+        }
+
+        let diff = next
+            .iter()
+            .zip(&rank)
+            .map(|(left, right)| (left - right).abs())
+            .sum::<f64>();
+        std::mem::swap(&mut rank, &mut next);
+        if diff < CONVERGENCE_EPSILON {
+            break;
+        }
+    }
+
+    rank
 }
 
 fn build_import_graph(
@@ -1267,7 +1329,7 @@ mod tests {
         DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GitProjectContext, RepoCommitChangeCache,
         clear_repo_commit_change_cache_for_root, commit_age_weight,
         most_relevant_project_files_with_half_life, related_files_by_git, related_files_by_imports,
-        repo_commit_change_cache,
+        repo_commit_change_cache, weighted_page_rank,
     };
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
@@ -1578,6 +1640,34 @@ mod tests {
                 .iter()
                 .all(|entry| entry.score > 0.0 && entry.score < 1.0)
         );
+    }
+
+    #[test]
+    fn weighted_page_rank_supports_uniform_global_centrality() {
+        let scores = weighted_page_rank(&[vec![(1, 1.0)], Vec::new()], &[]);
+
+        assert_eq!(scores.len(), 2);
+        assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+        assert!(scores[1] > scores[0], "scores: {scores:?}");
+    }
+
+    #[test]
+    fn weighted_page_rank_uses_edge_weights() {
+        let scores = weighted_page_rank(
+            &[vec![(1, 1.0), (2, 3.0)], Vec::new(), Vec::new()],
+            &[1.0, 0.0, 0.0],
+        );
+
+        assert!(scores[2] > scores[1], "scores: {scores:?}");
+        assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn weighted_page_rank_returns_dangling_mass_to_personalized_seeds() {
+        let scores = weighted_page_rank(&[vec![(1, 1.0)], Vec::new()], &[2.0, 0.0]);
+
+        assert!(scores[0] > 0.0 && scores[1] > 0.0, "scores: {scores:?}");
+        assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
     }
 
     #[test]
