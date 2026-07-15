@@ -361,7 +361,6 @@ fn structural_facts_cold_extraction_and_warm_persisted_hydration() {
     assert_eq!(cold.materialized_files, warm.materialized_files);
     assert_eq!(cold.facts, warm.facts);
     assert_eq!(cold.roles, warm.roles);
-    assert_eq!(cold.estimated_retained_bytes, warm.estimated_retained_bytes);
 
     eprintln!("\n=== structural facts persistence benchmark ===");
     eprintln!(
@@ -389,8 +388,9 @@ fn structural_facts_cold_extraction_and_warm_persisted_hydration() {
         mb(database_total_bytes_after_warm)
     );
     eprintln!(
-        "estimated retained facts: {:.1} MB; peak RSS start/cold/warm: {:.1} / {:.1} / {:.1} MB\n",
+        "estimated retained facts cold/warm: {:.1} / {:.1} MB; peak RSS start/cold/warm: {:.1} / {:.1} / {:.1} MB\n",
         mb(cold.estimated_retained_bytes),
+        mb(warm.estimated_retained_bytes),
         mb(rss_start),
         mb(rss_after_cold),
         mb(rss_after_warm)

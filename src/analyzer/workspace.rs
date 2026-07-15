@@ -312,3 +312,77 @@ impl WorkspaceAnalyzer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{OverlayProject, ProjectFile, TestProject};
+    use crate::gitblob::tests::{commit_all, init_repo};
+    use rusqlite::Connection;
+
+    #[test]
+    fn request_overlay_snapshot_cannot_replace_committed_structural_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let disk_source = "export const disk = call(1);\n";
+        let overlay_source = "export const overlay = call(1, 2);\nexport const extra = call(3);\n";
+        std::fs::write(root.join(".gitignore"), ".brokk/\n").unwrap();
+        std::fs::write(root.join("app.ts"), disk_source).unwrap();
+        let repository = init_repo(&root);
+        commit_all(&repository, "disk source");
+        let project: Arc<dyn Project> =
+            Arc::new(TestProject::new(root.clone(), Language::TypeScript));
+        let file = ProjectFile::new(root.clone(), "app.ts");
+
+        let disk_workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+        let disk_provider = disk_workspace.analyzer().structural_search_providers()[0];
+        let disk_facts = disk_provider.structural_facts(&file).unwrap();
+        let disk_fact_count = disk_facts.nodes().len();
+        assert_eq!(disk_facts.source(), disk_source);
+
+        let overlay = Arc::new(OverlayProject::new(Arc::clone(&project)));
+        assert!(overlay.set(file.abs_path(), overlay_source.to_owned()));
+        let overlay_workspace =
+            disk_workspace.clone_with_project(Arc::clone(&overlay) as Arc<dyn Project>);
+        let overlay_provider = overlay_workspace.analyzer().structural_search_providers()[0];
+        let extractions_before = overlay_provider.structural_extraction_count();
+        let overlay_facts = overlay_provider.structural_facts(&file).unwrap();
+        assert_eq!(overlay_facts.source(), overlay_source);
+        assert_ne!(overlay_facts.nodes().len(), disk_fact_count);
+        assert_eq!(
+            overlay_provider.structural_extraction_count(),
+            extractions_before + 1,
+            "the unseen overlay blob must extract its own facts"
+        );
+        drop(overlay_workspace);
+        drop(disk_workspace);
+
+        let disk_reopened = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+        let disk_provider = disk_reopened.analyzer().structural_search_providers()[0];
+        let hydrated_before = disk_provider.structural_hydration_count();
+        let disk_facts = disk_provider.structural_facts(&file).unwrap();
+        assert_eq!(disk_facts.source(), disk_source);
+        assert_eq!(disk_facts.nodes().len(), disk_fact_count);
+        assert_eq!(disk_provider.structural_extraction_count(), 0);
+        assert_eq!(
+            disk_provider.structural_hydration_count(),
+            hydrated_before + 1
+        );
+        drop(disk_reopened);
+
+        let snapshot_rows = Connection::open(root.join(".brokk/bifrost_cache.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM structural_facts_snapshots
+                 WHERE lang = 'typescript:ts'",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot_rows, 2,
+            "disk and overlay source OIDs must retain distinct cache rows"
+        );
+    }
+}

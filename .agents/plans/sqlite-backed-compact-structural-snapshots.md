@@ -19,7 +19,7 @@ A successful implementation can be demonstrated by running an ignored release be
 - [x] (2026-07-15T17:47:00Z) Added an implementation-independent persisted-reopen benchmark, smoke-tested it, preserved the optimized baseline executable, and recorded three 200-file baseline runs.
 - [x] (2026-07-15T18:03:00Z) Added snapshot semantic version 1, a packed explicit-code wire DTO, checked compact-row construction, source-aware validation, and round-trip/corruption tests.
 - [x] (2026-07-15T18:18:00Z) Added migration 0007 plus current-generation/complete-parent snapshot reads and writes, version replacement, cascade deletion, legacy cost repair, and snapshot-aware row/payload accounting.
-- [ ] Integrate read-through hydration and write-through persistence into structural-facts cache misses without changing overlay correctness.
+- [x] (2026-07-15T18:42:00Z) Integrated best-effort persisted hydration before extraction and write-through snapshots after extraction, with separate counters, in-memory bypass, exact-source identities, and LSP-style overlay isolation tests.
 - [ ] Validate content changes, language keys, generation changes, corrupt rows, in-memory stores, and cache deletion.
 - [ ] Run alternating optimized baseline/candidate measurements at multiple fixture sizes and record raw results.
 - [ ] Assess the same persistence boundary for import, hierarchy, and usage graphs; document promote/defer/discard decisions.
@@ -48,6 +48,12 @@ A successful implementation can be demonstrated by running an ignored release be
 - Observation: bincode's free `serialize`/`deserialize` functions use a legacy fixed-width configuration that permits trailing bytes, while `DefaultOptions` uses varints and rejects trailing bytes. The snapshot boundary explicitly selects varints, a payload-size read limit, and trailing-byte rejection rather than inheriting either implicit configuration.
   Evidence: bincode 1.3.3 configuration documentation and the corruption tests in `structural::facts`.
 
+- Observation: hydrated facts retain less allocator slack than freshly extracted facts because decoded node and role vectors are allocated at their exact persisted lengths. In the 20-file smoke fixture, estimated retained bytes fell from 530,120 after extraction to 378,920 after hydration while fact and role counts remained exact.
+  Evidence: the first successful candidate smoke run recorded below.
+
+- Observation: constructing a persisted workspace directly around an `OverlayProject` does not exercise the same state transition as the LSP. The production request path clones the already-built workspace with an overlay snapshot; testing that actual path proved separate source identities and preserved the disk snapshot.
+  Evidence: `WorkspaceAnalyzer::clone_with_project` use in `src/lsp/server.rs` and `request_overlay_snapshot_cannot_replace_committed_structural_facts` in `src/analyzer/workspace.rs`.
+
 ## Decision Log
 
 - Decision: persist one packed snapshot BLOB per `(blob_oid, storage_language_key, structural_snapshot_version)` rather than one SQL row per node or edge.
@@ -68,6 +74,10 @@ A successful implementation can be demonstrated by running an ignored release be
 
 - Decision: keep the existing in-memory `CompactRows` representation as the query engine format.
   Rationale: SQLite is optimized for persistence and capacity management, while structural queries repeatedly traverse complete rows. The experiment is explicitly hybrid, not SQL-driven graph traversal.
+  Date: 2026-07-15.
+
+- Decision: derive the snapshot OID directly from the exact source bytes passed to structural normalization rather than resolving and re-reading a live path.
+  Rationale: the content hash is the persisted blob identity and cannot race with a concurrent disk or overlay change. The store only accepts the snapshot if a complete parsed parent exists for that OID, language key, and generation. This is stronger than resolving a path and then assuming it still represents the already-read source.
   Date: 2026-07-15.
 
 ## Outcomes & Retrospective
@@ -159,6 +169,8 @@ Baseline raw summary, in run order:
 | median | 264.713 | 127.592 | 5.329 | 12.908 | 143.159 | 32.268 | 200 / 200 | 10.9 | 84.1 / 90.4 |
 
 All runs produced exactly 142,200 normalized facts, 70,000 semantic roles, and 22,603,600 estimated retained bytes in both lifetimes. The baseline has zero snapshot rows and bytes. The small 20-file smoke run also passed and extracted 20 files in each lifetime.
+
+The first candidate smoke run used 20 files x 10 calls. Cold extraction wrote 20 snapshots in 5.392 ms; reopened materialization hydrated all 20 with zero extractions in 2.265 ms. Facts and roles remained 3,020 and 1,400. Snapshot payload was 66,060 bytes, total database size grew from the baseline smoke's 417,792 bytes to 516,096 bytes, and estimated retained facts fell from 530,120 cold bytes to 378,920 hydrated bytes. This is directional evidence only; representative alternating runs remain required.
 
 Keep transient executables and bulky raw logs in `/private/tmp`; keep durable conclusions in this plan. If a reusable operator/developer note is needed, place it under `.agents/docs/`, not public `docs/`.
 
