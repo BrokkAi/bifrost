@@ -163,14 +163,14 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             ReceiverAnalysisOutcome::Precise(values) => {
                 let targets = values
                     .iter()
-                    .flat_map(|value| self.member_targets(value.owner(), member))
+                    .flat_map(|value| self.member_targets_for_value(value, member))
                     .collect::<Vec<_>>();
                 ReceiverAnalysisOutcome::single_precise_or_ambiguous(targets, budget)
             }
             ReceiverAnalysisOutcome::Ambiguous(values) => {
                 let targets = values
                     .iter()
-                    .flat_map(|value| self.member_targets(value.owner(), member))
+                    .flat_map(|value| self.member_targets_for_value(value, member))
                     .collect::<Vec<_>>();
                 if targets.is_empty() {
                     ReceiverAnalysisOutcome::Ambiguous(Vec::new())
@@ -237,7 +237,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let owners = self.contextual_object_literal_receiver_values(object, budget);
         let mut targets = owners
             .iter()
-            .flat_map(|value| self.member_targets(value.owner(), &member))
+            .flat_map(|value| self.member_targets_for_value(value, &member))
             .collect::<Vec<_>>();
         sort_units(&mut targets);
         targets.dedup();
@@ -888,7 +888,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         };
         let mut methods = Vec::new();
         for value in values {
-            for factory in self.member_targets(value.owner(), member) {
+            for factory in self.member_targets_for_value(&value, member) {
                 methods.extend(
                     nodes_for_code_unit(self.analyzer, &factory, self.root)
                         .into_iter()
@@ -980,6 +980,15 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         units
     }
 
+    fn member_targets_for_value(&self, receiver: &ReceiverValue, member: &str) -> Vec<CodeUnit> {
+        let indexed_member = if matches!(receiver, ReceiverValue::ClassOrStaticObject(_)) {
+            format!("{member}$static")
+        } else {
+            member.to_string()
+        };
+        self.member_targets(receiver.owner(), &indexed_member)
+    }
+
     fn visible_function_declarations_named(
         &self,
         name: &str,
@@ -1008,7 +1017,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .filter(|unit| unit.source() == self.file && unit.is_function())
             .find(|unit| {
                 self.analyzer.ranges(unit).iter().any(|range| {
-                    node.start_byte() <= range.start_byte && range.end_byte <= node.end_byte()
+                    range.start_byte < node.end_byte() && node.start_byte() < range.end_byte
                 })
             })
     }

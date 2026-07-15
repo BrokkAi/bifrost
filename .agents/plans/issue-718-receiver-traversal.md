@@ -17,7 +17,7 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - [x] (2026-07-15 12:34Z) Milestone 1: added the analyzer-owned receiver query service, shared member-site resolution, exact factory provenance, work/truncation reports, cancellation, and focused JS/TS tests.
 - [x] (2026-07-15) Milestone 2: added JSON/RQL steps, the receiver-analysis pipeline/result domain, public consumers, live help, grammar support, and end-to-end tests.
 - [x] (2026-07-15) Milestone 3: added the executable receiver cookbook, updated public capability/query/safety documentation, and inspected fresh development and production-base renders.
-- [ ] Milestone 4: review the complete diff, repair findings, and run the full repository validation bundle.
+- [x] (2026-07-15) Milestone 4: reviewed the complete diff, repaired exported and static factory receiver regressions, and ran the full repository validation bundle.
 
 ## Surprises & Discoveries
 
@@ -60,6 +60,15 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - Observation: The production-base link checker caught an extra slash at the end of the new reference-tutorial fragment.
   Evidence: the first build reported one broken internal link. Removing the trailing fragment slash yielded 3,993 checked links with no failures, and the production preview preserved `/bifrost` on sidebar, safety, stylesheet, and social-card URLs.
 
+- Observation: Exact factory provenance initially rejected exported factory declarations because analyzer ranges include the `export` wrapper while tree-sitter function nodes begin at `function`.
+  Evidence: the all-feature suite exposed missing usage-graph edges for exported local factories. Matching same-file, same-name function declarations by overlapping structured ranges restores the exact `CodeUnit` without a name-only fallback.
+
+- Observation: Static factory methods use the analyzer's `$static` member identity and must be selected from the receiver-value variant rather than from the owner declaration alone.
+  Evidence: `Service.create()` resolved as a class/static receiver but plain `Service.create` lookup produced no factory summary. Receiver-aware member selection now chooses `Service.create$static`, while factory-return values still unwrap to ordinary instance members such as `Service.run`.
+
+- Observation: This machine exposes distinct Homebrew and rustup compiler identities with the same Rust version string, and macOS Python extension tests require dynamic symbol lookup.
+  Evidence: a mixed-toolchain doctest invocation rejected cached rlibs with E0514 after every test binary passed. Pinning the rustup toolchain in `PATH`, setting `PYO3_PYTHON=.venv/bin/python`, adding macOS `dynamic_lookup` linker flags, and using the managed isolated-target helper avoids both toolchain contamination and retained temporary targets.
+
 ## Decision Log
 
 - Decision: Keep schema version 2 and name the operations `receiver_targets`, `points_to`, and `member_targets`, with hyphenated RQL wrappers.
@@ -96,7 +105,9 @@ Milestones 1 and 2 are complete. The analyzer-owned service accepts an exact fil
 
 Schema version 2 now exposes all three typed receiver steps through JSON, RQL, MCP help, live diagnostics/hover, and the TextMate grammar. The executor preserves receiver analysis as a terminal domain, supports `file_of`, charges provider work, retains bounded ambiguity, and renders explicit unknown, unsupported, candidate-cap, and budget outcomes. Rust, Python, LSP, CLI, and VS Code result consumers include the recursive result variant. The 13 receiver baseline, 4 focused service tests, 66 query/schema tests, 61 query-pipeline tests, and all 54 VS Code tests pass.
 
-Milestone 3 adds an executable six-case TypeScript receiver cookbook covering allocation, recursive factory provenance, exact same-name member selection, ambiguity, reference-site composition, and call-input composition. The docs overview, CodeQuery/RQL references, capability matrix, Python client, rule guide, evaluation/safety guidance, language index, TypeScript page, and former blanket no-points-to claims now distinguish bounded JS/TS receiver evidence from unsupported whole-program/general analyses. All 20 executable tutorial tests and 3 query-doc contract tests pass. Astro reports zero diagnostics; the production build checks 3,993 base-aware links across 50 pages. Fresh browser inspection verified the tutorial, sidebar, revised capability layout, and `/bifrost` deployment links. Final cross-repository gates remain for Milestone 4.
+Milestone 3 adds an executable six-case TypeScript receiver cookbook covering allocation, recursive factory provenance, exact same-name member selection, ambiguity, reference-site composition, and call-input composition. The docs overview, CodeQuery/RQL references, capability matrix, Python client, rule guide, evaluation/safety guidance, language index, TypeScript page, and former blanket no-points-to claims now distinguish bounded JS/TS receiver evidence from unsupported whole-program/general analyses. All 20 executable tutorial tests and 3 query-doc contract tests pass. Astro reports zero diagnostics; the production build checks 3,993 base-aware links across 50 pages. Fresh browser inspection verified the tutorial, sidebar, revised capability layout, and `/bifrost` deployment links.
+
+Milestone 4 repaired two integration defects found only by the complete suite: exported factory declarations now match their exact analyzer units across wrapper-range differences, and static factory summaries select `$static` member identities while returned instances continue to select ordinary members. All 17 JS/TS usage-graph tests, the 13 receiver tests, 61 query-pipeline tests, clippy with every target/feature, Python's 41 tests, VS Code's 54 tests, docs checks/build, formatting, and diff checks pass. The all-feature Rust run passed 842 library tests (3 ignored) and every integration-test binary; its first final doctest phase was invalidated solely by the host's mixed Homebrew/rustup artifact identities, so the gate was repeated with a pinned toolchain in the repository's self-cleaning isolated target.
 
 ## Context and Orientation
 
@@ -210,6 +221,8 @@ Revision note (2026-07-15): Completed Milestone 1 with a shared analyzer service
 Revision note (2026-07-15): Completed Milestone 2 with schema-v2 JSON/RQL operations, exact capture validation, a budgeted receiver-analysis terminal domain, all public result unions, editor/MCP metadata, and end-to-end JS/TS outcome/composition coverage. A review repair added explicit expression-versus-containing-site selection so unsupported shapes cannot be mistaken for receiver expressions.
 
 Revision note (2026-07-15): Completed Milestone 3 with six exact executable receiver recipes, capability/query/client/safety documentation, a readable receiver-provider capability table, base-aware link validation, and fresh visual inspection of development and production builds.
+
+Revision note (2026-07-15): Completed Milestone 4 by repairing exported-range and static-member factory regressions found by the full suite, then validating with a pinned Rust toolchain and the repository-managed isolated-target workflow.
 
 ## Interfaces and Dependencies
 
