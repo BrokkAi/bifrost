@@ -127,19 +127,87 @@ impl FileFacts {
     /// Rough heap footprint for the facts-cache weigher; exactness doesn't
     /// matter, monotonicity with actual size does.
     pub fn estimated_bytes(&self) -> u64 {
-        let roles: usize = self
-            .nodes
-            .iter()
-            .map(|node| node.roles.len() * std::mem::size_of::<RoleTarget>())
-            .sum();
-        (self.source.len()
-            + self.line_starts.len() * std::mem::size_of::<usize>()
-            + self.nodes.len() * std::mem::size_of::<NormalizedNode>()
-            + roles) as u64
+        let roles = self.nodes.iter().fold(0_u64, |bytes, node| {
+            bytes.saturating_add(
+                (node.roles.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<RoleTarget>() as u64),
+            )
+        });
+        (self.source.capacity() as u64)
+            .saturating_add(
+                (self.line_starts.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<usize>() as u64),
+            )
+            .saturating_add(
+                (self.nodes.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<NormalizedNode>() as u64),
+            )
+            .saturating_add(roles)
     }
 
     /// Whether `ancestor` lies on `node`'s parent chain (strictly above it).
     pub fn is_ancestor(&self, ancestor: u32, node: u32) -> bool {
         ancestor < node && node < self.subtree_end(ancestor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileFacts, NormalizedNode, RoleTarget, Span};
+    use crate::analyzer::Range;
+    use crate::analyzer::structural::kinds::{NormalizedKind, Role};
+
+    fn role_target() -> RoleTarget {
+        RoleTarget {
+            role: Role::Callee,
+            keyword: None,
+            node: None,
+            span: Span {
+                start_byte: 0,
+                end_byte: 1,
+            },
+            name: None,
+        }
+    }
+
+    fn node(roles: Vec<RoleTarget>) -> NormalizedNode {
+        NormalizedNode {
+            kind: NormalizedKind::Call,
+            range: Range {
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                end_line: 1,
+            },
+            parent: None,
+            name: None,
+            roles,
+            subtree_end: 1,
+        }
+    }
+
+    #[test]
+    fn estimated_bytes_counts_retained_allocation_capacity() {
+        let mut source = String::with_capacity(128);
+        source.push('x');
+        let mut line_starts = Vec::with_capacity(32);
+        line_starts.push(0);
+        let mut roles = Vec::with_capacity(16);
+        roles.push(role_target());
+        let mut nodes = Vec::with_capacity(8);
+        nodes.push(node(roles));
+        let facts = FileFacts::new(source, line_starts, nodes);
+
+        let length_based = facts.source.len() as u64
+            + (facts.line_starts.len() * std::mem::size_of::<usize>()) as u64
+            + (facts.nodes.len() * std::mem::size_of::<NormalizedNode>()) as u64
+            + (facts.nodes[0].roles.len() * std::mem::size_of::<RoleTarget>()) as u64;
+        let capacity_based = facts.source.capacity() as u64
+            + (facts.line_starts.capacity() * std::mem::size_of::<usize>()) as u64
+            + (facts.nodes.capacity() * std::mem::size_of::<NormalizedNode>()) as u64
+            + (facts.nodes[0].roles.capacity() * std::mem::size_of::<RoleTarget>()) as u64;
+
+        assert!(capacity_based > length_based);
+        assert_eq!(facts.estimated_bytes(), capacity_based);
     }
 }
