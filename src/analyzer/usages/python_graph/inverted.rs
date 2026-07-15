@@ -23,7 +23,7 @@ use super::extractor::{
 use super::resolver::resolve_receiver_type;
 use crate::analyzer::PythonAnalyzer;
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdges, build_edges, parse_and_collect,
+    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use crate::analyzer::usages::model::ImportKind;
@@ -32,18 +32,19 @@ use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 /// Build the whole Python `caller -> callee` edge set in a single inverted pass.
-pub(super) fn build_python_edges<F>(
+pub(super) fn build_python_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = py.get_analyzed_files().into_iter().collect();
     let language = tree_sitter_python::LANGUAGE.into();
-    build_edges(&files, keep_file, |file| {
+    build_edge_output(&files, keep_file, |file| {
         // Parse on demand and drop the tree when this closure returns, so live trees
         // are bounded by the worker count rather than the workspace size (#200).
         // Resolution reaches no other file's tree: the import binder, same-file

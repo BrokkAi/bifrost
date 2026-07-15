@@ -1,4 +1,4 @@
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
@@ -113,6 +113,15 @@ pub(crate) trait UsageEdgeResolver<'a>: Sized {
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync;
+
+    fn build_edge_weights<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync;
 }

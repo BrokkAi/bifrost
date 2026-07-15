@@ -3,7 +3,7 @@ use super::inverted::{self, ProjectTypes};
 use super::resolver::TargetSpec;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
@@ -147,6 +147,18 @@ impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        inverted::build_scala_edges(analyzer, self.scala, &self.graph, nodes, keep_file)
+    }
+
+    fn build_edge_weights<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {

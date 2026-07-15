@@ -40,6 +40,7 @@ pub(crate) mod rust_graph;
 pub(crate) mod scala_graph;
 pub(crate) mod target_kind;
 mod traits;
+pub(crate) mod workspace_graph;
 
 pub(crate) use call_relations::{
     CallBindingCache, CallRelationLimits, CallRelationResult, CallRelationService, CallSite,

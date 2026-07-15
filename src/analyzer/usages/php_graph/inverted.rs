@@ -36,7 +36,8 @@ use super::syntax::{
     variable_identifier,
 };
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
+    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output, first_precise,
+    parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
@@ -48,18 +49,19 @@ use tree_sitter::Node;
 
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
 /// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
-pub(super) fn build_php_edges<F>(
+pub(super) fn build_php_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     php: &PhpAnalyzer,
     files: &[ProjectFile],
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_php::LANGUAGE_PHP.into();
-    build_edges(files, keep_file, |file| {
+    build_edge_output(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let ctx = php.file_context_from_source(file, parsed.source.as_str());
             let mut scan = PhpScan {

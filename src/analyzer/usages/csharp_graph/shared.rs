@@ -2,7 +2,7 @@ use super::extractor::{ScanState, scan_file};
 use super::inverted;
 use super::resolver::TargetSpec;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
@@ -113,6 +113,18 @@ impl<'a> UsageEdgeResolver<'a> for CSharpEdgeResolver<'a> {
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        inverted::build_csharp_edges(analyzer, self.csharp, &self.files, nodes, keep_file)
+    }
+
+    fn build_edge_weights<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {

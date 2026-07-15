@@ -16,6 +16,7 @@ use crate::analyzer::usages::get_definition::{
     java_lombok_accessor_field_candidates,
 };
 use crate::analyzer::usages::reference_site::reference_target_match_offsets;
+use crate::analyzer::usages::workspace_graph::{UsageEcosystem, WorkspaceUsageCatalog};
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
@@ -3410,7 +3411,7 @@ fn path_match_sample(matches: &[String]) -> String {
 /// are always file-anchored. [`distinct_definitions`] also anchors other
 /// ecosystems when the same FQN spans multiple language/file domains.
 fn definition_selector(unit: &CodeUnit) -> String {
-    if Ecosystem::of(language_for_target(unit)).is_module_scoped() {
+    if UsageEcosystem::of(language_for_target(unit)).is_module_scoped() {
         file_anchored_definition_selector(unit)
     } else {
         unit.fq_name()
@@ -3430,7 +3431,7 @@ fn distinct_definitions(overloads: Vec<CodeUnit>) -> Vec<(String, Vec<CodeUnit>)
         HashMap::default();
     for unit in &overloads {
         let language = language_for_target(unit);
-        let module_path = Ecosystem::of(language)
+        let module_path = UsageEcosystem::of(language)
             .is_module_scoped()
             .then(|| rel_path_string(unit.source()));
         domains_by_fqn
@@ -4783,87 +4784,31 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref()).filter;
     let test_files = excluded_test_files(analyzer, params.include_tests);
 
-    // Group the definitions that become nodes by `(ecosystem, fqn, module
-    // scope)`. Only classes and functions participate; fields/modules/macros are
-    // excluded to keep the graph focused on call/reference structure. The fqn
-    // collapses overloads that share a name so a symbol resolves its callers once
-    // (not once per signature, which would multiply its edge weights); the module
-    // scope keeps two file-scoped symbols that share a bare name distinct (see
-    // `Ecosystem::is_module_scoped`); and a BTreeMap gives the output a
-    // deterministic order independent of the analyzer's declaration iteration.
-    let mut overloads_by_node: BTreeMap<(Ecosystem, String, Option<String>), Vec<CodeUnit>> =
-        BTreeMap::new();
-    for unit in analyzer.all_declarations() {
-        if unit.is_synthetic() || !(unit.is_class() || unit.is_callable()) {
-            continue;
-        }
-        let ecosystem = Ecosystem::of(language_for_target(&unit));
-        let scope = ecosystem
-            .is_module_scoped()
-            .then(|| rel_path_string(unit.source()));
-        overloads_by_node
-            .entry((ecosystem, unit.fq_name(), scope))
-            .or_default()
-            .push(unit.clone());
-    }
-
-    // Node metadata, built in one parallel pass over the fqn groups. (The edge
-    // passes need only the set of node fqns; per-file definition ranges are
-    // derived inside the inverted driver and the per-symbol path's dedupe.)
-    let mut nodes: Vec<UsageGraphNode> = overloads_by_node
-        .par_iter()
-        .map(|((ecosystem, fqn, _scope), overloads)| {
-            // Choose the representative declaration deterministically (lowest
-            // location) so a multi-declaration node (overloads, or a package-scoped
-            // name declared across several files) reports stable metadata across
-            // rebuilds rather than whichever declaration surfaced first.
-            let primary = overloads
-                .iter()
-                .min_by(|left, right| {
-                    rel_path_string(left.source())
-                        .cmp(&rel_path_string(right.source()))
-                        .then_with(|| {
-                            primary_range(analyzer, left)
-                                .map(|range| range.start_line)
-                                .cmp(&primary_range(analyzer, right).map(|range| range.start_line))
-                        })
-                })
-                .expect("a node group always has at least one declaration");
-            UsageGraphNode {
-                fqn: fqn.clone(),
-                language: ecosystem.as_str().to_string(),
-                path: rel_path_string(primary.source()),
-                start_line: primary_range(analyzer, primary)
-                    .map(|range| range.start_line)
-                    .unwrap_or(0),
-                kind: code_unit_kind_name(primary.kind()).to_string(),
-                signature: primary.signature().map(str::to_string),
-            }
+    // Build node identity once and share it with the internal relevance graph.
+    // The catalog collapses overloads, keeps JS/TS declarations file-scoped, and
+    // chooses deterministic primary declarations using analyzer-provided ranges.
+    let catalog = WorkspaceUsageCatalog::build(analyzer);
+    let mut nodes: Vec<UsageGraphNode> = catalog
+        .nodes
+        .iter()
+        .map(|node| UsageGraphNode {
+            fqn: node.key.fqn.clone(),
+            language: node.key.ecosystem.as_str().to_string(),
+            path: rel_path_string(node.primary.source()),
+            start_line: node
+                .primary_range
+                .map(|range| range.start_line)
+                .unwrap_or(0),
+            kind: code_unit_kind_name(node.primary.kind()).to_string(),
+            signature: node.primary.signature().map(str::to_string),
         })
         .collect();
-
-    // Node-membership set per ecosystem, so each language's inverted builder only
-    // matches callees that are nodes in its own ecosystem (a Go reference can't
-    // resolve to a same-fqn Python node).
-    let mut node_fqns_by_ecosystem: HashMap<Ecosystem, HashSet<String>> = HashMap::default();
-    for (ecosystem, fqn, _scope) in overloads_by_node.keys() {
-        node_fqns_by_ecosystem
-            .entry(*ecosystem)
-            .or_default()
-            .insert(fqn.clone());
-    }
-    let empty_fqns: HashSet<String> = HashSet::default();
-    let ecosystem_fqns = |ecosystem: Ecosystem| {
-        node_fqns_by_ecosystem
-            .get(&ecosystem)
-            .unwrap_or(&empty_fqns)
-    };
 
     // Edges keyed by `(ecosystem, from_fqn, to_fqn)`: both endpoints share the
     // builder's ecosystem, so the ecosystem disambiguates a fqn that exists in
     // more than one language. The value is the edge's call sites; its length is the
     // edge weight (so weight and sites can never disagree).
-    let mut edge_sites: BTreeMap<(Ecosystem, String, String), Vec<UsageGraphCallSite>> =
+    let mut edge_sites: BTreeMap<(UsageEcosystem, String, String), Vec<UsageGraphCallSite>> =
         BTreeMap::new();
     let mut truncated_symbols: Vec<UsageGraphTruncatedSymbol> = Vec::new();
 
@@ -4885,9 +4830,9 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     // Every supported language has a whole-workspace inverted builder, so all
     // edges are produced by the passes below; merge each one's result in.
     let record_inverted =
-        |ecosystem: Ecosystem,
+        |ecosystem: UsageEcosystem,
          edges: Option<crate::analyzer::usages::inverted_edges::UsageEdges>,
-         edge_sites: &mut BTreeMap<(Ecosystem, String, String), Vec<UsageGraphCallSite>>,
+         edge_sites: &mut BTreeMap<(UsageEcosystem, String, String), Vec<UsageGraphCallSite>>,
          truncated_symbols: &mut Vec<UsageGraphTruncatedSymbol>| {
             let Some(edges) = edges else {
                 return;
@@ -4914,11 +4859,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_go");
         let go_edges = crate::analyzer::usages::go_graph::build_go_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::Go),
+            catalog.fqns(UsageEcosystem::Go),
             keep_file,
         );
         record_inverted(
-            Ecosystem::Go,
+            UsageEcosystem::Go,
             go_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -4928,11 +4873,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_jsts");
         let jsts_edges = crate::analyzer::usages::js_ts_graph::build_jsts_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::JavaScriptTypeScript),
+            catalog.fqns(UsageEcosystem::JavaScriptTypeScript),
             keep_file,
         );
         record_inverted(
-            Ecosystem::JavaScriptTypeScript,
+            UsageEcosystem::JavaScriptTypeScript,
             jsts_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -4942,11 +4887,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_python");
         let python_edges = crate::analyzer::usages::python_graph::build_python_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::Python),
+            catalog.fqns(UsageEcosystem::Python),
             keep_file,
         );
         record_inverted(
-            Ecosystem::Python,
+            UsageEcosystem::Python,
             python_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -4956,11 +4901,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_rust");
         let rust_edges = crate::analyzer::usages::rust_graph::build_rust_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::Rust),
+            catalog.fqns(UsageEcosystem::Rust),
             keep_file,
         );
         record_inverted(
-            Ecosystem::Rust,
+            UsageEcosystem::Rust,
             rust_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -4970,11 +4915,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_java");
         let java_edges = crate::analyzer::usages::java_graph::build_java_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::Java),
+            catalog.fqns(UsageEcosystem::Java),
             keep_file,
         );
         record_inverted(
-            Ecosystem::Java,
+            UsageEcosystem::Java,
             java_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -4984,11 +4929,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_csharp");
         let csharp_edges = crate::analyzer::usages::csharp_graph::build_csharp_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::CSharp),
+            catalog.fqns(UsageEcosystem::CSharp),
             keep_file,
         );
         record_inverted(
-            Ecosystem::CSharp,
+            UsageEcosystem::CSharp,
             csharp_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -4998,11 +4943,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_php");
         let php_edges = crate::analyzer::usages::php_graph::build_php_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::Php),
+            catalog.fqns(UsageEcosystem::Php),
             keep_file,
         );
         record_inverted(
-            Ecosystem::Php,
+            UsageEcosystem::Php,
             php_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -5012,11 +4957,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_ruby");
         let ruby_edges = crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::Ruby),
+            catalog.fqns(UsageEcosystem::Ruby),
             keep_file,
         );
         record_inverted(
-            Ecosystem::Ruby,
+            UsageEcosystem::Ruby,
             ruby_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -5026,11 +4971,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_scala");
         let scala_edges = crate::analyzer::usages::scala_graph::build_scala_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::Scala),
+            catalog.fqns(UsageEcosystem::Scala),
             keep_file,
         );
         record_inverted(
-            Ecosystem::Scala,
+            UsageEcosystem::Scala,
             scala_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -5040,11 +4985,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let _scope = profiling::scope("usage_graph::resolve_cpp");
         let cpp_edges = crate::analyzer::usages::cpp_graph::build_cpp_usage_edges(
             analyzer,
-            ecosystem_fqns(Ecosystem::Cpp),
+            catalog.fqns(UsageEcosystem::Cpp),
             keep_file,
         );
         record_inverted(
-            Ecosystem::Cpp,
+            UsageEcosystem::Cpp,
             cpp_edges,
             &mut edge_sites,
             &mut truncated_symbols,
@@ -7062,7 +7007,7 @@ fn file_outline_source_block(
 }
 
 fn file_outline_source_note(file: &ProjectFile) -> String {
-    if Ecosystem::of(language_for_file(file)).is_module_scoped() {
+    if UsageEcosystem::of(language_for_file(file)).is_module_scoped() {
         "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for JS/TS module-scoped symbols, use the full relative path selector such as src/plugin/relativeTime/index.js#default), or use get_summaries for structured summaries"
             .to_string()
     } else {
@@ -7183,7 +7128,7 @@ fn module_file_listing_blocks(
 }
 
 fn module_outline_source_note(file: &ProjectFile, omitted_defining_files: usize) -> String {
-    let mut note = if Ecosystem::of(language_for_file(file)).is_module_scoped() {
+    let mut note = if UsageEcosystem::of(language_for_file(file)).is_module_scoped() {
         "module target: showing an outline of top-level symbols, not a full source body; pass a member symbol using path#symbol for module-scoped JS/TS, or use get_summaries for structured summaries"
             .to_string()
     } else {
@@ -7764,74 +7709,6 @@ fn strip_params(symbols: Vec<String>) -> Vec<String> {
 
 fn default_limit() -> usize {
     20
-}
-
-/// The usage-graph ecosystem a node belongs to — the identity component that
-/// keeps same-fqn symbols in different languages from merging into one node.
-/// JavaScript and TypeScript share one ecosystem because they share an fqn
-/// namespace and interop (a `.ts` file can import a `.js` symbol).
-///
-/// A `Copy` enum rather than a string so the `usage_graph` builders carry one
-/// value for both the node-membership lookup and the edge tag — the compiler,
-/// not a matched string literal, guarantees the two stay in sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Ecosystem {
-    JavaScriptTypeScript,
-    Python,
-    Go,
-    Rust,
-    Java,
-    CSharp,
-    Cpp,
-    Php,
-    Ruby,
-    Scala,
-    Unknown,
-}
-
-impl Ecosystem {
-    fn of(language: Language) -> Self {
-        match language {
-            Language::JavaScript | Language::TypeScript => Self::JavaScriptTypeScript,
-            Language::Python => Self::Python,
-            Language::Go => Self::Go,
-            Language::Rust => Self::Rust,
-            Language::Java => Self::Java,
-            Language::CSharp => Self::CSharp,
-            Language::Cpp => Self::Cpp,
-            Language::Php => Self::Php,
-            Language::Ruby => Self::Ruby,
-            Language::Scala => Self::Scala,
-            Language::None => Self::Unknown,
-        }
-    }
-
-    /// Whether a bare symbol name is scoped to its defining file rather than a
-    /// package. JavaScript/TypeScript modules are file-scoped, so two files
-    /// exporting the same name are distinct symbols and the file is part of node
-    /// identity; every other ecosystem qualifies its fqn by package and merges
-    /// declarations that share an fqn across files (Go package symbols, C#
-    /// partial classes).
-    fn is_module_scoped(self) -> bool {
-        matches!(self, Self::JavaScriptTypeScript)
-    }
-
-    /// The wire label carried in `UsageGraphNode`/`UsageGraphEdge.language`.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::JavaScriptTypeScript => "js_ts",
-            Self::Python => "python",
-            Self::Go => "go",
-            Self::Rust => "rust",
-            Self::Java => "java",
-            Self::CSharp => "csharp",
-            Self::Cpp => "cpp",
-            Self::Php => "php",
-            Self::Ruby => "ruby",
-            Self::Scala => "scala",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 fn language_name(language: Language) -> String {

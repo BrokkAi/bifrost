@@ -14,7 +14,7 @@ The behavior is observable through the MCP tool, the `most_relevant_files` helpe
 
 - [x] (2026-07-15T08:43:07Z) Confirmed the issue branch was clean, fetched origin, and rebased it onto `origin/master` at `3aee987b`.
 - [x] (2026-07-15T08:49:00Z) Extracted the import-specific PageRank loop into a reusable weighted dense-ID kernel and proved focused unit and import-ranking parity tests pass.
-- [ ] Add an exact-identity, weight-only workspace usage graph with shared node catalog and completeness metadata.
+- [x] (2026-07-15T09:24:00Z) Added an exact-identity, weight-only workspace usage graph with shared node catalog and completeness metadata.
 - [ ] Add opt-in usage-primary file ranking and public Rust, MCP, CLI, and Python surfaces.
 - [ ] Add behavior, identity, schema, client, and performance coverage.
 - [ ] Run formatting, Clippy, focused tests, and the full `nlp,python` test gate.
@@ -27,6 +27,9 @@ The behavior is observable through the MCP tool, the `most_relevant_files` helpe
 
 - Observation: the public usage graph groups JS/TS nodes with file scope, but the ordinary edge wrapper returns string keys. The existing scoped JS/TS edge builder retains `UsageNodeKey`, so ranking must use that path rather than reconstructing identity from public edges.
   Evidence: `src/searchtools.rs::usage_graph` and `src/analyzer/usages/js_ts_graph.rs::build_jsts_scoped_usage_edges`.
+
+- Observation: making each inverted language scan generic over its final output preserves one AST walk while allowing the public graph to retain call sites and relevance to consume compact weights directly.
+  Evidence: `UsageEdgeBuildOutput` in `src/analyzer/usages/inverted_edges.rs` and the language-specific `build_*_edges` adapters.
 
 ## Decision Log
 
@@ -44,9 +47,11 @@ The behavior is observable through the MCP tool, the `most_relevant_files` helpe
 
 ## Outcomes & Retrospective
 
-The weighted-PageRank milestone is complete; workspace usage-graph integration and public surfaces remain.
+The weighted-PageRank and exact workspace-graph milestones are complete; usage-primary ranking and public surfaces remain.
 
 Milestone 1 outcome 2026-07-15T08:49:00Z: `weighted_page_rank` now supports unit or weighted arcs, explicit personalized teleportation, uniform global teleportation, and personalized dangling-mass redistribution. The import adapter supplies unit weights and all 22 `most_relevant_files` integration tests remain green.
+
+Milestone 2 outcome 2026-07-15T09:24:00Z: every language's inverted resolver can now finalize the same per-file scan into either call-site edges or compact weights. `WorkspaceUsageCatalog` owns ecosystem-qualified and JS/TS file-qualified identity, deterministic primary declarations, declaration-file membership, and completeness metadata. The public `usage_graph` reuses this catalog without changing its wire result.
 
 ## Context and Orientation
 
@@ -114,6 +119,15 @@ Milestone 1 evidence:
     cargo test --test most_relevant_files
     test result: ok. 22 passed; 0 failed
 
+Milestone 2 evidence:
+
+    cargo check --lib
+    Finished successfully; temporary dead-code warnings remain until milestone 3 consumes the compact graph.
+
+    cargo test --test usage_graph_identity_test --test usage_graph_test
+    test result: ok. 5 passed; 0 failed
+    test result: ok. 16 passed; 0 failed
+
 ## Interfaces and Dependencies
 
 The public Rust request gains:
@@ -139,3 +153,5 @@ The Python client exposes the same two values through a string enum. The result 
 Revision note 2026-07-15T08:43:07Z: Created the implementation ExecPlan from the approved issue #781 design before source changes.
 
 Revision note 2026-07-15T08:49:00Z: Recorded the completed weighted-PageRank milestone and its focused validation evidence.
+
+Revision note 2026-07-15T09:24:00Z: Recorded the shared exact-identity catalog, direct weight finalization, and public usage-graph parity evidence.

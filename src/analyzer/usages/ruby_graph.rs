@@ -25,7 +25,7 @@ pub(crate) use syntax::{
 
 use crate::analyzer::ruby::parse_ruby_tree;
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageScanScope};
@@ -47,6 +47,15 @@ pub fn build_ruby_usage_edges(
 ) -> Option<UsageEdges> {
     let resolver = RubyEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_ruby_usage_edge_weights(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: impl Fn(&ProjectFile) -> bool + Sync,
+) -> Option<UsageEdgeWeights> {
+    let resolver = RubyEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
 #[derive(Default)]

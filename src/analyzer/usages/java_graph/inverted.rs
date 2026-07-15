@@ -27,8 +27,9 @@ use super::return_type::{
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, build_file_declarations,
-    build_file_declarations_from_state, parse_and_collect_with_declarations,
+    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
+    build_file_declarations, build_file_declarations_from_state,
+    parse_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
@@ -37,21 +38,22 @@ use crate::hash::{HashMap, HashSet};
 use std::sync::Mutex;
 use tree_sitter::Node;
 
-pub(super) fn build_java_edges<F>(
+pub(super) fn build_java_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     files: &[ProjectFile],
     file_states: &HashMap<ProjectFile, FileState>,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_java::LANGUAGE.into();
     let return_type_cache: MethodReturnCache = Mutex::new(HashMap::default());
     let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
-    build_edges(files, keep_file, |file| {
+    build_edge_output(files, keep_file, |file| {
         let state = file_states.get(file);
         let declarations = state
             .map(build_file_declarations_from_state)

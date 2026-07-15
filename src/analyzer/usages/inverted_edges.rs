@@ -229,6 +229,25 @@ pub(crate) struct UsageEdgeWeights<K = String> {
     pub(crate) unproven_inbound: BTreeMap<K, usize>,
 }
 
+/// Selects how a whole-workspace per-file scan is finalized. Language builders
+/// are generic over this trait so the AST walk is written once while callers can
+/// request either site-bearing API edges or compact weights for graph algorithms.
+pub(crate) trait UsageEdgeBuildOutput<K: NodeKey>: Sized {
+    fn merge(per_file: Vec<PerFileEdges<K>>) -> Self;
+}
+
+impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdges<K> {
+    fn merge(per_file: Vec<PerFileEdges<K>>) -> Self {
+        merge_and_cap(per_file)
+    }
+}
+
+impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdgeWeights<K> {
+    fn merge(per_file: Vec<PerFileEdges<K>>) -> Self {
+        merge_weights_and_cap(per_file)
+    }
+}
+
 impl<K: Ord> Default for UsageEdgeWeights<K> {
     fn default() -> Self {
         Self {
@@ -495,8 +514,7 @@ where
     KeepFn: Fn(&ProjectFile) -> bool + Sync,
     ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
 {
-    let per_file = collect_per_file_edges(files, keep_file, scan);
-    merge_and_cap(per_file)
+    build_edge_output(files, keep_file, scan)
 }
 
 #[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note above
@@ -510,8 +528,22 @@ where
     KeepFn: Fn(&ProjectFile) -> bool + Sync,
     ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
 {
-    let per_file = collect_per_file_edges(files, keep_file, scan);
-    merge_weights_and_cap(per_file)
+    build_edge_output(files, keep_file, scan)
+}
+
+#[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note above
+pub(crate) fn build_edge_output<K, Output, KeepFn, ScanFn>(
+    files: &[ProjectFile],
+    keep_file: KeepFn,
+    scan: ScanFn,
+) -> Output
+where
+    K: NodeKey + Send,
+    Output: UsageEdgeBuildOutput<K>,
+    KeepFn: Fn(&ProjectFile) -> bool + Sync,
+    ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
+{
+    Output::merge(collect_per_file_edges(files, keep_file, scan))
 }
 
 #[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note below

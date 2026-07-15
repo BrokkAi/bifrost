@@ -9,7 +9,7 @@ use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
 use crate::analyzer::usages::go_graph::resolver::{
     GoEdgeIndex, GoProjectGraph, TargetSpec, build_go_edge_index, build_go_graph,
 };
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{
@@ -44,6 +44,18 @@ where
 {
     let resolver = GoEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_go_usage_edge_weights<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdgeWeights>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = GoEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
 pub(crate) struct GoQueryResolver<'a> {
@@ -112,6 +124,18 @@ impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver {
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        inverted::build_go_edges(analyzer, &self.index, nodes, keep_file)
+    }
+
+    fn build_edge_weights<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {

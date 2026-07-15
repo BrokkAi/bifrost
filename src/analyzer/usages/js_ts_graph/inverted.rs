@@ -26,8 +26,8 @@ use crate::analyzer::js_ts::syntax::{
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeWeights, UsageEdges, UsageNodeKey, build_edge_weights, build_edges,
-    collect_file_edges, parse_and_collect,
+    EdgeCollector, UsageEdgeBuildOutput, UsageEdgeWeights, UsageNodeKey, build_edge_output,
+    build_edge_weights, collect_file_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
@@ -43,21 +43,22 @@ use tree_sitter::Node;
 /// Build every JS/TS `caller -> callee` edge in one parse-on-demand pass over the
 /// workspace files, using the shared [`build_edges`] driver for all the
 /// language-agnostic accounting.
-pub(super) fn build_jsts_edges<F>(
+pub(super) fn build_jsts_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     language: Language,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String> + Default,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     if tree_sitter_language_for(language).is_none() {
-        return UsageEdges::default();
+        return Output::default();
     }
     let _index = super::cached_jsts_index(analyzer, language, None);
     let files = collect_jsts_files(analyzer, language);
-    build_edges(&files, keep_file, |file| {
+    build_edge_output(&files, keep_file, |file| {
         // The non-scoped scan needs only the file's own tree for its main binder +
         // declaration pass. Receiver analysis can consult the analyzer-cached
         // resolution index, so it is pre-materialized before this parallel scan.

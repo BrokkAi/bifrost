@@ -20,25 +20,26 @@ use super::syntax::{
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, parse_and_collect,
+    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
-pub(super) fn build_ruby_edges<F>(
+pub(super) fn build_ruby_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     ruby: &RubyAnalyzer,
     files: &[ProjectFile],
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_ruby::LANGUAGE.into();
-    build_edges(files, keep_file, |file| {
+    build_edge_output(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let semantic = RubySemanticIndex::build_for_lookup(analyzer, ruby);
             let visible_files = semantic.visible_files_from(file);

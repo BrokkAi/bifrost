@@ -32,8 +32,9 @@ use crate::analyzer::scala::{ScalaAdapter, scala_normalize_full_name, scala_simp
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, build_file_declarations,
-    build_file_declarations_from_state, first_precise, parse_and_collect_with_declarations,
+    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
+    build_file_declarations, build_file_declarations_from_state, first_precise,
+    parse_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{CodeUnit, GlobalUsageDefinitionIndex, UsageFactsIndex};
@@ -677,18 +678,19 @@ fn simple_type_name(type_text: &str) -> Option<&str> {
 /// Build the whole Scala `caller -> callee` edge set in a single inverted pass
 /// over the workspace.
 /// `nodes`/`keep_file` mirror the Go builder.
-pub(super) fn build_scala_edges<F>(
+pub(super) fn build_scala_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     scala: &ScalaAnalyzer,
     graph: &ScalaEdgeGraph,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_scala::LANGUAGE.into();
-    build_edges(&graph.files, keep_file, |file| {
+    build_edge_output(&graph.files, keep_file, |file| {
         let state = graph.file_states.get(file);
         let declarations = state
             .map(build_file_declarations_from_state)

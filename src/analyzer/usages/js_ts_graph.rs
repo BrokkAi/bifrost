@@ -88,6 +88,23 @@ where
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
+pub(crate) fn build_jsts_usage_edge_weights<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdgeWeights>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = JsTsEdgeResolver::try_new(analyzer)?;
+    for language in [Language::TypeScript, Language::JavaScript] {
+        if !analyzed_files_for_language(analyzer, language).is_empty() {
+            let _ = prewarm_cached_jsts_index(analyzer, language);
+        }
+    }
+    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+}
+
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
 /// analyzer behind `analyzer`, building it on first use. `None` when the analyzer does
 /// not expose the matching JS/TS analyzer.
@@ -273,7 +290,8 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             if analyzed_files_for_language(analyzer, language).is_empty() {
                 continue;
             }
-            let result = inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
+            let result: UsageEdges =
+                inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
             for (key, sites) in result.edges {
                 edges.entry(key).or_default().extend(sites);
             }
@@ -292,6 +310,43 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
         }
 
         UsageEdges {
+            edges,
+            truncated,
+            unproven_inbound,
+        }
+    }
+
+    fn build_edge_weights<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdgeWeights
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        let mut edges = std::collections::BTreeMap::new();
+        let mut truncated = std::collections::BTreeMap::new();
+        let mut unproven_inbound = std::collections::BTreeMap::new();
+
+        for language in [Language::TypeScript, Language::JavaScript] {
+            if analyzed_files_for_language(analyzer, language).is_empty() {
+                continue;
+            }
+            let result: UsageEdgeWeights =
+                inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
+            for (key, weight) in result.edges {
+                *edges.entry(key).or_insert(0) += weight;
+            }
+            for (callee, total) in result.truncated {
+                *truncated.entry(callee).or_insert(0) += total;
+            }
+            for (callee, total) in result.unproven_inbound {
+                *unproven_inbound.entry(callee).or_insert(0) += total;
+            }
+        }
+
+        UsageEdgeWeights {
             edges,
             truncated,
             unproven_inbound,

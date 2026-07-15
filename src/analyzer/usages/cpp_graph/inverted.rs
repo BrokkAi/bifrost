@@ -30,7 +30,8 @@ use super::resolver::{
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
+    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output, first_precise,
+    parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text};
@@ -39,18 +40,19 @@ use tree_sitter::Node;
 
 /// Build the whole C++ `caller -> callee` edge set in a single inverted pass over
 /// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
-pub(super) fn build_cpp_edges<F>(
+pub(super) fn build_cpp_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     files: &[ProjectFile],
     visibility: &VisibilityIndex,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_cpp::LANGUAGE.into();
-    build_edges(files, keep_file, |file| {
+    build_edge_output(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = CppScan {
                 analyzer,

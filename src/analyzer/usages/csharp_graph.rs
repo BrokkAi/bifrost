@@ -22,7 +22,7 @@ pub(in crate::analyzer::usages) use resolver::{
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::csharp_graph::shared::{CSharpEdgeResolver, CSharpQueryResolver};
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{
@@ -41,6 +41,18 @@ where
 {
     let resolver = CSharpEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_csharp_usage_edge_weights<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdgeWeights>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = CSharpEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
 #[derive(Default)]

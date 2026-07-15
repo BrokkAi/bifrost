@@ -2,7 +2,7 @@ use super::extractor::{ScanState, scan_file};
 use super::inverted;
 use super::resolver::{TargetSpec, VisibilityIndex};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
@@ -123,6 +123,25 @@ impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
         // index is seeded with every in-scope caller file as a root (mirroring the
         // forward scan, which builds it from the query's candidate files). Built here
         // rather than at construction so the trait's `try_new` needs no `keep_file`.
+        let roots: HashSet<ProjectFile> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let visibility = VisibilityIndex::build(self.cpp, analyzer, &roots);
+        inverted::build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
+    }
+
+    fn build_edge_weights<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdgeWeights
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
         let roots: HashSet<ProjectFile> = self
             .files
             .iter()

@@ -4,7 +4,7 @@ mod inverted;
 mod resolver;
 
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::python_graph::extractor::{build_python_graph, scan_files_for_seeds};
@@ -37,6 +37,18 @@ where
 {
     let resolver = PythonEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_python_usage_edge_weights<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdgeWeights>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = PythonEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
 pub(crate) struct PythonQueryResolver<'a> {
@@ -147,6 +159,18 @@ impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        inverted::build_python_edges(analyzer, self.py, nodes, keep_file)
+    }
+
+    fn build_edge_weights<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {

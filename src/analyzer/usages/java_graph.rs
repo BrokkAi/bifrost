@@ -7,7 +7,7 @@ mod return_type;
 mod shared;
 
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
@@ -30,6 +30,18 @@ where
 {
     let resolver = JavaEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_java_usage_edge_weights<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdgeWeights>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = JavaEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
