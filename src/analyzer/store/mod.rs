@@ -558,9 +558,7 @@ impl AnalyzerStore {
                  WHERE blob_oid = ?1 AND lang = ?2 AND generation <> ?3",
             )?;
             let mut insert = tx.prepare(
-                "INSERT OR IGNORE INTO blobs(
-                   blob_oid, lang, generation, cascade_logical_rows, cascade_payload_bytes
-                 ) VALUES(?1, ?2, ?3, 1, 0)",
+                "INSERT OR IGNORE INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
             )?;
             let mut seen = HashSet::default();
             for oid in oids {
@@ -1034,17 +1032,25 @@ impl AnalyzerStore {
                 .fetch_add(1, Ordering::SeqCst);
             require_current_generation(&tx, lang, generation)?;
         }
-        let mut stored_cost_statement = tx.prepare_cached(stored_blob_cascade_cost_sql())?;
+        let stored_costs = self.stored_blob_cascade_costs(&tx, prepared)?;
         let mut fallback_cost_statement =
             tx.prepare_cached(persisted_blob_mutation_cost_fallback_sql())?;
         let mut cost = PersistedMutationCost::default();
-        for blob in prepared {
-            let replaced = self.persisted_blob_mutation_cost(
-                &mut stored_cost_statement,
-                &mut fallback_cost_statement,
-                blob.oid_text.as_str(),
-                blob.lang(),
-            )?;
+        for (blob, stored) in prepared.iter().zip(stored_costs) {
+            let replaced = match stored {
+                StoredCascadeCost::Missing => PersistedMutationCost::default(),
+                StoredCascadeCost::Known(cost) => cost,
+                StoredCascadeCost::Legacy => {
+                    #[cfg(test)]
+                    self.replacement_cost_fallback_queries
+                        .fetch_add(1, Ordering::SeqCst);
+                    persisted_blob_mutation_cost_fallback_statement(
+                        &mut fallback_cost_statement,
+                        blob.oid_text.as_str(),
+                        blob.lang(),
+                    )?
+                }
+            };
             cost.logical_rows = cost
                 .logical_rows
                 .saturating_add(blob.logical_rows())
@@ -1054,7 +1060,6 @@ impl AnalyzerStore {
                 .saturating_add(blob.payload_bytes())
                 .saturating_add(replaced.payload_bytes);
         }
-        drop(stored_cost_statement);
         drop(fallback_cost_statement);
         if prepared.len() > 1
             && (prepared.len() > limits.max_blobs
@@ -1076,26 +1081,16 @@ impl AnalyzerStore {
         Ok(cost)
     }
 
-    fn persisted_blob_mutation_cost(
+    fn stored_blob_cascade_costs(
         &self,
-        stored_statement: &mut rusqlite::Statement<'_>,
-        fallback_statement: &mut rusqlite::Statement<'_>,
-        oid: &str,
-        lang: &str,
-    ) -> Result<PersistedMutationCost> {
-        #[cfg(test)]
-        self.replacement_cost_lookup_queries
-            .fetch_add(1, Ordering::SeqCst);
-        match stored_blob_cascade_cost_statement(stored_statement, oid, lang)? {
-            StoredCascadeCost::Missing => Ok(PersistedMutationCost::default()),
-            StoredCascadeCost::Known(cost) => Ok(cost),
-            StoredCascadeCost::Legacy => {
-                #[cfg(test)]
-                self.replacement_cost_fallback_queries
-                    .fetch_add(1, Ordering::SeqCst);
-                persisted_blob_mutation_cost_fallback_statement(fallback_statement, oid, lang)
-            }
-        }
+        conn: &Connection,
+        prepared: &[PreparedParsedBlob],
+    ) -> Result<Vec<StoredCascadeCost>> {
+        stored_blob_cascade_costs_conn(conn, prepared, || {
+            #[cfg(test)]
+            self.replacement_cost_lookup_queries
+                .fetch_add(1, Ordering::SeqCst);
+        })
     }
 
     #[cfg(test)]
@@ -2170,7 +2165,7 @@ impl PreparedParsedBlob {
         self.mutation_payload_bytes
     }
 
-    fn cascade_payload_bytes(&self) -> usize {
+    fn persisted_payload_bytes(&self) -> usize {
         self.payload_bytes.saturating_sub(self.state.source.len())
     }
 
@@ -2410,7 +2405,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     type_identifiers.sort();
 
     let logical_rows = saturating_sum([
-        2,
+        3,
         units.len(),
         ranges.len(),
         signatures.len(),
@@ -2499,16 +2494,8 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         params![oid, lang],
     )?;
     tx.execute(
-        "INSERT INTO blobs(
-           blob_oid, lang, generation, cascade_logical_rows, cascade_payload_bytes
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-        params![
-            oid,
-            lang,
-            blob.generation.0,
-            usize_to_i64(blob.logical_rows())?,
-            usize_to_i64(blob.cascade_payload_bytes())?,
-        ],
+        "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
+        params![oid, lang, blob.generation.0],
     )?;
     {
         let mut stmt = tx.prepare(
@@ -2654,6 +2641,7 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
             "prepared blob {oid}/{lang} failed post-write integrity validation"
         )));
     }
+    insert_blob_payload_cost_tx(tx, oid, lang, blob.persisted_payload_bytes())?;
     Ok(())
 }
 
@@ -2754,7 +2742,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
         scala_trait_count,
     };
     insert_blob_meta(tx, &oid, lang, adapter, state, units.len(), side_counts)?;
-    update_blob_cascade_cost_tx(tx, &oid, lang)?;
+    update_blob_payload_cost_tx(tx, &oid, lang)?;
     Ok(())
 }
 
@@ -4884,41 +4872,86 @@ fn contains_parsed_blob_conn(conn: &Connection, oid: Oid, lang: &str) -> Result<
         .is_some())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredCascadeCost {
     Missing,
     Legacy,
     Known(PersistedMutationCost),
 }
 
-fn stored_blob_cascade_cost_statement(
-    statement: &mut rusqlite::Statement<'_>,
-    oid: &str,
-    lang: &str,
-) -> Result<StoredCascadeCost> {
-    let stored = statement
-        .query_row(params![oid, lang], |row| {
+fn stored_blob_cascade_costs_conn(
+    conn: &Connection,
+    prepared: &[PreparedParsedBlob],
+    mut on_query: impl FnMut(),
+) -> Result<Vec<StoredCascadeCost>> {
+    const KEYS_PER_QUERY: usize = PersistBatchLimits::PRODUCTION.max_blobs;
+    let mut costs = Vec::with_capacity(prepared.len());
+    for chunk in prepared.chunks(KEYS_PER_QUERY) {
+        let mut chunk_costs = vec![StoredCascadeCost::Missing; chunk.len()];
+        let sql = stored_blob_cascade_costs_sql(chunk.len());
+        on_query();
+        let mut statement = conn.prepare_cached(&sql)?;
+        let parameters = chunk
+            .iter()
+            .flat_map(|blob| [blob.oid_text.as_str(), blob.lang.as_str()]);
+        let rows = statement.query_map(params_from_iter(parameters), |row| {
             Ok((
-                row.get::<_, Option<usize>>(0)?,
-                row.get::<_, Option<usize>>(1)?,
+                row.get::<_, usize>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, usize>(3)?,
+                row.get::<_, Option<usize>>(4)?,
             ))
-        })
-        .optional()?;
-    Ok(match stored {
-        None => StoredCascadeCost::Missing,
-        Some((Some(logical_rows), Some(payload_bytes))) => {
-            StoredCascadeCost::Known(PersistedMutationCost {
-                logical_rows,
-                payload_bytes,
-            })
+        })?;
+        for row in rows {
+            let (ordinal, blob_present, meta_present, logical_rows, payload_bytes) = row?;
+            chunk_costs[ordinal] = match (blob_present, meta_present, payload_bytes) {
+                (false, _, _) => StoredCascadeCost::Missing,
+                (true, false, _) => StoredCascadeCost::Known(PersistedMutationCost {
+                    logical_rows: 1,
+                    payload_bytes: 0,
+                }),
+                (true, true, Some(payload_bytes)) => {
+                    StoredCascadeCost::Known(PersistedMutationCost {
+                        logical_rows,
+                        payload_bytes,
+                    })
+                }
+                (true, true, None) => StoredCascadeCost::Legacy,
+            };
         }
-        Some(_) => StoredCascadeCost::Legacy,
-    })
+        costs.extend(chunk_costs);
+    }
+    Ok(costs)
 }
 
-fn stored_blob_cascade_cost_sql() -> &'static str {
-    "SELECT cascade_logical_rows, cascade_payload_bytes
-     FROM blobs
-     WHERE blob_oid = ?1 AND lang = ?2"
+fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
+    assert!((1..=PersistBatchLimits::PRODUCTION.max_blobs).contains(&key_count));
+    let requested = (0..key_count)
+        .map(|ordinal| format!("({ordinal}, ?, ?)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "WITH requested(ordinal, blob_oid, lang) AS (VALUES {requested})
+         SELECT requested.ordinal,
+           blob.blob_oid IS NOT NULL,
+           meta.blob_oid IS NOT NULL,
+           CASE WHEN blob.blob_oid IS NULL THEN 0
+             WHEN meta.blob_oid IS NULL THEN 1
+             ELSE 2 + meta.stored_unit_count + meta.range_count + meta.signature_count
+               + meta.signature_metadata_count + meta.supertype_count + meta.child_count
+               + meta.import_statement_count + meta.import_count + meta.type_identifier_count
+               + meta.ruby_dispatch_count + meta.scala_trait_count
+               + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END,
+           costs.payload_bytes
+         FROM requested
+         LEFT JOIN blobs AS blob
+           ON blob.blob_oid = requested.blob_oid AND blob.lang = requested.lang
+         LEFT JOIN blob_meta AS meta
+           ON meta.blob_oid = blob.blob_oid AND meta.lang = blob.lang
+         LEFT JOIN blob_payload_costs AS costs
+           ON costs.blob_oid = meta.blob_oid AND costs.lang = meta.lang"
+    )
 }
 
 fn persisted_blob_mutation_cost_fallback_statement(
@@ -4944,23 +4977,27 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + meta.import_statement_count + meta.import_count + meta.type_identifier_count
            + meta.ruby_dispatch_count + meta.scala_trait_count END,
        CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
-         length(meta.content_package)
+         length(CAST(meta.content_package AS BLOB))
            + COALESCE((SELECT SUM(
-               length(short_name) + length(identifier) + length(content_qualifier)
-               + COALESCE(length(exact_fqn), 0) + COALESCE(length(normalized_fqn), 0)
-               + COALESCE(length(simple_type_name), 0) + COALESCE(length(signature), 0)
+               length(CAST(short_name AS BLOB)) + length(CAST(identifier AS BLOB))
+               + length(CAST(content_qualifier AS BLOB))
+               + COALESCE(length(CAST(exact_fqn AS BLOB)), 0)
+               + COALESCE(length(CAST(normalized_fqn AS BLOB)), 0)
+               + COALESCE(length(CAST(simple_type_name AS BLOB)), 0)
+               + COALESCE(length(CAST(signature AS BLOB)), 0)
              ) FROM code_units WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(text)) FROM unit_signatures
+           + COALESCE((SELECT SUM(length(CAST(text AS BLOB))) FROM unit_signatures
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(metadata)) FROM unit_signature_metadata
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(raw) + length(lookup_path)) FROM unit_supertypes
+           + COALESCE((SELECT SUM(length(CAST(raw AS BLOB))
+               + length(CAST(lookup_path AS BLOB))) FROM unit_supertypes
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(statement)) FROM import_statements
+           + COALESCE((SELECT SUM(length(CAST(statement AS BLOB))) FROM import_statements
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(info)) FROM import_details
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(type_identifier)) FROM type_identifiers
+           + COALESCE((SELECT SUM(length(CAST(type_identifier AS BLOB))) FROM type_identifiers
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0) END
      FROM blobs AS blob
      LEFT JOIN blob_meta AS meta
@@ -4968,23 +5005,26 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
      WHERE blob.blob_oid = ?1 AND blob.lang = ?2"
 }
 
-fn update_blob_cascade_cost_tx(tx: &Transaction<'_>, oid: &str, lang: &str) -> Result<()> {
+fn insert_blob_payload_cost_tx(
+    tx: &Transaction<'_>,
+    oid: &str,
+    lang: &str,
+    payload_bytes: usize,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes)
+         VALUES(?1, ?2, ?3)",
+        params![oid, lang, usize_to_i64(payload_bytes)?],
+    )?;
+    Ok(())
+}
+
+fn update_blob_payload_cost_tx(tx: &Transaction<'_>, oid: &str, lang: &str) -> Result<()> {
     let cost = {
         let mut statement = tx.prepare_cached(persisted_blob_mutation_cost_fallback_sql())?;
         persisted_blob_mutation_cost_fallback_statement(&mut statement, oid, lang)?
     };
-    tx.execute(
-        "UPDATE blobs
-         SET cascade_logical_rows = ?3, cascade_payload_bytes = ?4
-         WHERE blob_oid = ?1 AND lang = ?2",
-        params![
-            oid,
-            lang,
-            usize_to_i64(cost.logical_rows)?,
-            usize_to_i64(cost.payload_bytes)?,
-        ],
-    )?;
-    Ok(())
+    insert_blob_payload_cost_tx(tx, oid, lang, cost.payload_bytes)
 }
 
 fn parsed_blob_keys_conn(
@@ -5038,17 +5078,19 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
     let stale_blobs = {
         let mut stmt = tx.prepare(
             "SELECT blobs.blob_oid, blobs.lang,
-                    COALESCE(blobs.cascade_logical_rows,
-                      1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
-                        1 + meta.stored_unit_count + meta.range_count + meta.signature_count
-                          + meta.signature_metadata_count + meta.supertype_count + meta.child_count
-                          + meta.import_statement_count + meta.import_count
-                          + meta.type_identifier_count + meta.ruby_dispatch_count
-                          + meta.scala_trait_count END) AS logical_rows
+                    1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
+                      1 + meta.stored_unit_count + meta.range_count + meta.signature_count
+                        + meta.signature_metadata_count + meta.supertype_count + meta.child_count
+                        + meta.import_statement_count + meta.import_count
+                        + meta.type_identifier_count + meta.ruby_dispatch_count
+                        + meta.scala_trait_count
+                        + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END AS logical_rows
              FROM blobs
              LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
              LEFT JOIN blob_meta AS meta
                ON meta.blob_oid = blobs.blob_oid AND meta.lang = blobs.lang
+             LEFT JOIN blob_payload_costs AS costs
+               ON costs.blob_oid = meta.blob_oid AND costs.lang = meta.lang
              WHERE blobs.generation <> COALESCE(epochs.generation, 0)
              ORDER BY blobs.lang, blobs.generation, blobs.blob_oid",
         )?;
@@ -6206,8 +6248,7 @@ mod tests {
             .lock()
             .expect("store mutex")
             .execute(
-                "UPDATE blobs SET cascade_logical_rows = NULL, cascade_payload_bytes = NULL
-                 WHERE blob_oid = ?1 AND lang = 'java'",
+                "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = 'java'",
                 [oid.to_string()],
             )
             .unwrap();
@@ -6248,6 +6289,7 @@ mod tests {
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let state = Arc::new(parse_state(&JavaAdapter, &file));
         let store = AnalyzerStore::open_in_memory().unwrap();
+        store.reset_replacement_cost_lookup_queries_for_test();
         let prepared = (0..PREPARED_BLOBS)
             .map(|index| {
                 let oid =
@@ -6277,10 +6319,15 @@ mod tests {
         assert_eq!(stats.failed_transaction_attempts, 0);
         assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
         assert_eq!(store.parsed_blob_transaction_starts_for_test(), 5);
+        assert_eq!(
+            store.replacement_cost_lookup_queries_for_test(),
+            5,
+            "each at-most-64-blob writer transaction must execute one VALUES lookup"
+        );
     }
 
     #[test]
-    fn prepared_replacement_cost_is_looked_up_once_per_blob_inside_writer_transaction() {
+    fn prepared_replacement_cost_is_looked_up_once_per_writer_transaction() {
         const REPLACEMENTS: usize = 8;
         let temp = tempfile::TempDir::new().unwrap();
         let old_file = write_file(temp.path(), "Old.java", "class Old {}\n");
@@ -6323,10 +6370,7 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        let expected_cascade = (
-            prepared[0].logical_rows(),
-            prepared[0].cascade_payload_bytes(),
-        );
+        let expected_payload_bytes = prepared[0].persisted_payload_bytes();
 
         store.reset_replacement_cost_lookup_queries_for_test();
         store.reset_prepared_generation_lookup_queries_for_test();
@@ -6342,24 +6386,106 @@ mod tests {
                 .lock()
                 .expect("store mutex")
                 .query_row(
-                    "SELECT cascade_logical_rows, cascade_payload_bytes
-                     FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                    "SELECT payload_bytes FROM blob_payload_costs
+                     WHERE blob_oid = ?1 AND lang = 'java'",
                     [oids[0].to_string()],
-                    |row| Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?)),
+                    |row| row.get::<_, usize>(0),
                 )
                 .unwrap(),
-            expected_cascade
+            expected_payload_bytes
         );
         assert_eq!(
             store.replacement_cost_lookup_queries_for_test(),
-            REPLACEMENTS,
-            "replacement costs must be fetched once per blob, without a separate prepass"
+            1,
+            "replacement roots must be fetched once as an ordinal-preserving set"
         );
         assert_eq!(store.replacement_cost_fallback_queries_for_test(), 0);
         assert_eq!(
             store.prepared_generation_lookup_queries_for_test(),
             1,
             "one language generation must be validated once per persistence batch"
+        );
+    }
+
+    #[test]
+    fn unicode_legacy_replacements_use_one_set_lookup_and_reused_fallback() {
+        const REPLACEMENTS: usize = 3;
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Unicode.java",
+            "package café; class Résumé { String naïve; }\n",
+        );
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation_a = store
+            .ensure_language_epoch_value("java", "unicode-legacy-a")
+            .unwrap();
+        let oids = (0..REPLACEMENTS)
+            .map(|index| oid_for(format!("unicode-legacy-{index}").as_bytes()))
+            .collect::<Vec<_>>();
+        for oid in &oids {
+            store
+                .write_parsed_blob_at_generation(*oid, "java", generation_a, &JavaAdapter, &state)
+                .unwrap();
+        }
+        let expected = AnalyzerStore::prepare_parsed_blob(
+            oids[0],
+            "java",
+            generation_a,
+            &JavaAdapter,
+            Arc::clone(&state),
+        )
+        .unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute("DELETE FROM blob_payload_costs WHERE lang = 'java'", [])
+            .unwrap();
+        let mut fallback_statement = conn
+            .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
+            .unwrap();
+        assert_eq!(
+            persisted_blob_mutation_cost_fallback_statement(
+                &mut fallback_statement,
+                oids[0].to_string().as_str(),
+                "java",
+            )
+            .unwrap(),
+            PersistedMutationCost {
+                logical_rows: expected.logical_rows().saturating_sub(1),
+                payload_bytes: expected.persisted_payload_bytes(),
+            },
+            "SQLite length() must count UTF-8 bytes like Rust String::len"
+        );
+        drop(fallback_statement);
+        drop(conn);
+
+        let generation_b = store
+            .ensure_language_epoch_value("java", "unicode-legacy-b")
+            .unwrap();
+        let prepared = oids
+            .iter()
+            .map(|oid| {
+                AnalyzerStore::prepare_parsed_blob(
+                    *oid,
+                    "java",
+                    generation_b,
+                    &JavaAdapter,
+                    Arc::clone(&state),
+                )
+                .unwrap()
+            })
+            .collect();
+        store.reset_replacement_cost_lookup_queries_for_test();
+        let (outcomes, stats) =
+            store.persist_prepared_blobs(prepared, PersistBatchLimits::PRODUCTION);
+
+        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
+        assert_eq!(stats.transactions, 1);
+        assert_eq!(stats.committed_blobs, REPLACEMENTS);
+        assert_eq!(store.replacement_cost_lookup_queries_for_test(), 1);
+        assert_eq!(
+            store.replacement_cost_fallback_queries_for_test(),
+            REPLACEMENTS
         );
     }
 
@@ -6422,7 +6548,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_cost_distinguishes_complete_root_only_and_missing_keys() {
+    fn replacement_cost_set_preserves_duplicate_order_and_distinguishes_all_states() {
         let temp = tempfile::TempDir::new().unwrap();
         let old_file = write_file(temp.path(), "Old.java", "class Old { int value; }\n");
         let old_state = Arc::new(parse_state(&JavaAdapter, &old_file));
@@ -6445,14 +6571,17 @@ mod tests {
         store
             .register_blobs(&[root_only_oid], "java", generation)
             .unwrap();
-        let complete_prepared = AnalyzerStore::prepare_parsed_blob(
-            complete_oid,
-            "java",
-            generation,
-            &JavaAdapter,
-            Arc::clone(&old_state),
-        )
-        .unwrap();
+        let prepare = |oid| {
+            AnalyzerStore::prepare_parsed_blob(
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                Arc::clone(&old_state),
+            )
+            .unwrap()
+        };
+        let complete_prepared = prepare(complete_oid);
         let expected_complete = PersistedMutationCost {
             logical_rows: complete_prepared.logical_rows(),
             // Source bytes are part of the transient insertion budget but are not
@@ -6463,102 +6592,113 @@ mod tests {
         };
         store.reset_replacement_cost_lookup_queries_for_test();
         let conn = store.conn.lock().expect("store mutex");
-        let mut stored_statement = conn.prepare_cached(stored_blob_cascade_cost_sql()).unwrap();
-        let mut fallback_statement = conn
-            .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
-            .unwrap();
+        let requested = vec![
+            prepare(missing_oid),
+            complete_prepared,
+            prepare(root_only_oid),
+            prepare(complete_oid),
+        ];
         assert_eq!(
-            store
-                .persisted_blob_mutation_cost(
-                    &mut stored_statement,
-                    &mut fallback_statement,
-                    complete_oid.to_string().as_str(),
-                    "java",
-                )
-                .unwrap(),
-            expected_complete
+            store.stored_blob_cascade_costs(&conn, &requested).unwrap(),
+            vec![
+                StoredCascadeCost::Missing,
+                StoredCascadeCost::Known(expected_complete),
+                StoredCascadeCost::Known(PersistedMutationCost {
+                    logical_rows: 1,
+                    payload_bytes: 0,
+                }),
+                StoredCascadeCost::Known(expected_complete),
+            ],
+            "the ordinal-bearing VALUES relation must preserve order and duplicates"
         );
-        assert_eq!(
-            store
-                .persisted_blob_mutation_cost(
-                    &mut stored_statement,
-                    &mut fallback_statement,
-                    root_only_oid.to_string().as_str(),
-                    "java",
-                )
-                .unwrap(),
-            PersistedMutationCost {
-                logical_rows: 1,
-                payload_bytes: 0,
-            }
-        );
-        assert_eq!(
-            store
-                .persisted_blob_mutation_cost(
-                    &mut stored_statement,
-                    &mut fallback_statement,
-                    missing_oid.to_string().as_str(),
-                    "java",
-                )
-                .unwrap(),
-            PersistedMutationCost::default()
-        );
-        assert_eq!(store.replacement_cost_lookup_queries_for_test(), 3);
+        assert_eq!(store.replacement_cost_lookup_queries_for_test(), 1);
         assert_eq!(store.replacement_cost_fallback_queries_for_test(), 0);
 
-        drop(stored_statement);
-        drop(fallback_statement);
         conn.execute(
-            "UPDATE blobs SET cascade_payload_bytes = NULL
+            "UPDATE blobs
+             SET cascade_logical_rows = 999, cascade_payload_bytes = 999
              WHERE blob_oid = ?1 AND lang = 'java'",
             [complete_oid.to_string()],
         )
         .unwrap();
+        conn.execute(
+            "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = 'java'",
+            [complete_oid.to_string()],
+        )
+        .unwrap();
         store.reset_replacement_cost_lookup_queries_for_test();
-        let mut stored_statement = conn.prepare_cached(stored_blob_cascade_cost_sql()).unwrap();
+        let legacy_request = vec![prepare(complete_oid)];
+        assert_eq!(
+            store
+                .stored_blob_cascade_costs(&conn, &legacy_request)
+                .unwrap(),
+            vec![StoredCascadeCost::Legacy],
+            "non-NULL v5 columns are not trustworthy byte costs and must be ignored"
+        );
         let mut fallback_statement = conn
             .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
             .unwrap();
         assert_eq!(
-            store
-                .persisted_blob_mutation_cost(
-                    &mut stored_statement,
-                    &mut fallback_statement,
-                    complete_oid.to_string().as_str(),
-                    "java",
-                )
-                .unwrap(),
-            expected_complete,
-            "a partially NULL migrated row must use the legacy aggregate"
+            persisted_blob_mutation_cost_fallback_statement(
+                &mut fallback_statement,
+                complete_oid.to_string().as_str(),
+                "java",
+            )
+            .unwrap(),
+            PersistedMutationCost {
+                logical_rows: expected_complete.logical_rows.saturating_sub(1),
+                payload_bytes: expected_complete.payload_bytes,
+            },
+            "a migrated parsed row without payload cost must use the legacy aggregate"
         );
         assert_eq!(store.replacement_cost_lookup_queries_for_test(), 1);
-        assert_eq!(store.replacement_cost_fallback_queries_for_test(), 1);
     }
 
     #[test]
-    fn replacement_cost_fast_path_is_one_pk_search_and_legacy_fallback_is_indexed() {
+    fn replacement_cost_set_uses_only_bounded_primary_key_probes() {
         let store = AnalyzerStore::open_in_memory().unwrap();
-        let params = ["oid-a", "java"];
         let conn = store.conn.lock().expect("store mutex");
-        let explain = |query: &str| {
+        let explain = |query: &str, parameters: &[&str]| {
             let sql = format!("EXPLAIN QUERY PLAN {query}");
             let mut statement = conn.prepare(&sql).unwrap();
             statement
-                .query_map(params, |row| row.get::<_, String>(3))
+                .query_map(params_from_iter(parameters.iter().copied()), |row| {
+                    row.get::<_, String>(3)
+                })
                 .unwrap()
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap()
         };
 
-        let fast_plan = explain(stored_blob_cascade_cost_sql());
-        assert_eq!(
-            fast_plan.len(),
-            1,
-            "unexpected fast-path plan: {fast_plan:#?}"
+        let fast_plan = explain(
+            &stored_blob_cascade_costs_sql(3),
+            &["oid-a", "java", "oid-b", "java", "oid-a", "java"],
         );
-        assert!(fast_plan[0].contains("SEARCH blobs USING PRIMARY KEY"));
+        for table in ["blob", "meta", "costs"] {
+            assert!(
+                fast_plan
+                    .iter()
+                    .any(|detail| detail.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                "set lookup for {table} must use its composite primary key: {fast_plan:#?}"
+            );
+            assert!(
+                fast_plan
+                    .iter()
+                    .all(|detail| !detail.contains(&format!("SCAN {table}"))),
+                "set lookup must not scan persisted table {table}: {fast_plan:#?}"
+            );
+        }
+        assert!(
+            fast_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE")),
+            "set lookup must not materialize grouping or ordering state: {fast_plan:#?}"
+        );
 
-        let fallback_plan = explain(persisted_blob_mutation_cost_fallback_sql());
+        let fallback_plan = explain(
+            persisted_blob_mutation_cost_fallback_sql(),
+            &["oid-a", "java"],
+        );
         for table in [
             "blob",
             "meta",

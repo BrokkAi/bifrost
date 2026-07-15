@@ -15,7 +15,7 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
 #[cfg(test)]
-const CURRENT_MIGRATION_VERSION: i64 = 5;
+const CURRENT_MIGRATION_VERSION: i64 = 6;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -24,6 +24,8 @@ const ANALYZER_GENERATIONS_SQL: &str =
     include_str!("../migrations/cache/0004-analyzer-generations.sql");
 const ANALYZER_BLOB_CASCADE_COSTS_SQL: &str =
     include_str!("../migrations/cache/0005-analyzer-blob-cascade-costs.sql");
+const ANALYZER_BLOB_PAYLOAD_COSTS_SQL: &str =
+    include_str!("../migrations/cache/0006-analyzer-blob-payload-costs.sql");
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
     Migrations::new(vec![
         M::up(CURRENT_BASELINE_SQL),
@@ -31,6 +33,7 @@ static CACHE_MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
         M::up(FORWARD_FACTS_SQL),
         M::up(ANALYZER_GENERATIONS_SQL),
         M::up(ANALYZER_BLOB_CASCADE_COSTS_SQL),
+        M::up(ANALYZER_BLOB_PAYLOAD_COSTS_SQL),
     ])
 });
 static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
@@ -52,6 +55,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply analyzer generations migration");
     conn.execute_batch(ANALYZER_BLOB_CASCADE_COSTS_SQL)
         .expect("apply analyzer blob cascade costs migration");
+    conn.execute_batch(ANALYZER_BLOB_PAYLOAD_COSTS_SQL)
+        .expect("apply analyzer blob payload costs migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -438,6 +443,7 @@ mod tests {
             M::up(FORWARD_FACTS_SQL),
             M::up(ANALYZER_GENERATIONS_SQL),
             M::up(ANALYZER_BLOB_CASCADE_COSTS_SQL),
+            M::up(ANALYZER_BLOB_PAYLOAD_COSTS_SQL),
             M::up(sql),
         ])
     }
@@ -496,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_migrations_preserve_populated_v3_rows_with_lazy_cascade_costs() {
+    fn analyzer_migrations_preserve_populated_v3_rows_with_lazy_payload_costs() {
         let mut conn = Connection::open_in_memory().unwrap();
         configure_connection(&mut conn).unwrap();
         Migrations::new(vec![
@@ -545,7 +551,7 @@ mod tests {
 
         CACHE_MIGRATIONS.to_latest(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 5);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 6);
         assert_eq!(
             conn.query_row("SELECT generation FROM blobs", [], |row| row
                 .get::<_, i64>(0))
@@ -553,14 +559,22 @@ mod tests {
             0
         );
         assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM blob_payload_costs", [], |row| row
+                .get::<_, i64>(0),)
+                .unwrap(),
+            0,
+            "the migration must preserve populated analyzer rows for lazy fallback"
+        );
+        assert_eq!(
             conn.query_row(
-                "SELECT cascade_logical_rows, cascade_payload_bytes FROM blobs",
+                "SELECT COUNT(*) FROM pragma_table_info('blobs')
+                 WHERE name IN ('cascade_logical_rows', 'cascade_payload_bytes')",
                 [],
-                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            (None, None),
-            "the migration must preserve populated analyzer rows for lazy fallback"
+            2,
+            "the published v5 columns must remain present after additive v6 migration"
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM blob_meta", [], |row| row
@@ -595,6 +609,73 @@ mod tests {
             })
             .unwrap(),
             0
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn populated_v5_cache_migrates_additively_to_v6() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        Migrations::new(vec![
+            M::up(CURRENT_BASELINE_SQL),
+            M::up(PATH_SYMBOL_UNITS_SQL),
+            M::up(FORWARD_FACTS_SQL),
+            M::up(ANALYZER_GENERATIONS_SQL),
+            M::up(ANALYZER_BLOB_CASCADE_COSTS_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        let analyzer_oid = "2222222222222222222222222222222222222222";
+        conn.execute(
+            "INSERT INTO blobs(
+               blob_oid, lang, generation, cascade_logical_rows, cascade_payload_bytes
+             ) VALUES(?1, 'rust', 7, 3, 11)",
+            [analyzer_oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blob_meta(
+               blob_oid, lang, contains_tests, content_package, stored_unit_count,
+               range_count, signature_count, signature_metadata_count, supertype_count,
+               child_count, import_statement_count, import_count, type_identifier_count,
+               ruby_dispatch_count, scala_trait_count, is_complete
+             ) VALUES(?1, 'rust', 0, 'unicode_é', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)",
+            [analyzer_oid],
+        )
+        .unwrap();
+
+        CACHE_MIGRATIONS.to_latest(&mut conn).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 6);
+        assert_eq!(
+            conn.query_row(
+                "SELECT generation, cascade_logical_rows, cascade_payload_bytes FROM blobs",
+                [],
+                |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?
+                )),
+            )
+            .unwrap(),
+            (7, 3, 11),
+            "v6 must not reinterpret or rewrite already-applied v5 state"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM blob_payload_costs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "existing parsed blobs intentionally enter v6 in legacy-fallback state"
+        );
+        assert_eq!(
+            conn.query_row("SELECT content_package FROM blob_meta", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "unicode_é"
         );
         assert!(current_schema_is_valid(&conn).unwrap());
     }
@@ -724,7 +805,7 @@ mod tests {
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 6);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 7);
         assert_eq!(analyzer_count, 1);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
@@ -773,7 +854,7 @@ mod tests {
         writer.rollback().unwrap();
         migrations.to_latest(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 6);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 7);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
 
@@ -785,7 +866,7 @@ mod tests {
             ["2222222222222222222222222222222222222222"],
         )
         .unwrap();
-        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
 
         let err = migrate(&mut conn).unwrap_err();
 
@@ -796,7 +877,7 @@ mod tests {
             err.contains("DatabaseTooFarAhead"),
             "unexpected error: {err}"
         );
-        assert_eq!(cache_migration_version(&conn).unwrap(), 6);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 7);
         assert_eq!(analyzer_count, 1);
     }
 
