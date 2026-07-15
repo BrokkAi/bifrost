@@ -49,10 +49,10 @@ impl RustReferenceContext {
     /// or a free function imported via `use path::func;` (the binder classifies
     /// the latter as a namespace whose resolved value is the function's own fqn).
     pub fn resolve_bare(&self, name: &str) -> Option<&str> {
-        self.same_file
+        self.named
             .get(name)
-            .or_else(|| self.named.get(name))
             .or_else(|| self.namespace.get(name))
+            .or_else(|| self.same_file.get(name))
             .or_else(|| self.glob.get(name))
             .map(String::as_str)
     }
@@ -95,9 +95,9 @@ impl RustReferenceContext {
         {
             return Some(package);
         }
-        self.same_file
+        self.named
             .get(path)
-            .or_else(|| self.named.get(path))
+            .or_else(|| self.same_file.get(path))
             .or_else(|| self.glob.get(path))
             .cloned()
     }
