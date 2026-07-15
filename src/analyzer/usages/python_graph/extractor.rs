@@ -781,13 +781,7 @@ fn collect_imported_factory_return_types(
             continue;
         };
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        let mut units = analyzer.definitions(&fqn).collect::<Vec<_>>();
-        if units.is_empty() {
-            units = py.resolve_direct_named_exported_fqn(&fqn);
-        }
-        if units.is_empty() {
-            units = py.resolve_exported_fqn(&fqn);
-        }
+        let units = py.resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect());
         for unit in units {
             if unit.is_function() {
                 if let Some(return_type) = callable_return_type_name(analyzer, &unit) {
@@ -834,18 +828,17 @@ fn collect_imported_class_method_return_types(
 
 fn callable_return_type_name(analyzer: &dyn IAnalyzer, callable: &CodeUnit) -> Option<String> {
     let source = analyzer.indexed_source(callable.source())?;
-    let mut ranges = analyzer.ranges(callable);
-    ranges.sort_by_key(|range| range.start_byte);
-    ranges.into_iter().find_map(|range| {
-        let declaration_source = source.get(range.start_byte..range.end_byte)?;
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .ok()?;
-        let tree = parser.parse(declaration_source, None)?;
-        let function = first_function_definition(tree.root_node())?;
-        factory_return_type(function, declaration_source)
-    })
+    declaration_source_slices(analyzer, callable, &source)
+        .into_iter()
+        .find_map(|declaration_source| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .ok()?;
+            let tree = parser.parse(declaration_source, None)?;
+            let function = first_function_definition(tree.root_node())?;
+            factory_return_type(function, declaration_source)
+        })
 }
 
 fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
@@ -947,13 +940,21 @@ fn declaration_source(
     declaration: &CodeUnit,
     file_source: &str,
 ) -> Option<String> {
+    let slices = declaration_source_slices(analyzer, declaration, file_source);
+    (!slices.is_empty()).then(|| slices.join("\n\n"))
+}
+
+fn declaration_source_slices<'a>(
+    analyzer: &dyn IAnalyzer,
+    declaration: &CodeUnit,
+    file_source: &'a str,
+) -> Vec<&'a str> {
     let mut ranges = analyzer.ranges(declaration);
     ranges.sort_by_key(|range| range.start_byte);
-    let slices = ranges
+    ranges
         .into_iter()
         .filter_map(|range| file_source.get(range.start_byte..range.end_byte))
-        .collect::<Vec<_>>();
-    (!slices.is_empty()).then(|| slices.join("\n\n"))
+        .collect()
 }
 
 fn collect_scope_facts_from_source(

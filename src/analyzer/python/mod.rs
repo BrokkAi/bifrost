@@ -143,27 +143,19 @@ impl PythonAnalyzer {
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
-
-        for code_unit in self.inner.top_level_declarations(file) {
-            let identifier = code_unit.identifier().trim();
-            if identifier.is_empty() || identifier.starts_with('_') {
-                continue;
-            }
-            let start_byte = self
-                .inner
-                .ranges(&code_unit)
-                .iter()
-                .map(|range| range.start_byte)
-                .min()
-                .unwrap_or(usize::MAX);
-            events.push((
-                start_byte,
-                identifier.to_string(),
-                ExportEntry::Local {
-                    local_name: identifier.to_string(),
-                },
-            ));
-        }
+        let declarations = self.inner.top_level_declarations(file);
+        Self::collect_local_export_events(
+            declarations.iter(),
+            |code_unit| {
+                self.inner
+                    .ranges(code_unit)
+                    .iter()
+                    .map(|range| range.start_byte)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            },
+            &mut events,
+        );
 
         if let Ok(source) = file.read_to_string()
             && let Some(tree) = parse_python_tree(&source)
@@ -186,30 +178,20 @@ impl PythonAnalyzer {
     ) -> ExportIndex {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
-        let mut local_names = HashSet::default();
-
-        for code_unit in &state.top_level_declarations {
-            let identifier = code_unit.identifier().trim();
-            if identifier.is_empty() || identifier.starts_with('_') {
-                continue;
-            }
-            local_names.insert(identifier.to_string());
-            let start_byte = state
-                .ranges
-                .get(code_unit)
-                .into_iter()
-                .flatten()
-                .map(|range| range.start_byte)
-                .min()
-                .unwrap_or(usize::MAX);
-            events.push((
-                start_byte,
-                identifier.to_string(),
-                ExportEntry::Local {
-                    local_name: identifier.to_string(),
-                },
-            ));
-        }
+        let mut local_names = Self::collect_local_export_events(
+            state.top_level_declarations.iter(),
+            |code_unit| {
+                state
+                    .ranges
+                    .get(code_unit)
+                    .into_iter()
+                    .flatten()
+                    .map(|range| range.start_byte)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            },
+            &mut events,
+        );
 
         if !state.top_level_declarations.iter().any(CodeUnit::is_module)
             && let Some(identifier) = module_name.rsplit('.').next()
@@ -241,6 +223,29 @@ impl PythonAnalyzer {
         }
 
         Self::finish_export_index(events, index)
+    }
+
+    fn collect_local_export_events<'a>(
+        declarations: impl IntoIterator<Item = &'a CodeUnit>,
+        mut start_byte: impl FnMut(&CodeUnit) -> usize,
+        events: &mut Vec<(usize, String, ExportEntry)>,
+    ) -> HashSet<String> {
+        let mut local_names = HashSet::default();
+        for code_unit in declarations {
+            let identifier = code_unit.identifier().trim();
+            if identifier.is_empty() || identifier.starts_with('_') {
+                continue;
+            }
+            local_names.insert(identifier.to_string());
+            events.push((
+                start_byte(code_unit),
+                identifier.to_string(),
+                ExportEntry::Local {
+                    local_name: identifier.to_string(),
+                },
+            ));
+        }
+        local_names
     }
 
     fn finish_export_index(
@@ -504,6 +509,18 @@ impl PythonAnalyzer {
                 }
                 _ => {}
             }
+        }
+
+        if self
+            .inner
+            .import_info_of(code_unit.source())
+            .iter()
+            .any(|import| import.is_wildcard)
+            && let Some(imported) = self
+                .resolve_import_bindings(code_unit.source())
+                .get(trimmed)
+        {
+            return Some(imported.clone());
         }
 
         let local_fq_name = format!("{}.{}", code_unit.package_name(), trimmed);

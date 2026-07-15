@@ -80,6 +80,17 @@ resolution work.
   generation-scoped cache migration. Preserve active-generation filtering in
   the Python exact-FQN query, target the replacement generation-aware index,
   and adapt the batch-only tests to the new cancellation parameter.
+- [x] (2026-07-15) Complete a five-perspective guided review. Fix the two
+  correctness findings by routing local/import name collisions through the
+  source-order-aware export resolver and restoring wildcard-imported base-class
+  resolution; also make FQN tiers lazy and consolidate duplicated hot-path
+  export/source-slicing logic.
+- [x] (2026-07-15) Add and pass multi-hop regressions for both reexport source
+  orders plus an inline-project regression for wildcard-imported inheritance.
+- [x] (2026-07-15) Rerun strict clippy and the complete `nlp,python` suite after
+  the guided review fixes. Both pass; the isolated clippy target and test-created
+  `.venv` were removed after their commands completed.
+- [ ] Publish the ready pull request, monitor CI to green, and squash merge it.
 
 ## Surprises & Discoveries
 
@@ -418,6 +429,16 @@ The final rebase keeps master’s cache-generation contract intact. Python’s e
 path-symbol query now uses `idx_path_symbol_units_lang_generation_exact_fqn` and
 filters the active generation inside the same transaction as the generic query;
 the focused query-plan and batch lifecycle regressions pass on the rebased tree.
+
+The guided review caught two correctness edges before publication. The direct
+reexport walk now declines any local/import name collision, letting the complete
+export index choose the winner by source order, and Python base-class resolution
+retains the structured generic import resolver specifically for wildcard imports.
+The review also made the direct/full/exact FQN tiers genuinely lazy and consolidated
+the new export-event and persisted-range slicing helpers. Multi-hop tests cover both
+reexport source orders, an inline-project hierarchy test covers wildcard bases, and
+post-fix senior, architecture, duplication, security, and operational reviews report
+no remaining findings.
 
 ## Context and Orientation
 

@@ -939,6 +939,66 @@ mod tests {
     }
 
     #[test]
+    fn python_batch_context_preserves_reexport_source_order_across_facades() {
+        let source = "from facade_import_wins import Service as ImportedWins\nfrom facade_local_wins import Service as LocalWins\n\ndef handle(imported: ImportedWins, local: LocalWins):\n    imported.leaf_only()\n    local.local_only()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "leaf.py",
+                    "class Service:\n    def leaf_only(self):\n        pass\n",
+                ),
+                (
+                    "middle_import_wins.py",
+                    "class Service:\n    pass\n\nfrom leaf import Service\n",
+                ),
+                (
+                    "middle_local_wins.py",
+                    "from leaf import Service\n\nclass Service:\n    def local_only(self):\n        pass\n",
+                ),
+                (
+                    "facade_import_wins.py",
+                    "from middle_import_wins import Service\n",
+                ),
+                (
+                    "facade_local_wins.py",
+                    "from middle_local_wins import Service\n",
+                ),
+                ("app.py", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "app.py");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let requests = ["leaf_only", "local_only"]
+            .into_iter()
+            .map(|needle| {
+                let start_byte = source.rfind(needle).expect("receiver member in source");
+                DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + needle.len()),
+                }
+            })
+            .collect();
+
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+
+        assert_eq!(
+            outcomes[0].definitions[0].fq_name(),
+            "leaf.Service.leaf_only"
+        );
+        assert_eq!(
+            outcomes[1].definitions[0].fq_name(),
+            "middle_local_wins.Service.local_only"
+        );
+        assert_eq!(context.python_build_counts(), (1, 1, 2, 0));
+        assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
     fn python_batch_context_keeps_receiver_types_isolated_by_file() {
         let source_a =
             "from service_a import Service\n\ndef handle(service: Service):\n    service.run()\n";

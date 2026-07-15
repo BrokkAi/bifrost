@@ -461,15 +461,7 @@ fn python_fqn_outcome(
     fqn: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
-    let candidates = support.fqn(fqn);
-    if !candidates.is_empty() {
-        return candidates_outcome(candidates);
-    }
-    let candidates = py.resolve_direct_named_exported_fqn(fqn);
-    if !candidates.is_empty() {
-        return candidates_outcome(candidates);
-    }
-    let candidates = py.resolve_exported_fqn(fqn);
+    let candidates = py.resolve_fqn_candidates(fqn, |name| support.fqn(name));
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -489,11 +481,8 @@ fn python_class_for_fqn(
     support: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Option<CodeUnit> {
-    support
-        .fqn(fqn)
+    py.resolve_fqn_candidates(fqn, |name| support.fqn(name))
         .into_iter()
-        .chain(py.resolve_direct_named_exported_fqn(fqn))
-        .chain(py.resolve_exported_fqn(fqn))
         .find(|unit| unit.is_class())
 }
 

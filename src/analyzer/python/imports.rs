@@ -99,12 +99,10 @@ impl PythonAnalyzer {
 
     /// Resolve an unambiguous chain of explicit named reexports without
     /// constructing export indexes for each intermediate module. Star exports,
-    /// shadowing, and every other ambiguous shape remain with the complete
-    /// export resolver below.
-    pub(crate) fn resolve_direct_named_exported_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let Some((module, name)) = fqn.rsplit_once('.') else {
-            return Vec::new();
-        };
+    /// shadowing, and every other ambiguous shape return `None` so callers can
+    /// use the complete, source-order-aware export resolver below.
+    fn resolve_direct_named_exported_fqn(&self, fqn: &str) -> Option<Vec<CodeUnit>> {
+        let (module, name) = fqn.rsplit_once('.')?;
         let mut results = Vec::new();
         let mut queue = VecDeque::from([(module.to_string(), name.to_string())]);
         let mut visited = HashSet::default();
@@ -113,9 +111,7 @@ impl PythonAnalyzer {
             if !visited.insert((module.clone(), export_name.clone())) {
                 continue;
             }
-            let Some(module_unit) = self.resolve_module_code_unit(&module) else {
-                continue;
-            };
+            let module_unit = self.resolve_module_code_unit(&module)?;
             let file = module_unit.source();
             let local = self
                 .inner
@@ -123,20 +119,20 @@ impl PythonAnalyzer {
                 .into_iter()
                 .filter(|unit| unit.identifier() == export_name)
                 .collect::<Vec<_>>();
+            let binder = self.import_binder_of(file);
+            let binding = binder.bindings.get(&export_name);
+            if !local.is_empty() && binding.is_some() {
+                return None;
+            }
             if !local.is_empty() {
                 results.extend(local);
                 continue;
             }
-            let binder = self.import_binder_of(file);
-            let Some(binding) = binder.bindings.get(&export_name) else {
-                continue;
-            };
+            let binding = binding?;
             if binding.kind != ImportKind::Named {
-                continue;
+                return None;
             }
-            let Some(imported_name) = binding.imported_name.as_ref() else {
-                continue;
-            };
+            let imported_name = binding.imported_name.as_ref()?;
             queue.push_back((binding.module_specifier.clone(), imported_name.clone()));
         }
 
@@ -146,7 +142,26 @@ impl PythonAnalyzer {
                 .then_with(|| left.fq_name().cmp(&right.fq_name()))
         });
         results.dedup();
-        results
+        (!results.is_empty()).then_some(results)
+    }
+
+    /// Resolve a Python FQN with the cheapest semantically complete tier that
+    /// can answer it. The direct reexport walk handles only proven,
+    /// collision-free chains; ambiguous shapes use the ordered export index,
+    /// and the exact lookup remains the final fallback for non-export symbols.
+    pub(crate) fn resolve_fqn_candidates(
+        &self,
+        fqn: &str,
+        exact: impl FnOnce(&str) -> Vec<CodeUnit>,
+    ) -> Vec<CodeUnit> {
+        if let Some(candidates) = self.resolve_direct_named_exported_fqn(fqn) {
+            return candidates;
+        }
+        let candidates = self.resolve_exported_fqn(fqn);
+        if !candidates.is_empty() {
+            return candidates;
+        }
+        exact(fqn)
     }
 
     fn resolve_exported_name_from_module(&self, module: &str, name: &str) -> Vec<CodeUnit> {
