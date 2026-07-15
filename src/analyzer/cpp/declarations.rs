@@ -179,6 +179,19 @@ fn recover_exported_class_function_definition<'tree>(
     class_identifier_before_body(node, source).map(|name| (node, name))
 }
 
+pub(crate) fn recovered_exported_class_has_body(
+    node: Node<'_>,
+    source: &str,
+    expected_name: &str,
+) -> Option<bool> {
+    let (class_node, name) = match node.kind() {
+        "function_definition" => recover_exported_class_function_definition(node, source),
+        "declaration" | "field_declaration" => recover_exported_class_declaration(node, source),
+        _ => None,
+    }?;
+    (name == expected_name).then(|| cpp_body_node(class_node).is_some())
+}
+
 fn class_identifier_before_body(node: Node<'_>, source: &str) -> Option<String> {
     let body_start = node
         .child_by_field_name("body")

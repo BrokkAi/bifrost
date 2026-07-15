@@ -5964,3 +5964,277 @@ void consume(char selected) {
         );
     }
 }
+
+#[test]
+fn authoritative_cpp_usage_resolves_constructor_owner_from_full_definition_and_forward_include() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("widget_fwd.h", "namespace demo { class Widget; }\n"),
+        (
+            "widget.h",
+            r#"#pragma once
+namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        (
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+#include "widget.h"
+namespace demo {
+Widget::Widget() = default;
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    auto* widget = new demo::Widget;
+}
+"#,
+        ),
+    ]);
+
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.Widget"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expression = source.find("new demo::Widget").expect("new expression");
+    let start = expression + "new ".len();
+    let end = start + "demo::Widget".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            Some(&provider),
+            1,
+            1000,
+        );
+
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "authoritative query must scan only the explicit consumer"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative Widget constructor success");
+    };
+    let hits = hits_by_overload
+        .get(&constructor)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(hits.len(), 1, "Widget constructor hits: {hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+        }),
+        "missing exact new-expression type range {start}..{end}: {hits:#?}"
+    );
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&constructor)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "one full class definition plus a forward declaration should resolve precisely"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_resolves_constructor_owner_from_unique_transitive_definition() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("widget_fwd.h", "namespace demo { class Widget; }\n"),
+        (
+            "widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        ("bridge.h", "#include \"widget.h\"\n"),
+        (
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+#include "bridge.h"
+namespace demo {
+Widget::Widget() = default;
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    auto* widget = new demo::Widget;
+}
+"#,
+        ),
+    ]);
+
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.Widget"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &constructor, 1, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_keeps_constructor_owner_unresolved_with_only_direct_forwards() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("one/widget_fwd.h", "namespace demo { class Widget; }\n"),
+        ("two/widget_fwd.h", "namespace demo { class Widget; }\n"),
+        (
+            "widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        (
+            "widget.cc",
+            r#"#include "one/widget_fwd.h"
+#include "two/widget_fwd.h"
+namespace demo {
+Widget::Widget() = default;
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    auto* widget = new demo::Widget;
+}
+"#,
+        ),
+    ]);
+
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.Widget"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &constructor, 0, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_keeps_constructor_owner_ambiguous_with_two_transitive_definitions() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("widget_fwd.h", "namespace demo { class Widget; }\n"),
+        (
+            "one/widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        (
+            "two/widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        (
+            "bridge.h",
+            r#"#include "one/widget.h"
+#include "two/widget.h"
+"#,
+        ),
+        (
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+#include "bridge.h"
+namespace demo {
+Widget::Widget() = default;
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "one/widget.h"
+void consume() {
+    auto* widget = new demo::Widget;
+}
+"#,
+        ),
+    ]);
+
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.Widget"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &constructor, 0, 0);
+}

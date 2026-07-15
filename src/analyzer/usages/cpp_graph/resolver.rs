@@ -6,8 +6,8 @@ use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
-    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace, resolve_analyzer,
-    resolve_include_targets_with_index,
+    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
+    recovered_exported_class_has_body, resolve_analyzer, resolve_include_targets_with_index,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -2264,16 +2264,64 @@ pub(super) fn precise_parent_of(
     match directly_included_owner(analyzer, code_unit, &owner_fqn, owner_name) {
         DirectOwnerResolution::Unique(owner) => Some(owner),
         DirectOwnerResolution::Ambiguous => None,
+        DirectOwnerResolution::ForwardsOnly => {
+            visible_full_cpp_owner(analyzer, code_unit, &owner_fqn, owner_name)
+        }
         DirectOwnerResolution::None => fallback.filter(|parent| {
             parent.short_name() == owner_name && parent.package_name() == code_unit.package_name()
         }),
     }
 }
 
+fn visible_full_cpp_owner(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    owner_fqn: &str,
+    owner_name: &str,
+) -> Option<CodeUnit> {
+    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let mut visible_files = HashSet::default();
+    collect_include_closure(
+        analyzer,
+        cpp.include_target_index(),
+        code_unit.source(),
+        &mut visible_files,
+        None,
+    );
+    let candidates = analyzer
+        .global_usage_definition_index()
+        .by_fqn(owner_fqn)
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+                && visible_files.contains(candidate.source())
+        });
+    let mut full_definition = None;
+    for candidate in candidates {
+        match cpp_class_declaration_strength(analyzer, candidate) {
+            CppClassDeclarationStrength::Full if full_definition.is_some() => return None,
+            CppClassDeclarationStrength::Full => full_definition = Some(candidate.clone()),
+            CppClassDeclarationStrength::Forward => {}
+            CppClassDeclarationStrength::Unknown => return None,
+        }
+    }
+    full_definition
+}
+
 enum DirectOwnerResolution {
     None,
+    ForwardsOnly,
     Unique(CodeUnit),
     Ambiguous,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CppClassDeclarationStrength {
+    Full,
+    Forward,
+    Unknown,
 }
 
 fn directly_included_owner(
@@ -2296,7 +2344,7 @@ fn directly_included_owner(
             )
         })
         .collect();
-    let mut candidates = analyzer
+    let candidates = analyzer
         .global_usage_definition_index()
         .by_fqn(owner_fqn)
         .iter()
@@ -2306,13 +2354,86 @@ fn directly_included_owner(
                 && candidate.package_name() == code_unit.package_name()
                 && direct_includes.contains(candidate.source())
         });
-    let Some(owner) = candidates.next().cloned() else {
-        return DirectOwnerResolution::None;
-    };
-    if candidates.next().is_some() {
-        DirectOwnerResolution::Ambiguous
-    } else {
+    let mut full_definition = None;
+    let mut saw_forward = false;
+    for candidate in candidates {
+        match cpp_class_declaration_strength(analyzer, candidate) {
+            CppClassDeclarationStrength::Full if full_definition.is_some() => {
+                return DirectOwnerResolution::Ambiguous;
+            }
+            CppClassDeclarationStrength::Full => full_definition = Some(candidate.clone()),
+            CppClassDeclarationStrength::Forward => saw_forward = true,
+            CppClassDeclarationStrength::Unknown => return DirectOwnerResolution::Ambiguous,
+        }
+    }
+    if let Some(owner) = full_definition {
         DirectOwnerResolution::Unique(owner)
+    } else if saw_forward {
+        DirectOwnerResolution::ForwardsOnly
+    } else {
+        DirectOwnerResolution::None
+    }
+}
+
+fn cpp_class_declaration_strength(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+) -> CppClassDeclarationStrength {
+    let Some(source) = analyzer.indexed_source(candidate.source()) else {
+        return CppClassDeclarationStrength::Unknown;
+    };
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return CppClassDeclarationStrength::Unknown;
+    }
+    let Some(tree) = parser.parse(&source, None) else {
+        return CppClassDeclarationStrength::Unknown;
+    };
+    let ranges = analyzer.ranges(candidate);
+    let mut saw_forward = false;
+    for range in ranges {
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+                continue;
+            }
+            if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
+                if matches!(
+                    node.kind(),
+                    "class_specifier" | "struct_specifier" | "union_specifier"
+                ) {
+                    if cpp_class_node_has_body(node) {
+                        return CppClassDeclarationStrength::Full;
+                    }
+                    saw_forward = true;
+                } else if let Some(has_body) =
+                    recovered_exported_class_has_body(node, &source, candidate.identifier())
+                {
+                    if has_body {
+                        return CppClassDeclarationStrength::Full;
+                    }
+                    saw_forward = true;
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+    }
+    if saw_forward {
+        CppClassDeclarationStrength::Forward
+    } else {
+        CppClassDeclarationStrength::Unknown
+    }
+}
+
+fn cpp_class_node_has_body(node: Node<'_>) -> bool {
+    node.child_by_field_name("body").is_some() || {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .any(|child| matches!(child.kind(), "declaration_list" | "field_declaration_list"))
     }
 }
 
