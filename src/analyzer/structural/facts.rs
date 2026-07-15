@@ -160,6 +160,7 @@ mod tests {
     fn role_target() -> RoleTarget {
         RoleTarget {
             role: Role::Callee,
+            spread: false,
             keyword: None,
             node: None,
             span: Span {
