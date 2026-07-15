@@ -76,6 +76,13 @@ jobs:
         shell: bash
         run: rustup target add ${{ matrix.rust_targets }}
 
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+
       - name: Set up Android NDK
         if: matrix.target == 'aarch64-linux-android'
         id: setup-ndk
