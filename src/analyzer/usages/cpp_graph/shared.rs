@@ -31,7 +31,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
-        let Some(spec) = TargetSpec::from_targets(analyzer, overloads) else {
+        let Some(spec) = TargetSpec::from_target(analyzer, target) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),

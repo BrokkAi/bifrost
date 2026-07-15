@@ -141,10 +141,35 @@ fn recover_exported_class_function_definition<'tree>(
     if matches!(
         type_node.kind(),
         "class_specifier" | "struct_specifier" | "union_specifier"
-    ) && let Some(name) = direct_identifier_name(declarator, source)
-        && !cpp_export_macro_token(&name)
-    {
-        return Some((node, name));
+    ) {
+        if let Some(name) = direct_identifier_name(declarator, source)
+            && !cpp_export_macro_token(&name)
+        {
+            return Some((node, name));
+        }
+        if declarator.kind() == "parenthesized_declarator"
+            && type_node
+                .child_by_field_name("name")
+                .and_then(|name| direct_identifier_name(name, source))
+                .is_some_and(|name| cpp_export_macro_token(&name))
+        {
+            let body_start = node
+                .child_by_field_name("body")
+                .map(|body| body.start_byte())
+                .unwrap_or(node.end_byte());
+            let mut cursor = node.walk();
+            if let Some(name) = node
+                .named_children(&mut cursor)
+                .filter(|child| {
+                    child.kind() == "ERROR"
+                        && child.start_byte() >= declarator.end_byte()
+                        && child.end_byte() <= body_start
+                })
+                .find_map(|error| declarator_name_from_node(error, source))
+            {
+                return Some((node, name));
+            }
+        }
     }
 
     let declarator_text = direct_identifier_name(declarator, source)?;

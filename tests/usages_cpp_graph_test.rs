@@ -1596,17 +1596,19 @@ void Owner::block_shadow() {
 }
 
 #[test]
-fn authoritative_cpp_usage_matches_out_of_line_method_targets_to_visible_declarations() {
+fn authoritative_cpp_usage_matches_single_out_of_line_method_target_to_visible_declaration() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
             "graph.h",
             r#"namespace demo {
 struct Rect {};
-class Graph {
+#define API(component)
+class API(demo) Graph {
 public:
     void Layout(Rect& rect, Graph* peer);
     void Layout(int mode);
 };
+void Layout(Rect& rect, Graph* peer);
 class WrongGraph {
 public:
     void Layout(Rect& rect, Graph* peer);
@@ -1627,14 +1629,9 @@ private:
             "graph.cc",
             r#"#include "graph.h"
 namespace demo {
-struct Rect {};
-class Graph {
-public:
-    void Layout(Rect& rect, Graph* peer);
-    void Layout(int mode);
-};
 void Graph::Layout(Rect& rect, Graph* peer) {}
 void Graph::Layout(int mode) {}
+void Layout(Rect& rect, Graph* peer) {}
 }
 "#,
         ),
@@ -1646,6 +1643,7 @@ void Page::Draw(Rect& rect) {
     cpu_idle_.Layout(rect, &cpu_user_); // positive-visible-declaration
     cpu_idle_.Layout(7); // negative-overload
     wrong_.Layout(rect, &cpu_user_); // negative-owner
+    Layout(rect, &cpu_user_); // negative-namespace-free-function
 }
 void Page::DrawShadowed(WrongGraph cpu_idle_, Rect& rect) {
     cpu_idle_.Layout(rect, &cpu_user_); // negative-parameter-shadow-owner
@@ -1695,19 +1693,16 @@ void hidden_call(demo::Graph& graph, demo::Rect& rect) {
                 && slash_path(unit.source()) == path
         })
     };
-    let implementation_owner = owner_in("graph.cc");
     let declaration_owner = owner_in("graph.h");
-    assert_eq!(implementation_owner.fq_name(), declaration_owner.fq_name());
-    assert_eq!(
-        implementation_owner.signature(),
-        declaration_owner.signature()
+    assert_eq!(declaration_owner.fq_name(), "demo.Graph");
+    assert!(
+        analyzer
+            .get_definitions("demo.Graph")
+            .iter()
+            .all(|unit| slash_path(unit.source()) != "graph.cc"),
+        "the out-of-line target must not have a same-source class parent"
     );
-    assert_ne!(
-        implementation_owner.source(),
-        declaration_owner.source(),
-        "fixture must preserve distinct physical owner declarations: implementation={implementation_owner:#?}, declaration={declaration_owner:#?}"
-    );
-    let targets = [implementation.clone(), declaration];
+    let targets = [implementation.clone()];
     let consumer = project.file("consumer.cc");
     let hidden_consumer = project.file("hidden_consumer.cc");
     let provider = ExplicitCandidateProvider::new(Arc::new(
@@ -1760,6 +1755,57 @@ void hidden_call(demo::Graph& graph, demo::Rect& rect) {
             .unwrap_or_default(),
         0,
         "wrong-owner, overload, and shadow calls are proven negatives; the hidden same-FQN call must not enter this target's candidate set"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_keeps_two_direct_owner_declarations_ambiguous() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "one/graph.h",
+            "namespace demo { class Graph { public: void Layout(); }; }\n",
+        ),
+        (
+            "two/graph.h",
+            "namespace demo { class Graph { public: void Layout(); }; }\n",
+        ),
+        (
+            "graph.cc",
+            "#include \"one/graph.h\"\n#include \"two/graph.h\"\nnamespace demo { void Graph::Layout() {} }\n",
+        ),
+        (
+            "consumer.cc",
+            "#include \"one/graph.h\"\nvoid call(demo::Graph& graph) { graph.Layout(); }\n",
+        ),
+    ]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Graph.Layout"
+            && slash_path(unit.source()) == "graph.cc"
+    });
+    let consumer = project.file("consumer.cc");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new([consumer.clone()].into_iter().collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected ambiguous-owner success, got {:#?}", query.result);
+    };
+    assert!(
+        hits_by_overload
+            .get(&target)
+            .is_none_or(|hits| hits.is_empty()),
+        "two directly included exact-FQN owners must not choose an arbitrary declaration: {hits_by_overload:#?}"
     );
 }
 

@@ -15201,6 +15201,16 @@ fn cpp_export_macro_class_recovery_handles_header_variants() {
             "ns.Service.run",
         ),
         (
+            "function-like export macro",
+            "#define API(component)\nnamespace ns { class API(foo) Service { public: void run(); }; }\n",
+            "ns.Service.run",
+        ),
+        (
+            "function-like component export macro",
+            "#define COMPONENT_EXPORT(component)\nnamespace ns { class COMPONENT_EXPORT(URL) Service { public: void run(); }; }\n",
+            "ns.Service.run",
+        ),
+        (
             "multiple macros",
             "#define DLL_PUBLIC\n#define API\nnamespace ns { class DLL_PUBLIC API Service { public: void run(); }; }\n",
             "ns.Service.run",

@@ -6,7 +6,7 @@ use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
-    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
+    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace, resolve_analyzer,
     resolve_include_targets_with_index,
 };
 use crate::cancellation::CancellationToken;
@@ -32,7 +32,6 @@ pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
     pub(super) kind: TargetKind,
     pub(super) owner: Option<CodeUnit>,
-    pub(super) target_owners: Vec<CodeUnit>,
     pub(super) member_name: String,
     pub(super) owner_fq_name: Option<String>,
     pub(super) owner_cpp_name: Option<String>,
@@ -41,31 +40,6 @@ pub(super) struct TargetSpec {
 }
 
 impl TargetSpec {
-    pub(super) fn from_targets(analyzer: &dyn IAnalyzer, targets: &[CodeUnit]) -> Option<Self> {
-        let target = targets.first()?;
-        let mut spec = Self::from_target(analyzer, target)?;
-        for equivalent in targets
-            .iter()
-            .skip(1)
-            .filter(|candidate| same_logical_symbol(candidate, target))
-        {
-            let owner = if equivalent.is_class() {
-                Some(equivalent.clone())
-            } else {
-                type_owner_of(analyzer, equivalent)
-            };
-            if let Some(owner) = owner
-                && !spec
-                    .target_owners
-                    .iter()
-                    .any(|existing| same_symbol(existing, &owner))
-            {
-                spec.target_owners.push(owner);
-            }
-        }
-        Some(spec)
-    }
-
     pub(super) fn from_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self::new(
@@ -137,12 +111,10 @@ impl TargetSpec {
     ) -> Self {
         let owner_fq_name = owner.as_ref().map(CodeUnit::fq_name);
         let owner_cpp_name = owner.as_ref().map(cpp_name_for);
-        let target_owners = owner.iter().cloned().collect();
         Self {
             target,
             kind,
             owner,
-            target_owners,
             member_name,
             owner_fq_name,
             owner_cpp_name,
@@ -288,7 +260,6 @@ impl VisibilityIndex {
                 .get(file)
                 .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
     }
-
     pub(in crate::analyzer::usages) fn resolve_type(
         &self,
         file: &ProjectFile,
@@ -2209,7 +2180,7 @@ pub(super) fn precise_parent_of(
     } else {
         format!("{}.{}", code_unit.package_name(), owner_name)
     };
-    analyzer
+    if let Some(owner) = analyzer
         .global_usage_definition_index()
         .by_fqn(&owner_fqn)
         .iter()
@@ -2220,12 +2191,62 @@ pub(super) fn precise_parent_of(
                 && candidate.package_name() == code_unit.package_name()
         })
         .cloned()
-        .or_else(|| {
-            fallback.filter(|parent| {
-                parent.short_name() == owner_name
-                    && parent.package_name() == code_unit.package_name()
-            })
+    {
+        return Some(owner);
+    }
+    match directly_included_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+        DirectOwnerResolution::Unique(owner) => Some(owner),
+        DirectOwnerResolution::Ambiguous => None,
+        DirectOwnerResolution::None => fallback.filter(|parent| {
+            parent.short_name() == owner_name && parent.package_name() == code_unit.package_name()
+        }),
+    }
+}
+
+enum DirectOwnerResolution {
+    None,
+    Unique(CodeUnit),
+    Ambiguous,
+}
+
+fn directly_included_owner(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    owner_fqn: &str,
+    owner_name: &str,
+) -> DirectOwnerResolution {
+    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+        return DirectOwnerResolution::None;
+    };
+    let imports = analyzer.import_statements(code_unit.source());
+    let direct_includes: HashSet<ProjectFile> = cpp_include_paths(&imports)
+        .into_iter()
+        .flat_map(|include| {
+            resolve_include_targets_with_index(
+                code_unit.source(),
+                &include,
+                cpp.include_target_index(),
+            )
         })
+        .collect();
+    let mut candidates = analyzer
+        .global_usage_definition_index()
+        .by_fqn(owner_fqn)
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+                && direct_includes.contains(candidate.source())
+        });
+    let Some(owner) = candidates.next().cloned() else {
+        return DirectOwnerResolution::None;
+    };
+    if candidates.next().is_some() {
+        DirectOwnerResolution::Ambiguous
+    } else {
+        DirectOwnerResolution::Unique(owner)
+    }
 }
 
 pub(super) fn visible_owner_from_member_name(

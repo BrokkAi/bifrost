@@ -53,6 +53,25 @@ fn is_empty_test() {
 }
 
 #[test]
+fn function_like_export_macro_preserves_class_declaration_identity() {
+    let project = inline_cpp_project(&[(
+        "gurl.h",
+        "#define COMPONENT_EXPORT(component)\nnamespace url { class COMPONENT_EXPORT(URL) GURL { public: void Swap(GURL*); }; }\n",
+    )]);
+    let analyzer = CppAnalyzer::from_project(project);
+
+    let classes = analyzer.get_definitions("url.GURL");
+    assert_eq!(classes.len(), 1, "class declarations: {classes:#?}");
+    assert_eq!(classes[0].kind(), CodeUnitType::Class);
+    assert_eq!(classes[0].source().rel_path().to_string_lossy(), "gurl.h");
+
+    let methods = analyzer.get_definitions("url.GURL.Swap");
+    assert_eq!(methods.len(), 1, "method declarations: {methods:#?}");
+    assert_eq!(methods[0].kind(), CodeUnitType::Function);
+    assert_eq!(analyzer.parent_of(&methods[0]), Some(classes[0].clone()));
+}
+
+#[test]
 fn cpp_iterative_visitor_preserves_top_level_source_order() {
     let project = inline_cpp_project(&[(
         "ordered.cpp",
