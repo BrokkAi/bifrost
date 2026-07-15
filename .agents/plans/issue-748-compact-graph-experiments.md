@@ -20,6 +20,7 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - [x] (2026-07-15T14:20:00Z) Captured the unmodified structural-role baseline at three synthetic sizes and on `/Users/dave/Workspace/test-repos/vscode` at `a5914335df0bf1cae7d818a168ef321def9f8572`.
 - [x] (2026-07-15T14:29:00Z) Replaced per-node structural role vectors with one contiguous role array and row offsets, appending directly during extraction and preserving source order across `query_code`, Rune IR, reference classification, and structured call-site consumers.
 - [x] (2026-07-15T14:29:00Z) Compared and promoted the structural-role candidate: retained bytes fell 28.9% on `vscode`, optimized warm reads were at parity in a load-matched A/B, and all focused behavior plus warnings-as-errors checks passed.
+- [x] (2026-07-15T14:47:31Z) Added and captured a generated file-dependency baseline that exercises both import-based PageRank and complete reverse RQL traversal with identical files and edges.
 - [ ] Prototype a shared file-dependency relation for RQL import traversal and import PageRank, measure forward and reverse reads, and make a promote-or-discard decision.
 - [ ] Prototype compact hierarchy and ownership relations using exact `CodeUnit` identity, measure direct and transitive traversal, and make a promote-or-discard decision.
 - [ ] Adapt the dense-ID `WorkspaceUsageGraph` introduced by #781 to contiguous outgoing and incoming edge storage without reintroducing rich-key construction, then measure graph construction, PageRank, public rendering, and memory.
@@ -54,6 +55,12 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - Observation: debug timings on this host vary substantially with compiler rebuild and background load. The clean real-repository candidate was 6.5% slower to extract and 5.0% slower for the warm role-heavy query than the historical baseline, while analyzer construction—unaffected by role storage—was 13.6% slower in the same comparison.
   Evidence: the candidate reported 40.956 s analyzer construction, 32.573 s extraction, and 6.691 s matching versus 36.068 s, 30.593 s, and 6.370 s historically. A same-compiler small A/B narrowed the warm-read difference to 7.12 ms versus 6.53 ms, so optimized A/B validation is required before calling this a read regression.
 
+- Observation: RQL and relevance do not currently share a compatible graph lifecycle. RQL resolves forward rows lazily to preserve file/edge budgets and unsupported-provider diagnostics, and only completes the workspace graph for `importers_of`; relevance deliberately explores a two-hop graph around seeds on every request.
+  Evidence: `DirectImportGraph` tracks `unsupported`, `resolved_files`, `resolved_edges`, `complete`, and `truncated`, while `relevance::build_import_graph` stops after `IMPORT_DEPTH` and combines forward plus reverse discovery around its frontier. The experiment should share compact row mechanics without forcing an eager full-workspace cache.
+
+- Observation: a dense generated dependency graph provides useful end-to-end signal for both consumers. With 1,000 files and 17,982 edges, the pre-change warm median is 132.160 ms for import PageRank and 483.503 ms for complete `importers_of` traversal.
+  Evidence: peak RSS rose from 66,453,504 bytes after analyzer construction to 100,499,456 after relevance and 127,320,064 after RQL reverse traversal, leaving measurable room for compact construction and read storage.
+
 ## Decision Log
 
 - Decision: begin with structural fact roles and keep the first compact representation local to `FileFacts` until its measurements are known.
@@ -87,6 +94,8 @@ The structural-role experiment is promoted. Planning and prerequisite verificati
 Milestone 1 outcome 2026-07-15T14:20:00Z: the representation-neutral benchmark is implemented and exercises nonzero facts and semantic role edges. Synthetic retained storage scales from 7,844,400 bytes at 36,100 facts to 123,759,200 bytes at 564,400 facts. The real `vscode` run establishes a 1.530 GB retained-storage baseline and proves the role representation is large enough for the pilot to produce a meaningful signal.
 
 Milestone 2 outcome 2026-07-15T14:29:00Z: direct CSR-style extraction removes every per-node role allocation and stores one `u32` offset per fact boundary plus one exact-sized role buffer. At 564,400 generated facts, retained bytes fell from 123,759,200 to 90,357,600 (27.0%). On `vscode`, retained bytes fell by 463,469,148 (28.9%), peak RSS after extraction fell by 369,836,032 (15.8%), and peak RSS after warm matching fell by 414,253,056 (15.1%). In the adjacent optimized large-fixture pair where analyzer setup was load-matched, warm reads were 88.98 ms for compact rows versus 89.53 ms for the baseline. All 86 structural unit tests, the structured call-site test, documented query tests, tutorials, all 57 pipeline tests, formatting, and all-target/all-feature Clippy with warnings denied pass. The candidate is promoted.
+
+Milestone 3 baseline 2026-07-15T14:47:31Z: `tests/measure_file_dependency_graph.rs` generates a Java hub/ring graph whose hub both imports and is imported by every node. This makes forward personalized PageRank and reverse RQL traversal cover the same full graph without depending on Git history. At the default 801 files / 4,800 edges, warm medians are 38.536 ms relevance and 216.907 ms `importers_of`; at 1,000 files / 17,982 edges they are 132.160 ms and 483.503 ms. The harness passes focused all-feature Clippy.
 
 ## Context and Orientation
 
@@ -198,6 +207,14 @@ Structural-role baseline at Bifrost representation commit `da0dc303f0854e28c1c28
     BIFROST_STRUCTURAL_BENCH_REPO=/Users/dave/Workspace/test-repos/vscode BIFROST_STRUCTURAL_BENCH_ITERATIONS=3 BIFROST_STRUCTURAL_BENCH_PARALLELISM=1 BIFROST_SEMANTIC_INDEX=off cargo test --test measure_structural_facts_memory -- --ignored --nocapture
     workspace_commit=a5914335df0bf1cae7d818a168ef321def9f8572 candidate_files=6556 extracted_files=6553 skipped_files=3 facts=6276000 roles=4258462 retained=1604467430 extraction_ms=30593.007 match_median_ms=6370.008 rss_after_extraction=2342944768 rss_after_matching=2744664064
 
+File-dependency baseline at Bifrost commit `df76cfbdb140f54984ec98a5c677b4c4e98d94dd`, single-threaded, debug test profile:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test measure_file_dependency_graph -- --ignored --nocapture
+    files=801 edges=4800 relevance_first_ms=501.728 relevance_warm_median_ms=38.536 importers_first_ms=315.253 importers_warm_median_ms=216.907 rss_after_analyzer=40583168 rss_after_relevance=53084160 rss_after_importers=65552384
+
+    BIFROST_FILE_GRAPH_BENCH_FILES=999 BIFROST_FILE_GRAPH_BENCH_FANOUT=16 BIFROST_FILE_GRAPH_BENCH_ITERATIONS=7 BIFROST_SEMANTIC_INDEX=off cargo test --test measure_file_dependency_graph -- --ignored --nocapture
+    files=1000 edges=17982 relevance_first_ms=1194.168 relevance_warm_median_ms=132.160 importers_first_ms=825.381 importers_warm_median_ms=483.503 rss_after_analyzer=66453504 rss_after_relevance=100499456 rss_after_importers=127320064
+
 ## Interfaces and Dependencies
 
 The first benchmark may add representation-neutral methods to `FileFacts`:
@@ -222,3 +239,5 @@ Revision note 2026-07-15T14:25:00Z: Documented the host's dual-Rust compiler cac
 Revision note 2026-07-15T14:29:00Z: Recorded the implemented structural-role CSR candidate, its targeted behavior checks, and synthetic plus `vscode` memory results; left promotion pending optimized timing and lint validation.
 
 Revision note 2026-07-15T14:29:00Z: Promoted compact structural role rows after optimized A/B read parity, focused behavior validation, and warnings-as-errors Clippy passed.
+
+Revision note 2026-07-15T14:47:31Z: Added the file-dependency benchmark, recorded default and dense baselines, and narrowed the sharing goal to representation mechanics because RQL and relevance require different graph lifecycles.
