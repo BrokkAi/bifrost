@@ -1064,29 +1064,29 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     .ranges(&unit)
                     .into_iter()
                     .flat_map(|declaration_range| {
-                        syntax_ranges.iter().filter_map(move |syntax_range| {
-                            (declaration_range.start_byte < syntax_range.end_byte
-                                && syntax_range.start_byte < declaration_range.end_byte)
-                                .then(|| {
-                                    let boundary_distance = declaration_range
-                                        .start_byte
-                                        .abs_diff(syntax_range.start_byte)
-                                        .saturating_add(
-                                            declaration_range
-                                                .end_byte
-                                                .abs_diff(syntax_range.end_byte),
-                                        );
-                                    let span_distance = declaration_range
-                                        .end_byte
-                                        .saturating_sub(declaration_range.start_byte)
-                                        .abs_diff(
-                                            syntax_range
-                                                .end_byte
-                                                .saturating_sub(syntax_range.start_byte),
-                                        );
-                                    (boundary_distance, span_distance, *syntax_range)
-                                })
-                        })
+                        syntax_ranges
+                            .iter()
+                            .filter(move |syntax_range| {
+                                declaration_range.start_byte < syntax_range.end_byte
+                                    && syntax_range.start_byte < declaration_range.end_byte
+                            })
+                            .map(move |syntax_range| {
+                                let boundary_distance = declaration_range
+                                    .start_byte
+                                    .abs_diff(syntax_range.start_byte)
+                                    .saturating_add(
+                                        declaration_range.end_byte.abs_diff(syntax_range.end_byte),
+                                    );
+                                let span_distance = declaration_range
+                                    .end_byte
+                                    .saturating_sub(declaration_range.start_byte)
+                                    .abs_diff(
+                                        syntax_range
+                                            .end_byte
+                                            .saturating_sub(syntax_range.start_byte),
+                                    );
+                                (boundary_distance, span_distance, *syntax_range)
+                            })
                     })
                     .min_by_key(|(boundary_distance, span_distance, syntax_range)| {
                         (*boundary_distance, *span_distance, syntax_range.start_byte)
