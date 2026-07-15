@@ -16,9 +16,9 @@ The behavior is observable through the MCP tool, the `most_relevant_files` helpe
 - [x] (2026-07-15T08:49:00Z) Extracted the import-specific PageRank loop into a reusable weighted dense-ID kernel and proved focused unit and import-ranking parity tests pass.
 - [x] (2026-07-15T09:24:00Z) Added an exact-identity, weight-only workspace usage graph with shared node catalog and completeness metadata.
 - [x] (2026-07-15T10:02:00Z) Added opt-in usage-primary file ranking and public Rust, MCP, CLI, and Python surfaces.
-- [ ] Add final performance coverage and complete the behavior, identity, schema, and client validation matrix.
-- [ ] Run formatting, Clippy, focused tests, and the full `nlp,python` test gate.
-- [ ] Complete guided post-implementation review and address material findings.
+- [x] (2026-07-15T13:03:00Z) Captured paired #754-compatible construction timings and completed the behavior, identity, schema, and client validation matrix.
+- [x] (2026-07-15T13:03:00Z) Ran formatting, warnings-as-errors Clippy, focused tests, the full executable `nlp,python` suite, and rustdoc with a matched toolchain.
+- [x] (2026-07-15T13:03:00Z) Completed the five guided specialist reviews and fixed the material mixed-JS/TS identity finding.
 
 ## Surprises & Discoveries
 
@@ -30,6 +30,12 @@ The behavior is observable through the MCP tool, the `most_relevant_files` helpe
 
 - Observation: making each inverted language scan generic over its final output preserves one AST walk while allowing the public graph to retain call sites and relevance to consume compact weights directly.
   Evidence: `UsageEdgeBuildOutput` in `src/analyzer/usages/inverted_edges.rs` and the language-specific `build_*_edges` adapters.
+
+- Observation: selecting only the analyzer matching a caller file's language drops valid TypeScript-to-JavaScript and JavaScript-to-TypeScript edges even though both share one module ecosystem.
+  Evidence: the guided senior review found the gap; `combine_jsts_usage_indices` now merges cached JS and TS binder/export indices before scanning, and `tests/usage_graph_identity_test.rs` proves both directions.
+
+- Observation: paired debug-profile runs show the compact opt-in request is dominated by the existing Rust resolver, not the new rank computation. On the final run, compact construction took 40.528s (38.056s Rust), PageRank 10.0ms, aggregation 15.8ms, and total usage ranking 41.332s. The comparable public graph with tests included took 39.369s (36.360s Rust), a roughly 5% end-to-end delta within observed resolver-run variance.
+  Evidence: `BIFROST_TIMING=1` output from the commands in `Artifacts and Notes`; issue #754 has no posted hard threshold or authoritative timing artifact to compare against.
 
 ## Decision Log
 
@@ -49,15 +55,21 @@ The behavior is observable through the MCP tool, the `most_relevant_files` helpe
   Rationale: the usage graph is a whole-program feature and cross-language ecosystems must remain distinguishable; the legacy CLI keeps its narrower seed-language optimization.
   Date/Author: 2026-07-15 / Codex
 
+- Decision: retain per-ecosystem resolver dispatch in both the compact and public graph entry points for this issue.
+  Rationale: architecture and duplication reviews correctly identified this as a registry-refactor opportunity, but combining the dispatch would broaden the change without affecting correctness; exact identity and shared per-language scan/finalization are covered behaviorally.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
-The weighted-PageRank, exact workspace graph, and opt-in public ranking milestones are complete; final performance/full-suite validation and guided review remain.
+The weighted-PageRank, exact workspace graph, opt-in public ranking, validation, performance characterization, and guided review milestones are complete. Existing behavior remains the default; usage ranking is deliberately opt-in because whole-workspace edge resolution costs tens of seconds on the Bifrost repository, while PageRank and file aggregation add only about 26ms.
 
 Milestone 1 outcome 2026-07-15T08:49:00Z: `weighted_page_rank` now supports unit or weighted arcs, explicit personalized teleportation, uniform global teleportation, and personalized dangling-mass redistribution. The import adapter supplies unit weights and all 22 `most_relevant_files` integration tests remain green.
 
 Milestone 2 outcome 2026-07-15T09:24:00Z: every language's inverted resolver can now finalize the same per-file scan into either call-site edges or compact weights. `WorkspaceUsageCatalog` owns ecosystem-qualified and JS/TS file-qualified identity, deterministic primary declarations, declaration-file membership, and completeness metadata. The public `usage_graph` reuses this catalog without changing its wire result.
 
 Milestone 3 outcome 2026-07-15T10:02:00Z: `usage_graph` ranking personalizes caller-to-callee PageRank from declaration-bearing seed files, aggregates complete symbol scores into deterministic primary files, and fills from the unchanged git/import pipeline. Rust, MCP schema/JSON, CLI, semantic-search, and Python client surfaces all carry an explicit mode while omitted requests remain legacy.
+
+Milestone 4 outcome 2026-07-15T13:03:00Z: security, architecture, duplication, senior-engineering, and operations reviews completed. The only material correctness finding was fixed by merging cached JavaScript and TypeScript usage indices for scoped graph resolution. Focused tests, Clippy, and all executable feature-enabled tests pass. Timing confirms the new numerical work is negligible relative to existing structured usage resolution and does not justify adding the permanent cache reserved for #748.
 
 ## Context and Orientation
 
@@ -150,6 +162,40 @@ Milestone 3 evidence:
     BIFROST_SEMANTIC_INDEX=off uv run --python 3.12 --with maturin python -m unittest python_tests.test_searchtools_client.SearchToolsClientTest.test_most_relevant_files_returns_ranked_paths
     Ran 1 test; OK. The test passes MostRelevantFilesRankingMode.USAGE_GRAPH through the native boundary.
 
+Final review and validation evidence:
+
+    cargo fmt --all -- --check
+    Passed.
+
+    env PATH=/opt/homebrew/bin:/usr/bin:/bin scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    Passed. A single toolchain was selected because the default environment paired ~/.local rustc with Homebrew clippy-driver.
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test most_relevant_files --test usage_graph_identity_test
+    test result: ok. 27 passed; 0 failed
+    test result: ok. 9 passed; 0 failed
+
+    RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup' GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false UV_CACHE_DIR=/tmp/bifrost-uv-cache BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python
+    All 837 library tests and every integration-test binary passed outside the sandbox. The command's final rustdoc phase could not use the mixed default toolchain because this machine has ~/.local rustc artifacts but no matching ~/.local rustdoc; Homebrew rustdoc rejects those artifacts with E0514.
+
+    env PATH=/opt/homebrew/bin:/usr/bin:/bin RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup' BIFROST_SEMANTIC_INDEX=off scripts/with-isolated-cargo-target.sh cargo test --doc --features nlp,python
+    Doc-tests passed with the matched Homebrew toolchain; 0 doctests are defined.
+
+Final timing evidence (debug profile, warm checkout, tests included in both graph scans):
+
+    BIFROST_SEMANTIC_INDEX=off BIFROST_TIMING=1 target/debug/most_relevant_files --root . --ranking-mode usage_graph src/searchtools.rs
+    catalog 765.9ms; compact construction 40527.9ms; PageRank 10.0ms; aggregation 15.8ms; related_files_by_usage 41332.0ms; total ranking 41725.2ms.
+
+    BIFROST_SEMANTIC_INDEX=off BIFROST_TIMING=1 target/debug/bifrost --root . --tool usage_graph --args '{"include_tests":true}'
+    public usage_graph 39368.6ms. Compact versus public end-to-end usage work differed by about 5%; the Rust resolver accounted for 38.056s and 36.360s respectively.
+
+Guided review evidence:
+
+    Security review: no findings.
+    Architecture review: no high-severity findings; noted duplicated resolver dispatch as a follow-up refactor opportunity.
+    Duplication review: noted the same resolver API/dispatch duplication, with no correctness defect.
+    Senior review: found mixed JS/TS edges were omitted; fixed and covered in both directions.
+    Operations review: requested explicit performance and release-gate evidence; supplied above.
+
 ## Interfaces and Dependencies
 
 The public Rust request gains:
@@ -179,3 +225,5 @@ Revision note 2026-07-15T08:49:00Z: Recorded the completed weighted-PageRank mil
 Revision note 2026-07-15T09:24:00Z: Recorded the shared exact-identity catalog, direct weight finalization, and public usage-graph parity evidence.
 
 Revision note 2026-07-15T10:02:00Z: Recorded the opt-in ranking pipeline, public interfaces, semantic-search pin, behavior coverage, and focused client validation.
+
+Revision note 2026-07-15T13:03:00Z: Recorded the completed review, mixed-JS/TS repair, full validation status, paired timing evidence, and final outcome.

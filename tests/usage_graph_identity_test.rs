@@ -204,6 +204,68 @@ fn usage_relevance_keeps_identical_cross_language_fqns_distinct() {
     assert_eq!(result["files"], serde_json::json!(["z.go"]));
 }
 
+#[test]
+fn usage_relevance_resolves_typescript_callers_to_javascript_callees() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(
+        temp.path().join("main.ts"),
+        "import { helper } from './helper.js';\nexport function run() { return helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("helper.js"),
+        "export function helper() { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("unrelated.ts"),
+        "export function unrelated() { return 2; }\n",
+    )
+    .unwrap();
+
+    let service = SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+        .expect("service");
+    let payload = service
+        .call_tool_json(
+            "most_relevant_files",
+            r#"{"seed_file_paths":["main.ts"],"ranking_mode":"usage_graph","limit":1}"#,
+        )
+        .expect("most_relevant_files call failed");
+    let result: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(result["files"], serde_json::json!(["helper.js"]));
+}
+
+#[test]
+fn usage_relevance_resolves_javascript_callers_to_typescript_callees() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(
+        temp.path().join("main.js"),
+        "import { helper } from './helper.ts';\nexport function run() { return helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("helper.ts"),
+        "export function helper(): number { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("unrelated.js"),
+        "export function unrelated() { return 2; }\n",
+    )
+    .unwrap();
+
+    let service = SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+        .expect("service");
+    let payload = service
+        .call_tool_json(
+            "most_relevant_files",
+            r#"{"seed_file_paths":["main.js"],"ranking_mode":"usage_graph","limit":1}"#,
+        )
+        .expect("most_relevant_files call failed");
+    let result: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(result["files"], serde_json::json!(["helper.ts"]));
+}
+
 // The inverted path must resolve typed receivers like the forward path does:
 // `run(s: Service)` calling `s.handle()` yields a `svc.run -> svc.Service.handle`
 // edge, not just the `svc.run -> svc.Service` type-annotation edge.

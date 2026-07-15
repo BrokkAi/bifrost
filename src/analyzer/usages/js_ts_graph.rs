@@ -45,7 +45,9 @@ pub(crate) use resolver::{
 
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
-use crate::analyzer::usages::js_ts_graph::resolver::{is_static_member, target_language};
+use crate::analyzer::usages::js_ts_graph::resolver::{
+    combine_jsts_usage_indices, is_static_member, target_language,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface, UsageProof};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{
@@ -357,27 +359,30 @@ where
         std::collections::BTreeMap::new();
     let mut any = false;
 
+    let mut cached_indices = Vec::new();
+    for language in [Language::TypeScript, Language::JavaScript] {
+        if let Some(index) = cached_jsts_index(analyzer, language, None) {
+            cached_indices.push(index);
+        }
+    }
+    let combined_index = combine_jsts_usage_indices(
+        analyzer,
+        cached_indices.iter().map(std::convert::AsRef::as_ref),
+    );
+
     for language in [Language::TypeScript, Language::JavaScript] {
         if analyzed_files_for_language(analyzer, language).is_empty() {
             continue;
         }
         any = true;
-        let language_nodes: HashSet<UsageNodeKey> = nodes
-            .iter()
-            .filter(|key| crate::analyzer::common::language_for_file(&key.file) == language)
-            .cloned()
-            .collect();
-        if language_nodes.is_empty() {
+        if nodes.is_empty() {
             continue;
         }
-        let Some(index) = cached_jsts_index(analyzer, language, None) else {
-            continue;
-        };
         let result = inverted::build_jsts_scoped_edges(
             analyzer,
-            index.as_ref(),
+            &combined_index,
             language,
-            &language_nodes,
+            nodes,
             keep_file,
         );
         for (key, weight) in result.edges.edges {

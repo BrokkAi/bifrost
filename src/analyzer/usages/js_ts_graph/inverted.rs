@@ -153,7 +153,7 @@ where
         };
     }
     let files = collect_jsts_files(analyzer, language);
-    let declarations = scoped_declarations_by_file_and_name(analyzer, language);
+    let declarations = scoped_declarations_by_file_and_name(analyzer);
     let node_status = scoped_node_status(index, nodes, &declarations);
     let imports_by_file = scoped_import_bindings_by_file(index, &declarations);
     let edges = build_edge_weights(&files, keep_file, |file| {
@@ -294,13 +294,14 @@ impl TsScan<'_, '_> {
 
 fn scoped_declarations_by_file_and_name(
     analyzer: &dyn IAnalyzer,
-    language: Language,
 ) -> HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>> {
     let mut out: HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>> = HashMap::default();
-    for declaration in analyzer
-        .all_declarations()
-        .filter(|unit| crate::analyzer::common::language_for_file(unit.source()) == language)
-    {
+    for declaration in analyzer.all_declarations().filter(|unit| {
+        matches!(
+            crate::analyzer::common::language_for_file(unit.source()),
+            Language::JavaScript | Language::TypeScript
+        )
+    }) {
         out.entry((
             declaration.source().clone(),
             declaration.identifier().to_string(),

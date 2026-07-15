@@ -193,50 +193,64 @@ pub(crate) fn build_workspace_usage_graph(
     let mut edges = Vec::new();
 
     macro_rules! record_package_edges {
-        ($ecosystem:expr, $builder:path) => {{
-            if let Some(result) = $builder(analyzer, catalog.fqns($ecosystem), |_| true) {
+        ($scope:literal, $ecosystem:expr, $builder:path) => {{
+            let _scope = crate::profiling::scope($scope);
+            let fqns = catalog.fqns($ecosystem);
+            if !fqns.is_empty()
+                && let Some(result) = $builder(analyzer, fqns, |_| true)
+            {
                 record_weighted_edges($ecosystem, result, &catalog, &mut nodes, &mut edges);
             }
         }};
     }
 
     record_package_edges!(
+        "workspace_usage_graph::resolve_go",
         UsageEcosystem::Go,
         super::go_graph::build_go_usage_edge_weights
     );
     record_package_edges!(
+        "workspace_usage_graph::resolve_python",
         UsageEcosystem::Python,
         super::python_graph::build_python_usage_edge_weights
     );
     record_package_edges!(
+        "workspace_usage_graph::resolve_rust",
         UsageEcosystem::Rust,
         super::rust_graph::build_rust_usage_edge_weights
     );
     record_package_edges!(
+        "workspace_usage_graph::resolve_java",
         UsageEcosystem::Java,
         super::java_graph::build_java_usage_edge_weights
     );
     record_package_edges!(
+        "workspace_usage_graph::resolve_csharp",
         UsageEcosystem::CSharp,
         super::csharp_graph::build_csharp_usage_edge_weights
     );
     record_package_edges!(
+        "workspace_usage_graph::resolve_cpp",
         UsageEcosystem::Cpp,
         super::cpp_graph::build_cpp_usage_edge_weights
     );
     record_package_edges!(
+        "workspace_usage_graph::resolve_php",
         UsageEcosystem::Php,
         super::php_graph::build_php_usage_edge_weights
     );
     record_package_edges!(
+        "workspace_usage_graph::resolve_ruby",
         UsageEcosystem::Ruby,
         super::ruby_graph::build_ruby_usage_edge_weights
     );
     record_package_edges!(
+        "workspace_usage_graph::resolve_scala",
         UsageEcosystem::Scala,
         super::scala_graph::build_scala_usage_edge_weights
     );
 
+    let _jsts_scope = crate::profiling::scope("workspace_usage_graph::resolve_jsts");
     let scoped_nodes: HashSet<_> = catalog
         .nodes
         .iter()
@@ -251,8 +265,9 @@ pub(crate) fn build_workspace_usage_graph(
             )
         })
         .collect();
-    if let Some(result) =
-        super::js_ts_graph::build_jsts_scoped_usage_edges(analyzer, &scoped_nodes, |_| true)
+    if !scoped_nodes.is_empty()
+        && let Some(result) =
+            super::js_ts_graph::build_jsts_scoped_usage_edges(analyzer, &scoped_nodes, |_| true)
     {
         let convert = |key: UsageNodeKey| WorkspaceUsageNodeKey {
             ecosystem: UsageEcosystem::JavaScriptTypeScript,

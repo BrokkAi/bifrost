@@ -318,6 +318,59 @@ impl JsTsUsageIndex {
     }
 }
 
+pub(super) fn combine_jsts_usage_indices<'a>(
+    analyzer: &dyn IAnalyzer,
+    indices: impl Iterator<Item = &'a JsTsUsageIndex>,
+) -> JsTsUsageIndex {
+    let mut exports_by_file = HashMap::default();
+    let mut binders_by_file = HashMap::default();
+    for index in indices {
+        exports_by_file.extend(index.exports_by_file.clone());
+        binders_by_file.extend(index.binders_by_file.clone());
+    }
+
+    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
+    let resolve = |file: &ProjectFile, module_specifier: &str| {
+        let mut resolved = Vec::new();
+        for language in [Language::TypeScript, Language::JavaScript] {
+            resolved.extend(resolve_js_ts_module_specifier(
+                file,
+                module_specifier,
+                language,
+                Some(&aliases),
+            ));
+        }
+        resolved.sort();
+        resolved.dedup();
+        resolved
+    };
+    let (reexport_edges, direct_reexport_edges, star_reexports, direct_star_reexports) =
+        build_reexport_edges(&exports_by_file, &binders_by_file, &resolve, None)
+            .unwrap_or_default();
+    let mut files: Vec<_> = binders_by_file.keys().cloned().collect();
+    files.sort();
+    let importer_reverse = build_importer_reverse(
+        &files,
+        &binders_by_file,
+        &exports_by_file,
+        &direct_reexport_edges,
+        &direct_star_reexports,
+        &resolve,
+        None,
+    )
+    .unwrap_or_default();
+
+    JsTsUsageIndex {
+        exports_by_file,
+        binders_by_file,
+        reexport_edges,
+        direct_reexport_edges,
+        star_reexports,
+        direct_star_reexports,
+        importer_reverse,
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn build_reexport_edges(
     exports_by_file: &HashMap<ProjectFile, ExportIndex>,
