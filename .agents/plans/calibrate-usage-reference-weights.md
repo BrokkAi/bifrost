@@ -14,9 +14,9 @@ The result will be observable through a deterministic ignored benchmark over rep
 
 - [x] (2026-07-15T13:12:00Z) Created the calibration goal, inventoried available test repositories, and selected an evaluation design.
 - [x] (2026-07-15T13:28:00Z) Retained call, member, type, and other reference counts through every inverted usage adapter without changing uniform aggregate weights.
-- [ ] Add a deterministic ignored benchmark that builds each repository graph once and sweeps candidate profiles against held-out git co-change targets.
-- [ ] Run the benchmark across representative Go, Python, JavaScript/TypeScript, Java, Rust, PHP, C#, C++, and Scala repositories where runtime permits.
-- [ ] Inspect representative query results, choose conservative defaults, and add behavior regressions that demonstrate the intended ordering.
+- [x] (2026-07-15T14:08:00Z) Added a deterministic ignored benchmark that builds each repository graph once and sweeps candidate profiles against bounded recent git co-change targets.
+- [x] (2026-07-15T14:08:00Z) Ran the benchmark across eight usable corpora covering Python, TypeScript, PHP, Java, Go, C++, mixed native/JVM code, and a small Rust workspace; recorded impractical full Rust and C# construction runs.
+- [x] (2026-07-15T14:08:00Z) Inspected deterministic examples and selected the conservative calibrated profile: call 1.5, member 1.25, type 1.0, other 0.875.
 - [ ] Run formatting, focused tests, Clippy, and the full feature-enabled test suite; document and checkpoint every milestone.
 
 ## Surprises & Discoveries
@@ -32,6 +32,18 @@ The result will be observable through a deterministic ignored benchmark over rep
 
 - Observation: multiple resolved references from one caller to one callee on the same source line were historically one weighted site, so independently summing kind counts would change compatibility.
   Evidence: the new per-line kind map uses the strongest structured kind in the order call, member, type, other; `strongest_kind_wins_when_one_edge_repeats_on_a_line` proves one total site remains.
+
+- Observation: several `test-repos` checkouts initially had only one commit, which produced valid graphs but no independent co-change labels.
+  Evidence: `godog`, `ruff`, `kokkos`, `bitwarden-server`, and `spark` reported `git rev-list --count HEAD` as one. Their histories were deepened by 300 commits without changing the checked-out trees.
+
+- Observation: aggressive call-first weighting overfits behavior-heavy corpora and degrades Go, where type relationships are especially informative.
+  Evidence: on the 20-seed `godog` sample, uniform NDCG@10 was 0.28596, subtle weighting was 0.28668, and type-light weighting fell to 0.28075. On `kokkos`, the same values were 0.18745, 0.19240, and 0.20243, demonstrating why the selected cross-language default should be a small rather than maximal bias.
+
+- Observation: full-scale Rust and C# graph construction is not practical for iterative weight calibration on this checkout.
+  Evidence: `ruff` and `bitwarden-server` each exceeded nine minutes before reaching the profile sweep and were stopped. The small Rust `lgtm` corpus completed but only eight labeled seeds were available. This is a graph-construction performance concern, not PageRank cost.
+
+- Observation: four `u16` counters retain the 8-byte compact edge payload used by the previous single `usize` weight on supported 64-bit targets.
+  Evidence: `reference_counts_keep_the_legacy_edge_payload_size` pins `size_of::<UsageReferenceCounts>() == 8`; retained non-truncated callees are below the 1,000-site cap, so `u16` is exact for every edge PageRank consumes.
 
 ## Decision Log
 
@@ -51,11 +63,21 @@ The result will be observable through a deterministic ignored benchmark over rep
   Rationale: deterministic samples make runs comparable, while several retrieval metrics reduce the chance of choosing weights that optimize one arbitrary cutoff or one repository.
   Date/Author: 2026-07-15 / Codex
 
+- Decision: select call 1.5, member 1.25, type 1.0, and other 0.875 as the production profile.
+  Rationale: across eight corpora, this subtle profile improved macro NDCG@10 from 0.18686 to 0.18977, MRR@10 from 0.36166 to 0.36745, and Recall@10 from 0.13222 to 0.13847. It also slightly improved Go instead of accepting the regression caused by stronger profiles. The improvement is modest enough to reflect the noisy co-change proxy rather than claim false precision.
+  Date/Author: 2026-07-15 / Codex
+
+- Decision: keep the selected weights internal and expose no new MCP parameter.
+  Rationale: one conservative profile generalized adequately, while raw numeric controls would enlarge every Rust, MCP, CLI, and Python interface without demonstrated user need. The ignored benchmark keeps alternatives reproducible for future recalibration.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
 Calibration is in progress. The initial design establishes an independent quantitative signal, retains qualitative inspection, and deliberately postpones public configurability.
 
 Milestone 1 outcome 2026-07-15T13:28:00Z: `UsageReferenceCounts` now survives from every language scanner through `UsageEdgeWeights` and the dense workspace graph. The public site-bearing graph still emits its unchanged `(path, line)` payload, dead-code consumers sum the four counts, and relevance currently combines them with a uniform profile. Structured classifier and focused graph/relevance tests pass.
+
+Milestone 2 outcome 2026-07-15T14:08:00Z: the ignored benchmark evaluates deterministic random seed files against independent git co-change labels while reusing one expensive graph across all profiles. Eight completed corpora favor a subtle behavioral profile overall. The selected default improves all three macro metrics, preserves type references at full strength, avoids the measured Go regression, and adds no public configuration surface.
 
 ## Context and Orientation
 
@@ -111,6 +133,18 @@ Initial corpus inventory includes `godog` (91 Go files), `cassandra-python-drive
 
 The prior issue #781 implementation measured roughly 40.5 seconds to build Bifrost's compact usage graph, while PageRank and file aggregation together took about 26 milliseconds. The calibration harness must therefore build once and sweep profiles over the retained graph rather than rebuilding for every candidate.
 
+Final deterministic 20-seed macro results across `cassandra-python-driver`, `ngx-admin`, `dbal`, `jgit`, `godog`, `kokkos`, `lgtm`, and `tsngtest`:
+
+    profile                 NDCG@10   MRR@10   Recall@10
+    uniform                 0.18686   0.36166  0.13222
+    subtle_behavioral       0.18977   0.36745  0.13847
+    conservative_behavioral 0.19147   0.36920  0.13961
+    type_light              0.19279   0.37461  0.14005
+
+The stronger profiles have higher macro scores but reduce `godog` NDCG and recall. The selected subtle profile instead raises `godog` NDCG from 0.28596 to 0.28668 while also improving the behavior-heavy corpora. Representative output showed stable, plausible collaborators such as `cassandra/connection.py` for Python policy tests, JGit object-reader and object-ID files for abbreviation tests, and Kokkos execution-policy and view-construction headers for policy tests.
+
+Graph timings from cold or partially warm debug-profile runs were approximately 15.6s for `cassandra-python-driver`, 0.7s for `ngx-admin`, 1.7s for `dbal`, 74.4s for `jgit`, 0.6s for `godog`, 171.0s for `kokkos`, 4.2s for `lgtm`, and 5.0s for `tsngtest`. Sweeping all profiles was much cheaper than construction. `ruff` and `bitwarden-server` exceeded the nine-minute calibration cutoff.
+
 Milestone 1 validation:
 
     BIFROST_SEMANTIC_INDEX=off cargo test inverted_edges::tests --lib
@@ -132,3 +166,5 @@ Define `UsageReferenceWeights` near the relevance graph consumer. It must valida
 Revision note 2026-07-15T13:12:00Z: Created the calibration ExecPlan after inventorying available corpora and identifying git co-change retrieval as an independent evaluation signal.
 
 Revision note 2026-07-15T13:28:00Z: Recorded the completed kind-retention milestone, the same-line compatibility rule, and focused validation evidence.
+
+Revision note 2026-07-15T14:08:00Z: Recorded the reproducible benchmark, corpus limitations, profile sweep, selected calibrated defaults, compact counter representation, and decision not to add MCP configuration.

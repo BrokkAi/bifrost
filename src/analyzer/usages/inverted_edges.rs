@@ -142,23 +142,26 @@ pub(crate) enum UsageReferenceKind {
 /// Summing the fields reproduces the legacy unit-per-line edge weight.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UsageReferenceCounts {
-    pub(crate) calls: usize,
-    pub(crate) members: usize,
-    pub(crate) types: usize,
-    pub(crate) other: usize,
+    pub(crate) calls: u16,
+    pub(crate) members: u16,
+    pub(crate) types: u16,
+    pub(crate) other: u16,
 }
 
 impl UsageReferenceCounts {
     pub(crate) fn total(self) -> usize {
-        self.calls + self.members + self.types + self.other
+        usize::from(self.calls)
+            + usize::from(self.members)
+            + usize::from(self.types)
+            + usize::from(self.other)
     }
 
     fn record(&mut self, kind: UsageReferenceKind) {
         match kind {
-            UsageReferenceKind::Call => self.calls += 1,
-            UsageReferenceKind::Member => self.members += 1,
-            UsageReferenceKind::Type => self.types += 1,
-            UsageReferenceKind::Other => self.other += 1,
+            UsageReferenceKind::Call => self.calls = self.calls.saturating_add(1),
+            UsageReferenceKind::Member => self.members = self.members.saturating_add(1),
+            UsageReferenceKind::Type => self.types = self.types.saturating_add(1),
+            UsageReferenceKind::Other => self.other = self.other.saturating_add(1),
         }
     }
 }
@@ -223,17 +226,26 @@ pub(crate) fn classify_reference_node(node: Node<'_>) -> UsageReferenceKind {
                 | "selector_expression"
                 | "navigation_expression"
                 | "scope_resolution_expression"
-        ) && field_contains_site(parent, &["property", "field", "name"], site_start, site_end)
-        {
+                | "attribute"
+                | "field_access"
+                | "scoped_property_access_expression"
+        ) && field_contains_site(
+            parent,
+            &["property", "field", "name", "attribute"],
+            site_start,
+            site_end,
+        ) {
             member = true;
         }
         if matches!(
             kind,
-            "call_expression"
+            "call"
+                | "call_expression"
                 | "method_invocation"
                 | "invocation_expression"
                 | "function_call_expression"
                 | "member_call_expression"
+                | "scoped_call_expression"
                 | "command"
         ) && field_contains_site(
             parent,
@@ -277,10 +289,10 @@ fn field_contains_site(
 
 impl std::ops::AddAssign for UsageReferenceCounts {
     fn add_assign(&mut self, rhs: Self) {
-        self.calls += rhs.calls;
-        self.members += rhs.members;
-        self.types += rhs.types;
-        self.other += rhs.other;
+        self.calls = self.calls.saturating_add(rhs.calls);
+        self.members = self.members.saturating_add(rhs.members);
+        self.types = self.types.saturating_add(rhs.types);
+        self.other = self.other.saturating_add(rhs.other);
     }
 }
 
@@ -958,6 +970,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn structured_reference_classifier_distinguishes_python_calls_and_members() {
+        let source = "def caller(value: Model):\n    helper()\n    value.member\n    value.run()\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "identifier", "Model")),
+            UsageReferenceKind::Type
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "identifier", "helper")),
+            UsageReferenceKind::Call
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "identifier", "member")),
+            UsageReferenceKind::Member
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "identifier", "run")),
+            UsageReferenceKind::Call
+        );
+    }
+
+    #[test]
+    fn structured_reference_classifier_distinguishes_typescript_kinds() {
+        let source =
+            "function caller(value: Model) { helper(); value.member; value.run(); OTHER; }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "type_identifier", "Model")),
+            UsageReferenceKind::Type
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "identifier", "helper")),
+            UsageReferenceKind::Call
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "property_identifier", "member")),
+            UsageReferenceKind::Member
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "property_identifier", "run")),
+            UsageReferenceKind::Call
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "identifier", "OTHER")),
+            UsageReferenceKind::Other
+        );
+    }
+
     fn per_file_with_edge(path: &str, caller: &str, callee: &str, line: usize) -> PerFileEdges {
         let mut edges = PerFileEdges {
             path: path.to_string(),
@@ -1054,6 +1127,11 @@ mod tests {
                 ..UsageReferenceCounts::default()
             })
         );
+    }
+
+    #[test]
+    fn reference_counts_keep_the_legacy_edge_payload_size() {
+        assert_eq!(std::mem::size_of::<UsageReferenceCounts>(), 8);
     }
 
     #[test]

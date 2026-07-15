@@ -1,6 +1,6 @@
 use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
 use crate::analyzer::usages::workspace_graph::{
-    WorkspaceUsageCatalog, build_workspace_usage_graph,
+    WorkspaceUsageCatalog, WorkspaceUsageGraph, build_workspace_usage_graph,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
@@ -92,7 +92,13 @@ struct UsageReferenceWeights {
     other: f64,
 }
 
+struct UsageRankingGraph {
+    graph: WorkspaceUsageGraph,
+    node_indices_by_file: HashMap<ProjectFile, Vec<usize>>,
+}
+
 impl UsageReferenceWeights {
+    #[cfg(test)]
     const UNIFORM: Self = Self {
         calls: 1.0,
         members: 1.0,
@@ -100,11 +106,22 @@ impl UsageReferenceWeights {
         other: 1.0,
     };
 
+    // Calibrated against deterministic git co-change retrieval on eight
+    // repositories spanning Python, TypeScript, PHP, Java, Go, C++, and Rust.
+    // The deliberately subtle bias improved the macro average without the Go
+    // regression caused by more aggressive call-first profiles.
+    const CALIBRATED: Self = Self {
+        calls: 1.5,
+        members: 1.25,
+        types: 1.0,
+        other: 0.875,
+    };
+
     fn combine(self, counts: UsageReferenceCounts) -> f64 {
-        counts.calls as f64 * self.calls
-            + counts.members as f64 * self.members
-            + counts.types as f64 * self.types
-            + counts.other as f64 * self.other
+        f64::from(counts.calls) * self.calls
+            + f64::from(counts.members) * self.members
+            + f64::from(counts.types) * self.types
+            + f64::from(counts.other) * self.other
     }
 }
 
@@ -211,6 +228,16 @@ fn related_files_by_usage(
         return Vec::new();
     }
 
+    let ranking_graph = build_usage_ranking_graph(analyzer);
+    related_files_by_usage_graph(
+        &ranking_graph,
+        seed_weights,
+        k,
+        UsageReferenceWeights::CALIBRATED,
+    )
+}
+
+fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> UsageRankingGraph {
     let catalog = {
         let _scope = profiling::scope("relevance::usage_graph_catalog");
         WorkspaceUsageCatalog::build(analyzer)
@@ -225,9 +252,29 @@ fn related_files_by_usage(
         }
     }
 
-    let mut teleport = vec![0.0; catalog.nodes.len()];
+    let graph = {
+        let _scope = profiling::scope("relevance::usage_graph_construction");
+        build_workspace_usage_graph(analyzer, catalog)
+    };
+    UsageRankingGraph {
+        graph,
+        node_indices_by_file,
+    }
+}
+
+fn related_files_by_usage_graph(
+    ranking_graph: &UsageRankingGraph,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    k: usize,
+    weights: UsageReferenceWeights,
+) -> Vec<FileRelevance> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let graph = &ranking_graph.graph;
+    let mut teleport = vec![0.0; graph.nodes.len()];
     for (file, weight) in seed_weights.iter().filter(|(_, weight)| **weight > 0.0) {
-        let Some(indices) = node_indices_by_file.get(file) else {
+        let Some(indices) = ranking_graph.node_indices_by_file.get(file) else {
             continue;
         };
         if indices.is_empty() {
@@ -242,10 +289,6 @@ fn related_files_by_usage(
         return Vec::new();
     }
 
-    let graph = {
-        let _scope = profiling::scope("relevance::usage_graph_construction");
-        build_workspace_usage_graph(analyzer, catalog)
-    };
     if graph.edges.is_empty() {
         return Vec::new();
     }
@@ -259,7 +302,7 @@ fn related_files_by_usage(
     }
     let mut outgoing = vec![Vec::new(); graph.nodes.len()];
     for edge in &graph.edges {
-        outgoing[edge.from].push((edge.to, UsageReferenceWeights::UNIFORM.combine(edge.counts)));
+        outgoing[edge.from].push((edge.to, weights.combine(edge.counts)));
     }
     for neighbors in &mut outgoing {
         neighbors.sort_by_key(|(target, _)| *target);
@@ -1490,13 +1533,17 @@ fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::c
 }
 
 #[cfg(test)]
+mod weight_benchmark;
+
+#[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GitProjectContext, RepoCommitChangeCache,
-        clear_repo_commit_change_cache_for_root, commit_age_weight,
+        UsageReferenceWeights, clear_repo_commit_change_cache_for_root, commit_age_weight,
         most_relevant_project_files_with_half_life, related_files_by_git, related_files_by_imports,
         repo_commit_change_cache, weighted_page_rank,
     };
+    use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
         TestProject,
@@ -1826,6 +1873,42 @@ mod tests {
 
         assert!(scores[2] > scores[1], "scores: {scores:?}");
         assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn calibrated_usage_weights_apply_a_subtle_behavioral_preference() {
+        let weights = UsageReferenceWeights::CALIBRATED;
+        let call = weights.combine(UsageReferenceCounts {
+            calls: 1,
+            ..UsageReferenceCounts::default()
+        });
+        let member = weights.combine(UsageReferenceCounts {
+            members: 1,
+            ..UsageReferenceCounts::default()
+        });
+        let type_reference = weights.combine(UsageReferenceCounts {
+            types: 1,
+            ..UsageReferenceCounts::default()
+        });
+        let other = weights.combine(UsageReferenceCounts {
+            other: 1,
+            ..UsageReferenceCounts::default()
+        });
+        assert!(call > member && member > type_reference && type_reference > other);
+
+        let scores = weighted_page_rank(
+            &[
+                vec![(1, call), (2, member), (3, type_reference), (4, other)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ],
+            &[1.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        assert!(scores[1] > scores[2]);
+        assert!(scores[2] > scores[3]);
+        assert!(scores[3] > scores[4]);
     }
 
     #[test]
