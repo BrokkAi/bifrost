@@ -5394,3 +5394,353 @@ int main() {
     );
     assert_success_counts(result, &build_service, 0, 1);
 }
+
+#[test]
+fn authoritative_cpp_usage_resolves_relative_and_templated_qualified_owners_lexically() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "owners.h",
+            r#"#pragma once
+namespace outer {
+struct Owner { static void run(); };
+namespace inner {
+struct Owner { static void run(); };
+}
+template <typename T>
+struct Supplement { static void trace(); };
+}
+
+namespace wrong {
+struct Owner { static void run(); };
+template <typename T>
+struct Supplement { static void trace(); };
+}
+
+struct Owner { static void run(); };
+template <typename T>
+struct Supplement { static void trace(); };
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "owners.h"
+namespace outer {
+void consume() {
+    Owner::run();                         // outer-relative
+    ::outer::Owner::run();                // outer-fully-qualified
+    inner::Owner::run();                  // inner-relative
+    ::outer::inner::Owner::run();         // inner-fully-qualified
+    Supplement<int>::trace();             // template-relative
+    ::outer::Supplement<int>::trace();    // template-fully-qualified
+
+    ::wrong::Owner::run();                // wrong-namespace
+    ::Owner::run();                       // wrong-global
+    ::wrong::Supplement<int>::trace();    // wrong-template-namespace
+    ::Supplement<int>::trace();           // wrong-template-global
+}
+}
+"#,
+        ),
+    ]);
+
+    let method = |owner_fq_name: &str, member_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.identifier() == member_name
+                && unit.fq_name() == format!("{owner_fq_name}.{member_name}")
+        })
+    };
+    let outer_run = method("outer.Owner", "run");
+    let inner_run = method("outer::inner.Owner", "run");
+    let supplement_trace = method("outer.Supplement", "trace");
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let terminal_range = |needle: &str, terminal: &str| {
+        let occurrence = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}"));
+        let terminal_offset = needle
+            .find(terminal)
+            .unwrap_or_else(|| panic!("missing terminal {terminal} in {needle}"));
+        let start = occurrence + terminal_offset;
+        (start, start + terminal.len())
+    };
+    let outer_ranges = [
+        terminal_range(
+            "Owner::run();                         // outer-relative",
+            "run",
+        ),
+        terminal_range(
+            "::outer::Owner::run();                // outer-fully-qualified",
+            "run",
+        ),
+    ];
+    let inner_ranges = [
+        terminal_range(
+            "inner::Owner::run();                  // inner-relative",
+            "run",
+        ),
+        terminal_range(
+            "::outer::inner::Owner::run();         // inner-fully-qualified",
+            "run",
+        ),
+    ];
+    let supplement_ranges = [
+        terminal_range(
+            "Supplement<int>::trace();             // template-relative",
+            "trace",
+        ),
+        terminal_range(
+            "::outer::Supplement<int>::trace();    // template-fully-qualified",
+            "trace",
+        ),
+    ];
+
+    let assert_exact_authoritative_hits =
+        |target: &CodeUnit, expected_ranges: &[(usize, usize)]| {
+            let query = UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(target),
+                    Some(&provider),
+                    1,
+                    1000,
+                );
+            assert_eq!(
+                query.candidate_files,
+                std::iter::once(consumer.clone()).collect(),
+                "authoritative query must scan only the explicit consumer"
+            );
+            let FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                ..
+            } = query.result
+            else {
+                panic!("expected authoritative C++ success for {target:#?}");
+            };
+            let hits = hits_by_overload.get(target).cloned().unwrap_or_default();
+            assert_eq!(
+                hits.len(),
+                expected_ranges.len(),
+                "expected only relative and fully-qualified target hits for {target:#?}: {hits:#?}"
+            );
+            for (start, end) in expected_ranges {
+                assert!(
+                    hits.iter().any(|hit| {
+                        hit.file == consumer && hit.start_offset == *start && hit.end_offset == *end
+                    }),
+                    "missing exact terminal range {start}..{end} for {target:#?}: {hits:#?}"
+                );
+            }
+            assert_eq!(
+                unproven_total_by_overload
+                    .get(target)
+                    .copied()
+                    .unwrap_or_default(),
+                0,
+                "wrong namespace/global same-name sites must be known non-targets: {unproven_by_overload:#?}"
+            );
+        };
+
+    assert_exact_authoritative_hits(&outer_run, &outer_ranges);
+    assert_exact_authoritative_hits(&inner_run, &inner_ranges);
+    assert_exact_authoritative_hits(&supplement_trace, &supplement_ranges);
+}
+
+#[test]
+fn authoritative_cpp_usage_lets_nearer_lexical_owner_veto_legacy_qualified_matches() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "owners.h",
+            r#"#pragma once
+struct Owner {
+    static void run();
+    static int value;
+};
+namespace outer {
+struct Owner {
+    static void run();
+    static int value;
+};
+namespace near {
+struct Owner {
+    static void run();
+    static int value;
+};
+}
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "owners.h"
+namespace outer {
+namespace near {
+void Owner::run() {}
+int read() { return Owner::value; }
+}
+}
+"#,
+        ),
+    ]);
+
+    let target = |fq_name: &str, kind: CodeUnitType| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == kind && unit.fq_name() == fq_name
+        })
+    };
+    let targets = [
+        target("Owner.run", CodeUnitType::Function),
+        target("outer.Owner.run", CodeUnitType::Function),
+        target("Owner.value", CodeUnitType::Field),
+        target("outer.Owner.value", CodeUnitType::Field),
+    ];
+    let consumer = project.file("consumer.cpp");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for target in targets {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            );
+        assert_eq!(
+            query.candidate_files,
+            std::iter::once(consumer.clone()).collect(),
+            "authoritative query must scan only the explicit consumer"
+        );
+        assert_success_counts(query.result, &target, 0, 0);
+    }
+}
+
+#[test]
+fn authoritative_cpp_usage_resolves_relative_owner_through_enclosing_class_tiers() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[(
+        "consumer.cpp",
+        r#"namespace outer {
+struct Container {
+    struct Nested { static void run(); };
+    void inline_call() { Nested::run(); }
+    void out_of_line_call();
+};
+
+void Container::out_of_line_call() {
+    Nested::run();
+}
+}
+"#,
+    )]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "outer.Container$Nested.run"
+    });
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected = source
+        .match_indices("Nested::run();")
+        .map(|(start, _)| {
+            let terminal = start + "Nested::".len();
+            (terminal, terminal + "run".len())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expected.len(), 2, "inline fixture call count");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative enclosing-class success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(
+        hits.len(),
+        expected.len(),
+        "enclosing-class hits: {hits:#?}"
+    );
+    for (start, end) in expected {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+            }),
+            "missing exact enclosing-class terminal {start}..{end}: {hits:#?}"
+        );
+    }
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "enclosing-class relative owners should resolve without unproven hits"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_keeps_relative_owner_unproven_when_enclosing_owner_is_missing() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "targets.h",
+            r#"#pragma once
+namespace outer {
+struct Nested { static void run(); };
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "targets.h"
+namespace outer {
+void MissingContainer::call() {
+    Nested::run();
+}
+}
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "outer.Nested.run"
+    });
+    let consumer = project.file("consumer.cpp");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer).collect(),
+        "authoritative query must scan only the partial-workspace consumer"
+    );
+    assert_success_counts(query.result, &target, 0, 1);
+}

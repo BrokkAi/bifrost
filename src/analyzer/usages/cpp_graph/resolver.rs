@@ -28,6 +28,15 @@ pub(in crate::analyzer::usages) enum TargetKind {
     MemberField,
 }
 
+pub(super) enum LexicalTypeResolution {
+    Resolved {
+        unit: CodeUnit,
+        components: Vec<String>,
+    },
+    Ambiguous,
+    Missing,
+}
+
 pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
     pub(super) kind: TargetKind,
@@ -279,6 +288,45 @@ impl VisibilityIndex {
             .into_iter()
             .next()
             .cloned()
+    }
+
+    pub(super) fn resolve_type_components_lexically(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        components: &[String],
+        global: bool,
+        lexical_scope: &[String],
+    ) -> LexicalTypeResolution {
+        if components.is_empty() {
+            return LexicalTypeResolution::Missing;
+        }
+        let first_prefix_len = if global { 0 } else { lexical_scope.len() };
+        for prefix_len in (0..=first_prefix_len).rev() {
+            let mut qualified = Vec::with_capacity(prefix_len + components.len());
+            qualified.extend_from_slice(&lexical_scope[..prefix_len]);
+            qualified.extend_from_slice(components);
+            let qualified_name = qualified.join("::");
+            let candidates = self
+                .type_candidates(file, &qualified_name)
+                .into_iter()
+                .filter(|candidate| cpp_name_for(candidate) == qualified_name)
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                continue;
+            }
+            let Some(resolved) = unique_logical_type_candidate(candidates) else {
+                return LexicalTypeResolution::Ambiguous;
+            };
+            let Some(unit) = self.canonical_type_unit(analyzer, file, &resolved) else {
+                return LexicalTypeResolution::Ambiguous;
+            };
+            return LexicalTypeResolution::Resolved {
+                unit,
+                components: qualified,
+            };
+        }
+        LexicalTypeResolution::Missing
     }
 
     fn resolve_type_for_declaration(
@@ -1882,10 +1930,20 @@ pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
-pub(super) fn function_terminal_node(node: Node<'_>) -> Node<'_> {
-    node.child_by_field_name("field")
-        .or_else(|| node.child_by_field_name("name"))
-        .unwrap_or(node)
+pub(super) fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
+    loop {
+        let next = match node.kind() {
+            "qualified_identifier" | "scoped_identifier" | "template_function" => {
+                node.child_by_field_name("name")
+            }
+            "field_expression" => node.child_by_field_name("field"),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return node;
+        };
+        node = next;
+    }
 }
 
 pub(in crate::analyzer::usages) fn normalize_type_text(value: &str) -> String {

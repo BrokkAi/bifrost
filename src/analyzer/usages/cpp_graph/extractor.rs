@@ -742,8 +742,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     else {
         return;
     };
-    let text = node_text(function, ctx.source);
-    if !name_matches_callable(text, &ctx.spec.member_name) {
+    if !callable_node_matches(function, &ctx.spec.member_name, ctx.source) {
         return;
     }
     *ctx.raw_match_count += 1;
@@ -753,6 +752,18 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if !method_call_may_target(node, ctx) {
+        return;
+    }
+    if is_structurally_qualified(function) {
+        match qualified_owner_resolution(function, ctx) {
+            QualifiedOwnerResolution::Target => {
+                push_hit(function_terminal_node(function), ctx);
+            }
+            QualifiedOwnerResolution::NonTarget => {}
+            QualifiedOwnerResolution::Unresolved => {
+                push_unproven_hit(function_terminal_node(function), ctx);
+            }
+        }
         return;
     }
     if receiver_matches_target(function, ctx) {
@@ -809,8 +820,7 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(function) = function_definition_name_node(node) else {
         return;
     };
-    let text = node_text(function, ctx.source);
-    if !name_matches_callable(text, &ctx.spec.member_name) {
+    if !callable_node_matches(function, &ctx.spec.member_name, ctx.source) {
         return;
     }
     *ctx.raw_match_count += 1;
@@ -818,6 +828,14 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if node_inside_target_declaration(function, ctx) {
+        return;
+    }
+    if is_structurally_qualified(function) {
+        match qualified_owner_resolution(function, ctx) {
+            QualifiedOwnerResolution::Target => push_definition_hit(function, ctx),
+            QualifiedOwnerResolution::NonTarget => {}
+            QualifiedOwnerResolution::Unresolved => push_unproven_hit(function, ctx),
+        }
         return;
     }
     if definition_name_candidates(function, ctx)
@@ -831,7 +849,6 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     &ctx.spec.target,
                 )
         })
-        || qualified_owner_matches(text, ctx)
     {
         push_definition_hit(function, ctx);
     } else if definition_name_candidates(function, ctx)
@@ -915,6 +932,10 @@ fn function_definition_signature_matches_target(node: Node<'_>, ctx: &ScanCtx<'_
         return true;
     };
     cpp_signature_param_types(definition) == cpp_signature_param_types(target_signature)
+}
+
+fn callable_node_matches(node: Node<'_>, expected: &str, source: &str) -> bool {
+    name_matches_callable(node_text(function_terminal_node(node), source), expected)
 }
 
 fn definition_name_candidates(function: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<String> {
@@ -1133,7 +1154,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     if !matches!(
         node.kind(),
-        "identifier" | "field_identifier" | "qualified_identifier"
+        "identifier" | "field_identifier" | "qualified_identifier" | "scoped_identifier"
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         || is_declaration_name(node)
         || is_member_field_declaration_context(node, ctx)
@@ -1143,33 +1164,31 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    let text = node_text(node, ctx.source);
-    if !text.contains("::") && ctx.local_shadows.is_shadowed(text) {
+    if is_structurally_qualified(node) {
+        match qualified_owner_resolution(node, ctx) {
+            QualifiedOwnerResolution::Target => push_hit(node, ctx),
+            QualifiedOwnerResolution::NonTarget => {}
+            QualifiedOwnerResolution::Unresolved => push_unproven_hit(node, ctx),
+        }
         return;
     }
-    let qualified_match = text.contains("::")
-        && (ctx
-            .visibility
-            .resolve_named(ctx.file, text, TargetKind::MemberField)
-            .is_some_and(|resolved| same_visible_symbol(&resolved, &ctx.spec.target))
-            || qualified_owner_matches(text, ctx));
+    let text = node_text(node, ctx.source);
+    if ctx.local_shadows.is_shadowed(text) {
+        return;
+    }
     let unscoped_enum_match = ctx.spec.owner.as_ref().is_some_and(|owner| {
-        !text.contains("::")
-            && owner_is_unscoped_enum(owner, ctx)
-            && ctx.visibility.is_visible(ctx.file, &ctx.spec.target)
+        owner_is_unscoped_enum(owner, ctx) && ctx.visibility.is_visible(ctx.file, &ctx.spec.target)
     });
-    let unqualified_same_owner = !text.contains("::") && same_owner_context(node, ctx);
-    if qualified_match || unqualified_same_owner || unscoped_enum_match {
+    let unqualified_same_owner = same_owner_context(node, ctx);
+    if unqualified_same_owner || unscoped_enum_match {
         push_hit(node, ctx);
     } else if ctx
         .spec
         .owner
         .as_ref()
-        .is_some_and(|owner| owner_is_scoped_enum(owner, ctx) && !text.contains("::"))
+        .is_some_and(|owner| owner_is_scoped_enum(owner, ctx))
     {
         // Scoped enum values must be qualified, so an unqualified same-name value is not this target.
-    } else if text.contains("::") {
-        // Explicitly qualified fields that do not match the target owner are known non-targets.
     } else if !known_non_target_owner_context(node, ctx) {
         push_unproven_hit(node, ctx);
     }
@@ -1443,13 +1462,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                     .any(|target| receiver_owner_matches_target(target, owner, ctx))
             }),
         "this" => same_owner_context(node, ctx),
-        "qualified_identifier" | "scoped_identifier" | "field_identifier" => {
-            qualified_owner_matches(node_text(node, ctx.source), ctx)
-        }
-        _ => {
-            let text = node_text(node, ctx.source);
-            qualified_owner_matches(text, ctx)
-        }
+        _ => qualified_owner_matches(node, ctx),
     }
 }
 
@@ -1535,22 +1548,184 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             }),
         "this" => known_non_target_owner_context(node, ctx),
         "qualified_identifier" | "scoped_identifier" | "field_identifier" => {
-            let text = node_text(node, ctx.source);
-            !qualified_owner_matches(text, ctx) && text.contains("::")
+            qualified_owner_is_known_non_target(node, ctx)
         }
         _ => false,
     }
 }
 
-fn qualified_owner_matches(text: &str, ctx: &ScanCtx<'_>) -> bool {
-    let Some(owner_cpp_name) = ctx.spec.owner_cpp_name.as_deref() else {
-        return false;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QualifiedOwnerResolution {
+    Target,
+    NonTarget,
+    Unresolved,
+}
+
+enum LexicalScopeResolution {
+    Resolved(Vec<String>),
+    Ambiguous,
+    Missing,
+}
+
+fn qualified_owner_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    qualified_owner_resolution(node, ctx) == QualifiedOwnerResolution::Target
+}
+
+fn qualified_owner_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    qualified_owner_resolution(node, ctx) == QualifiedOwnerResolution::NonTarget
+}
+
+fn is_structurally_qualified(node: Node<'_>) -> bool {
+    matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+}
+
+fn qualified_owner_resolution(node: Node<'_>, ctx: &ScanCtx<'_>) -> QualifiedOwnerResolution {
+    let Some(target_owner) = ctx.spec.owner.as_ref() else {
+        return QualifiedOwnerResolution::Unresolved;
     };
-    let normalized = normalize_cpp_reference_text(text);
-    normalized == owner_cpp_name
-        || normalized
-            .strip_suffix(&format!("::{}", ctx.spec.member_name))
-            .is_some_and(|owner| owner == owner_cpp_name)
+    let Some((components, global)) = qualified_callable_owner_components(node, ctx.source) else {
+        return QualifiedOwnerResolution::Unresolved;
+    };
+    let lexical_scope = match enclosing_lexical_scope_components(node, ctx) {
+        LexicalScopeResolution::Resolved(scope) => scope,
+        LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
+            return QualifiedOwnerResolution::Unresolved;
+        }
+    };
+    match ctx.visibility.resolve_type_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &components,
+        global,
+        &lexical_scope,
+    ) {
+        LexicalTypeResolution::Resolved { unit: owner, .. }
+            if receiver_owner_matches_target(&owner, target_owner, ctx) =>
+        {
+            QualifiedOwnerResolution::Target
+        }
+        LexicalTypeResolution::Resolved { unit: owner, .. }
+            if same_visible_symbol(&owner, target_owner) =>
+        {
+            QualifiedOwnerResolution::Unresolved
+        }
+        LexicalTypeResolution::Resolved { .. } => QualifiedOwnerResolution::NonTarget,
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
+            QualifiedOwnerResolution::Unresolved
+        }
+    }
+}
+
+fn qualified_callable_owner_components(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(Vec<String>, bool)> {
+    if !matches!(node.kind(), "qualified_identifier" | "scoped_identifier") {
+        return None;
+    }
+    let global = node.child_by_field_name("scope").is_none()
+        && node.child(0).is_some_and(|child| child.kind() == "::");
+    let mut components = Vec::new();
+    append_cpp_name_components(node, source, &mut components)?;
+    components.pop()?;
+    (!components.is_empty()).then_some((components, global))
+}
+
+fn append_cpp_name_components(node: Node<'_>, source: &str, out: &mut Vec<String>) -> Option<()> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "namespace_identifier"
+        | "type_identifier"
+        | "operator_name"
+        | "destructor_name" => {
+            out.push(node_text(node, source).to_string());
+            Some(())
+        }
+        "template_type" | "template_function" => {
+            append_cpp_name_components(node.child_by_field_name("name")?, source, out)
+        }
+        "qualified_identifier" | "scoped_identifier" => {
+            if let Some(scope) = node.child_by_field_name("scope") {
+                append_cpp_name_components(scope, source, out)?;
+            }
+            append_cpp_name_components(node.child_by_field_name("name")?, source, out)
+        }
+        "nested_namespace_specifier" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                append_cpp_name_components(child, source, out)?;
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut namespaces = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition"
+            && let Some(name) = parent.child_by_field_name("name")
+        {
+            let mut components = Vec::new();
+            if append_cpp_name_components(name, source, &mut components).is_some() {
+                namespaces.push(components);
+            }
+        }
+        current = parent.parent();
+    }
+    namespaces.reverse();
+    namespaces.into_iter().flatten().collect()
+}
+
+fn enclosing_lexical_scope_components(node: Node<'_>, ctx: &ScanCtx<'_>) -> LexicalScopeResolution {
+    let namespace = enclosing_namespace_components(node, ctx.source);
+    let mut scope = namespace.clone();
+    let mut classes = Vec::new();
+    let mut function_definition = None;
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && let Some(name) = parent.child_by_field_name("name")
+        {
+            let mut components = Vec::new();
+            if append_cpp_name_components(name, ctx.source, &mut components).is_some() {
+                classes.push(components);
+            }
+        }
+        if function_definition.is_none() && parent.kind() == "function_definition" {
+            function_definition = Some(parent);
+        }
+        current = parent.parent();
+    }
+
+    if let Some(function) = function_definition.and_then(function_definition_name_node)
+        && is_structurally_qualified(function)
+    {
+        let Some((owner, global)) = qualified_callable_owner_components(function, ctx.source)
+        else {
+            return LexicalScopeResolution::Missing;
+        };
+        match ctx.visibility.resolve_type_components_lexically(
+            ctx.analyzer,
+            ctx.file,
+            &owner,
+            global,
+            &namespace,
+        ) {
+            LexicalTypeResolution::Resolved { components, .. } => scope = components,
+            LexicalTypeResolution::Ambiguous => return LexicalScopeResolution::Ambiguous,
+            LexicalTypeResolution::Missing => return LexicalScopeResolution::Missing,
+        }
+    }
+
+    classes.reverse();
+    scope.extend(classes.into_iter().flatten());
+    LexicalScopeResolution::Resolved(scope)
 }
 
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
