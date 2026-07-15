@@ -153,7 +153,7 @@ void test("highlights semantic traversal forms and options", async () => {
   assertScoped(tokens, "callers", "support.function.wrapper.bifrost-rql");
 });
 
-test("highlights receiver traversal forms and capture options", async () => {
+void test("highlights receiver traversal forms and capture options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),
     "(receiver-targets (call)) (points-to :capture service (call :receiver (capture service))) (member-targets (field-access))"

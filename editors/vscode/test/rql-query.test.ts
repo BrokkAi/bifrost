@@ -11,6 +11,7 @@ import {
   queryResultTooltip,
   runRqlQuery,
   type RqlQueryRunner,
+  type RqlReceiverAnalysisResult,
   type RqlReferenceSiteResult
 } from "../src/rql_query";
 
@@ -178,8 +179,8 @@ void test("renders and navigates an exact reference-site result", () => {
   assert.deepEqual(queryResultRange(reference), reference.range);
 });
 
-test("renders and navigates a receiver-analysis result", () => {
-  const analysis = {
+void test("renders and navigates a receiver-analysis result", () => {
+  const analysis: RqlReceiverAnalysisResult = {
     uri: "file:///workspace/src/app.ts",
     path: "src/app.ts",
     result_type: "receiver_analysis",
