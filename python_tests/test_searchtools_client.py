@@ -18,6 +18,7 @@ from bifrost_searchtools import (
     CodeQueryFile,
     CodeQueryMatch,
     CodeQueryReferenceSite,
+    CodeQueryReceiverAnalysis,
     CodeQueryResult,
     MostRelevantFilesRankingMode,
     SearchToolsClient,
@@ -357,6 +358,64 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertEqual(result.results[0].arguments[0].formal_name, "payload")
         self.assertIsInstance(result.results[1], CodeQueryExpressionSite)
         self.assertEqual(result.results[1].text, '"value"')
+
+    def test_query_code_parses_recursive_receiver_analysis(self) -> None:
+        declaration = lambda kind, fq_name: {
+            "path": "sample.ts",
+            "language": "typescript",
+            "kind": kind,
+            "fq_name": fq_name,
+            "start_line": 1,
+            "end_line": 3,
+        }
+        source_range = {
+            "start_line": 8,
+            "start_column": 14,
+            "end_line": 8,
+            "end_column": 21,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "receiver_analysis",
+                        "analysis_kind": "points_to",
+                        "path": "sample.ts",
+                        "language": "typescript",
+                        "range": source_range,
+                        "text": "service",
+                        "input_kind": "identifier",
+                        "capture": "service",
+                        "outcome": "precise",
+                        "values": [
+                            {
+                                "receiver_value_kind": "factory_return",
+                                "factory": declaration("function", "makeService"),
+                                "returned_value": {
+                                    "receiver_value_kind": "allocation_site",
+                                    "type_declaration": declaration("class", "Service"),
+                                    "allocation_site": {
+                                        "path": "sample.ts",
+                                        "range": source_range,
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "truncated": False,
+            }
+        )
+
+        analysis = result.results[0]
+        self.assertIsInstance(analysis, CodeQueryReceiverAnalysis)
+        self.assertEqual(analysis.capture, "service")
+        self.assertEqual(analysis.values[0].factory.fq_name, "makeService")
+        returned = analysis.values[0].returned_value
+        self.assertIsNotNone(returned)
+        assert returned is not None
+        self.assertEqual(returned.type_declaration.fq_name, "Service")
+        self.assertEqual(returned.allocation_site.range.start_line, 8)
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

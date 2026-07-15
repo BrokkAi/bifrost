@@ -15,7 +15,7 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - [x] (2026-07-15 11:46Z) Inspected the typed query IR/executor, declarative schema, public result consumers, receiver provider, get-definition member resolution, documentation harness, and current capability claims.
 - [x] (2026-07-15 11:46Z) Created this implementation plan and fixed the public names, typed domains, capture semantics, explicit outcome model, provider scope, and validation contract.
 - [x] (2026-07-15 12:34Z) Milestone 1: added the analyzer-owned receiver query service, shared member-site resolution, exact factory provenance, work/truncation reports, cancellation, and focused JS/TS tests.
-- [ ] Milestone 2: add JSON/RQL steps, the receiver-analysis pipeline/result domain, consumers, and end-to-end tests.
+- [x] (2026-07-15) Milestone 2: added JSON/RQL steps, the receiver-analysis pipeline/result domain, public consumers, live help, grammar support, and end-to-end tests.
 - [ ] Milestone 3: add the executable cookbook and update every relevant public capability/query document.
 - [ ] Milestone 4: review the complete diff, repair findings, and run the full repository validation bundle.
 
@@ -41,6 +41,15 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 
 - Observation: Cargo's non-test library build reports the new service as dead code until Milestone 2 wires it into structural traversal.
   Evidence: the receiver and pipeline tests pass, while the integration-test build warns on the not-yet-consumed service types. This is an expected transient milestone state and will be eliminated by the query executor integration rather than suppressed.
+
+- Observation: Receiver traversal needs to distinguish an exact receiver expression from a containing call/member site.
+  Evidence: treating both as the same service input could analyze an unsupported structural shape directly. The service now accepts an explicit input mode, and the pipeline test proves a class match returns `unsupported` with `receiver_site_without_receiver`.
+
+- Observation: Semantic capture diagnostics already map through `steps[i].capture` to the exact JSON string value.
+  Evidence: live-source tests assert the range is precisely `"service"` for a missing declared capture and for a capture used after a reference-site stage.
+
+- Observation: The issue worktree had no VS Code dependencies, while the main checkout only had reusable docs dependencies.
+  Evidence: `npm ci` under `editors/vscode` installed 340 locked packages; lint, compilation, grammar tests, and all 54 extension unit tests pass.
 
 ## Decision Log
 
@@ -74,7 +83,9 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. The analyzer-owned service accepts an exact file/range and operation, checks cancellation, uses indexed JS/TS source and tree-sitter nodes, and returns explicit supported or unsupported reports. Provider reports now expose actual scope-node and summary-expansion work and candidate truncation. Member-site extraction is shared with get-definition, and factory summaries retain exact recursive provenance. The 13 receiver baseline, 5 focused service tests, and all 57 query-pipeline tests pass. Structural query integration and public consumers remain for Milestone 2.
+Milestones 1 and 2 are complete. The analyzer-owned service accepts an exact file/range, operation, and expression-versus-containing-site mode; checks cancellation; uses indexed JS/TS source and tree-sitter nodes; and returns explicit supported or unsupported reports. Provider reports expose actual scope-node and summary-expansion work and candidate truncation. Member-site extraction is shared with get-definition, and factory summaries retain exact recursive provenance.
+
+Schema version 2 now exposes all three typed receiver steps through JSON, RQL, MCP help, live diagnostics/hover, and the TextMate grammar. The executor preserves receiver analysis as a terminal domain, supports `file_of`, charges provider work, retains bounded ambiguity, and renders explicit unknown, unsupported, candidate-cap, and budget outcomes. Rust, Python, LSP, CLI, and VS Code result consumers include the recursive result variant. The 13 receiver baseline, 4 focused service tests, 66 query/schema tests, 61 query-pipeline tests, and all 54 VS Code tests pass. Public documentation remains for Milestone 3.
 
 ## Context and Orientation
 
@@ -184,6 +195,8 @@ Canonical outcome labels:
 Revision note (2026-07-15): Created the implementation-ready ExecPlan after rebasing onto current master, verifying focused baselines, and fixing the public outcome, domain, provider, budget, consumer, documentation, and validation contracts.
 
 Revision note (2026-07-15): Completed Milestone 1 with a shared analyzer service, real work/truncation reports, exact factory wrapping, cancellation, unsupported-language results, and focused regression coverage.
+
+Revision note (2026-07-15): Completed Milestone 2 with schema-v2 JSON/RQL operations, exact capture validation, a budgeted receiver-analysis terminal domain, all public result unions, editor/MCP metadata, and end-to-end JS/TS outcome/composition coverage. A review repair added explicit expression-versus-containing-site selection so unsupported shapes cannot be mistaken for receiver expressions.
 
 ## Interfaces and Dependencies
 

@@ -40,8 +40,8 @@ pub use query::{
     CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
     MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
-    MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind, ReferenceTraversalFilter,
-    SCHEMA_VERSION, StringPredicate,
+    MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind, ReceiverTraversalFilter,
+    ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate,
 };
 pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
@@ -50,8 +50,8 @@ pub use rune_ir::{
 pub use search::{
     CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture, CodeQueryDeclaration,
     CodeQueryExecutionLimits, CodeQueryExpressionSite, CodeQueryFile, CodeQueryMatch,
-    CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReferenceSite,
-    CodeQueryResult, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, execute,
-    execute_with_limits,
+    CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReceiverAnalysis,
+    CodeQueryReceiverValue, CodeQueryReferenceSite, CodeQueryResult, CodeQueryResultItem,
+    CodeQueryResultRef, CodeQueryResultValue, CodeQuerySourceSite, execute, execute_with_limits,
 };
 pub use spec::{RoleSink, StructuralSpec};

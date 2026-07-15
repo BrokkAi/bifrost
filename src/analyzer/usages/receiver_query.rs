@@ -21,6 +21,12 @@ pub(crate) enum ReceiverQueryOperation {
     MemberTargets,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverQueryInput {
+    Expression,
+    ContainingSite,
+}
+
 impl ReceiverQueryOperation {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -31,7 +37,7 @@ impl ReceiverQueryOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReceiverQuerySite {
     pub(crate) file: ProjectFile,
     pub(crate) language: Language,
@@ -41,13 +47,13 @@ pub(crate) struct ReceiverQuerySite {
     pub(crate) member_name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ReceiverQueryAnalysis {
     Values(ReceiverAnalysisOutcome<ReceiverValue>),
     MemberTargets(ReceiverAnalysisOutcome<CodeUnit>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReceiverQueryReport {
     pub(crate) operation: ReceiverQueryOperation,
     pub(crate) site: ReceiverQuerySite,
@@ -75,6 +81,7 @@ impl<'a> ReceiverQueryService<'a> {
         operation: ReceiverQueryOperation,
         file: &ProjectFile,
         range: Range,
+        input: ReceiverQueryInput,
         budget: ReceiverAnalysisBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
@@ -139,15 +146,21 @@ impl<'a> ReceiverQueryService<'a> {
                 values_report(operation, file, language, input_node, &source, analysis)
             }
             ReceiverQueryOperation::ReceiverTargets => {
-                let Some(receiver) = receiver_node_at_site(input_node) else {
-                    return Ok(unsupported_report(
-                        operation,
-                        file,
-                        language,
-                        range,
-                        "receiver_site_without_receiver",
-                        Some(&source),
-                    ));
+                let receiver = match input {
+                    ReceiverQueryInput::Expression => input_node,
+                    ReceiverQueryInput::ContainingSite => {
+                        let Some(receiver) = receiver_node_at_site(input_node) else {
+                            return Ok(unsupported_report(
+                                operation,
+                                file,
+                                language,
+                                range,
+                                "receiver_site_without_receiver",
+                                Some(&source),
+                            ));
+                        };
+                        receiver
+                    }
                 };
                 let analysis = provider.resolve_receiver_node_report(receiver, budget);
                 values_report(operation, file, language, receiver, &source, analysis)
@@ -264,7 +277,6 @@ fn site(
 }
 
 fn receiver_node_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
-    let input = node;
     for _ in 0..5 {
         match node.kind() {
             "member_expression" => return node.child_by_field_name("object"),
@@ -281,7 +293,7 @@ fn receiver_node_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
         };
         node = parent;
     }
-    Some(input)
+    None
 }
 
 fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), ReceiverQueryError> {
@@ -350,6 +362,7 @@ export function caller() {
                 ReceiverQueryOperation::PointsTo,
                 &file,
                 last_marker_range(source, "makeService()"),
+                ReceiverQueryInput::Expression,
                 ReceiverAnalysisBudget::default(),
                 None,
             )
@@ -392,6 +405,7 @@ export function caller() {
                 ReceiverQueryOperation::MemberTargets,
                 &file,
                 marker_range(source, "service.run"),
+                ReceiverQueryInput::ContainingSite,
                 ReceiverAnalysisBudget::default(),
                 None,
             )
@@ -422,6 +436,7 @@ export function caller() {
                 ReceiverQueryOperation::ReceiverTargets,
                 &file,
                 marker_range(source, "object.member"),
+                ReceiverQueryInput::ContainingSite,
                 ReceiverAnalysisBudget::default(),
                 None,
             )
@@ -455,6 +470,7 @@ export function caller() {
                 ReceiverQueryOperation::MemberTargets,
                 &file,
                 range,
+                ReceiverQueryInput::ContainingSite,
                 ReceiverAnalysisBudget::tiny(),
                 None,
             )
@@ -474,6 +490,7 @@ export function caller() {
                 ReceiverQueryOperation::MemberTargets,
                 &file,
                 range,
+                ReceiverQueryInput::ContainingSite,
                 ReceiverAnalysisBudget::default(),
                 Some(&cancellation),
             ),

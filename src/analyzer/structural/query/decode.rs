@@ -4,7 +4,8 @@ use super::ir::{
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep,
-    ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate, validate_query_steps,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate,
+    validate_query_steps,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
@@ -83,7 +84,7 @@ impl CodeQuery {
             Some(value) => decode_result_detail(value, "result_detail")?,
         };
 
-        Ok(Self {
+        let query = Self {
             schema_version,
             where_globs,
             languages,
@@ -93,7 +94,9 @@ impl CodeQuery {
             steps,
             limit,
             result_detail,
-        })
+        };
+        query.validate_steps()?;
+        Ok(query)
     }
 }
 
@@ -293,6 +296,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             QueryStep::CallSitesTo(_) | QueryStep::CallSitesFrom(_)
         );
         let call_input = matches!(step, QueryStep::CallInput(_));
+        let receiver = matches!(
+            step,
+            QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
+        );
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
@@ -304,6 +311,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ParameterIndex
                     | QueryStepField::ParameterName,
                 ) if call_input => {}
+                Some(QueryStepField::Capture) if receiver => {}
                 Some(
                     QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
@@ -317,7 +325,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Surface
                     | QueryStepField::Receiver
                     | QueryStepField::ParameterIndex
-                    | QueryStepField::ParameterName,
+                    | QueryStepField::ParameterName
+                    | QueryStepField::Capture,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -510,6 +519,34 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 CallInputSelector::ParameterName(name.to_owned())
             };
             step = QueryStep::CallInput(selector);
+        } else if receiver {
+            let capture = object
+                .get("capture")
+                .map(|value| {
+                    let path = child_path(&entry_path, "capture");
+                    let shape = QueryStepField::Capture.value_shape();
+                    value
+                        .as_str()
+                        .filter(|name| shape.accepts_string(name))
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            let (minimum, maximum) = shape
+                                .string_length_bounds()
+                                .expect("capture-name shape has string bounds");
+                            QueryError::new(
+                                path,
+                                format!("expected a string between {minimum} and {maximum} bytes"),
+                            )
+                        })
+                })
+                .transpose()?;
+            let filter = ReceiverTraversalFilter { capture };
+            step = match step {
+                QueryStep::ReceiverTargets(_) => QueryStep::ReceiverTargets(filter),
+                QueryStep::PointsTo(_) => QueryStep::PointsTo(filter),
+                QueryStep::MemberTargets(_) => QueryStep::MemberTargets(filter),
+                _ => unreachable!("receiver step filtered above"),
+            };
         }
         steps.push(step);
     }

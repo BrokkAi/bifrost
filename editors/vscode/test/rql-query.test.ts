@@ -177,3 +177,61 @@ void test("renders and navigates an exact reference-site result", () => {
   assert.match(queryResultTooltip(reference), /Target\.status/);
   assert.deepEqual(queryResultRange(reference), reference.range);
 });
+
+test("renders and navigates a receiver-analysis result", () => {
+  const analysis = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "receiver_analysis",
+    analysis_kind: "points_to",
+    language: "typescript",
+    range: {
+      start_line: 9,
+      start_column: 15,
+      end_line: 9,
+      end_column: 22
+    },
+    text: "service",
+    input_kind: "identifier",
+    outcome: "precise",
+    values: [
+      {
+        receiver_value_kind: "factory_return",
+        factory: {
+          path: "src/app.ts",
+          language: "typescript",
+          kind: "function",
+          fq_name: "makeService",
+          start_line: 2,
+          end_line: 4
+        },
+        returned_value: {
+          receiver_value_kind: "allocation_site",
+          type_declaration: {
+            path: "src/app.ts",
+            language: "typescript",
+            kind: "class",
+            fq_name: "Service",
+            start_line: 1,
+            end_line: 1
+          },
+          allocation_site: {
+            path: "src/app.ts",
+            range: {
+              start_line: 3,
+              start_column: 10,
+              end_line: 3,
+              end_column: 23
+            }
+          }
+        }
+      }
+    ]
+  };
+
+  assert.equal(queryResultLabel(analysis), "points_to: service");
+  assert.equal(queryResultDescription(analysis), "precise · 9:15");
+  assert.equal(queryResultIcon(analysis), "type-hierarchy");
+  assert.match(queryResultTooltip(analysis), /points_to/);
+  assert.deepEqual(queryResultRange(analysis), analysis.range);
+});

@@ -1773,7 +1773,7 @@ export function caller(which: number) {
         );
 
         assert!(
-            matches!(report.outcome, ReceiverAnalysisOutcome::Ambiguous(ref targets) if targets.len() > DEFAULT_RECEIVER_MAX_TARGETS),
+            matches!(report.outcome, ReceiverAnalysisOutcome::Ambiguous(ref targets) if targets.len() == DEFAULT_RECEIVER_MAX_TARGETS),
             "expected fanout to become ambiguous, got {:?}",
             report.outcome
         );

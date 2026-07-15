@@ -643,6 +643,9 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
             validate_call_wrapper(form, args, query, analysis)
         }
         RqlForm::CallInput => validate_call_input_wrapper(args, query, analysis),
+        RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
+            validate_receiver_wrapper(form, args, query, analysis)
+        }
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -652,6 +655,48 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
         | RqlForm::NotKind => unreachable!("predicate cannot be a query wrapper"),
     }
     validate_rql_query(query, path, analysis);
+}
+
+fn validate_receiver_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
+    match args {
+        [_query] => {}
+        [key, value, _query] if key.as_symbol() == Some(":capture") => {
+            analysis.add_help(
+                key.range.clone(),
+                ":capture declared-name",
+                QueryStepField::Capture.description(),
+            );
+            let valid = match &value.kind {
+                ExprKind::String(name) | ExprKind::Symbol(name) => {
+                    !name.is_empty() && name.len() <= MAX_CAPTURE_LENGTH
+                }
+                _ => false,
+            };
+            if !valid {
+                analysis.error(
+                    value.range.clone(),
+                    "wrong-value-shape",
+                    format!(
+                        "{} capture must be a name between 1 and {MAX_CAPTURE_LENGTH} bytes",
+                        form.label()
+                    ),
+                );
+            }
+        }
+        [key, _, _query] => analysis.error(
+            key.range.clone(),
+            "unknown-property",
+            format!("{} accepts only :capture", form.label()),
+        ),
+        _ => analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            format!(
+                "{} expects a query, optionally preceded by :capture name",
+                form.label()
+            ),
+        ),
+    }
 }
 
 fn validate_call_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
@@ -1146,6 +1191,9 @@ fn validate_property_value(
         }
         super::schema::ValueShape::ParameterName => {
             unreachable!("parameter names are query-step values, not pattern properties")
+        }
+        super::schema::ValueShape::CaptureName => {
+            unreachable!("capture names are query-step values, not pattern properties")
         }
         super::schema::ValueShape::RegexString => validate_rql_regex(value, &child, analysis),
         super::schema::ValueShape::KindList => validate_kind_value(value, &child, analysis),
@@ -2128,6 +2176,10 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let call_step = matches!(op_label, Some("callers" | "callees"));
         let call_site_step = matches!(op_label, Some("call_sites_to" | "call_sites_from"));
         let call_input_step = op_label == Some("call_input");
+        let receiver_step = matches!(
+            op_label,
+            Some("receiver_targets" | "points_to" | "member_targets")
+        );
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
@@ -2137,6 +2189,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_receiver = false;
         let mut seen_parameter_index = false;
         let mut seen_parameter_name = false;
+        let mut seen_capture = false;
         let mut transitive_range = None;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
@@ -2279,6 +2332,39 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 continue;
             }
+            if field == Some(QueryStepField::Capture) && receiver_step {
+                analysis.add_help(
+                    key.range(),
+                    QueryStepField::Capture.signature(),
+                    QueryStepField::Capture.description(),
+                );
+                if seen_capture {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'capture'",
+                    );
+                }
+                seen_capture = true;
+                if let Some(name) = child.as_string() {
+                    if name.is_empty() {
+                        analysis.error(
+                            child.range(),
+                            "wrong-value-shape",
+                            "capture name must not be empty",
+                        );
+                    } else if name.len() > MAX_CAPTURE_LENGTH {
+                        analysis.error(
+                            child.range(),
+                            "wrong-value-shape",
+                            format!("capture name must be at most {MAX_CAPTURE_LENGTH} bytes"),
+                        );
+                    }
+                } else {
+                    require_json_string(child, analysis);
+                }
+                continue;
+            }
             if field == Some(QueryStepField::Surface) && reference_step {
                 analysis.add_help(
                     key.range(),
@@ -2331,6 +2417,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                         | QueryStepField::ParameterIndex
                                         | QueryStepField::ParameterName
                                 ))
+                            || (receiver_step && **candidate == QueryStepField::Capture)
                     })
                     .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))
                     .collect();
@@ -2869,6 +2956,46 @@ mod tests {
                     && diagnostic.message.contains("parameter name")
             }));
         }
+    }
+
+    #[test]
+    fn receiver_step_help_and_capture_diagnostics_are_range_precise() {
+        let rql = "(points-to :capture service (call :receiver (capture \"service\")))";
+        for token in ["points-to", ":capture"] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no receiver traversal help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        let json = r#"{"match":{"kind":"call","receiver":{"capture":"service"}},"steps":[{"op":"points_to","capture":"service"}]}"#;
+        for token in ["points_to", "capture"] {
+            let offset = json.rfind(token).unwrap();
+            let help = query_source_help_at(json, offset)
+                .unwrap_or_else(|| panic!("no JSON receiver traversal help for {token}"));
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(json).is_empty());
+
+        let missing =
+            r#"{"match":{"kind":"call"},"steps":[{"op":"points_to","capture":"service"}]}"#;
+        let diagnostic = validate_query_source(missing).pop().expect("diagnostic");
+        assert_eq!(diagnostic.code, "invalid-query");
+        assert_eq!(&missing[diagnostic.range], r#""service""#);
+        assert!(
+            diagnostic
+                .message
+                .contains("not declared by a positive pattern")
+        );
+
+        let wrong_domain = r#"{"match":{"kind":"class","capture":"service"},"steps":[{"op":"enclosing_decl"},{"op":"references_of"},{"op":"points_to","capture":"service"}]}"#;
+        let diagnostic = validate_query_source(wrong_domain)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("capture is allowed only"))
+            .expect("domain diagnostic");
+        assert_eq!(&wrong_domain[diagnostic.range], r#""service""#);
     }
 
     #[test]

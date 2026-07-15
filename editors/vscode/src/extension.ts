@@ -230,11 +230,8 @@ async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
 async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
   const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(result.uri));
   const editor = await vscode.window.showTextDocument(document, { preview: true });
-  if (result.result_type === "reference_site") {
-    const resultRange = queryResultRange(result);
-    if (!resultRange) {
-      return;
-    }
+  const resultRange = queryResultRange(result);
+  if (resultRange) {
     const startLine = Math.min(Math.max(0, resultRange.start_line - 1), document.lineCount - 1);
     const endLine = Math.min(Math.max(startLine, resultRange.end_line - 1), document.lineCount - 1);
     const startColumn = Math.min(
@@ -252,8 +249,8 @@ async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
     return;
   }
-  const resultStartLine = result.result_type === "file" ? 1 : result.start_line;
-  const resultEndLine = result.result_type === "file" ? resultStartLine : result.end_line;
+  const resultStartLine = 1;
+  const resultEndLine = resultStartLine;
   const startLine = Math.min(Math.max(0, resultStartLine - 1), document.lineCount - 1);
   const endLine = Math.min(Math.max(startLine, resultEndLine - 1), document.lineCount - 1);
   const start = new vscode.Position(startLine, 0);

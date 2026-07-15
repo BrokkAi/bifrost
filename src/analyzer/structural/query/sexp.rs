@@ -282,6 +282,38 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
+            let (query_expr, capture) = match items.len() {
+                2 => (&items[1], None),
+                4 if items[1].as_symbol() == Some(":capture") => {
+                    (&items[3], Some(symbol_or_string(&items[2])?))
+                }
+                _ => {
+                    return Err(format!(
+                        "({head} ...) expects an optional :capture name followed by a query"
+                    ));
+                }
+            };
+            let op = match form {
+                RqlForm::ReceiverTargets => "receiver_targets",
+                RqlForm::PointsTo => "points_to",
+                RqlForm::MemberTargets => "member_targets",
+                _ => unreachable!("receiver wrapper filtered above"),
+            };
+            let mut query = query_object(query_expr)?;
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.to_string()));
+            if let Some(capture) = capture {
+                step.insert("capture".to_string(), Value::String(capture));
+            }
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Supertypes | RqlForm::Subtypes => {
             let (query_expr, option) = match items.len() {
                 2 => (&items[1], None),
@@ -431,7 +463,10 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
         | RqlForm::Callees
         | RqlForm::CallSitesTo
         | RqlForm::CallSitesFrom
-        | RqlForm::CallInput => unreachable!("wrapper filtered above"),
+        | RqlForm::CallInput
+        | RqlForm::ReceiverTargets
+        | RqlForm::PointsTo
+        | RqlForm::MemberTargets => unreachable!("wrapper filtered above"),
     }
     Ok(Value::Object(object))
 }

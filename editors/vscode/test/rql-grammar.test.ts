@@ -152,3 +152,14 @@ void test("highlights semantic traversal forms and options", async () => {
   assertScoped(tokens, "call-sites-to", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, "callers", "support.function.wrapper.bifrost-rql");
 });
+
+test("highlights receiver traversal forms and capture options", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(receiver-targets (call)) (points-to :capture service (call :receiver (capture service))) (member-targets (field-access))"
+  );
+  assertScoped(tokens, "receiver-targets", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "points-to", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":capture", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, "member-targets", "support.function.wrapper.bifrost-rql");
+});

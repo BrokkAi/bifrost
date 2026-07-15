@@ -850,6 +850,27 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.input_kind
                     ));
                 }
+                CodeQueryResultValue::ReceiverAnalysis { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let text = sanitize_terminal_text(&value.text);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "receiver analysis:",
+                            use_color
+                        ),
+                        text,
+                        value.outcome
+                    ));
+                    for target in &value.member_targets {
+                        let target = sanitize_terminal_text(&target.fq_name);
+                        out.push_str(&format!("  member: {target}\n"));
+                    }
+                }
             }
             if !result.provenance.is_empty() {
                 out.push_str(&format!(

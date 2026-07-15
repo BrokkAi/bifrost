@@ -8,7 +8,7 @@
 
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 
-use super::ir::MAX_KWARG_NAME_LENGTH;
+use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
@@ -19,6 +19,7 @@ pub enum ValueShape {
     PatternMap,
     String,
     ParameterName,
+    CaptureName,
     RegexString,
     StringList,
     StringPredicate,
@@ -45,6 +46,7 @@ impl ValueShape {
             Self::PatternMap => "a map of names to patterns",
             Self::String => "a string",
             Self::ParameterName => "a non-empty parameter name",
+            Self::CaptureName => "a non-empty declared capture name",
             Self::RegexString => "a regular expression string",
             Self::StringList => "one or more strings",
             Self::StringPredicate => "an exact string or regex predicate",
@@ -65,6 +67,7 @@ impl ValueShape {
     pub fn string_length_bounds(self) -> Option<(usize, usize)> {
         match self {
             Self::ParameterName => Some((1, MAX_KWARG_NAME_LENGTH)),
+            Self::CaptureName => Some((1, MAX_CAPTURE_LENGTH)),
             _ => None,
         }
     }
@@ -137,6 +140,13 @@ macro_rules! query_step_ops {
             pub fn allows_call_site_options(self) -> bool {
                 matches!(self, Self::CallSitesTo | Self::CallSitesFrom)
             }
+
+            pub fn allows_receiver_options(self) -> bool {
+                matches!(
+                    self,
+                    Self::ReceiverTargets | Self::PointsTo | Self::MemberTargets
+                )
+            }
         }
     };
 }
@@ -158,6 +168,9 @@ query_step_ops! {
     CallSitesTo { label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
     CallSitesFrom { label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
     CallInput { label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
+    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site -> receiver_analysis", description: "Analyze the bounded JS/TS receiver value at each input site." }
+    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site -> receiver_analysis", description: "Analyze the bounded JS/TS value provenance of each input expression." }
+    MemberTargets { label: "member_targets", signature: "structural_match|reference_site -> receiver_analysis", description: "Resolve exact JS/TS member declarations through bounded receiver facts." }
 }
 
 macro_rules! rql_forms {
@@ -249,7 +262,10 @@ macro_rules! rql_forms {
                     | Self::Callees
                     | Self::CallSitesTo
                     | Self::CallSitesFrom
-                    | Self::CallInput => None,
+                    | Self::CallInput
+                    | Self::ReceiverTargets
+                    | Self::PointsTo
+                    | Self::MemberTargets => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -417,6 +433,27 @@ rql_forms! {
         shape: Query,
         signature: "(call-input (:receiver true | :parameter-index index | :parameter-name name) query)",
         description: "Project the receiver or one formal parameter's direct argument expressions.",
+    }
+    ReceiverTargets {
+        labels: ["receiver-targets", "receiver_targets"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(receiver-targets [:capture name] query)",
+        description: "Analyze bounded JS/TS receiver values at structural or semantic source sites.",
+    }
+    PointsTo {
+        labels: ["points-to", "points_to"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(points-to [:capture name] query)",
+        description: "Analyze bounded JS/TS value and allocation provenance.",
+    }
+    MemberTargets {
+        labels: ["member-targets", "member_targets"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(member-targets [:capture name] query)",
+        description: "Resolve exact JS/TS member declarations through the analyzed receiver.",
     }
     Name {
         labels: ["name"],
@@ -648,6 +685,7 @@ json_fields! {
     Receiver { label: "receiver", shape: TrueBoolean, signature: "\"receiver\": true", description: "Select the explicit base or receiver expression of a call site." }
     ParameterIndex { label: "parameter_index", shape: NonNegativeInteger, signature: "\"parameter_index\": non-negative integer", description: "Select a zero-based formal parameter slot, excluding receiver-bound parameters." }
     ParameterName { label: "parameter_name", shape: ParameterName, signature: "\"parameter_name\": \"name\"", description: "Select a formal parameter slot by its declared name." }
+    Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
 }
 
 pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[

@@ -37,6 +37,288 @@ fn result_fq_names(value: &Value) -> Vec<String> {
 }
 
 #[test]
+fn receiver_traversal_preserves_factory_allocation_and_exact_member_provenance() {
+    let files = [(
+        "app.ts",
+        r#"class Service { run() {} }
+class Other { run() {} }
+function makeService() { return new Service(); }
+export function caller() {
+    const service = makeService();
+    service.run();
+}
+"#,
+    )];
+    let points_to = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "service" }
+            },
+            "steps": [{ "op": "points_to", "capture": "service" }],
+            "result_detail": "full"
+        }),
+    ));
+    assert_eq!(
+        points_to["results"].as_array().unwrap().len(),
+        1,
+        "{points_to}"
+    );
+    let analysis = &points_to["results"][0];
+    assert_eq!(analysis["result_type"], "receiver_analysis", "{points_to}");
+    assert_eq!(analysis["analysis_kind"], "points_to", "{points_to}");
+    assert_eq!(analysis["outcome"], "precise", "{points_to}");
+    assert_eq!(analysis["capture"], "service", "{points_to}");
+    assert_eq!(
+        analysis["values"][0]["receiver_value_kind"], "factory_return",
+        "{points_to}"
+    );
+    assert!(
+        analysis["values"][0]["factory"]["fq_name"]
+            .as_str()
+            .unwrap()
+            .ends_with("makeService"),
+        "{points_to}"
+    );
+    assert_eq!(
+        analysis["values"][0]["returned_value"]["receiver_value_kind"], "allocation_site",
+        "{points_to}"
+    );
+    assert!(
+        analysis["values"][0]["returned_value"]["type_declaration"]["fq_name"]
+            .as_str()
+            .unwrap()
+            .ends_with("Service"),
+        "{points_to}"
+    );
+
+    let members = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "member_targets" }, { "op": "file_of" }]
+        }),
+    ));
+    assert_eq!(members["results"].as_array().unwrap().len(), 1, "{members}");
+    assert_eq!(members["results"][0]["result_type"], "file", "{members}");
+    assert_eq!(members["results"][0]["path"], "app.ts", "{members}");
+
+    let exact_members = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(
+        exact_members["results"][0]["outcome"], "precise",
+        "{exact_members}"
+    );
+    assert_eq!(
+        exact_members["results"][0]["member_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{exact_members}"
+    );
+    let target = exact_members["results"][0]["member_targets"][0]["fq_name"]
+        .as_str()
+        .unwrap();
+    assert!(
+        target.contains("Service") && !target.contains("Other"),
+        "{exact_members}"
+    );
+}
+
+#[test]
+fn receiver_traversal_keeps_ambiguity_unknown_and_unsupported_as_rows() {
+    let ambiguous = serialized(&run(
+        &[(
+            "ambiguous.ts",
+            r#"class A { run() {} }
+class B { run() {} }
+export function caller(flag: boolean) {
+    const service = flag ? new A() : new B();
+    service.run();
+}
+"#,
+        )],
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(
+        ambiguous["results"][0]["outcome"], "ambiguous",
+        "{ambiguous}"
+    );
+    assert_eq!(
+        ambiguous["results"][0]["values"].as_array().unwrap().len(),
+        2,
+        "{ambiguous}"
+    );
+
+    let unknown = serialized(&run(
+        &[(
+            "unknown.ts",
+            "export function caller() { external.run(); }\n",
+        )],
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(unknown["results"][0]["outcome"], "unknown", "{unknown}");
+
+    let unsupported = serialized(&run(
+        &[("unsupported.py", "def caller(value):\n    value.run()\n")],
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(
+        unsupported["results"][0]["outcome"], "unsupported",
+        "{unsupported}"
+    );
+    assert_eq!(
+        unsupported["results"][0]["reason"], "receiver_analysis_language_unsupported",
+        "{unsupported}"
+    );
+    assert!(
+        unsupported["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["language"] == "python"),
+        "{unsupported}"
+    );
+
+    let unsupported_shape = serialized(&run(
+        &[("shape.ts", "export class Service { run() {} }\n")],
+        json!({
+            "match": { "kind": "class", "name": "Service" },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(
+        unsupported_shape["results"][0]["outcome"], "unsupported",
+        "{unsupported_shape}"
+    );
+    assert_eq!(
+        unsupported_shape["results"][0]["reason"], "receiver_site_without_receiver",
+        "{unsupported_shape}"
+    );
+}
+
+#[test]
+fn receiver_traversal_composes_with_call_inputs_and_reference_sites() {
+    let files = [(
+        "compose.ts",
+        r#"class Service { run() {} }
+function consume(value: Service) { value.run(); }
+export function caller() { consume(new Service()); }
+"#,
+    )];
+    let call_input = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "function", "name": "consume" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to" },
+                { "op": "call_input", "parameter_index": 0 },
+                { "op": "points_to" }
+            ]
+        }),
+    ));
+    assert_eq!(
+        call_input["results"][0]["outcome"], "precise",
+        "{call_input}"
+    );
+    assert_eq!(
+        call_input["results"][0]["values"][0]["receiver_value_kind"], "allocation_site",
+        "{call_input}"
+    );
+    assert_eq!(
+        call_input["results"][0]["provenance"][0]["steps"][2]["result"]["result_type"],
+        "expression_site",
+        "{call_input}"
+    );
+
+    let reference = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "method", "name": "run" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "references_of", "proof": "proven" },
+                { "op": "member_targets" }
+            ]
+        }),
+    ));
+    assert_eq!(reference["results"][0]["outcome"], "precise", "{reference}");
+    assert!(
+        reference["results"][0]["member_targets"][0]["fq_name"]
+            .as_str()
+            .unwrap()
+            .contains("Service"),
+        "{reference}"
+    );
+}
+
+#[test]
+fn receiver_candidate_cap_retains_bounded_values_and_marks_truncation() {
+    let result = serialized(&run(
+        &[(
+            "fanout.ts",
+            r#"class A { run() {} }
+class B { run() {} }
+class C { run() {} }
+class D { run() {} }
+class E { run() {} }
+function make(which: number) {
+    if (which === 0) return new A();
+    if (which === 1) return new B();
+    if (which === 2) return new C();
+    if (which === 3) return new D();
+    return new E();
+}
+export function caller(which: number) {
+    const service = make(which);
+    service.run();
+}
+"#,
+        )],
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(result["results"][0]["outcome"], "ambiguous", "{result}");
+    assert_eq!(
+        result["results"][0]["values"].as_array().unwrap().len(),
+        4,
+        "{result}"
+    );
+    assert_eq!(result["truncated"], true, "{result}");
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_targets")),
+        "{result}"
+    );
+}
+
+#[test]
 fn call_traversal_and_formal_input_projection_share_structured_call_sites() {
     let files = [(
         "Sample.java",

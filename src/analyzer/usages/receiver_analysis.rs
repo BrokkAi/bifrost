@@ -13,7 +13,7 @@ pub(crate) const DEFAULT_RECEIVER_MAX_TARGETS: usize = 4;
 pub(crate) const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
 pub(crate) const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ReceiverAnalysisOutcome<T> {
     Precise(Vec<T>),
     Ambiguous(Vec<T>),
@@ -27,6 +27,13 @@ impl<T> ReceiverAnalysisOutcome<T> {
         match self {
             Self::Precise(values) | Self::Ambiguous(values) => Some(values),
             Self::Unknown | Self::Unsupported { .. } | Self::ExceededBudget { .. } => None,
+        }
+    }
+
+    fn truncate_values(&mut self, limit: usize) {
+        match self {
+            Self::Precise(values) | Self::Ambiguous(values) => values.truncate(limit),
+            Self::Unknown | Self::Unsupported { .. } | Self::ExceededBudget { .. } => {}
         }
     }
 
@@ -285,12 +292,15 @@ pub(crate) struct ReceiverAnalysisReport<T> {
 
 impl<T> ReceiverAnalysisReport<T> {
     pub(crate) fn without_work(
-        outcome: ReceiverAnalysisOutcome<T>,
+        mut outcome: ReceiverAnalysisOutcome<T>,
         budget: ReceiverAnalysisBudget,
     ) -> Self {
         let candidates_truncated = outcome
             .values()
             .is_some_and(|values| values.len() > budget.max_targets);
+        if candidates_truncated {
+            outcome.truncate_values(budget.max_targets);
+        }
         Self {
             outcome,
             work: ReceiverAnalysisWork::default(),
@@ -335,11 +345,14 @@ impl ReceiverAnalysisBudgetTracker {
 
     pub(crate) fn report<T>(
         &self,
-        outcome: ReceiverAnalysisOutcome<T>,
+        mut outcome: ReceiverAnalysisOutcome<T>,
     ) -> ReceiverAnalysisReport<T> {
         let candidates_truncated = outcome
             .values()
             .is_some_and(|values| values.len() > self.budget.max_targets);
+        if candidates_truncated {
+            outcome.truncate_values(self.budget.max_targets);
+        }
         ReceiverAnalysisReport {
             outcome,
             work: self.work(),
