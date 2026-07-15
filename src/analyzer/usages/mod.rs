@@ -41,7 +41,10 @@ pub(crate) mod scala_graph;
 pub(crate) mod target_kind;
 mod traits;
 
-pub(crate) use call_relations::{CallRelationResult, CallRelationService, CallSite};
+pub(crate) use call_relations::{
+    CallBindingCache, CallRelationLimits, CallRelationResult, CallRelationService, CallSite,
+    bind_call_site_arguments, is_call_relation_unit, nearest_call_relation_unit,
+};
 pub use candidates::{
     ExplicitCandidateProvider, FallbackCandidateProvider, ImportGraphCandidateProvider,
     TextSearchCandidateProvider, default_provider,

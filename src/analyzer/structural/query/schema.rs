@@ -8,6 +8,8 @@
 
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 
+use super::ir::MAX_KWARG_NAME_LENGTH;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
     Query,
@@ -16,6 +18,7 @@ pub enum ValueShape {
     PatternList,
     PatternMap,
     String,
+    ParameterName,
     RegexString,
     StringList,
     StringPredicate,
@@ -41,6 +44,7 @@ impl ValueShape {
             Self::PatternList => "a list/vector of patterns",
             Self::PatternMap => "a map of names to patterns",
             Self::String => "a string",
+            Self::ParameterName => "a non-empty parameter name",
             Self::RegexString => "a regular expression string",
             Self::StringList => "one or more strings",
             Self::StringPredicate => "an exact string or regex predicate",
@@ -56,6 +60,18 @@ impl ValueShape {
             Self::UsageProof => "proven or unproven",
             Self::UsageSurface => "external_usages or lsp_references",
         }
+    }
+
+    pub fn string_length_bounds(self) -> Option<(usize, usize)> {
+        match self {
+            Self::ParameterName => Some((1, MAX_KWARG_NAME_LENGTH)),
+            _ => None,
+        }
+    }
+
+    pub fn accepts_string(self, value: &str) -> bool {
+        self.string_length_bounds()
+            .is_none_or(|(minimum, maximum)| value.len() >= minimum && value.len() <= maximum)
     }
 }
 
@@ -631,7 +647,7 @@ json_fields! {
     Surface { label: "surface", shape: UsageSurface, signature: "\"surface\": \"external_usages\" | \"lsp_references\"", description: "Choose the external-usage or editor-visible reference surface." }
     Receiver { label: "receiver", shape: TrueBoolean, signature: "\"receiver\": true", description: "Select the explicit base or receiver expression of a call site." }
     ParameterIndex { label: "parameter_index", shape: NonNegativeInteger, signature: "\"parameter_index\": non-negative integer", description: "Select a zero-based formal parameter slot, excluding receiver-bound parameters." }
-    ParameterName { label: "parameter_name", shape: String, signature: "\"parameter_name\": \"name\"", description: "Select a formal parameter slot by its declared name." }
+    ParameterName { label: "parameter_name", shape: ParameterName, signature: "\"parameter_name\": \"name\"", description: "Select a formal parameter slot by its declared name." }
 }
 
 pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[

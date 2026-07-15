@@ -719,6 +719,139 @@ def caller(items):
 }
 
 #[test]
+fn incoming_call_discovery_is_not_limited_by_unrelated_calls() {
+    let result = serialized(&run(
+        &[(
+            "Sample.java",
+            r#"class Sample {
+    static void first() {}
+    static void second() {}
+    static void target() {}
+    static void caller() { first(); second(); target(); }
+}
+"#,
+        )],
+        json!({
+            "match": { "kind": "callable", "name": "target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" }
+            ],
+            "limit": 1
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(
+        result["results"][0]["caller"]["fq_name"], "Sample.caller",
+        "{result}"
+    );
+}
+
+#[test]
+fn incoming_call_relations_include_direct_self_recursion() {
+    let result = serialized(&run(
+        &[("recursive.py", "def recurse():\n    recurse()\n")],
+        json!({
+            "match": { "kind": "callable", "name": "recurse" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(
+        result["results"][0]["caller"]["fq_name"], result["results"][0]["callee"]["fq_name"],
+        "{result}"
+    );
+}
+
+#[test]
+fn python_unbound_method_calls_do_not_consume_the_self_parameter() {
+    let result = serialized(&run(
+        &[(
+            "unbound.py",
+            r#"class Sink:
+    def send(self, payload):
+        return payload
+
+def caller(instance):
+    Sink.send(instance, "secret")
+"#,
+        )],
+        json!({
+            "match": { "kind": "method", "name": "send" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_name": "payload" }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"][0]["text"], "\"secret\"", "{result}");
+    assert_eq!(result["results"][0]["parameter_index"], 1, "{result}");
+}
+
+#[test]
+fn class_target_calls_do_not_borrow_an_arbitrary_member_signature() {
+    let result = serialized(&run(
+        &[(
+            "constructor.py",
+            r#"class Base:
+    def __init__(self, inherited):
+        self.inherited = inherited
+
+class Sink(Base):
+    def payload(value):
+        return value
+
+def caller():
+    Sink("secret")
+"#,
+        )],
+        json!({
+            "match": { "kind": "class", "name": "Sink" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_name": "value" }
+            ]
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 0, "{result}");
+}
+
+#[test]
+fn keyword_variadics_receive_unmatched_named_arguments() {
+    let result = serialized(&run(
+        &[(
+            "kwargs.py",
+            r#"def sink(**kwargs):
+    return kwargs
+
+def caller():
+    sink(payload="secret", mode=2)
+"#,
+        )],
+        json!({
+            "match": { "kind": "callable", "name": "sink" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_name": "kwargs" }
+            ]
+        }),
+    ));
+    let texts = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["text"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec!["\"secret\"", "2"], "{result}");
+}
+
+#[test]
 fn reference_surface_and_proof_filters_preserve_existing_usage_semantics() {
     let files = [(
         "target.js",
@@ -1384,6 +1517,45 @@ fn reference_scans_charge_workspace_budgets_and_do_not_leak_intermediate_sites()
 }
 
 #[test]
+fn call_scans_report_zero_remaining_workspace_budget() {
+    let project = InlineTestProject::new()
+        .file(
+            "Sample.java",
+            "class Sample { static void target(String value) {} static void caller() { target(\"secret\"); } }\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "callable", "name": "target" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "call_sites_to" },
+            { "op": "call_input", "parameter_index": 0 }
+        ]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+
+    assert!(result.truncated, "{:?}", result.diagnostics);
+    assert!(result.results.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("execution budget exhausted")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn inbound_reference_scan_admits_candidate_sources_before_graph_work() {
     let target_source = "class Target { static void target() {} }\n";
     let project = InlineTestProject::new()
@@ -1849,6 +2021,82 @@ fn deep_hierarchy_provenance_is_bounded_by_pipeline_work_budget() {
             .diagnostics
             .iter()
             .any(|diagnostic| { diagnostic.message.contains("pipeline budget exhausted") })
+    );
+}
+
+#[test]
+fn deep_call_provenance_is_bounded_by_pipeline_work_budget() {
+    let mut source = String::new();
+    for index in 0..200 {
+        if index + 1 < 200 {
+            source.push_str(&format!("def f{index}():\n    f{}()\n\n", index + 1));
+        } else {
+            source.push_str(&format!("def f{index}():\n    pass\n"));
+        }
+    }
+    let project = InlineTestProject::new().file("deep.py", source).build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "callable", "name": "f0" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "callees", "depth": 200 }
+        ],
+        "limit": 1000
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 1000,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(result.truncated);
+    assert!(result.results.len() < 100, "{}", result.results.len());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("pipeline budget exhausted")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn transitive_call_provenance_preserves_alternate_paths() {
+    let result = serialized(&run(
+        &[(
+            "Paths.java",
+            r#"class Paths {
+    static void a() { b(); c(); }
+    static void b() { d(); }
+    static void c() { d(); }
+    static void d() { e(); }
+    static void e() {}
+}
+"#,
+        )],
+        json!({
+            "match": { "kind": "callable", "name": "a" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "callees", "depth": 4 }
+            ]
+        }),
+    ));
+    let terminal = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["fq_name"] == "Paths.e")
+        .unwrap_or_else(|| panic!("missing terminal e: {result}"));
+    assert_eq!(
+        terminal["provenance"].as_array().unwrap().len(),
+        2,
+        "{result}"
     );
 }
 

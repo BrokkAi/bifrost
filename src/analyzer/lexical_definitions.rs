@@ -36,13 +36,37 @@ pub(crate) struct FormalParameterSlot {
     pub(crate) names: Vec<String>,
     pub(crate) declaration_range: Range,
     pub(crate) receiver: bool,
-    pub(crate) variadic: bool,
+    pub(crate) variadic: Option<FormalVariadicKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormalVariadicKind {
+    Positional,
+    Keyword,
+    Both,
+}
+
+impl FormalVariadicKind {
+    pub(crate) fn accepts_positional(self) -> bool {
+        matches!(self, Self::Positional | Self::Both)
+    }
+
+    pub(crate) fn accepts_keyword(self) -> bool {
+        matches!(self, Self::Keyword | Self::Both)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PythonMethodBinding {
+    Instance,
+    Class,
+    Static,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FormalParameterLayout {
     pub(crate) slots: Vec<FormalParameterSlot>,
-    pub(crate) receiver_bound_first: bool,
+    pub(crate) python_binding: Option<PythonMethodBinding>,
 }
 
 /// Return the formal parameter slots owned by the callable at
@@ -58,8 +82,8 @@ pub(crate) fn formal_parameter_slots(
     let Some(owner) = parameter_owner_for_range(language, root, declaration_range) else {
         return FormalParameterLayout::default();
     };
-    let receiver_bound_first = language == Language::Python
-        && !python_has_staticmethod_decorator(owner, source, declaration_range);
+    let python_binding = (language == Language::Python)
+        .then(|| python_method_binding(owner, source, declaration_range));
     let lambda = is_lambda_owner(language, owner.kind());
     let (ordinary_roots, receiver_roots) = parameter_roots(language, owner);
     let mut bindings = ordinary_roots
@@ -98,7 +122,7 @@ pub(crate) fn formal_parameter_slots(
             if !slot.names.iter().any(|candidate| candidate == name) {
                 slot.names.push(name.to_owned());
             }
-            slot.variadic |= variadic;
+            slot.variadic = slot.variadic.or(variadic);
             continue;
         }
         slots.push(FormalParameterSlot {
@@ -111,21 +135,21 @@ pub(crate) fn formal_parameter_slots(
 
     FormalParameterLayout {
         slots,
-        receiver_bound_first,
+        python_binding,
     }
 }
 
-fn python_has_staticmethod_decorator(
+fn python_method_binding(
     owner: Node<'_>,
     source: &str,
     declaration_range: &Range,
-) -> bool {
+) -> PythonMethodBinding {
     let Some(decorated) = owner.parent().filter(|parent| {
         parent.kind() == "decorated_definition"
             && parent.start_byte() >= declaration_range.start_byte
             && parent.end_byte() <= declaration_range.end_byte
     }) else {
-        return false;
+        return PythonMethodBinding::Instance;
     };
     let mut stack = Vec::new();
     let mut cursor = decorated.walk();
@@ -135,12 +159,16 @@ fn python_has_staticmethod_decorator(
             .filter(|child| child.kind() == "decorator"),
     );
     while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" && source.get(node.byte_range()) == Some("staticmethod") {
-            return true;
+        if node.kind() == "identifier" {
+            match source.get(node.byte_range()) {
+                Some("staticmethod") => return PythonMethodBinding::Static,
+                Some("classmethod") => return PythonMethodBinding::Class,
+                _ => {}
+            }
         }
         push_named_children(node, &mut stack);
     }
-    false
+    PythonMethodBinding::Instance
 }
 
 fn parameter_owner_for_range<'tree>(
@@ -342,16 +370,27 @@ fn parameter_roots<'tree>(
     (ordinary_roots, receiver_roots)
 }
 
-fn is_variadic_parameter(language: Language, kind: &str) -> bool {
+fn is_variadic_parameter(language: Language, kind: &str) -> Option<FormalVariadicKind> {
+    use FormalVariadicKind::{Both, Keyword, Positional};
     match language {
-        Language::Java => kind == "spread_parameter",
-        Language::Go => kind == "variadic_parameter_declaration",
-        Language::JavaScript | Language::TypeScript => kind == "rest_pattern",
-        Language::Python => matches!(kind, "list_splat_pattern" | "dictionary_splat_pattern"),
-        Language::Rust => kind == "variadic_parameter",
-        Language::Php => kind == "variadic_parameter",
-        Language::Ruby => matches!(kind, "splat_parameter" | "hash_splat_parameter"),
-        Language::Cpp | Language::Scala | Language::CSharp | Language::None => false,
+        Language::Java => (kind == "spread_parameter").then_some(Positional),
+        Language::Go => (kind == "variadic_parameter_declaration").then_some(Positional),
+        Language::JavaScript | Language::TypeScript => {
+            (kind == "rest_pattern").then_some(Positional)
+        }
+        Language::Python => match kind {
+            "list_splat_pattern" => Some(Positional),
+            "dictionary_splat_pattern" => Some(Keyword),
+            _ => None,
+        },
+        Language::Rust => (kind == "variadic_parameter").then_some(Positional),
+        Language::Php => (kind == "variadic_parameter").then_some(Both),
+        Language::Ruby => match kind {
+            "splat_parameter" => Some(Positional),
+            "hash_splat_parameter" => Some(Keyword),
+            _ => None,
+        },
+        Language::Cpp | Language::Scala | Language::CSharp | Language::None => None,
     }
 }
 

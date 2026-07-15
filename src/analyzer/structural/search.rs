@@ -24,9 +24,9 @@ use crate::analyzer::usages::get_definition::{
     resolve_definition_batch_with_source, resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::usages::{
-    CallRelationResult, CallRelationService, CallSite, DEFAULT_MAX_FILES,
-    ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind,
-    UsageProof,
+    CallBindingCache, CallRelationLimits, CallRelationResult, CallRelationService, CallSite,
+    DEFAULT_MAX_FILES, ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind,
+    UsageFinder, UsageHitKind, UsageProof, bind_call_site_arguments,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -524,6 +524,7 @@ struct CallTraversalCache {
     outgoing: HashMap<CodeUnit, CallRelationResult>,
     reported_incoming: HashSet<CodeUnit>,
     reported_outgoing: HashSet<CodeUnit>,
+    bindings: CallBindingCache,
 }
 
 #[derive(Debug)]
@@ -1356,7 +1357,10 @@ fn apply_pipeline_step(
                     filter,
                     indexed,
                     call_cache,
+                    budget,
+                    limits,
                     max_step_outputs,
+                    cancellation,
                     diagnostics,
                 );
                 row_exhausted = call_exhausted;
@@ -1372,7 +1376,10 @@ fn apply_pipeline_step(
                     step,
                     filter,
                     call_cache,
+                    budget,
+                    limits,
                     max_step_outputs,
+                    cancellation,
                     diagnostics,
                 );
                 row_exhausted = call_exhausted;
@@ -1489,7 +1496,13 @@ fn reference_expansion(value: PipelineValue, site: ReferenceSiteValue) -> Pipeli
 struct CallTraversalWork {
     unit: CodeUnit,
     depth: usize,
-    trace: Vec<(DeclarationValue, CallSiteValue)>,
+    path_tail: Option<usize>,
+}
+
+struct CallPathNode {
+    value: DeclarationValue,
+    via: CallSiteValue,
+    parent: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1500,35 +1513,43 @@ fn call_declaration_expansions(
     filter: &CallTraversalFilter,
     indexed: &mut IndexedDeclarations,
     cache: &mut CallTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
     max_outputs: usize,
+    cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::Callers(_));
     let mut queue = VecDeque::from([CallTraversalWork {
         unit: declaration.unit.clone(),
         depth: 0,
-        trace: Vec::new(),
+        path_tail: None,
     }]);
-    let mut queued = HashSet::default();
-    queued.insert(declaration.unit.clone());
+    let mut paths = Vec::new();
+    let mut emitted = HashSet::default();
     let mut expansions = Vec::new();
     let mut exhausted = false;
     while let Some(work) = queue.pop_front() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (expansions, true);
+        }
         let result = cached_call_relation(
             analyzer,
             &work.unit,
             incoming,
-            max_outputs.max(1),
             cache,
+            budget,
+            limits,
+            cancellation,
             diagnostics,
         );
-        exhausted |= result.truncated;
+        exhausted |= result.truncated || result.cancelled;
         for site in result
             .sites
             .into_iter()
             .filter(|site| filter.proof.is_none_or(|proof| proof == site.proof))
         {
-            if expansions.len() >= max_outputs {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return (expansions, true);
             }
             let next_unit = if incoming {
@@ -1539,29 +1560,48 @@ fn call_declaration_expansions(
             let Some(next) = indexed.get(analyzer, &next_unit) else {
                 continue;
             };
+            if !emitted.contains(&next_unit) && emitted.len() >= max_outputs {
+                return (expansions, true);
+            }
+            if budget.pipeline_rows >= limits.max_pipeline_rows {
+                return (expansions, true);
+            }
+            let cycle = match call_path_contains(
+                &paths,
+                work.path_tail,
+                &declaration.unit,
+                &next_unit,
+                &mut budget.provenance_steps,
+                limits.max_pipeline_rows,
+            ) {
+                Some(cycle) => cycle,
+                None => return (expansions, true),
+            };
+            let next_depth = work.depth + 1;
+            if budget.provenance_steps.saturating_add(next_depth) > limits.max_pipeline_rows {
+                budget.provenance_steps = limits.max_pipeline_rows;
+                return (expansions, true);
+            }
+            budget.provenance_steps += next_depth;
+            budget.pipeline_rows += 1;
             let call_site = CallSiteValue(site);
-            let mut trace = work.trace.clone();
-            trace.push((next.clone(), call_site.clone()));
+            let path_tail = paths.len();
+            paths.push(CallPathNode {
+                value: next.clone(),
+                via: call_site,
+                parent: work.path_tail,
+            });
             expansions.push(PipelineExpansion {
                 value: PipelineValue::Declaration(next),
-                trace: trace
-                    .iter()
-                    .cloned()
-                    .map(|(value, via)| {
-                        (
-                            PipelineTraceValue::Declaration(value),
-                            Some(PipelineVia::CallSite(via)),
-                        )
-                    })
-                    .collect(),
-                budgeted: false,
+                trace: call_trace_values(&paths, path_tail, next_depth),
+                budgeted: true,
             });
-            let next_depth = work.depth + 1;
-            if next_depth < filter.depth.get() && queued.insert(next_unit.clone()) {
+            emitted.insert(next_unit.clone());
+            if !cycle && next_depth < filter.depth.get() {
                 queue.push_back(CallTraversalWork {
                     unit: next_unit,
                     depth: next_depth,
-                    trace,
+                    path_tail: Some(path_tail),
                 });
             }
         }
@@ -1569,13 +1609,17 @@ fn call_declaration_expansions(
     (expansions, exhausted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_site_expansions(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
     step: &QueryStep,
     filter: &CallSiteTraversalFilter,
     cache: &mut CallTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
     max_outputs: usize,
+    cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::CallSitesTo(_));
@@ -1583,27 +1627,38 @@ fn call_site_expansions(
         analyzer,
         &declaration.unit,
         incoming,
-        max_outputs.max(1),
         cache,
+        budget,
+        limits,
+        cancellation,
         diagnostics,
     );
-    let truncated = result.truncated;
-    let expansions = result
+    let mut sites = result
         .sites
         .into_iter()
         .filter(|site| filter.proof.is_none_or(|proof| proof == site.proof))
-        .take(max_outputs)
-        .map(|site| pipeline_expansion(PipelineValue::CallSite(CallSiteValue(site))))
+        .collect::<Vec<_>>();
+    let truncated = result.truncated || result.cancelled || sites.len() > max_outputs;
+    sites.truncate(max_outputs);
+    let expansions = sites
+        .into_iter()
+        .map(|mut site| {
+            bind_call_site_arguments(analyzer, &mut site, &mut cache.bindings);
+            pipeline_expansion(PipelineValue::CallSite(CallSiteValue(site)))
+        })
         .collect();
     (expansions, truncated)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cached_call_relation(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
     incoming: bool,
-    max_sites: usize,
     cache: &mut CallTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> CallRelationResult {
     let results = if incoming {
@@ -1611,16 +1666,47 @@ fn cached_call_relation(
     } else {
         &mut cache.outgoing
     };
-    let result = results
-        .entry(unit.clone())
-        .or_insert_with(|| {
-            if incoming {
-                CallRelationService::incoming(analyzer, unit, DEFAULT_MAX_FILES, max_sites)
-            } else {
-                CallRelationService::outgoing(analyzer, unit, max_sites)
+    let result = if let Some(result) = results.get(unit) {
+        result.clone()
+    } else {
+        let relation_limits = CallRelationLimits {
+            max_files: limits
+                .max_scanned_files
+                .saturating_sub(budget.scanned_files)
+                .min(DEFAULT_MAX_FILES),
+            max_source_bytes: limits
+                .max_scanned_source_bytes
+                .saturating_sub(budget.scanned_source_bytes),
+            max_candidates: limits
+                .max_fact_nodes
+                .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references)),
+        };
+        let result = if relation_limits.max_files == 0
+            || relation_limits.max_source_bytes == 0
+            || relation_limits.max_candidates == 0
+        {
+            push_budget_diagnostic(diagnostics, budget);
+            CallRelationResult {
+                truncated: true,
+                ..CallRelationResult::default()
             }
-        })
-        .clone();
+        } else if incoming {
+            CallRelationService::incoming_bounded(analyzer, unit, relation_limits, cancellation)
+        } else {
+            CallRelationService::outgoing_bounded(analyzer, unit, relation_limits, cancellation)
+        };
+        let budget_exhausted = charge_reference_scan(
+            budget,
+            limits,
+            result.work.scanned_files,
+            result.work.scanned_source_bytes,
+            result.work.examined_candidates,
+        );
+        let mut result = result;
+        result.truncated |= budget_exhausted;
+        results.insert(unit.clone(), result.clone());
+        result
+    };
     let reported = if incoming {
         &mut cache.reported_incoming
     } else {
@@ -1637,6 +1723,52 @@ fn cached_call_relation(
         );
     }
     result
+}
+
+fn call_path_contains(
+    paths: &[CallPathNode],
+    mut tail: Option<usize>,
+    seed: &CodeUnit,
+    candidate: &CodeUnit,
+    work: &mut usize,
+    max_work: usize,
+) -> Option<bool> {
+    if seed == candidate {
+        return Some(true);
+    }
+    while let Some(index) = tail {
+        if *work >= max_work {
+            return None;
+        }
+        *work += 1;
+        let node = &paths[index];
+        if &node.value.unit == candidate {
+            return Some(true);
+        }
+        tail = node.parent;
+    }
+    Some(false)
+}
+
+fn call_trace_values(
+    paths: &[CallPathNode],
+    mut tail: usize,
+    depth: usize,
+) -> Vec<(PipelineTraceValue, Option<PipelineVia>)> {
+    let mut values = Vec::with_capacity(depth);
+    loop {
+        let node = &paths[tail];
+        values.push((
+            PipelineTraceValue::Declaration(node.value.clone()),
+            Some(PipelineVia::CallSite(node.via.clone())),
+        ));
+        let Some(parent) = node.parent else {
+            break;
+        };
+        tail = parent;
+    }
+    values.reverse();
+    values
 }
 
 fn call_input_expansions(

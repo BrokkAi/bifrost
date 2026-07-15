@@ -759,15 +759,18 @@ fn validate_call_input_wrapper(args: &[Expr], query: &Expr, analysis: &mut Analy
                 );
             }
         }
-        ":parameter-name" => {
-            if !matches!(args[1].kind, ExprKind::String(_) | ExprKind::Symbol(_)) {
+        ":parameter-name" => match &args[1].kind {
+            ExprKind::String(name) | ExprKind::Symbol(name) => {
+                validate_parameter_name(name, args[1].range.clone(), analysis);
+            }
+            _ => {
                 analysis.error(
                     args[1].range.clone(),
                     "wrong-value-shape",
                     "parameter name must be a string or symbol",
                 );
             }
-        }
+        },
         _ => analysis.error(
             args[0].range.clone(),
             "unknown-property",
@@ -1140,6 +1143,9 @@ fn validate_property_value(
         super::schema::ValueShape::String => {
             require_string(value, analysis);
             validate_plain_string(property, value, analysis);
+        }
+        super::schema::ValueShape::ParameterName => {
+            unreachable!("parameter names are query-step values, not pattern properties")
         }
         super::schema::ValueShape::RegexString => validate_rql_regex(value, &child, analysis),
         super::schema::ValueShape::KindList => validate_kind_value(value, &child, analysis),
@@ -2266,7 +2272,11 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                     );
                 }
                 seen_parameter_name = true;
-                require_json_string(child, analysis);
+                if let Some(name) = child.as_string() {
+                    validate_parameter_name(name, child.range(), analysis);
+                } else {
+                    require_json_string(child, analysis);
+                }
                 continue;
             }
             if field == Some(QueryStepField::Surface) && reference_step {
@@ -2505,6 +2515,20 @@ fn validate_json_result_detail(value: &spanned::Value, analysis: &mut Analysis) 
 fn require_json_string(value: &spanned::Value, analysis: &mut Analysis) {
     if !value.is_string() {
         analysis.error(value.range(), "wrong-value-shape", "expected a string");
+    }
+}
+
+fn validate_parameter_name(name: &str, range: Range<usize>, analysis: &mut Analysis) {
+    let shape = QueryStepField::ParameterName.value_shape();
+    if !shape.accepts_string(name) {
+        let (minimum, maximum) = shape
+            .string_length_bounds()
+            .expect("parameter-name shape has string bounds");
+        analysis.error(
+            range,
+            "invalid-query",
+            format!("parameter name must be between {minimum} and {maximum} bytes"),
+        );
     }
 }
 
@@ -2813,6 +2837,38 @@ mod tests {
             &conflicting[diagnostic.range.clone()] == "true"
                 && diagnostic.message.contains("mutually exclusive")
         }));
+    }
+
+    #[test]
+    fn parameter_name_constraints_are_shared_by_json_and_rql_validation() {
+        let oversized = "x".repeat(MAX_KWARG_NAME_LENGTH + 1);
+        let rql = format!(
+            "(call-input :parameter-name \"{oversized}\" (call-sites-to (enclosing-decl (method))))"
+        );
+        let json = format!(
+            r#"{{"match":{{"kind":"method"}},"steps":[{{"op":"enclosing_decl"}},{{"op":"call_sites_to"}},{{"op":"call_input","parameter_name":"{oversized}"}}]}}"#
+        );
+
+        for (source, expected) in [
+            (rql.as_str(), format!("\"{oversized}\"")),
+            (json.as_str(), format!("\"{oversized}\"")),
+        ] {
+            let diagnostics = validate_query_source(source);
+            assert!(diagnostics.iter().any(|diagnostic| {
+                source[diagnostic.range.clone()] == expected
+                    && diagnostic.message.contains("parameter name")
+            }));
+        }
+
+        for source in [
+            r#"(call-input :parameter-name "" (call-sites-to (enclosing-decl (method))))"#,
+            r#"{"match":{"kind":"method"},"steps":[{"op":"enclosing_decl"},{"op":"call_sites_to"},{"op":"call_input","parameter_name":""}]}"#,
+        ] {
+            assert!(validate_query_source(source).iter().any(|diagnostic| {
+                &source[diagnostic.range.clone()] == "\"\""
+                    && diagnostic.message.contains("parameter name")
+            }));
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use tree_sitter::{Node, Tree};
 
+use crate::analyzer::structural::{FileFacts, NormalizedKind, Role, Span};
 use crate::analyzer::{Language, ProjectFile, Range};
 
 use super::{parse_tree_for_language, scala::scala_postfix_method_node};
@@ -36,16 +37,12 @@ pub(crate) struct CallSiteSyntax {
     pub(crate) kind: CallSyntaxKind,
 }
 
-pub(crate) fn call_reference_ranges(
-    file: &ProjectFile,
-    source: &str,
+pub(crate) fn call_reference_ranges_in_tree(
+    tree: &Tree,
+    language: Language,
     search_range: &Range,
     limit: usize,
 ) -> Vec<Range> {
-    let language = language_for_file(file);
-    let Some(tree) = parse_tree_for_language(file, language, source) else {
-        return Vec::new();
-    };
     collect_call_reference_ranges(tree.root_node(), language, search_range, limit)
 }
 
@@ -65,194 +62,78 @@ pub(crate) fn is_call_reference_range_in_tree(
 }
 
 pub(crate) fn call_site_syntax_for_reference(
-    tree: &Tree,
-    language: Language,
-    source: &str,
+    facts: &FileFacts,
     start_byte: usize,
     end_byte: usize,
 ) -> Option<CallSiteSyntax> {
-    let mut current = tree
-        .root_node()
-        .named_descendant_for_byte_range(start_byte, end_byte)?;
-    if language == Language::Ruby && ruby_bare_call_identifier(current) {
-        let range = node_range(current);
-        return Some(CallSiteSyntax {
-            range,
-            callee_range: range,
-            receiver: None,
-            arguments: Vec::new(),
-            kind: CallSyntaxKind::Function,
-        });
-    }
-    let call = loop {
-        if is_call_expression_node(current, language)
-            || (language == Language::Scala
-                && matches!(current.kind(), "infix_expression" | "postfix_expression"))
+    let call = facts
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == NormalizedKind::Call)
+        .filter(|node| {
+            node.name
+                .is_some_and(|name| name.start_byte <= start_byte && end_byte <= name.end_byte)
+        })
+        .min_by_key(|node| node.range.end_byte.saturating_sub(node.range.start_byte))?;
+    let callee = call.name?;
+    let receiver = call
+        .role_targets(Role::Receiver)
+        .next()
+        .map(|target| range_for_span(facts, target.span));
+    let mut position = 0;
+    let arguments = call
+        .roles
+        .iter()
+        .filter_map(|target| match target.role {
+            Role::Arg => {
+                let current = position;
+                position += 1;
+                Some(CallArgumentSyntax {
+                    range: range_for_span(facts, target.span),
+                    name: None,
+                    position: Some(current),
+                    spread: target.spread,
+                })
+            }
+            Role::Kwarg => Some(CallArgumentSyntax {
+                range: range_for_span(facts, target.span),
+                name: target
+                    .keyword
+                    .map(|keyword| keyword.text(facts.source()).to_owned()),
+                position: None,
+                spread: target.spread,
+            }),
+            _ => None,
+        })
+        .collect();
+    let kind = match receiver {
+        Some(range)
+            if matches!(
+                facts.source().get(range.start_byte..range.end_byte),
+                Some("super" | "base")
+            ) =>
         {
-            break current;
+            CallSyntaxKind::Super
         }
-        current = current.parent()?;
-    };
-
-    let callee = if language == Language::Scala && call.kind() == "infix_expression" {
-        call.child_by_field_name("operator")?
-    } else if language == Language::Scala && call.kind() == "postfix_expression" {
-        scala_postfix_method_node(call)?
-    } else {
-        call_reference_leaf(callee_node_for_call(call, language)?, language)?
-    };
-    if start_byte < callee.start_byte() || end_byte > callee.end_byte() {
-        return None;
-    }
-
-    let receiver_node = receiver_node_for_call(call, callee, language);
-    let receiver = receiver_node.map(node_range);
-    let arguments = call_arguments(call, language, source);
-    let kind = if matches!(call.kind(), "object_creation_expression" | "new_expression") {
-        CallSyntaxKind::Constructor
-    } else if callee.kind() == "super" || receiver_node.is_some_and(|node| node.kind() == "super") {
-        CallSyntaxKind::Super
-    } else if receiver.is_some() {
-        CallSyntaxKind::Method
-    } else {
-        CallSyntaxKind::Function
+        Some(_) => CallSyntaxKind::Method,
+        None => CallSyntaxKind::Function,
     };
     Some(CallSiteSyntax {
-        range: node_range(call),
-        callee_range: node_range(callee),
+        range: call.range,
+        callee_range: range_for_span(facts, callee),
         receiver,
         arguments,
         kind,
     })
 }
 
-fn receiver_node_for_call<'tree>(
-    call: Node<'tree>,
-    callee: Node<'tree>,
-    language: Language,
-) -> Option<Node<'tree>> {
-    for field in ["object", "receiver"] {
-        if let Some(receiver) = call.child_by_field_name(field) {
-            return Some(receiver);
-        }
+fn range_for_span(facts: &FileFacts, span: Span) -> Range {
+    Range {
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        start_line: facts.line_of_byte(span.start_byte),
+        end_line: facts.line_of_byte(span.end_byte),
     }
-
-    let receiver_fields: &[&str] = match language {
-        Language::Go => &["operand"],
-        Language::Cpp => &["argument", "object"],
-        Language::JavaScript | Language::TypeScript | Language::Python => &["object"],
-        Language::Rust => &["value"],
-        Language::Php => &["object"],
-        Language::Scala => &["left", "object"],
-        Language::CSharp => &["expression"],
-        Language::Ruby => &["receiver"],
-        Language::Java | Language::None => &[],
-    };
-    let mut current = callee;
-    while let Some(parent) = current.parent() {
-        if parent == call {
-            break;
-        }
-        for field in receiver_fields {
-            if let Some(receiver) = parent.child_by_field_name(field)
-                && receiver != current
-            {
-                return Some(receiver);
-            }
-        }
-        current = parent;
-    }
-    None
-}
-
-fn call_arguments(call: Node<'_>, language: Language, source: &str) -> Vec<CallArgumentSyntax> {
-    if language == Language::Scala && call.kind() == "infix_expression" {
-        return call
-            .child_by_field_name("right")
-            .map(|argument| CallArgumentSyntax {
-                range: node_range(argument),
-                name: None,
-                position: Some(0),
-                spread: false,
-            })
-            .into_iter()
-            .collect();
-    }
-    if language == Language::Scala && call.kind() == "postfix_expression" {
-        return Vec::new();
-    }
-
-    let mut arguments = Vec::new();
-    let mut position = 0;
-    for container in argument_nodes_for_call(call, language) {
-        let mut cursor = container.walk();
-        for argument in container.named_children(&mut cursor) {
-            let name_node = named_argument_name(argument, language);
-            let value = named_argument_value(argument, language).unwrap_or(argument);
-            let name = name_node.and_then(|name| source.get(name.byte_range()).map(str::to_owned));
-            let argument_position = if name.is_none() {
-                let current = position;
-                position += 1;
-                Some(current)
-            } else {
-                None
-            };
-            arguments.push(CallArgumentSyntax {
-                range: node_range(value),
-                name,
-                position: argument_position,
-                spread: is_spread_argument(argument.kind()),
-            });
-        }
-    }
-    arguments.sort_by_key(|argument| (argument.range.start_byte, argument.range.end_byte));
-    arguments.dedup_by_key(|argument| (argument.range.start_byte, argument.range.end_byte));
-    arguments
-}
-
-fn named_argument_name(node: Node<'_>, language: Language) -> Option<Node<'_>> {
-    if !matches!(
-        node.kind(),
-        "keyword_argument"
-            | "named_argument"
-            | "pair"
-            | "hash_pair"
-            | "argument"
-            | "assignment_expression"
-    ) {
-        return None;
-    }
-    node.child_by_field_name("name")
-        .or_else(|| node.child_by_field_name("key"))
-        .or_else(|| {
-            (language == Language::Scala && node.kind() == "assignment_expression")
-                .then(|| node.child_by_field_name("left"))
-                .flatten()
-        })
-}
-
-fn named_argument_value(node: Node<'_>, language: Language) -> Option<Node<'_>> {
-    let name = named_argument_name(node, language)?;
-    node.child_by_field_name("value")
-        .or_else(|| node.child_by_field_name("expression"))
-        .or_else(|| node.child_by_field_name("right"))
-        .or_else(|| {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find(|child| *child != name && !matches!(child.kind(), "reference_modifier"))
-        })
-}
-
-fn is_spread_argument(kind: &str) -> bool {
-    matches!(
-        kind,
-        "spread_element"
-            | "splat_argument"
-            | "hash_splat_argument"
-            | "list_splat"
-            | "dictionary_splat"
-            | "spread_argument"
-    )
 }
 
 pub(crate) fn call_signature_context(
@@ -816,8 +697,9 @@ mod tests {
     use std::env;
 
     use super::{call_signature_context, call_site_syntax_for_reference};
-    use crate::analyzer::usages::get_definition::parse_tree_for_language;
-    use crate::analyzer::{Language, ProjectFile};
+    use crate::analyzer::ProjectFile;
+    use crate::analyzer::ruby::structural::RUBY_STRUCTURAL_SPEC;
+    use crate::analyzer::structural::extract::extract_file_facts;
 
     fn file(name: &str) -> ProjectFile {
         ProjectFile::new(env::temp_dir().join("bifrost-signature-help"), name)
@@ -830,17 +712,12 @@ mod tests {
     #[test]
     fn ruby_bare_call_has_a_structured_call_site() {
         let source = "def target; end\ndef caller; target; end\n";
-        let file = file("sample.rb");
-        let tree = parse_tree_for_language(&file, Language::Ruby, source).expect("Ruby parse");
+        let grammar = tree_sitter_ruby::LANGUAGE.into();
+        let facts = extract_file_facts(&RUBY_STRUCTURAL_SPEC, &grammar, source)
+            .expect("Ruby structural facts");
         let start = source.rfind("target").expect("call target");
-        let site = call_site_syntax_for_reference(
-            &tree,
-            Language::Ruby,
-            source,
-            start,
-            start + "target".len(),
-        )
-        .unwrap_or_else(|| panic!("bare Ruby call site: {}", tree.root_node().to_sexp()));
+        let site = call_site_syntax_for_reference(&facts, start, start + "target".len())
+            .expect("bare Ruby call site");
         assert_eq!(
             &source[site.callee_range.start_byte..site.callee_range.end_byte],
             "target"

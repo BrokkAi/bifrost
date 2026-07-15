@@ -494,15 +494,17 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 CallInputSelector::ParameterIndex(index)
             } else {
                 let path = child_path(&entry_path, "parameter_name");
+                let shape = QueryStepField::ParameterName.value_shape();
                 let name = object["parameter_name"]
                     .as_str()
-                    .filter(|name| !name.is_empty() && name.len() <= MAX_KWARG_NAME_LENGTH)
+                    .filter(|name| shape.accepts_string(name))
                     .ok_or_else(|| {
+                        let (minimum, maximum) = shape
+                            .string_length_bounds()
+                            .expect("parameter-name shape has string bounds");
                         QueryError::new(
                             path,
-                            format!(
-                                "expected a non-empty string of at most {MAX_KWARG_NAME_LENGTH} bytes"
-                            ),
+                            format!("expected a string between {minimum} and {maximum} bytes"),
                         )
                     })?;
                 CallInputSelector::ParameterName(name.to_owned())

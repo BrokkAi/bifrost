@@ -18,6 +18,7 @@ The public operations are `callers`, `callees`, `call_sites_to`, `call_sites_fro
 - [x] (2026-07-14 18:02Z) Milestone 2: added typed JSON/RQL call steps, `call_site` / `expression_site` results, finite breadth-first traversal, cycle-closing results, call-site provenance, receiver/formal projection, `file_of` composition, and schema-driven validation/help.
 - [x] (2026-07-14 18:02Z) Milestone 3: migrated LSP call hierarchy to the shared service, removed the Ruby guard, updated MCP/CLI/Python/VS Code consumers, and documented direct call-input and cross-language precision boundaries.
 - [x] (2026-07-14 18:02Z) Milestone 4: reviewed the relation/query/consumer diff, fixed self-receiver inclusion, canonical PHP formal names, named-value AST extraction, RQL token priority, and stale docs; completed focused and repository-wide validation.
+- [x] (2026-07-15 07:20Z) Ran the Brokk guided review and applied all twelve queued findings: bounded exact incoming discovery, symmetric recursion, correct Python unbound and constructor binding, keyword-variadic binding, cancellation and work budgets, alternate-path provenance, shared structural call facts, schema-owned parameter-name validation, lazy LSP binding, and shared callable-ancestor helpers.
 
 ## Surprises & Discoveries
 
@@ -39,14 +40,20 @@ The public operations are `callers`, `callees`, `call_sites_to`, `call_sites_fro
 - Observation: tree-sitter-ruby represents a no-parentheses bare invocation used as a statement as an `identifier`, not a `call` node.
   Evidence: the focused syntax test renders `(body_statement (identifier))` for `def caller; target; end`; exact definition resolution still proves that the node targets a callable, so the shared service treats only that structured expression-statement shape as a zero-argument call.
 
-- Observation: incoming and outgoing relations drifted when each normalized the same reference independently, first visible for Ruby bare calls.
-  Evidence: all-adapter tests found outgoing Ruby resolution but no incoming relation until incoming hits were normalized through the same per-caller outgoing relation and matched back to the exact target/focus range.
+- Observation: normalizing every incoming reference by rescanning and re-resolving every call in its enclosing caller both amplified LSP work and let unrelated calls consume the target's discovery cap.
+  Evidence: `incoming_call_discovery_is_not_limited_by_unrelated_calls` fails under the old per-caller rescan and passes when the exact usage hit is normalized directly against the already-known target; LSP now consumes that same bounded relation without formal-parameter parsing.
 
 - Observation: PHP and C# named arguments attach the name as a field but leave the value as an unfielded expression child, while Scala represents a named argument as an assignment expression with `left` and `right` fields.
   Evidence: the adapter node-type registries and the cross-language named-input test required a structured fallback to the non-name child for PHP/C# and explicit `left`/`right` handling for Scala.
 
-- Observation: the local shell resolves `cargo`/`rustc` from `~/.local` but `cargo-clippy`/`clippy-driver` from Homebrew, whose different LLVM builds are artifact-incompatible despite sharing Rust 1.96.0 version strings.
-  Evidence: ordinary and initially isolated clippy runs failed with E0514; aligning `RUSTC=/opt/homebrew/bin/rustc` with `/opt/homebrew/bin/cargo clippy` in the isolated-target helper completed with `-D warnings`.
+- Observation: the local shell resolves `cargo`/`rustc` from rustup but `clippy-driver` from Homebrew, whose LLVM 22.1.6 build is artifact-incompatible with rustup's LLVM 22.1.2 build despite sharing Rust 1.96.0 version strings.
+  Evidence: ordinary and isolated clippy runs failed with E0514; placing `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` first in `PATH` selected the matching driver and completed all-target/all-feature clippy with warnings denied.
+
+- Observation: call syntax had two independent cross-language normalizers: structural adapters for `query_code` and a second tree-sitter decomposition in definition lookup.
+  Evidence: call relations now read callee, receiver, ordered arguments, keyword names, and spread metadata from `FileFacts`; Ruby bare calls and Scala infix/postfix calls enter through their structural adapters, and the duplicate argument/receiver parser was removed.
+
+- Observation: the full macOS Python-feature test link needs the same dynamic-lookup flags used by CI, and several unrelated tests need normal user-cache, subprocess, and git/GPG access.
+  Evidence: `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' cargo test --all-features --lib` passed 797 tests outside the sandbox after the sandbox run identified only six environment-restricted failures.
 
 - Observation: rendered docs inspection found a stale JSON-reference sentence claiming version 2 did not traverse call graphs.
   Evidence: the fresh Astro preview showed the contradiction above the new call-step documentation; the rebuilt page now describes resolved call edges and contains no stale claim.
@@ -73,19 +80,29 @@ The public operations are `callers`, `callees`, `call_sites_to`, `call_sites_fro
   Rationale: security-oriented discovery needs recall and visible uncertainty, while the LSP wire shape cannot represent proof tiers.
   Date/Author: 2026-07-14 / Codex
 
-- Decision: real self-recursive and cycle-closing edges are results. Bounded breadth-first traversal expands each callable once at its shortest depth and never offers unbounded transitive traversal.
-  Rationale: recursion is a genuine call relation, but centrality-oriented usage-graph exclusions and recursive graph walks must not leak into this API.
+- Decision: real self-recursive and cycle-closing edges are results. Bounded breadth-first traversal uses path-local cycle detection, retains distinct paths to the same declaration, and never offers unbounded transitive traversal.
+  Rationale: recursion is a genuine call relation, and alternate call paths are security-relevant provenance. Parent-linked path nodes avoid cloning complete paths while file, source, candidate, pipeline-row, and provenance-step budgets bound the additional work.
   Date/Author: 2026-07-14 / Codex
 
 - Decision: do not expand override families implicitly.
   Rationale: exact proven runtime targets remain exact edges; analyzer-supported possible dynamic targets remain separate unproven edges that callers can filter. Type-hierarchy steps already provide explicit family traversal.
   Date/Author: 2026-07-14 / Codex
 
+- Decision: structural `FileFacts` are the single call-shape boundary, while formal-slot binding remains a lazy query-only enrichment.
+  Rationale: adapters already own grammar-specific call syntax, so relations and structural matching must not parse the same call twice. LSP call hierarchy needs caller/callee edges but not argument binding, so delaying formal extraction and Python receiver resolution avoids unnecessary interactive work.
+  Date/Author: 2026-07-15 / Codex
+
+- Decision: constrained query-step strings use a declarative schema value shape.
+  Rationale: `parameter_name` previously had runtime and MCP length checks but weaker JSON/RQL live validation. `ValueShape::ParameterName` now supplies one constraint to decoding, source diagnostics, and MCP schema generation.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
-The issue behavior is implemented. JSON and RQL can traverse direct or finite-depth callers/callees, return exact call sites, and project an explicit receiver or one formal parameter by zero-based index/name. The shared service now powers query traversal and LSP call hierarchy, including Ruby bare calls and real recursive/cycle-closing relations. All eleven adapters prove direct callers, callees, and positional input projection; Python, PHP, Scala, C#, and Ruby prove keyword/named binding. Additional coverage exercises Java receiver projection and provenance, Python bound versus static methods, keyword ordering, defaults, variadics, spreads, and cycles.
+The issue behavior is implemented and the guided-review queue is exhausted. JSON and RQL traverse direct or finite-depth callers/callees, return exact call sites, and project an explicit receiver or one formal parameter by zero-based index/name. The shared service powers query traversal and LSP call hierarchy, including Ruby bare calls and real recursive/cycle-closing relations. Incoming discovery retains valid sample hits under caps, recursion is symmetric, Python bound/unbound/static calls consume the correct formal slots, constructors bind only a unique structured initializer, and unmatched named inputs reach keyword variadics. Alternate provenance paths survive transitive traversal without eager path cloning.
 
-Validation is complete: 62 focused query frontend tests, 49 pipeline tests, 11 call-hierarchy tests, all 52 VS Code tests, Astro check/build, and all 40 Python binding tests pass. Clippy passes for all targets/features with warnings denied. The feature-complete Rust run passed 795 library tests; its single sandbox-only uv sidecar failure passed when rerun with normal uv-cache access. A fresh rendered docs preview was inspected after the final rebuild. The implementation intentionally omits a call-input row when structured formal binding is unavailable or an argument is a spread/splat, and it does not perform dataflow beyond the written expression.
+Call relations now consume the same structural facts as `query_code`, including named and spread arguments, rather than maintaining a second cross-language call parser. Work is charged before materializing rows or provenance, cancellation reaches relation discovery, zero remaining relation budget is diagnostic, and LSP avoids formal binding it does not render. Parameter-name limits are owned by the declarative schema and enforced consistently by runtime decoding, JSON/RQL live validation, and MCP schema generation.
+
+Validation is complete for the review diff: `cargo fmt --all` and `git diff --check` pass; all 57 `code_query_pipelines` tests and all 22 query-source validation tests pass; matching-toolchain `cargo clippy --all-targets --all-features -- -D warnings` passes; and the CI-configured all-feature library suite passes 797 tests with 3 intentionally ignored. The implementation intentionally omits a call-input row when structured formal binding is unavailable or an argument is a spread/splat, and it does not perform dataflow beyond the written expression.
 
 ## Context and Orientation
 
@@ -109,7 +126,7 @@ Milestone 2 extends the typed query pipeline. Keep schema version 2. Add `CallSi
 
 Render a terminal call site with path/language, full range, callee range, caller/callee declarations, call kind, proof, receiver, and arguments including syntax plus bound slot metadata. Render an expression site with path/language/range/text, optional normalized kind, selected slot, argument syntax, and compact call-site identity. `callers` and `callees` return declarations and retain the proving call site under provenance `via`.
 
-Implement direct site expansion and iterative breadth-first callable traversal. Depth one is the default. Depth N returns nodes reached by one through N call edges. Emit a seed when a real self/cycle edge reaches it but do not enqueue an already expanded callable. Preserve deterministic shortest paths up to the existing provenance cap. Account for files, source bytes, examined sites, pipeline rows, and provenance steps before expensive work; cancellation discards partial relations.
+Implement direct site expansion and iterative breadth-first callable traversal. Depth one is the default. Depth N returns nodes reached by one through N call edges. Emit a seed when a real self/cycle edge reaches it, stop only cycles already present on the current path, and retain alternate paths to the same declaration. Store parent links instead of cloning whole paths. Account for files, source bytes, examined sites, pipeline rows, and provenance steps before expensive work; cancellation discards partial relations.
 
 Milestone 3 migrates consumers. Replace LSP incoming/outgoing discovery with the shared service and remove the blanket Ruby guard. LSP filters to proven relations, includes proven recursion, and retains its existing range/grouping shape. Update MCP schema/help, CLI/REPL rendering, Python result models, VS Code result unions/tree navigation, live RQL diagnostics, hover/completion, and the conservative TextMate grammar.
 
@@ -193,6 +210,8 @@ Revision note (2026-07-14): Created the initial self-contained plan after rebasi
 Revision note (2026-07-14): Completed the shared relation, query, and consumer milestones. The design now normalizes incoming hits through the same outgoing call-site builder, handles resolved Ruby bare expression calls, and records Python `staticmethod` versus bound-method receiver semantics from decorator syntax.
 
 Revision note (2026-07-14): Completed final review and validation. Added all-adapter positional and five-adapter named-input coverage, fixed structured PHP/C#/Scala named-value extraction and RQL token precedence, verified the rendered docs, and recorded the local Rust/uv environment constraints encountered by broad tests.
+
+Revision note (2026-07-15): Applied all twelve findings from the Brokk guided review. Consolidated call syntax on structural facts, made formal binding lazy, corrected capped discovery/recursion/Python/constructor/variadic semantics, bounded and cancelled graph/provenance work, preserved alternate paths, centralized parameter-name constraints, and refreshed validation evidence with the CI-equivalent all-feature run.
 
 ## Interfaces and Dependencies
 

@@ -5,7 +5,8 @@
 
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, first_named_child,
+    attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
+    first_named_child,
 };
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, StructuralSpec};
 use tree_sitter::Node;
@@ -135,9 +136,8 @@ impl StructuralSpec for PythonStructuralSpec {
                                     sink.kwarg(keyword, value);
                                 }
                             }
-                            _ => attach_role_with_derived_name(
+                            _ => attach_argument_role_with_derived_name(
                                 sink,
-                                Role::Arg,
                                 argument,
                                 expression_name_node,
                             ),

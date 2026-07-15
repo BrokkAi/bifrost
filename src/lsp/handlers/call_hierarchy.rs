@@ -11,7 +11,8 @@ use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_call_reference_definition_with_source,
 };
 use crate::analyzer::usages::{
-    CallRelationService, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageProof,
+    CallRelationService, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageProof, is_call_relation_unit,
+    nearest_call_relation_unit,
 };
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, IAnalyzer, Project, ProjectFile, Range, WorkspaceAnalyzer,
@@ -79,7 +80,7 @@ fn declaration_target_at_cursor(
     range: &Range,
 ) -> Option<CodeUnit> {
     let enclosing = analyzer.enclosing_code_unit(file, range)?;
-    let callable = nearest_call_hierarchy_unit(analyzer, enclosing)?;
+    let callable = nearest_call_relation_unit(analyzer, enclosing)?;
     if callable.source() != file {
         return None;
     }
@@ -115,7 +116,7 @@ fn call_reference_target_at_cursor(
     outcome
         .definitions
         .into_iter()
-        .find_map(|definition| nearest_call_hierarchy_unit(analyzer, definition))
+        .find_map(|definition| nearest_call_relation_unit(analyzer, definition))
 }
 
 fn lsp_range_contains_position(range: &LspRange, position: &Position) -> bool {
@@ -181,7 +182,7 @@ pub fn outgoing_calls(
     let analyzer = workspace.analyzer();
     let _query_scope = AnalyzerQueryScope::new(analyzer);
     let caller = resolve_item_code_unit(analyzer, project, &params.item)?;
-    if !is_call_hierarchy_unit(&caller) {
+    if !is_call_relation_unit(&caller) {
         return Some(Vec::new());
     }
     let relation = CallRelationService::outgoing(analyzer, &caller, DEFAULT_MAX_USAGES);
@@ -216,19 +217,6 @@ pub fn outgoing_calls(
             })
             .collect(),
     )
-}
-
-fn nearest_call_hierarchy_unit(analyzer: &dyn IAnalyzer, mut unit: CodeUnit) -> Option<CodeUnit> {
-    loop {
-        if is_call_hierarchy_unit(&unit) {
-            return Some(unit);
-        }
-        unit = analyzer.parent_of(&unit)?;
-    }
-}
-
-fn is_call_hierarchy_unit(unit: &CodeUnit) -> bool {
-    (unit.is_class() || unit.is_callable()) && !unit.is_synthetic()
 }
 
 fn source_range(
@@ -275,7 +263,7 @@ fn resolve_item_code_unit(
     item: &CallHierarchyItem,
 ) -> Option<CodeUnit> {
     resolve_hierarchy_item_code_unit(analyzer, project, item.data.as_ref(), &item.uri, |unit| {
-        is_call_hierarchy_unit(unit)
+        is_call_relation_unit(unit)
     })
 }
 

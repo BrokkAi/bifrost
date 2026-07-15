@@ -1,5 +1,5 @@
 use crate::analyzer::structural::query::schema::{
-    ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, reference_kind_label,
+    ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryStepField, reference_kind_label,
 };
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
@@ -35,6 +35,10 @@ pub fn run_extended_stdio_server(
 }
 
 fn query_step_input_variants() -> Vec<Value> {
+    let (parameter_name_minimum, parameter_name_maximum) = QueryStepField::ParameterName
+        .value_shape()
+        .string_length_bounds()
+        .expect("parameter-name shape has string bounds");
     let plain = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
@@ -164,7 +168,11 @@ fn query_step_input_variants() -> Vec<Value> {
             "type": "object",
             "properties": {
                 "op": { "const": "call_input" },
-                "parameter_name": { "type": "string", "minLength": 1, "maxLength": MAX_KWARG_NAME_LENGTH }
+                "parameter_name": {
+                    "type": "string",
+                    "minLength": parameter_name_minimum,
+                    "maxLength": parameter_name_maximum
+                }
             },
             "required": ["op", "parameter_name"],
             "additionalProperties": false

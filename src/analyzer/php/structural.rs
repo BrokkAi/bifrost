@@ -3,6 +3,7 @@
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
+    is_spread_argument_node,
 };
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, StructuralSpec};
 use tree_sitter::Node;
@@ -182,7 +183,11 @@ fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
             if let Some(keyword) = keyword {
                 sink.kwarg(keyword, value);
             } else {
-                attach_role_with_derived_name(sink, Role::Arg, value, expression_name_node);
+                sink.argument_maybe_named(
+                    value,
+                    expression_name_node(value),
+                    is_spread_argument_node(argument),
+                );
             }
         }
     }
