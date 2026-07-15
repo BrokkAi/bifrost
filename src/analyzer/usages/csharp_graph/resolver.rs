@@ -1338,6 +1338,12 @@ fn receiver_type_fq_names(
                 .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
                 .unwrap_or(SymbolResolution::Unknown)
         }
+        "object_creation_expression" => object_created_type(receiver_node)
+            .and_then(|type_node| {
+                resolve_type_fq_name(csharp, file, &reference_type_text(type_node, source))
+            })
+            .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
+            .unwrap_or(SymbolResolution::Unknown),
         "parenthesized_expression" | "checked_expression" => receiver_node
             .named_child(0)
             .map(|inner| receiver_type_fq_names(inner, csharp, file, source, bindings))

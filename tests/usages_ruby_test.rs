@@ -1248,6 +1248,64 @@ end
 }
 
 #[test]
+fn resolves_bare_new_singleton_factory_receiver_usage() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "lib/precision/base.rb",
+            r#"module Precision
+  class Base
+    def execute
+    end
+
+    def self.build
+      new
+    end
+  end
+end
+"#,
+        ),
+        (
+            "lib/precision/factory.rb",
+            r#"require_relative "base"
+
+module Precision
+  def self.build
+    Base.new
+  end
+end
+"#,
+        ),
+        (
+            "app/run.rb",
+            r#"require_relative "../lib/precision/factory"
+
+service = Precision.build
+service.execute
+
+second = Precision::Base.build
+second.execute
+"#,
+        ),
+    ]);
+
+    let execute = definition(&analyzer, "Precision$Base.execute");
+    let hits = analyzer
+        .find_usages(&[execute])
+        .into_either()
+        .expect("Precision::Base#execute lookup should succeed");
+    let lines = hit_source_lines(&hits);
+
+    assert!(
+        lines.iter().any(|line| line == "service.execute"),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line == "second.execute"),
+        "bare new in a singleton factory should preserve the invocation owner: {lines:?}"
+    );
+}
+
+#[test]
 fn recursive_factory_receiver_returns_unproven_without_inventing_hit() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app.rb",

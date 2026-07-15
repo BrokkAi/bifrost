@@ -1314,6 +1314,81 @@ func Run(m ExtensionManager, args []string, streams IOStreams) error {
 }
 
 #[test]
+fn go_graph_strategy_excludes_concrete_receivers_from_interface_method_usages() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "worker/worker.go",
+            r#"
+package worker
+
+type Worker struct{}
+
+func (Worker) Record() {}
+
+type Recorder interface {
+    Record()
+}
+
+func NewWorker() Worker { return Worker{} }
+"#,
+        ),
+        (
+            "cmd/app/main.go",
+            r#"
+package main
+
+import . "example.com/app/worker"
+
+func main() {
+    worker := NewWorker()
+    worker.Record()
+    _, paired := 0, NewWorker()
+    paired.Record()
+    var recorder Recorder = worker
+    recorder.Record()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/worker.Recorder.Record");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            let hits = hits_by_overload
+                .get(&target)
+                .expect("interface receiver call should be proven");
+            assert_eq!(
+                1,
+                hits.len(),
+                "only recorder.Record should be proven: {hits:#?}"
+            );
+            assert!(hits.iter().all(|hit| {
+                hit.file == project.file("cmd/app/main.go")
+                    && hit.snippet.contains("recorder.Record()")
+            }));
+            assert_eq!(
+                None,
+                unproven_total_by_overload.get(&target),
+                "known concrete receivers must not be interface-method candidates"
+            );
+        }
+        other => panic!("expected interface proof-tier result, got {other:#?}"),
+    }
+}
+
+#[test]
 fn go_graph_strategy_does_not_match_interface_fields_by_method_name_only() {
     let (_project, analyzer) = go_analyzer_with_files(&[(
         "example/service.go",

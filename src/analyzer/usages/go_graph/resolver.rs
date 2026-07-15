@@ -60,6 +60,17 @@ impl GoProjectGraph {
             .map(|parsed| canonical_go_package_name(file, &parsed.package_name))
     }
 
+    pub(super) fn constructor_return_types(&self, callee: &str) -> &[String] {
+        self.edge_index
+            .constructor_return_types(callee)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(super) fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
+        self.edge_index.namespace_packages(file)
+    }
+
     pub(super) fn scan_files(
         &self,
         candidate_files: &HashSet<ProjectFile>,
@@ -971,6 +982,8 @@ pub(super) struct TargetSpec {
     top_level_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     owner_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     compatible_receiver_types: BTreeSet<(ProjectFile, String)>,
+    compatible_receiver_fqns: HashSet<String>,
+    owner_is_interface: bool,
     field_owner_direct_names: HashMap<ProjectFile, HashMap<String, HashSet<String>>>,
     owner_constructor_names: HashSet<String>,
 }
@@ -997,6 +1010,15 @@ impl TargetSpec {
                 )
             })
             .unwrap_or_default();
+        let compatible_receiver_fqns = compatible_receiver_types
+            .iter()
+            .filter_map(|(file, receiver)| {
+                graph
+                    .package_name_of(file)
+                    .map(|package| format!("{package}.{receiver}"))
+            })
+            .collect();
+        let owner_is_interface = go_target_owner_is_interface(analyzer, graph, target);
         let field_owner_direct_names =
             collect_field_owner_direct_names(graph, &compatible_receiver_types);
         let owner_seeds = (!compatible_receiver_types.is_empty()).then(|| {
@@ -1026,6 +1048,8 @@ impl TargetSpec {
             top_level_seeds,
             owner_seeds,
             compatible_receiver_types,
+            compatible_receiver_fqns,
+            owner_is_interface,
             field_owner_direct_names,
             owner_constructor_names,
         }
@@ -1047,12 +1071,48 @@ impl TargetSpec {
         self.owner.is_some() && !is_module_field(&self.target)
     }
 
+    pub(super) fn owner_is_interface(&self) -> bool {
+        self.owner_is_interface
+    }
+
+    pub(super) fn matches_receiver_fqn(&self, fq_name: &str) -> bool {
+        self.compatible_receiver_fqns.contains(fq_name)
+    }
+
     /// Whether `name` is a package-level function in the owner type's package whose
     /// result is the owner type (e.g. `NewService` for `Service`), so a local bound
     /// to its return value can be seeded as the owner receiver.
     pub(super) fn is_owner_constructor(&self, name: &str) -> bool {
         self.owner_constructor_names.contains(name)
     }
+}
+
+fn go_target_owner_is_interface(
+    analyzer: &GoAnalyzer,
+    graph: &GoProjectGraph,
+    target: &CodeUnit,
+) -> bool {
+    let Some(owner) = analyzer.parent_of(target) else {
+        return false;
+    };
+    let Some(parsed) = graph.parsed_file(owner.source()) else {
+        return false;
+    };
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_spec"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, &parsed.source) == owner.identifier())
+        {
+            return node
+                .child_by_field_name("type")
+                .is_some_and(|ty| ty.kind() == "interface_type");
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 fn collect_compatible_receiver_types(
@@ -1449,6 +1509,7 @@ pub(super) struct ScanBindings {
     owner_namespace_type_names: HashMap<String, HashSet<String>>,
     field_owner_direct_names: HashMap<String, HashSet<String>>,
     field_owner_namespace_names: HashMap<String, HashMap<String, HashSet<String>>>,
+    mark_non_owner_types: bool,
 }
 
 impl ScanBindings {
@@ -1538,6 +1599,7 @@ impl ScanBindings {
             owner_namespace_type_names,
             field_owner_direct_names,
             field_owner_namespace_names,
+            mark_non_owner_types: spec.owner_is_interface(),
         }
     }
 
@@ -1594,6 +1656,14 @@ impl ScanBindings {
                     }
                 }
             }
+        }
+        if self.mark_non_owner_types
+            && ty.name.is_some()
+            && !tokens
+                .iter()
+                .any(|token| token == crate::analyzer::usages::go_graph::extractor::OWNER_TOKEN)
+        {
+            tokens.push(crate::analyzer::usages::go_graph::extractor::NON_OWNER_TOKEN.to_string());
         }
         tokens.sort();
         tokens.dedup();

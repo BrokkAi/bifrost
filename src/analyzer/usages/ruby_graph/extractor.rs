@@ -736,6 +736,17 @@ fn ruby_factory_method_outcome(
     } else {
         expression
     };
+    if expression.kind() == "identifier"
+        && node_text(expression, &source) == "new"
+        && !ruby_method_declares_local(node, "new", &source)
+        && ruby_method_lookup_mode_matches(
+            semantic.ruby,
+            &frame.method,
+            RubyMethodLookupMode::SingletonMethod,
+        )
+    {
+        return FactoryMethodOutcome::Owner(frame.invocation_owner_fq_name.clone());
+    }
     if expression.kind() != "call"
         || expression
             .child_by_field_name("method")
@@ -763,6 +774,58 @@ fn ruby_factory_method_outcome(
         &frame.invocation_owner_fq_name,
         receiver,
     )
+}
+
+fn ruby_method_declares_local(method: Node<'_>, name: &str, source: &str) -> bool {
+    if method
+        .child_by_field_name("parameters")
+        .is_some_and(|parameters| ruby_subtree_contains_identifier(parameters, name, source))
+    {
+        return true;
+    }
+    let mut stack: Vec<_> = method.child_by_field_name("body").into_iter().collect();
+    while let Some(node) = stack.pop() {
+        if node.kind() == "assignment"
+            && node
+                .child_by_field_name("left")
+                .is_some_and(|left| ruby_assignment_declares_name(left, name, source))
+        {
+            return true;
+        }
+        if node.id() != method.id()
+            && matches!(
+                node.kind(),
+                "method" | "singleton_method" | "class" | "module" | "singleton_class"
+            )
+        {
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
+fn ruby_subtree_contains_identifier(node: Node<'_>, name: &str, source: &str) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "identifier" && node_text(current, source) == name {
+            return true;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
+fn ruby_assignment_declares_name(node: Node<'_>, name: &str, source: &str) -> bool {
+    ruby_subtree_contains_identifier(node, name, source)
 }
 
 pub(super) fn ruby_method_node_for_ranges<'tree>(

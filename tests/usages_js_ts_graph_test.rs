@@ -569,6 +569,37 @@ fn js_seedless_factory_returned_unexported_class_method_is_proven() {
 }
 
 #[test]
+fn js_commonjs_barrel_factory_returned_class_method_is_proven() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib.js",
+            "class Client {\n  request() {}\n}\nfunction create() { return new Client(); }\nmodule.exports = { Client, create };\n",
+        )
+        .file("barrel.js", "module.exports = require('./lib');\n")
+        .file(
+            "app.js",
+            "const { Client } = require('./barrel');\nnew Client().request();\nrequire('./barrel').create().request();\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.short_name() == "Client.request" && cu.is_function()
+    });
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(
+        2,
+        hits.iter()
+            .filter(|hit| hit.file == project.file("app.js"))
+            .count(),
+        "both direct construction and CommonJS barrel factory calls should be proven: {hits:#?}"
+    );
+}
+
+#[test]
 fn js_seedless_method_with_self_call_proves_external_factory_receiver() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

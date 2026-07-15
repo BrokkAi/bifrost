@@ -243,6 +243,35 @@ impl RustAnalyzer {
         self.resolve_imported_export_from_binder(file, &binder, reference)
     }
 
+    pub(crate) fn canonical_exported_fqn(
+        &self,
+        file: &ProjectFile,
+        reference: &str,
+    ) -> Option<String> {
+        let targets = if let Some((module_specifier, name)) = reference.rsplit_once("::") {
+            let module_files = self.resolve_module_files(file, module_specifier);
+            let mut targets = self.exported_targets_from_files(&module_files, name);
+            if targets.is_empty() {
+                targets.extend(rust_declaration_targets_in_files(self, &module_files, name));
+            }
+            targets.into_iter().collect::<Vec<_>>()
+        } else {
+            self.resolve_imported_export(file, reference)
+        };
+        let mut fq_names = targets
+            .into_iter()
+            .flat_map(|(target_file, target_name)| {
+                self.declarations(&target_file)
+                    .into_iter()
+                    .filter(move |unit| unit.identifier() == target_name)
+                    .map(|unit| unit.fq_name())
+            })
+            .collect::<Vec<_>>();
+        fq_names.sort();
+        fq_names.dedup();
+        (fq_names.len() == 1).then(|| fq_names.remove(0))
+    }
+
     pub(crate) fn resolve_imported_export_from_binder_forward(
         &self,
         file: &ProjectFile,

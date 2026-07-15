@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use tree_sitter::Node;
 
 pub(super) const OWNER_TOKEN: &str = "__go_target_owner__";
+pub(super) const NON_OWNER_TOKEN: &str = "__go_known_non_target_owner__";
 const FIELD_OWNER_TOKEN_PREFIX: &str = "__go_field_owner__:";
 
 pub(super) fn scan_files_for_target(
@@ -53,6 +54,7 @@ pub(super) fn scan_files_for_target(
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
+            graph,
             file,
             source,
             line_starts: &parsed.line_starts,
@@ -91,6 +93,7 @@ pub(super) struct GoScanResult {
 }
 
 pub(super) struct ScanCtx<'a> {
+    pub(super) graph: &'a GoProjectGraph,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
@@ -292,7 +295,7 @@ fn seed_assignment_like(
 }
 
 enum InferredBinding {
-    Owner,
+    Targets(Vec<String>),
     Alias(String),
 }
 
@@ -311,10 +314,16 @@ fn infer_names_from_values(
         .zip(values.iter())
         .filter_map(|(name, value)| {
             let name = name.as_ref()?;
-            if expression_matches_owner_type(*value, ctx)
+            let constructor_targets = constructor_call_receiver_targets(*value, ctx, locals);
+            if !constructor_targets.is_empty() {
+                Some((name.clone(), InferredBinding::Targets(constructor_targets)))
+            } else if expression_matches_owner_type(*value, ctx)
                 || call_returns_owner_type(*value, ctx, locals)
             {
-                Some((name.clone(), InferredBinding::Owner))
+                Some((
+                    name.clone(),
+                    InferredBinding::Targets(vec![OWNER_TOKEN.to_string()]),
+                ))
             } else if is_identifier_node(*value) {
                 Some((
                     name.clone(),
@@ -333,10 +342,91 @@ fn apply_inferred_bindings(
 ) {
     for (name, binding) in bindings {
         match binding {
-            InferredBinding::Owner => locals.seed_symbol(name, OWNER_TOKEN.to_string()),
+            InferredBinding::Targets(targets) => locals.seed_symbol_many(name, targets),
             InferredBinding::Alias(source) => locals.alias_symbol(name, &source),
         }
     }
+}
+
+fn constructor_call_receiver_targets(
+    value: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    locals: &LocalInferenceEngine<String>,
+) -> Vec<String> {
+    if value.kind() != "call_expression" {
+        return Vec::new();
+    }
+    let Some(function) = value
+        .child_by_field_name("function")
+        .or_else(|| first_named_child(value))
+    else {
+        return Vec::new();
+    };
+    let (alias_packages, dot_packages) = ctx.graph.namespace_packages(ctx.file);
+    let mut return_types = match function.kind() {
+        "identifier" => {
+            let name = node_text(function, ctx.source);
+            if locals.is_shadowed(name) {
+                return Vec::new();
+            }
+            let mut types = ctx
+                .graph
+                .package_name_of(ctx.file)
+                .into_iter()
+                .flat_map(|package| {
+                    ctx.graph
+                        .constructor_return_types(&format!("{package}.{name}"))
+                        .iter()
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            for package in dot_packages {
+                types.extend(
+                    ctx.graph
+                        .constructor_return_types(&format!("{package}.{name}"))
+                        .iter()
+                        .cloned(),
+                );
+            }
+            types
+        }
+        "selector_expression" => {
+            let Some((qualifier, _, field)) = selector_parts(function, ctx.source) else {
+                return Vec::new();
+            };
+            if locals.is_shadowed(&qualifier) {
+                return Vec::new();
+            }
+            let field = node_text(field, ctx.source);
+            alias_packages
+                .get(&qualifier)
+                .into_iter()
+                .flatten()
+                .flat_map(|package| {
+                    ctx.graph
+                        .constructor_return_types(&format!("{package}.{field}"))
+                        .iter()
+                        .cloned()
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    return_types.sort();
+    return_types.dedup();
+    return_types
+        .into_iter()
+        .map(|return_type| {
+            if ctx.spec.matches_receiver_fqn(&return_type) {
+                OWNER_TOKEN.to_string()
+            } else if ctx.spec.owner_is_interface() {
+                NON_OWNER_TOKEN.to_string()
+            } else {
+                String::new()
+            }
+        })
+        .filter(|target| !target.is_empty())
+        .collect()
 }
 
 /// Whether `value` is a call to a constructor whose result is the owner type, so
@@ -510,14 +600,19 @@ fn scan_selector_like(
 
     if ctx.spec.is_member() {
         let receiver = receiver_symbol_from_qualifier(&qualifier);
-        if locals
-            .resolve_symbol(receiver)
+        let receiver_resolution = locals.resolve_symbol(receiver);
+        if receiver_resolution
             .as_precise()
             .is_some_and(|targets| targets.contains(OWNER_TOKEN))
             || field_receiver_matches_owner(qualifier_node, ctx, locals)
             || composite_literal_receiver_matches_owner(qualifier_node, ctx)
         {
             record_hit(field_node, ctx);
+        } else if receiver_resolution
+            .as_precise()
+            .is_some_and(|targets| targets.contains(NON_OWNER_TOKEN))
+        {
+            return;
         } else if !ctx.bindings.namespace_names.contains(&qualifier)
             || locals.is_shadowed(&qualifier)
         {
