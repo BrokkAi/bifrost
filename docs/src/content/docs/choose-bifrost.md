@@ -36,7 +36,7 @@ MCP and LSP are separate Bifrost processes. A VS Code Play action proves that th
 
 ### Evaluate Bifrost for research
 
-Read [Language and Analysis Capabilities](/capabilities/) first. It distinguishes structural support, exact graph-backed references and calls, proof tiers, named arguments, imports, hierarchy, external-dependency limits, and unsupported whole-program analyses. Then use the [executable language tutorials](/code-query-tutorials/) to inspect source, query, and exact expected output together.
+Read [Language and Analysis Capabilities](/capabilities/) first. It distinguishes structural support, exact graph-backed references and calls, proof tiers, named arguments, imports, hierarchy, external-dependency limits, and unsupported whole-program analyses. Then complete the [ten-minute evaluation](/evaluate-bifrost/) and use the [executable language tutorials](/code-query-tutorials/) to inspect source, query, and exact expected output together.
 
 ### Build or study an agent platform
 

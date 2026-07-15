@@ -122,6 +122,48 @@ fn reference_traversal_tutorial() {
 }
 
 #[test]
+fn ten_minute_evaluation_tutorial() {
+    let relative = "docs/src/content/docs/evaluate-bifrost.md";
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join(relative);
+    let markdown = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let tutorial = parse_tutorial(&path, &markdown);
+
+    for fixture in &tutorial.fixtures {
+        let published = root
+            .join("docs/fixtures/ten-minute-evaluation")
+            .join(&fixture.path);
+        let contents = fs::read_to_string(&published)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", published.display()));
+        assert_eq!(
+            contents.trim_end(),
+            fixture.source,
+            "published fixture {} differs from the evaluated docs block",
+            published.display()
+        );
+    }
+
+    let published_query = root.join(
+        "docs/fixtures/ten-minute-evaluation/queries/find-audit.rql",
+    );
+    let query_contents = fs::read_to_string(&published_query)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", published_query.display()));
+    let documented_query = tutorial
+        .cases
+        .get("find-audit")
+        .and_then(|case| case.rql.as_deref())
+        .expect("find-audit RQL block");
+    assert_eq!(
+        query_contents.trim_end(),
+        documented_query,
+        "published query differs from the evaluated docs block"
+    );
+
+    verify_tutorial_contents(&path, &markdown);
+}
+
+#[test]
 fn tutorials_cover_all_public_kinds_roles_and_pages() {
     const PAGES: &[&str] = &[
         "python",

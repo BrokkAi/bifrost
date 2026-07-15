@@ -15,7 +15,7 @@ The first observable improvement is deliberately narrow and urgent: every agent-
 - [x] (2026-07-15 09:47Z) Read the handed-off persona review, synchronized detached `HEAD` with `origin/master`, and verified the MCP/RQL contract against `src/mcp_extended.rs`, `src/searchtools_service.rs`, `plugins/bifrost-agent/mcp.json`, and the current docs.
 - [x] (2026-07-15 09:53Z) Added the authoritative MCP/RQL availability matrix, changed query-capable host examples from `core` to `symbol|extended`, added host validation callouts, clarified the RQL and VS Code boundaries, and made the smoke queries executable documentation tests.
 - [x] (2026-07-15 09:59Z) Added a first-contact "Choose Bifrost" route by analysis question, interface, and persona; added a source-backed language/capability/precision matrix; updated landing and Start navigation; and inspected desktop and mobile rendering.
-- [ ] Add reproducible ten-minute evaluation journeys for the CLI, agent MCP, and VS Code using a fixture that readers can obtain or create exactly.
+- [x] (2026-07-15 10:02Z) Added a checked-in Python fixture and saved RQL query plus reproducible CLI, agent MCP, and VS Code journeys with one shared `src/app.py:5` expected result; added executable fixture/query drift checks and verified both CLI forms.
 - [ ] Add a static-analysis rule-building guide and an agent-result-safety guide covering result variants, diagnostics, truncation, proof tiers, and provenance.
 - [ ] Correct the known version, traversal, and obsolete tool-name drift and add durable checks where inexpensive.
 - [ ] Add evaluation methodology, workspace/data boundaries, citation, and reproducibility guidance; validate links, rendered pages, and the full site build.
@@ -32,6 +32,8 @@ The first observable improvement is deliberately narrow and urgent: every agent-
   Evidence: `cargo test --test code_query_docs documented_code_queries_parse` parsed `{"match":{"kind":"declaration"},"limit":1}` and `(limit 1 (declaration))` successfully.
 - Observation: A Markdown table cell containing the literal toolset `symbol|extended` must escape the pipe even when the text is inside backticks.
   Evidence: the first rendered Choose Bifrost preview split the agent row into four cells; changing it to `symbol\|extended` restored the expected three-column row.
+- Observation: The documentation tutorial harness can serve as a reproducibility contract for a published fixture, not only for language cookbooks.
+  Evidence: `ten_minute_evaluation_tutorial` compares the checked-in source and RQL files with the rendered docs blocks, executes both RQL and canonical JSON, and asserts the complete `src/app.py:5` result.
 
 ## Decision Log
 
@@ -50,7 +52,7 @@ The first observable improvement is deliberately narrow and urgent: every agent-
 
 ## Outcomes & Retrospective
 
-The MCP/RQL contract and persona-routing milestones are complete. `mcp.md` now answers availability at first contact, the packaged and manual agent-host setup paths agree on `symbol|extended`, every agent-facing page distinguishes MCP from skills and verifies both inline JSON and saved RQL, and the editor pages clearly identify unsaved RQL execution as an LSP feature. The landing page now routes first to Choose Bifrost; that page selects analysis and interface before installation, and the adjacent capability matrix records language-specific precision and hard product boundaries. Astro check/build, whitespace validation, executable query parsing, cross-language tutorial coverage, and desktop/mobile rendered previews pass. Reproducible ten-minute journeys remain next.
+The MCP/RQL contract, persona routing, capability matrix, and evaluator journeys are complete. `mcp.md` now answers availability at first contact, the packaged and manual agent-host setup paths agree on `symbol|extended`, every agent-facing page distinguishes MCP from skills and verifies both inline JSON and saved RQL, and the editor pages clearly identify unsaved RQL execution as an LSP feature. The landing page now routes first to Choose Bifrost; that page selects analysis and interface before installation, and the adjacent capability matrix records language-specific precision and hard product boundaries. A checked-in Python fixture now gives CLI, agent MCP, and VS Code readers the same executable result instead of referring to an unexplained local toy directory. Astro check/build, whitespace validation, executable query parsing, cross-language tutorial coverage, evaluator fixture execution, direct CLI parity, and desktop/mobile rendered previews pass. The builder and result-safety guides remain next.
 
 ## Context and Orientation
 
@@ -151,3 +153,5 @@ Plan revision note (2026-07-15): Created the initial self-contained plan after v
 Plan revision note (2026-07-15 09:53Z): Marked the MCP/RQL milestone complete after aligning all agent-host pages and passing `npm --prefix docs run check`, `npm --prefix docs run build`, `git diff --check`, and the focused executable query-doc test. Recorded the reusable language-neutral smoke query and left persona routing as the next milestone.
 
 Plan revision note (2026-07-15 09:59Z): Marked persona routing and the capability matrix complete after the site generated 42 pages, cross-language tutorial coverage passed, and desktop/mobile previews confirmed usable routes and scroll-contained wide tables. Recorded and corrected the rendered Markdown pipe issue found during preview.
+
+Plan revision note (2026-07-15 10:02Z): Marked the evaluator milestone complete after adding the published fixture, asserting its source/query blocks against the docs, executing the documented RQL and JSON end to end, verifying saved and inline CLI output, and generating the 43-page site. Left production rule-building and agent result safety as the next milestone.

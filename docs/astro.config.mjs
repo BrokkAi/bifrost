@@ -31,6 +31,7 @@ export default defineConfig({
             { label: 'Choose Bifrost', slug: 'choose-bifrost' },
             { label: 'Overview', slug: 'overview' },
             { label: 'Capabilities', slug: 'capabilities' },
+            { label: '10-Minute Evaluation', slug: 'evaluate-bifrost' },
             { label: 'Install Bifrost', slug: 'install' },
             { label: 'CLI', slug: 'cli' },
           ],
