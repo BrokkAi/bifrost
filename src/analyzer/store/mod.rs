@@ -755,6 +755,126 @@ impl AnalyzerStore {
         Ok(exists)
     }
 
+    pub(crate) fn load_structural_facts_snapshot(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        snapshot_version: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        if snapshot_version <= 0 {
+            return Err(StoreError::new(format!(
+                "invalid structural facts snapshot version {snapshot_version}"
+            )));
+        }
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let sql = format!(
+            "SELECT snapshot.payload
+             FROM structural_facts_snapshots AS snapshot
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = snapshot.blob_oid AND meta.lang = snapshot.lang
+             WHERE snapshot.blob_oid = ?1 AND snapshot.lang = ?2
+               AND snapshot.snapshot_version = ?3
+               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+        );
+        let payload = tx
+            .query_row(
+                &sql,
+                params![oid.to_string(), lang, snapshot_version],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(payload)
+    }
+
+    /// Store the current structural snapshot when the corresponding parsed
+    /// blob is still complete in `generation`. Older snapshot versions for
+    /// the blob are discarded so rebuildable cache rows cannot accumulate.
+    /// Returns false when the parent parsed blob is absent or incomplete.
+    pub(crate) fn upsert_structural_facts_snapshot(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        snapshot_version: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        if snapshot_version <= 0 {
+            return Err(StoreError::new(format!(
+                "invalid structural facts snapshot version {snapshot_version}"
+            )));
+        }
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let complete_sql = format!(
+            "SELECT 1 FROM blob_meta AS meta
+             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+        );
+        let oid = oid.to_string();
+        let complete = tx
+            .query_row(&complete_sql, params![oid, lang], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !complete {
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        let previous_snapshot_bytes = tx.query_row(
+            "SELECT COALESCE(SUM(length(payload)), 0)
+             FROM structural_facts_snapshots
+             WHERE blob_oid = ?1 AND lang = ?2",
+            params![oid, lang],
+            |row| row.get::<_, usize>(0),
+        )?;
+        let previous_payload_cost = tx
+            .query_row(
+                "SELECT payload_bytes FROM blob_payload_costs
+                 WHERE blob_oid = ?1 AND lang = ?2",
+                params![oid, lang],
+                |row| row.get::<_, usize>(0),
+            )
+            .optional()?;
+        tx.execute(
+            "DELETE FROM structural_facts_snapshots
+             WHERE blob_oid = ?1 AND lang = ?2",
+            params![oid, lang],
+        )?;
+        tx.execute(
+            "INSERT INTO structural_facts_snapshots(
+               blob_oid, lang, snapshot_version, payload
+             ) VALUES(?1, ?2, ?3, ?4)",
+            params![oid, lang, snapshot_version, payload],
+        )?;
+
+        if previous_payload_cost.is_some_and(|cost| cost >= previous_snapshot_bytes) {
+            tx.execute(
+                "UPDATE blob_payload_costs
+                 SET payload_bytes = payload_bytes - ?3 + ?4
+                 WHERE blob_oid = ?1 AND lang = ?2",
+                params![
+                    oid,
+                    lang,
+                    usize_to_i64(previous_snapshot_bytes)?,
+                    usize_to_i64(payload.len())?,
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = ?2",
+                params![oid, lang],
+            )?;
+            update_blob_payload_cost_tx(&tx, &oid, lang)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn reset_parsed_blob_point_contains_queries_for_test(&self) {
         self.parsed_blob_point_contains_queries
@@ -4942,6 +5062,8 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
                + meta.signature_metadata_count + meta.supertype_count + meta.child_count
                + meta.import_statement_count + meta.import_count + meta.type_identifier_count
                + meta.ruby_dispatch_count + meta.scala_trait_count
+               + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
+                  WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang)
                + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END,
            costs.payload_bytes
          FROM requested
@@ -4975,7 +5097,9 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
          1 + meta.stored_unit_count + meta.range_count + meta.signature_count
            + meta.signature_metadata_count + meta.supertype_count + meta.child_count
            + meta.import_statement_count + meta.import_count + meta.type_identifier_count
-           + meta.ruby_dispatch_count + meta.scala_trait_count END,
+           + meta.ruby_dispatch_count + meta.scala_trait_count
+           + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
+              WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang) END,
        CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
          length(CAST(meta.content_package AS BLOB))
            + COALESCE((SELECT SUM(
@@ -4998,6 +5122,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + COALESCE((SELECT SUM(length(info)) FROM import_details
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(CAST(type_identifier AS BLOB))) FROM type_identifiers
+               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+           + COALESCE((SELECT SUM(length(payload)) FROM structural_facts_snapshots
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0) END
      FROM blobs AS blob
      LEFT JOIN blob_meta AS meta
@@ -5084,6 +5210,9 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
                         + meta.import_statement_count + meta.import_count
                         + meta.type_identifier_count + meta.ruby_dispatch_count
                         + meta.scala_trait_count
+                        + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
+                           WHERE snapshots.blob_oid = meta.blob_oid
+                             AND snapshots.lang = meta.lang)
                         + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END AS logical_rows
              FROM blobs
              LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
@@ -5289,6 +5418,204 @@ mod tests {
                 .missing_parsed_blob_keys(&[(oid, "python".to_string())])
                 .unwrap(),
             vec![(oid, "python".to_string())]
+        );
+    }
+
+    #[test]
+    fn structural_snapshot_roundtrips_replaces_and_updates_cascade_costs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("java", "structural-snapshot-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, state.as_ref())
+            .unwrap();
+        let prepared = AnalyzerStore::prepare_parsed_blob(
+            oid,
+            "java",
+            generation,
+            &JavaAdapter,
+            Arc::clone(&state),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .load_structural_facts_snapshot(oid, "java", generation, 1)
+                .unwrap(),
+            None
+        );
+        let first = b"first structural snapshot";
+        assert!(
+            store
+                .upsert_structural_facts_snapshot(oid, "java", generation, 1, first)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .load_structural_facts_snapshot(oid, "java", generation, 1)
+                .unwrap()
+                .as_deref(),
+            Some(first.as_slice())
+        );
+
+        let expected_first = PersistedMutationCost {
+            logical_rows: prepared.logical_rows().saturating_add(1),
+            payload_bytes: prepared
+                .persisted_payload_bytes()
+                .saturating_add(first.len()),
+        };
+        {
+            let conn = store.conn.lock().expect("store mutex");
+            assert_eq!(
+                store
+                    .stored_blob_cascade_costs(&conn, std::slice::from_ref(&prepared))
+                    .unwrap(),
+                vec![StoredCascadeCost::Known(expected_first)]
+            );
+        }
+
+        let second = b"second";
+        assert!(
+            store
+                .upsert_structural_facts_snapshot(oid, "java", generation, 2, second)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .load_structural_facts_snapshot(oid, "java", generation, 1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .load_structural_facts_snapshot(oid, "java", generation, 2)
+                .unwrap()
+                .as_deref(),
+            Some(second.as_slice())
+        );
+        let conn = store.conn.lock().expect("store mutex");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM structural_facts_snapshots
+                 WHERE blob_oid = ?1 AND lang = 'java'",
+                [oid.to_string()],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap(),
+            1,
+            "old semantic versions must not accumulate"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT payload_bytes FROM blob_payload_costs
+                 WHERE blob_oid = ?1 AND lang = 'java'",
+                [oid.to_string()],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap(),
+            prepared
+                .persisted_payload_bytes()
+                .saturating_add(second.len())
+        );
+        conn.execute(
+            "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = 'java'",
+            [oid.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let repaired = b"repaired legacy payload cost";
+        assert!(
+            store
+                .upsert_structural_facts_snapshot(oid, "java", generation, 3, repaired)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .expect("store mutex")
+                .query_row(
+                    "SELECT payload_bytes FROM blob_payload_costs
+                     WHERE blob_oid = ?1 AND lang = 'java'",
+                    [oid.to_string()],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            prepared
+                .persisted_payload_bytes()
+                .saturating_add(repaired.len()),
+            "a missing legacy cost row must be recomputed with snapshot bytes"
+        );
+
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, state.as_ref())
+            .unwrap();
+        assert_eq!(
+            store
+                .load_structural_facts_snapshot(oid, "java", generation, 3)
+                .unwrap(),
+            None,
+            "replacing the parsed blob must cascade-delete its snapshot"
+        );
+    }
+
+    #[test]
+    fn structural_snapshot_requires_current_complete_parent_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
+        let state = parse_state(&JavaAdapter, &file);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let old_generation = store
+            .ensure_language_epoch_value("java", "snapshot-old-generation")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", old_generation, &JavaAdapter, &state)
+            .unwrap();
+        store.mark_parsed_blob_incomplete_for_test(oid, "java");
+        assert!(
+            !store
+                .upsert_structural_facts_snapshot(oid, "java", old_generation, 1, b"ignored",)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .load_structural_facts_snapshot(oid, "java", old_generation, 1)
+                .unwrap(),
+            None
+        );
+
+        let current_generation = store
+            .ensure_language_epoch_value("java", "snapshot-current-generation")
+            .unwrap();
+        assert!(
+            store
+                .load_structural_facts_snapshot(oid, "java", old_generation, 1)
+                .unwrap_err()
+                .is_stale_generation()
+        );
+        assert!(
+            store
+                .upsert_structural_facts_snapshot(oid, "java", old_generation, 1, b"stale",)
+                .unwrap_err()
+                .is_stale_generation()
+        );
+        assert!(
+            !store
+                .upsert_structural_facts_snapshot(
+                    oid,
+                    "java",
+                    current_generation,
+                    1,
+                    b"no current parent",
+                )
+                .unwrap()
         );
     }
 

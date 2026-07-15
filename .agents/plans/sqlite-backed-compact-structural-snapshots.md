@@ -18,7 +18,7 @@ A successful implementation can be demonstrated by running an ignored release be
 - [x] (2026-07-15T17:36:49Z) Traced the structural-facts cache, persisted analyzer context, blob identity, schema migrations, analyzer epochs, cache GC accounting, compact rows, and the existing memory benchmark.
 - [x] (2026-07-15T17:47:00Z) Added an implementation-independent persisted-reopen benchmark, smoke-tested it, preserved the optimized baseline executable, and recorded three 200-file baseline runs.
 - [x] (2026-07-15T18:03:00Z) Added snapshot semantic version 1, a packed explicit-code wire DTO, checked compact-row construction, source-aware validation, and round-trip/corruption tests.
-- [ ] Add migration 0007 and generation-aware snapshot read/write APIs that participate in payload and row accounting.
+- [x] (2026-07-15T18:18:00Z) Added migration 0007 plus current-generation/complete-parent snapshot reads and writes, version replacement, cascade deletion, legacy cost repair, and snapshot-aware row/payload accounting.
 - [ ] Integrate read-through hydration and write-through persistence into structural-facts cache misses without changing overlay correctness.
 - [ ] Validate content changes, language keys, generation changes, corrupt rows, in-memory stores, and cache deletion.
 - [ ] Run alternating optimized baseline/candidate measurements at multiple fixture sizes and record raw results.
