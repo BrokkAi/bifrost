@@ -93,6 +93,27 @@ export interface RqlReceiverValue {
   returned_value?: RqlReceiverValue;
 }
 
+function receiverValueLabel(value: RqlReceiverValue): string {
+  switch (value.receiver_value_kind) {
+    case "allocation_site":
+      return `allocation ${value.type_declaration?.fq_name ?? "unknown"}`;
+    case "instance_type":
+      return `instance ${value.declaration?.fq_name ?? "unknown"}`;
+    case "class_or_static_object":
+      return `class/static ${value.declaration?.fq_name ?? "unknown"}`;
+    case "module_or_export_object":
+      return `module/export ${value.declaration?.fq_name ?? "unknown"}`;
+    case "current_receiver":
+      return `current receiver ${value.declaration?.fq_name ?? "unknown"}`;
+    case "factory_return":
+      return `factory ${value.factory?.fq_name ?? "unknown"} → ${
+        value.returned_value ? receiverValueLabel(value.returned_value) : "unknown"
+      }`;
+    default:
+      return value.receiver_value_kind;
+  }
+}
+
 export interface RqlReceiverAnalysisResult extends RqlQueryResultBase {
   result_type: "receiver_analysis";
   analysis_kind: string;
@@ -254,6 +275,12 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
       return (
         `**${result.analysis_kind}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
         `\n\n${result.outcome} · \`${result.text}\`` +
+        (result.values?.length
+          ? `\n\n${result.values.map((value) => `Value: \`${receiverValueLabel(value)}\``).join("\n\n")}`
+          : "") +
+        (result.member_targets?.length
+          ? `\n\n${result.member_targets.map((target) => `Member: \`${target.fq_name}\``).join("\n\n")}`
+          : "") +
         (result.reason ? `\n\n${result.reason}` : "") +
         (result.limit ? `\n\nLimit: ${result.limit}` : "")
       );

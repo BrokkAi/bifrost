@@ -258,6 +258,65 @@ pub enum CodeQueryReceiverValue {
     },
 }
 
+impl CodeQueryReceiverValue {
+    pub fn render_text(&self) -> String {
+        match self {
+            Self::AllocationSite {
+                type_declaration,
+                allocation_site,
+            } => format!(
+                "allocation {} at {}:{}:{}",
+                type_declaration.fq_name,
+                allocation_site.path,
+                allocation_site.range.start_line,
+                allocation_site.range.start_column
+            ),
+            Self::InstanceType { declaration } => {
+                format!("instance {}", declaration.fq_name)
+            }
+            Self::ClassOrStaticObject { declaration } => {
+                format!("class/static {}", declaration.fq_name)
+            }
+            Self::ModuleOrExportObject { declaration } => {
+                format!("module/export {}", declaration.fq_name)
+            }
+            Self::CurrentReceiver { declaration } => {
+                format!("current receiver {}", declaration.fq_name)
+            }
+            Self::FactoryReturn {
+                factory,
+                returned_value,
+            } => format!(
+                "factory {} -> {}",
+                factory.fq_name,
+                returned_value.render_text()
+            ),
+        }
+    }
+}
+
+impl CodeQueryReceiverAnalysis {
+    pub fn render_detail_lines(&self) -> Vec<String> {
+        let mut lines = self
+            .values
+            .iter()
+            .map(|value| format!("value -> {}", value.render_text()))
+            .collect::<Vec<_>>();
+        lines.extend(
+            self.member_targets
+                .iter()
+                .map(|target| format!("member -> {}", target.fq_name)),
+        );
+        if let Some(reason) = self.reason {
+            lines.push(format!("reason -> {reason}"));
+        }
+        if let Some(limit) = self.limit {
+            lines.push(format!("limit -> {limit}"));
+        }
+        lines
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQuerySourceSite {
     pub path: String,
@@ -1067,7 +1126,7 @@ fn execute_internal(
                 }
             }
         }
-        let (next, exhausted) = apply_pipeline_step(
+        let (next, exhausted, step_truncated) = apply_pipeline_step(
             analyzer,
             step,
             rows,
@@ -1086,6 +1145,7 @@ fn execute_internal(
             &mut diagnostics,
             receiver_budget_override,
         );
+        budget_exhausted |= step_truncated;
         rows = next;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return cancelled_query_result();
@@ -1263,7 +1323,7 @@ fn apply_pipeline_step(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
-) -> (Vec<PipelineRow>, bool) {
+) -> (Vec<PipelineRow>, bool, bool) {
     let max_pipeline_rows = limits.max_pipeline_rows;
     let mut output = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
@@ -1274,11 +1334,20 @@ fn apply_pipeline_step(
     let mut enclosing_declarations: HashMap<ProjectFile, Vec<DeclarationValue>> =
         HashMap::default();
     let mut exhausted = false;
+    let mut receiver_truncated = false;
+    let receiver_service = matches!(
+        step,
+        QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
+    )
+    .then(|| ReceiverQueryService::new(analyzer));
 
     let mut indexed_declarations = indexed_declarations;
     'rows: for row in rows {
+        if output.len() >= max_step_outputs {
+            break;
+        }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return (Vec::new(), true);
+            return (Vec::new(), true, receiver_truncated);
         }
         let mut row_exhausted = false;
         let expansions = match (&row.value, step) {
@@ -1509,7 +1578,9 @@ fn apply_pipeline_step(
                 let (ranges, input) =
                     structural_receiver_ranges(seed, operation, filter.capture.as_deref());
                 receiver_analysis_expansions(
-                    analyzer,
+                    receiver_service
+                        .as_ref()
+                        .expect("receiver query service exists for receiver steps"),
                     operation,
                     &seed.file,
                     ranges,
@@ -1518,9 +1589,11 @@ fn apply_pipeline_step(
                     budget,
                     limits,
                     receiver_budget_override,
+                    max_step_outputs.saturating_sub(output.len()),
                     cancellation,
                     &mut receiver_diagnostics,
                     &mut row_exhausted,
+                    &mut receiver_truncated,
                 )
             }
             (
@@ -1529,7 +1602,9 @@ fn apply_pipeline_step(
                 | QueryStep::PointsTo(_)
                 | QueryStep::MemberTargets(_),
             ) => receiver_analysis_expansions(
-                analyzer,
+                receiver_service
+                    .as_ref()
+                    .expect("receiver query service exists for receiver steps"),
                 receiver_operation(step),
                 &site.file,
                 vec![site.range],
@@ -1542,13 +1617,17 @@ fn apply_pipeline_step(
                 budget,
                 limits,
                 receiver_budget_override,
+                max_step_outputs.saturating_sub(output.len()),
                 cancellation,
                 &mut receiver_diagnostics,
                 &mut row_exhausted,
+                &mut receiver_truncated,
             ),
             (PipelineValue::CallSite(site), QueryStep::ReceiverTargets(_)) => {
                 receiver_analysis_expansions(
-                    analyzer,
+                    receiver_service
+                        .as_ref()
+                        .expect("receiver query service exists for receiver steps"),
                     ReceiverQueryOperation::ReceiverTargets,
                     &site.0.file,
                     vec![site.0.range],
@@ -1557,16 +1636,20 @@ fn apply_pipeline_step(
                     budget,
                     limits,
                     receiver_budget_override,
+                    max_step_outputs.saturating_sub(output.len()),
                     cancellation,
                     &mut receiver_diagnostics,
                     &mut row_exhausted,
+                    &mut receiver_truncated,
                 )
             }
             (
                 PipelineValue::ExpressionSite(site),
                 QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_),
             ) => receiver_analysis_expansions(
-                analyzer,
+                receiver_service
+                    .as_ref()
+                    .expect("receiver query service exists for receiver steps"),
                 receiver_operation(step),
                 &site.call_site.0.file,
                 vec![site.range],
@@ -1575,9 +1658,11 @@ fn apply_pipeline_step(
                 budget,
                 limits,
                 receiver_budget_override,
+                max_step_outputs.saturating_sub(output.len()),
                 cancellation,
                 &mut receiver_diagnostics,
                 &mut row_exhausted,
+                &mut receiver_truncated,
             ),
             _ => unreachable!("query step domains are validated before execution"),
         };
@@ -1661,7 +1746,7 @@ fn apply_pipeline_step(
             ),
         });
     }
-    (output, exhausted)
+    (output, exhausted, receiver_truncated)
 }
 
 fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {
@@ -1734,7 +1819,7 @@ fn structural_receiver_ranges(
 
 #[allow(clippy::too_many_arguments)]
 fn receiver_analysis_expansions(
-    analyzer: &dyn IAnalyzer,
+    service: &ReceiverQueryService<'_>,
     operation: ReceiverQueryOperation,
     file: &ProjectFile,
     mut ranges: Vec<Range>,
@@ -1743,12 +1828,15 @@ fn receiver_analysis_expansions(
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    max_outputs: usize,
     cancellation: Option<&CancellationToken>,
     receiver_diagnostics: &mut BTreeMap<(Language, &'static str, String), usize>,
-    exhausted: &mut bool,
+    shared_budget_exhausted: &mut bool,
+    receiver_truncated: &mut bool,
 ) -> Vec<PipelineExpansion> {
     ranges.sort_by_key(primary_range_key);
     ranges.dedup();
+    ranges.truncate(max_outputs);
     let mut expansions = Vec::with_capacity(ranges.len());
     for range in ranges {
         let remaining_facts = limits
@@ -1764,21 +1852,17 @@ fn receiver_analysis_expansions(
             max_summary_expansions: base.max_summary_expansions.min(remaining_facts),
             max_scope_nodes: base.max_scope_nodes.min(remaining_facts),
         };
-        let Ok(report) = ReceiverQueryService::new(analyzer).analyze(
-            operation,
-            file,
-            range,
-            input,
-            receiver_budget,
-            cancellation,
-        ) else {
-            *exhausted = true;
+        let Ok(report) =
+            service.analyze(operation, file, range, input, receiver_budget, cancellation)
+        else {
+            *shared_budget_exhausted = true;
             break;
         };
 
         let candidate_count = receiver_candidate_count(&report);
         budget.fact_nodes = budget
             .fact_nodes
+            .saturating_add(report.work.setup_nodes)
             .saturating_add(report.work.scope_nodes)
             .saturating_add(report.work.summary_expansions);
         budget.pipeline_rows = budget
@@ -1788,7 +1872,7 @@ fn receiver_analysis_expansions(
         if budget.fact_nodes.saturating_add(budget.examined_references) > limits.max_fact_nodes
             || budget.pipeline_rows > limits.max_pipeline_rows
         {
-            *exhausted = true;
+            *shared_budget_exhausted = true;
         }
 
         let language = report.site.language;
@@ -1809,7 +1893,7 @@ fn receiver_analysis_expansions(
             | ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
                 limit,
             }) => {
-                *exhausted = true;
+                *receiver_truncated = true;
                 *receiver_diagnostics
                     .entry((
                         language,
@@ -1830,7 +1914,7 @@ fn receiver_analysis_expansions(
             ) => {}
         }
         if report.candidates_truncated {
-            *exhausted = true;
+            *receiver_truncated = true;
             *receiver_diagnostics
                 .entry((
                     language,
@@ -4059,8 +4143,8 @@ impl CodeQueryResult {
                             value.outcome,
                             value.text
                         ));
-                        for target in &value.member_targets {
-                            out.push_str(&format!("  member -> {}\n", target.fq_name));
+                        for detail in value.render_detail_lines() {
+                            out.push_str(&format!("  {detail}\n"));
                         }
                     }
                 }
@@ -4184,10 +4268,27 @@ export function caller() {
         );
 
         assert!(result.truncated);
+        assert!(result.render_text().contains("limit -> scope_nodes"));
         assert!(matches!(
             result.results[0].value,
             CodeQueryResultValue::ReceiverAnalysis { ref value }
                 if value.outcome == "exceeded_budget" && value.limit == Some("scope_nodes")
+        ));
+
+        let file_query = CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }, { "op": "file_of" }]
+        }))
+        .expect("file query");
+        let file_result = execute_with_receiver_budget_for_test(
+            &analyzer,
+            &file_query,
+            ReceiverAnalysisBudget::tiny(),
+        );
+        assert!(file_result.truncated);
+        assert!(matches!(
+            file_result.results[0].value,
+            CodeQueryResultValue::File { ref value } if value.path == "app.ts"
         ));
     }
 }

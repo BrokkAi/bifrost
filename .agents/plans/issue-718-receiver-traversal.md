@@ -18,6 +18,8 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - [x] (2026-07-15) Milestone 2: added JSON/RQL steps, the receiver-analysis pipeline/result domain, public consumers, live help, grammar support, and end-to-end tests.
 - [x] (2026-07-15) Milestone 3: added the executable receiver cookbook, updated public capability/query/safety documentation, and inspected fresh development and production-base renders.
 - [x] (2026-07-15) Milestone 4: reviewed the complete diff, repaired exported and static factory receiver regressions, and ran the full repository validation bundle.
+- [x] (2026-07-15) Post-milestone guided review: queued and repaired all seven confirmed findings covering prepared-context reuse, terminal-limit short-circuiting, nonhalting receiver truncation, complete text rendering, schema-owned capture bounds, exact factory association, `file_of` metadata, and shared member-site extraction.
+- [ ] (2026-07-15) Re-run the complete publish gate, push the reviewed branch, and open the user-authorized ready-for-review pull request.
 
 ## Surprises & Discoveries
 
@@ -69,6 +71,15 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - Observation: This machine exposes distinct Homebrew and rustup compiler identities with the same Rust version string, and macOS Python extension tests require dynamic symbol lookup.
   Evidence: a mixed-toolchain doctest invocation rejected cached rlibs with E0514 after every test binary passed. Pinning the rustup toolchain in `PATH`, setting `PYO3_PYTHON=.venv/bin/python`, adding macOS `dynamic_lookup` linker flags, and using the managed isolated-target helper avoids both toolchain contamination and retained temporary targets.
 
+- Observation: The first query integration reused the JS/TS provider but rebuilt its tree-sitter declaration index and materialized a definition context for every receiver row.
+  Evidence: the guided review traced `ReceiverQueryService::new` from the per-range expansion loop. The executor now owns one service per receiver step, each source file is parsed and indexed once, bounded forward-definition lookup replaces the workspace-wide index, cancellation covers setup traversal, and setup nodes are charged once to the CodeQuery fact budget.
+
+- Observation: Receiver-local limits were incorrectly treated as fatal shared execution-budget exhaustion.
+  Evidence: candidate truncation and deterministic tiny budgets set `row_exhausted`, which stopped later receiver rows and cleared intermediate receiver rows before `file_of`. Receiver truncation now marks the top-level result and emits its diagnostic without halting the typed pipeline; only cancellation or exhausted shared CodeQuery limits stop execution.
+
+- Observation: Analyzer declaration ranges can enclose nested same-name syntax that is not itself indexed as a `CodeUnit`.
+  Evidence: overlap-only factory selection could attribute the enclosing function to a nested same-name factory. Each candidate analyzer range is now associated with its nearest same-name tree-sitter declaration range before it may represent the requested factory node; unavailable nested declarations return unknown instead of false provenance.
+
 ## Decision Log
 
 - Decision: Keep schema version 2 and name the operations `receiver_targets`, `points_to`, and `member_targets`, with hyphenated RQL wrappers.
@@ -99,6 +110,14 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
   Rationale: Reconstructing factory provenance in a renderer would be impossible and would let get-definition, usage analysis, and query traversal disagree about the underlying value.
   Date/Author: 2026-07-15 / Codex
 
+- Decision: Treat receiver candidate caps and provider budget exits as nonhalting truncation metadata, distinct from the shared CodeQuery execution budget.
+  Rationale: Every receiver input still has a valid explicit analysis row, and that row must remain composable with `file_of`; stopping the entire pipeline loses typed results and suppresses unrelated bounded inputs.
+  Date/Author: 2026-07-15 / Codex guided-review repair
+
+- Decision: Reuse one prepared receiver context per file and receiver step, backed by bounded forward-definition queries.
+  Rationale: Parsing and declaration indexing are file setup work rather than per-site analysis, and demand-driven lookup avoids silently constructing an unmetered whole-workspace index.
+  Date/Author: 2026-07-15 / Codex guided-review repair
+
 ## Outcomes & Retrospective
 
 Milestones 1 and 2 are complete. The analyzer-owned service accepts an exact file/range, operation, and expression-versus-containing-site mode; checks cancellation; uses indexed JS/TS source and tree-sitter nodes; and returns explicit supported or unsupported reports. Provider reports expose actual scope-node and summary-expansion work and candidate truncation. Member-site extraction is shared with get-definition, and factory summaries retain exact recursive provenance.
@@ -108,6 +127,8 @@ Schema version 2 now exposes all three typed receiver steps through JSON, RQL, M
 Milestone 3 adds an executable six-case TypeScript receiver cookbook covering allocation, recursive factory provenance, exact same-name member selection, ambiguity, reference-site composition, and call-input composition. The docs overview, CodeQuery/RQL references, capability matrix, Python client, rule guide, evaluation/safety guidance, language index, TypeScript page, and former blanket no-points-to claims now distinguish bounded JS/TS receiver evidence from unsupported whole-program/general analyses. All 20 executable tutorial tests and 3 query-doc contract tests pass. Astro reports zero diagnostics; the production build checks 3,993 base-aware links across 50 pages. Fresh browser inspection verified the tutorial, sidebar, revised capability layout, and `/bifrost` deployment links.
 
 Milestone 4 repaired two integration defects found only by the complete suite: exported factory declarations now match their exact analyzer units across wrapper-range differences, and static factory summaries select `$static` member identities while returned instances continue to select ordinary members. All 17 JS/TS usage-graph tests, the 13 receiver tests, 61 query-pipeline tests, clippy with every target/feature, Python's 41 tests, VS Code's 54 tests, docs checks/build, formatting, and diff checks pass. The all-feature Rust run passed 842 library tests (3 ignored) and every integration-test binary; its first final doctest phase was invalidated solely by the host's mixed Homebrew/rustup artifact identities, so the gate was repeated with a pinned toolchain in the repository's self-cleaning isolated target.
+
+The guided-review repair keeps the public contract intact while closing seven implementation and consumer gaps. Receiver steps now reuse prepared per-file syntax/import contexts and bounded definition lookup, charge setup work, and stop preparing rows once the terminal output cap is satisfied. Candidate caps and provider budget exits remain explicit, diagnostic, top-level truncation states but no longer discard later rows or prevent `file_of`. Rust, REPL, Python, and VS Code presentations expose recursive values plus member, reason, and limit details. Capture bounds and `file_of` help come from the declarative schema. Factory-to-`CodeUnit` association and member-site extraction now each have one structured implementation path. Focused validation passes 31 receiver-related unit tests, 23 query-source tests, all 61 query-pipeline tests, Python's 41 tests, and all 54 VS Code tests; the complete publish gate remains the final step before the authorized pull request.
 
 ## Context and Orientation
 
@@ -141,7 +162,7 @@ Milestone 4 reviews the complete diff for duplicated parsing, name-only guesses,
 
 ## Concrete Steps
 
-All commands run from `/Users/dave/.codex/worktrees/c2c4/bifrost` on the existing issue branch. Do not create or switch branches, push, or open a pull request. Stage only files changed for the current milestone and make multiline checkpoint commits explaining the behavior and rationale.
+All commands run from `/Users/dave/.codex/worktrees/c2c4/bifrost` on the existing issue branch. Do not create or switch branches. Stage only files changed for the current milestone and make multiline checkpoint commits explaining the behavior and rationale. The user subsequently authorized pushing this branch and opening a non-draft pull request after the guided-review repairs and publish gate pass.
 
 Before implementation, the branch was synchronized with:
 
@@ -223,6 +244,8 @@ Revision note (2026-07-15): Completed Milestone 2 with schema-v2 JSON/RQL operat
 Revision note (2026-07-15): Completed Milestone 3 with six exact executable receiver recipes, capability/query/client/safety documentation, a readable receiver-provider capability table, base-aware link validation, and fresh visual inspection of development and production builds.
 
 Revision note (2026-07-15): Completed Milestone 4 by repairing exported-range and static-member factory regressions found by the full suite, then validating with a pinned Rust toolchain and the repository-managed isolated-target workflow.
+
+Revision note (2026-07-15): Applied every confirmed guided-review finding: reusable and metered receiver setup, terminal-limit short-circuiting, nonhalting receiver truncation, complete recursive renderers, schema-driven capture validation and `file_of` metadata, exact factory association, and one shared member-site walk. Focused Rust, Python, and VS Code regressions pass; final publish validation is pending.
 
 ## Interfaces and Dependencies
 

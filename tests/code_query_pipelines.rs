@@ -49,7 +49,7 @@ export function caller() {
 }
 "#,
     )];
-    let points_to = serialized(&run(
+    let points_result = run(
         &files,
         json!({
             "match": {
@@ -60,7 +60,15 @@ export function caller() {
             "steps": [{ "op": "points_to", "capture": "service" }],
             "result_detail": "full"
         }),
-    ));
+    );
+    let points_text = points_result.render_text();
+    assert!(
+        points_text.contains("value -> factory")
+            && points_text.contains("-> allocation")
+            && points_text.contains("Service"),
+        "{points_text}"
+    );
+    let points_to = serialized(&points_result);
     assert_eq!(
         points_to["results"].as_array().unwrap().len(),
         1,
@@ -272,14 +280,14 @@ export function caller() { consume(new Service()); }
 
 #[test]
 fn receiver_candidate_cap_retains_bounded_values_and_marks_truncation() {
-    let result = serialized(&run(
-        &[(
-            "fanout.ts",
-            r#"class A { run() {} }
+    let files = [(
+        "fanout.ts",
+        r#"class A { run() {} }
 class B { run() {} }
 class C { run() {} }
 class D { run() {} }
 class E { run() {} }
+class F { run() {} }
 function make(which: number) {
     if (which === 0) return new A();
     if (which === 1) return new B();
@@ -291,13 +299,20 @@ export function caller(which: number) {
     const service = make(which);
     service.run();
 }
+export function simple() {
+    const service = new F();
+    service.run();
+}
 "#,
-        )],
+    )];
+    let result = serialized(&run(
+        &files,
         json!({
             "match": { "kind": "call", "callee": { "name": "run" } },
             "steps": [{ "op": "receiver_targets" }]
         }),
     ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 2, "{result}");
     assert_eq!(result["results"][0]["outcome"], "ambiguous", "{result}");
     assert_eq!(
         result["results"][0]["values"].as_array().unwrap().len(),
@@ -305,6 +320,14 @@ export function caller(which: number) {
         "{result}"
     );
     assert_eq!(result["truncated"], true, "{result}");
+    assert!(
+        result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["outcome"] == "precise" && row["text"] == "service"),
+        "{result}"
+    );
     assert!(
         result["diagnostics"]
             .as_array()
@@ -316,6 +339,17 @@ export function caller(which: number) {
                 .contains("max_targets")),
         "{result}"
     );
+
+    let composed = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }, { "op": "file_of" }]
+        }),
+    ));
+    assert_eq!(composed["results"][0]["result_type"], "file", "{composed}");
+    assert_eq!(composed["results"][0]["path"], "fanout.ts", "{composed}");
+    assert_eq!(composed["truncated"], true, "{composed}");
 }
 
 #[test]

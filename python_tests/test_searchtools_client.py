@@ -416,6 +416,9 @@ class SearchToolsClientTest(unittest.TestCase):
         assert returned is not None
         self.assertEqual(returned.type_declaration.fq_name, "Service")
         self.assertEqual(returned.allocation_site.range.start_line, 8)
+        rendered = analysis.render_text()
+        self.assertIn("value -> factory makeService", rendered)
+        self.assertIn("-> allocation Service", rendered)
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

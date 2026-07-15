@@ -279,6 +279,7 @@ pub(crate) struct ReceiverAnalysisBudgetTracker {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct ReceiverAnalysisWork {
+    pub(crate) setup_nodes: usize,
     pub(crate) summary_expansions: usize,
     pub(crate) scope_nodes: usize,
 }
@@ -338,6 +339,7 @@ impl ReceiverAnalysisBudgetTracker {
 
     pub(crate) fn work(&self) -> ReceiverAnalysisWork {
         ReceiverAnalysisWork {
+            setup_nodes: 0,
             summary_expansions: self.summary_expansions,
             scope_nodes: self.scope_nodes,
         }

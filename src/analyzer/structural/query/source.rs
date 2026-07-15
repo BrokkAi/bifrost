@@ -9,7 +9,7 @@ use super::schema::{
 use super::sexp::query_to_json;
 use super::syntax::{Expr, ExprKind, parse_rql};
 use super::{
-    CodeQuery, CodeQueryResultDetail, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
+    CodeQuery, CodeQueryResultDetail, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_STEPS,
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, QueryStep, SCHEMA_VERSION,
 };
@@ -668,7 +668,14 @@ fn validate_receiver_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysi
             );
             let valid = match &value.kind {
                 ExprKind::String(name) | ExprKind::Symbol(name) => {
-                    !name.is_empty() && name.len() <= MAX_CAPTURE_LENGTH
+                    validate_capture_name(
+                        name,
+                        value.range.clone(),
+                        "wrong-value-shape",
+                        &format!("{} capture", form.label()),
+                        analysis,
+                    );
+                    true
                 }
                 _ => false,
             };
@@ -676,10 +683,7 @@ fn validate_receiver_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysi
                 analysis.error(
                     value.range.clone(),
                     "wrong-value-shape",
-                    format!(
-                        "{} capture must be a name between 1 and {MAX_CAPTURE_LENGTH} bytes",
-                        form.label()
-                    ),
+                    format!("{} capture must be a name", form.label()),
                 );
             }
         }
@@ -1236,9 +1240,19 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
     let ExprKind::String(text) = &value.kind else {
         return;
     };
+    if property == RqlProperty::Capture {
+        validate_capture_name(
+            text,
+            value.range.clone(),
+            "invalid-query",
+            "capture label",
+            analysis,
+        );
+        return;
+    }
     let (label, max, reject_empty) = match property {
         RqlProperty::Name => ("exact string", MAX_STRING_PREDICATE_LENGTH, false),
-        RqlProperty::Capture => ("capture label", MAX_CAPTURE_LENGTH, true),
+        RqlProperty::Capture => unreachable!("capture handled above"),
         RqlProperty::NameRegex
         | RqlProperty::TextRegex
         | RqlProperty::NotKind
@@ -2347,19 +2361,13 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 seen_capture = true;
                 if let Some(name) = child.as_string() {
-                    if name.is_empty() {
-                        analysis.error(
-                            child.range(),
-                            "wrong-value-shape",
-                            "capture name must not be empty",
-                        );
-                    } else if name.len() > MAX_CAPTURE_LENGTH {
-                        analysis.error(
-                            child.range(),
-                            "wrong-value-shape",
-                            format!("capture name must be at most {MAX_CAPTURE_LENGTH} bytes"),
-                        );
-                    }
+                    validate_capture_name(
+                        name,
+                        child.range(),
+                        "wrong-value-shape",
+                        "capture name",
+                        analysis,
+                    );
                 } else {
                     require_json_string(child, analysis);
                 }
@@ -2624,17 +2632,31 @@ fn validate_json_capture(value: &spanned::Value, analysis: &mut Analysis) {
         require_json_string(value, analysis);
         return;
     };
-    if label.is_empty() {
+    validate_capture_name(
+        label,
+        value.range(),
+        "invalid-query",
+        "capture label",
+        analysis,
+    );
+}
+
+fn validate_capture_name(
+    name: &str,
+    range: Range<usize>,
+    code: &'static str,
+    label: &str,
+    analysis: &mut Analysis,
+) {
+    let shape = QueryStepField::Capture.value_shape();
+    if !shape.accepts_string(name) {
+        let (minimum, maximum) = shape
+            .string_length_bounds()
+            .expect("capture-name shape has string bounds");
         analysis.error(
-            value.range(),
-            "invalid-query",
-            "capture label must not be empty",
-        );
-    } else if label.len() > MAX_CAPTURE_LENGTH {
-        analysis.error(
-            value.range(),
-            "invalid-query",
-            format!("capture label must be at most {MAX_CAPTURE_LENGTH} bytes"),
+            range,
+            code,
+            format!("{label} must be between {minimum} and {maximum} bytes"),
         );
     }
 }
@@ -2874,6 +2896,7 @@ mod tests {
         }
         let file_of_help = query_source_help_at(rql, rql.find("file-of").unwrap()).unwrap();
         assert!(file_of_help.description.contains("reference site"));
+        assert!(file_of_help.description.contains("receiver analysis"));
         assert!(validate_query_source(rql).is_empty());
 
         let json = r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;
@@ -2885,6 +2908,7 @@ mod tests {
         }
         let file_of_help = query_source_help_at(json, json.find("file_of").unwrap()).unwrap();
         assert!(file_of_help.description.contains("reference sites"));
+        assert!(file_of_help.description.contains("receiver analyses"));
         assert!(
             crate::analyzer::structural::query::schema::QueryStepOp::FileOf
                 .signature()

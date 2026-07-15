@@ -153,7 +153,7 @@ macro_rules! query_step_ops {
 
 query_step_ops! {
     EnclosingDecl { label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|reference_site|call_site|expression_site -> file", description: "Map structural matches, declarations, reference sites, call sites, or expression sites to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -334,7 +334,7 @@ rql_forms! {
         class: Wrapper,
         shape: Query,
         signature: "(file-of query)",
-        description: "Return the workspace file containing each structural match, declaration, or reference site.",
+        description: "Return the workspace file containing each structural match, declaration, reference site, call site, expression site, or receiver analysis.",
     }
     ImportsOf {
         labels: ["imports-of"],

@@ -866,9 +866,8 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         text,
                         value.outcome
                     ));
-                    for target in &value.member_targets {
-                        let target = sanitize_terminal_text(&target.fq_name);
-                        out.push_str(&format!("  member: {target}\n"));
+                    for detail in value.render_detail_lines() {
+                        out.push_str(&format!("  {}\n", sanitize_terminal_text(&detail)));
                     }
                 }
             }

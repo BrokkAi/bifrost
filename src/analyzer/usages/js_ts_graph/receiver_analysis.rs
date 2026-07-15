@@ -20,9 +20,11 @@ use crate::analyzer::usages::receiver_analysis::{
 use crate::analyzer::{
     AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, Range,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use std::cell::RefCell;
+use std::sync::Arc;
 use tree_sitter::Node;
 
 const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
@@ -36,11 +38,22 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     root: Node<'tree>,
     imports: ImportBinder,
     aliases: AliasResolver,
-    function_declarations_by_name: HashMap<String, Vec<Node<'tree>>>,
-    class_declarations_by_name: HashMap<String, Vec<Node<'tree>>>,
+    syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     member_target_cache:
         RefCell<HashMap<ReceiverAnalysisCacheKey, ReceiverAnalysisOutcome<CodeUnit>>>,
     jsx_props_owner_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexedNodeRange {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+#[derive(Debug, Default)]
+pub(in crate::analyzer::usages) struct JsTsReceiverSyntaxIndex {
+    function_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
+    class_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
 }
 
 pub(in crate::analyzer::usages) struct JsTsMemberTargetReport {
@@ -59,8 +72,31 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         root: Node<'tree>,
         imports: ImportBinder,
     ) -> Self {
-        let (function_declarations_by_name, class_declarations_by_name) =
-            index_js_ts_declarations(root, source);
+        let (syntax_index, _) =
+            build_js_ts_receiver_syntax_index(root, source, None).expect("uncancelled index build");
+        Self::new_with_syntax_index(
+            analyzer,
+            support,
+            language,
+            file,
+            source,
+            root,
+            imports,
+            syntax_index,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::analyzer::usages) fn new_with_syntax_index(
+        analyzer: &'a dyn IAnalyzer,
+        support: &'a dyn BoundedDefinitionLookup,
+        language: Language,
+        file: &'a ProjectFile,
+        source: &'a str,
+        root: Node<'tree>,
+        imports: ImportBinder,
+        syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+    ) -> Self {
         let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
         Self {
             analyzer,
@@ -71,8 +107,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             root,
             imports,
             aliases,
-            function_declarations_by_name,
-            class_declarations_by_name,
+            syntax_index,
             member_target_cache: RefCell::new(HashMap::default()),
             jsx_props_owner_cache: RefCell::new(HashMap::default()),
         }
@@ -995,12 +1030,15 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         site: Node<'tree>,
     ) -> Vec<Node<'tree>> {
         let visible_scopes = lexical_scope_ids_for_node(site);
-        self.function_declarations_by_name
+        self.syntax_index
+            .function_declarations_by_name
             .get(name)
             .map(|functions| {
                 functions
                     .iter()
-                    .copied()
+                    .filter_map(|range| {
+                        smallest_named_node_covering(self.root, range.start_byte, range.end_byte)
+                    })
                     .filter(|function| {
                         declaration_scope_id(*function)
                             .is_some_and(|id| visible_scopes.contains(&id))
@@ -1011,25 +1049,65 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 
     fn function_unit_for_node(&self, name: &str, node: Node<'_>) -> Option<CodeUnit> {
+        let target = IndexedNodeRange {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        };
+        let syntax_ranges = self.syntax_index.function_declarations_by_name.get(name)?;
         self.support
             .file_identifier(self.file, name)
             .into_iter()
             .filter(|unit| unit.source() == self.file && unit.is_function())
-            .find(|unit| {
-                self.analyzer.ranges(unit).iter().any(|range| {
-                    range.start_byte < node.end_byte() && node.start_byte() < range.end_byte
-                })
+            .filter_map(|unit| {
+                let associated_syntax = self
+                    .analyzer
+                    .ranges(&unit)
+                    .into_iter()
+                    .flat_map(|declaration_range| {
+                        syntax_ranges.iter().filter_map(move |syntax_range| {
+                            (declaration_range.start_byte < syntax_range.end_byte
+                                && syntax_range.start_byte < declaration_range.end_byte)
+                                .then(|| {
+                                    let boundary_distance = declaration_range
+                                        .start_byte
+                                        .abs_diff(syntax_range.start_byte)
+                                        .saturating_add(
+                                            declaration_range
+                                                .end_byte
+                                                .abs_diff(syntax_range.end_byte),
+                                        );
+                                    let span_distance = declaration_range
+                                        .end_byte
+                                        .saturating_sub(declaration_range.start_byte)
+                                        .abs_diff(
+                                            syntax_range
+                                                .end_byte
+                                                .saturating_sub(syntax_range.start_byte),
+                                        );
+                                    (boundary_distance, span_distance, *syntax_range)
+                                })
+                        })
+                    })
+                    .min_by_key(|(boundary_distance, span_distance, syntax_range)| {
+                        (*boundary_distance, *span_distance, syntax_range.start_byte)
+                    })?
+                    .2;
+                (associated_syntax == target).then_some(unit)
             })
+            .min()
     }
 
     fn visible_class_declaration_nodes(&self, name: &str, site: Node<'tree>) -> Vec<Node<'tree>> {
         let visible_scopes = lexical_scope_ids_for_node(site);
-        self.class_declarations_by_name
+        self.syntax_index
+            .class_declarations_by_name
             .get(name)
             .map(|classes| {
                 classes
                     .iter()
-                    .copied()
+                    .filter_map(|range| {
+                        smallest_named_node_covering(self.root, range.start_byte, range.end_byte)
+                    })
                     .filter(|class| {
                         declaration_scope_id(*class).is_some_and(|id| visible_scopes.contains(&id))
                     })
@@ -1495,33 +1573,40 @@ fn is_summary_boundary(kind: &str) -> bool {
     )
 }
 
-fn index_js_ts_declarations<'tree>(
+pub(in crate::analyzer::usages) fn build_js_ts_receiver_syntax_index<'tree>(
     root: Node<'tree>,
     source: &str,
-) -> (
-    HashMap<String, Vec<Node<'tree>>>,
-    HashMap<String, Vec<Node<'tree>>>,
-) {
-    let mut functions: HashMap<String, Vec<Node<'tree>>> = HashMap::default();
-    let mut classes: HashMap<String, Vec<Node<'tree>>> = HashMap::default();
+    cancellation: Option<&CancellationToken>,
+) -> Option<(Arc<JsTsReceiverSyntaxIndex>, usize)> {
+    let mut functions: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
+    let mut classes: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
     let mut seen = HashSet::default();
     let mut stack = vec![root];
+    let mut visited = 0usize;
     while let Some(node) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
         if !seen.insert(node.id()) {
             continue;
         }
+        visited += 1;
+        let range = IndexedNodeRange {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        };
         if node.kind() == "function_declaration"
             && let Some(name_node) = node.child_by_field_name("name")
             && let Some(name) = simple_identifier_text(name_node, source)
         {
-            functions.entry(name.to_string()).or_default().push(node);
+            functions.entry(name.to_string()).or_default().push(range);
         } else if matches!(
             node.kind(),
             "class_declaration" | "abstract_class_declaration"
         ) && let Some(name_node) = node.child_by_field_name("name")
             && let Some(name) = simple_identifier_text(name_node, source)
         {
-            classes.entry(name.to_string()).or_default().push(node);
+            classes.entry(name.to_string()).or_default().push(range);
         }
         for index in (0..node.named_child_count()).rev() {
             if let Some(child) = node.named_child(index) {
@@ -1529,7 +1614,13 @@ fn index_js_ts_declarations<'tree>(
             }
         }
     }
-    (functions, classes)
+    Some((
+        Arc::new(JsTsReceiverSyntaxIndex {
+            function_declarations_by_name: functions,
+            class_declarations_by_name: classes,
+        }),
+        visited,
+    ))
 }
 
 fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -1580,7 +1671,9 @@ pub(in crate::analyzer::usages) fn node_range(node: Node<'_>) -> Range {
     }
 }
 
-fn member_expression_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
+pub(in crate::analyzer::usages) fn member_expression_at_site(
+    mut node: Node<'_>,
+) -> Option<Node<'_>> {
     for _ in 0..4 {
         if node.kind() == "member_expression" {
             return Some(node);
@@ -1615,7 +1708,7 @@ fn dedup_units(mut units: Vec<CodeUnit>, limit: usize) -> Vec<CodeUnit> {
 mod tests {
     use super::*;
     use crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_TARGETS;
-    use crate::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
+    use crate::analyzer::{AnalyzerDefinitionLookup, ProjectFile, TestProject, TypescriptAnalyzer};
     use std::path::PathBuf;
     use tree_sitter::Parser;
 
@@ -1789,5 +1882,37 @@ export function caller(which: number) {
         assert!(report.outcome.is_terminal_for_graph());
         assert!(report.candidates_truncated);
         assert!(report.work.summary_expansions > 0);
+    }
+
+    #[test]
+    fn nested_same_name_factory_does_not_reuse_the_enclosing_declaration() {
+        let source = r#"
+class Outer {}
+class Inner {}
+function make() {
+  function make() { return new Inner(); }
+  return make();
+}
+"#;
+        let (_temp, file, analyzer) = test_project(source);
+        let tree = parse(source);
+        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
+        let provider = JsTsReceiverFactProvider::new(
+            &analyzer,
+            &definitions,
+            Language::TypeScript,
+            &file,
+            source,
+            tree.root_node(),
+            ImportBinder::empty(),
+        );
+        let inner_start = source.rfind("function make").expect("inner factory");
+        let inner = smallest_named_node_covering(
+            tree.root_node(),
+            inner_start,
+            inner_start + "function make".len(),
+        )
+        .expect("inner function node");
+        assert_eq!(provider.function_unit_for_node("make", inner), None);
     }
 }

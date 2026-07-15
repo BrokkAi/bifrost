@@ -232,6 +232,9 @@ test("renders and navigates a receiver-analysis result", () => {
   assert.equal(queryResultLabel(analysis), "points_to: service");
   assert.equal(queryResultDescription(analysis), "precise · 9:15");
   assert.equal(queryResultIcon(analysis), "type-hierarchy");
-  assert.match(queryResultTooltip(analysis), /points_to/);
+  const tooltip = queryResultTooltip(analysis);
+  assert.match(tooltip, /points_to/);
+  assert.match(tooltip, /factory makeService/);
+  assert.match(tooltip, /allocation Service/);
   assert.deepEqual(queryResultRange(analysis), analysis.range);
 });

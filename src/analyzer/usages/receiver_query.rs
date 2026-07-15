@@ -3,6 +3,7 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::js_ts::parse_js_ts_tree;
 use crate::analyzer::usages::js_ts_graph::receiver_analysis::{
+    JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index, member_expression_at_site,
     node_range, smallest_named_node_covering,
 };
 use crate::analyzer::usages::js_ts_graph::{JsTsReceiverFactProvider, compute_jsts_import_binder};
@@ -10,8 +11,13 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
     ReceiverValue,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{
+    AnalyzerDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, Range,
+};
 use crate::cancellation::CancellationToken;
+use crate::hash::HashMap;
+use std::cell::RefCell;
+use std::sync::Arc;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,11 +75,24 @@ pub(crate) enum ReceiverQueryError {
 
 pub(crate) struct ReceiverQueryService<'a> {
     analyzer: &'a dyn IAnalyzer,
+    definitions: AnalyzerDefinitionLookup<'a>,
+    prepared_files: RefCell<HashMap<ProjectFile, PreparedReceiverFile>>,
+}
+
+struct PreparedReceiverFile {
+    source: String,
+    tree: tree_sitter::Tree,
+    imports: crate::analyzer::usages::model::ImportBinder,
+    syntax_index: Arc<JsTsReceiverSyntaxIndex>,
 }
 
 impl<'a> ReceiverQueryService<'a> {
     pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
-        Self { analyzer }
+        Self {
+            analyzer,
+            definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
+            prepared_files: RefCell::new(HashMap::default()),
+        }
     }
 
     pub(crate) fn analyze(
@@ -108,62 +127,95 @@ impl<'a> ReceiverQueryService<'a> {
                 None,
             ));
         };
-        let Some(tree) = parse_js_ts_tree(file, &source, language) else {
-            return Ok(unsupported_report(
-                operation,
-                file,
-                language,
-                range,
-                "receiver_source_parse_failed",
-                Some(&source),
-            ));
-        };
+        let mut setup_nodes = 0;
+        if !self.prepared_files.borrow().contains_key(file) {
+            let Some(tree) = parse_js_ts_tree(file, &source, language) else {
+                return Ok(unsupported_report(
+                    operation,
+                    file,
+                    language,
+                    range,
+                    "receiver_source_parse_failed",
+                    Some(&source),
+                ));
+            };
+            check_cancelled(cancellation)?;
+            let Some((syntax_index, visited)) =
+                build_js_ts_receiver_syntax_index(tree.root_node(), &source, cancellation)
+            else {
+                return Err(ReceiverQueryError::Cancelled);
+            };
+            setup_nodes = visited;
+            self.prepared_files.borrow_mut().insert(
+                file.clone(),
+                PreparedReceiverFile {
+                    imports: compute_jsts_import_binder(&source, &tree),
+                    source,
+                    tree,
+                    syntax_index,
+                },
+            );
+        }
+        let prepared_files = self.prepared_files.borrow();
+        let prepared = prepared_files
+            .get(file)
+            .expect("receiver file was prepared above");
+        let source = prepared.source.as_str();
+        let tree = &prepared.tree;
         let Some(input_node) =
             smallest_named_node_covering(tree.root_node(), range.start_byte, range.end_byte)
         else {
-            return Ok(unsupported_report(
+            let mut report = unsupported_report(
                 operation,
                 file,
                 language,
                 range,
                 "receiver_input_range_unavailable",
-                Some(&source),
-            ));
+                Some(source),
+            );
+            report.work.setup_nodes = setup_nodes;
+            return Ok(report);
         };
-        let provider = JsTsReceiverFactProvider::new(
+        self.definitions.set_language(language);
+        let provider = JsTsReceiverFactProvider::new_with_syntax_index(
             self.analyzer,
-            self.analyzer.global_usage_definition_index(),
+            &self.definitions,
             language,
             file,
-            &source,
+            source,
             tree.root_node(),
-            compute_jsts_import_binder(&source, &tree),
+            prepared.imports.clone(),
+            Arc::clone(&prepared.syntax_index),
         );
 
         let report = match operation {
             ReceiverQueryOperation::PointsTo => {
                 let analysis = provider.resolve_receiver_node_report(input_node, budget);
-                values_report(operation, file, language, input_node, &source, analysis)
+                values_report(operation, file, language, input_node, source, analysis)
             }
             ReceiverQueryOperation::ReceiverTargets => {
                 let receiver = match input {
                     ReceiverQueryInput::Expression => input_node,
                     ReceiverQueryInput::ContainingSite => {
-                        let Some(receiver) = receiver_node_at_site(input_node) else {
-                            return Ok(unsupported_report(
+                        let Some(receiver) = member_expression_at_site(input_node)
+                            .and_then(|member| member.child_by_field_name("object"))
+                        else {
+                            let mut report = unsupported_report(
                                 operation,
                                 file,
                                 language,
                                 range,
                                 "receiver_site_without_receiver",
-                                Some(&source),
-                            ));
+                                Some(source),
+                            );
+                            report.work.setup_nodes = setup_nodes;
+                            return Ok(report);
                         };
                         receiver
                     }
                 };
                 let analysis = provider.resolve_receiver_node_report(receiver, budget);
-                values_report(operation, file, language, receiver, &source, analysis)
+                values_report(operation, file, language, receiver, source, analysis)
             }
             ReceiverQueryOperation::MemberTargets => {
                 let Some(member_report) = provider.resolve_member_targets_at_site(
@@ -172,20 +224,22 @@ impl<'a> ReceiverQueryService<'a> {
                     input_node.start_byte(),
                     budget,
                 ) else {
-                    return Ok(unsupported_report(
+                    let mut report = unsupported_report(
                         operation,
                         file,
                         language,
                         range,
                         "member_target_site_unsupported",
-                        Some(&source),
-                    ));
+                        Some(source),
+                    );
+                    report.work.setup_nodes = setup_nodes;
+                    return Ok(report);
                 };
                 let site = site(
                     file,
                     language,
                     member_report.receiver_range,
-                    &source,
+                    source,
                     "receiver",
                     Some(member_report.member_name),
                 );
@@ -199,7 +253,14 @@ impl<'a> ReceiverQueryService<'a> {
             }
         };
         check_cancelled(cancellation)?;
+        let mut report = report;
+        report.work.setup_nodes = setup_nodes;
         Ok(report)
+    }
+
+    #[cfg(test)]
+    fn prepared_file_count(&self) -> usize {
+        self.prepared_files.borrow().len()
     }
 }
 
@@ -274,26 +335,6 @@ fn site(
         syntax_kind: syntax_kind.to_string(),
         member_name,
     }
-}
-
-fn receiver_node_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
-    for _ in 0..5 {
-        match node.kind() {
-            "member_expression" => return node.child_by_field_name("object"),
-            "call_expression" => {
-                let function = node.child_by_field_name("function")?;
-                return (function.kind() == "member_expression")
-                    .then(|| function.child_by_field_name("object"))
-                    .flatten();
-            }
-            _ => {}
-        }
-        let Some(parent) = node.parent() else {
-            break;
-        };
-        node = parent;
-    }
-    None
 }
 
 fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), ReceiverQueryError> {
@@ -419,6 +460,46 @@ export function caller() {
                     && targets[0].fq_name().contains("Service")
                     && !targets[0].fq_name().contains("Other")
         ));
+    }
+
+    #[test]
+    fn repeated_queries_reuse_prepared_file_context_and_charge_setup_once() {
+        let source = r#"
+class Service { run() {} }
+export function caller() {
+  const first = new Service();
+  const second = new Service();
+  first.run();
+  second.run();
+}
+"#;
+        let (_temp, file, analyzer) = test_project(source);
+        let service = ReceiverQueryService::new(&analyzer);
+
+        let first = service
+            .analyze(
+                ReceiverQueryOperation::PointsTo,
+                &file,
+                marker_range(source, "first.run"),
+                ReceiverQueryInput::ContainingSite,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("first receiver query");
+        let second = service
+            .analyze(
+                ReceiverQueryOperation::PointsTo,
+                &file,
+                marker_range(source, "second.run"),
+                ReceiverQueryInput::ContainingSite,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("second receiver query");
+
+        assert_eq!(service.prepared_file_count(), 1);
+        assert!(first.work.setup_nodes > 0);
+        assert_eq!(second.work.setup_nodes, 0);
     }
 
     #[test]

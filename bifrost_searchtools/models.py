@@ -595,6 +595,33 @@ class CodeQueryReceiverValue:
             else None,
         )
 
+    def render_text(self) -> str:
+        if self.receiver_value_kind == "allocation_site":
+            assert self.type_declaration is not None
+            assert self.allocation_site is not None
+            site = self.allocation_site
+            return (
+                f"allocation {self.type_declaration.fq_name} at "
+                f"{site.path}:{site.range.start_line}:{site.range.start_column}"
+            )
+        labels = {
+            "instance_type": "instance",
+            "class_or_static_object": "class/static",
+            "module_or_export_object": "module/export",
+            "current_receiver": "current receiver",
+        }
+        if self.receiver_value_kind in labels:
+            assert self.declaration is not None
+            return f"{labels[self.receiver_value_kind]} {self.declaration.fq_name}"
+        if self.receiver_value_kind == "factory_return":
+            assert self.factory is not None
+            assert self.returned_value is not None
+            return (
+                f"factory {self.factory.fq_name} -> "
+                f"{self.returned_value.render_text()}"
+            )
+        return self.receiver_value_kind
+
 
 @dataclass(frozen=True)
 class CodeQueryReceiverAnalysis:
@@ -639,10 +666,19 @@ class CodeQueryReceiverAnalysis:
         )
 
     def render_text(self) -> str:
-        return (
+        lines = [
             f"{self.path}:{self.range.start_line}:{self.range.start_column} "
             f"[receiver analysis; {self.analysis_kind}; {self.outcome}] `{self.text}`"
+        ]
+        lines.extend(f"  value -> {value.render_text()}" for value in self.values)
+        lines.extend(
+            f"  member -> {target.fq_name}" for target in self.member_targets
         )
+        if self.reason is not None:
+            lines.append(f"  reason -> {self.reason}")
+        if self.limit is not None:
+            lines.append(f"  limit -> {self.limit}")
+        return "\n".join(lines)
 
 
 CodeQueryResultItem = (
