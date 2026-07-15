@@ -17,7 +17,7 @@ A successful implementation can be demonstrated by running an ignored release be
 - [x] (2026-07-15T17:36:49Z) Created and synchronized `experiment-sqlite-backed-compact-graph-snapshots` from `origin/master` at `fce80f1664df0564fc4bef99115439c08bc82f9e`.
 - [x] (2026-07-15T17:36:49Z) Traced the structural-facts cache, persisted analyzer context, blob identity, schema migrations, analyzer epochs, cache GC accounting, compact rows, and the existing memory benchmark.
 - [x] (2026-07-15T17:47:00Z) Added an implementation-independent persisted-reopen benchmark, smoke-tested it, preserved the optimized baseline executable, and recorded three 200-file baseline runs.
-- [ ] Add a versioned packed wire format with checked decoding and round-trip/corruption tests.
+- [x] (2026-07-15T18:03:00Z) Added snapshot semantic version 1, a packed explicit-code wire DTO, checked compact-row construction, source-aware validation, and round-trip/corruption tests.
 - [ ] Add migration 0007 and generation-aware snapshot read/write APIs that participate in payload and row accounting.
 - [ ] Integrate read-through hydration and write-through persistence into structural-facts cache misses without changing overlay correctness.
 - [ ] Validate content changes, language keys, generation changes, corrupt rows, in-memory stores, and cache deletion.
@@ -44,6 +44,9 @@ A successful implementation can be demonstrated by running an ignored release be
 
 - Observation: the role-heavy query in the second analyzer lifetime was consistently slower than in the first lifetime (about 32 ms versus 5 ms) even though fact/role counts, retained bytes, and extraction counts matched. The persistence candidate must be compared in the same lifecycle positions rather than treating the cold-lifetime query as its baseline.
   Evidence: all three baseline runs reproduced the difference. The cause is not yet established and is not required to evaluate snapshot hydration, but it should be revisited if the candidate changes the gap.
+
+- Observation: bincode's free `serialize`/`deserialize` functions use a legacy fixed-width configuration that permits trailing bytes, while `DefaultOptions` uses varints and rejects trailing bytes. The snapshot boundary explicitly selects varints, a payload-size read limit, and trailing-byte rejection rather than inheriting either implicit configuration.
+  Evidence: bincode 1.3.3 configuration documentation and the corruption tests in `structural::facts`.
 
 ## Decision Log
 
